@@ -1890,14 +1890,22 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # Task 4014 -- deterministic unit coverage for wait_subtree_live's descendant
 # discovery poll (the "no descendant appeared within 20.0s" flake).  Every
 # test here injects the two private seams (_probe_children / _ppid_map) and
-# runs with interval=0, so there is ZERO real timing and ZERO real
-# subprocess -- the same task-2819 precedent as the wait_for_marker_stable
-# tests above.  Fixing a flake with a flake is the failure mode to avoid, and
-# the 3689 steward failed to reproduce this one in 19 of 19 attempts
-# (including synthetic pressure at load 100 / ~8000 processes), so a
-# load-based test would be non-deterministic in BOTH directions.  The
-# efficiency property that actually prevents sampling-rate collapse is
-# therefore pinned STRUCTURALLY, by call count, which is exact at any load.
+# runs with interval=0, so the POLL LOOP itself has ZERO real timing -- the
+# same task-2819 precedent as the wait_for_marker_stable tests above.
+# Fixing a flake with a flake is the failure mode to avoid, and the 3689
+# steward failed to reproduce this one in 19 of 19 attempts (including
+# synthetic pressure at load 100 / ~8000 processes), so a load-based test
+# would be non-deterministic in BOTH directions.  The efficiency property
+# that actually prevents sampling-rate collapse is therefore pinned
+# STRUCTURALLY, by call count, which is exact at any load.
+#
+# Deliberate, narrow exceptions to "zero real subprocess" (task 4312,
+# joining test_read_direct_children_sees_a_real_fork_including_off_main_thread
+# below): the two timeout-diagnostic tests spawn a real `proc` because the
+# diagnostic message's CONTENT -- the leader's actual returncode and, where
+# applicable, its stderr tail -- is exactly what is under test.  The poll
+# loop each one drives still runs zero ticks (timeout=0, interval=0), so
+# timing stays zero even there.
 # ---------------------------------------------------------------------------
 
 
@@ -2038,6 +2046,128 @@ def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable(
         'a pid that does not exist must probe as None (cannot probe), not raise -- '
         'a leader exiting mid-poll must not turn the timeout path into an OSError'
     )
+
+
+def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
+    """The timeout diagnostic names the LEADER's real rc and stderr tail (291a75a919).
+
+    291a75a919 ("De-flake alpha: make wait_subtree_live's timeout path
+    self-diagnosing") added the ``proc``/``proc_label`` reporting in the
+    timeout branch above (:func:`wait_subtree_live`, ~:582-603) so a
+    watchdog self-kill (rc == 1, no ``Error:`` line), an exception exit
+    (rc == 1 WITH an ``Error:`` line), and a merely slow leader (rc is
+    None) are distinguishable from the failure message alone -- exactly the
+    signal an incident needs. It shipped with no test (task 4312).
+
+    Deterministic per the task-4014 precedent above: ``_probe_children``
+    always reports no children and ``timeout=0`` so the poll body never
+    executes a single tick -- the timeout branch fires immediately, with
+    zero real timing.  What IS real is *proc*: an actually-spawned,
+    already-``wait()``-ed subprocess with a KNOWN returncode (3) and a
+    KNOWN stderr payload (``SENTINEL-XYZ``), so this pins the diagnostic's
+    CONTENT rather than merely the presence of the words "rc"/"stderr" --
+    the vacuous-guard trap this repo has hit before: a message reporting
+    nothing (e.g. ``rc=None; stderr tail:\n``) would also contain those
+    labels.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.stderr.write("SENTINEL-XYZ\\n"); sys.exit(3)'],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        proc.wait()
+        assert proc.returncode == 3  # sanity: the known rc actually landed
+
+        with pytest.raises(AssertionError) as exc_info:
+            wait_subtree_live(
+                1234,
+                proc=proc,
+                proc_label='leader',
+                timeout=0,
+                interval=0,
+                _probe_children=lambda _pid: set(),
+                _ppid_map=lambda: {},
+            )
+
+        message = str(exc_info.value)
+        assert 'leader rc=3' in message, (
+            f'expected the leader\'s actual returncode (3), reported under its '
+            f'proc_label, in the timeout message; got: {message!r}'
+        )
+        assert 'SENTINEL-XYZ' in message, (
+            f'expected the leader\'s actual stderr tail content in the timeout '
+            f'message; got: {message!r}'
+        )
+    finally:
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+
+def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_leader():
+    """The rc=None ("merely slow leader") taxonomy branch and its anti-hang guard (291a75a919).
+
+    Sibling of
+    :func:`test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail`
+    above, covering the two properties that rc=3 case cannot reach (task 4312
+    review):
+
+    * the ``rc is None`` taxonomy branch itself -- a leader that is merely
+      slow (still running when the poll gives up) is the case an incident is
+      most likely to actually hit, and it was entirely unpinned.
+    * the load-bearing guard :func:`wait_subtree_live`'s docstring calls out:
+      stderr is read ONLY when ``proc.poll()`` is not ``None``, precisely
+      because a LIVE leader's pipe write end can still be held open by an
+      inherited-fd helper it spawned, and a buffered read on that pipe would
+      block until EOF -- hanging this helper, and the rest of the suite,
+      rather than raising.  A regression that swapped the guarded
+      ``select()``-bounded raw read for an unconditional ``proc.stderr.read()``
+      would still pass every other test in this module while reintroducing
+      exactly that hang.
+
+    *proc* here is a real, still-running subprocess (``time.sleep(300)``, well
+    outside this test's own runtime) so ``proc.poll()`` is genuinely ``None``
+    -- checking that costs one non-blocking ``waitpid(WNOHANG)`` syscall, so
+    this stays zero real TIMING even though *proc* itself is real, same as
+    its rc=3 sibling.  ``stderr=PIPE`` is set (mirroring real call sites) so a
+    guard regression would hang on the open write end rather than raise
+    ``AttributeError`` on a ``None`` pipe, which would make this test pass for
+    the wrong reason.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(AssertionError) as exc_info:
+            wait_subtree_live(
+                1234,
+                proc=proc,
+                proc_label='leader',
+                timeout=0,
+                interval=0,
+                _probe_children=lambda _pid: set(),
+                _ppid_map=lambda: {},
+            )
+
+        message = str(exc_info.value)
+        assert 'leader rc=None' in message, (
+            f'expected the merely-slow-leader taxonomy branch (rc=None, '
+            f'reported under its proc_label) in the timeout message; got: '
+            f'{message!r}'
+        )
+        assert 'stderr tail' not in message, (
+            f'stderr must be read ONLY when proc.poll() is not None -- seeing '
+            f'"stderr tail" here means the anti-hang poll()-gate regressed to '
+            f'an unconditional read, which would hang on a live leader whose '
+            f'pipe write end is still open; got: {message!r}'
+        )
+    finally:
+        proc.kill()
+        proc.wait()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
 
 
 #: A child that stays alive but is never waited on -- killed by the test that
