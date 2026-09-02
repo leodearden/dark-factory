@@ -5428,6 +5428,152 @@ class TestPremiseGuardRunsOffEventLoop:
         assert d2 is not None and d2.action == "refuse"
         assert load_call_count == 1
 
+    async def test_registry_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """RED: a registry load that RAISES must fail OPEN, and must not latch
+        into a permanent failure.
+
+        VERIFIED EMPIRICALLY (not assumed): load_premise_registry only catches
+        FileNotFoundError/OSError on read_text and yaml.YAMLError on parse, so
+        a registry that is not valid UTF-8 raises UnicodeDecodeError — a
+        ValueError, NOT an OSError — despite that function's own docstring
+        claiming "The function never raises". The prior step (offloading the
+        lazy load via asyncio.to_thread, with
+        _premise_registry_load_attempted set only AFTER a successful
+        assignment) left this raise path unwrapped, so on the current branch:
+        (a) the exception escapes _maybe_premise_refuted_drop — whose own
+        docstring promises "Never raises" and whose callers curate() /
+        curate_batch_prepared() invoke it unguarded — and (b) the attempted
+        flag is never set, so EVERY subsequent call re-enters the load and
+        re-raises again: a one-shot failure becomes a permanent one for the
+        life of the process.
+
+        Writes the registry as genuinely non-UTF-8 bytes so the failure is
+        reached through the real load_premise_registry rather than fabricated
+        with a bare side_effect=RuntimeError — this is reachable in
+        production with no thread-pool weirdness and no mocking of the raise
+        itself. The patch wraps the real callable (captured before patching)
+        only to count invocations.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry_path = tmp_path / "premise_registry.yaml"
+        registry_path.write_bytes(b"- name: \xff\xfe bad\n")
+
+        config = _make_config_with_premise_registry(str(registry_path))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        load_calls = 0
+
+        def counting_load(path):
+            nonlocal load_calls
+            load_calls += 1
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=counting_load,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        assert any(
+            "premise" in r.message.lower()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+    async def test_registry_load_cancellation_does_not_disable_guard(
+        self, tmp_path,
+    ):
+        """GUARD (expected GREEN already): a cancelled load must NOT latch the
+        guard permanently off.
+
+        This locks a property that already holds on the current branch (the
+        attempted flag sits after the assignment, inside the lock, so a
+        CancelledError from the first caller leaves it clear and a later call
+        retries) against the obvious "just settle the flag in a finally"
+        fix for the sibling RED test above. asyncio.CancelledError is a
+        BaseException in Python 3.13, so a `finally` would also latch the
+        flag on cancellation — permanently disabling the premise guard for
+        this TaskCurator instance because one unrelated caller was
+        cancelled mid-load, which is the same transient-becomes-permanent
+        defect class the sibling test exists to close, just with a rarer
+        trigger. The follow-up impl step must keep this test GREEN.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            load_premise_registry as real_load_premise_registry,
+        )
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        call_count = 0
+
+        def first_call_cancelled(path):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise asyncio.CancelledError()
+            return real_load_premise_registry(path)
+
+        with patch(
+            "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
+            side_effect=first_call_cancelled,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await curator._maybe_premise_refuted_drop(
+                    candidate, candidate.payload_hash(),
+                )
+
+            decision = await curator._maybe_premise_refuted_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is not None
+        assert decision.action == "refuse"
+        assert decision.justification.startswith("recon-premise-refuted:")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-13 RED: TestCuratorBatchPremiseRefutedDrop
