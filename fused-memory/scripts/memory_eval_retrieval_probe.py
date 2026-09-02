@@ -1059,6 +1059,29 @@ def rank_index(results: list) -> dict[str, int]:
     return first_rank
 
 
+def ranks_at_depth(ranks: dict[str, int], k: int) -> dict[str, int]:
+    """The depth-scoped view of a full-depth :func:`rank_index` mapping.
+
+    Exactly equal to ``rank_index(results[:k])``: :func:`rank_index` keeps
+    the FIRST rank a content hash appeared at, so a hash whose first rank is
+    ``<= k`` has that same first rank in the truncated list, and a hash
+    whose first rank is ``> k`` does not appear in the truncated list at
+    all. Filtering the existing mapping therefore reproduces re-hashing the
+    truncation exactly, without re-deriving it.
+
+    Deriving rather than re-hashing preserves :func:`rank_index`'s own
+    contract: the list is sha256'd once per query rather than once per
+    consumer. A second, truncated re-hash would reintroduce the very second
+    pass that contract exists to avoid.
+
+    Returns a NEW mapping — the full-depth index the canonical-presence
+    family reads (``canonical_hit`` / ``observe_phrasing``, which deliberately
+    scan the whole list so a hit beyond ``k`` is reported at its true rank
+    rather than as absent) is left untouched.
+    """
+    return {content_hash: rank for content_hash, rank in ranks.items() if rank <= k}
+
+
 def canonical_hit(
     results: list,
     entry: RegistryEntry,
@@ -1504,12 +1527,28 @@ class InversionObservation:
     itself the signal: comparable ≪ registered means most pairs are not being
     returned at all, which is a findability fact ``canonical-in-top-k``
     measures and this metric must not be read as if it had.
+
+    ``pairs_beyond_scored_depth`` is a THIRD number, diagnostic rather than an
+    exposure: registry pairs both-present in the full FETCHED list but not
+    both within the scored depth — the population the scored-depth pin
+    removed from ``pairs_comparable``. It is never summed into the metric or
+    published as a second ``n``; it exists only so a run where the pin
+    genuinely trimmed exposure is distinguishable, in the artifact, from one
+    with nothing beyond the scored depth to trim.
+
+    ``k`` is the depth this observation was SCORED at, not the depth fetched
+    — mirroring :class:`ContaminationObservation` and :class:`ClaimObservation`.
+    It is required rather than defaulted so no construction site can silently
+    claim the tripwire's depth for an observation actually built at another
+    one; every existing construction site passes it explicitly.
     """
 
     topic: str
     phrasing: str
+    k: int
     pairs_registered: int
     pairs_comparable: int
+    pairs_beyond_scored_depth: int
     inversions: tuple[InversionRecord, ...] = ()
     degraded: bool = False
 
@@ -1647,6 +1686,37 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
         for store in observation.stores_served:
             key = f'observations_served_by_{store}_at_k{observation.k}'
             counts[key] = counts.get(key, 0) + 1
+    # The inversion family's own depth-named disclosure. `superseded-above-
+    # successor` carries no depth suffix in its metric_id and leaf alpha joins
+    # by metric_id alone, so without a row naming the depth a --k change reads
+    # to the evaluator as a rate move rather than a re-parameterisation.
+    # `pairs_registered` is published because it is the un-narrowed population
+    # `pairs_comparable` is a subset of; the two together separate "fewer
+    # pairs are coming back" from "the registry recorded fewer pairs". There
+    # is deliberately NO `inversion_pairs_comparable` row: leaf beta settled
+    # this exact question for the identically-shaped `surfacing` family
+    # (fused-memory/scripts/memory_eval_staleness_sweep.py::_disclosure_counts,
+    # refusing a `surfacing_pairs_observed` row) — it would be a second name
+    # for the number already published as the metric's `n`, and when exposure
+    # is zero the metric is absent and `metric_families_not_measured` names
+    # the gap, which a bare 0 here would have disguised as a measurement.
+    # `pairs_beyond_scored_depth` is NOT that same refusal reversed: it is
+    # the population the pin REMOVED (both-present in the full fetch, not
+    # both within the scored depth), a number `n` never carries at all.
+    # Without it a corpus where superseded entries reliably outrank their
+    # successors just past the scored depth is indistinguishable, in this
+    # artifact, from one with no such pairs anywhere in reach.
+    for observation in observations.inversions:
+        if observation.degraded:
+            key = f'degraded_inversion_observations_at_k{observation.k}'
+            counts[key] = counts.get(key, 0) + 1
+            continue
+        key = f'inversion_observations_at_k{observation.k}'
+        counts[key] = counts.get(key, 0) + 1
+        key = f'inversion_pairs_registered_at_k{observation.k}'
+        counts[key] = counts.get(key, 0) + observation.pairs_registered
+        key = f'inversion_pairs_beyond_scored_depth_at_k{observation.k}'
+        counts[key] = counts.get(key, 0) + observation.pairs_beyond_scored_depth
     return counts
 
 
@@ -1919,6 +1989,12 @@ async def probe_topic(
     built from three results as "top 5". :func:`run_probe` normalises ``ks``
     so that never happens from the CLI; this keeps the label honest for the
     direct callers too, and neither guard depends on the other.
+
+    The superseded-inversion family is pinned at the same ``scored_k`` for the
+    same reason, one level further down: its ``pairs_comparable`` is not just
+    a count but a DENOMINATOR (the metric's ``n``), so if it moved with
+    ``--k`` a deeper fetch would silently change what the rate is a rate of,
+    on top of relabelling it.
     """
     limit = max(ks) if ks else TRIPWIRE_K
     # min(), not max(): a deeper fetch must not silently widen a metric that
@@ -1934,9 +2010,15 @@ async def probe_topic(
                 failed_stores=info.failed_stores,
                 diagnostics=info.diagnostics,
             ))
-        # Hashed ONCE per search, then read by every consumer below: canonical
-        # presence at each k, the inversions, and their comparable exposure.
+        # Hashed ONCE per search, then read by every consumer below. `ranks`
+        # (full depth) feeds canonical presence at each k — canonical_hit and
+        # observe_phrasing deliberately scan the whole list so a hit beyond
+        # the scored depth is reported at its true rank rather than as
+        # absent. `scored_ranks` (derived, not re-hashed — see
+        # ranks_at_depth) feeds the inversion family, which must be pinned to
+        # scored_k like contamination and claim recall.
         ranks = rank_index(info.results)
+        scored_ranks = ranks_at_depth(ranks, scored_k)
         for k in ks:
             observations.phrasings.append(observe_phrasing(
                 info.results, entry, phrasing, k, degraded=info.degraded, ranks=ranks,
@@ -1952,14 +2034,22 @@ async def probe_topic(
             foreign_records=outcome.foreign_records,
             degraded=info.degraded,
         ))
+        # Both at once so `pairs_beyond_scored_depth` is exactly their
+        # difference — the population both-present at full fetch depth but
+        # not both within the scored depth — rather than a second, possibly
+        # divergent computation of the same narrowing.
+        comparable_at_full_depth = comparable_pairs(entry, ranks)
+        comparable_at_scored_depth = comparable_pairs(entry, scored_ranks)
         observations.inversions.append(InversionObservation(
             topic=entry.topic,
             phrasing=phrasing.text,
+            k=scored_k,
             pairs_registered=len(entry.supersedes_pairs),
-            pairs_comparable=comparable_pairs(entry, ranks),
+            pairs_comparable=comparable_at_scored_depth,
+            pairs_beyond_scored_depth=comparable_at_full_depth - comparable_at_scored_depth,
             inversions=tuple(
                 superseded_inversions(
-                    info.results, entry, phrasing=phrasing.text, ranks=ranks,
+                    info.results, entry, phrasing=phrasing.text, ranks=scored_ranks,
                 ),
             ),
             degraded=info.degraded,
