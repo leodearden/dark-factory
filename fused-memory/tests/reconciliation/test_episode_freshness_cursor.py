@@ -466,3 +466,102 @@ class TestUndatableFreshnessRecords:
             f'Expected counter to reset per call, not accumulate; '
             f'got {stage._undatable_freshness_records}'
         )
+
+
+class TestWatermarkCutoffDisclosure:
+    """The '### Previous Reconciliation' section must disclose the episode
+    and memory freshness cutoffs the filters above just compared against.
+
+    Their invisibility is precisely why the 894fbe90 bug survived three
+    full cycles of re-investigation with nobody able to see the cursor: the
+    payload told the reader a filtered count ("New Episodes ... (1)") but
+    never the instant it was filtered against, so there was nothing to
+    cross-check the count with.
+    """
+
+    @pytest.mark.asyncio
+    async def test_episode_and_memory_cutoffs_appear_in_isoformat_form(self):
+        """Both cutoff instants must be disclosed, rendered via .isoformat()
+        (a 'T' separator) — never a bare str(datetime) rendering, which
+        would reintroduce the exact space-separator ambiguity task 4574
+        removed from the comparison itself."""
+        stage = _make_consolidator()
+        episode_ts = datetime(2026, 8, 20, 12, 0, 0, tzinfo=UTC)
+        memory_ts = datetime(2026, 8, 21, 6, 30, 0, tzinfo=UTC)
+        watermark = Watermark(
+            project_id='test_project',
+            last_full_run_id='run-abc',
+            last_full_run_completed=datetime(2026, 8, 22, 0, 0, 0, tzinfo=UTC),
+            last_episode_timestamp=episode_ts,
+            last_memory_timestamp=memory_ts,
+        )
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert episode_ts.isoformat() in result, (
+            f'Expected episode cutoff {episode_ts.isoformat()!r} disclosed in payload; '
+            f'got:\n{result!r}'
+        )
+        assert memory_ts.isoformat() in result, (
+            f'Expected memory cutoff {memory_ts.isoformat()!r} disclosed in payload; '
+            f'got:\n{result!r}'
+        )
+        assert str(episode_ts) not in result, (
+            f'Must never render the space-separated str(datetime) form '
+            f'{str(episode_ts)!r} — that is the exact ambiguity task 4574 removes; '
+            f'got:\n{result!r}'
+        )
+        assert str(memory_ts) not in result, (
+            f'Must never render the space-separated str(datetime) form '
+            f'{str(memory_ts)!r} — that is the exact ambiguity task 4574 removes; '
+            f'got:\n{result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_project_all_none_watermark_does_not_raise_or_emit_none(self):
+        """A fresh project's all-None Watermark must degrade cleanly: no
+        raise, and the literal 'None' must never appear as a stand-in for a
+        missing cutoff. _format_watermark's existing last_full_run_completed
+        is-None short-circuit ('First run — no previous reconciliation.')
+        already covers this by construction; pinned here so a future edit
+        cannot silently regress it while adding the episode/memory lines."""
+        stage = _make_consolidator()
+        watermark = Watermark(project_id='test_project')
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        section = result.split('### Previous Reconciliation', 1)[1].split('## Your Task', 1)[0]
+        assert 'First run' in section, f'Expected first-run short-circuit; got:\n{section!r}'
+        assert 'None' not in section, (
+            f"Must never emit the literal 'None' in the Previous Reconciliation "
+            f'section; got:\n{section!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_episode_cutoff_omits_line_not_none_literal(self):
+        """Mixed case: last_full_run_completed is set (so the first-run
+        short-circuit does NOT fire) but last_episode_timestamp is None. The
+        missing episode cutoff must be omitted entirely, never rendered as
+        the literal 'None' — the memory cutoff (which IS set) must still
+        appear."""
+        stage = _make_consolidator()
+        memory_ts = datetime(2026, 8, 21, 6, 30, 0, tzinfo=UTC)
+        watermark = Watermark(
+            project_id='test_project',
+            last_full_run_id='run-abc',
+            last_full_run_completed=datetime(2026, 8, 22, 0, 0, 0, tzinfo=UTC),
+            last_episode_timestamp=None,
+            last_memory_timestamp=memory_ts,
+        )
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        section = result.split('### Previous Reconciliation', 1)[1].split('## Your Task', 1)[0]
+        assert 'None' not in section, (
+            f"Must never emit the literal 'None' for the missing episode cutoff; "
+            f'got:\n{section!r}'
+        )
+        assert memory_ts.isoformat() in section, (
+            f'Expected memory cutoff {memory_ts.isoformat()!r} still disclosed; '
+            f'got:\n{section!r}'
+        )
