@@ -193,3 +193,60 @@ def report_broken_pipe() -> int:
     return report_stdout_failure(
         'downstream reader closed the output pipe before the run finished'
     )
+
+
+def _handle_broken_pipe() -> int:
+    """:func:`report_broken_pipe` plus ownership of fd 1 — the PROCESS-boundary half.
+
+    Called only from :func:`run_cli`. Redirecting a process-global file
+    descriptor is legitimate at the boundary that is about to exit, and out of
+    place in a ``main()``, which owes an in-process caller nothing but an exit
+    code. That split is the whole reason this module exports the report-only
+    form and keeps this one private.
+    """
+    _silence_stream_fd(sys.stdout)
+    return report_broken_pipe()
+
+
+def _handle_stdout_error(exc: OSError) -> int:
+    """As :func:`_handle_broken_pipe`, for a stdout write that failed some OTHER way.
+
+    A closed reader is not the only way ``> file`` or ``| cmd`` ends badly: a
+    full disk or quota (``ENOSPC``/``EDQUOT``) and a disconnected terminal
+    (``EIO``) fail the same write, and are at least as likely for a CLI whose
+    report is routinely redirected. Reported through the same single
+    ``error: ...`` line, with the errno text kept so the remedy is visible —
+    "no space left on device" and "closed the output pipe" are different jobs.
+
+    Serves BOTH frames such a failure can surface in, because a handler on one
+    is not a handler on the other:
+
+    * DEFERRED — every write is buffered and :func:`_flush_stdout`'s flush is
+      what reaches the device.
+    * IN-BAND — the write itself reaches the device and raises mid-run, from a
+      ``print`` on the report path or from :class:`LoudArgumentParser`'s
+      re-raise during ``parse_args``. Neither is inside a flush; both arrive at
+      :func:`run_cli`'s ``except OSError``.
+
+    One handler for both, so a full disk produces the same line and the same
+    :data:`EXIT_STDOUT_FAILED` whichever frame it was noticed in.
+    """
+    _silence_stream_fd(sys.stdout)
+    return report_stdout_failure(f'cannot write to stdout: {exc}')
+
+
+def _flush_stdout() -> int | None:
+    """Flush stdout; return an exit code if that write failed, else ``None``.
+
+    Deliberately narrow. Only the flush is inside the ``try``, so the widened
+    ``except OSError`` cannot reach anything else in the run and mis-attribute
+    a store or filesystem failure to stdout — the mis-attribution hazard task
+    3757 fixed by moving a store handler down to its own seam.
+    """
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        return _handle_broken_pipe()
+    except OSError as exc:
+        return _handle_stdout_error(exc)
+    return None
