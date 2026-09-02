@@ -2984,6 +2984,43 @@ class TestTheCorpusCliConsumesTheSharedBoundaryHelper:
     them would destroy it at the moment it is needed.
     """
 
+    @pytest.fixture(autouse=True)
+    def _fresh_shared_reporter_state(self):
+        """Leave ``shared.cli_boundary``'s per-run state as clean as it was found.
+
+        This class is the ONLY place in this file that reaches into another
+        module's per-run state, and every test in it ends by calling a shared
+        reporter DIRECTLY — which is the point (that call is the observation),
+        but it also leaves ``_STDOUT_FAILURE_REPORTED`` spent and ``_DETAIL``
+        bound to ``build_corpus._manifest_detail``, whose ``_WRITTEN_MANIFEST``
+        points into a ``tmp_path`` pytest is about to delete.
+
+        Every OTHER test in this file enters through ``main``/``_cli``, which
+        reset on the way in, so the leak is latent rather than live. It stays
+        latent only until some future test calls a shared reporter directly or
+        asserts on stderr from a path that does not go through ``main``.
+
+        MEASURED, because the obvious check gives the wrong answer here. This
+        package runs ``-n auto --dist loadgroup`` (fused-memory/pyproject.toml
+        addopts), so a probe appended after this class usually lands in a
+        DIFFERENT xdist worker process and sees pristine module state no matter
+        what this class did — the leak reads as absent. Forced into one process
+        with ``-n 0`` and this fixture disabled, that same probe fails with the
+        reporter already spent; re-enabled, it passes. So the hazard is not
+        merely collection order: it is which worker drew the straw, which is
+        the worst possible way to find out.
+
+        Cleared on both edges, mirroring ``_fresh_reporter_state`` in
+        ``shared/tests/test_cli_boundary.py``: entry so this class cannot
+        inherit someone else's spent flag and assert nothing, exit so it cannot
+        hand one on.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        cli_boundary.reset_stdout_failure_state()
+        yield
+        cli_boundary.reset_stdout_failure_state()
+
     def test_the_corpus_cli_spends_the_shared_reporters_once_only_budget(
         self, monkeypatch, tmp_path, capsys
     ):
@@ -3316,7 +3353,7 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
       which discards it (``BrokenPipeError`` is an ``OSError``). ``_cli``'s
       flush then finds an empty buffer and the process exits **0** — a success
       status for a run whose output went nowhere. Closed by
-      ``_LoudArgumentParser``.
+      ``shared/src/shared/cli_boundary.py::LoudArgumentParser``.
 
     The controls matter as much as the assertion. ``--help`` must keep exiting
     0 and an unrecognized flag must keep exiting 2 — a fix that routed every
@@ -3418,10 +3455,11 @@ class TestArgparseOutputOntoAFullDiskExitsCleanlyToo:
 
     * BLOCK-buffered — the help text fits the buffer, ``parse_args`` raises
       nothing, and ``_cli``'s explicit flush finds the ENOSPC. Already handled
-      by ``_flush_stdout``'s widened ``except OSError``, so this id is a
-      CONTROL that must stay green.
+      by ``shared/src/shared/cli_boundary.py::_flush_stdout``'s widened
+      ``except OSError``, so this id is a CONTROL that must stay green.
     * UNBUFFERED — the write reaches ``/dev/full`` during ``parse_args``,
-      ``_LoudArgumentParser.print_help`` re-raises it, and it arrives at
+      ``shared/src/shared/cli_boundary.py::LoudArgumentParser``'s
+      ``print_help`` re-raises it, and it arrives at
       ``_cli`` as a plain ``OSError`` where only ``BrokenPipeError`` and
       ``SystemExit`` are being caught. This id is the RED: measured as a full
       argparse traceback with NO ``error: `` line, which falsifies both the
