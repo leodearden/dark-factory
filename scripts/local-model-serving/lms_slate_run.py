@@ -262,6 +262,27 @@ def healthcheck_argv(*args: str) -> list[str]:
 #: to debug an arm that is fine.
 RELEASE_SUBJECT = '(all arms)'
 
+#: The stage an arm is reported under when its OLD PART COULD NOT BE REMOVED.
+#: Deliberately not one of the probe stages (`start`, `wait-ready`,
+#: `healthcheck`): nothing was measured and no model was loaded, so blaming a
+#: probe would send an operator to debug an arm that is fine for a fault that
+#: is entirely in the parts directory.  A single constant because the failure
+#: tuple, the refusal message and the test all key on it, and three spellings
+#: of one stage name is three chances to drift.
+STALE_PART_STAGE = 'stale-part-removal'
+
+#: What `run_slate` prints when it refuses to merge because a part it decided
+#: to replace is still on disk.  The paths are in the message because that file
+#: is the thing a human has to go and deal with.
+STALE_PART_REFUSAL = (
+    'lms_slate_run: refusing to merge: the previous run\'s part could not be '
+    'removed for {arms}, so {paths} would be handed to `--merge` carrying a '
+    'row this run did not measure. With full manifest coverage that merge '
+    'SUCCEEDS and overwrites the committed artifact with a stale row '
+    'presented as this slate. Remove the part(s) by hand -- or point '
+    '--parts-dir at a writable directory -- and re-run.'
+)
+
 
 def sweep_arms(
     parts_dir: str | Path,
@@ -275,7 +296,9 @@ def sweep_arms(
     Returns the per-arm failures as `(arm_id, stage, returncode)` rather than
     raising on the first one: the loop must reach every arm, and a bare
     non-zero exit would send an operator back through ~30 minutes of journal to
-    find out which arm and which stage.
+    find out which arm and which stage.  One stage, `STALE_PART_STAGE`, is not
+    a subprocess at all and carries a synthetic 1 -- it is the one failure
+    `run_slate` reads back rather than merely reporting.
 
     Arm order and identity come from `load_arms().arms`, never a hardcoded
     list, so an eighth arm added to `arms.yaml` is swept without touching this
@@ -349,7 +372,20 @@ def sweep_arms(
         # because `--force` means "measure everything NOW" -- a slate assembled
         # half from this run and half from the last is precisely the laundered
         # vintage it is meant to rule out.
-        existing.unlink(missing_ok=True)
+        try:
+            existing.unlink(missing_ok=True)
+        except OSError as exc:
+            # The removal is a filesystem mutation and CAN fail -- a read-only
+            # mount, an immutable attribute, the path having become a
+            # directory.  When it does, the stale part survives and everything
+            # the removal prevents is back on the table, so the arm is NOT
+            # started: there is nothing to gain from a ~4 minute model load
+            # whose result cannot be written into a directory that is already
+            # holding a file hostage.  `run_slate` turns this stage into a
+            # refusal to merge at all.
+            print(f'\n=== {arm.arm_id} === {exc}', flush=True)
+            failures.append((arm.arm_id, STALE_PART_STAGE, 1))
+            continue
 
         print(f'\n=== {arm.arm_id} ===', flush=True)
         try:
@@ -470,14 +506,31 @@ def run_slate(
     forgotten keyword away from writing exactly the artifact that must not
     exist.
 
-    The merge is issued even when NO part exists.  Skipping it on a totally
-    failed sweep would end the run with no refusal recorded anywhere.
+    The merge is issued even when NO part exists, and when only SOME do.
+    Skipping it on a totally failed sweep would end the run with no refusal
+    recorded anywhere, and pre-empting a partial one is the duplicated coverage
+    check the paragraph above rules out.
 
-    The ONE thing that returns before the merge is a manifest still carrying
-    TBD placeholders -- see `PLACEHOLDER_REFUSAL` for why such a slate cannot
-    be assembled by this driver OR by hand.  Sweeping anyway would spend the
-    full ~30 minutes to arrive at a coverage refusal that was decidable from
-    the manifest alone, before the card was touched.
+    TWO things return before the merge, and NEITHER is a completeness check:
+
+      * A manifest still carrying TBD placeholders -- see `PLACEHOLDER_REFUSAL`
+        for why such a slate cannot be assembled by this driver OR by hand.
+        Sweeping anyway would spend the full ~30 minutes to arrive at a
+        coverage refusal that was decidable from the manifest alone, before the
+        card was touched.
+      * A part the sweep DECIDED TO REPLACE that is still on disk, reported by
+        `sweep_arms` under `STALE_PART_STAGE`.  This is the one case where the
+        driver cannot vouch for the VINTAGE of a file it would hand `--merge`.
+        It reads no manifest and judges no completeness -- with that file
+        present the merge has FULL coverage, so it succeeds and writes a row
+        this run did not measure into the committed artifact, reporting
+        success.  Handing it over is therefore strictly worse than refusing.
+
+    The distinction between them and a coverage check is what keeps the
+    neighbouring invariant intact: an empty or partial set still goes to the
+    merge, because `merge_reports` records a refusal there in its own words and
+    names the uncovered arms.  An unremovable part records one only if the
+    driver stops.
     """
     unresolved = placeholder_arm_ids()
     if unresolved:
@@ -489,6 +542,22 @@ def run_slate(
     )
     for arm_id, stage, code in failures:
         print(f'lms_slate_run: {arm_id}: {stage} failed (exit {code})', file=sys.stderr)
+
+    hostages = [arm_id for arm_id, stage, _ in failures if stage == STALE_PART_STAGE]
+    if hostages:
+        # NOT a duplicate of `merge_reports`' coverage check: it reads no
+        # manifest and judges no completeness.  It is the one case where the
+        # driver cannot vouch for the VINTAGE of a file it would hand
+        # `--merge` -- and with that file present the merge has full coverage,
+        # so it SUCCEEDS and writes a row this run did not measure into the
+        # committed artifact while reporting success.  Returning 1, the same
+        # code the sweep's own failures produce below, because that is exactly
+        # what this is: a sweep failure that happens to be unsafe to merge on.
+        print(STALE_PART_REFUSAL.format(
+            arms=hostages,
+            paths=[str(part_path(parts_dir, arm_id)) for arm_id in hostages],
+        ), file=sys.stderr)
+        return 1
 
     merged = runner(healthcheck_argv(
         '--merge', *existing_parts(parts_dir), '--output', str(output),
