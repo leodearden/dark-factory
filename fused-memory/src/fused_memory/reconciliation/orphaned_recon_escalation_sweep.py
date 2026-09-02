@@ -239,3 +239,113 @@ def classify_orphan(esc, statuses):
     if by_str[tid] in TERMINAL_TASK_STATUSES:
         return 'terminal'
     return 'live'
+
+
+def build_orphaned_escalation_flag(
+    esc,
+    classification,
+    *,
+    subject_project_id,
+    subject_status,
+):
+    """Build the Stage-1 flag announcing that *esc* is an orphaned record.
+
+    Stage 1 holds no authority to close a recon escalation — the A7b contract
+    above ``reconciliation/harness.py::_RECON_DEDUP_CONFIG`` reserves that for
+    the port-8103 watcher session — so this flag's job is to hand that closer
+    a re-derivable finding, and to route it to the playbook branch that
+    already sanctions the close.
+
+    The description states ONLY what was OBSERVED (mirroring
+    ``curator_gate_resolution_sweep.py::build_gate_resolution_flag``'s
+    discipline): the record's own fields, plus the subject's status read off
+    that project's cross-tag-complete census microseconds earlier in the same
+    sweep.  It never asserts that the record has been or will be closed — the
+    record is still pending when this flag is written, and the closer is a
+    different actor entirely.  ``suggested_action`` therefore carries the
+    no-churn argument explicitly: without it, the watcher's documented PARK
+    default is the correct reading of its own playbook and the flag would
+    rightly be ignored.
+
+    ``flag_type``/``category`` are the module constants and ``task_id`` is the
+    ``str``-coerced SUBJECT task id.  Together those are
+    ``flag_dedup.compute_flag_signature``'s key, so an un-actioned orphan
+    gains a ``stage1_flag_marker`` recurrence row and honours explicit
+    suppression instead of re-emitting unmarked every cycle.  Keying on the
+    escalation id instead would make every re-file of the same subject look
+    like a brand-new finding.
+
+    Args:
+        esc: The pending ``Escalation`` being reported.
+        classification: ``'terminal'`` or ``'missing'`` — the result of
+            ``classify_orphan``.
+        subject_project_id: The project whose task store was consulted.  Named
+            in the description so "no row" is read relative to a specific
+            store rather than as "this task does not exist anywhere".
+        subject_status: The observed status for ``'terminal'``; ``None`` for
+            ``'missing'``.
+
+    Raises:
+        ValueError: for any *classification* other than ``'terminal'``/
+            ``'missing'`` — notably ``'live'``.  A live record must never
+            reach the closer, since resolving a still-``blocked`` subject's
+            record re-arms the filing rule and reproduces the measured
+            re-file churn (``esc-650-1`` -> ``esc-650-2`` in ~4h), so a wiring
+            mistake is made loud here rather than silently forwarded.
+
+    Pure: no I/O, no side effects.
+    """
+    if classification not in ('terminal', 'missing'):
+        raise ValueError(
+            f'build_orphaned_escalation_flag: classification must be '
+            f"'terminal' or 'missing', got {classification!r}; a 'live' or "
+            'unresolvable record must never be handed to the closer',
+        )
+
+    tid = str(getattr(esc, 'task_id', None))
+    esc_id = getattr(esc, 'id', None)
+    category = getattr(esc, 'category', None)
+
+    if classification == 'terminal':
+        observation = (
+            f'subject task {tid} is {subject_status} (terminal) in '
+            f"{subject_project_id}'s task store"
+        )
+    else:
+        observation = (
+            f'subject task {tid} has no row in '
+            f"{subject_project_id}'s task store (checked across every tag)"
+        )
+
+    description = (
+        f'Pending level-1 escalation {esc_id} (category {category}) is '
+        f'orphaned: {observation}. That record is filed only while its '
+        "subject is status == 'blocked' "
+        '(stage1_stall_detector.py::extract_stalled_gate_backlog_task_ids), '
+        'so its premise no longer holds and it can never be re-filed, yet '
+        'nothing closes it — the reconciliation harness never resolves its '
+        'own escalation queue (A7b), and the orchestrator revalidation sweep '
+        'reads a different queue and only considers level == 2.'
+    )
+
+    return {
+        'description': description,
+        'severity': 'minor',
+        'actionable': False,
+        'task_id': tid,
+        'flag_type': ORPHANED_ESCALATION_FLAG_TYPE,
+        'category': ORPHANED_ESCALATION_FLAG_CATEGORY,
+        'suggested_action': (
+            f'For the port-8103 watcher session (the sole closer of recon '
+            f'escalations): resolve {esc_id} with '
+            "resolution_class='moot-terminal-subject'. This is the playbook's "
+            'existing "Resolve only when the underlying task will genuinely '
+            'stop qualifying for re-selection" branch, not its PARK default: '
+            "re-selection requires status == 'blocked', so a terminal or "
+            'absent subject provably cannot cause a re-file. First VERIFY the '
+            f"observation against {subject_project_id}'s task store; if task "
+            f'{tid} is in fact still blocked (or lives in a tag that was not '
+            'read), dismiss this flag and leave the record pending — closing '
+            'a live record re-arms the filing rule.'
+        ),
+    }
