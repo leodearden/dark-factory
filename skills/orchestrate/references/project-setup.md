@@ -162,7 +162,7 @@ module_overrides:
   crates/reify-util: 2           # medium activity
 ```
 
-When the scheduler acquires a lock for a task touching `crates/reify-core/src/foo.rs`, it walks the first path component (`crates`), loads `crates/orchestrator.yaml`, looks for a matching `module_overrides` entry, and falls back to `max_per_module` if none matches.
+When the scheduler acquires a lock for a task touching `crates/reify-core/src/foo.rs`, it first normalizes the path to `lock_depth` components (`normalize_lock`; default `lock_depth=2` gives `crates/reify-core`, *not* the first path component `crates`), then resolves the `ModuleConfig` whose registered prefix is the deepest match for that normalized path (`OrchestratorConfig.for_module`, which walks candidate prefixes inward from the full path and returns the most specific one — e.g. it would prefer a config registered at `crates/reify-core` over one at `crates`). It then checks the resolved module's `module_overrides` for an entry keyed by the full depth-`lock_depth` path (`crates/reify-core`), falling through a four-level ladder if that lookup misses: the resolved config's own `module_overrides[module]`, then the top-level config's `module_overrides[module]`, then the resolved config's `max_per_module`, then the top-level config's `max_per_module`. Because `for_module` only ever sees paths pre-truncated to `lock_depth`, a module config registered at a prefix *deeper* than `lock_depth` is unreachable from this lookup — `load_config` warns when it detects that mismatch, so keep module config prefixes at or above `lock_depth`.
 
 ### Picking values: the `analyze_modules` helper
 
