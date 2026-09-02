@@ -37,6 +37,9 @@ from fused_memory.memory_metadata import (
     parent_liveness_violation,
     validate_memory_metadata,
 )
+from fused_memory.middleware.entity_mint_storm_escalator import (
+    emit_entity_mint_storm_escalation,
+)
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
 from fused_memory.middleware.referent_repair_storm_escalator import (
     emit_referent_repair_storm_escalation,
@@ -2455,6 +2458,12 @@ class MemoryService:
         # likely to be noticed any other way.
         self._mem0_update_storm_counters: dict[str, StormCounter] = {}
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
+        # keyed per `agent_id` for the same attribution reason as the dict above.
+        # No escalator OBJECT beside it: `middleware/entity_mint_storm_escalator`
+        # is a module FUNCTION taking project_root explicitly, so there is no
+        # queue cache to own and no set_known_projects lifecycle to keep in sync.
+        self._entity_mint_storm_counters: dict[str, StormCounter] = {}
         # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
         # leaf epsilon). `_decode_referents` degrades an unreadable or absent
         # blob to ('none') rather than raising — losing the memory over a
@@ -2525,6 +2534,8 @@ class MemoryService:
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
+        # Same seam for the entity-mint burst alarm's own 3600s window.
+        self._entity_mint_storm_time_provider: Callable[[], float] = time.time
         # Process-start baselines for uptime reporting
         self._started_at: datetime = datetime.now(UTC)
         self._start_monotonic: float = time.monotonic()
@@ -8820,7 +8831,123 @@ class MemoryService:
                 success=success, error=error_msg,
             )
 
+        # GUARD 7, the MINT branch only, and only once the lock is released
+        # (the `finally` above ran on every path that reaches here). A resolve
+        # created nothing and the two refusals wrote nothing, so neither is
+        # evidence of a mint storm.
+        if result.get('minted'):
+            await self._record_entity_mint(project_id, agent_id)
+
         return result
+
+    async def _record_entity_mint(
+        self, project_id: str, agent_id: str | None,
+    ) -> None:
+        """Count one MINT; escalate on a burst (INV-4, guard 7).
+
+        Post-write and never blocking: this is a monitoring alarm, not a rate
+        limiter. Crossing the threshold must not reject the mint that crossed
+        it, or a legitimate large repair batch would fail mid-run over its own
+        success count — precisely when the batch is going well.
+
+        Counts the MINT branch ONLY. A resolve makes no backend call at all and
+        the two refusals write nothing, so counting them would measure tool
+        TRAFFIC while the operator question is how many new nodes entered the
+        identity graph. Nothing sweeps orphan minted nodes, which is what makes
+        that the load-bearing number.
+
+        Called AFTER the identity lock is released, and the emit is dispatched
+        through ``asyncio.to_thread`` because ``EscalationQueue.submit`` is a
+        synchronous filesystem write — holding the lock across it would extend
+        exactly the hold time the bounded acquire in ``ensure_entity_node``
+        exists to bound, and would stall the event loop besides.
+
+        One counter per ``agent_id``, so two independently-busy agents cannot
+        sum into a false alarm. The threshold and window are read LIVE off the
+        shared config and passed INTO ``record()`` per call — captured once,
+        they would make both green-tier leaves restart-only in disguise.
+        """
+        label = agent_id or '<unattributed>'
+        counter = self._entity_mint_storm_counters.get(label)
+        if counter is None:
+            counter = StormCounter(time_provider=self._entity_mint_storm_time_provider)
+            self._entity_mint_storm_counters[label] = counter
+
+        cfg = getattr(self.config, 'entity_mint', None)
+        threshold = getattr(cfg, 'storm_threshold', None)
+        window_seconds = getattr(cfg, 'storm_window_seconds', None)
+        if not isinstance(threshold, int) or isinstance(threshold, bool) \
+                or not isinstance(window_seconds, int | float) \
+                or isinstance(window_seconds, bool):
+            # A corrupt or absent config leaf costs the ALARM, never the mint
+            # that already landed.
+            return
+
+        storm = counter.record(
+            threshold=threshold,
+            window_seconds=float(window_seconds),
+            label=label,
+        )
+
+        # Evict counters whose window has gone empty. Each counter self-prunes
+        # its own deque, but nothing would drop the counter OBJECT, and
+        # ``agent_id`` is caller-supplied and unbounded in cardinality — the
+        # gate is a self-reported prefix match, so a widened prefix admits
+        # arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
+        # every run). A server designed to run for weeks between restarts would
+        # otherwise accumulate one dead counter per agent it ever saw. Mirrors
+        # ``_record_content_amend``'s sweep exactly; see StormCounter.prune on
+        # why dropping an empty counter is behaviour-preserving.
+        for other, dormant in list(self._entity_mint_storm_counters.items()):
+            if other != label and dormant.prune(float(window_seconds)) == 0:
+                del self._entity_mint_storm_counters[other]
+
+        if storm is None:
+            return
+
+        # PROJECT ROOT resolution has NO FALLBACK. graphiti's ``group_id`` IS
+        # the ``project_id``, so ``_known_projects`` is the correct and only
+        # answer. Falling back to ``config.taskmaster.project_root`` is
+        # forbidden: it defaults to ``'.'``, so the fallback files into the
+        # server's cwd, where no operator watches, and reports success doing it
+        # — a silent misfile is strictly worse than a logged refusal, because it
+        # also destroys the evidence that the alarm ever fired.
+        project_root = self._known_projects.get(project_id)
+        if not project_root:
+            logger.warning(
+                'entity mint storm from agent_id=%r in project_id=%r '
+                '(count=%s, threshold=%s, window_seconds=%s) could NOT be '
+                'escalated: the project is absent from `_known_projects`, so '
+                'no project queue can be resolved. Wire '
+                'MemoryService.set_known_projects(build_known_projects_map(...)) '
+                'at server startup to restore this alarm. Minting continues.',
+                label, project_id, storm['count'], storm['threshold'],
+                storm['window_seconds'],
+            )
+            return
+
+        # Never let the alarm's own failure reach the caller: the mint already
+        # landed, and turning a completed mint into an exception would be
+        # strictly worse than losing the signal. The escalator is itself
+        # never-raise; this is the belt to its braces.
+        try:
+            await asyncio.to_thread(
+                emit_entity_mint_storm_escalation,
+                project_root,
+                project_id=project_id,
+                agent_id=label,
+                count=storm['count'],
+                threshold=storm['threshold'],
+                window_seconds=storm['window_seconds'],
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'entity mint storm escalation failed for agent %r in project %r '
+                '(count=%s); the mint itself succeeded',
+                label, project_id, storm['count'],
+            )
 
     async def _journal_entity_mint(
         self,
