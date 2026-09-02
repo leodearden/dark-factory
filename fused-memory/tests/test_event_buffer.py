@@ -3,6 +3,7 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
@@ -11,6 +12,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation import event_buffer as event_buffer_mod
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 
@@ -900,6 +902,90 @@ async def test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp(tmp_
 
         # And the path stays usable afterwards rather than wedging.
         assert await buf.cleanup_drained(max_age_seconds=0) == 0
+    finally:
+        await buf.close()
+
+
+# ── Bounded-chunk cursor consumption (task 4348) ───────────────────────
+#
+# The six cleanup_drained tests above all seed <= 6 rows, so under the shipped
+# 10_000-row _CLEANUP_FETCH_CHUNK they never exercise the chunk loop at all —
+# each completes in a single fetchmany call indistinguishable from a bare
+# fetchall. These tests monkeypatch _CLEANUP_FETCH_CHUNK down to 2-3 so the
+# multi-chunk paths run in milliseconds, and pin the shape of the cursor
+# consumption itself (bounded, chunked, terminating on an empty chunk) rather
+# than only the end result the tests above already cover.
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_consumes_the_returning_cursor_in_bounded_chunks(
+    tmp_path, monkeypatch
+):
+    """cleanup_drained drains the DELETE...RETURNING cursor via bounded fetchmany
+    calls and never materialises the whole result set with fetchall."""
+    monkeypatch.setattr(event_buffer_mod, '_CLEANUP_FETCH_CHUNK', 3)
+
+    calls: list[tuple[str, int | None, int]] = []
+    orig_fetchmany = aiosqlite.Cursor.fetchmany
+    orig_fetchall = aiosqlite.Cursor.fetchall
+
+    async def spy_fetchmany(self, size=None):
+        rows = await orig_fetchmany(self, size)
+        calls.append(('fetchmany', size, len(rows)))
+        return rows
+
+    async def spy_fetchall(self):
+        rows = await orig_fetchall(self)
+        calls.append(('fetchall', None, len(rows)))
+        return rows
+
+    monkeypatch.setattr(aiosqlite.Cursor, 'fetchmany', spy_fetchmany)
+    monkeypatch.setattr(aiosqlite.Cursor, 'fetchall', spy_fetchall)
+
+    buf = EventBuffer(db_path=tmp_path / 'chunked_cleanup.db')
+    await buf.initialize()
+    try:
+        hour_a = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        hour_b = datetime(2026, 7, 25, 14, 5, tzinfo=UTC)
+        for _ in range(4):
+            await buf.push(_make_event(
+                timestamp=hour_a, event_type=EventType.task_status_changed))
+        for _ in range(3):
+            await buf.push(_make_event(
+                timestamp=hour_b, event_type=EventType.memory_added))
+        await buf.drain('test-project')
+
+        calls.clear()
+        deleted = await buf.cleanup_drained(max_age_seconds=0)
+        sweep = list(calls)
+        calls.clear()
+
+        # The memory bound, expressed deterministically: the whole result set
+        # is never materialised in one go.
+        assert not [c for c in sweep if c[0] == 'fetchall']
+        assert [c[0] for c in sweep] == ['fetchmany'] * len(sweep)
+        assert {c[1] for c in sweep} == {3}
+        assert all(c[2] <= 3 for c in sweep)
+        # 7 rows at chunk 3 is 3 + 3 + 1 + 0.
+        assert len(sweep) == 4
+        # LOAD-BEARING: the loop must terminate on an *empty* chunk, not a
+        # *short* one — fetchmany may legally return fewer rows than
+        # requested without meaning exhaustion.
+        assert sweep[-1][2] == 0
+        assert deleted == 7
+
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'task_status_changed'): 4,
+            ('test-project', '2026-07-25T14', 'memory_added'): 3,
+        }
+
+        db = buf._require_db()
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'drained'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row['cnt'] == 0
     finally:
         await buf.close()
 
