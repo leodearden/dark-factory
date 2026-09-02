@@ -1763,15 +1763,37 @@ def create_mcp_server(
         refs_by_project: dict[str | None, list[str]],
         *,
         log_prefix: str,
-    ) -> tuple[dict[tuple[str | None, str], str], set[str | None]]:
+    ) -> tuple[
+        dict[tuple[str | None, str], str],
+        set[str | None],
+        set[tuple[str | None, str]],
+    ]:
         """One batched status read per project; report WHICH projects answered.
 
-        Returns ``(resolved, consulted)``.
+        Returns ``(resolved, consulted, acknowledged)``.
 
         ``resolved`` is the ``(project_id, ref) -> status`` map, exactly as
         ``_claim_task_statuses`` has always produced it. ``consulted`` is the
         set of projects whose ``get_statuses`` returned WITHOUT RAISING — and it
         is the whole reason this body was extracted rather than copied.
+
+        ``acknowledged`` is the set of ``(project_id, ref)`` keys the registry
+        RETURNED AT ALL, independent of the value's type, and it exists because
+        ``resolved`` alone cannot answer "does this task exist". The
+        ``get_statuses`` contract is explicit that PRESENCE is the existence
+        signal — ``middleware/task_interceptor.py::TaskInterceptor.get_statuses``
+        documents "unknown ids are silently omitted", and
+        ``backends/sqlite_task_backend.py::SqliteTaskBackend.get_statuses_raw``
+        coerces even a NULL status to the sentinel string ``'unknown'`` rather
+        than dropping the row. So a key present with a non-``str`` value is a
+        task that EXISTS whose status came back unusable, which the
+        ``isinstance(value, str)`` filter below erases from ``resolved``.
+        That erasure is benign for ``_claim_task_statuses`` (an absent key
+        collapses into the same 'unverifiable' tag either way) and WRONG for
+        ``_verify_mint_referent``, which would otherwise read the gap as a
+        positive "no such task" and refuse to mint for a task that is really
+        there. Reported separately rather than by loosening the filter, so
+        ``resolved``'s values stay ``str`` for the claim gate that types them.
 
         WHY THE SECOND RETURN VALUE EXISTS. ``_claim_task_statuses``'s own
         docstring states that "an ABSENT key is the unresolvable signal", which
@@ -1805,6 +1827,7 @@ def create_mcp_server(
         """
         resolved: dict[tuple[str | None, str], str] = {}
         consulted: set[str | None] = set()
+        acknowledged: set[tuple[str | None, str]] = set()
         for claimed_project, project_refs in refs_by_project.items():
             refs = sorted(project_refs)
             root = _kp.get(claimed_project) if claimed_project is not None else None
@@ -1833,9 +1856,10 @@ def create_mcp_server(
             # confident "no such task".
             consulted.add(claimed_project)
             for key, value in (statuses or {}).items():
+                acknowledged.add((claimed_project, str(key)))
                 if isinstance(value, str):
                     resolved[(claimed_project, str(key))] = value
-        return resolved, consulted
+        return resolved, consulted, acknowledged
 
     async def _claim_task_statuses(
         claims: list[Any], project_id: str
@@ -1853,15 +1877,16 @@ def create_mcp_server(
         unregistered project, a raising read) deliberately leaves the key absent
         rather than fabricating a permissive answer.
 
-        Delegates to ``_batched_task_statuses`` and DISCARDS its ``consulted``
-        set: this gate collapses "no such task" into the same tag as "could not
-        consult", so external behaviour here is byte-identical to the
-        pre-extraction body.
+        Delegates to ``_batched_task_statuses`` and DISCARDS both its
+        ``consulted`` set and its ``acknowledged`` key set: this gate collapses
+        "no such task", "the registry could not be consulted" and "the status
+        came back unusable" into the same tag, so external behaviour here is
+        byte-identical to the pre-extraction body.
         """
         grouped = _group_refs_by_project(claims, 'task')
         if not grouped:
             return {}
-        resolved, _consulted = await _batched_task_statuses(
+        resolved, _consulted, _acknowledged = await _batched_task_statuses(
             grouped, log_prefix=f'completion_claim_gate (writer_project={project_id!r})',
         )
         return resolved
@@ -1877,10 +1902,18 @@ def create_mcp_server(
         reusing that function directly:
 
         * ref PRESENT in the resolved map -> the task exists; proceed.
-        * project CONSULTED but the ref absent -> the registry ANSWERED, and the
-          answer was "no such task". Refuse: minting a node for a task that does
-          not exist creates exactly the orphan this gate exists to prevent, and
-          nothing sweeps orphan minted nodes.
+        * ref ACKNOWLEDGED but not resolved -> the registry returned the key
+          with a non-``str`` value, so the task EXISTS and only its status is
+          unusable. Proceed: ``get_statuses`` omits unknown ids entirely and
+          coerces even a NULL status to ``'unknown'``, so PRESENCE is the
+          existence signal and the value's type is not. Reading this gap as
+          "no such task" would refuse a mint for a task that is really there —
+          the one input where the filter ``resolved`` shares with
+          ``_claim_task_statuses`` would give this caller the wrong answer.
+        * project CONSULTED but the ref absent ENTIRELY -> the registry
+          ANSWERED, and the answer was "no such task". Refuse: minting a node
+          for a task that does not exist creates exactly the orphan this gate
+          exists to prevent, and nothing sweeps orphan minted nodes.
         * project NOT consulted -> unresolvable (no taskmaster, the referent's
           project unregistered, or a raising read). Log a structured WARNING and
           PROCEED. Refusing here would make the tool unusable on any deployment
@@ -1897,14 +1930,24 @@ def create_mcp_server(
         ref = str(getattr(referent, 'number', '') or '')
         if not ref:
             return None
-        resolved, consulted = await _batched_task_statuses(
+        resolved, consulted, acknowledged = await _batched_task_statuses(
             {claimed_project: [ref]},
             log_prefix=f'entity_mint (writer_project={project_id!r})',
         )
         if (claimed_project, ref) in resolved:
             return None
+        if (claimed_project, ref) in acknowledged:
+            logger.warning(
+                'entity_mint: the task registry acknowledged task %r in project '
+                '%r but returned a non-str status for it; the task EXISTS, so '
+                'the mint proceeds — a present key is the existence signal and '
+                'the status value is not. writer_project=%r',
+                ref, claimed_project, project_id,
+            )
+            return None
         if claimed_project in consulted:
             return {
+                'status': 'refused',
                 'error': (
                     f'task {ref} does not exist in project '
                     f'{claimed_project!r}, so no Entity node will be minted for '
@@ -6915,7 +6958,27 @@ def create_mcp_server(
 
         Returns:
             ``{'status': 'minted'|'resolved', 'uuid': ..., 'minted': bool}`` on
-            success, or an ``{'error', 'error_type'}`` envelope on a refusal.
+            success.
+
+            EVERY refusal carries ``{'status': 'refused', 'error',
+            'error_type'}`` — the tool-layer ones raised here
+            (``EntityMintToolDisabled`` / ``EntityMintNotAuthorized``,
+            ``EntityMintNonCanonicalName`` / ``EntityMintNonTaskName``,
+            ``EntityMintUnknownTask``) and the service-layer ones raised by
+            ``services/memory_service.py::MemoryService.ensure_entity_node``
+            (``EntityMintLockBusy``, ``EntityMintAmbiguousName``) alike, so
+            ``result.get('status') == 'refused'`` is ONE discriminator that
+            works across both layers rather than KeyError-ing on half of them.
+            Individual refusals add their own detail keys (``agent_id``,
+            ``name``, ``ref``, ``uuids``).
+
+            The exception is the SHARED project-id validation envelope
+            (``error_type='ValidationError'``, from
+            ``_canonicalize_project_id_arg`` / ``validate_project_id`` /
+            ``_known_project_gate``), which every MCP tool returns in one
+            spelling and which this tool deliberately does not re-shape. So
+            ``'error' in result`` remains the universal "did this fail" test;
+            ``status == 'refused'`` is the mint-specific one.
         """
         # (1) Identity first — nothing downstream can gate an unresolved agent_id.
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
@@ -6932,6 +6995,7 @@ def create_mcp_server(
         decision = resolve_entity_mint_authorization(memory_service, agent_id=agent_id)
         if not decision.allowed:
             return {
+                'status': 'refused',
                 'error': decision.error,
                 'error_type': decision.error_type,
                 'agent_id': agent_id,
@@ -6964,6 +7028,7 @@ def create_mcp_server(
         name_decision = validate_mint_name(name)
         if not name_decision.allowed:
             return {
+                'status': 'refused',
                 'error': name_decision.error,
                 'error_type': name_decision.error_type,
                 'name': name,

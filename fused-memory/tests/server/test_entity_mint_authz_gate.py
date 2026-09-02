@@ -125,6 +125,9 @@ class TestFailsClosed:
 
 class TestKillSwitchOutranksAgentId:
     def test_disabled_denies_every_caller_with_named_reason(self):
+        """Also proves the switch is evaluated FIRST: the first two agent_ids
+        are ON the shipped default bar, so ``EntityMintToolDisabled`` is only
+        reachable if the kill switch runs BEFORE the prefix check."""
         svc = _service(enabled=False)
         for agent_id in ('recon-stage-memory_consolidator', 'curator-gate', None):
             decision = resolve_entity_mint_authorization(svc, agent_id=agent_id)
@@ -132,15 +135,6 @@ class TestKillSwitchOutranksAgentId:
             assert decision.error_type == 'EntityMintToolDisabled', (
                 f'expected EntityMintToolDisabled, got {decision.error_type!r}'
             )
-
-    def test_disabled_outranks_an_allowlisted_agent(self):
-        """Proves the switch is evaluated FIRST: an on-the-bar agent_id would
-        otherwise pass, so the disabled error_type is only reachable if the
-        kill switch runs before the prefix check."""
-        svc = _service(enabled=False)
-        decision = resolve_entity_mint_authorization(svc, agent_id='recon-stage-1')
-        assert decision.allowed is False
-        assert decision.error_type == 'EntityMintToolDisabled'
 
 
 class TestAgentIdTypes:
@@ -157,6 +151,40 @@ class TestAgentIdTypes:
             svc, agent_id='recon-stage-1',
         ).allowed is False
 
+    def test_junk_elements_are_dropped_from_the_allowlist(self):
+        """The ELEMENT-level `isinstance(p, str) and p` filter, and why the
+        empty string is the load-bearing half of it.
+
+        `''` is not merely useless: `any_agent_id.startswith('')` is True, so a
+        single stray empty entry — a trailing comma in the yaml list, a
+        templated value that rendered blank — would silently admit EVERY caller
+        while the config still reads as a narrow allowlist. That is the
+        fail-OPEN direction this gate exists to rule out, so it must be dropped
+        rather than honoured. A non-str element is dropped for the ordinary
+        reason: `startswith` would raise on it and take the whole gate with it.
+        """
+        from fused_memory.server.entity_mint_authz import (
+            resolve_entity_mint_allowed_prefixes,
+        )
+
+        svc = _service()
+        object.__setattr__(
+            svc.config.entity_mint, 'allowed_agent_prefixes',
+            ['', 'curator-', 7],
+        )
+
+        assert resolve_entity_mint_allowed_prefixes(svc) == ('curator-',)
+        assert resolve_entity_mint_authorization(
+            svc, agent_id='anything',
+        ).allowed is False, (
+            "an empty prefix must not turn the allowlist into an open door"
+        )
+        # The one real prefix in the list still works — the filter drops junk,
+        # not the whole leaf.
+        assert resolve_entity_mint_authorization(
+            svc, agent_id='curator-repair',
+        ).allowed is True
+
     def test_allowlisted_prefixes_pass_out_of_the_box(self):
         """The task's stated minimum bar: no operator config required."""
         svc = _service()
@@ -167,16 +195,6 @@ class TestAgentIdTypes:
 
 
 class TestDecisionShape:
-    def test_denial_is_a_value_carrying_a_structured_reason(self):
-        svc = _service()
-        decision = resolve_entity_mint_authorization(svc, agent_id='rando')
-        assert decision.allowed is False
-        assert isinstance(decision.error_type, str) and decision.error_type
-        assert isinstance(decision.error, str) and decision.error, (
-            'the deny reason must be a caller-facing message, so the tool can '
-            'return a structured rejection rather than raising (INV-1)'
-        )
-
     def test_allowed_decision_has_no_error(self):
         svc = _service()
         decision = resolve_entity_mint_authorization(svc, agent_id='recon-stage-1')
@@ -185,14 +203,18 @@ class TestDecisionShape:
         assert decision.error is None
 
     def test_denial_names_agent_required_prefixes_and_the_config_knob(self):
-        """An operator reading the refusal must learn what to widen, and the
+        """A denial is a VALUE carrying a structured, caller-facing reason
+        (INV-1: a structured rejection, never a raise).
+
+        An operator reading the refusal must learn what to widen, and the
         caller must learn which bar it failed — so the message names the
         offending agent_id, the authorized prefixes, and the knob."""
         svc = _service()
         decision = resolve_entity_mint_authorization(svc, agent_id='rando')
+        assert decision.allowed is False
         assert decision.error_type == 'EntityMintNotAuthorized', decision
         message = decision.error
-        assert isinstance(message, str)
+        assert isinstance(message, str) and message
         assert 'rando' in message, (
             f'the message must name the rejected agent_id, got {message!r}'
         )
@@ -585,6 +607,36 @@ class TestMintNameTaskVerification:
         mock_service.ensure_entity_node.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_an_acknowledged_id_with_a_non_str_status_does_not_refuse(self):
+        """PRESENCE is the existence signal; the value's TYPE is not.
+
+        Amendment (review finding: robustness). `_batched_task_statuses` only
+        records a `resolved` entry when the status `isinstance(value, str)`.
+        That filter is benign for `_claim_task_statuses` (a dropped key
+        collapses into the same 'unverifiable' tag) but WRONG here: the project
+        is `consulted`, the key is absent from `resolved`, and this guard would
+        read that as a positive "no such task" — refusing to mint for a task
+        that demonstrably exists.
+
+        `{'3222': None}` is the input that separates the two readings.
+        `TaskInterceptor.get_statuses` omits unknown ids ENTIRELY and
+        `SqliteTaskBackend.get_statuses_raw` coerces even a NULL status to the
+        sentinel string `'unknown'`, so a returned key is a real record however
+        odd its value; only a protocol-violating backend produces this shape,
+        and the correct response to one is to proceed, not to accuse.
+        """
+        mock_service = _mock_service()
+        server, interceptor = self._server(
+            mock_service, statuses={'3222': None},
+        )
+
+        result = await _call_on(server, agent_id='curator-repair')
+
+        assert result.get('error_type') is None, result
+        mock_service.ensure_entity_node.assert_awaited_once()
+        interceptor.get_statuses.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_an_unconfigured_taskmaster_does_not_refuse(self):
         """UNRESOLVABLE (1) — the tool must not require the registry to exist."""
         mock_service = _mock_service()
@@ -664,121 +716,82 @@ class TestMintNameTaskVerification:
         interceptor.get_statuses.assert_not_awaited()
 
 
-class TestClaimTaskStatusesIsUnchanged:
-    """REGRESSION: extracting `_batched_task_statuses` must not move the
-    completion-claim gate.
+class TestRefusalEnvelopeShape:
+    """ONE discriminator across both refusal layers.
 
-    `_claim_task_statuses` keeps byte-identical external behaviour by DISCARDING
-    the new `consulted` set. These legs re-pin its contract through the public
-    ingestion path; `tests/server/test_completion_claim_gate_ingestion.py` and
-    `tests/test_completion_claim_gate.py` cover it in full and must pass
-    UNMODIFIED.
+    Amendment (review finding: api-consistency). The tool returns refusals from
+    two places — the tool-layer guards here in ``server/tools.py`` (authz, the
+    canonical-name guard, the unknown-task guard) and the service-layer ones in
+    ``services/memory_service.py::MemoryService.ensure_entity_node``
+    (``EntityMintLockBusy``, ``EntityMintAmbiguousName``). The service half has
+    always carried ``status='refused'``; the tool half did not, so
+    ``result['status'] == 'refused'`` KeyError-ed on three of the five refusal
+    types and ``'error' in result`` was the only uniform test. Both halves now
+    carry it, and these legs are what keeps them agreeing.
+
+    NOT pinned here: the SHARED project-id validation envelope
+    (``error_type='ValidationError'``), which every MCP tool returns in one
+    spelling and which this tool deliberately does not re-shape — see the
+    tool docstring's Returns section.
     """
 
-    @staticmethod
-    def _episode_server(*, statuses=None, raises=False, known_projects=None,
-                        task_interceptor=True) -> tuple[Any, Any, Any]:
-        from unittest.mock import AsyncMock, MagicMock
-
-        from fused_memory.server.tools import create_mcp_server
-
-        mock_service = AsyncMock()
-        ep_result = MagicMock()
-        ep_result.model_dump.return_value = {'id': 'ep'}
-        mock_service.add_episode.return_value = ep_result
-
-        interceptor = None
-        if task_interceptor:
-            interceptor = MagicMock()
-            interceptor.get_statuses = AsyncMock(
-                side_effect=RuntimeError('taskmaster down') if raises else None,
-                return_value=None if raises else (statuses or {}),
-            )
-            interceptor.get_ticket_row = AsyncMock(return_value=None)
-        server = create_mcp_server(
-            mock_service,
-            task_interceptor=interceptor,
-            known_projects=known_projects if known_projects is not None
-            else {'dark_factory': '/df-root', 'reify': '/reify-root'},
-        )
-        return server, mock_service, interceptor
-
-    @pytest.fixture(autouse=True)
-    def _no_real_escalations(self, monkeypatch):
-        """A tagged ingestion files into `<project_root>/data/escalations`."""
-        import fused_memory.server.tools as tools_mod
-
-        monkeypatch.setattr(
-            tools_mod, 'emit_unverified_claim_escalation', lambda *a, **k: None,
-        )
-
-    @staticmethod
-    async def _ingest(server, content, project_id='reify'):
-        return await server._tool_manager.call_tool('add_episode', {
-            'content': content,
-            'agent_id': 'claude-task-5638-implementer',
-            'project_id': project_id,
-        })
-
     @pytest.mark.asyncio
-    async def test_one_batched_read_per_claimed_project(self):
-        server, _svc, interceptor = self._episode_server(
-            statuses={'3142': 'in-progress', '5638': 'in-progress'},
+    async def test_every_tool_layer_refusal_carries_status_refused(self):
+        mock_service = _mock_service()
+        server, _interceptor = TestMintNameTaskVerification._server(
+            mock_service, statuses={},
         )
 
-        await self._ingest(
-            server,
-            'dark_factory task 3142 has landed. reify task 5638 has landed',
-        )
-
-        reads = {
-            call.kwargs.get('project_root'): sorted(call.kwargs.get('ids') or [])
-            for call in interceptor.get_statuses.await_args_list
+        # (authz, name-guard, unknown-task) — one call per tool-layer guard.
+        cases = {
+            'EntityMintNotAuthorized': {'agent_id': 'claude-interactive'},
+            'EntityMintNonTaskName': {
+                'agent_id': 'curator-repair', 'name': 'Postgres',
+            },
+            'EntityMintNonCanonicalName': {
+                'agent_id': 'curator-repair', 'name': 'task #3222',
+            },
+            'EntityMintUnknownTask': {'agent_id': 'curator-repair'},
         }
-        assert reads == {'/df-root': ['3142'], '/reify-root': ['5638']}, reads
+        for expected_type, args in cases.items():
+            result = await _call_on(server, **args)
+            assert result.get('error_type') == expected_type, result
+            assert result.get('status') == 'refused', (
+                f'{expected_type} must carry the same status discriminator the '
+                f'service-layer refusals do, got {result!r}'
+            )
+            assert isinstance(result.get('error'), str) and result['error']
 
     @pytest.mark.asyncio
-    async def test_a_raising_read_still_leaves_the_key_absent(self):
-        """Absent, not fabricated — the claim lands UNVERIFIABLE and is tagged."""
-        server, mock_service, _interceptor = self._episode_server(raises=True)
+    async def test_a_service_layer_refusal_round_trips_unchanged(self):
+        """The tool must not re-shape or swallow a service refusal.
 
-        await self._ingest(server, 'reify task 5638 has landed')
+        Every other test here stubs the service to a successful mint, so
+        nothing else exercises the path where the service says no. The lock-busy
+        refusal is a VALUE, not a raise, precisely so it reaches the MCP caller
+        intact — including the ``uuids`` an ambiguous-name refusal needs to
+        carry for an operator to adjudicate by hand.
+        """
+        from unittest.mock import AsyncMock
 
-        kwargs = mock_service.add_episode.call_args.kwargs
-        assert kwargs.get('unverified_claim') is True, (
-            f'a raising status read must tag, never pass; got {kwargs!r}'
+        mock_service = _mock_service()
+        refusal = {
+            'status': 'refused',
+            'error_type': 'EntityMintLockBusy',
+            'error': 'Could not acquire the write-time-identity lock ...',
+            'name': _CANONICAL_NAME,
+        }
+        mock_service.ensure_entity_node = AsyncMock(return_value=refusal)
+        server, _interceptor = TestMintNameTaskVerification._server(
+            mock_service, statuses={'3222': 'done'},
         )
 
-    @pytest.mark.asyncio
-    async def test_an_unconfigured_interceptor_still_leaves_the_key_absent(self):
-        server, mock_service, _interceptor = self._episode_server(
-            task_interceptor=False,
+        result = await _call_on(server, agent_id='curator-repair')
+
+        assert result == refusal, (
+            f'the service refusal must reach the caller unchanged, got {result!r}'
         )
-
-        await self._ingest(server, 'reify task 5638 has landed')
-
-        kwargs = mock_service.add_episode.call_args.kwargs
-        assert kwargs.get('unverified_claim') is True, (
-            f'no interceptor must tag, never fabricate a permissive answer; '
-            f'got {kwargs!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_an_unregistered_project_still_leaves_the_key_absent(self):
-        # An EMPTY registry, because `_known_project_gate` is permissive on a
-        # falsy one — that is the only shape where ingestion proceeds and the
-        # claimed project still resolves to no root. A non-empty registry
-        # missing the writer would be rejected before any claim was read.
-        server, mock_service, _interceptor = self._episode_server(
-            statuses={'5638': 'done'}, known_projects={},
-        )
-
-        await self._ingest(server, 'reify task 5638 has landed')
-
-        kwargs = mock_service.add_episode.call_args.kwargs
-        assert kwargs.get('unverified_claim') is True, (
-            f'an unregistered project must tag, never pass; got {kwargs!r}'
-        )
+        assert result.get('status') == 'refused'
 
 
 class TestDisallowListForEnsureEntityNode:
