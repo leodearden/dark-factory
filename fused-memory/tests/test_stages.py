@@ -15168,6 +15168,198 @@ class TestSweepStaleMem0PoolProtectsAuditRecords:
         assert 'task 3041' in message
 
 
+class TestSweepStaleMem0PoolTerminalClosureGate:
+    """_sweep_stale_mem0_pool's opt-in terminal-task-closure gate (task 4375, Part A).
+
+    THE PRIMARY correctness gate, and the reason Part B's kind denylist is only
+    defence in depth. Measured: all 40 destroyed cadence_check records cite
+    autopilot_video task 452, whose status is 'deferred' — not in
+    TERMINAL_STATUSES ({'done','cancelled'}). This gate alone would have
+    preserved every one of them, because it demands POSITIVE evidence that the
+    record's cited task has closed. That makes it structurally opt-IN: an
+    audit-log kind nobody remembered to register in PROTECTED_AUDIT_KINDS is
+    still protected for as long as its task stays open.
+
+    The ``None``-vs-``[]`` sentinel distinction is load-bearing.
+    ``_resolve_terminal_task_ids`` is fail-safe to ``[]`` on a falsy taskmaster,
+    a raising get_statuses, or an unexpected result shape. Collapsing the two
+    would make a Taskmaster outage read as "no gate" and resume unconditional
+    age-deletion during exactly the window in which nothing can be verified.
+    """
+
+    _NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+
+    @classmethod
+    def _member(cls, mid, metadata):
+        return {
+            'id': mid,
+            'created_at': (cls._NOW - timedelta(days=20)).isoformat(),
+            'metadata': metadata,
+        }
+
+    @staticmethod
+    def _service(members):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @classmethod
+    async def _sweep(cls, memory_service, caplog=None, **kwargs):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'autopilot_video',
+                'r1',
+                source='flag_for_stage2',
+                gc_sweep_source='flag_for_stage2_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+                now=cls._NOW,
+                enum_filters={'flag_for_stage2': True},
+                **kwargs,
+            )
+        return result, tombstone
+
+    @staticmethod
+    def _deleted(memory_service):
+        return {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+
+    @pytest.mark.asyncio
+    async def test_gate_omitted_leaves_the_age_only_siblings_byte_for_byte_unchanged(self):
+        """Default None => NO gate. Pins the two age-only sibling sweeps' contract."""
+        members = [
+            self._member('open-task', {'flag_for_stage2': True, 'task_id': 't-open'}),
+            self._member('no-task-id', {'flag_for_stage2': True}),
+        ]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(memory_service)
+
+        assert self._deleted(memory_service) == {'open-task', 'no-task-id'}
+        assert result == 2
+
+    @pytest.mark.asyncio
+    async def test_gate_active_deletes_only_members_citing_a_terminal_task(self):
+        members = [
+            self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'}),
+            self._member('open', {'flag_for_stage2': True, 'task_id': 't-open'}),
+            self._member('no-task-id', {'flag_for_stage2': True}),
+            self._member('empty-task-id', {'flag_for_stage2': True, 'task_id': ''}),
+        ]
+        memory_service = self._service(members)
+
+        result, tombstone = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert self._deleted(memory_service) == {'terminal'}
+        assert result == 1
+        # Withheld members must never reach the tombstone writer.
+        assert [v['id'] for v in tombstone.await_args.args[2]] == ['terminal']
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_task_id_is_kept_even_when_every_cited_id_is_terminal(self):
+        """The exact-string-match KEEP precedent _gc_recon_markers already documents."""
+        members = [
+            self._member('comma-joined',
+                         {'flag_for_stage2': True, 'task_id': 't-done,t-other'}),
+        ]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(
+            memory_service, terminal_task_ids={'t-done', 't-other'},
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_int_task_id_is_normalized_to_str_before_the_membership_test(self):
+        """LLM writers emit both spellings; _resolve_terminal_task_ids returns str."""
+        members = [self._member('int-id', {'flag_for_stage2': True, 'task_id': 452})]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(memory_service, terminal_task_ids={'452'})
+
+        assert self._deleted(memory_service) == {'int-id'}
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_non_taskmaster_pseudo_id_is_kept(self):
+        """Observed live: a task_id no get_statuses will ever return."""
+        members = [
+            self._member('pseudo',
+                         {'flag_for_stage2': True,
+                          'task_id': 'graphiti_index_health_falkordb'}),
+        ]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_list_means_gate_active_nothing_terminal_so_nothing_is_deleted(self):
+        """FAIL-SAFE: a degraded _resolve_terminal_task_ids => a full-KEEP cycle.
+
+        This is the None-vs-[] distinction. [] must NOT be read as "no gate".
+        """
+        members = [
+            self._member('would-have-died', {'flag_for_stage2': True, 'task_id': 't-done'}),
+            self._member('no-task-id', {'flag_for_stage2': True}),
+        ]
+        memory_service = self._service(members)
+
+        result, _ = await self._sweep(memory_service, terminal_task_ids=[])
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_aggregate_warning_names_the_retained_count(self, caplog):
+        """The KEEP-direction leak is surfaced, not hidden — once per sweep."""
+        members = [
+            self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'}),
+            self._member('open', {'flag_for_stage2': True, 'task_id': 't-open'}),
+            self._member('no-task-id', {'flag_for_stage2': True}),
+        ]
+        memory_service = self._service(members)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result, _ = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert result == 1
+        warnings = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert '2' in message
+        assert '_sweep_stale_mem0_flag_for_stage2_markers' in message
+
+    @pytest.mark.asyncio
+    async def test_no_aggregate_warning_when_nothing_is_withheld(self, caplog):
+        members = [self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'})]
+        memory_service = self._service(members)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result, _ = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert result == 1
+        assert [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ] == []
+
+
 class TestSweepStaleMem0PoolTombstones:
     """Every recon-initiated Mem0 delete leaves a queryable tombstone (task 3041).
 
