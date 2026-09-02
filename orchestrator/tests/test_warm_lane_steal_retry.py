@@ -258,3 +258,161 @@ class TestReclaimExclude:
             f'the existing steal WARNING must still fire; got: '
             f'{[r.getMessage() for r in caplog.records]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-05: the bounded steal-path retry actually serves a DIFFERENT lane
+# ---------------------------------------------------------------------------
+
+
+def _install_selective_seed_failure(
+    git_ops: GitOps, *, failing_rc: int = 1, fail_lanes: set[Path] | None = None,
+) -> list[Path]:
+    """Make ``_seed_warm_lane`` hostile for a chosen set of lanes.
+
+    ``_seed_warm_lane`` is the established injection seam for warm-lane
+    hostility (cf. ``test_harness_warm_lane_wiring.py``'s
+    ``git_ops._seed_warm_lane = AsyncMock(return_value=1)``); wrapping the
+    BOUND method rather than replacing it keeps every non-hostile lane on the
+    real implementation, so the surviving lane is provisioned for real.
+
+    When *fail_lanes* is None the FIRST lane this wrapper is asked to seed
+    becomes the hostile one — the lane the steal valve happens to pick — which
+    keeps the test independent of ``reclaim_victim``'s victim ordering.
+
+    Returns the (live) list of lane dirs the wrapper was called with, in order.
+    """
+    real_seed = git_ops._seed_warm_lane
+    seen: list[Path] = []
+    hostile: set[Path] = set() if fail_lanes is None else set(fail_lanes)
+    pick_first = fail_lanes is None
+
+    async def _seed(lane_dir: Path, mode: str, *, take_lane_lock: bool = True) -> int:
+        lane = Path(lane_dir)
+        seen.append(lane)
+        if pick_first and not hostile:
+            hostile.add(lane)
+        if lane in hostile:
+            return failing_rc
+        return await real_seed(lane_dir, mode, take_lane_lock=take_lane_lock)
+
+    git_ops._seed_warm_lane = _seed  # type: ignore[method-assign]
+    return seen
+
+
+@pytest.mark.asyncio
+class TestStealRetriesAnotherLane:
+    """A steal that lands on a hostile lane must retry a DIFFERENT lane.
+
+    The 2026-08-29 incident shape: ``_try_reclaim_lane_for`` hands out whatever
+    ``reclaim_victim`` re-keys — conflicted index and all — with no validation
+    of the victim lane's state, and the resulting FAULT hard-BLOCKs the task.
+    """
+
+    async def test_second_lane_is_served_after_first_steal_faults(
+        self, wl_git_repo: Path,
+    ):
+        git_ops, lanes, start_ref = await _setup_pool(wl_git_repo, size=2)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        seen = _install_selective_seed_failure(git_ops)
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'a hostile first steal must be retried on another lane, not '
+            f'returned as a failure sentinel; got {result!r}'
+        )
+        hostile = seen[0]
+        served = result.path
+        assert served != hostile, (
+            f'the retry must serve a DIFFERENT lane; served the hostile '
+            f'{hostile} again'
+        )
+        assert served in lanes, f'served lane {served} is not a pool lane'
+
+        _, branch_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=served,
+        )
+        assert branch_raw.strip() == 'task/Z', (
+            f'served lane HEAD must be on task/Z, got {branch_raw.strip()!r}'
+        )
+        assert pool.assignment_for('Z') == served, (
+            'the pool must map Z to the lane it was actually served'
+        )
+
+    async def test_failed_stolen_lane_is_not_re_handed(self, wl_git_repo: Path):
+        """The hostile lane must be seeded exactly ONCE.
+
+        This is the assertion that fails if the exclusion is dropped: a failed
+        attempt unwinds through ``_abort_lane_acquisition`` whose final
+        ``pool.release(lane)`` returns the hostile lane to FREE, making it the
+        lowest-index lane ``acquire_for`` hands straight back — so without the
+        exclusion + veto the retry re-picks the same lane and the loop is a
+        no-op.
+        """
+        git_ops, _lanes, start_ref = await _setup_pool(wl_git_repo, size=2)
+        seen = _install_selective_seed_failure(git_ops)
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'expected success, got {result!r}'
+        hostile = seen[0]
+        assert seen.count(hostile) == 1, (
+            f'the hostile lane {hostile} was re-handed to the retry '
+            f'({seen.count(hostile)} seed attempts); the exclusion + veto did '
+            f'not hold. Full seed order: {seen}'
+        )
+
+    async def test_retry_is_logged(self, wl_git_repo: Path, caplog):
+        """The retry must be greppable in the journal alongside the existing
+        ``reclaim-on-exhaustion — stole lane`` line."""
+        git_ops, _lanes, start_ref = await _setup_pool(wl_git_repo, size=2)
+        seen = _install_selective_seed_failure(git_ops)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'expected success, got {result!r}'
+        hostile = seen[0]
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        retry_lines = [m for m in messages if 'steal-retry' in m]
+        assert retry_lines, (
+            f'expected a WARNING naming the steal-retry; got: {messages}'
+        )
+        line = retry_lines[0]
+        assert str(hostile) in line, (
+            f'the retry WARNING must name the failed lane {hostile}: {line!r}'
+        )
+        assert 'attempt' in line, (
+            f'the retry WARNING must name the attempt number: {line!r}'
+        )
+        assert 'fault' in line, (
+            f'the retry WARNING must name the retryable sentinel: {line!r}'
+        )
+
+    async def test_free_lane_fault_is_not_retried(self, wl_git_repo: Path):
+        """Retry is scoped to the STEAL path.
+
+        A size-1 pool with no victim leaves the lane FREE, so ``acquire_for``
+        succeeds and the steal path is never entered. A FREE lane's failure is
+        not evidence that a different lane is healthier, so its disposition
+        must stay exactly as it is today: FAULT after exactly ONE seed attempt.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops, _lanes, start_ref = await _setup_pool(
+            wl_git_repo, size=1, exhaust=False,
+        )
+        seen = _install_selective_seed_failure(git_ops)
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.FAULT, (
+            f'a FREE-lane seed fault must keep its existing disposition; '
+            f'got {result!r}'
+        )
+        assert len(seen) == 1, (
+            f'the FREE-lane path must not be retried; saw {len(seen)} seed '
+            f'attempts: {seen}'
+        )
