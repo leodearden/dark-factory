@@ -37,18 +37,27 @@ from escalation.models import Escalation
 # The capability headers whose construction must live in exactly one module.
 _CAPABILITY_HEADER_NAMES = frozenset({'X-Escalation-Levels', 'X-Escalation-Identity'})
 
-# This module is exempt from its own scan -- the ONE exemption, and it is not a
-# loophole. ``TestCapabilityHeaders`` asserts exact equality against dict
-# literals naming both headers (``== {'X-Escalation-Levels': '0,1'}``), which
-# the AST scan cannot distinguish from construction. Those literals are the PIN,
-# not a drift risk: they are the deliberate INDEPENDENT restatement of the wire
-# contract. Rewriting them to reference the helper's own output to satisfy the
-# scan would make the test follow a rename anywhere and go green on a break --
-# exactly the failure ``_escalation_http``'s docstring refuses when it keeps the
-# header names as literals rather than importing the server constants. So the
-# guard's own expectations are exempt, and every module that could actually
-# carry a drifting SECOND COPY is still scanned.
+# Modules the INV-5 scan below skips, as paths relative to ``escalation/tests/``
+# (for a top-level module that is just its basename).
+#
+# This module is exempt from its own scan -- not a loophole.
+# ``TestCapabilityHeaders`` asserts exact equality against dict literals naming
+# both headers (``== {'X-Escalation-Levels': '0,1'}``), which the scan cannot
+# distinguish from construction. Those literals are the PIN, not a drift risk:
+# they are the deliberate INDEPENDENT restatement of the wire contract.
+# Rewriting them to reference the helper's own output to satisfy the scan would
+# make the test follow a rename anywhere and go green on a break -- exactly the
+# failure ``_escalation_http``'s docstring refuses when it keeps the header
+# names as literals rather than importing the server constants.
+#
+# So the SET is the extension point, deliberately: a future module that also
+# needs an independent restatement of the wire contract belongs here, with a
+# comment saying why. It does not belong rewritten to assert against
+# ``capability_headers``' own output -- that would couple the new pin to the
+# implementation it exists to check. Every module that could carry a drifting
+# SECOND COPY is still scanned.
 _THIS_MODULE = Path(__file__).name
+_EXEMPT_MODULES = frozenset({_THIS_MODULE})
 
 # ---------------------------------------------------------------------------
 # Pure seam: capability_headers
@@ -233,39 +242,135 @@ class TestHeaderReachesServer:
 
 
 def _constructs_capability_headers(source: str) -> bool:
-    """True iff *source* CONSTRUCTS a capability header (never merely reads one).
+    """True iff *source* NAMES a capability header anywhere but a READ subscript.
 
-    Two node shapes count, and both are checked so the guard stays honest
-    against the obvious refactor (someone replacing the two
-    ``headers[...] = ...`` lines with a single dict literal):
+    The rule is deliberately BROAD: any ``ast.Constant`` whose value is exactly
+    ``'X-Escalation-Levels'`` or ``'X-Escalation-Identity'`` counts, wherever it
+    appears — with one structural exception, the constant SLICE of a
+    Load-context ``ast.Subscript``, i.e. the
+    ``_WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']`` read form.
 
-    * ``ast.Assign`` onto an ``ast.Subscript`` with a constant string slice —
-      the ``headers['X-Escalation-Levels'] = levels`` form.
-    * ``ast.Dict`` with a constant key — the ``{'X-Escalation-Levels': ...}``
-      literal form.
+    An earlier version matched only two construction SHAPES (an ``Assign`` onto
+    a subscript with a constant slice, and a ``Dict`` with a constant key). That
+    left the guard weaker than its own purpose, because a reintroduced second
+    copy that binds the wire name to a local first::
 
-    Both are Store-context / literal construction, which is what makes this an
-    AST scan rather than a text grep. The header names appear ~50 times across
-    this suite as docstring prose describing the seven boundary scenarios and as
-    ``_WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']`` READ subscripts; a
-    grep would flag every one of them and so could never assert "exactly one
-    place", while excluding them by substring would turn a structural invariant
-    into a prose pin that goes red on any docstring edit.
+        _LEVELS = 'X-Escalation-Levels'   # Name target, not a Subscript
+        headers[_LEVELS] = levels         # Name slice, not a Constant
+
+    matched neither shape and slipped through completely — as did
+    ``headers.setdefault('X-Escalation-Levels', v)``. Since the ENTIRE value of
+    this guard is that a *later* copy cannot go unnoticed, and aliasing is a
+    natural thing to write when you think you are being tidy, matching on the
+    name itself rather than on a catalogue of spellings is the only version that
+    stays honest.
+
+    Prose needs no special case, and that measurement is what makes an AST scan
+    viable where a text grep is not. Comments never enter the AST at all; a
+    docstring that DISCUSSES a header is a single Constant holding the whole
+    paragraph, and a paragraph is not EQUAL to a bare header name. Measured
+    across ``escalation/tests/``: 78 textual occurrences, but only 31 bare-name
+    Constants — and outside this module and ``_escalation_http.py`` all 17 of
+    those are read subscripts. Hence an exception list exactly one entry long.
+
+    The breadth over-approximates on purpose. A legitimate READ spelled some
+    other way — ``headers.get('X-Escalation-Identity')`` — would trip this and
+    is not construction. That direction of error is the chosen one: a false
+    positive is a loud failure closed by one documented ``_EXEMPT_MODULES``
+    entry, whereas a false negative silently voids INV-5 and nobody finds out.
     """
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if (
-                    isinstance(target, ast.Subscript)
-                    and isinstance(target.slice, ast.Constant)
-                    and target.slice.value in _CAPABILITY_HEADER_NAMES
-                ):
-                    return True
-        elif isinstance(node, ast.Dict):
-            for key in node.keys:
-                if isinstance(key, ast.Constant) and key.value in _CAPABILITY_HEADER_NAMES:
-                    return True
-    return False
+    # Materialised so every node stays referenced while its ``id()`` is in use:
+    # ids are unique only among LIVE objects.
+    nodes = list(ast.walk(ast.parse(source)))
+    read_slices = {
+        id(node.slice)
+        for node in nodes
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(node.slice, ast.Constant)
+    }
+    return any(
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value in _CAPABILITY_HEADER_NAMES
+        and id(node) not in read_slices
+        for node in nodes
+    )
+
+
+class TestConstructionDetector:
+    """Pin the detector itself — an unchecked guard is not a guard.
+
+    ``_constructs_capability_headers`` is the whole mechanism behind INV-5, so
+    its own true/false boundary is pinned here rather than left implied by the
+    suite-wide scan below (which, on a healthy tree, passes whether or not the
+    detector can see anything at all).
+    """
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(
+                "headers['X-Escalation-Levels'] = levels",
+                id='subscript-assign',
+            ),
+            pytest.param(
+                "headers = {'X-Escalation-Identity': identity}",
+                id='dict-literal',
+            ),
+            pytest.param(
+                "_LEVELS = 'X-Escalation-Levels'\nheaders[_LEVELS] = levels",
+                id='aliased-to-a-local',
+            ),
+            pytest.param(
+                "headers.setdefault('X-Escalation-Levels', levels)",
+                id='setdefault',
+            ),
+            pytest.param(
+                "send(headers={'X-Escalation-Identity': who})",
+                id='inline-kwarg-dict',
+            ),
+        ],
+    )
+    def test_construction_spellings_are_detected(self, source: str) -> None:
+        """Every way of naming the wire header to BUILD it counts as a site.
+
+        The aliased and ``setdefault`` cells are the regression pins: both were
+        invisible to the earlier shape-matching version, so a second copy
+        written either way would have passed the suite-wide scan silently.
+        """
+        assert _constructs_capability_headers(source) is True
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(
+                "expected = _WATCHER_ESCALATION_HEADERS['X-Escalation-Identity']",
+                id='read-subscript',
+            ),
+            pytest.param(
+                '"""Prose about the X-Escalation-Levels capability header."""',
+                id='docstring-prose',
+            ),
+            pytest.param(
+                '# X-Escalation-Levels mentioned in a comment\nx = 1',
+                id='comment',
+            ),
+            pytest.param(
+                "headers['X-Some-Other-Header'] = value",
+                id='unrelated-header',
+            ),
+        ],
+    )
+    def test_reads_and_prose_are_not_construction(self, source: str) -> None:
+        """Reading, discussing or mentioning a header is not constructing one.
+
+        These are the false positives that would make the guard unusable: the
+        read-subscript cell alone accounts for 17 of the 31 bare-name Constants
+        in this suite, and prose accounts for the gap between 31 and the 78
+        textual occurrences a grep would have had to triage.
+        """
+        assert _constructs_capability_headers(source) is False
 
 
 def test_exactly_one_module_constructs_the_capability_headers() -> None:
@@ -279,17 +384,33 @@ def test_exactly_one_module_constructs_the_capability_headers() -> None:
     written. This is the assertion.
     """
     tests_dir = Path(__file__).parent
-    sites = sorted(
-        path.name
-        for path in tests_dir.glob('*.py')
-        if path.name != _THIS_MODULE
-        and _constructs_capability_headers(path.read_text(encoding='utf-8'))
-    )
+    sites: list[str] = []
+    for path in sorted(tests_dir.rglob('*.py')):
+        # rglob, not glob: ``escalation/tests/`` already has a subdirectory
+        # (``fixtures/``), and this suite already keeps child-process modules
+        # (``_concurrent_queue_child.py``) as plain siblings -- so a helper that
+        # migrated one level down is a realistic way for a second construction
+        # site to land somewhere a top-level-only scan would never look. The
+        # assertion claims "this suite"; the scan now covers it.
+        if '__pycache__' in path.parts:
+            continue
+        relpath = path.relative_to(tests_dir).as_posix()
+        if relpath in _EXEMPT_MODULES:
+            continue
+        if _constructs_capability_headers(path.read_text(encoding='utf-8')):
+            sites.append(relpath)
 
     assert set(sites) == {'_escalation_http.py'}, (
-        f'Expected exactly one module in {tests_dir.name}/ to construct the '
+        f'Expected exactly one module under {tests_dir.name}/ to construct the '
         f'capability headers ({sorted(_CAPABILITY_HEADER_NAMES)}), found: {sites}.\n'
-        'Put the construction in _escalation_http.capability_headers and call it '
-        '(via escalation_http_call, or directly) instead of building the header '
-        'dict locally — that is the INV-5 property this task established.'
+        'If that is a second COPY: put the construction in '
+        '_escalation_http.capability_headers and call it (via '
+        'escalation_http_call, or directly) instead of building the header dict '
+        'locally -- that is the INV-5 property this task established.\n'
+        'If it is instead an intentional INDEPENDENT restatement of the wire '
+        'contract (as in this module\'s TestCapabilityHeaders, which asserts '
+        'against literal header dicts on purpose), add it to _EXEMPT_MODULES '
+        'with a comment saying why. Do NOT rewrite it to assert against '
+        "capability_headers' own output: a pin that reads the wire name out of "
+        'the code under test follows a rename and goes green on a break.'
     )
