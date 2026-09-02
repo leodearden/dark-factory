@@ -1759,6 +1759,84 @@ def create_mcp_server(
                 refs.append(claim.ref)
         return grouped
 
+    async def _batched_task_statuses(
+        refs_by_project: dict[str | None, list[str]],
+        *,
+        log_prefix: str,
+    ) -> tuple[dict[tuple[str | None, str], str], set[str | None]]:
+        """One batched status read per project; report WHICH projects answered.
+
+        Returns ``(resolved, consulted)``.
+
+        ``resolved`` is the ``(project_id, ref) -> status`` map, exactly as
+        ``_claim_task_statuses`` has always produced it. ``consulted`` is the
+        set of projects whose ``get_statuses`` returned WITHOUT RAISING — and it
+        is the whole reason this body was extracted rather than copied.
+
+        WHY THE SECOND RETURN VALUE EXISTS. ``_claim_task_statuses``'s own
+        docstring states that "an ABSENT key is the unresolvable signal", which
+        is correct for the completion-claim gate: an unchecked claim is TAGGED,
+        so the two unresolvable causes ("no such task" and "could not consult")
+        may safely collapse. ``_verify_mint_referent`` cannot collapse them —
+        it must REFUSE on "no such task" and PROCEED on "could not consult", or
+        the mint tool becomes unusable on any deployment without a task
+        registry. A project in ``consulted`` whose key is nonetheless absent is
+        a positive "no such task"; a project outside it is genuinely
+        unresolvable.
+
+        Duplicating this probe into the mint path instead would be the lockstep
+        duplication INV-5 forbids, in exactly the seam the task text says to
+        reuse.
+
+        PRECEDENT: the ``_claim_ticket_rows`` sibling below already draws this
+        same distinction, in the same two parts. The FUNCTION encodes "key
+        mapped to None means the registry answered NO SUCH TICKET; an absent key
+        means it could not be consulted", and the ``UNRESOLVABLE`` sentinel is
+        applied at its CALL SITE via
+        ``ticket_probe=lambda ref: tickets.get(ref, UNRESOLVABLE)``. This
+        extraction reproduces that split with the answered-set carried
+        explicitly rather than encoded in a None value, because a status map's
+        values are already meaningful strings and have no spare None to spend.
+
+        The guard is ``_taskmaster_configured``, NOT ``task_interceptor is not
+        None``: that name is rebound later in this same closure to a bare
+        ``TaskInterceptor(None, None, _fallback_buffer)`` fallback, after which
+        the latter test is always true.
+        """
+        resolved: dict[tuple[str | None, str], str] = {}
+        consulted: set[str | None] = set()
+        for claimed_project, project_refs in refs_by_project.items():
+            refs = sorted(project_refs)
+            root = _kp.get(claimed_project) if claimed_project is not None else None
+            if not _taskmaster_configured or root is None:
+                logger.warning(
+                    '%s: live status unresolvable for %d task ref(s) '
+                    '(taskmaster_configured=%s claimed_project=%r registered=%s)',
+                    log_prefix, len(refs), _taskmaster_configured, claimed_project,
+                    root is not None,
+                )
+                continue
+            try:
+                statuses = await task_interceptor.get_statuses(  # type: ignore[union-attr]
+                    project_root=root,
+                    ids=refs,
+                )
+            except Exception:
+                logger.warning(
+                    '%s: get_statuses failed for claimed_project=%r; the %d '
+                    'task ref(s) are UNVERIFIABLE',
+                    log_prefix, claimed_project, len(refs), exc_info=True,
+                )
+                continue
+            # Recorded only AFTER the call returned: a raising read consulted
+            # nothing, and treating it as an answer would turn an outage into a
+            # confident "no such task".
+            consulted.add(claimed_project)
+            for key, value in (statuses or {}).items():
+                if isinstance(value, str):
+                    resolved[(claimed_project, str(key))] = value
+        return resolved, consulted
+
     async def _claim_task_statuses(
         claims: list[Any], project_id: str
     ) -> dict[tuple[str | None, str], str]:
@@ -1771,42 +1849,82 @@ def create_mcp_server(
 
         An ABSENT key is the unresolvable signal — the sync probe handed to
         verify_claims returns None for it, which lands the claim on
-        'unverifiable' and therefore tagged. Every failure mode below (no
-        interceptor, unregistered project, a raising read) deliberately leaves
-        the key absent rather than fabricating a permissive answer.
+        'unverifiable' and therefore tagged. Every failure mode (no interceptor,
+        unregistered project, a raising read) deliberately leaves the key absent
+        rather than fabricating a permissive answer.
+
+        Delegates to ``_batched_task_statuses`` and DISCARDS its ``consulted``
+        set: this gate collapses "no such task" into the same tag as "could not
+        consult", so external behaviour here is byte-identical to the
+        pre-extraction body.
         """
         grouped = _group_refs_by_project(claims, 'task')
         if not grouped:
             return {}
-        resolved: dict[tuple[str | None, str], str] = {}
-        for claimed_project, refs in grouped.items():
-            refs = sorted(refs)
-            root = _kp.get(claimed_project) if claimed_project is not None else None
-            if not _taskmaster_configured or root is None:
-                logger.warning(
-                    'completion_claim_gate: live status unresolvable for %d task claim(s) '
-                    '(taskmaster_configured=%s claimed_project=%r registered=%s '
-                    'writer_project=%r)',
-                    len(refs), _taskmaster_configured, claimed_project,
-                    root is not None, project_id,
-                )
-                continue
-            try:
-                statuses = await task_interceptor.get_statuses(  # type: ignore[union-attr]
-                    project_root=root,
-                    ids=refs,
-                )
-            except Exception:
-                logger.warning(
-                    'completion_claim_gate: get_statuses failed for claimed_project=%r; '
-                    'the %d task claim(s) are UNVERIFIABLE and will be tagged',
-                    claimed_project, len(refs), exc_info=True,
-                )
-                continue
-            for key, value in (statuses or {}).items():
-                if isinstance(value, str):
-                    resolved[(claimed_project, str(key))] = value
+        resolved, _consulted = await _batched_task_statuses(
+            grouped, log_prefix=f'completion_claim_gate (writer_project={project_id!r})',
+        )
         return resolved
+
+    async def _verify_mint_referent(referent: Any, project_id: str) -> dict | None:
+        """Guard 4: refuse to mint a node for a task the registry does not have.
+
+        Returns an ``EntityMintUnknownTask`` refusal dict, or ``None`` to
+        proceed.
+
+        THE THREE-VALUED ANSWER, which is why this shares
+        ``_batched_task_statuses`` with ``_claim_task_statuses`` rather than
+        reusing that function directly:
+
+        * ref PRESENT in the resolved map -> the task exists; proceed.
+        * project CONSULTED but the ref absent -> the registry ANSWERED, and the
+          answer was "no such task". Refuse: minting a node for a task that does
+          not exist creates exactly the orphan this gate exists to prevent, and
+          nothing sweeps orphan minted nodes.
+        * project NOT consulted -> unresolvable (no taskmaster, the referent's
+          project unregistered, or a raising read). Log a structured WARNING and
+          PROCEED. Refusing here would make the tool unusable on any deployment
+          without the task registry, which is a far worse failure than the
+          occasional unverified mint.
+
+        The adjudicating project is the REFERENT's own
+        (``referent.project_id or project_id``), never the writer's: reading the
+        writing project's tree for "does reify task 132 exist" answers a
+        question nobody asked, confidently and with the wrong tree — the
+        esc-3085-1 mistake ``_group_refs_by_project`` exists to avoid.
+        """
+        claimed_project = getattr(referent, 'project_id', '') or project_id
+        ref = str(getattr(referent, 'number', '') or '')
+        if not ref:
+            return None
+        resolved, consulted = await _batched_task_statuses(
+            {claimed_project: [ref]},
+            log_prefix=f'entity_mint (writer_project={project_id!r})',
+        )
+        if (claimed_project, ref) in resolved:
+            return None
+        if claimed_project in consulted:
+            return {
+                'error': (
+                    f'task {ref} does not exist in project '
+                    f'{claimed_project!r}, so no Entity node will be minted for '
+                    'it. The task registry was consulted successfully and '
+                    'reported no such task — check the number, or file the task '
+                    'first.'
+                ),
+                'error_type': 'EntityMintUnknownTask',
+                'project_id': claimed_project,
+                'ref': ref,
+            }
+        logger.warning(
+            'entity_mint: could not verify task %r in project %r against the '
+            'task registry (taskmaster_configured=%s, registered=%s); minting '
+            'anyway rather than refusing, because an unreachable registry must '
+            'not make this tool unusable. writer_project=%r',
+            ref, claimed_project, _taskmaster_configured,
+            _kp.get(claimed_project) is not None, project_id,
+        )
+        return None
 
     async def _claim_ticket_rows(claims: list[Any]) -> dict[str, Any]:
         """Registry row per ticket claim, keyed by ticket id.
@@ -6851,7 +6969,12 @@ def create_mcp_server(
                 'name': name,
             }
 
-        # (5) Task-store verification is wired in here (task 4932 step-16).
+        # (5) The referent must name a task the live registry actually has —
+        # but ONLY when the registry can be consulted. See
+        # `_verify_mint_referent` for the three-valued distinction and why it
+        # cannot be expressed through `_claim_task_statuses` directly.
+        if err := await _verify_mint_referent(name_decision.referent, project_id):
+            return err
 
         causation_id, source, _ = _extract_causation(metadata, agent_id)
         return await memory_service.ensure_entity_node(
