@@ -47,8 +47,34 @@ def test_count_add_memory_graphiti_enqueued_without_memory_ids_is_false():
     assert _count_add_memory(op) is False
 
 
-def test_count_add_memory_failure_is_false():
+def test_count_add_memory_counts_when_graphiti_leg_failed_but_ids_returned():
+    """``success=0`` must not veto a Mem0 leg that provably persisted.
+
+    ``services/memory_service.py::MemoryService.add_memory`` mints ONE
+    ``write_op_id`` spanning a QUEUED Graphiti leg and a SYNCHRONOUS Mem0 leg,
+    then journals a single Layer-1 row whose ``success`` is
+    ``not (_graphiti_error or _mem0_error)`` — the AND across BOTH legs. So a
+    raised ``durable_queue.enqueue`` stamps ``success=0`` on the very row that
+    also carries Mem0's returned ``memory_ids``: a per-leg fact wearing a
+    per-op mask.
+
+    Those ids can only have come back inline from the completed synchronous
+    ``mem0.add`` call — the queue worker has no path back to the caller for
+    server-assigned ids — so a non-empty ``memory_ids`` is standalone proof
+    that write persisted, which no Graphiti-leg failure can contradict.
+    """
     op = {'success': 0, 'result_summary': {'memory_ids': ['m1']}}
+    assert _count_add_memory(op) is True
+
+
+def test_count_add_memory_false_when_failed_and_no_ids():
+    """Boundary pin: dropping the ``success`` gate cannot over-count.
+
+    When BOTH legs failed the row carries no per-leg evidence at all, so the
+    evidence gate alone still rejects it — ``success`` was never what made this
+    case False.
+    """
+    op = {'success': 0, 'result_summary': {'memory_ids': [], 'stores': []}}
     assert _count_add_memory(op) is False
 
 
@@ -727,6 +753,33 @@ async def test_derive_stage_stats_excludes_failed_ops(journal):
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
     assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_counts_mem0_leg_when_graphiti_enqueue_failed(journal):
+    """End-to-end: a dual_write whose ``durable_queue.enqueue`` RAISED.
+
+    The row shape is exact for that path in
+    ``services/memory_service.py::MemoryService.add_memory``: ``stores`` has NO
+    ``'graphiti'`` (the append only runs after a successful enqueue), ``success``
+    is 0 because ``_graphiti_error`` was set, and ``terminal_status`` stays NULL
+    because no queue item was ever created for the terminal hook to stamp.
+
+    The Mem0 memory nonetheless persisted, so ``memories_added`` is 1. Both
+    ``graphiti_writes_queued`` and ``writes_dead_lettered`` stay 0: nothing was
+    ever queued, so nothing could be queued-or-dead.
+    """
+    run_id = str(uuid.uuid4())
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+        success=False,
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(memories_added=1)
 
 
 @pytest.mark.asyncio
