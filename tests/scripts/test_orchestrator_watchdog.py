@@ -9524,6 +9524,145 @@ def test_liveness_pass_restart_does_not_touch_fm_deploy_clock(
 
 
 # ---------------------------------------------------------------------------
+# Part D: a RAISING restart_unit must still arm the cap (task 4131)
+#
+# restart_unit wraps each of its three subprocess.run phases in
+# `except subprocess.TimeoutExpired` ONLY, so every other exception propagates:
+# a PermissionError, or an OSError(EAGAIN|ENOMEM) from a fork/exec failure
+# under memory pressure, or a FileNotFoundError from a mid-tick systemctl swap
+# (a systemctl missing for the WHOLE tick returns early at the is_unit_enabled
+# gate and never reaches here, so the reachable trigger is a TRANSIENT failure).
+#
+# Before task 4131 the stamp-and-clear ran only on the returns-normally path,
+# so a raise left the cap UNARMED and the streak UNCLEARED at/above threshold —
+# and because the streak is recorded BEFORE the cap check, the very next tick
+# re-attempted the restart. The pass therefore degraded to one restart attempt
+# every 60s tick, unbounded: strictly worse than the ~one-per-N-ticks flapping
+# _stamp_fm_liveness_restart_clock's own docstring already calls out as the
+# wrong direction, and it defeated BOTH task-3764 layers at once.
+#
+# Arming the cap after a FAILED restart is not a new policy: restart_unit
+# passes check=False, so a systemctl that exits NON-ZERO is already
+# indistinguishable from success and arms the cap today. The fix only makes the
+# raising path agree with the already-shipped non-zero-exit path. The exception
+# is deliberately NOT caught locally — it still reaches the pass's outer
+# `except Exception`, so a genuine fork/exec failure stays LOUD in the journal
+# rather than being made indistinguishable from a clean revive.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError(11, "Resource temporarily unavailable"),  # EAGAIN: fork/exec failure
+        PermissionError(1, "Operation not permitted"),
+    ],
+    ids=["oserror-eagain", "permission-error"],
+)
+def test_liveness_pass_raising_restart_still_arms_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, exc: Exception
+) -> None:
+    """A restart_unit that RAISES must still arm the cap and consume the streak.
+
+    Parametrized over two exception classes so the fix cannot be written
+    against one of them; both are types restart_unit demonstrably does not
+    catch (it wraps only subprocess.TimeoutExpired).
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    clock_file = tmp_path / "liveness_clock.json"
+    streak_file = tmp_path / "streak.json"
+    _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 4)
+    attempts: list[str] = []
+    logged: list[str] = []
+
+    def raising_restart(unit: str) -> None:
+        attempts.append(unit)
+        raise exc
+
+    monkeypatch.setattr(wdog, "restart_unit", raising_restart)
+    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
+    now = 1783000000.0
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    # (c) must NOT propagate — the outer `except Exception` still swallows it.
+    for _ in range(3):
+        wdog.fused_memory_liveness_pass()
+
+    assert attempts == ["fused-memory.service"], (
+        f"the threshold tick must still attempt exactly one restart; got {attempts}"
+    )
+    # (a) the cap is armed even though the restart raised.
+    assert clock_file.exists(), (
+        "a restart that raised must still ARM the cap, or the next tick "
+        "re-attempts it and the pass degrades to one attempt per 60s tick"
+    )
+    assert float(json.loads(clock_file.read_text())["ts"]) == pytest.approx(now, abs=1.0)
+    # (b) the evidence was consumed.
+    assert not streak_file.exists(), (
+        "a restart that raised must still consume the streak, or it stays at or "
+        "above threshold and every subsequent tick re-attempts the restart"
+    )
+    # (c) the failure stays LOUD rather than being silently swallowed inside.
+    assert any("watchdog error for fused-memory.service" in m for m in logged), (
+        f"a fork/exec failure must still reach the journal: {logged!r}"
+    )
+    assert any(type(exc).__name__ in m or str(exc) in m for m in logged), (
+        f"the logged line must name the actual failure: {logged!r}"
+    )
+
+    # (d) THE DECISIVE ASSERTION: the next tick issues no further attempt.
+    wdog.fused_memory_liveness_pass()
+
+    assert attempts == ["fused-memory.service"], (
+        f"the armed cap must suppress the immediate re-attempt; got {attempts}"
+    )
+
+
+def test_liveness_pass_raising_restart_cannot_flap_every_tick(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """THE MIRROR-IMAGE CONTROL: 10 ticks against a raising restart_unit = 1 attempt.
+
+    Ticked at the real 60s cadence so the streak legitimately re-earns the
+    threshold after the revive consumed it — which is exactly what makes the
+    CAP, not the cleared streak, the thing doing the suppressing from tick 6
+    onward.
+
+    Before task 4131 this issued EIGHT attempts (ticks 3 through 10): the raise
+    left the cap unarmed and the streak uncleared at 3, so every subsequent
+    tick incremented it further and sailed through an unarmed cap. That is the
+    unbounded flapping this test exists to make impossible.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 3)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_RESTART_MIN_INTERVAL_SECS", 3600)
+    monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_MAX_AGE_SECS", 300)
+    _wire_liveness_pass(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "_fused_memory_liveness_verdict", lambda: "wedged")
+    attempts: list[str] = []
+
+    def raising_restart(unit: str) -> None:
+        attempts.append(unit)
+        raise OSError(11, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(wdog, "restart_unit", raising_restart)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    now = [1783000000.0]
+    monkeypatch.setattr(wdog.time, "time", lambda: now[0])
+
+    for _ in range(10):
+        wdog.fused_memory_liveness_pass()
+        now[0] += 60.0  # OnUnitActiveSec=60
+
+    assert attempts == ["fused-memory.service"], (
+        f"a failing restart must stay bounded by the cap, not retried every "
+        f"tick; got {len(attempts)} attempts: {attempts}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Part D: preserved invariants after the rewrite (task 3764, item 5)
 #
 # The gates and fail-directions this task must NOT change, re-asserted with
