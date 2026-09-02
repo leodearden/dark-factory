@@ -5278,11 +5278,22 @@ class TestPremiseGuardRunsOffEventLoop:
             )
 
         assert decision is None
-        assert any(
-            "premise" in r.message.lower()
+        fail_open_records = [
+            r
             for r in caplog.records
             if r.levelno >= logging.WARNING
-        )
+            and "failing open" in r.getMessage()
+            and "recon-premise" in r.getMessage()
+        ]
+        # Exactly one — not "the word 'premise' appears somewhere in the log",
+        # which would stay green even if a retry loop double-logged or if
+        # this WARNING were deleted and some unrelated premise-related
+        # warning (e.g. the guard module's own "assertion fails open", or
+        # the pre-existing "guard disabled for this call" cwd warning) fired
+        # instead. "recon-premise" + "failing open" together are the exact
+        # text this method's own except block emits and nothing else in the
+        # module does (verified by grep).
+        assert len(fail_open_records) == 1
 
     async def test_registry_load_runs_off_event_loop(self, tmp_path):
         """RED: the one-shot lazy registry load must also be offloaded.
@@ -5498,8 +5509,13 @@ class TestPremiseGuardRunsOffEventLoop:
         assert decision1 is None
         assert decision2 is None
         assert load_calls == 1  # one-shot contract survives a failed load
+        # "recon-premise" + "failing open" is the exact text this method's
+        # registry-load except block emits (see the sibling assertion in
+        # test_verification_failure_fails_open) — narrower than "premise"
+        # appears somewhere, which would stay green even if this WARNING
+        # were deleted and some other premise-related warning fired instead.
         assert any(
-            "premise" in r.message.lower()
+            "failing open" in r.getMessage() and "recon-premise" in r.getMessage()
             for r in caplog.records
             if r.levelno >= logging.WARNING
         )
