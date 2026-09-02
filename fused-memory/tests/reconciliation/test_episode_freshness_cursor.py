@@ -21,7 +21,10 @@ import pytest
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stages.memory_consolidator import (
+    MemoryConsolidator,
+    _is_newer_than_watermark,
+)
 
 
 def _scope(project_id: str, project_root: str) -> ProjectScope:
@@ -241,4 +244,94 @@ class TestMem0FreshnessCursor:
         )
         assert 'fallback-earlier-mem' not in result, (
             f'Same-day-earlier fallback memory must not re-surface; got result:\n{result!r}'
+        )
+
+
+# LATER the same calendar day as the incident episode, matching WATERMARK_TS above.
+_WM = datetime(2026, 8, 20, 12, 0, 0, tzinfo=UTC)
+
+
+class TestIsNewerThanWatermarkTrue:
+    """Pins the instant-comparison contract independently of payload assembly.
+
+    Every case here is a genuinely-newer instant relative to _WM, expressed
+    in a different textual shape than _WM itself — the whole point of
+    comparing parsed instants rather than strings is that the shape must not
+    matter.
+    """
+
+    @pytest.mark.parametrize(
+        'raw_ts',
+        [
+            pytest.param('2026-08-20T13:00:00+00:00', id='plainly-newer'),
+            pytest.param('2026-08-20T13:00:00Z', id='z-suffix'),
+            pytest.param('2026-08-20T06:00:00-07:00', id='non-utc-offset-newer'),
+            pytest.param('2026-08-20T13:00:00', id='naive-assumed-utc'),
+            pytest.param('2026-08-20T12:00:00.000001+00:00', id='one-microsecond-after'),
+        ],
+    )
+    def test_returns_true(self, raw_ts):
+        assert _is_newer_than_watermark(raw_ts, _WM) is True, (
+            f'Expected {raw_ts!r} to be newer than watermark {_WM.isoformat()!r}'
+        )
+
+    def test_non_utc_offset_guards_false_negative(self):
+        """A non-UTC offset that IS genuinely newer must not be silently
+        dropped by a naive string-style comparison.
+
+        With watermark 2026-08-21T02:00:00+00:00, the string
+        '2026-08-20T20:00:00-07:00' (== 2026-08-21T03:00:00Z, newer by one
+        hour) sorts LESS than the watermark string lexically ('2026-08-20'
+        < '2026-08-21'), so a str(watermark)-style comparison would wrongly
+        exclude it. The instant comparison must include it.
+        """
+        watermark = datetime(2026, 8, 21, 2, 0, 0, tzinfo=UTC)
+        raw_ts = '2026-08-20T20:00:00-07:00'  # == 2026-08-21T03:00:00+00:00
+        assert _is_newer_than_watermark(raw_ts, watermark) is True, (
+            f'Expected {raw_ts!r} (= 2026-08-21T03:00:00+00:00) to be newer than '
+            f'watermark {watermark.isoformat()!r}'
+        )
+
+
+class TestIsNewerThanWatermarkFalse:
+    """Cases that must NOT be classified as newer than _WM."""
+
+    @pytest.mark.parametrize(
+        'raw_ts',
+        [
+            pytest.param('2026-08-20T01:52:27+00:00', id='incident-same-day-earlier'),
+            pytest.param('2026-08-20T12:00:00+00:00', id='exactly-equal'),
+            pytest.param('2026-08-19T23:59:59+00:00', id='older'),
+        ],
+    )
+    def test_returns_false(self, raw_ts):
+        assert _is_newer_than_watermark(raw_ts, _WM) is False, (
+            f'Expected {raw_ts!r} to NOT be newer than watermark {_WM.isoformat()!r}'
+        )
+
+
+class TestIsNewerThanWatermarkNaiveWatermarkSymmetry:
+    """A naive watermark must behave identically to its UTC-aware twin."""
+
+    @pytest.mark.parametrize(
+        'raw_ts, expected',
+        [
+            pytest.param('2026-08-20T13:00:00+00:00', True, id='newer'),
+            pytest.param('2026-08-20T01:52:27+00:00', False, id='same-day-earlier'),
+            pytest.param('2026-08-20T12:00:00+00:00', False, id='exactly-equal'),
+        ],
+    )
+    def test_naive_watermark_matches_aware_twin(self, raw_ts, expected):
+        naive_wm = datetime(2026, 8, 20, 12, 0, 0)
+        aware_wm = datetime(2026, 8, 20, 12, 0, 0, tzinfo=UTC)
+
+        # Must not raise TypeError on naive-vs-aware datetime comparison.
+        naive_result = _is_newer_than_watermark(raw_ts, naive_wm)
+
+        assert naive_result is expected, (
+            f'Expected _is_newer_than_watermark({raw_ts!r}, <naive watermark>) == {expected}, '
+            f'got {naive_result}'
+        )
+        assert naive_result == _is_newer_than_watermark(raw_ts, aware_wm), (
+            'Naive watermark must behave identically to its UTC-aware twin'
         )
