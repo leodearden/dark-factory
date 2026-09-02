@@ -257,8 +257,12 @@ def build_eval_env() -> dict[str, str]:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip()
 
-    # Prefer account A (interactive token, confirmed uncapped) over G.
-    oauth_token = env.get("CLAUDE_OAUTH_TOKEN_A") or env.get("CLAUDE_OAUTH_TOKEN_G", "")
+    # Seed from a POOL account only. Account A is interactive-only and must
+    # not seed an eval run (ruling 2026-08-30, task 4741). This is just the
+    # BOOTSTRAP credential — per-invocation account selection is UsageGate's
+    # job, driven by the roster in USAGE_ACCOUNTS_FILE below — so it only
+    # needs to be a valid pool credential, not a specific one.
+    oauth_token = env.get("CLAUDE_OAUTH_TOKEN_G", "")
     if not oauth_token:
         log("WARNING: no CLAUDE_OAUTH_TOKEN found in .env")
     env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
