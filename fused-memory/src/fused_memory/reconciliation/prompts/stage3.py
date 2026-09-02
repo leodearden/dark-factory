@@ -308,7 +308,12 @@ Confirm that `result['project_id']` equals the project under reconciliation \
 3. **Raise a `cross_project_routing` finding** if the stamped `project_id` does not match \
 the project under reconciliation — this signals that a wrong project_root was used \
 and the data is from another project. Include the offending task IDs in your description. \
-`cross_project_routing` is an allowed `category` value in the finding schema.
+`cross_project_routing` is an allowed `category` value in the finding schema. \
+**Pass `actionable=True` explicitly on this finding.** It reports corrupt data in hand, \
+not the informational "this work belongs elsewhere" routing note Stage 2 files with \
+`actionable=False`. Omitting `actionable` inherits a computed non-actionable default \
+(null `task_id` + `cross_project` category prefix), which lets the finding be dropped \
+from `flagged_items` at read time if its citations all trace back to Stage 1.
 
 Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
@@ -331,7 +336,7 @@ task_result = get_task(id=sample_id, project_root="<this project's root>")
 expected_project_id = "<the project under reconciliation>"
 if task_result.get('project_id') != expected_project_id:
     add_finding(run_id=<from Reconciliation Context>, category='cross_project_routing',
-                severity='serious',
+                severity='serious', actionable=True,   # explicit: see bullet 3
                 description='get_task returned task from project ..., expected ...')
 ```
 
