@@ -175,14 +175,29 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # flag_for_stage2 row into the ledger — the identical
         # declared-vs-actual gap documented on stage2_persistence_marker
         # below (task 2228 W5-κ, review finding model_drift). The live
-        # collector is the separate Mem0 age-based sweep
-        # task_knowledge_sync._sweep_stale_mem0_flag_for_stage2_markers
+        # collector is the separate Mem0 sweep
+        # stages/task_knowledge_sync.py::_sweep_stale_mem0_flag_for_stage2_markers
         # (task 2966), which — unlike stage2_persistence_marker's sweep —
         # enumerates via the boolean payload filter
         # {'flag_for_stage2': True} rather than a {'source': ...} filter,
-        # since these markers carry no source metadata field. Migrating the
-        # writer onto the ledger — so DELETER_GC becomes true in practice and
-        # not just in eligibility — is a follow-up.
+        # since these markers carry no source metadata field.
+        #
+        # That collector is NO LONGER age-based (task 4375). Retirement is now
+        # COMPOSITE: a marker is deleted only when it is past the 14-day age
+        # cutoff AND is not a protected cycle_summary mirror AND its kind is
+        # not in mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is
+        # confirmed terminal. The age-only rule destroyed 40 kind='cadence_check'
+        # audit records in autopilot_video, all citing a merely-'deferred' task.
+        #
+        # The terminal-closure arm NARROWS the declared-vs-actual gap this
+        # comment documents, without closing it: the Mem0 side now applies the
+        # same terminal-task-closure test that
+        # recon_ledger.ReconLedgerStore.gc()'s terminal-referenced DELETE arm
+        # applies to ledger rows, so DELETER_GC is now accurate about the
+        # ELIGIBILITY RULE even though the rows themselves still never reach
+        # the ledger. Migrating the writer onto the ledger — so DELETER_GC
+        # becomes true in mechanism too, not just in rule — remains a
+        # follow-up.
         deleter=DELETER_GC,
     ),
     'stage2_persistence_marker': MarkerLifecycle(

@@ -25,13 +25,24 @@ That "only enumeration filter is ``source``" claim is true of
 ``_sweep_stale_mem0_flag_markers`` but materially incomplete as a description of
 the in-cycle drain as a whole (task 3897). Task 2966 shipped a SECOND in-cycle
 collector, ``_sweep_stale_mem0_flag_for_stage2_markers``, which enumerates on
-``{'flag_for_stage2': True}`` (``_FLAG_FOR_STAGE2_ENUM_FILTERS``), age-GCs at the
-same 14 days, and is likewise wired unconditionally per-project every cycle
+``{'flag_for_stage2': True}`` (``_FLAG_FOR_STAGE2_ENUM_FILTERS``) and is likewise
+wired unconditionally per-project every cycle
 (``task_knowledge_sync.py:3038``, recording
 ``report.stats['stale_mem0_flag_for_stage2_markers_gc_swept']``). THAT collector —
 not this script — is what drains the live Stage-1 -> Stage-2 relay pool. The
 distinction matters because the two collectors address disjoint populations, and
 this script can only see the first one (see "Enumeration strategy" below).
+
+That collector's ENUMERATION filter is still the boolean payload key above — it
+is deliberately kept wide, because 165 of the 288 records it destroyed carried
+no ``kind`` at all and 248 no ``source``, so no positive allowlist can identify
+the genuine relay pool. Its RETIREMENT rule, however, is no longer a plain
+14-day age GC (task 4375): a marker is deleted only when it is past the 14-day
+cutoff AND is not a protected cycle_summary mirror AND its ``kind`` is not in
+``mem0_tombstone.PROTECTED_AUDIT_KINDS`` AND its ``task_id`` is confirmed
+terminal for that cycle. The age-only rule destroyed 40 ``kind='cadence_check'``
+audit records in autopilot_video, every one at exactly 14 days old, all citing a
+task that is merely ``deferred``.
 
 The pre-2406 Mem0 records remain pure dead weight (nothing reads them — see
 ``find_stale_markers``/``find_terminal_task_markers`` docstrings); they are simply
