@@ -29,7 +29,9 @@ place serving the consumer-side tests.
 
 from __future__ import annotations
 
+import contextlib
 import errno
+import io
 import os
 import sys
 
@@ -178,4 +180,234 @@ class TestTheReporterPrintsOneErrorLineAndTouchesNoFileDescriptor:
             pipe_stdout.close()
             os.close(read_fd)
         # The report itself still went to stderr, which was never the subject.
+        assert 'closed the output pipe' in capsys.readouterr().err
+
+
+@contextlib.contextmanager
+def _closed_pipe_stdout(monkeypatch, *, buffering: int | None = None, quiet_close: bool = True):
+    """Point ``sys.stdout`` at a pipe whose reader is already gone (the ``| head`` shape).
+
+    Ported from ``fused-memory/tests/test_local_memory_models_eval_corpus.py``
+    (2721-2777), which keeps its own copy serving the consumer-side tests.
+
+    A REAL closed ``os.pipe()``, never a mocked ``print``: a fix that only
+    satisfies a mock cannot pass through here, because the assertion is on the
+    actual OS-level write failure.
+
+    *buffering* is the load-bearing knob, not a detail — it selects WHICH of
+    the two failure regimes the test exercises, so every caller states it:
+
+    * ``None`` (block buffering, the default) — a short write stays in the
+      buffer, nothing fails in-band, and only an explicit flush can surface it.
+    * ``1`` (line buffering) — every print does a real ``write()``, so the
+      failure is raised during the run.
+
+    The exit is itself an assertion. Closing the wrapper stands in for the
+    interpreter's finalization-time flush of ``sys.stdout``, which is where a
+    closed pipe would otherwise resurface as "Exception ignored ..." noise and
+    a forced exit status no ``return`` can override. It runs in a ``finally``
+    so a failing assertion in the body cannot skip it or leak the write fd;
+    the verdict on it is checked only when the body passed, so a real failure
+    is never masked by a second one here.
+
+    *quiet_close* says which LAYER is under test. ``True`` (:func:`run_cli`,
+    the process boundary) means that flush must not raise, because the
+    boundary owns fd 1 and redirects it to ``os.devnull``. ``False`` (a
+    ``main`` alone, or a report-only call) means it must raise:
+    ``main(argv) -> int`` deliberately does not mutate a process-global fd on
+    behalf of a caller that only asked for an exit code.
+    """
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)  # the reader is already gone, like `head` after its window
+    if buffering is None:
+        pipe_stdout = os.fdopen(write_fd, 'w')
+    else:
+        pipe_stdout = os.fdopen(write_fd, 'w', buffering=buffering)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, 'stdout', pipe_stdout)
+    close_failure: BaseException | None = None
+    try:
+        yield pipe_stdout
+    finally:
+        sys.stdout = original_stdout
+        try:
+            pipe_stdout.close()
+        except BrokenPipeError as exc:
+            close_failure = exc
+    if quiet_close:
+        assert close_failure is None, (
+            'the interpreter\'s shutdown flush would have raised a second, '
+            f'uncatchable BrokenPipeError: {close_failure!r}'
+        )
+    else:
+        assert close_failure is not None, (
+            'this layer took over the caller\'s stdout fd — only the process '
+            'boundary may do that'
+        )
+
+
+class _StdoutWithAFailingFlush(io.StringIO):
+    """A stdout that accepts every write and fails on flush — ENOSPC, not a closed reader.
+
+    ``StringIO.fileno()`` raises ``io.UnsupportedOperation``, so this doubles as
+    a pin on the handler's fd guard: a stream with no real descriptor must not
+    turn the reported failure into a second, different traceback out of the
+    code meant to prevent the first one. (``io.UnsupportedOperation`` subclasses
+    both ``OSError`` and ``ValueError``, which is exactly the pair
+    ``_silence_stream_fd`` names.)
+    """
+
+    def __init__(self, exc: OSError):
+        super().__init__()
+        self._exc = exc
+
+    def flush(self) -> None:
+        raise self._exc
+
+
+class _StdoutWithAFailingWrite(io.StringIO):
+    """A stdout whose LARGE writes fail outright — the IN-BAND half of the pair above.
+
+    ``_StdoutWithAFailingFlush`` accepts every write and defers the failure to
+    the flush, which is what a *block-buffered* full disk does. A real
+    ``> /full/disk/report.txt`` also fails the other way: once the write is big
+    enough to reach the device — over the 8 KiB buffer, or on any write at all
+    when unbuffered — the ``write()`` itself raises, mid-run, with no flush
+    involved. Same errno, different frame, different handler needed.
+
+    *min_length* gates which writes fail, so the double stays usable for the
+    rest of the run rather than exploding on the first character. (In the
+    corpus copy of this double the threshold is MEASURED against that CLI's
+    four stdout writes; here the synthetic CLIs choose their own line lengths
+    around whatever threshold the test states.)
+
+    Keeps the ``io.StringIO`` base for the same second job as above:
+    ``fileno()`` raises, re-pinning the handler's fd guard.
+    """
+
+    def __init__(self, exc: OSError, *, min_length: int):
+        super().__init__()
+        self._exc = exc
+        self._min_length = min_length
+
+    def write(self, s: str) -> int:
+        if len(s) >= self._min_length:
+            raise self._exc
+        return super().write(s)
+
+
+class TestTheFlushIsWhatSurfacesADeferredStdoutFailure:
+    """The FD-OWNING half: the handlers that may take over fd 1 because they are exiting.
+
+    The two failure regimes are the axis this behaviour turns on, and only one
+    of them can ever reach an in-band handler:
+
+    * LINE-BUFFERED — the write reaches the device during the run and raises
+      where a ``try`` around ``main()`` can see it.
+    * BLOCK-BUFFERED — a short write stays in the buffer, the run raises
+      NOTHING, and the failure surfaces only when something flushes. Without
+      an explicit flush that is interpreter finalization, where no ``except``
+      can intervene and the returned status is overridden.
+    """
+
+    def test_a_healthy_stdout_flushes_quietly_and_reports_nothing(self, capsys):
+        """CONTROL: the flush is not a failure detector that fires on success."""
+        assert cli_boundary._flush_stdout() is None
+        assert capsys.readouterr().err == ''
+
+    def test_a_short_buffered_write_surfaces_at_the_flush_and_nowhere_earlier(
+        self, monkeypatch, capsys
+    ):
+        """The headline shape, and the reason the explicit flush exists at all.
+
+        ``quiet_close=True`` is a second assertion, not decoration: it says the
+        handler redirected fd 1 to ``os.devnull``, so the interpreter's later
+        flush cannot fail on the buffer this one left behind.
+        """
+        with _closed_pipe_stdout(monkeypatch, quiet_close=True):
+            print('short')  # block-buffered: stays in the buffer, raises nothing
+            code = cli_boundary._flush_stdout()
+        monkeypatch.undo()
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        reported = _reported_lines(capsys.readouterr().err)
+        assert len(reported) == 1
+        assert 'closed the output pipe' in reported[0]
+
+    def test_a_flush_failure_that_is_not_a_closed_pipe_routes_to_the_errno_message(
+        self, monkeypatch, capsys
+    ):
+        """Arm ORDER, asserted behaviourally: BrokenPipeError is tried before OSError.
+
+        ``BrokenPipeError`` IS an ``OSError``, so a wide arm placed first would
+        swallow the closed-pipe case and print ITS message for everything. This
+        test catches the mirror-image mistake — a narrow-only guard — and the
+        closed-pipe test above catches the wide-first one.
+        """
+        monkeypatch.setattr(
+            sys, 'stdout', _StdoutWithAFailingFlush(OSError(errno.ENOSPC, 'No space left on device'))
+        )
+        capsys.readouterr()
+        code = cli_boundary._flush_stdout()
+        monkeypatch.undo()
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        reported = _reported_lines(capsys.readouterr().err)
+        assert len(reported) == 1
+        assert 'No space left on device' in reported[0]
+        assert 'closed the output pipe' not in reported[0]
+
+    def test_an_in_band_stdout_error_is_handled_by_the_same_pair_of_messages(self, capsys):
+        """``_handle_stdout_error`` serves the IN-BAND frame with the same message shape.
+
+        A full disk raised by ``print`` mid-run and one found by a later flush
+        are the same operator situation, so they get one handler, one message
+        and one code — a reader comparing the two should see the failure site
+        differ and nothing else.
+        """
+        code = cli_boundary._handle_stdout_error(OSError(errno.ENOSPC, 'No space left on device'))
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        reported = _reported_lines(capsys.readouterr().err)
+        assert len(reported) == 1
+        assert 'No space left on device' in reported[0]
+        assert 'closed the output pipe' not in reported[0]
+
+    def test_a_stream_with_no_real_descriptor_does_not_crash_the_handler(self, monkeypatch, capsys):
+        """The fd guard, pinned by the doubles' ``fileno()`` raising.
+
+        These handlers exist to keep a traceback off the screen; one that
+        itself raised on a captured or replaced stdout would produce a second,
+        different traceback out of the code meant to prevent the first.
+        """
+        monkeypatch.setattr(sys, 'stdout', _StdoutWithAFailingWrite(OSError(errno.EIO, 'io'), min_length=1))
+        capsys.readouterr()
+        code = cli_boundary._handle_broken_pipe()
+        monkeypatch.undo()
+
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        assert 'closed the output pipe' in capsys.readouterr().err
+
+    def test_only_the_handler_takes_over_fd_one_the_reporter_leaves_it_alone(
+        self, monkeypatch, capsys
+    ):
+        """The layering, asserted from BOTH sides in one place.
+
+        ``quiet_close`` is the discriminator: ``False`` demands the wrapper's
+        close still raise (nobody touched fd 1), ``True`` demands it not
+        (the handler redirected it). The pair is what stops a future
+        "simplification" collapsing the report-only and fd-owning forms into
+        one function.
+        """
+        with _closed_pipe_stdout(monkeypatch, quiet_close=False):
+            print('short')
+            assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        monkeypatch.undo()
+        capsys.readouterr()
+        cli_boundary.reset_stdout_failure_state()
+
+        with _closed_pipe_stdout(monkeypatch, quiet_close=True):
+            print('short')
+            assert cli_boundary._handle_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        monkeypatch.undo()
         assert 'closed the output pipe' in capsys.readouterr().err
