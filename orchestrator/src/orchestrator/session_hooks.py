@@ -1473,6 +1473,26 @@ def _run_status_refresh_and_retitle(
     deliver: the status came from ``refresh_record``'s write and the
     question/binding from a conditional second one.
 
+    ONE BLOCK, ALL LANES. Every lane -- adopt, fork, hand-launched, and the
+    UNREADABLE fault -- shares the single withhold / refresh / bind /
+    question / write block below. The unreadable case differs ONLY in where
+    its snapshot came from: it spends one extra ``read_record`` and then
+    falls through, exactly as ``run_session_start``'s unreadable arm does,
+    so the two handlers are structurally symmetric.
+
+    Do NOT re-fork that lane. A second copy of this policy is precisely how
+    the task-4193 withhold guard went missing: the fault lane reproduced
+    this block's WRITE policy (refresh, bind, stamp the question) while
+    silently omitting its DECISION policy, and a lane that writes without
+    evaluating ``_in_unbound_launch_window`` inverts ownership on a nested
+    ``claude``'s event. Measured before the lanes were merged, same scenario
+    both sides: the two-read shape withheld (``launching``, no question),
+    the duplicated lane did not (``awaiting-input``, the nested session's
+    prompt landed on the SPAWNING session's record). The pre-task-4662
+    shape was only accidentally robust here -- it made TWO independent
+    reads, so a transient fault on the probe's read left the second free to
+    succeed and the guard still ran.
+
     It also closes a TOCTOU gap. The withhold decision used to be computed
     from a snapshot taken BEFORE ``refresh_record``'s own internal re-read,
     so the body written was not the body decided on and two racing events
@@ -1515,26 +1535,20 @@ def _run_status_refresh_and_retitle(
     # every other path (fork, hand-launched) reads here for the first time.
     snapshot = resolution.snapshot or _read_record_snapshot(slug, root)
 
-    if snapshot.unreadable:
-        # FAULT LANE, deliberately left on the two-read shape. A record that
-        # EXISTS but cannot be read must not be synthesized over, so this
-        # hands the decision back to refresh_record, whose contract is to
-        # re-read and either succeed on a transient fault or propagate
-        # CorruptSessionRecord to main()'s blanket except -- "a *corrupt*
-        # existing body is NOT treated as absent". One extra read on a path
-        # that is rare by construction buys byte-identical fail-soft
-        # behaviour; the fast path below is taken for OK and ABSENT only.
-        record = session_registry.refresh_record(slug, root=root, status=status)
-        bound = may_bind and _bind_claude_session_id(
-            record, hook_input, probes=probes
-        )
-        if question is not None:
-            record.question = question
-        if question is not None or bound:
-            session_registry.write_record(record, root=root)
-        return osc_retitle_sequence(status, hook_display_title(identity, env, record))
-
     prior = snapshot.record
+    if prior is None and snapshot.unreadable:
+        # UNREADABLE, not ABSENT: a record EXISTS but could not be read, and
+        # deciding from NO observation is what silently disarmed the
+        # task-4193 launch-window withhold. Re-read, then fall through to the
+        # one shared block below. A transient fault on the probe's read must
+        # not cost this event its withhold decision; a genuinely corrupt body
+        # must still not be synthesized over, so CorruptSessionRecord/OSError
+        # propagates to main()'s blanket except exactly as refresh_record's
+        # contract requires. FileNotFoundError means the fault was transient
+        # over an absent record, which is ABSENT -- suppressed, and
+        # synthesized below.
+        with contextlib.suppress(FileNotFoundError):
+            prior = session_registry.read_record(slug, root=root)
     # Decide the launch window BEFORE applying the status: the decision and
     # the body written below both derive from THIS one snapshot, so they can
     # never disagree. status=None makes the refresh a pure heartbeat bump,
