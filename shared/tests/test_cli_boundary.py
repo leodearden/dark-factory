@@ -33,11 +33,17 @@ import contextlib
 import errno
 import io
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 import shared.cli_boundary as cli_boundary
+
+# Same src-root expression as shared/tests/conftest.py and
+# test_pure_stdlib_leaves.py — read the LOCAL tree, never an installed copy.
+_SRC = Path(__file__).resolve().parent.parent / 'src'
 
 
 @pytest.fixture(autouse=True)
@@ -715,3 +721,243 @@ class TestRunCliConvertsEveryStdoutFailureIntoOneDocumentedOutcome:
         monkeypatch.undo()
 
         assert 'a stale artifact path' not in capsys.readouterr().err
+
+
+#: A minimal CLI built on the helper — the two-line adoption shape from
+#: :func:`~shared.cli_boundary.run_cli`'s USAGE block and nothing else, so a
+#: failure in the subprocess suite below names the helper rather than any
+#: consumer's build logic. One SHORT print, deliberately: it is the write that
+#: stays in a block buffer and therefore raises nothing in-band.
+_SYNTHETIC_CLI = """\
+import sys
+
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
+
+def main() -> int:
+    parser = LoudArgumentParser(prog='synthetic')
+    parser.add_argument('--alpha', help='the first flag')
+    parser.add_argument('--beta', action='store_true', help='the second flag')
+    parser.parse_args()
+    print('done')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(run_cli(main))
+"""
+
+#: Both stdout buffering regimes, which is the axis this behaviour actually
+#: turns on — NOT an incidental parametrization.
+_BUFFERING = pytest.mark.parametrize(
+    'unbuffered', [False, True], ids=['block-buffered', 'unbuffered']
+)
+
+
+@pytest.fixture(scope='module')
+def synthetic_cli(tmp_path_factory) -> Path:
+    """The synthetic CLI on disk, for the child process to run."""
+    script = tmp_path_factory.mktemp('cli_boundary') / 'synthetic_cli.py'
+    script.write_text(_SYNTHETIC_CLI)
+    return script
+
+
+def _spawn(
+    script: Path,
+    *argv: str,
+    closed_stdout: bool,
+    unbuffered: bool,
+    closed_stderr: bool = False,
+) -> tuple[int, str, str]:
+    """Run *script* in a CHILD process and return (exit status, stdout, stderr).
+
+    Modelled on ``fused-memory/tests/test_local_memory_models_eval_corpus.py``
+    (3107-3199). A real subprocess is the only shape that can observe the two
+    things this file's in-process tests structurally cannot: the interpreter's
+    own finalization-time flush of ``sys.stdout``, and the exit status the OS
+    actually reports (CPython overrides the returned code when that flush
+    fails, which nothing inside the process can express).
+
+    With *closed_stdout*, fd 1 is a pipe whose READ end is closed BEFORE the
+    spawn. Closing the reader first is what makes it deterministic: leave it
+    open and the child's write lands in the kernel's pipe buffer and never
+    fails, so the test would pass for the wrong reason. Python re-installs
+    ``SIGPIPE`` as ``SIG_IGN`` at startup, so the child gets EPIPE as a
+    catchable ``BrokenPipeError`` rather than dying on the signal — the status
+    here is therefore always a real exit code, never ``-13``.
+
+    *closed_stderr* puts stderr on that SAME closed pipe: the ``cmd 2>&1 |
+    head`` shape, where the diagnostic has nowhere to go either. Returned
+    stderr is then empty by construction — the exit status is the only
+    observable, and the only one that matters there.
+
+    *unbuffered* is set EXPLICITLY rather than inherited, and that is the whole
+    point of it being a REQUIRED keyword argument: ``PYTHONUNBUFFERED`` decides
+    WHERE a closed-pipe write fails (in-band inside ``argparse`` when
+    unbuffered, at a later flush when block-buffered), so a test that merely
+    inherits it asserts against whichever regime the ambient environment
+    happens to supply. This suite is normally run by a harness that exports
+    ``PYTHONUNBUFFERED=1`` and by hand without it, so an inherited value made
+    the same test pass locally and fail under the harness.
+
+    The ``PYTHONPATH`` prepend is load-bearing, not boilerplate — the
+    ``run_python_child`` invariant, whose single home is
+    ``shared/tests/test_pure_stdlib_leaves.py:108-138``. A bare child
+    interpreter inside a task worktree resolves ``shared`` to the MAIN
+    checkout's installed editable copy, which has no ``cli_boundary`` at all,
+    so the whole suite would go red for a reason with nothing to do with the
+    code under test. (``run_python_child`` itself is not reusable here: it
+    asserts rc==0 and parses JSON stdout, and these tests need a non-zero
+    status and a closed stdout.)
+    """
+    assert closed_stdout or not closed_stderr, 'closed_stderr shares stdout closed pipe'
+    env = {
+        **os.environ,
+        'PYTHONPATH': f'{_SRC}{os.pathsep}' + os.environ.get('PYTHONPATH', ''),
+    }
+    if unbuffered:
+        env['PYTHONUNBUFFERED'] = '1'
+    else:
+        env.pop('PYTHONUNBUFFERED', None)
+    cmd = [sys.executable, str(script), *argv]
+
+    if not closed_stdout:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    else:
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)  # the reader is already gone, like `head` after its window
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=write_fd,
+                stderr=write_fd if closed_stderr else subprocess.PIPE,
+                env=env,
+            )
+        finally:
+            os.close(write_fd)  # the child now holds the only write end
+
+    # A wedged child must not outlive the run: it holds the only write end of
+    # the closed pipe, so an un-killed one leaks an interpreter per failure.
+    try:
+        out, err = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
+    return (
+        proc.returncode,
+        (out or b'').decode('utf-8', 'replace'),
+        (err or b'').decode('utf-8', 'replace'),
+    )
+
+
+class TestARealChildProcessExitsCleanlyOntoAClosedStdout:
+    """The regime neither in-process shape can see: finalization, and a real exit status.
+
+    Everything above runs inside pytest's interpreter, which never finalizes
+    mid-suite. Only a child process can show that a stream was left holding an
+    unwritable buffer — CPython flushes both streams at shutdown, prints
+    "Exception ignored ..." where no ``except`` can reach, and OVERRIDES the
+    status the program returned.
+
+    Both buffering regimes throughout, because they fail in different frames
+    and one handler catches only one of them.
+
+    Stderr is asserted with "contains", not "is exactly one line", unlike the
+    in-process tests: a child interpreter's stderr is not fully under this
+    test's control (an unrelated warning would be a real signal, not a reason
+    to go red), and the single-line contract is already pinned in-process
+    where stderr IS controlled.
+    """
+
+    @_BUFFERING
+    def test_an_ordinary_run_into_a_closed_pipe_exits_failed_without_shutdown_noise(
+        self, synthetic_cli, unbuffered
+    ):
+        code, _, err = _spawn(synthetic_cli, closed_stdout=True, unbuffered=unbuffered)
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        assert 'Traceback' not in err, err
+        assert 'Exception ignored' not in err, err
+        assert any(line.startswith('error: ') for line in err.splitlines()), err
+
+    @_BUFFERING
+    def test_help_into_a_closed_pipe_exits_failed_without_shutdown_noise(
+        self, synthetic_cli, unbuffered
+    ):
+        """The leg that reaches neither ``main``'s body nor ``run_cli``'s in-band handler.
+
+        ``argparse`` leaves via ``SystemExit(0)`` from ``parse_args``, so
+        nothing is raised in-band at all. Unbuffered, a STOCK parser exits 0
+        with its output discarded — this is the case ``LoudArgumentParser``
+        exists for.
+        """
+        code, _, err = _spawn(synthetic_cli, '--help', closed_stdout=True, unbuffered=unbuffered)
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+        assert 'Traceback' not in err, err
+        assert 'Exception ignored' not in err, err
+        assert any(line.startswith('error: ') for line in err.splitlines()), err
+
+    @_BUFFERING
+    def test_help_with_stderr_on_the_same_closed_pipe_still_exits_failed(
+        self, synthetic_cli, unbuffered
+    ):
+        """``--help 2>&1 | head``: the diagnostic is lost; the exit code is not.
+
+        With both streams on the closed pipe the ``error: ...`` line cannot be
+        written and cannot be observed, so the exit status is the whole
+        contract — and it is enough. A stream left holding an unwritable buffer
+        fails again during finalization and CPython overrides the returned
+        status when that happens; exiting EXIT_STDOUT_FAILED is therefore a
+        positive statement that NEITHER stream was left in that state.
+
+        Pins the best-effort stderr write as deliberate rather than accidental:
+        the message is allowed to vanish here, and nothing else is.
+        """
+        code, _, _ = _spawn(
+            synthetic_cli, '--help', closed_stdout=True, closed_stderr=True, unbuffered=unbuffered
+        )
+        assert code == cli_boundary.EXIT_STDOUT_FAILED
+
+    @_BUFFERING
+    def test_help_with_a_healthy_stdout_still_exits_zero_and_prints_usage(
+        self, synthetic_cli, unbuffered
+    ):
+        """CONTROL: pins the override to still EMIT the help text, in full."""
+        code, out, _ = _spawn(synthetic_cli, '--help', closed_stdout=False, unbuffered=unbuffered)
+        assert code == 0
+        assert 'usage:' in out
+        assert '--alpha' in out and '--beta' in out
+
+    @_BUFFERING
+    def test_a_healthy_run_still_exits_zero_and_prints_its_line(self, synthetic_cli, unbuffered):
+        """CONTROL: the boundary is invisible when nothing goes wrong."""
+        code, out, err = _spawn(synthetic_cli, closed_stdout=False, unbuffered=unbuffered)
+        assert code == 0
+        assert out.strip() == 'done'
+        assert err == ''
+
+    @_BUFFERING
+    def test_an_unrecognized_flag_still_exits_two_on_both_stdout_shapes(
+        self, synthetic_cli, unbuffered
+    ):
+        """CONTROL, and the closed-pipe half is the sharper of the two.
+
+        argparse writes its error to STDERR, so stdout's buffer is empty, the
+        flush attempts no write and cannot fail — meaning the exit status must
+        still be 2. A fix that collapsed "stdout is a closed pipe" into
+        EXIT_STDOUT_FAILED regardless of whether the flush actually failed goes
+        red here and nowhere else.
+        """
+        healthy_code, _, healthy_err = _spawn(
+            synthetic_cli, '--definitely-not-a-flag', closed_stdout=False, unbuffered=unbuffered
+        )
+        assert healthy_code == 2
+        assert 'unrecognized' in healthy_err
+
+        closed_code, _, closed_err = _spawn(
+            synthetic_cli, '--definitely-not-a-flag', closed_stdout=True, unbuffered=unbuffered
+        )
+        assert closed_code == 2
+        # Still reported: the usage error goes to stderr, which is NOT the
+        # closed stream, so a closed stdout must not cost the diagnostic.
+        assert 'unrecognized' in closed_err
