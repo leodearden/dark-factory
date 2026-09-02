@@ -648,12 +648,12 @@ abandoned work is recorded as a successful run."""
 # sighting every census cycle, and a number baked into a role prompt goes
 # stale silently while "catalogued sightings all show the same shape" stays
 # true.
-TOOL_CALL_REJECTION_GUIDANCE = """
+_TOOL_CALL_REJECTION_KNOWN_SHAPES = """
 ## Reading a tool-call rejection before you retry
 
 `InputValidationError` reports a defect in the CALL you just made, and it
 echoes back the exact bytes you sent — read that echo before retrying. It
-reports two different shapes, and they need OPPOSITE fixes:
+reports several distinct shapes, and they do not share a fix:
 
 - "could not be parsed as JSON" means the call's SYNTAX is broken and no
   parameter VALUE is implicated. Re-emit the entire call from scratch; never
@@ -667,6 +667,63 @@ reports two different shapes, and they need OPPOSITE fixes:
   tool called before `ToolSearch` loaded its schema. Consult the schema; do
   not re-emit blindly.
 """
+
+
+# Census-2026-08-21 §1.1 companion to _TOOL_CALL_REJECTION_KNOWN_SHAPES above
+# (task 4578; plans/confusion-census-2026-08-21.md). A dispatched session
+# called the `Agent` tool supplying only a `prompt` field; the schema also
+# requires `description`, and the omission was rejected by
+# `InputValidationError: The required parameter 'description' is missing`
+# before any sub-agent launched.
+#
+# WHAT IS AND IS NOT ADDRESSED. The CAUSE is upstream of this repository --
+# harness-side tool-call construction for a Claude Code builtin -- and no
+# in-repo code path produces or can intercept it, so this constant does not
+# attempt to detect or repair the malformed call. Only the RECOVERY facet is
+# in scope, the same carve-out the constant above already takes for the
+# stray-comma sighting: a dispatched agent's response to the rejection is
+# this repo's to fix, through the role system prompts.
+#
+# DISCRIMINATION, NOT DUPLICATION. This is a THIRD `InputValidationError`
+# shape, not a rewording of either bullet above -- do not fold it into, or
+# delete, either existing bullet as redundant. The raw error string ("The
+# required parameter `X` is missing") is IDENTICAL to the deferred-tool
+# shape's founding evidence above, so the string alone does not discriminate
+# between the two mechanisms; read the echo instead. The deferred-tool case
+# carries a trailer stating the tool's schema was not sent to the API, and
+# names a parameter the schema does not have -- an INVENTED name. This case
+# carries neither: the named parameter is real and accepted, and only a
+# required sibling is missing.
+#
+# HARD CONSTRAINTS, same as the block above. No `mcp__<family>__<name>`
+# example -- the ancestry-check test that guards role/tool-grant consistency
+# is parametrized over every role and would fail for whichever of the 8
+# roles lacks the grant; `Agent`, `ToolSearch` and `InputValidationError` are
+# all builtins and do not match that test's regex, so naming them is safe,
+# and `Agent` is genuinely reachable by a dispatched role regardless of
+# whether it appears in that role's allowed_tools -- the same fact the
+# comment above already records for `ToolSearch`. No literal `{`/`}` braces
+# -- role prompts reach this only by plain `+` concatenation. No sighting
+# COUNT -- the codebook accrues a new sighting every census cycle, and a
+# number baked into a role prompt goes stale silently.
+MISSING_REQUIRED_PARAMETER_REJECTION = """\
+- A rejection naming a REQUIRED parameter that is MISSING is a third shape,
+  distinct from both above: the call parsed fine and the parameter it
+  names IS a real, accepted field — a required sibling was left out. No
+  schema-not-sent trailer, and the named parameter is real rather than
+  invented, means a required sibling is missing rather than the
+  deferred-tool problem above — re-emit the whole call with every required
+  field supplied; do not edit or drop the field that was already accepted,
+  and do not reach for `ToolSearch`. Catalogued sighting: an `Agent` call
+  that supplied `prompt` and omitted the required `description`, rejected
+  before any sub-agent launched.
+"""
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# own -- test_roles_tool_call_rejection.py asserts the composition so the
+# three shapes cannot drift apart.
+TOOL_CALL_REJECTION_GUIDANCE = _TOOL_CALL_REJECTION_KNOWN_SHAPES + MISSING_REQUIRED_PARAMETER_REJECTION
 
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
