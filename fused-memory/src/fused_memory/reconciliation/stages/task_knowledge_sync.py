@@ -9,7 +9,7 @@ import itertools
 import json
 import logging
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -1183,6 +1183,7 @@ async def _sweep_stale_mem0_pool(
     scroll_limit: int = 1000,
     count_short_circuit: bool = False,
     enum_filters: dict | Sequence[dict] | None = None,
+    terminal_task_ids: Collection[str] | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1246,6 +1247,47 @@ async def _sweep_stale_mem0_pool(
     (which would send an operator to tighten the wrong thing). An over-broad
     payload filter therefore degrades to a LOUD, correctly-attributed skip
     rather than collateral loss.
+
+    **Terminal-task-closure gate (task 4375, opt-in per caller).** When
+    *terminal_task_ids* is supplied, an age-stale member is additionally
+    required to cite a ``metadata.task_id`` that is confirmed TERMINAL before
+    it may be retired, mirroring on the Mem0 side the ``task_id IN (...)``
+    arm that
+    :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc`
+    already applies to ledger rows. The semantics are AND, never OR: the gate
+    is ADDITIONAL to — never an alternative to — the age cutoff and the two
+    protected-record guards above.
+
+    The ``None``-vs-``[]`` sentinel is load-bearing:
+
+    - ``None`` (the default) means "NO gate requested" and leaves this
+      skeleton byte-for-byte as it was for the two age-only callers
+      (:func:`_sweep_stale_persistence_markers`,
+      :func:`_sweep_stale_mem0_flag_markers`), which are age-only by design.
+    - An EMPTY collection means "gate active, nothing is terminal" and
+      therefore retires nothing this cycle. :func:`_resolve_terminal_task_ids`
+      is explicitly fail-safe to ``[]`` on a falsy taskmaster, a raising
+      ``get_statuses``, or an unexpected result shape — so a Taskmaster outage
+      degrades to a FULL KEEP, not to unconditional age-deletion during
+      exactly the window in which nothing can be verified. Collapsing the two
+      sentinels would invert that.
+
+    Matching is exact-string against ``str(task_id).strip()``, deliberately
+    reusing ``_gc_recon_markers``' documented precedent and its consequence: a
+    marker whose stored ``task_id`` is a comma-joined multi-task list never
+    matches even when every cited task is terminal, and is KEPT. So is a
+    marker with no ``task_id`` at all, an empty one, or a non-Taskmaster
+    pseudo-id. That is a KEEP-direction leak and it is deliberate — this
+    module's documented posture is "uncertain => keep, never delete on
+    partial/failed information", and bounded recoverable growth outranks
+    permanent loss. It is surfaced, not hidden: when the gate withholds at
+    least one AGE-STALE member, ONE aggregate WARNING per sweep names the
+    retained count, so a persistently growing number becomes visible as the
+    signal that this pool needs a real closure path for task_id-less markers.
+    The gate is evaluated only for members that already cleared the age
+    cutoff, so that count means "old enough to retire but cannot be" and never
+    "not yet old enough" — a still-young marker citing an open task is the
+    healthy steady state of a live pool and must not inflate the signal.
 
     The guards live HERE rather than in each caller's payload filter because
     filter-tightening cannot guarantee precision:
@@ -1320,11 +1362,30 @@ async def _sweep_stale_mem0_pool(
             and unioned by ``id`` — see the "Multi-variant union" note
             above. ``source`` itself always supplies the human-readable log
             label regardless of which filter(s) are actually applied.
+        terminal_task_ids: Opt-in terminal-task-closure gate (task 4375).
+            ``None`` (default) disables the gate entirely, preserving the
+            age-only behaviour every caller had before this task. A supplied
+            collection — INCLUDING an empty one — activates it: an age-stale
+            member is retired only if ``str(metadata['task_id']).strip()`` is
+            a member. Accepts any ``Collection`` (list, set, frozenset); it is
+            normalized to a ``frozenset`` once so the per-member test is O(1).
+            See the "Terminal-task-closure gate" note above for the
+            ``None``-vs-``[]`` distinction and the deliberate KEEP-direction
+            consequences.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
+    # Normalize the terminal-closure gate ONCE (task 4375) so the per-member
+    # membership test below is O(1) and a caller may hand us any Collection.
+    # `None` is preserved as a distinct sentinel meaning "no gate requested" —
+    # it is NOT the same as an empty set, which means "gate active, nothing is
+    # terminal" and correctly retires nothing this cycle.
+    terminal_ids: frozenset[str] | None = (
+        None if terminal_task_ids is None else frozenset(terminal_task_ids)
+    )
+
     # Normalize enum_filters to a list of one-or-more filter variants (task
     # 3915): a bare dict is the pre-3915 single-filter shape (one-element
     # list); None preserves the {'source': source} default; a Sequence[dict]
@@ -1482,6 +1543,9 @@ async def _sweep_stale_mem0_pool(
     # as one list so the zip(..., strict=True) delete/result pairing below is
     # structurally unchanged.
     stale_members: list[dict] = []
+    # Count of age-stale members withheld by the terminal-closure gate, used
+    # for the single aggregate WARNING after the loop (task 4375).
+    retained_unclosed = 0
     for member in members:
         mid = member.get('id')
         if not mid:
@@ -1542,7 +1606,76 @@ async def _sweep_stale_mem0_pool(
             continue
 
         if created_at < cutoff:
+            # Terminal-task-closure gate (task 4375). Ordering within the
+            # eligibility chain is deliberate on BOTH sides:
+            #
+            # - AFTER the two protected-record guards, so a protected record
+            #   still produces its own attributable WARNING above rather than
+            #   being silently absorbed into the retained-unclosed tally.
+            # - AFTER the age test, so `retained_unclosed` counts only members
+            #   that are OLD ENOUGH TO RETIRE BUT CANNOT BE. A marker younger
+            #   than max_age_days citing an open task is the normal, healthy
+            #   steady state of a live relay pool; counting it would fire the
+            #   aggregate WARNING below every cycle for every healthy project
+            #   and train an operator to ignore the one signal that matters.
+            #   The gate is a `continue` either way, so the SET OF DELETED
+            #   RECORDS is identical under either ordering — only the
+            #   diagnostic's meaning changes.
+            #
+            # Exact-string match on the stripped task_id, reusing
+            # _gc_recon_markers' precedent verbatim — so a comma-joined
+            # multi-task task_id, a non-Taskmaster pseudo-id, an empty string
+            # and a missing key all fail the test and are KEPT. Never raises
+            # on a weird payload.
+            if terminal_ids is not None:
+                raw_task_id = (
+                    member_metadata.get('task_id')
+                    if isinstance(member_metadata, dict)
+                    else None
+                )
+                key = str(raw_task_id).strip() if raw_task_id is not None else ''
+                if not key or key not in terminal_ids:
+                    retained_unclosed += 1
+                    continue
+
             stale_members.append(member)
+
+    if retained_unclosed > 0:
+        # Retained-unclosed diagnostic (task 4375). The gate's KEEP direction
+        # is deliberate and correct — permanent loss outranks bounded,
+        # recoverable growth — but a marker with no task_id, a pseudo-id, or a
+        # comma-joined task_id can now NEVER be retired, so the cohort only
+        # grows. Surfaced rather than hidden, per the project's
+        # loud-over-silent-degradation invariant.
+        #
+        # Modelled on the task-3915 under-tagged-drift block above: purely
+        # diagnostic, emitted ONCE per sweep rather than per member, wrapped so
+        # it can never raise into the sweep, and it must never alter `members`
+        # or the returned count. Following that precedent is also why no new
+        # cycle stat is introduced for this cohort.
+        try:
+            logger.warning(
+                'reconciliation.%s: RETAINED %d age-stale %s record(s) — their '
+                'referencing task is not terminal, or they cite no resolvable '
+                'task id (missing/empty/comma-joined/non-Taskmaster). This is '
+                'the deliberate fail-safe KEEP direction, not a failure; a '
+                'persistently growing count means this pool needs a closure '
+                'path for task_id-less markers (task 4375).',
+                log_name, retained_unclosed, source,
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: retained-unclosed diagnostic raised; skipping '
+                '(fail-safe, does not affect the sweep count).',
+                log_name,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
 
     if not stale_members:
         return 0

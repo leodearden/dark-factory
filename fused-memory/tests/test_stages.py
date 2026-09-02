@@ -15346,6 +15346,39 @@ class TestSweepStaleMem0PoolTerminalClosureGate:
         assert '_sweep_stale_mem0_flag_for_stage2_markers' in message
 
     @pytest.mark.asyncio
+    async def test_young_members_are_not_counted_into_the_retained_tally(self, caplog):
+        """The retained count must mean "old enough to retire, but cannot be".
+
+        A marker younger than max_age_days citing an open task is the NORMAL,
+        healthy steady state of a live relay pool — it is not retirement-
+        eligible yet for a reason that has nothing to do with this gate.
+        Counting it would make the WARNING fire every cycle for every healthy
+        project (measured: 10 live flag_for_stage2 markers in dark_factory, 15
+        in autopilot_video), which is exactly the log noise that trains an
+        operator to ignore the signal. The number whose growth is meaningful
+        is the age-stale-but-unretireable backlog, and only that.
+        """
+        members = [
+            self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'}),
+            {
+                'id': 'young-and-open',
+                'created_at': (self._NOW - timedelta(days=1)).isoformat(),
+                'metadata': {'flag_for_stage2': True, 'task_id': 't-open'},
+            },
+        ]
+        memory_service = self._service(members)
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result, _ = await self._sweep(memory_service, terminal_task_ids={'t-done'})
+
+        assert self._deleted(memory_service) == {'terminal'}
+        assert result == 1
+        assert [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ] == []
+
+    @pytest.mark.asyncio
     async def test_no_aggregate_warning_when_nothing_is_withheld(self, caplog):
         members = [self._member('terminal', {'flag_for_stage2': True, 'task_id': 't-done'})]
         memory_service = self._service(members)
