@@ -4378,18 +4378,27 @@ class GitOps:
                 )
             if pool_info is WarmLaneUnavailable.STEAL_FAILED:
                 # Pool pressure (task 4930): the reclaim-on-exhaustion safety
-                # valve stole up to _WARM_LANE_STEAL_MAX_ATTEMPTS DIFFERENT
-                # lanes and every one failed to provision (or no further
-                # eligible victim remained). Carry the SAME typed census the
-                # EXHAUSTED row above appends, via the single shared render(),
-                # so an operator sees the pinned/free counts that drove the
-                # steal pressure in the same line.
+                # valve stole one or more DIFFERENT lanes and every one failed
+                # to provision, or a retry found no further eligible victim.
+                # The message deliberately states NO lane count: STEAL_FAILED is
+                # returned from two places — the driver after
+                # _WARM_LANE_STEAL_MAX_ATTEMPTS failures, and the impl after a
+                # SINGLE attempt when no further victim remains — so any fixed
+                # number would be a lie half the time, which is the exact defect
+                # the FAULT rewrite below removes. The per-lane detail (each
+                # lane and the sentinel it produced) is in the preceding
+                # `acquire_warm_lane: steal-retry` WARNING. Carry the SAME typed
+                # census the EXHAUSTED row above appends, via the single shared
+                # render(), so an operator sees the pinned/free counts that
+                # drove the steal pressure in the same line.
                 census = self._assemble_warm_lane_census()
                 raise WarmLaneStealFailed(
                     f'warm-lane reclaim-on-exhaustion steal failed for branch '
-                    f'{branch_name!r}: all {_WARM_LANE_STEAL_MAX_ATTEMPTS} '
-                    f'attempted lanes failed to provision (or no further '
-                    f'eligible victim remained); requeue — {census.render()}'
+                    f'{branch_name!r}: every stolen lane failed to provision, or '
+                    f'no further eligible victim remained (at most '
+                    f'{_WARM_LANE_STEAL_MAX_ATTEMPTS} attempts per acquire); the '
+                    f'per-lane detail is in the preceding `acquire_warm_lane: '
+                    f'steal-retry` WARNING. Requeue — {census.render()}'
                 )
             if pool_info is WarmLaneUnavailable.DISABLED:
                 # A PROGRAMMING ERROR, not an infra fault: the caller reached
@@ -4410,11 +4419,15 @@ class GitOps:
             # an unclassified infra fault genuinely is a per-task block.
             #
             # Task 4930 rewrote this message. It used to claim "seed/worktree-add
-            # failure, absent seed script, or pool disabled" — two thirds of
-            # which FAULT cannot produce: an absent CoW base is BASE_ABSENT
-            # (WarmLanePoolHardDown) and a disabled pool is DISABLED, handled
-            # just above. That left an operator with a three-cause guess for a
-            # condition whose real root cause was already in the journal.
+            # failure, absent seed script, or pool disabled". ONE of those three
+            # was wrong: a disabled pool is DISABLED, handled just above, and
+            # never reaches here. The other two are genuine FAULT producers and
+            # are kept — in particular an absent seed SCRIPT is rc=127, which
+            # _seed_rc_to_unavailable maps to FAULT (an absent CoW BASE is the
+            # different rc=76 → BASE_ABSENT/WarmLanePoolHardDown condition; do
+            # not conflate them). The real defect was that the old text stopped
+            # at three terse causes and never pointed at the journal line whose
+            # traceback already carried the actual root cause.
             raise RuntimeError(
                 f'warm-lane acquire fault for branch {branch_name!r}: the pool '
                 f'could not provision a lane and the failure matched none of '
@@ -6618,6 +6631,26 @@ class GitOps:
         :data:`_WARM_LANE_STEAL_MAX_ATTEMPTS` the driver returns
         ``STEAL_FAILED`` — a requeue class, not a block.
 
+        **The cost of a retry is paid by OTHER tasks, not by this one.**  Every
+        attempt past the first is itself a steal: it evicts another
+        non-dispatched task from its lane (commits its WIP, resets the lane,
+        forces it to re-acquire).  So a failing acquire displaces up to
+        ``_WARM_LANE_STEAL_MAX_ATTEMPTS`` innocent tasks instead of one, and the
+        cap bounds that per-acquire, NOT fleet-wide: under a HOST-scoped
+        condition that surfaces as generic ``FAULT`` (a repo-wide
+        ``git worktree add`` failure, a corrupt base seeding rc=1, an unexpected
+        provisioning exception) every dispatch evicts three victims that then
+        requeue and steal again.  A future retune of that constant must price in
+        the victim evictions, not just this acquire's added latency.
+
+        Short-circuiting the loop when two DIFFERENT lanes fail with the SAME
+        sentinel would look like a cheap host-scope detector and is deliberately
+        NOT done: all three measured lane-scoped hostility modes (conflicted
+        index, branch checked out elsewhere, unexpected provisioning exception)
+        collapse into that same ``FAULT``, so the heuristic cannot separate them
+        from a host-wide fault and would instead cut the retry — the whole point
+        of this driver — down to one for the incident's own signature.
+
         Everything the retry needs lives on THIS call's stack (``excluded``,
         ``stolen``), never on the instance: ``acquire_warm_lane`` runs
         concurrently for different tasks on one shared GitOps, the same
@@ -7088,22 +7121,54 @@ class GitOps:
         # makes the steal-path retry non-trivial: the failed attempt unwound
         # through _abort_lane_acquisition, whose final pool.release(lane)
         # returned the hostile lane to FREE — where it is the LOWEST-INDEX FREE
-        # lane and therefore exactly what acquire_for just handed back. Release
-        # it again (which also clears the assignment entry acquire_for just
-        # wrote — WarmLanePool.release drops every _assignments entry pointing
-        # at the lane) and fall through to the steal path, which will pick a
-        # genuinely different victim. Only a FRESH allocation is vetoed: a
-        # `reused` hit means the branch is already mapped to that lane, which
-        # is a live-requeue, not this retry loop re-picking it.
+        # lane and therefore exactly what acquire_for just handed back. Only a
+        # FRESH allocation is vetoed: a `reused` hit means the branch is already
+        # mapped to that lane, which is a live-requeue, not this retry loop
+        # re-picking it.
+        #
+        # The veto PROBES rather than giving up on free capacity. acquire_for
+        # only ever returns the lowest-index FREE lane, so a healthy lane that a
+        # concurrent task released during the previous (multi-second)
+        # provisioning attempt is invisible behind the excluded one. Vetoing
+        # straight to the steal path would then evict a live non-dispatched
+        # victim — or, with no eligible victim left, return STEAL_FAILED and
+        # burn the task's requeue cap — while a usable FREE lane sat idle.
+        # So each declined lane is HELD (kept ASSIGNED, with only its branch key
+        # dropped, so the next acquire_for is a fresh allocation that must look
+        # PAST it rather than taking the reuse fast path) until acquire_for
+        # either yields a non-excluded lane or reports exhaustion; the held
+        # lanes are then handed straight back. Bounded by |steal_excluded| + 1
+        # iterations (< _WARM_LANE_STEAL_MAX_ATTEMPTS), each consuming one FREE
+        # lane, so it always terminates. The pool itself stays a pure FREE/
+        # ASSIGNED state machine with no notion of per-acquire retry history —
+        # exclusion remains entirely in git_ops (design decision 3); an
+        # `exclude=` parameter on acquire_for would do this atomically and is
+        # the cleaner long-term shape, but lives in warm_lane_pool.py.
         if acq is not None and not acq[1] and acq[0] in steal_excluded:
-            logger.info(
-                'acquire_warm_lane: steal-retry — declining re-handed lane %s '
-                'for %r (already failed this acquire); falling through to the '
-                'reclaim valve',
-                acq[0], branch_name,
-            )
-            await self.warm_lane_pool.release(acq[0])
-            acq = None
+            held: list[Path] = []
+            try:
+                while acq is not None and not acq[1] and acq[0] in steal_excluded:
+                    logger.info(
+                        'acquire_warm_lane: steal-retry — declining re-handed '
+                        'lane %s for %r (already failed this acquire); probing '
+                        'for another FREE lane',
+                        acq[0], branch_name,
+                    )
+                    held.append(acq[0])
+                    self.warm_lane_pool.drop_assignment(branch_name)
+                    acq = await self.warm_lane_pool.acquire_for(
+                        branch_name, title=expected_title, branch=full_branch,
+                    )
+            finally:
+                # Always give the held lanes back — they were only ever held to
+                # see past them, never used. Released AFTER the probe so the
+                # loop cannot be re-handed one it just declined. release() also
+                # drops every _assignments entry pointing at the lane, and the
+                # lane finally chosen is never among the held ones (a held lane
+                # is ASSIGNED and acquire_for only allocates a FREE one), so the
+                # winning branch → lane mapping survives intact.
+                for held_lane in held:
+                    await self.warm_lane_pool.release(held_lane)
         if acq is None:
             # Pool exhausted — try to reclaim a non-dispatched non-terminal lane
             # before falling back to EXHAUSTED (task 1933 safety valve).

@@ -418,6 +418,133 @@ class TestStealRetriesAnotherLane:
         )
 
 
+    async def test_lock_timeout_steal_is_retried_on_another_lane(
+        self, wl_git_repo: Path,
+    ):
+        """rc=124 (LANE_LOCK_TIMEOUT) is retryable, exactly like FAULT.
+
+        A lost ``<lane>.lock`` race is the single most-expected hostile-lane
+        cause (a concurrent GC reseed holds the lock 25-88s against a 30s
+        wait), and it is lane-scoped: a DIFFERENT lane is not the one mid-
+        reseed. Every other retry test injects rc=1, so without this one
+        nothing pins ``LANE_LOCK_TIMEOUT``'s membership in ``_STEAL_RETRYABLE``.
+        """
+        from orchestrator.git_ops import _SEED_WARM_LANE_LOCK_TIMEOUT_RC
+
+        git_ops, lanes, start_ref = await _setup_pool(wl_git_repo, size=2)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        seen = _install_selective_seed_failure(
+            git_ops, failing_rc=_SEED_WARM_LANE_LOCK_TIMEOUT_RC,
+        )
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), (
+            f'a stolen lane whose seed lost the lock race must be retried on '
+            f'another lane, not returned as a failure sentinel; got {result!r}'
+        )
+        hostile = seen[0]
+        assert result.path != hostile, (
+            f'the retry must serve a DIFFERENT lane; served the hostile '
+            f'{hostile} again'
+        )
+        assert result.path in lanes, f'served lane {result.path} is not a pool lane'
+        assert pool.assignment_for('Z') == result.path
+
+    async def test_non_retryable_steal_sentinel_is_not_retried(
+        self, wl_git_repo: Path,
+    ):
+        """A HOST-scoped sentinel from a steal passes straight through.
+
+        ``_STEAL_RETRYABLE`` deliberately excludes DISK_PRESSURE / SOFT_PRESSURE
+        / BASE_ABSENT: those are properties of the host, so another lane cannot
+        help and retrying would only evict more innocent victims. Nothing else
+        drives the ``if result not in _STEAL_RETRYABLE: return result`` branch,
+        so widening that constant to a host-scoped sentinel would otherwise
+        burn three steals per acquire with no test failing.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        git_ops, _lanes, start_ref = await _setup_pool(wl_git_repo, size=2)
+        seen = _install_selective_seed_failure(git_ops, failing_rc=75)
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert result is WarmLaneUnavailable.DISK_PRESSURE, (
+            f'exit 75 is the disk discriminant and must survive the steal path '
+            f'unchanged; got {result!r}'
+        )
+        assert len(seen) == 1, (
+            f'a host-scoped sentinel must not be retried on another lane; saw '
+            f'{len(seen)} seed attempts: {seen}'
+        )
+
+    async def test_free_lane_freed_mid_attempt_beats_evicting_a_victim(
+        self, wl_git_repo: Path,
+    ):
+        """The retry must PREFER a FREE lane over stealing from a live victim.
+
+        ``acquire_for`` only ever returns the LOWEST-INDEX free lane, and the
+        hostile lane is free again by retry time (``_abort_lane_acquisition``
+        released it), so a healthy lane that a concurrent task released during
+        the previous multi-second provisioning attempt is hidden behind it.
+        Vetoing straight to the steal path would evict a live non-dispatched
+        victim while that free lane sat idle. Simulates the concurrent release
+        from inside the hostile seed — the exact window in which it happens.
+        """
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops, lanes, start_ref = await _setup_pool(wl_git_repo, size=3)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        free_lane = lanes[-1]  # V2's lane — released mid-attempt below
+
+        real_seed = git_ops._seed_warm_lane
+        seen: list[Path] = []
+        hostile: set[Path] = set()
+
+        async def _seed(lane_dir, mode, *, take_lane_lock: bool = True) -> int:
+            lane = Path(lane_dir)
+            seen.append(lane)
+            if not hostile and lane != free_lane:
+                # First stolen lane is hostile — and while this attempt is in
+                # flight a concurrent task finishes and releases a HIGHER-index
+                # healthy lane.
+                hostile.add(lane)
+                await pool.release(free_lane)
+                return 1
+            if lane in hostile:
+                return 1
+            return await real_seed(lane_dir, mode, take_lane_lock=take_lane_lock)
+
+        git_ops._seed_warm_lane = _seed  # type: ignore[method-assign]
+
+        result = await git_ops.acquire_warm_lane('Z', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'expected success, got {result!r}'
+        assert result.path == free_lane, (
+            f'the retry must take the FREE lane {free_lane} released mid-'
+            f'attempt, not steal another victim; served {result.path}'
+        )
+        survivors = {
+            br: lane for br, lane in pool.assignments_snapshot().items()
+            if br.startswith('V')
+        }
+        assert survivors, (
+            'the remaining victim must keep its lane — a free lane was '
+            f'available, so nothing should have been evicted: {survivors}'
+        )
+        hostile_lane = next(iter(hostile))
+        assert pool.state(hostile_lane) is LaneState.FREE, (
+            f'the vetoed lane {hostile_lane} was only HELD to see past it and '
+            f'must be handed back FREE, not leaked ASSIGNED'
+        )
+        assert seen.count(hostile_lane) == 1, (
+            f'the hostile lane must not be re-handed: {seen}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # step-07: exhausting the retries yields STEAL_FAILED, without manufacturing a
 #          false structural-exhaustion signal
@@ -644,8 +771,9 @@ class TestCreateWorktreeMapping:
         self, wl_git_repo: Path,
     ):
         """FAULT still blocks + L1 (a genuine unclassified infra fault), but
-        its message must stop naming three causes that are each separately
-        typed, and must point at the log line carrying the real root cause.
+        its message must stop naming the one cause that is separately typed
+        (a disabled pool → DISABLED), and must point at the log line carrying
+        the real root cause instead of leaving a terse multi-cause guess.
         """
         from orchestrator.git_ops import WarmLaneUnavailable
 
@@ -655,10 +783,12 @@ class TestCreateWorktreeMapping:
             await git_ops.create_worktree('A')
 
         msg = str(exc_info.value)
-        assert 'absent seed script' not in msg, (
-            f'BASE_ABSENT is separately typed (WarmLanePoolHardDown); the '
-            f'FAULT message must not claim it: {msg!r}'
-        )
+        # NB: the old message's 'absent seed script' clause is NOT pinned away.
+        # An absent seed SCRIPT is rc=127, which _seed_rc_to_unavailable maps to
+        # FAULT — a real producer, and the rewritten message still names it. It
+        # is the absent CoW BASE (rc=76) that is separately typed as
+        # WarmLanePoolHardDown; the two must not be conflated. Only the 'pool
+        # disabled' clause was stale, and only that one is asserted away.
         assert 'pool disabled' not in msg, (
             f'DISABLED now has its own message; the FAULT message must not '
             f'claim it: {msg!r}'
