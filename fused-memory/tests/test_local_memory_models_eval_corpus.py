@@ -19,12 +19,10 @@ server-side on the live path.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import errno
 import hashlib
 import importlib.util
-import io
 import json
 import os
 import random
@@ -37,6 +35,11 @@ from typing import Any
 
 import pytest
 from _fm_helpers import falkor_skipif
+from shared.testing_streams import (
+    StdoutWithAFailingFlush,
+    StdoutWithAFailingWrite,
+    closed_pipe_stdout,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
@@ -2718,65 +2721,6 @@ class TestAWriteFailureIsNotBlamedOnTheStore:
         assert code == _mod.EXIT_CODES['bad_manifest']
 
 
-@contextlib.contextmanager
-def _closed_pipe_stdout(monkeypatch, *, buffering: int | None = None, quiet_close: bool = True):
-    """Point ``sys.stdout`` at a pipe whose reader is already gone (the ``| head`` shape).
-
-    A REAL closed ``os.pipe()``, never a mocked ``print``: a fix that only
-    satisfies a mock cannot pass through here, because the assertion is on the
-    actual OS-level write failure.
-
-    *buffering* is the load-bearing knob, not a detail — it selects WHICH of
-    the two failure regimes the test exercises, so every caller states it:
-
-    * ``None`` (block buffering, the default) — a short write stays in the
-      buffer, nothing fails in-band, and only an explicit flush can surface it.
-    * ``1`` (line buffering) — every print does a real ``write()``, so the
-      failure is raised during the run.
-
-    The exit is itself an assertion. Closing the wrapper stands in for the
-    interpreter's finalization-time flush of ``sys.stdout``, which is where a
-    closed pipe would otherwise resurface as "Exception ignored ..." noise and
-    a forced exit status no ``return`` can override. It runs in a ``finally``
-    so a failing assertion in the body cannot skip it or leak the write fd;
-    the verdict on it is checked only when the body passed, so a real failure
-    is never masked by a second one here.
-
-    *quiet_close* says which LAYER is under test. ``True`` (``_cli``, the
-    process boundary) means that flush must not raise, because ``_cli`` owns
-    fd 1 and redirects it to ``os.devnull``. ``False`` (``main`` alone) means
-    it must raise: ``main(argv) -> int`` deliberately does not mutate a
-    process-global fd on behalf of a caller that only asked for an exit code.
-    """
-    read_fd, write_fd = os.pipe()
-    os.close(read_fd)  # the reader is already gone, like `head` after its window
-    if buffering is None:
-        pipe_stdout = os.fdopen(write_fd, 'w')
-    else:
-        pipe_stdout = os.fdopen(write_fd, 'w', buffering=buffering)
-    original_stdout = sys.stdout
-    monkeypatch.setattr(sys, 'stdout', pipe_stdout)
-    close_failure: BaseException | None = None
-    try:
-        yield pipe_stdout
-    finally:
-        sys.stdout = original_stdout
-        try:
-            pipe_stdout.close()
-        except BrokenPipeError as exc:
-            close_failure = exc
-    if quiet_close:
-        assert close_failure is None, (
-            'the interpreter\'s shutdown flush would have raised a second, '
-            f'uncatchable BrokenPipeError: {close_failure!r}'
-        )
-    else:
-        assert close_failure is not None, (
-            'this layer took over the caller\'s stdout fd — only the process '
-            'boundary may do that'
-        )
-
-
 class TestBrokenPipeIsARunFailureNotATraceback:
     """A downstream reader closing stdout early (``--verify | head``) must not traceback.
 
@@ -2797,7 +2741,7 @@ class TestBrokenPipeIsARunFailureNotATraceback:
     ):
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch, buffering=1):
+        with closed_pipe_stdout(monkeypatch, buffering=1):
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
             )
@@ -2824,7 +2768,7 @@ class TestBrokenPipeIsARunFailureNotATraceback:
         """
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False):
+        with closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False):
             code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
 
         assert code == _mod.EXIT_RUN_FAILED
@@ -2836,7 +2780,7 @@ class TestBrokenPipeIsARunFailureNotATraceback:
         """CONTROL: not specific to the write path — the report print itself is the hazard."""
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch, buffering=1):
+        with closed_pipe_stdout(monkeypatch, buffering=1):
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
                 entry=_mod._cli,
@@ -2881,7 +2825,7 @@ class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
         """
         out = self._built_manifest(monkeypatch, tmp_path)
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch):
+        with closed_pipe_stdout(monkeypatch):
             code, _ = _run_cli(
                 monkeypatch, '--verify', '--out', str(out), entry=_mod._cli
             )
@@ -2928,7 +2872,7 @@ class TestAPipeThatBrokeAfterTheManifestLandedSaysSo:
     ):
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
+        with closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
             )
@@ -2953,7 +2897,7 @@ class TestAPipeThatBrokeAfterTheManifestLandedSaysSo:
         out.unlink()
 
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch):
+        with closed_pipe_stdout(monkeypatch):
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
                 entry=_mod._cli,
@@ -3035,7 +2979,7 @@ class TestTheCorpusCliConsumesTheSharedBoundaryHelper:
 
         out = tmp_path / 'corpus_manifest.json'
         capsys.readouterr()
-        with _closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
+        with closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
             code, _ = _run_cli(
                 monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
             )
@@ -3091,58 +3035,6 @@ class TestTheCorpusCliConsumesTheSharedBoundaryHelper:
         assert str(out) not in capsys.readouterr().err
 
 
-class _StdoutWithAFailingFlush(io.StringIO):
-    """A stdout that accepts every write and fails on flush — ENOSPC, not a closed reader.
-
-    ``StringIO.fileno()`` raises ``io.UnsupportedOperation``, so this doubles as
-    a pin on the handler's fd guard: a stream with no real descriptor must not
-    turn the reported failure into a second, different traceback out of the
-    code meant to prevent the first one.
-    """
-
-    def __init__(self, exc: OSError):
-        super().__init__()
-        self._exc = exc
-
-    def flush(self) -> None:
-        raise self._exc
-
-
-class _StdoutWithAFailingWrite(io.StringIO):
-    """A stdout whose LARGE writes fail outright — the IN-BAND half of the pair above.
-
-    ``_StdoutWithAFailingFlush`` accepts every write and defers the failure to
-    the flush, which is what a *block-buffered* full disk does. A real
-    ``> /full/disk/report.txt`` also fails the other way: once the write is big
-    enough to reach the device — over the 8 KiB buffer, or on any write at all
-    when unbuffered — the ``write()`` itself raises, mid-run, with no flush
-    involved. Same errno, different frame, different handler needed.
-
-    *min_length* gates which writes fail, so the double stays usable for the
-    rest of the run rather than exploding on the first character. MEASURED on
-    ``--n 20 --dry-run``: the four stdout writes are 759, 0, 70 and 1
-    characters — the ``render_report`` body, then the ``dry-run: ...`` line and
-    its newline — so any threshold between 71 and 759 fails exactly the report
-    write. 200 is used, comfortably clear of both edges.
-
-    Keeps ``_StdoutWithAFailingFlush``'s ``io.StringIO`` base for the same
-    second job: ``StringIO.fileno()`` raises ``io.UnsupportedOperation``, so
-    this re-pins the handler's fd guard — a stream with no real descriptor must
-    not turn the reported failure into a different traceback out of the code
-    meant to prevent the first one.
-    """
-
-    def __init__(self, exc: OSError, *, min_length: int):
-        super().__init__()
-        self._exc = exc
-        self._min_length = min_length
-
-    def write(self, s: str) -> int:
-        if len(s) >= self._min_length:
-            raise self._exc
-        return super().write(s)
-
-
 class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
     """``build_corpus.py --dry-run > /full/disk/report.txt``: ENOSPC is not a traceback either.
 
@@ -3168,7 +3060,7 @@ class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
         monkeypatch.setattr(
             sys,
             'stdout',
-            _StdoutWithAFailingFlush(OSError(errno.ENOSPC, 'No space left on device')),
+            StdoutWithAFailingFlush(OSError(errno.ENOSPC, 'No space left on device')),
         )
         capsys.readouterr()
         code, _ = _run_cli(
@@ -3205,10 +3097,19 @@ class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
         site differ and nothing else.
         """
         out = tmp_path / 'corpus_manifest.json'
+        # min_length is MEASURED against THIS CLI, which is why the shared
+        # double leaves the threshold to its caller. On ``--n 20 --dry-run``
+        # build_corpus makes four stdout writes — 759, 0, 70 and 1 characters:
+        # the ``render_report`` body, then the ``dry-run: ...`` line and its
+        # newline. Any threshold between 71 and 759 fails exactly the report
+        # write; 200 sits comfortably clear of both edges. Too low and the
+        # double explodes on the first character, so the run never reaches the
+        # write under test; too high and nothing fails at all and the test goes
+        # green while asserting nothing.
         monkeypatch.setattr(
             sys,
             'stdout',
-            _StdoutWithAFailingWrite(
+            StdoutWithAFailingWrite(
                 OSError(errno.ENOSPC, 'No space left on device'), min_length=200
             ),
         )

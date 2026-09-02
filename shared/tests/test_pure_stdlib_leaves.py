@@ -74,6 +74,7 @@ PURE_STDLIB_LEAVES = (
     'task_claimant',
     'task_statuses',
     'task_transitions',
+    'testing_streams',
     'timestamps',
     'transcript_archive',
     'verify_admission',
