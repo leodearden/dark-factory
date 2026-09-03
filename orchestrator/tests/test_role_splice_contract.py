@@ -518,3 +518,168 @@ def test_composes_is_not_hardcoded_to_two_halves(half_count: int) -> None:
     )
 
     assert contract.assert_composes(halves, remedy=_REMEDY) is None
+
+
+# Synthetic prompts shaped like a real role prompt: an identity paragraph with
+# no heading, then sections each introduced by `MARKDOWN_HEADING`. `_SPLICE`
+# itself opens with that heading (as `BACKGROUND_WAIT_GUIDANCE` and
+# `TOOL_CALL_REJECTION_GUIDANCE` both do), so `find(_SPLICE) ==
+# find(MARKDOWN_HEADING)` is exactly the "spliced up front" condition.
+_IDENTITY = 'You are a synthetic agent. You do synthetic work.'
+_SECTION = f'{MARKDOWN_HEADING}A Later Section\n\nSome other rule.\n'
+_PREDECESSOR = f'{MARKDOWN_HEADING}Predecessor Block\n\nThe block spliced first.\n'
+
+
+def test_placement_up_front_passes_when_the_splice_owns_the_first_heading() -> None:
+    """`follows=None`: the constant's own heading IS the prompt's first `##`."""
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    assert contract.assert_placement(remedy=_REMEDY) is None
+
+
+def test_placement_up_front_fires_when_another_section_precedes_the_splice() -> None:
+    """A `##` section ahead of the splice fires, reporting offset and first_heading."""
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_SECTION}{_SPLICE}'), frozenset({'alpha'})
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_placement(remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert 'alpha' in message
+    assert 'offset' in message
+    assert 'first_heading' in message
+    assert _REMEDY in message
+
+
+def test_placement_up_front_fires_when_the_splice_lands_past_the_char_budget() -> None:
+    """A pathologically long heading-free preamble fires even though it owns the first `##`.
+
+    The budget is the secondary, deliberately loose bound: the real invariant is
+    the structural one, and this only catches a preamble that is technically
+    heading-free but far too long.
+    """
+    preamble = 'A very long identity paragraph. ' * 60  # ~1920 chars, no heading
+    contract = _contract(
+        _roles(alpha=f'{preamble}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    # Structurally correct — it still owns the first `##` heading.
+    assert contract.assert_placement(remedy=_REMEDY) is None
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_placement(char_budget=1500, remedy=_REMEDY)
+    assert 'alpha' in str(excinfo.value)
+
+
+def test_placement_up_front_passes_within_the_char_budget() -> None:
+    """A short preamble passes the budget check."""
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    assert contract.assert_placement(char_budget=1500, remedy=_REMEDY) is None
+
+
+@pytest.mark.parametrize('follows', [None, _PREDECESSOR])
+def test_placement_records_an_absent_splice_as_an_offender_in_both_modes(
+    follows: str | None,
+) -> None:
+    """ABSENT is RECORDED, never skipped — in up-front AND follows mode.
+
+    This is what stops the placement check passing vacuously on a role that
+    dropped the splice entirely: with no index to compare, "no offender found"
+    would otherwise read as "correctly placed".
+    """
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_PREDECESSOR}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_placement(follows=follows, follows_name='PREDECESSOR', remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert 'alpha' in message
+    assert 'ABSENT' in message
+
+
+def test_placement_follows_passes_when_the_splice_abuts_its_predecessor() -> None:
+    """`follows=`: the constant lands IMMEDIATELY after the predecessor, no gap."""
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_PREDECESSOR}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    assert (
+        contract.assert_placement(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+        is None
+    )
+
+
+def test_placement_follows_fires_when_text_is_inserted_before_the_splice() -> None:
+    """A gap between predecessor and constant fires, reporting the expected index."""
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_PREDECESSOR}{_SECTION}{_SPLICE}'), frozenset({'alpha'})
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_placement(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+
+    message = str(excinfo.value)
+    assert 'alpha' in message
+    assert 'offset' in message
+    assert 'PREDECESSOR' in message
+    assert _REMEDY in message
+
+
+def test_placement_follows_falls_back_to_the_up_front_rule_without_a_predecessor() -> None:
+    """A role carrying no predecessor block falls back to the first-`##` rule.
+
+    This is `judge` in production: it carries `TOOL_CALL_REJECTION_GUIDANCE` but
+    no `BACKGROUND_WAIT_GUIDANCE`, so "immediately after the wait block" has no
+    referent and the up-front landmark governs instead. Derived at runtime from
+    whether the predecessor is present, never hardcoded to a role name.
+    """
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+    assert (
+        contract.assert_placement(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+        is None
+    )
+
+    buried = _contract(
+        _roles(alpha=f'{_IDENTITY}{_SECTION}{_SPLICE}'), frozenset({'alpha'})
+    )
+    with pytest.raises(AssertionError) as excinfo:
+        buried.assert_placement(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+    assert 'first_heading' in str(excinfo.value)
+
+
+@pytest.mark.parametrize('follows', [None, _PREDECESSOR])
+def test_placement_char_budget_none_means_no_budget_check(follows: str | None) -> None:
+    """`char_budget=None` (the default) disables the budget check in BOTH modes.
+
+    The rejection file passes no budget at all: its splice sits after the wait
+    block, which is itself budget-checked by the wait file, so a second budget
+    would be a redundant hand-maintained number.
+    """
+    preamble = 'A very long identity paragraph. ' * 60
+    contract = _contract(
+        _roles(alpha=f'{preamble}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    assert (
+        contract.assert_placement(follows=follows, follows_name='PREDECESSOR', remedy=_REMEDY)
+        is None
+    )
