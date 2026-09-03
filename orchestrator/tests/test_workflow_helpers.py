@@ -234,6 +234,69 @@ def test_e2e_factories_identity() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Group E: transcript-archival harness (task 4384): ENC, _config,
+# _make_git_ops, _make_workflow, _config_dir, _write_transcript, _archived —
+# promoted out of three divergent copies (test_transcript_archive_producer_hook.py,
+# test_transcript_archive_backstop.py, test_transcript_archival_boundary_gate.py).
+# ---------------------------------------------------------------------------
+
+
+def test_transcript_archival_factories_smoke(tmp_path) -> None:
+    """The transcript-archival factories build the paths and objects the suites assert on.
+
+    Only the cheap, pure-path contracts are exercised. `_make_workflow` is
+    deliberately NOT driven here: it needs a real git repo plus
+    `create_worktree`, and all three consumer suites already drive it
+    end-to-end, so duplicating that cost buys nothing.
+    """
+    from _workflow_helpers import (  # noqa: PLC0415
+        ENC,
+        _archived,
+        _config,
+        _config_dir,
+        _make_git_ops,
+        _write_transcript,
+    )
+
+    from orchestrator.config import TranscriptArchiveConfig  # noqa: PLC0415
+    from orchestrator.git_ops import GitOps  # noqa: PLC0415
+
+    repo = tmp_path / 'repo'
+    wt = tmp_path / 'wt'
+
+    # The hyphen-encoded project dir the fake transcripts live under.
+    assert ENC == '-home-leo-projX'
+
+    # git_ops.py's per-task Claude config-dir derivation.
+    assert _config_dir(wt, '7') == wt / '.task' / 'claude-config-7'
+
+    src = _write_transcript(wt, '7', 'sess-A', b'x')
+    assert src.exists()
+    assert src == _config_dir(wt, '7') / 'projects' / ENC / 'sess-A.jsonl'
+    assert src.read_bytes() == b'x'
+
+    assert _archived(repo, '7', 'sess-A') == (
+        repo / 'data' / 'orchestrator' / 'agent-transcripts' / '7' / ENC / 'sess-A.jsonl'
+    )
+
+    assert _config(repo).project_root == repo
+    assert _config(repo).transcript_archive.enabled is True
+    # Overrides reach OrchestratorConfig.
+    disabled = _config(repo, transcript_archive={'enabled': False})
+    assert disabled.transcript_archive.enabled is False
+
+    ops = _make_git_ops(repo)
+    assert isinstance(ops, GitOps)
+    assert ops.project_root == repo
+    # No transcript_archive => the teardown backstop is inert...
+    assert ops.transcript_archive is None
+    # ...and the passthrough kwarg reaches GitOps.__init__ and arms it.
+    armed = _make_git_ops(repo, transcript_archive=TranscriptArchiveConfig())
+    assert armed.transcript_archive is not None
+    assert armed.transcript_archive.enabled is True
+
+
+# ---------------------------------------------------------------------------
 # Contract: the same-module-sibling constructor is depth-invariant (task 3866,
 # relocated here from test_workflow_status_on_resume.py by task 3903 so the
 # contract test sits beside the helper it pins).
