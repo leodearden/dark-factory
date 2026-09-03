@@ -2088,12 +2088,13 @@ class CuratorConfig(BaseModel):
 
     # Zero-output-timeout (ZOT) circuit-breaker watchdog.
     # Root cause: transient Anthropic-backend degradation on the curator's
-    # sonnet+json-schema call shape (task 1550). Each hang burns the full
+    # sonnet+json-schema call shape (task 1743). Each hang burns the full
     # timeout_seconds (180s); the breaker stops every call burning that cost
     # during a sustained outage while preserving the best-effort
     # degrade-to-create contract.
     # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
-    # any success or on a non-ZOT failure).
+    # any success or on a non-ZOT failure — the batch path's missing reset
+    # was fixed in task 4143).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
     # before allowing a half-open probe.
