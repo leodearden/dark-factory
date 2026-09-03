@@ -168,11 +168,40 @@ def _is_testclient_construction(call: ast.Call, aliases: _AliasMap) -> bool:
     return _trailing_name(call.func) == 'TestClient'
 
 
+def is_scannable(filename: str) -> bool:
+    """Return True if *filename* is a file this rule applies to.
+
+    Two exclusions, applied UNIFORMLY to explicitly-passed paths and
+    directory-scan results alike:
+
+    ``conftest.py`` — LOAD-BEARING, not incidental.  ``hooks/project-checks``
+    passes explicit staged file paths, so ``dashboard/tests/conftest.py`` is
+    handed to this checker whenever it is edited.  conftest is the intended HOME
+    of the shared ``_client`` fixture; scanning it would flag the very thing this
+    rule exists to promote, and the rejection message would tell its author to
+    request the fixture they are looking at.  The skip must therefore key on the
+    BASENAME rather than only on a directory-scan glob, which an explicit path
+    bypasses entirely.
+
+    Anything not matching ``test_*.py`` — the rule is about a per-module app
+    lifespan being stood up twice, which only happens in a test module.
+    """
+    name = Path(filename).name
+    if name == 'conftest.py':
+        return False
+    return name.startswith('test_') and name.endswith('.py')
+
+
 def find_violations(source: str, filename: str) -> list[Violation]:
     """Parse *source* and return violations for TestClient constructions in fixture bodies.
 
     A violation is emitted for each ``ast.Call`` that constructs a TestClient and
     lies inside the body of a function marked as a pytest fixture.
+
+    Scoping to fixture BODIES is what lets this rule ship with no whitelist at
+    all: a client built inline in a plain test function, or in a
+    ``@contextmanager`` helper, is excluded STRUCTURALLY rather than by name.
+    Files outside ``is_scannable`` return [] regardless of content.
 
     Matching a real ``ast.Call`` node rather than source text is load-bearing:
     several dashboard test modules (and conftest.py itself) carry the literal
@@ -185,6 +214,9 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     deterministic source-order output (``ast.walk`` yields BFS order, not source
     order).
     """
+    if not is_scannable(filename):
+        return []
+
     try:
         tree = ast.parse(source, filename=filename)
     except SyntaxError:
@@ -239,6 +271,10 @@ def main(argv: list[str] | None = None) -> int:
             files_to_scan.extend(sorted(p.rglob('test_*.py')))
         else:
             files_to_scan.append(p)
+
+    # The same gate as find_violations, applied to discovery so an explicitly
+    # passed conftest.py is never even read.
+    files_to_scan = [f for f in files_to_scan if is_scannable(str(f))]
 
     all_violations: list[Violation] = []
     for file_path in files_to_scan:
