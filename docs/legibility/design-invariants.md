@@ -214,6 +214,23 @@ loop enforcing it *was* the blocked thread. 726 of the sampled
 subprocesses were a byte-identical, render-invariant
 `git worktree list --porcelain`. (task 3778)
 
+That fix was correct; the CENSUS accompanying it was not, and it took three
+further batches to notice. Two methodology defects, both since confirmed
+against the live tree. (1) It enumerated the sites where the blocking
+PRIMITIVE is written and then made a per-MODULE offload claim —
+`services/recon_claim_verification_guard.py` was recorded as "already
+offloaded at its call sites", which was true of the callers it looked at and
+false of the others, so one offloaded caller made the whole module read as
+clean and every other caller was invisible. The census question is "which
+CALLERS reach this primitive without a hop", not "is this module offloaded".
+(2) It enumerated `subprocess.run` only, while the Rule above names
+filesystem and lock too; `read_text` and `yaml.safe_load` misses accounted
+for tasks 4091 and 4201 independently of (1). Tasks 4091 and 4201 each found
+live sites in that blind spot, and task 4484's caller-side re-run found 60 —
+including four same-shape `async def _maybe_*` registry loaders in
+`fused-memory/src/fused_memory/middleware/task_curator.py`, two of which had
+no task filed at all. (tasks 3778, 4091, 4201, 4484)
+
 **House pattern**: `asyncio.to_thread` at the boundary
 (`fused-memory/src/fused_memory/middleware/task_interceptor.py::_apply_status_transition`;
 `middleware/task_curator.py::curate_batch_prepared`); the async
@@ -221,6 +238,15 @@ subprocess runner `orchestrator/src/orchestrator/git_ops.py::_run`;
 hoist the loop-invariant probe out of the body and bound the fan-out with
 an explicit cap that logs what it dropped (no silent truncation); loop-lag
 heartbeat firing above a threshold (INV-4 applied to scheduling).
+Mechanical enforcement now stands behind this slug:
+`shared/tests/test_loop_blocking_gate.py` scans `fused-memory/src` caller-side
+(`shared/tests/loop_blocking_scan.py::find_loop_blocking_sites`) and ratchets
+every coroutine call site reaching a blocking primitive against a
+dispositioned ledger, `shared/tests/loop_blocking_allowlist.py`. A new site
+must be fixed or blessed with a stated reason in the same change, and a landed
+fix must delete its blessing. This is what the Census seam section below asks
+for when a slug is violated across repeated census batches — INV-8 was missed
+across three (3778, 4091, 4201) before the guard was filed as task 4484.
 
 ## INV-9 `one-fact-one-home`
 
