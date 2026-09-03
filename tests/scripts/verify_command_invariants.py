@@ -78,11 +78,13 @@ from orchestrator import verify_cmd
 # subcommand at all, so each anchors on the program name itself.
 #
 # Before task 3745's amendment pass the literal ``"ruff check"`` was spelled in
-# four files under three names. That is the same N-copy shape the rest of this
-# module exists to close: were ruff ever to spell its subcommand differently,
-# one edit here beats four coordinated ones, and a caller left behind would not
-# fail loudly — it would fail to MATCH a segment and take the exactly-one
-# assertion, or match and anchor in the wrong place.
+# four files under three names, and task 3883 brought a fifth consumer
+# (``test_fallback_verify_config.py``'s ``_RUFF_KEYWORD``) onto this constant
+# rather than letting it restate the literal. That is the same N-copy shape the
+# rest of this module exists to close: were ruff ever to spell its subcommand
+# differently, one edit here beats five coordinated ones, and a caller left
+# behind would not fail loudly — it would fail to MATCH a segment and take the
+# exactly-one assertion, or match and anchor in the wrong place.
 RUFF = "ruff check"
 PYRIGHT = "pyright"
 PYTEST = "pytest"
@@ -180,8 +182,9 @@ def anchor_split(
 
     The ANCHOR is the last whitespace-separated token of *keyword*: ``check`` for
     ``ruff check``, ``pyright`` for ``pyright``, ``pytest`` for ``pytest``. One
-    rule reproduces every anchor the four callers use, two of which spelled it as
-    a hand-rolled ``tokens.index("check")``.
+    rule reproduces every anchor the five callers use, two of which spelled it as
+    a hand-rolled ``tokens.index("check")`` and a third as a ``shlex``-tokenised
+    marker window with a raw ``str.endswith`` fallback (task 3883).
 
     THE ANCHOR BELONGS TO NEITHER HALF, and the split is the whole point.
     Everything BEFORE it is the WRAPPER's: in
@@ -282,13 +285,14 @@ def positional_targets(
     ``'scripts/' in cmd`` for both.
 
     *value_flags* is the caller's POLICY, and its default is the reason one
-    implementation serves four call sites unchanged. With it EMPTY, ``consume``
+    implementation serves five call sites unchanged. With it EMPTY, ``consume``
     can never become True and the loop below reduces byte-for-byte to
     ``[t for t in post if not t.startswith('-')]`` — exactly what
-    ``test_root_lint_covers_nonmember_py.py`` and ``test_scripts_module_config.py``
-    do today, phantom flag values included. Supplying a set (the CONTRIBUTING
-    guard's ``_RUFF_FLAGS_TAKING_A_VALUE``, the skills guard's
-    ``_PYTEST_VALUE_FLAGS``) drops the following token instead. The
+    ``test_root_lint_covers_nonmember_py.py``, ``test_scripts_module_config.py``
+    and ``test_fallback_verify_config.py`` do today, phantom flag values
+    included. Supplying a set (the CONTRIBUTING guard's
+    ``_RUFF_FLAGS_TAKING_A_VALUE``, the skills guard's ``_PYTEST_VALUE_FLAGS``)
+    drops the following token instead. The
     ``--flag=value`` spelling needs no entry either way: ``shlex`` keeps it as
     one token and the ``-`` prefix drops it whole.
 
@@ -303,13 +307,17 @@ def positional_targets(
     never fail. But a caller that ALSO asserts each target exists on disk reads
     the list for exactly what a phantom adds, and goes red naming a flag value as
     a missing path — a misleading diagnosis on a change that broke nothing.
-    Measured across the four callers: THREE assert existence
+    Measured across the five callers: FOUR assert existence
     (``test_root_lint_covers_nonmember_py.py``,
     ``test_contributing_lint_command_drift.py``,
-    ``test_skills_module_config_decision.py``) while only two of those three
-    supply a set; ``test_scripts_module_config.py`` supplies none and asserts no
-    existence. The remaining exposure is root_lint's, and it is recorded on that
-    guard's own ``_ruff_targets`` rather than papered over here.
+    ``test_skills_module_config_decision.py``,
+    ``test_fallback_verify_config.py``) while only two of those four supply a
+    set; ``test_scripts_module_config.py`` supplies none and asserts no
+    existence. The remaining exposure is therefore root_lint's AND fallback's,
+    and each is recorded on that guard's own extractor —
+    ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` and
+    ``test_fallback_verify_config.py::_lint_leg_targets`` — rather than papered
+    over here.
 
     Discarding unrecognised tokens instead is not an option: that would silently
     shrink the target list and re-open the false-pass hazard the parsing exists

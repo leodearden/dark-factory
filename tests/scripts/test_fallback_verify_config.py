@@ -1284,14 +1284,39 @@ def _lint_leg_targets(cmd: str, marker: str) -> list[str]:
     — is the closest-preserving choice, and matches the two ``value_flags``-free
     siblings.
 
+    WHAT THAT COSTS, recorded here rather than papered over in the shared
+    module, whose phantom census
+    (``tests/scripts/verify_command_invariants.py::positional_targets``) names
+    this guard for it. A space-separated flag VALUE is admitted as a phantom
+    target, and both call sites below assert every target EXISTS on disk — so an
+    unrecognised value-taking flag added to the fleet ``lint_command`` would go
+    red naming its value as a missing path. Accepted deliberately: the exposure
+    is identical to ``test_root_lint_covers_nonmember_py.py::_ruff_targets``'s,
+    the live command carries no such flag, and inventing a set here would be a
+    behaviour change smuggled into a migration whose whole claim is that it
+    makes none. The moment one appears, borrow
+    ``test_contributing_lint_command_drift.py``'s ``_RUFF_FLAGS_TAKING_A_VALUE``
+    rather than re-deriving one.
+
     ``required_segment`` also upgrades a no-match from a silent ``[]`` to a loud
     exactly-one assertion: a marker that stops matching now names itself instead
     of degrading into the callers' generic "would pass vacuously" message.
+
+    THE LABEL IS THREADED INTO BOTH CALLS, from one local rather than two
+    literals so the two cannot drift apart. There are TWO ways to fail here —
+    segment selection (no leg matches *marker*) and anchor location (a leg
+    matches, but names no such checker token) — and only the first is
+    ``required_segment``'s. Labelling just that one would leave the anchor
+    failure, which is precisely what
+    ``test_lint_leg_targets_anchors_on_a_whole_path_component_not_a_suffix``
+    exercises, degrading into ``_where``'s bare ``repr(segment)`` fallback.
     """
+    label = "the fleet lint_command (task 3397)"
     return vci.positional_targets(
-        vci.required_segment(cmd, marker, label="the fleet lint_command (task 3397)"),
+        vci.required_segment(cmd, marker, label=label),
         marker,
         path_anchor=True,
+        label=label,
     )
 
 
@@ -1314,7 +1339,7 @@ def test_lint_leg_targets_reads_flag_values_as_flags_not_paths() -> None:
         "uv run ruff check --fix alpha beta.py && "
         "python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
     )
-    assert _lint_leg_targets(cmd, "ruff check") == ["alpha", "beta.py"]
+    assert _lint_leg_targets(cmd, _RUFF_KEYWORD) == ["alpha", "beta.py"]
 
 
 def test_lint_leg_targets_anchors_on_a_whole_path_component_not_a_suffix() -> None:
@@ -1327,12 +1352,30 @@ def test_lint_leg_targets_anchors_on_a_whole_path_component_not_a_suffix() -> No
     path COMPONENT rejects the near-miss while still matching the live
     ``fused-memory/scripts/check_bare_magicmock_config.py`` token.
 
+    ISOLATING WHICH ASSERTION FIRES is what makes this a pin rather than a
+    tautology. ``_lint_leg_targets`` raises ``AssertionError`` from two
+    independent places — ``required_segment``'s exactly-one-segment check and
+    ``anchor_split``'s anchor-presence check — so a bare ``pytest.raises``
+    around the helper alone would go green on either and pin nothing about
+    anchoring. Establishing that segment SELECTION succeeds first
+    (``required_segment`` matches on substring, so the near-miss leg IS the
+    selected one) leaves the anchor check as the only remaining source, for the
+    direct call below AND for the end-to-end one after it. Same shape as
+    ``test_verify_command_invariants.py::test_positional_targets_default_still_rejects_a_path_spelled_anchor``.
+
     No ``match=``: assertion wording is not pinned anywhere in this family, so
     the diagnostics stay free to be reworded.
     """
+    cmd = "python3 scripts/x_check_bare_magicmock_config.py a b"
+    marker = "check_bare_magicmock_config.py"
+    segment = vci.required_segment(cmd, marker)
+    assert segment == cmd
     with pytest.raises(AssertionError):
-        _lint_leg_targets("python3 scripts/x_check_bare_magicmock_config.py a b",
-                          "check_bare_magicmock_config.py")
+        vci.positional_targets(segment, marker, path_anchor=True)
+    # End-to-end through the helper actually under test, so ``path_anchor=True``
+    # stays load-bearing HERE rather than merely restated by the line above.
+    with pytest.raises(AssertionError):
+        _lint_leg_targets(cmd, marker)
 
 
 class TestFleetLintCoversEveryWorkspaceMember:
