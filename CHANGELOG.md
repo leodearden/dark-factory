@@ -536,6 +536,36 @@ table in `docs/task-authoring.md` §8, owned by
 but is neither blessed nor typed (272 tasks), and the `x_` sweep has not been
 run corpus-wide.
 
+#### Plan-decision cross-pairing: a re-runnable scanner, and where it's documented (task 3967)
+
+A `design_decisions` entry whose `decision` and `rationale` are each well-formed
+prose but wrongly **paired** — a different damage class from the envelope
+leakage above, and invisible to that detector by construction, not by
+oversight (`shared.toolcall_markup.detect` cannot see a mis-pairing) — though
+the two classes do co-occur on individual plans, which is why the scanner
+reports an `envelope_leak` column rather than deferring to a second sweep.
+The full account — the shape, why repair is impossible, why no deterministic
+write-time predicate can contain it, and the containment measurement — lives
+in [`docs/plan-decision-cross-pairing.md`](docs/plan-decision-cross-pairing.md).
+Treat every prevalence figure there as a dated, strict lower bound, not a
+number to trust — the corpus keeps growing — and re-run the scanner instead of
+citing it.
+
+**Added `scripts/scan_plan_decision_pairing.py`**, a read-only, re-runnable CLI
+(`--root`, `--json`, `--fail-on-hit`, `--require-scanned`; no `--apply`, ever).
+The invocation safe for an unattended gate (CI job, timer):
+
+```bash
+python scripts/scan_plan_decision_pairing.py --fail-on-hit --require-scanned 1
+```
+
+`--require-scanned` must accompany `--fail-on-hit`: alone, `--fail-on-hit` keys
+only on hits, so a `--root` that is mistyped, not yet created, or unlistable
+yields zero hits over zero scanned files and exits 0 — indistinguishable from a
+clean corpus. `--require-scanned N` states the coverage floor instead and exits
+**3** when fewer than `N` plan files were actually read, which outranks
+`--fail-on-hit`'s exit 1.
+
 ### Changed (BREAKING)
 
 #### MCP writes carrying raw envelope markup are now REJECTED (task 3141)
