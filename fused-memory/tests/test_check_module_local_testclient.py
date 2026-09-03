@@ -33,6 +33,7 @@ def _load_checker() -> types.ModuleType:
 
 _checker = _load_checker()
 find_violations = _checker.find_violations
+main = _checker.main
 
 
 # A module-scoped fixture building its own TestClient — the exact shape that
@@ -451,4 +452,96 @@ class TestExemptionPragma:
         assert offenders == [], (
             f'The checker contains hardcoded test-module filenames {offenders} — '
             f'exemptions belong at the site, as a # noqa pragma.'
+        )
+
+
+class TestCliExitCodes:
+    """main(argv) returns 0 clean / 1 violations / 2 fatal, and prints ruff-style."""
+
+    def test_clean_file_exits_zero_with_empty_stdout(self, tmp_path: Path, capsys):
+        clean = tmp_path / 'test_clean.py'
+        clean.write_text(
+            "import pytest\n\n\n@pytest.fixture\ndef _x():\n    yield 1\n"
+        )
+        assert main([str(clean)]) == 0
+        assert capsys.readouterr().out == ''
+
+    def test_violating_file_exits_one(self, tmp_path: Path, capsys):
+        bad = tmp_path / 'test_bad.py'
+        bad.write_text(_MODULE_LOCAL_CLIENT_FIXTURE)
+        assert main([str(bad)]) == 1
+        assert capsys.readouterr().out.strip() != ''
+
+    def test_violations_print_in_ruff_style_path_lineno_col_message(self, tmp_path: Path, capsys):
+        bad = tmp_path / 'test_bad.py'
+        bad.write_text(_MODULE_LOCAL_CLIENT_FIXTURE)
+        main([str(bad)])
+        out = capsys.readouterr().out
+        assert out.startswith(f'{bad}:9:9: '), out
+        assert 'noqa: module-local-testclient' in out
+
+    def test_missing_explicit_path_exits_two_before_any_scan_work(self, tmp_path: Path, capsys):
+        """Fail fast: a missing explicit path returns 2 and NOTHING is scanned.
+
+        The violating file is passed alongside the missing one; an empty stdout
+        proves discovery validated up front rather than part-way through the scan.
+        """
+        bad = tmp_path / 'test_bad.py'
+        bad.write_text(_MODULE_LOCAL_CLIENT_FIXTURE)
+        assert main([str(tmp_path / 'test_absent.py'), str(bad)]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == '', 'scan ran despite a missing explicit path'
+        assert 'test_absent.py' in captured.err
+
+
+class TestCliDirectoryScan:
+    """A directory argument recursively discovers test_*.py — and never conftest.py."""
+
+    def test_directory_scan_finds_nested_test_modules_and_skips_conftest(
+        self, tmp_path: Path, capsys
+    ):
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        (sub / 'test_nested.py').write_text(_MODULE_LOCAL_CLIENT_FIXTURE)
+        # conftest.py is the intended HOME of the shared fixture — never an offender.
+        (tmp_path / 'conftest.py').write_text(_MODULE_LOCAL_CLIENT_FIXTURE)
+        # Not a test module at all.
+        (tmp_path / 'helpers.py').write_text(_MODULE_LOCAL_CLIENT_FIXTURE)
+
+        assert main([str(tmp_path)]) == 1
+        out = capsys.readouterr().out
+        # Assert on the REPORTED PATH, not on raw output: the violation message
+        # itself names conftest.py as the remedy, so a substring check over the
+        # whole line could never fail.
+        reported = {line.split(':', 1)[0] for line in out.splitlines() if line.strip()}
+        assert str(sub / 'test_nested.py') in reported
+        assert str(tmp_path / 'conftest.py') not in reported
+        assert str(tmp_path / 'helpers.py') not in reported
+
+    def test_clean_directory_exits_zero(self, tmp_path: Path, capsys):
+        (tmp_path / 'test_ok.py').write_text('def test_ok():\n    assert True\n')
+        assert main([str(tmp_path)]) == 0
+        assert capsys.readouterr().out == ''
+
+
+class TestCliErrorHandling:
+    """A transient per-file read error is reported without discarding other files' violations."""
+
+    def test_unreadable_file_reports_on_stderr_and_keeps_other_violations(
+        self, tmp_path: Path, capsys
+    ):
+        """Undecodable bytes on the FIRST file scanned must not abort the run.
+
+        Names are chosen so the bad file sorts first, which is the stronger
+        ordering: an implementation that returned early on the read error would
+        print no violations at all.
+        """
+        (tmp_path / 'test_a_unreadable.py').write_bytes(b'\xff\xfe not utf-8 at all\n')
+        (tmp_path / 'test_b_violating.py').write_text(_MODULE_LOCAL_CLIENT_FIXTURE)
+
+        assert main([str(tmp_path)]) == 2
+        captured = capsys.readouterr()
+        assert 'test_a_unreadable.py' in captured.err
+        assert 'test_b_violating.py' in captured.out, (
+            'a read error discarded violations collected from other files'
         )
