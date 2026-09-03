@@ -379,6 +379,35 @@ async def _metrics_loop(
     files so a stale connection cannot strand the loop. Each sampler in
     collect_metrics_snapshot has its own try/except, so one failed source
     does not poison the others.
+
+    **The binding invariant (task 3771): handles bind to ARGUMENTS, config
+    binds to ``app.state``.** The asymmetry is deliberate, not an oversight.
+
+    ``pool`` and ``http_client`` belong to the caller — the lifespan that
+    created them — and are never re-read from ``app.state``. ``app.state`` is
+    one mutable namespace shared by every lifespan over this ``app``, and an
+    inner lifespan (starlette runs a full lifespan per ``TestClient`` context,
+    and ~15 module-scoped ``TestClient(app)`` fixtures overlap the
+    function-scoped ``client`` fixture) installs its own handles there and does
+    not restore the outer's on exit. A loop re-reading ``app.state`` therefore
+    spends the rest of the outer lifespan polling the inner's *closed* pool and
+    client — silently, since a closed ``DbPool.get()`` returns ``None`` and a
+    closed ``httpx`` client raises into ``_run_once``'s ``except Exception``,
+    surfacing only as a generic 'Metrics snapshot error'. Both are keyword-only
+    and required: an ``app.state`` fallback default would silently reinstate
+    exactly that cross-talk, so a stale call site fails loudly instead.
+
+    ``config``, by contrast, IS re-read from ``app.state`` every cycle **on
+    purpose** — ~25 tests swap ``client.app.state.config`` mid-test and depend
+    on the swap being picked up.
+
+    Accepted residual: an outer lifespan's loop still reads the INNER's config
+    *object* once the inner has run. Both come from ``DashboardConfig.from_env()``
+    under one environment, so they are value-equivalent and carry no
+    closed-handle hazard; removing it would break the swap-ability above.
+
+    Both halves are pinned by ``dashboard/tests/test_lifespan_resource_binding.py``
+    — change either one and a test there fails.
     """
 
     async def _run_once() -> None:
@@ -607,6 +636,18 @@ async def lifespan(app: FastAPI):
     and pytest blames whichever unrelated test is running at that instant.
     ``app.state`` stays assigned for request handlers and for tests that swap
     ``app.state.config``; it is simply not the shutdown path's source of truth.
+
+    **Startup binds to locals for the same reason (task 3771).** ``config``,
+    ``pool`` and ``http_client`` are captured here and used directly, rather
+    than read back off ``app.state`` further down. Read-back was not merely
+    untidy: startup assigns ``app.state.config`` and then ``await``\\ s
+    ``burndown_store.open()`` before the reads that consume it, and across that
+    suspension point an interleaving lifespan can install its own config — so
+    this lifespan would wire its stores and loops to a config it never built.
+    ``app.state`` assignment is retained purely for request handlers (which
+    read ``request.app.state.config``) and for the tests that swap it.
+    ``_metrics_loop``'s docstring above states the resulting invariant in full;
+    ``dashboard/tests/test_lifespan_resource_binding.py`` pins it.
 
     **Shutdown also reaps detached cache refreshes**, which are the one thing
     it ends that this lifespan did not open.  ``TTLCache`` instances are
