@@ -660,6 +660,18 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: 'done_gate_missing_files guard firing twice: task(s) marked done claim deliverable files that don''t exist in the tree. No premise verification occurred before filing or task state transition.'
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 8217cb71-b871-4831-b4fe-1dfbea0b6af8
+    origin_phase: review
+    manifested_phase: verify
+    note: 'Task dispatched on reviewer''s diagnosis of a data-integrity bug in existing_parts() without pre-verifying the premise. Agent''s reproduction attempts fail: lms_healthcheck.Reason enum lacks HTTP_ERROR (API mismatch); review correctly notes ''No test covers this path,'' meaning the specific failure mode was never validated against the tree.'
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 778d5834-7718-4f9a-9430-15e37da05fe6
+    origin_phase: unknown
+    manifested_phase: architect
+    note: Task 3476 filed assuming Stage 1 could file tasks and check gate coverage. Architect verified via code trace (cli_stage_runner.py:DISALLOW_TASK_WRITES, consolidation_gate.py::render_consolidation_gate_section, prompts/stage1.py:81 vs stage2.py:82) that Stage 1 structurally cannot execute these actions. Sub-findings B and C invalidated; capabilities listed as delivered are unavailable. Work landed post-filing contradicted premises.
 - id: warm-lane-cache-incoherence
   title: Warm-lane warmth transfer and shared caches violate source coherence; no disk GC — phantom compile errors and recurring ENOSPC
   severity: high
@@ -1828,6 +1840,12 @@ entries:
     manifested_phase: verify
     invariant_violated: StructuredOutput shape/nesting
     note: 'Identical double-wrap error: {"decisions": {"decisions": [...]}} violates schema expecting /decisions as root array. Recurrence in review-adjudication task; pattern consistent with module-tagger (9/11 sessions). Root cause: StructuredOutput parameter name collision with schema root key not yet fixed for all subsystems.'
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 1a60e99b-05ae-4b6f-9693-6b8905c9c93d
+    origin_phase: review
+    manifested_phase: recon
+    note: 'StructuredOutput double-wrap: schema parameter ''findings'' nests a top-level key ''findings'', producing {"findings": {"findings": [...]}} instead of {"findings": [...]}. Recon Stage 1 (memory_consolidator) output failed validation.'
 - id: prose-routing-intent
   title: Execution-routing intent lives only in description prose — no-code deploys, gates, operator actions, and design decisions dispatch into the TDD architect pipeline
   severity: medium
@@ -3118,6 +3136,12 @@ entries:
     origin_phase: implement
     manifested_phase: verify
     note: 'Turn 143: Python multi-line command flattened to single line, causing IndentationError. Command lost internal newlines (statements `import json,pathlib p=json.loads...print...for` collapsed to one line). Consistent with Bash tool''s static-analysis pre-check or heredoc flattening bug.'
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 22adc70e-5d28-4c73-8bd6-e5106d6e0126
+    origin_phase: verify
+    manifested_phase: verify
+    note: 'Turn 79: git commit with multi-line heredoc + multi-command chain failed with exit 127 syntax error. Error message shows command flattening: ''EOF'' newline lost, commit message runs together without proper shell quoting protection: `git commit -q -m "$(cat <<''EOF'' fix(4902):...` triggers `syntax error near unexpected token ''(''`'
 - id: entry-cand-20260714-2
   title: resolve_ticket timeout gives no outcome signal, forcing redundant state polling
   severity: medium
@@ -5521,6 +5545,12 @@ entries:
     origin_phase: architect
     manifested_phase: architect
     note: Session in .worktrees/4796 fires modulenotfounderror at turn 7 followed by repeated 'does not exist' / 'not found in' signals across turns 30 and 52, matching the documented pattern of architect explore hitting import/module resolution failures in task worktrees.
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 90ef0b45-25d8-44c6-812b-e172e8add1a8
+    origin_phase: unknown
+    manifested_phase: architect
+    note: ModuleNotFoundError signal fired in task worktree context; consistent with architect explore-phase import failures in isolated worktree environments
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -6607,6 +6637,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Guard trip at turn 3 renders as bare template 'blocked:' with no matched substring or detail text; consistent with digest generator dropping guard-trip content.
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 60397f48-cb34-480f-bbb3-9a76e8c728f7
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard trips recorded as bare 'blocked:' with no detail text following, consistent with digest generator dropping matched substrings from guard signals
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 3b86f7c4-68ff-4673-816b-42055946925e
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Guard Trip section renders signals as bare templates: `(turn 12) blocked:` and `(turn 3) blocked:` with no category detail following the colon, matching the pattern of digest generator dropping matched substrings from guard signals.'
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -8038,6 +8080,12 @@ entries:
     origin_phase: review
     manifested_phase: review
     note: Score 5.0 with all signal_counts at 0 (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome all zero). Severity decoupled from evidence body.
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 59d2e6a0-57cc-46f2-b89b-84dc4c195c3a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Digest score (10.0) and ''User Corrections'' label decoupled from signal_counts: high score assigned while actual signals show 5 not_found; the mislabeled task-notification dominates the digest despite not being user feedback.'
 - id: entry-cand-20260729-3
   title: Digest generator files a recon stage's reconciliation run-review report under 'User Corrections' despite zero fired signal counters
   severity: medium
@@ -8600,6 +8648,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Digest score 5.0 assigned despite all signal_counts=0 (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome all zero)
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 5c4eb2e0-8e67-4828-9846-31b57e33d8ff
+    origin_phase: unknown
+    manifested_phase: review
+    note: Digest assigned severity score=5.0 despite all signal_counts reading zero across all categories (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome)
 - id: entry-cand-20260729-4
   title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
   severity: medium
@@ -10001,6 +10055,18 @@ entries:
     origin_phase: unknown
     manifested_phase: review
     note: 'Digest ''User Corrections'' bucket captures the task''s injected briefing instructions (''You are adjudicating whether...'', ''IMPORTANT: the PRIOR-ROUND block...'') and context block as corrective feedback, when these are task framing and operand lists for the review-adjudication agent.'
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 59d2e6a0-57cc-46f2-b89b-84dc4c195c3a
+    origin_phase: implement
+    manifested_phase: unknown
+    note: Task-notification (structured sub-agent completion output) mislabeled as 'User Correction' in digest's User Corrections bucket. The notification is a task-event, not corrective user feedback.
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 5c4eb2e0-8e67-4828-9846-31b57e33d8ff
+    origin_phase: unknown
+    manifested_phase: review
+    note: Digest 'User Corrections' bucket mislabels a dispatched task's injected '# Context' briefing block (review task adjudication prompt with PRIOR-ROUND block structure) as user feedback; actual user turns = 1
 - id: entry-cand-20260728-3
   title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
   severity: medium
@@ -11679,6 +11745,49 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: Orchestrated-task worktree firing repeated file-not-found errors accessing .task/reviews/ and .task/metadata.json (turns 18, 35) with no context about missing setup; matches described pattern of silent no-such-file-or-directory in orchestrated worktrees during post-merge verify
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 2689bbf2-1091-4860-8ec6-99ce413e1d80
+    origin_phase: unknown
+    manifested_phase: verify
+    note: 'Orchestrated worktree task firing repeated ''no such file or directory'' errors with minimal diagnostic signal: tail -c on .task-meta/4885/iterations.jsonl fails with exit 1; six not_found signals across 161 turns suggest persistent unlocatable file dependencies'
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 90ef0b45-25d8-44c6-812b-e172e8add1a8
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task (.worktrees/4755) fires repeated 'no such file or directory' / 'does not exist' signals (7 total) across turns 10–123 with no other diagnostic signal; matches the signature of ModuleNotFoundError+file-access cascade in task worktrees
+  - date: '2026-09-02'
+    project: dark_factory
+    session: a66caee9-d53f-44d6-a0f3-c9a01b38ac1a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Worktree session shows 2 identical Bash grep commands (exit 2) with 3-turn interval; both search for BORN_AT_L2_SEVERITIES across worktree paths. Grep exit 2 indicates file-read error or missing path. Session has n_user_turns=0 and minimal size (891 bytes), suggesting early task failure with no recovery.
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 768084bd-8ff7-4dfc-bee7-a836a5a119f3
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 7 'not found' signals scattered across turns 9–88 in a .worktrees/4930 orchestrated task with n_user_turns=0 (zero human corrections) and no accompanying tool_error signal. Pattern matches repeated file-not-found with no other diagnostic context.
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 64d11036-ba34-43b2-87b7-4f552c8962a1
+    origin_phase: unknown
+    manifested_phase: implement
+    invariant_violated: worktree cold-provision contract — required files should exist before agent executes
+    note: 5 not_found signals across turns 54–245 ('no such file or directory', 'does not exist') with zero tool_errors and no designed_outcome. Orchestrated task in worktree repeatedly fails on file I/O with no diagnostic context. Session termination at 597 bytes suggests early collapse.
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 59d2e6a0-57cc-46f2-b89b-84dc4c195c3a
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Orchestrated worktree task (.worktrees/4932) fires 1 tool_error + 4 not_found signals (repeated file-not-found errors) with minimal diagnostic. Error neighborhood shows only one instance; no user turns (automated dispatch).
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 96dd35b9-2c15-41e0-9c91-1bcaf556c1ab
+    origin_phase: unknown
+    manifested_phase: review
+    note: 'Orchestrated worktree task (cwd: .worktrees/4201) fires ''no such file or directory'' error at turn 40 with no additional diagnostic signal — signal_counts shows only not_found: 1, zero tool_errors/context/other signals. Occurs during review phase after code review identifies blocking implementation issues in error-handling logic.'
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -20414,3 +20523,94 @@ candidates:
     origin_phase: implement
     manifested_phase: verify
     evidence_quote: 'ValueError: could not convert string to float: ''0.20232026-09-01'' — in parse_watchdog_gate_fire_delays where m.group(''grace'') is expected to be a float but contains the date 2026-09-01 concatenated with a numeric prefix'
+- id: cand-20260902-1
+  title: Orchestrated-task session task-notifications captured as 'User Corrections'
+  cause: Digest pipeline mislabels structured task-notification JSON (sub-agent completion outputs) as user corrections when they fire within an orchestrated-task session. The notification marks task status, not user feedback.
+  area: digest-generation
+  first_seen: '2026-09-02'
+  disposition: pending
+  sightings:
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 59d2e6a0-57cc-46f2-b89b-84dc4c195c3a
+    origin_phase: implement
+    manifested_phase: unknown
+    evidence_quote: '(turn 361) <task-notification>… mislabeled under ## User Corrections section; signal_counts show 5 not_found but digest categorizes the task-completion event as a correction'
+- id: cand-20260902-2
+  title: Code-review diagnosis fails reproduction due to stale test-code API assumptions
+  cause: Review identifies causal diagnosis with specific failure scenario, but reproduction script embeds outdated enum/API shape assumptions not validated against current implementation. Review text assumes Reason.HTTP_ERROR exists; actual API differs.
+  area: verify
+  first_seen: '2026-09-02'
+  disposition: pending
+  sightings:
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 8217cb71-b871-4831-b4fe-1dfbea0b6af8
+    origin_phase: review
+    manifested_phase: verify
+    evidence_quote: 'Suggested fix: [35871 bytes truncated]. Turn 51 Bash error: AttributeError: type object ''Reason'' has no attribute ''HTTP_ERROR''. Review states scenario is ''Reproduced offline on this branch'' but reproduction fails with stale API shape.'
+- id: cand-20260902-3
+  title: Bash multi-line Python command syntax error when agent constructs test scenarios
+  cause: 'Agent attempted to format a Python one-liner in Bash -c string without proper statement separators. Command shows: `import json p=json.load(open(...)) print(...)` missing semicolons and newlines between statements.'
+  area: verify
+  first_seen: '2026-09-02'
+  disposition: pending
+  sightings:
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 8217cb71-b871-4831-b4fe-1dfbea0b6af8
+    origin_phase: verify
+    manifested_phase: verify
+    evidence_quote: 'Turn 75 Bash error: IndentationError: unexpected indent on line `import json p=json.load(open(''.task/plan.json'')) print(''steps:'', ...)` — statements run together without separators.'
+- id: cand-20260902-4
+  title: Interactive agent classified with zero user turns
+  cause: 'Session metadata inconsistency: agent_class=''interactive'' declared but n_user_turns=0, suggesting either mislabeling (system-generated session incorrectly tagged as interactive) or a session lifecycle bug where user-turn count failed to increment despite interactions.'
+  area: session-classification
+  first_seen: '2026-09-02'
+  disposition: pending
+  sightings:
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 3b86f7c4-68ff-4673-816b-42055946925e
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'agent_class: "interactive" paired with n_user_turns: 0 in digest metadata for 2026-09-02 session 3b86f7c4'
+- id: cand-20260902-5
+  title: Bash `-c` Python multi-line argument flattening breaks indentation
+  cause: Multi-line Python code embedded in Bash `-c` argument loses newlines during transmission or parsing, collapsing into a single line and breaking indentation rules
+  area: Bash tool command escaping / multi-line string handling
+  first_seen: '2026-09-02'
+  disposition: pending
+  sightings:
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 68920256-ef90-4fc2-b97f-c45e2ee4fc27
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'python3 -c "...import json try: for line in open(...) -> IndentationError: unexpected indent. The Python code `import json\ntry:\n...` was received as `import json try: for line in...` on a single line'
+- id: cand-20260902-6
+  title: Digest pipeline attributes not_found signals to non-existent turns
+  cause: Digest extraction/processing pipeline assigns signal origins (e.g., 'turn 16') to turn numbers that don't exist in the source session, possibly due to malformed signal tagging or turn-count inference from tool results rather than session structure
+  area: digest-extraction/trickle-coder
+  first_seen: '2026-09-02'
+  disposition: pending
+  sightings:
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 205d6297-16d3-43fc-991a-2e92ad160a68
+    origin_phase: unknown
+    manifested_phase: ops
+    evidence_quote: (turn 16) does not exist — single not_found signal in an orchestrated-task session with n_user_turns=0, session size 455 bytes, truncated_items=0
+- id: cand-20260902-7
+  title: Digest captures and scores sessions with zero user turns and zero signal activity
+  cause: Session capture mechanism or digest generation processes sessions that had no user interaction (n_user_turns=0) and assigns them to the codebook review pipeline despite zero observable signal events (tool_error/self_correct/not_found/df_guard/interrupt/designed_outcome all 0)
+  area: digest-generation
+  first_seen: '2026-09-02'
+  disposition: pending
+  sightings:
+  - date: '2026-09-02'
+    project: dark_factory
+    session: 2ecf49c6-45b7-4fb6-a342-086b36a4732d
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'session 2ecf49c6 dated 2026-09-02: n_user_turns=0, size_bytes=378, score=0.0, all signal_counts=0'
