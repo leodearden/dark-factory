@@ -738,6 +738,15 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         return None
 
 
+# Stay well under SQLite's SQLITE_MAX_VARIABLE_NUMBER (999 on older builds, 32766 on
+# modern ones -- measured 32766 on SQLite 3.50.4 here) -- the test universe a report
+# covers is unbounded, so a single `IN (...)` over it is not safely bounded.  500 and the
+# chunking shape are the in-repo precedent at
+# `evals/reviewer_trial/__main__.py::_FETCH_TITLES_CHUNK_SIZE`; one spelling of this
+# pattern in the orchestrator package rather than a second idiom.
+_READ_DEBT_CHUNK_SIZE = 500
+
+
 def read_debt_many(db_path: Path, test_ids: Iterable[str]) -> dict[str, DebtRow]:
     """The debt rows for *test_ids*, keyed by ``test_id`` — one connection for the batch.
 
@@ -782,16 +791,25 @@ def read_debt_many(db_path: Path, test_ids: Iterable[str]) -> dict[str, DebtRow]
         if not ids:
             return {}
 
+        found: dict[str, DebtRow] = {}
+        # ONE connection for the whole batch, hoisted OUTSIDE the chunk loop.  A
+        # per-chunk connection would each pay the five-pragma durability triad and
+        # re-run the schema DDL -- the same amplification this reader exists to remove,
+        # merely at 1/500th the rate -- and would break the module's machine-checked
+        # one-connection-per-entry-point contract for any batch over the chunk size.
         conn = _open(db_path)
         try:
             conn.row_factory = sqlite3.Row
-            placeholders = ','.join('?' for _ in ids)
-            rows = conn.execute(
-                f'SELECT * FROM flake_debt WHERE test_id IN ({placeholders})', ids
-            ).fetchall()
+            for i in range(0, len(ids), _READ_DEBT_CHUNK_SIZE):
+                chunk = ids[i : i + _READ_DEBT_CHUNK_SIZE]
+                placeholders = ','.join('?' for _ in chunk)
+                rows = conn.execute(
+                    f'SELECT * FROM flake_debt WHERE test_id IN ({placeholders})', chunk
+                ).fetchall()
+                found.update((row['test_id'], _to_debt_row(row)) for row in rows)
         finally:
             conn.close()
-        return {row['test_id']: _to_debt_row(row) for row in rows}
+        return found
     except Exception:
         logger.warning(
             'flake_ledger: failed to read debt for %d test(s) from %s',
@@ -800,6 +818,7 @@ def read_debt_many(db_path: Path, test_ids: Iterable[str]) -> dict[str, DebtRow]
             exc_info=True,
         )
         return {}
+
 
 async def open_debt(
     db_path: Path,
