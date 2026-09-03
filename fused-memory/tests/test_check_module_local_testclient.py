@@ -229,3 +229,100 @@ def _client():
         violations = find_violations(source, 'test_x.py')
         assert len(violations) == 1, 'aliased pytest.fixture decorator was not resolved'
         assert violations[0].lineno == 7
+
+
+class TestFindViolationsNonGoals:
+    """The boundary the deleted guard drew CORRECTLY, carried over verbatim.
+
+    Scoping detection to fixture BODIES is what leaves both of dashboard's
+    deliberate non-duplicates clean with no whitelist at all.  They are excluded
+    structurally — by not being fixtures — rather than by name.
+    """
+
+    def test_plain_test_function_building_a_client_inline_is_not_flagged(self):
+        """The `test_scaffold.py:287` idiom: a client built inline in a plain test."""
+        source = '''\
+from starlette.testclient import TestClient
+
+
+def test_scaffold_serves_index():
+    with TestClient(app) as c:
+        assert c.get('/').status_code == 200
+'''
+        assert find_violations(source, 'test_scaffold.py') == []
+
+    def test_contextmanager_helper_building_a_client_is_not_flagged(self):
+        """The `test_api_curator.py:70` `_override_client` idiom: a @contextmanager, not a fixture."""
+        source = '''\
+from contextlib import contextmanager
+
+from starlette.testclient import TestClient
+
+
+@contextmanager
+def _override_client(config):
+    app.state.config = config
+    with TestClient(app) as c:
+        yield c
+'''
+        assert find_violations(source, 'test_api_curator.py') == []
+
+    def test_module_level_and_class_body_constructions_are_not_flagged(self):
+        """Outside any fixture there is no per-module lifespan duplication to prevent."""
+        source = '''\
+from starlette.testclient import TestClient
+
+_MODULE_CLIENT = TestClient(app)
+
+
+class TestThing:
+    client = TestClient(app)
+
+    def test_it(self):
+        assert self.client
+'''
+        assert find_violations(source, 'test_x.py') == []
+
+    def test_docstring_mentioning_the_literal_is_not_flagged(self):
+        """Matching a real ast.Call, not source text — several dashboard modules say this in prose."""
+        source = '''\
+"""This module uses `with TestClient(app) as c:` via conftest's shared fixture."""
+import pytest
+
+
+@pytest.fixture(scope='module')
+def _thing():
+    """Docstring mentioning TestClient(app) — prose, not a call."""
+    yield 1
+'''
+        assert find_violations(source, 'test_x.py') == []
+
+
+class TestFileSelection:
+    """Only ``test_*.py`` is scanned, and ``conftest.py`` is skipped unconditionally.
+
+    The conftest skip is LOAD-BEARING, not incidental: ``hooks/project-checks``
+    passes explicit staged file paths, which include ``dashboard/tests/conftest.py``
+    whenever it is edited — and conftest is the intended HOME of the shared
+    fixture, so scanning it would flag the very thing this rule exists to promote.
+    """
+
+    def test_conftest_is_skipped_even_as_a_bare_filename(self):
+        assert find_violations(_MODULE_LOCAL_CLIENT_FIXTURE, 'conftest.py') == []
+
+    def test_conftest_is_skipped_as_an_explicit_path(self):
+        """The shape hooks/project-checks actually passes: a repo-relative staged path."""
+        assert find_violations(_MODULE_LOCAL_CLIENT_FIXTURE, 'dashboard/tests/conftest.py') == []
+
+    def test_non_test_module_is_skipped(self):
+        for filename in ('helpers.py', '_dashboard_helpers.py', 'app.py', 'contest_test.py'):
+            assert find_violations(_MODULE_LOCAL_CLIENT_FIXTURE, filename) == [], (
+                f'{filename!r} should not be scanned'
+            )
+
+    def test_test_module_is_still_scanned(self):
+        """Non-vacuity control: the same source under a test_*.py name IS flagged."""
+        assert len(find_violations(_MODULE_LOCAL_CLIENT_FIXTURE, 'test_x.py')) == 1
+        assert len(
+            find_violations(_MODULE_LOCAL_CLIENT_FIXTURE, 'dashboard/tests/test_x.py')
+        ) == 1
