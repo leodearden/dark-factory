@@ -37,11 +37,24 @@ fails on a legitimate tightening — so it only taxes future prompt edits.
 Every assertion in this file is an existence / containment / count / index
 check against a NAMED CONSTANT: never a string literal asserted against the
 constant's prose, never a regex over wording, never a byte-size figure.
+
+The mechanical half of that shape — the offender-collection loops, the derived-
+vs-hardcoded role-set comparison, the count and index bookkeeping — lives in
+`_role_splice_contract.py` (task 4405), shared with the sibling
+`test_roles_wait_pattern.py`. The tests below stay one thin function per
+invariant, each delegating its body to that helper while keeping its own
+docstring and its own remediation prose: a THIRD prompt constant now costs ~10
+lines of contract construction plus one-line bodies rather than a third clone of
+this file. What the helper deliberately does NOT absorb is the `capability`
+predicate — `role.prompt_spec is None` answers a different question than the
+sibling's `'Bash' in role.allowed_tools`, and both are correct for their own
+constant, so it is passed in.
 """
 
 from __future__ import annotations
 
 import pytest
+from _role_splice_contract import SpliceContract, assert_brace_free, assert_nonempty
 
 from orchestrator.agents.roles import (
     _TOOL_CALL_REJECTION_KNOWN_SHAPES,
@@ -81,13 +94,20 @@ _UNPINNED_PROMPT_ROLES = frozenset({
     'steward',
 })
 
-# `BACKGROUND_WAIT_GUIDANCE` opens with its own `\n## ` heading, so for a role
-# that carries no wait block (`judge`, today), "spliced up front" is exactly
-# "its heading IS the first `##` heading in the prompt" — see
-# `test_roles_wait_pattern.py`'s own `_MARKDOWN_HEADING` for the precedent.
-# Reused here as a structural landmark, not any particular heading's text, so
-# renaming a section in roles.py cannot silently turn this check into a no-op.
-_MARKDOWN_HEADING = '\n## '
+# The splice contract for this constant: what is spliced, into which roles, and
+# the capability that justifies it. `all_roles` is omitted, so it binds the real
+# `ROLES`. The structural `\n## ` landmark the placement check falls back to for
+# a role carrying no wait block (`judge`, today) lives in the helper as
+# `MARKDOWN_HEADING`; it is not referenced directly here because
+# `assert_placement` owns that comparison.
+_CONTRACT = SpliceContract(
+    constant_name='TOOL_CALL_REJECTION_GUIDANCE',
+    constant=TOOL_CALL_REJECTION_GUIDANCE,
+    roles=_UNPINNED_PROMPT_ROLES,
+    role_set_name='_UNPINNED_PROMPT_ROLES',
+    capability=lambda role: role.prompt_spec is None,
+    capability_description='a literal (non-PromptSpec) system_prompt',
+)
 
 
 def test_tool_call_rejection_guidance_is_nonempty() -> None:
@@ -101,11 +121,13 @@ def test_tool_call_rejection_guidance_is_nonempty() -> None:
     ever emptied. This one-line assertion is the sole guard against the
     guidance being silently dropped in a prompt refactor.
     """
-    assert TOOL_CALL_REJECTION_GUIDANCE.strip(), (
-        'TOOL_CALL_REJECTION_GUIDANCE is empty. Every containment test added '
-        'for this constant still passes when it is — the empty string is a '
-        'substring of anything — so this assertion is the sole guard against '
-        'the census-4273 guidance being silently dropped in a prompt refactor.'
+    assert_nonempty(
+        'TOOL_CALL_REJECTION_GUIDANCE',
+        TOOL_CALL_REJECTION_GUIDANCE,
+        remedy=(
+            'Restore the census-4273 guidance: this assertion is the sole guard '
+            'against it being silently dropped in a prompt refactor.'
+        ),
     )
 
 
@@ -121,20 +143,30 @@ def test_missing_required_parameter_shape_is_a_nonempty_brace_free_constant() ->
     f-string-interpolated, and staying brace-free keeps this constant safe
     at any future interpolating splice site.
     """
-    assert MISSING_REQUIRED_PARAMETER_REJECTION.strip(), (
-        'MISSING_REQUIRED_PARAMETER_REJECTION is empty. Every containment test '
-        'written against it — including its own composition into '
-        'TOOL_CALL_REJECTION_GUIDANCE — still passes when it is, since the '
-        'empty string is a substring of anything; this assertion is the sole '
-        'guard against the census-4578 guidance being silently dropped.'
+    assert_nonempty(
+        'MISSING_REQUIRED_PARAMETER_REJECTION',
+        MISSING_REQUIRED_PARAMETER_REJECTION,
+        remedy=(
+            'Restore the census-4578 guidance: this assertion is the sole guard '
+            'against it being silently dropped, including from its own '
+            'composition into TOOL_CALL_REJECTION_GUIDANCE.'
+        ),
     )
-    assert '{' not in MISSING_REQUIRED_PARAMETER_REJECTION and (
-        '}' not in MISSING_REQUIRED_PARAMETER_REJECTION
-    ), (
-        'MISSING_REQUIRED_PARAMETER_REJECTION contains a literal brace. Role '
-        'prompts are deliberately not f-strings, but this constant is held '
-        'brace-free defensively so it stays interpolation-safe if a future '
-        'splice site needs it.'
+    # The brace half now OVERLAPS
+    # `test_tool_call_rejection_halves_have_no_literal_braces
+    # [MISSING_REQUIRED_PARAMETER_REJECTION]`, which task 4578 added later. It is
+    # kept anyway: dropping it would make this test's name lie, and the
+    # redundancy is one line now rather than the eight it used to be. Renaming
+    # the function to shed the "brace_free" half is not an option either — that
+    # would change a collected test ID.
+    assert_brace_free(
+        'MISSING_REQUIRED_PARAMETER_REJECTION',
+        MISSING_REQUIRED_PARAMETER_REJECTION,
+        remedy=(
+            'Role prompts are deliberately not f-strings, but this constant is '
+            'held brace-free defensively so it stays interpolation-safe if a '
+            'future splice site needs it.'
+        ),
     )
 
 
@@ -146,31 +178,22 @@ def test_unpinned_prompt_role_set_matches_prompt_spec_capability() -> None:
     anywhere yet — it pins the PREMISE (which roles have a literal prompt),
     not the splice itself.
     """
-    derived = {name for name, role in ROLES.items() if role.prompt_spec is None}
-
-    assert derived == _UNPINNED_PROMPT_ROLES, (
-        'A role gained or lost a literal (non-PromptSpec) system_prompt, so '
-        'the set of roles eligible for TOOL_CALL_REJECTION_GUIDANCE has '
-        f'changed: gained={sorted(derived - _UNPINNED_PROMPT_ROLES)} '
-        f'lost={sorted(_UNPINNED_PROMPT_ROLES - derived)}. A newly '
-        'unpinned-prompt role must be added to _UNPINNED_PROMPT_ROLES AND given '
-        'TOOL_CALL_REJECTION_GUIDANCE; if it is genuinely exempt, justify the '
-        'exclusion in the comment above the set.'
+    _CONTRACT.assert_role_set_matches_capability(
+        remedy=(
+            'A newly unpinned-prompt role must be added to _UNPINNED_PROMPT_ROLES '
+            'AND given TOOL_CALL_REJECTION_GUIDANCE; if it is genuinely exempt, '
+            'justify the exclusion in the comment above the set.'
+        ),
     )
 
 
 def test_unpinned_prompt_roles_carry_tool_call_rejection_guidance() -> None:
     """Every unpinned-prompt role's system_prompt embeds the guidance block."""
-    offenders = sorted(
-        name
-        for name in _UNPINNED_PROMPT_ROLES
-        if TOOL_CALL_REJECTION_GUIDANCE not in ROLES[name].system_prompt
-    )
-
-    assert offenders == [], (
-        f'Roles missing TOOL_CALL_REJECTION_GUIDANCE from their system_prompt: '
-        f'{offenders}. These roles hold Read and can hit a rejected tool call '
-        'with no guidance on how to read the rejection before retrying.'
+    _CONTRACT.assert_every_role_carries(
+        remedy=(
+            'These roles hold Read and can hit a rejected tool call with no '
+            'guidance on how to read the rejection before retrying.'
+        ),
     )
 
 
@@ -187,21 +210,14 @@ def test_artifact_pinned_role_does_not_carry_guidance() -> None:
     role is exempt on the merits — this test enforces the gap, it does not
     justify it.
     """
-    offenders = sorted(
-        name
-        for name in ROLES
-        if name not in _UNPINNED_PROMPT_ROLES
-        and TOOL_CALL_REJECTION_GUIDANCE in ROLES[name].system_prompt
-    )
-
-    assert offenders == [], (
-        f'Roles carrying TOOL_CALL_REJECTION_GUIDANCE without an unpinned '
-        f'prompt: {offenders}. A PromptSpec-backed role may silently drop a '
-        'splice at runtime — either remove it, or if the role genuinely '
-        'gained an unpinned prompt, add it to _UNPINNED_PROMPT_ROLES. '
-        "`reviewer_comprehensive`'s absence from that set is a deferred "
-        'coverage gap (closing it needs a _REVIEWER_PROMPT_HARNESS_VERSION '
-        'bump), not an exemption on the merits.'
+    _CONTRACT.assert_no_other_role_carries(
+        remedy=(
+            'A PromptSpec-backed role may silently drop a splice at runtime — '
+            'either remove it, or if the role genuinely gained an unpinned '
+            "prompt, add it to _UNPINNED_PROMPT_ROLES. `reviewer_comprehensive`'s "
+            'absence from that set is a deferred coverage gap (closing it needs a '
+            '_REVIEWER_PROMPT_HARNESS_VERSION bump), not an exemption on the merits.'
+        ),
     )
 
 
@@ -215,18 +231,16 @@ def test_guidance_appears_exactly_once_per_role() -> None:
     flagged, so a role that has not yet received the splice fails exactly one
     test for that one root cause instead of two.
     """
-    offenders = {}
-    for name in sorted(_UNPINNED_PROMPT_ROLES):
-        count = ROLES[name].system_prompt.count(TOOL_CALL_REJECTION_GUIDANCE)
-        if count == 0:
-            continue
-        if count != 1:
-            offenders[name] = count
-
-    assert offenders == {}, (
-        f'Roles carrying more than one copy of TOOL_CALL_REJECTION_GUIDANCE: '
-        f'{offenders}. A stale duplicate splice was probably left beside a new '
-        'one — delete the extra copy.'
+    # `absent_ok=True` IS the "skipped rather than flagged" behaviour the
+    # docstring above describes, and it is the documented asymmetry with
+    # `test_missing_required_parameter_shape_appears_exactly_once_per_role`
+    # below, which passes `absent_ok=False` deliberately.
+    _CONTRACT.assert_spliced_exactly_once(
+        absent_ok=True,
+        remedy=(
+            'A stale duplicate splice was probably left beside a new one — delete '
+            'the extra copy.'
+        ),
     )
 
 
