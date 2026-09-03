@@ -804,3 +804,149 @@ def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
         'patch_targets': sorted(patch_targets(source, path=path)),
         'private_reads': private_reads(source, path=path),
     }
+
+
+# ---------------------------------------------------------------------------
+# Report assembly, and DERIVED totals.
+
+SCHEMA_VERSION = 1
+
+#: Subdirectory swept for the two test-suite measures.
+TESTS_ROOT = 'orchestrator/tests'
+
+
+def build_report(root: Path) -> dict[str, object]:
+    """Measure the whole cluster plus the test suite under *root*.
+
+    Note there is NO ``totals`` key: cluster-wide totals are DERIVED at check
+    time by ``derive_totals`` from the stored per-path maps. PRD gamma1..gamma10
+    run in parallel and each lowers only its own group's contribution, so a
+    shared totals line would conflict on every one of ten rebases -- while
+    deriving preserves the anti-rename-gaming property in full (see
+    ``derive_totals``) and keeps one number in one place.
+    """
+    # Up front, before any measurement: a wrong-version engine must fail
+    # immediately with a named cause rather than after a 250-second run whose
+    # numbers would be wrong anyway.
+    version = require_complexipy()
+    enumeration = resolve_cluster_paths(root)
+
+    files: dict[str, object] = {}
+    functions: dict[str, int] = {}
+    for relpath in enumeration.resolved:
+        source = _read_source(root, relpath)
+        size = file_size_measures(source, path=relpath)
+        target = root / relpath
+        files[relpath] = {
+            'lines': size.lines,
+            'prose_lines': size.prose_lines,
+            'cognitive': file_cognitive_total(target),
+            'function_local_imports': function_local_imports(source, path=relpath),
+            'reexport_names': len(reexport_names(source, path=relpath)),
+        }
+        for qualname, score in cognitive_complexity(target).items():
+            functions[f'{relpath}::{qualname}'] = score
+
+    tests, test_enumeration = _sweep_test_tree(root)
+
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'params': {
+            'complexipy_version': version,
+            'cluster_paths': list(CLUSTER_PATHS),
+            'file_line_ceiling': FILE_LINE_CEILING,
+            'new_function_cognitive_ceiling': NEW_FUNCTION_COGNITIVE_CEILING,
+        },
+        'enumeration': _merge_enumerations(enumeration, test_enumeration).to_dict(),
+        'files': dict(sorted(files.items())),
+        'functions': dict(sorted(functions.items())),
+        'tests': dict(sorted(tests.items())),
+    }
+
+
+def _sweep_test_tree(root: Path) -> tuple[dict[str, object], Enumeration]:
+    """Measure every lane-importing file under ``orchestrator/tests``.
+
+    THIS sweep keeps the sibling guards' per-file fail-SOFT polarity -- an
+    unrelated mid-edit test file must not redden the ratchet, which is the
+    misattribution every neighbouring guard exists to avoid. What is NOT soft is
+    the record: each skipped file lands in ``Enumeration.unreadable``, the
+    enumeration goes incomplete, and ``check_against_baseline`` then refuses to
+    compare at all. That split is the INV-11 seam between "this cluster file is
+    unmeasurable, which IS the finding" and "some unrelated test file is
+    mid-edit".
+    """
+    tests: dict[str, object] = {}
+    requested: list[str] = []
+    unreadable: list[str] = []
+    for path in sorted((root / TESTS_ROOT).rglob('*.py')):
+        relpath = path.relative_to(root).as_posix()
+        requested.append(relpath)
+        try:
+            source = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            unreadable.append(relpath)
+            continue
+        try:
+            measures = test_file_measures(source, path=relpath)
+        except MetricsError:
+            unreadable.append(relpath)
+            continue
+        if measures is not None:
+            tests[relpath] = measures
+    return tests, Enumeration(
+        requested=tuple(requested),
+        resolved=tuple(sorted(tests)),
+        unreadable=tuple(unreadable),
+        complete=not unreadable,
+    )
+
+
+def _merge_enumerations(cluster: Enumeration, tests: Enumeration) -> Enumeration:
+    return Enumeration(
+        requested=cluster.requested + tests.requested,
+        resolved=cluster.resolved + tests.resolved,
+        unreadable=cluster.unreadable + tests.unreadable,
+        complete=cluster.complete and tests.complete,
+    )
+
+
+#: Per-file measures summed into a cluster total by ``derive_totals``.
+_SUMMED_FILE_MEASURES = (
+    'lines',
+    'prose_lines',
+    'cognitive',
+    'function_local_imports',
+    'reexport_names',
+)
+
+
+def derive_totals(report: dict) -> dict[str, int]:
+    """Cluster-wide totals, DERIVED by summing *report*'s per-path maps.
+
+    Pure: *report* is never mutated.
+
+    Deriving rather than storing is what makes the ten parallel gamma branches
+    rebase cleanly, AND it preserves the anti-rename-gaming property exactly. A
+    total computed by summing stored per-path baselines is unchanged when 500
+    lines move from ``merge_queue.py`` to a brand-new path, so the ratchet still
+    catches the move -- which a per-path-only comparison would not, since the
+    new path is simply absent from the baseline.
+
+    ``patch_targets`` is the size of the UNION across files, matching the PRD's
+    "distinct names" measure rather than a sum of per-file counts.
+    """
+    files = report.get('files', {})
+    totals = {
+        measure: sum(int(entry.get(measure, 0)) for entry in files.values())
+        for measure in _SUMMED_FILE_MEASURES
+    }
+    tests = report.get('tests', {})
+    totals['private_reads'] = sum(
+        int(entry.get('private_reads', 0)) for entry in tests.values()
+    )
+    union: set[str] = set()
+    for entry in tests.values():
+        union.update(entry.get('patch_targets', ()))
+    totals['patch_targets'] = len(union)
+    return totals
