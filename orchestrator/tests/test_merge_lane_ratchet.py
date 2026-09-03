@@ -533,3 +533,168 @@ class TestReexportNames:
         stripped = source.replace('  # noqa: F401  re-export shim', '')
         assert metrics.reexport_names(source, path='t.py') == ['B', 'C']
         assert metrics.reexport_names(stripped, path='t.py') == ['B', 'C']
+
+
+# ---------------------------------------------------------------------------
+# The complexipy adapter, and its version contract (INV-11 for tools).
+
+_TINY_SOURCE = (
+    'def f(a):\n'
+    '    if a:\n'
+    '        for i in range(3):\n'
+    '            if i:\n'
+    '                return i\n'
+    '    return 0\n'
+    '\n'
+    '\n'
+    'class C:\n'
+    '    def m(self):\n'
+    '        return 1\n'
+)
+
+
+class TestCognitiveComplexity:
+    def test_keyed_by_complexipy_qualname(self, tmp_path: Path) -> None:
+        target = tmp_path / 'tiny.py'
+        target.write_text(_TINY_SOURCE, encoding='utf-8')
+        scores = metrics.cognitive_complexity(target)
+        assert scores == {'f': 6, 'C::m': 0}
+
+    def test_module_with_no_functions_returns_an_empty_map(self, tmp_path: Path) -> None:
+        target = tmp_path / 'empty.py'
+        target.write_text('X = 1\n', encoding='utf-8')
+        assert metrics.cognitive_complexity(target) == {}
+
+    def test_file_total_is_reported_separately(self, tmp_path: Path) -> None:
+        target = tmp_path / 'tiny.py'
+        target.write_text(_TINY_SOURCE, encoding='utf-8')
+        assert metrics.file_cognitive_total(target) == 6
+
+    def test_missing_complexipy_raises_naming_the_tool(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Never a skipped measure and never a 0: a tool the instrument cannot
+        # run is an instrument failure with a named cause (INV-11).
+        monkeypatch.setitem(sys.modules, 'complexipy', None)
+        target = tmp_path / 'tiny.py'
+        target.write_text(_TINY_SOURCE, encoding='utf-8')
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.cognitive_complexity(target)
+        message = str(excinfo.value)
+        assert 'complexipy' in message
+        assert 'dev' in message
+
+    def test_unparseable_file_raises_naming_the_path(self, tmp_path: Path) -> None:
+        target = tmp_path / 'broken.py'
+        target.write_text('def (:\n', encoding='utf-8')
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.cognitive_complexity(target)
+        assert 'broken.py' in str(excinfo.value)
+
+    def test_merge_queue_anchor_reproduces_the_prd_background_numbers(self) -> None:
+        # Anti-vacuity anchor. These are the exact figures the PRD Background
+        # table quotes. complexipy majors 3/4/5 compute DIFFERENT numbers for
+        # this same file (2031 / 2124 / 2092), so a silent algorithm change in a
+        # future release is caught here by a named failure rather than by every
+        # baseline number quietly shifting underneath the ratchet.
+        target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
+        scores = metrics.cognitive_complexity(target)
+        assert scores['SpeculativeMergeWorker::_verifier_loop'] == 245
+        assert scores['SpeculativeMergeWorker::stop'] == 109
+        assert metrics.file_cognitive_total(target) == 2133
+
+
+class TestComplexipyVersionContract:
+    def test_required_specifier_is_the_measured_range(self) -> None:
+        assert metrics.COMPLEXIPY_REQUIRED == '>=6.2,<7'
+
+    def test_installed_version_satisfies_the_requirement(self) -> None:
+        # The executable form of the measured pin.
+        metrics.require_complexipy()
+        assert metrics.satisfies_complexipy_requirement(metrics.complexipy_version())
+
+    def test_pyproject_pin_matches_the_scripts_requirement(self) -> None:
+        # Goes RED the moment someone relaxes the dependency to 7.x. The pin and
+        # the runtime check are two halves of one contract; letting them drift
+        # would leave the ratchet silently measuring with the wrong engine.
+        pyproject = (_REPO_ROOT / 'orchestrator/pyproject.toml').read_text(encoding='utf-8')
+        assert f'"complexipy{metrics.COMPLEXIPY_REQUIRED}"' in pyproject
+
+    def test_version_out_of_range_raises_naming_both_versions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(metrics, 'complexipy_version', lambda: '7.0.1')
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.require_complexipy()
+        message = str(excinfo.value)
+        assert '7.0.1' in message
+        assert metrics.COMPLEXIPY_REQUIRED in message
+        # The measured reason travels with the failure so the next reader does
+        # not have to re-derive it.
+        assert '247' in message
+        assert '4.75' in message
+
+    def test_version_below_the_floor_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(metrics, 'complexipy_version', lambda: '6.1.0')
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.require_complexipy()
+        assert '6.1.0' in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        ('version', 'ok'),
+        [
+            ('6.2.0', True),
+            ('6.2', True),
+            ('6.9.9', True),
+            ('6.1.9', False),
+            ('6.0.0', False),
+            ('5.0.0', False),
+            ('7.0.0', False),
+            ('7.0.1', False),
+            ('8.0.0', False),
+        ],
+    )
+    def test_specifier_boundaries(self, version: str, ok: bool) -> None:
+        assert metrics.satisfies_complexipy_requirement(version) is ok
+
+    def test_missing_complexipy_distribution_raises_naming_the_tool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib.metadata
+
+        def _boom(name: str) -> str:
+            raise importlib.metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(importlib.metadata, 'version', _boom)
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.complexipy_version()
+        assert 'complexipy' in str(excinfo.value)
+
+
+class TestMaintainabilityIndex:
+    def test_returns_a_float_for_a_tiny_module(self) -> None:
+        value = metrics.maintainability_index(_TINY_SOURCE, path='tiny.py')
+        assert isinstance(value, float)
+        assert 0.0 <= value <= 100.0
+
+    def test_merge_queue_anchor_is_zero(self) -> None:
+        # The PRD Background table's "Maintainability index (radon) | 0" row.
+        # Reported, never ratcheted -- but genuinely exercised, so the `radon`
+        # dev-group entry is not dead weight.
+        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py').read_text(
+            encoding='utf-8'
+        )
+        assert metrics.maintainability_index(source, path='merge_queue.py') == 0.0
+
+    def test_missing_radon_raises_naming_the_tool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(sys.modules, 'radon.metrics', None)
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.maintainability_index(_TINY_SOURCE, path='tiny.py')
+        assert 'radon' in str(excinfo.value)
+
+    def test_unparseable_source_raises_naming_the_path(self) -> None:
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.maintainability_index('def (:\n', path='broken.py')
+        assert 'broken.py' in str(excinfo.value)
