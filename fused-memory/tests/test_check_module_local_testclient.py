@@ -67,7 +67,7 @@ class TestFindViolationsBasicDetection:
         v = violations[0]
         assert v.filename == 'test_x.py'
         # 1-based lineno of the `TestClient(` call, not of the fixture def.
-        assert v.lineno == 10
+        assert v.lineno == 9
         assert _MODULE_LOCAL_CLIENT_FIXTURE.splitlines()[v.lineno - 1].lstrip().startswith(
             'with TestClient(app)'
         )
@@ -94,7 +94,7 @@ class TestFindViolationsBasicDetection:
         for name in ('_client', '_ro_client', '_c', 'app_client'):
             violations = find_violations(_fixture_source(name), 'test_x.py')
             assert len(violations) == 1, f'fixture named {name!r} was not flagged'
-            assert violations[0].lineno == 10
+            assert violations[0].lineno == 9
 
     def test_two_constructions_in_one_fixture_yield_two_violations(self):
         """One Violation per construction, sorted by (lineno, col_offset)."""
