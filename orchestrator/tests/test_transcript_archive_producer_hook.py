@@ -19,11 +19,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import ENC, _config, _make_workflow
+from _workflow_helpers import ENC, _archived, _config, _make_git_ops, _make_workflow
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
-from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 
@@ -47,15 +46,7 @@ async def _init_repo(repo: Path) -> None:
 
 @pytest.fixture
 def git_ops(git_repo: Path) -> GitOps:
-    return GitOps(
-        GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-        git_repo,
-    )
+    return _make_git_ops(git_repo)
 
 
 @pytest.fixture
@@ -103,10 +94,7 @@ class TestProducerHook:
             await workflow._invoke(SIMPLE_TASK, 'p', cwd)
 
         sid = workflow._last_invoke_session_id
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / f'{sid}.jsonl'
-        )
+        archived = _archived(git_repo, task_assignment.task_id, sid)
         assert archived.exists()
         assert archived.read_bytes() == fake_bytes
 
@@ -241,10 +229,7 @@ class TestCleanupConfigDirArchivesFirst:
 
         workflow._cleanup_config_dir()
 
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / 'sess-teardown.jsonl'
-        )
+        archived = _archived(git_repo, task_assignment.task_id, 'sess-teardown')
         assert archived.read_bytes() == payload
         # ...and the dir is still torn down. Archival is a precondition of the
         # delete, not a replacement for it.
@@ -349,10 +334,7 @@ class TestCleanupConfigDirArchivesFirst:
 
         workflow._recycle_config_dir()
 
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / 'sess-wedged.jsonl'
-        )
+        archived = _archived(git_repo, task_assignment.task_id, 'sess-wedged')
         assert archived.read_bytes() == payload
         # The recycle rebuilds at the SAME path (TaskConfigDir is named from
         # the task id), so "the dir is gone" is not the observable here — the
@@ -444,10 +426,7 @@ class TestProducerHookIsUncancellable:
             await workflow._invoke(SIMPLE_TASK, 'p', cwd)
 
         sid = workflow._last_invoke_session_id
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / f'{sid}.jsonl'
-        )
+        archived = _archived(git_repo, task_assignment.task_id, sid)
         # Cancellation still propagates — teardown is cooperative. What changed
         # is that it can no longer take the archival with it.
         assert archived.read_bytes() == payload
@@ -479,10 +458,7 @@ class TestProducerHookIsUncancellable:
             await workflow._invoke(SIMPLE_TASK, 'p', cwd)
 
         sid = workflow._last_invoke_session_id
-        archived = (
-            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / f'{sid}.jsonl'
-        )
+        archived = _archived(git_repo, task_assignment.task_id, sid)
         assert archived.read_bytes() == payload
 
     async def test_this_site_copies_so_a_resumed_session_keeps_reading(
