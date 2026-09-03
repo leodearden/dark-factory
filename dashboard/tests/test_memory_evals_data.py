@@ -693,6 +693,33 @@ _HUGE_METRIC_ID = 'm' * 5000
 _HUGE_KIND = 'k' * 5000
 
 
+def _assert_capped(detail: str, *, values: int = 1) -> None:
+    """Assert *detail* is a `_short_repr`-bounded issue detail.
+
+    Shared by every per-site capping test below plus the escalation-join
+    test, so all of them stay coupled to `_MAX_DISCARDED_VALUE_REPR` --
+    the way ``TestAllIssueDetailsAreBounded`` already is -- instead of
+    each carrying its own ``len(detail) < 500`` literal that a retuned
+    knob could silently outgrow (raising the knob to 250 alone pushes the
+    two-value details past 500 and fails eight tests for a reason that
+    has nothing to do with a regression).  *values* is the number of
+    oversized values THIS CALLER'S fixture actually put in *detail* --
+    not the number of `_short_repr(...)` call sites the detail's f-string
+    has in the source, which can be larger: `unknown_verdict`,
+    `unknown_escalation_status` and `unfingerprinted_escalation` each wrap
+    a SECOND value (``verdict``/``status``/``fingerprint``) that most
+    fixtures leave short, so it never truncates and contributes no
+    ellipsis.  Pass the count of ellipses the fixture actually earns --
+    two only for `unknown_kind`, `orphan_verdict` and
+    `duplicate_escalation_fingerprint`, whose fixtures make BOTH
+    interpolated values oversized; one (the default) everywhere else.
+    """
+    from dashboard.data.memory_evals import _MAX_DISCARDED_VALUE_REPR
+
+    assert detail.count('…') == values
+    assert len(detail) <= values * (_MAX_DISCARDED_VALUE_REPR + 1) + 200
+
+
 class TestLimitsProvenance:
     """The limits artifact contributes provenance + ``rule_kind``. Nothing else.
 
@@ -785,7 +812,7 @@ class TestLimitsProvenance:
         assert issue['path'] == str(root / 'eval-a' / 'limits-current.json')
 
     def test_duplicate_limits_verdict_metric_id_is_capped(self, tmp_path: Path) -> None:
-        """``metric_id`` is str-guarded (:391) but never length-guarded.
+        """``metric_id`` is str-guarded (memory_evals.py::_read_limits) but never length-guarded.
 
         A duplicate limits verdict names the metric_id in its detail — an
         oversized one must not blow up the payload the way an oversized
@@ -807,8 +834,7 @@ class TestLimitsProvenance:
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
         assert issue['kind'] == 'duplicate_limits_verdict'
-        assert '…' in issue['detail']
-        assert len(issue['detail']) < 500
+        _assert_capped(issue['detail'])
         assert 'has more than one limits verdict' in issue['detail']
 
 
@@ -970,7 +996,7 @@ class TestVerdicts:
         """Both interpolations in this ONE detail are unvalidated JSON.
 
         ``eval_id`` and ``metric_id`` are ``isinstance(..., str)``-guarded at
-        the verdicts read boundary (:583) but never length-guarded — the
+        the verdicts read boundary (memory_evals.py::_read_verdicts) but never length-guarded — the
         same size exposure as the duplicate-index details, one field over.
         """
         from dashboard.data.memory_evals import build_memory_evals
@@ -988,9 +1014,14 @@ class TestVerdicts:
         assert issue['kind'] == 'orphan_verdict'
         # BOTH halves capped — metric_id and eval_id interpolate into the
         # same detail, so the ellipsis must appear twice.
-        assert issue['detail'].count('…') == 2
-        assert len(issue['detail']) < 500
+        _assert_capped(issue['detail'], values=2)
         assert 'matches no metric row in eval' in issue['detail']
+        # The structured `eval_id=` kwarg is an identity field, not prose —
+        # it stays the untruncated original (design decision: truncating it
+        # would corrupt the UI's grouping/linking rather than just trim a
+        # detail).  A future over-eager sweep that routed it through
+        # `_short_repr` too would break that and nothing above would notice.
+        assert issue['eval_id'] == huge_eval_id
 
     def test_missing_root_verdicts_is_named(self, tmp_path: Path) -> None:
         """Trends with a blank verdict column would otherwise look healthy."""
@@ -1684,7 +1715,8 @@ class TestEscalationJoin:
         )
         # Two escalations sharing one fingerprint, BOTH with oversized ids ->
         # duplicate_escalation_fingerprint; the detail names the loser's own id
-        # (:867) AND the survivor's id read back out of the index (:868).
+        # AND the survivor's id read back out of the index
+        # (memory_evals.py::_index_escalations).
         _write_escalation(
             esc_dir, 'esc-huge-dup-1',
             dedupe_fingerprint='f' * 32, timestamp=_JOIN_ESC_TIMESTAMP, id=huge_id,
@@ -1706,7 +1738,7 @@ class TestEscalationJoin:
         not_truncated = [i for i in status_issues if '…' not in i['detail']]
         assert len(truncated) == 1
         assert len(not_truncated) == 1
-        assert len(truncated[0]['detail']) < 500
+        _assert_capped(truncated[0]['detail'])
         assert 'has unrecognised status' in truncated[0]['detail']
         # The strict-drop-in control -- `_short_repr` on a short id must read
         # exactly like the raw `!r` it replaces.
@@ -1716,8 +1748,7 @@ class TestEscalationJoin:
         unfingerprinted = [i for i in payload['issues'] if i['kind'] == 'unfingerprinted_escalation']
         assert len(unfingerprinted) == 1
         unfingerprinted_detail = unfingerprinted[0]['detail']
-        assert '…' in unfingerprinted_detail
-        assert len(unfingerprinted_detail) < 500
+        _assert_capped(unfingerprinted_detail)
         assert 'is open but carries no usable dedupe_fingerprint' in unfingerprinted_detail
 
         dup = [i for i in payload['issues'] if i['kind'] == 'duplicate_escalation_fingerprint']
@@ -1726,8 +1757,7 @@ class TestEscalationJoin:
         # BOTH halves capped: the loser's own id and the survivor's id read back
         # out of the index are the SAME huge value, so the ellipsis must appear
         # twice in one detail, not just for whichever interpolation comes first.
-        assert dup_detail.count('…') == 2
-        assert len(dup_detail) < 500
+        _assert_capped(dup_detail, values=2)
         assert 'shares dedupe_fingerprint' in dup_detail
         assert 'the first is used' in dup_detail
 
@@ -1902,8 +1932,7 @@ class TestUnknownVerdict:
         named = [i for i in payload['issues'] if i['kind'] == 'unknown_verdict']
         assert len(named) == 1
         detail = named[0]['detail']
-        assert '…' in detail
-        assert len(detail) < 500
+        _assert_capped(detail)
         assert 'M2 vocabulary' in detail
 
 
@@ -2761,12 +2790,11 @@ class TestStalenessAndDegradedStates:
         issue = payload['issues'][0]
         assert issue['kind'] == 'unknown_kind'
         assert issue['eval_id'] == 'eval-a'
-        assert issue['detail'].count('…') == 2
-        assert len(issue['detail']) < 500
+        _assert_capped(issue['detail'], values=2)
         assert 'which has no chart primitive' in issue['detail']
 
     def test_two_distinct_huge_kinds_sharing_a_prefix_are_not_deduped(self, tmp_path: Path) -> None:
-        """The ``seen_kinds`` dedup key (:1103/:1105) stays UNCAPPED, on purpose.
+        """The ``seen_kinds`` dedup key (memory_evals.py::_build_eval) stays UNCAPPED, on purpose.
 
         It is an internal set key, never emitted into the payload -- capping
         it would make two distinct kinds differing only past char 120 collide
@@ -2833,8 +2861,7 @@ class TestStalenessAndDegradedStates:
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
         assert issue['kind'] == 'missing_kind'
-        assert '…' in issue['detail']
-        assert len(issue['detail']) < 500
+        _assert_capped(issue['detail'])
         assert 'so it has no chart primitive' in issue['detail']
 
     def test_a_metric_absent_from_a_run_is_not_a_missing_kind(self, tmp_path: Path) -> None:
@@ -2910,9 +2937,11 @@ class TestStalenessAndDegradedStates:
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
         assert issue['kind'] == 'duplicate_metric_id'
-        assert '…' in issue['detail']
-        assert len(issue['detail']) < 500
+        _assert_capped(issue['detail'])
         assert 'appears more than once in this run' in issue['detail']
+        # The docstring's claim above -- only the detail is bounded, the
+        # surviving row's own identity is not -- pinned, not just asserted.
+        assert _only(payload['evals'][0]['metrics'], _HUGE_METRIC_ID)['metric_id'] == _HUGE_METRIC_ID
 
     def test_metric_record_with_no_metric_id_is_counted_not_dropped(self, tmp_path: Path) -> None:
         """An unidentifiable record cannot be charted — but its loss is reported.
@@ -2978,9 +3007,13 @@ class TestStalenessAndDegradedStates:
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
         assert issue['kind'] == 'duplicate_verdict_entry'
-        assert '…' in issue['detail']
-        assert len(issue['detail']) < 500
+        _assert_capped(issue['detail'])
         assert 'has more than one verdict entry' in issue['detail']
+        # The docstring's claim above -- only the detail is bounded, the
+        # surviving row's own identity is not -- pinned, not just asserted.
+        row = _only(payload['evals'][0]['metrics'], _HUGE_METRIC_ID)
+        assert row['verdict'] == 'alarm'
+        assert row['current_value'] == 4.0
 
     def test_two_escalations_sharing_a_fingerprint_are_named(self, tmp_path: Path) -> None:
         """A dropped escalation is exactly what the parity view exists to catch.
@@ -3236,7 +3269,7 @@ class TestStalenessAndDegradedStates:
         assert payload['evals'][0]['stale'] is False
 
     def test_unparseable_run_stamp_is_capped(self, tmp_path: Path) -> None:
-        """``latest_run_stamp`` is ``isinstance``-guarded (:1048) but never length-guarded.
+        """``latest_run_stamp`` is ``isinstance``-guarded (memory_evals.py::_build_eval) but never length-guarded.
 
         Same size exposure as the other rendering-vocabulary details: a
         hostile in-body ``run_stamp`` must not blow up the payload.
@@ -3251,8 +3284,7 @@ class TestStalenessAndDegradedStates:
         assert payload['issue_count'] == len(payload['issues']) == 1
         issue = payload['issues'][0]
         assert issue['kind'] == 'unparseable_run_stamp'
-        assert '…' in issue['detail']
-        assert len(issue['detail']) < 500
+        _assert_capped(issue['detail'])
         assert 'is not in' in issue['detail']
         # The structured field is NOT truncated — only the detail prose is.
         assert payload['evals'][0]['latest_run_stamp'] == huge_stamp
@@ -3317,16 +3349,22 @@ class TestStalenessAndDegradedStates:
 
 
 class TestAllIssueDetailsAreBounded:
-    """No per-site sweep can be re-broken silently by the next ``_issue`` call.
+    """The twelve issue kinds in ``required_kinds`` below cannot be silently re-broken.
 
-    Every per-site test above protects only the sites that existed when it
-    was written.  This property test converts "we fixed the known list"
-    into "the module cannot emit an unbounded detail": build one tree that
-    is hostile in every dimension the module reads unvalidated JSON from,
-    then assert every issue detail in the resulting payload is bounded AND
-    that the observed issue-kind set actually covers every in-scope kind —
-    so a hostile tree that quietly stopped triggering half its sites cannot
-    pass by accident.
+    Every per-site test above protects only the exact assertion it wrote.
+    This property test raises that to: re-introducing an unbounded value at
+    any of the sites that feed these twelve kinds cannot happen silently —
+    build one tree hostile in every dimension THOSE sites read unvalidated
+    JSON from, then assert every resulting issue detail is bounded AND that
+    the observed issue-kind set still covers all twelve, so a hostile tree
+    that quietly stopped triggering half its sites cannot pass by accident.
+
+    What this does NOT hold: it does not prove the module overall "cannot
+    emit an unbounded detail".  A `_issue` call for a kind outside
+    ``required_kinds`` — a new kind, or one of the module's other existing
+    kinds this hostile tree never triggers — is not exercised here and
+    needs its own per-site bound and test, the same way the twelve below
+    got theirs.
     """
 
     def test_every_issue_detail_is_bounded_and_every_kind_is_covered(
