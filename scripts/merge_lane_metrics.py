@@ -311,3 +311,68 @@ def file_size_measures(source: str, *, path: str) -> FileSizeMeasures:
     tree = _parse(source, path=path)
     prose = _docstring_lines(tree) | _comment_lines(source, path=path)
     return FileSizeMeasures(lines=len(source.splitlines()), prose_lines=len(prose))
+
+
+# ---------------------------------------------------------------------------
+# Structural import measures.
+
+_FUNCTION_NODES: tuple[type[ast.AST], ...] = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def function_local_imports(source: str, *, path: str) -> int:
+    """Count import statements that live inside a function body.
+
+    These are the lane's reach-back imports -- the function-local
+    ``from orchestrator.merge_queue import ...`` sites that exist to break
+    import cycles, plus every other deferred import in the same shape. The PRD's
+    ceiling for this measure is zero.
+
+    Counted per STATEMENT, not per bound name, and deduped by node identity so a
+    nested function's import is counted once rather than once per enclosing
+    function. AST-based, so a docstring quoting an import statement -- which the
+    satellite modules' reach-back notes do verbatim -- is never counted.
+    """
+    tree = _parse(source, path=path)
+    seen: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, _FUNCTION_NODES):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Import | ast.ImportFrom):
+                seen.add(id(inner))
+    return len(seen)
+
+
+def reexport_names(source: str, *, path: str) -> list[str]:
+    """Names a module imports at module level and never itself references.
+
+    This is the STRUCTURAL reading of a re-export shim, and deliberately not a
+    scan for the ``# noqa: F401  re-export shim`` comment: comments do not exist
+    in the AST at all, and a comment-based detector would zero out on a purely
+    cosmetic edit. The structural predicate is exactly what ruff's F401 computes
+    -- which is precisely why those blocks carry the suppression -- so it agrees
+    with the annotated set while being ungameable.
+
+    Scoped to MODULE-LEVEL ``from X import ...`` bindings: a bare ``import x``
+    binds a module rather than re-exporting a name, a function-local import is
+    the ``function_local_imports`` measure's business, and ``import *`` binds
+    nothing nameable. Returns the bound names (``asname or name``) sorted and
+    deduped.
+    """
+    tree = _parse(source, path=path)
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    # An attribute chain rooted at the binding (`B.attr`) also uses it, and so
+    # does an `__all__` listing -- but `__all__` entries are string constants,
+    # not Names, and a module that re-exports via `__all__` is still a shim by
+    # this measure's definition, which is the reading the PRD's ceiling wants.
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        for alias in node.names:
+            if alias.name == '*':
+                continue
+            bound = alias.asname or alias.name
+            if bound not in used:
+                names.add(bound)
+    return sorted(names)
