@@ -162,3 +162,67 @@ class SpliceContract:
             f'lost={sorted(self.roles - derived)}. '
             f'The hand-maintained set is {self.role_set_name}. {remedy}'
         )
+
+    def _resolve(self, constant: str | None, constant_name: str | None) -> tuple[str, str]:
+        """Fall back to the contract's own constant when no override is given.
+
+        The override exists for a splice unit COMPOSED of named halves: the
+        whole-unit calls stay one-liners, while a half-scoped call (a negative
+        containment or a count against one half specifically) reuses the same
+        body instead of a fourth copy of the offender idiom.
+        """
+        return (
+            self.constant if constant is None else constant,
+            self.constant_name if constant_name is None else constant_name,
+        )
+
+    def assert_every_role_carries(
+        self,
+        *,
+        constant: str | None = None,
+        constant_name: str | None = None,
+        remedy: str,
+    ) -> None:
+        """Every role in the set carries the constant in its ``system_prompt``.
+
+        Offenders are collected as a SORTED LIST rather than reduced to a bare
+        boolean, so a failure prints the roles a reader has to act on.
+        """
+        value, name = self._resolve(constant, constant_name)
+        offenders = sorted(
+            role_name
+            for role_name in self.roles
+            if value not in self.all_roles[role_name].system_prompt
+        )
+
+        assert offenders == [], (
+            f'Roles missing {name} from their system_prompt: {offenders}. {remedy}'
+        )
+
+    def assert_no_other_role_carries(
+        self,
+        *,
+        constant: str | None = None,
+        constant_name: str | None = None,
+        remedy: str,
+    ) -> None:
+        """No role OUTSIDE the set carries the constant.
+
+        The negative half. ``assert_role_set_matches_capability`` catches a role
+        GAINING the capability and ``assert_every_role_carries`` catches a
+        covered role LOSING the constant; neither catches an accidental splice
+        into an excluded role, which would ship silently and is paid on every
+        invocation of that role.
+        """
+        value, name = self._resolve(constant, constant_name)
+        offenders = sorted(
+            role_name
+            for role_name in self.all_roles
+            if role_name not in self.roles
+            and value in self.all_roles[role_name].system_prompt
+        )
+
+        assert offenders == [], (
+            f'Roles carrying {name} without {self.capability_description}: '
+            f'{offenders}. {remedy}'
+        )
