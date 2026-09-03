@@ -97,7 +97,7 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
 
     Returns an empty list (without warning) when *path* is ``None``.
     Returns an empty list and emits one WARNING when the file is missing,
-    unreadable, or not valid YAML.
+    unreadable, not decodable as UTF-8, or not valid YAML.
     Skips malformed individual entries with one WARNING each while returning
     the well-formed entries from the same file.
 
@@ -117,6 +117,12 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
     except OSError as exc:
         logger.warning(
             "recon_code_fix_premise_guard: cannot read %s: %s — guard disabled",
+            path, exc,
+        )
+        return []
+    except UnicodeDecodeError as exc:
+        logger.warning(
+            "recon_code_fix_premise_guard: cannot decode %s as UTF-8: %s — guard disabled",
             path, exc,
         )
         return []
