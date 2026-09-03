@@ -726,6 +726,83 @@ MISSING_REQUIRED_PARAMETER_REJECTION = """\
 TOOL_CALL_REJECTION_GUIDANCE = _TOOL_CALL_REJECTION_KNOWN_SHAPES + MISSING_REQUIRED_PARAMETER_REJECTION
 
 
+# Census-2026-08-31 §1.1 finding (task 4964; plans/confusion-census-2026-08-31.md),
+# codebook entry entry-cand-20260827-23, founding session
+# 7dae04c6-f0a5-400d-b199-8932d65a8790. An `Edit` call landed
+# `<tool_use_error>Found 3 matches of the string to replace, but replace_all
+# is false...`, and the very next turn called a bare `replace_all({})` --
+# rejected with `Error: No such tool available: replace_all`, one turn lost.
+# The agent read the rejection's remedy clause ("set replace_all to true")
+# and bound the bare identifier `replace_all` to the wrong syntactic
+# category: a callable tool rather than a parameter on a re-issued `Edit`
+# call.
+#
+# WHAT IS AND IS NOT ADDRESSED. `Edit`'s multi-match error text is emitted
+# by the harness and is upstream of this repository; no in-repo code path
+# produces or can intercept it, so this constant does not attempt to
+# change, wrap or detect that message. Only the RESPONSE facet is in
+# scope -- an agent that reads the remedy clause correctly does not spend a
+# turn on a phantom tool call. This is the same carve-out tasks 4273 and
+# 4578 documented for the two `InputValidationError` findings above, and it
+# is why a harness-rooted census finding still lands in this file.
+#
+# DISCRIMINATION, NOT DUPLICATION -- now against THREE neighbouring shapes,
+# not two. `TOOL_CALL_REJECTION_GUIDANCE` above covers `InputValidationError`:
+# a defect in the CALL you just made, with the echoed bytes to read, in
+# three shapes (unparseable JSON / invented parameter name / missing
+# required sibling). This constant covers a DIFFERENT error class: a
+# well-formed call that succeeded in parsing, failed on CONTENT, and
+# printed a remedy -- where the failure is in parsing the remedy, not the
+# call. The census recorded "No such tool available" as spanning at least
+# five catalogued mechanisms, so neither block may be collapsed into the
+# other and neither may be deleted as redundant with the other.
+#
+# ACCURACY CAVEAT the text below must honour: the census explicitly does
+# NOT establish that `replace_all: true` was the semantically correct fix
+# for that particular edit. The guidance presents both remedies as chosen
+# on intent -- it must never assert that setting the parameter is always
+# right.
+#
+# HARD CONSTRAINTS, same as both neighbours above. No `mcp__<family>__<name>`
+# example -- this constant is spliced into 8 roles with differing
+# allowlists, and
+# test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
+# asserts any fully-qualified MCP tool a prompt names is in THAT role's
+# allowed_tools; `Edit`, `Read` and `ToolSearch` are all builtins and do not
+# match that regex. No literal `{`/`}` braces -- role prompts reach this
+# only by plain `+` concatenation. No sighting COUNT in the prose -- the
+# codebook accrues a new sighting every census cycle, and a number baked
+# into a role prompt goes stale silently.
+ERROR_REMEDY_HINT_GUIDANCE = """
+## A tool error's remedy hint names a parameter, not a new tool
+
+When a tool result rejects your call and its remedy clause names a bare
+identifier ("set X to true", "pass Y"), that identifier is a PARAMETER of
+the tool that just errored — not a tool you can call. Re-issue THAT SAME
+tool call with the parameter set, carrying over every argument from the
+failed call; the remedy names the one field to change, not a standalone
+action.
+
+Catalogued sighting: `Edit` failed with "Found 3 matches of the string to
+replace, but replace_all is false", and the next turn called a bare
+`replace_all` with an empty argument object — rejected with "No such tool
+available: replace_all", one turn lost. The empty argument object is the
+tell: read as a tool, the name carries nothing from the failed edit, so
+there is nothing for it to act on.
+
+For that `Edit` case both remedies are legitimate and you choose on
+INTENT: re-issue `Edit` with `replace_all: true` only if you really do
+mean every occurrence; otherwise lengthen `old_string` until it matches
+uniquely. The hint reports why the edit was refused; it is not a claim
+that replacing all of them is what you wanted.
+
+A short pointer, not a repeat: before calling a tool name you have not
+seen in your own tool list, check the list. "No such tool available"
+spans several distinct causes, and the deferred-tool case — which needs
+`ToolSearch` first — is already covered by the section above.
+"""
+
+
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
 # kind="found_on_main"). Being a single shared constant IS the mechanism that
