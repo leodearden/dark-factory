@@ -365,3 +365,156 @@ def test_an_emptied_constant_makes_every_containment_check_pass_vacuously() -> N
     # ...and the guard that DOES catch it:
     with pytest.raises(AssertionError):
         assert_nonempty('EMPTIED', '', remedy=_REMEDY)
+
+
+# BOTH count-zero behaviours are kept, deliberately, because the three consumer
+# tests disagree and each argues its choice in its own docstring.
+# `test_guidance_appears_exactly_once_per_role` SKIPS a count of 0 so a role that
+# has not yet received the splice fails exactly ONE test for that one root cause
+# (the containment test) instead of two.
+# `test_combined_guidance_appears_exactly_once_per_role` and
+# `test_missing_required_parameter_shape_appears_exactly_once_per_role` treat 0
+# as an offender — for the latter, because the composition is separately pinned,
+# so a 0 count for the half proves the whole composed splice is missing from that
+# role. Unifying them would silently change one consumer's coverage under cover
+# of a "pure refactor", which is the drift these anchor tests exist to prevent.
+@pytest.mark.parametrize('absent_ok', [False, True])
+def test_spliced_exactly_once_passes_for_a_count_of_one(absent_ok: bool) -> None:
+    """Exactly one copy passes under either `absent_ok` setting."""
+    contract = _contract(_roles(alpha=f'ident{_SPLICE}tail'), frozenset({'alpha'}))
+
+    assert contract.assert_spliced_exactly_once(absent_ok=absent_ok, remedy=_REMEDY) is None
+
+
+@pytest.mark.parametrize('absent_ok', [False, True])
+def test_spliced_exactly_once_fires_for_a_duplicate_splice(absent_ok: bool) -> None:
+    """A count of 2 fires under EITHER setting — `absent_ok` only governs 0.
+
+    This is the stale-tail case: a leftover `+ CONSTANT` surviving beside a new
+    up-front splice silently doubles the block in every session of that role.
+    """
+    contract = _contract(_roles(alpha=f'ident{_SPLICE}middle{_SPLICE}tail'), frozenset({'alpha'}))
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_spliced_exactly_once(absent_ok=absent_ok, remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert "'alpha': 2" in message
+    assert 'SPLICE_UNIT' in message
+    assert _REMEDY in message
+
+
+def test_spliced_exactly_once_skips_an_absent_splice_when_absent_ok() -> None:
+    """`absent_ok=True`: a count of 0 is SKIPPED, not flagged."""
+    contract = _contract(_roles(alpha='ident, no splice at all'), frozenset({'alpha'}))
+
+    assert contract.assert_spliced_exactly_once(absent_ok=True, remedy=_REMEDY) is None
+
+
+def test_spliced_exactly_once_flags_an_absent_splice_by_default() -> None:
+    """`absent_ok=False` (the default): a count of 0 IS an offender, reported as 0."""
+    contract = _contract(_roles(alpha='ident, no splice at all'), frozenset({'alpha'}))
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_spliced_exactly_once(remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert "'alpha': 0" in message
+    assert _REMEDY in message
+
+
+def test_spliced_exactly_once_honours_the_half_scoped_constant_override() -> None:
+    """The count re-scopes to a named half, which is how a stale bare tail is caught.
+
+    The wait file counts `BACKGROUND_TASK_WARNING` alongside its splice unit and
+    the rejection file counts `MISSING_REQUIRED_PARAMETER_REJECTION`: a leftover
+    bare `+ HALF` tail pushes the HALF's count to 2 while the composed unit's
+    count stays at 1, so the whole-unit count alone cannot see it.
+    """
+    half = '\n### Half\n\nOne composed half.\n'
+    composed = f'{_SPLICE}{half}'
+    contract = _contract(
+        _roles(alpha=f'ident{composed}tail, plus a stale bare half{half}'),
+        frozenset({'alpha'}),
+        constant=composed,
+    )
+
+    # The composed unit is spliced exactly once...
+    assert contract.assert_spliced_exactly_once(remedy=_REMEDY) is None
+
+    # ...but the half survives twice.
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_spliced_exactly_once(
+            constant=half, constant_name='HALF_CONSTANT', remedy=_REMEDY
+        )
+    message = str(excinfo.value)
+    assert "'alpha': 2" in message
+    assert 'HALF_CONSTANT' in message
+
+
+def test_composes_passes_when_every_half_is_non_empty_and_contained() -> None:
+    """The composition holds: each named half is non-empty AND inside the unit."""
+    first, second = '\n### First\n\nrule one\n', '\n### Second\n\nrule two\n'
+    contract = _contract(
+        _roles(alpha='ident'), frozenset(), constant=f'{first}{second}'
+    )
+
+    assert (
+        contract.assert_composes(
+            [('FIRST_HALF', first), ('SECOND_HALF', second)], remedy=_REMEDY
+        )
+        is None
+    )
+
+
+def test_composes_fires_and_names_a_half_that_was_spliced_away() -> None:
+    """A half no longer inside the composed unit is reported by NAME."""
+    first, second = '\n### First\n\nrule one\n', '\n### Second\n\nrule two\n'
+    contract = _contract(_roles(alpha='ident'), frozenset(), constant=first)
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_composes(
+            [('FIRST_HALF', first), ('SECOND_HALF', second)], remedy=_REMEDY
+        )
+
+    message = str(excinfo.value)
+    assert 'SECOND_HALF' in message
+    assert _REMEDY in message
+
+
+def test_composes_fires_for_an_emptied_half_even_though_it_is_contained() -> None:
+    """The vacuous-containment guard, and the reason it is not redundant.
+
+    An emptied half is a substring of every string, so the containment half of
+    this assertion holds trivially for it. Without the per-half non-emptiness
+    check, a refactor could empty one half and every containment, count and
+    placement test in both consumer modules would stay green while the half's
+    content vanished from every spliced role prompt. This is
+    `test_an_emptied_constant_makes_every_containment_check_pass_vacuously`'s
+    observation made actionable.
+    """
+    first = '\n### First\n\nrule one\n'
+    contract = _contract(_roles(alpha='ident'), frozenset(), constant=first)
+
+    # Containment alone would pass: '' is in everything.
+    assert '' in contract.constant
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_composes([('FIRST_HALF', first), ('EMPTIED_HALF', '')], remedy=_REMEDY)
+
+    assert 'EMPTIED_HALF' in str(excinfo.value)
+
+
+@pytest.mark.parametrize('half_count', [1, 3])
+def test_composes_is_not_hardcoded_to_two_halves(half_count: int) -> None:
+    """Nothing in the composition check assumes exactly two halves.
+
+    A splice unit that grows a third census shape (as
+    `TOOL_CALL_REJECTION_GUIDANCE` did in task 4578) must not need a new helper.
+    """
+    halves = [(f'HALF_{i}', f'\n### Half {i}\n\nrule {i}\n') for i in range(half_count)]
+    contract = _contract(
+        _roles(alpha='ident'), frozenset(), constant=''.join(value for _, value in halves)
+    )
+
+    assert contract.assert_composes(halves, remedy=_REMEDY) is None
