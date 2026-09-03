@@ -117,16 +117,91 @@ def site_key(site: LoopBlockingSite) -> tuple[str, str, str]:
 # Blocking primitive table
 # --------------------------------------------------------------------------- #
 #
-# Kept minimal at task 4484 step-2; widened to the full INV-8 vocabulary
-# (subprocess / network / filesystem / lock / sleep) in step-4.
+# Every entry pairs the primitive with WHY it belongs here.  That is not
+# decoration: task 3778's census enumerated `subprocess.run` and nothing else,
+# while INV-8's own Rule text names "subprocess, network, filesystem, lock,
+# sleep" -- and both of task 4201's missed sites and one of task 4091's are
+# FILESYSTEM, not subprocess.  A table whose entries carry no reason is one a
+# future census narrows back to `subprocess.run` unchallenged, because nothing
+# on the page argues against it.
+#
+# The five INV-8 limbs, all present: subprocess, network, filesystem, lock,
+# sleep.
 
-# Dotted paths, matched after module-alias substitution: `subprocess.run(...)`,
-# and `run(...)` when bound by `from subprocess import run`.
-DOTTED_PRIMITIVES: dict[str, str] = {}
+# Dotted paths, matched after `import X as Y` alias substitution
+# (`subprocess.run(...)`) and after `from X import Y` binding resolution
+# (a bare `run(...)` bound by `from subprocess import run`).
+DOTTED_PRIMITIVES: dict[str, str] = {
+    # -- subprocess: fork+exec parks the loop thread for the child's lifetime
+    'subprocess.run': (
+        'subprocess: the primitive task 3778 censused; fork+exec parks the loop '
+        'thread until the child exits'
+    ),
+    'subprocess.check_output': (
+        'subprocess: same fork+exec cost as subprocess.run, plus a blocking read '
+        'of the child stdout pipe'
+    ),
+    'subprocess.check_call': 'subprocess: same fork+exec cost as subprocess.run',
+    'subprocess.Popen': (
+        'subprocess: the fork+exec itself blocks even when the caller never '
+        'waits; .communicate()/.wait() then block again'
+    ),
+    'os.system': (
+        'subprocess: spawns a shell AND blocks until it exits -- strictly worse '
+        'than subprocess.run, never correct on a loop thread'
+    ),
 
-# Bare method names, matched on any receiver: `path.read_text()`.
+    # -- filesystem: the limb task 3778's vocabulary omitted entirely
+    'yaml.safe_load': (
+        'filesystem/CPU: measured by task 4201 at 8.15 ms for an 11 KB document '
+        '-- the same order as a subprocess spawn, which is why it does not get '
+        'read as "just parsing" and dropped from the vocabulary again'
+    ),
+    'yaml.safe_dump': (
+        'filesystem/CPU: the serialising half of the task 4201 measurement '
+        '(8.15 ms / 11 KB); a stamping coroutine pays it on the loop thread'
+    ),
+
+    # -- lock: an flock waits on ANOTHER process, with no bound
+    'fcntl.flock': (
+        'lock: blocks the loop thread for as long as another process holds the '
+        'lock -- an unbounded wait on a party this process does not control'
+    ),
+
+    # -- sleep: the deliberate one, and the easiest to write by reflex
+    'time.sleep': (
+        'sleep: parks the loop thread outright; asyncio.sleep is the sibling '
+        'that yields instead, and is excluded below'
+    ),
+
+    # -- network: a connect() can hang for the full TCP timeout
+    'socket.create_connection': (
+        'network: a DNS lookup plus a TCP handshake, either of which can park '
+        'the loop thread for the full connect timeout'
+    ),
+}
+
+# Bare method names, matched on any receiver: `path.read_text()`.  Receiver
+# types are not inferred, so these match by attribute name alone -- the
+# deliberate trade for finding `self._path.read_text()` without type inference.
 METHOD_PRIMITIVES: dict[str, str] = {
-    'read_text': 'filesystem: Path.read_text blocks the loop thread on disk I/O',
+    'read_text': (
+        'filesystem: the primitive behind task 4091\'s and task 4201\'s missed '
+        'sites -- a registry read off disk on the loop thread; page-cache-warm '
+        'is fast and cold is not, and the coroutine cannot tell which it got'
+    ),
+    'write_text': (
+        'filesystem: task 4091/4201 vocabulary; a write additionally waits on '
+        'the filesystem, not merely the page cache'
+    ),
+    'read_bytes': (
+        'filesystem: task 4091/4201 vocabulary; identical cost to read_text '
+        'without the decode'
+    ),
+    'write_bytes': (
+        'filesystem: task 4091/4201 vocabulary; identical cost to write_text '
+        'without the encode'
+    ),
 }
 
 # The non-blocking siblings.  Never a finding, whatever else matches.
@@ -498,15 +573,24 @@ def find_loop_blocking_sites(sources: dict[str, str]) -> list[LoopBlockingSite]:
             for node in _shallow_nodes(func_node, skip):
                 if not isinstance(node, ast.Call):
                     continue
-                resolved = _resolve_callee(node, ctx, modules)
-                if resolved is None:
-                    continue
-                target_ctx, target = resolved
-                if isinstance(target, ast.AsyncFunctionDef):
-                    continue
-                primitive = _reaches_blocking(target, target_ctx, modules, memo)
+                # (1) The primitive written DIRECTLY in the coroutine body --
+                # no helper anywhere for a definition-side census to point at.
+                # This is the manifest_stamping::_stamp_capability_manifests_impl
+                # shape (read_text + yaml.safe_load + write_text + yaml.safe_dump
+                # inline in one coroutine).
+                primitive = _primitive_for_call(node, ctx)
                 if primitive is None:
-                    continue
+                    # (2) The primitive reached THROUGH a sync helper -- the
+                    # shape task 3778's per-module offload claim made invisible.
+                    resolved = _resolve_callee(node, ctx, modules)
+                    if resolved is None:
+                        continue
+                    target_ctx, target = resolved
+                    if isinstance(target, ast.AsyncFunctionDef):
+                        continue
+                    primitive = _reaches_blocking(target, target_ctx, modules, memo)
+                    if primitive is None:
+                        continue
                 callee = (
                     node.func.id
                     if isinstance(node.func, ast.Name)
