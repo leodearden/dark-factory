@@ -40,6 +40,9 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
+from dashboard.app import _BurndownStore
+from dashboard.config import DashboardConfig
+
 
 async def _noop_burndown_loop(*args: object, **kwargs: object) -> None:
     """Stand-in for _burndown_loop so nesting two lifespans stays hermetic.
@@ -154,4 +157,83 @@ async def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
         'task 3771 CROSS-TALK: the outer metrics loop is bound to the INNER lifespan closed '
         'AsyncClient via app.state — http_client must be an argument, not an '
         'app.state re-read'
+    )
+
+
+async def _noop_metrics_loop(*args: object, **kwargs: object) -> None:
+    """Stand-in for _metrics_loop where only the burndown binding is under test."""
+    return None
+
+
+@pytest.mark.asyncio
+async def test_lifespan_binds_burndown_loop_to_the_config_it_built() -> None:
+    """The burndown loop gets the config ITS OWN lifespan built, not a later swap.
+
+    ``lifespan`` assigns ``app.state.config`` at the top of startup but reads it
+    back for ``burndown_path``, ``_burndown_loop`` and ``metrics_path`` only
+    afterwards -- with ``await burndown_store.open()`` in between.  That await is
+    a real suspension point, so a concurrently starting lifespan can install its
+    own config before the reads happen, and this lifespan then wires its loops to
+    a config it never built.
+
+    The interleave is simulated deterministically by swapping ``app.state.config``
+    from inside ``_BurndownStore.open`` -- exactly the window a second lifespan
+    would occupy.
+    """
+    from dashboard.app import app
+
+    real_open = _BurndownStore.open
+    captured: dict[str, Any] = {}
+
+    async def _swapping_open(self: _BurndownStore) -> None:
+        # Real open first: the lifespan must still get a usable store.
+        await real_open(self)
+        # Now stand in for an interleaving lifespan reaching this window.
+        original = app.state.config
+        captured['original'] = original
+        # Same project_root, so every derived path stays valid and the lifespan
+        # completes -- only the config OBJECT identity differs.
+        swapped = DashboardConfig(project_root=original.project_root)
+        app.state.config = swapped
+        captured['swapped'] = swapped
+
+    recorded: list[Any] = []
+
+    async def _recording_burndown_loop(
+        store: object,
+        config: object,
+        client: object,
+    ) -> None:
+        recorded.append(config)
+
+    config_before = getattr(app.state, 'config', None)
+    try:
+        with (
+            patch.object(_BurndownStore, 'open', _swapping_open),
+            patch('dashboard.app._burndown_loop', new=_recording_burndown_loop),
+            patch('dashboard.app._metrics_loop', new=_noop_metrics_loop),
+            TestClient(app),
+        ):
+            pass
+    finally:
+        # Do not leak a hand-built config into sibling tests; every lifespan
+        # rebuilds it from_env anyway, so this only restores the idle state.
+        if config_before is not None:
+            app.state.config = config_before
+
+    assert 'original' in captured, (
+        'task 3771: _BurndownStore.open was never called -- the simulated interleave '
+        'never ran, so this test proves nothing'
+    )
+    assert captured['original'] is not captured['swapped'], (
+        'task 3771: the simulated interleave must install a DISTINCT config object'
+    )
+    assert len(recorded) == 1, (
+        f'task 3771: expected exactly one _burndown_loop start per lifespan, '
+        f'got {len(recorded)}'
+    )
+    assert recorded[0] is captured['original'], (
+        'task 3771 INTERLEAVE: _burndown_loop received a config installed on app.state '
+        'AFTER its own lifespan built one -- lifespan must bind config to a local before '
+        'the first await, not re-read app.state.config across it'
     )
