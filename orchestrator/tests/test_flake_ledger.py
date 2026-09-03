@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -72,6 +73,54 @@ def _table_names(db_path: Path) -> list[str]:
 
 def _column_names(db_path: Path, table: str) -> list[str]:
     return [r['name'] for r in _rows(db_path, f'PRAGMA table_info({table})')]
+
+
+class _RecordingConnection:
+    """A ``sqlite3.Connection`` that appends every ``execute`` SQL string to a log.
+
+    Transparent by delegation, so the module under test sees an ordinary connection —
+    including the ``conn.row_factory = sqlite3.Row`` assignment, which is forwarded to
+    the real one so ``_to_debt_row``'s keyed access still works.
+
+    A proxy rather than a monkeypatch of ``sqlite3.Connection.execute``: that is a C
+    extension type and refuses attribute assignment.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, log: list[str]) -> None:
+        self._conn = conn
+        self._log = log
+
+    def execute(self, sql, *args, **kwargs):
+        self._log.append(sql)
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value) -> None:
+        if name in ('_conn', '_log'):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._conn, name, value)
+
+
+def _count_connections(monkeypatch) -> list:
+    """Record every ``sqlite3.connect`` opened for the rest of the test.
+
+    Module level rather than a method, because BOTH the async
+    :class:`TestOneConnectionPerCall` and the sync :class:`TestReadDebtMany` state the
+    same one-connection-per-entry-point contract and must state it the same way.
+    """
+    opened: list = []
+    real_connect = sqlite3.connect
+
+    def _recording_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, 'connect', _recording_connect)
+    return opened
 
 
 @contextlib.contextmanager
@@ -2132,6 +2181,123 @@ class TestReadDebtMany:
 
         assert read_debt_many(self._seeded(tmp_path), []) == {}
 
+    def test_opens_no_connection_for_an_empty_batch(self, tmp_path: Path, monkeypatch) -> None:
+        """ZERO connections, not one that finds nothing.
+
+        ι's binding contract is that printing a report never WRITES, and `_open` does
+        ``parent.mkdir`` → ``connect`` (which creates the file) → ``executescript``.  An
+        empty batch is the normal case for a project whose every chain is already served
+        from ``list_open_debt``, so a connection here would provision a ledger — plus its
+        WAL sidecars — as a side effect of an empty lookup.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path = self._seeded(tmp_path)
+        opened = _count_connections(monkeypatch)
+
+        assert read_debt_many(db_path, []) == {}
+
+        assert opened == [], f'expected 0 connections, got {len(opened)}'
+
+    def _seed_n(self, tmp_path: Path, n: int) -> tuple[Path, list[str]]:
+        """*n* debt rows in ONE raw transaction — bulk, so a 1200-row fixture stays fast."""
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        test_ids = [f'tests/test_{i:04d}.py::test_x' for i in range(n)]
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executemany(
+                'INSERT INTO flake_debt '
+                '(test_id, project_id, opened_at, open_count, last_occurrence_at) '
+                "VALUES (?, 'dark_factory', ?, 1, ?)",
+                [(t, self.T_OPENED, self.T_OPENED) for t in test_ids],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path, test_ids
+
+    def test_one_connection_regardless_of_chunk_count(self, tmp_path: Path, monkeypatch) -> None:
+        """The chunk loop runs on ONE connection — the module's per-entry-point contract
+        must not quietly degrade to one-connection-per-chunk.
+
+        A per-chunk connection would reintroduce, at 1/500th the rate, precisely the
+        amplification this reader exists to remove: each one pays the full five-pragma
+        durability triad and re-runs the schema DDL against the live ``runs.db``.
+        """
+        from orchestrator import flake_ledger
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path, test_ids = self._seed_n(tmp_path, 7)
+        monkeypatch.setattr(flake_ledger, '_READ_DEBT_CHUNK_SIZE', 2)  # -> 4 chunks
+        opened = _count_connections(monkeypatch)
+
+        assert len(read_debt_many(db_path, test_ids)) == 7
+
+        assert len(opened) == 1, f'expected 1 connection, got {len(opened)}'
+
+    @pytest.mark.parametrize('n', [4, 5], ids=['exact_multiple', 'ragged_remainder'])
+    def test_chunk_boundaries_neither_drop_nor_duplicate(self, tmp_path: Path, monkeypatch, n
+                                                         ) -> None:
+        """The off-by-one guard on the ``range(0, len(ids), k)`` slicing.
+
+        Both shapes are covered because they fail differently: an exact multiple exposes
+        a phantom trailing chunk, a ragged remainder exposes a dropped tail.
+        """
+        from orchestrator import flake_ledger
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path, test_ids = self._seed_n(tmp_path, n)
+        monkeypatch.setattr(flake_ledger, '_READ_DEBT_CHUNK_SIZE', 2)
+
+        result = read_debt_many(db_path, test_ids)
+
+        assert set(result) == set(test_ids)
+        assert [result[t].test_id for t in test_ids] == test_ids
+
+    def test_chunking_actually_issues_multiple_selects(self, tmp_path: Path, monkeypatch) -> None:
+        """Chunking is proven BEHAVIOURALLY — by the SELECTs on the wire — rather than by
+        trusting that the constant is read.
+
+        Asserting only the returned dict would pass just as happily against one giant
+        ``IN (...)``, which is the form that trips ``SQLITE_MAX_VARIABLE_NUMBER`` on the
+        999-limit builds the chunking exists for and which this host (32766) cannot
+        reproduce.
+        """
+        from orchestrator import flake_ledger
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path, test_ids = self._seed_n(tmp_path, 7)
+        monkeypatch.setattr(flake_ledger, '_READ_DEBT_CHUNK_SIZE', 2)
+
+        executed: list[str] = []
+        real_open = flake_ledger._open
+        monkeypatch.setattr(
+            flake_ledger, '_open', lambda p: _RecordingConnection(real_open(p), executed)
+        )
+
+        assert len(read_debt_many(db_path, test_ids)) == 7
+
+        selects = [sql for sql in executed if 'FROM flake_debt' in sql]
+        assert len(selects) == math.ceil(7 / 2), executed
+
+    def test_more_ids_than_the_legacy_variable_limit(self, tmp_path: Path) -> None:
+        """1200 ids in one call, unchunked-by-hand — no ``sqlite3.OperationalError``.
+
+        A regression guard aimed at the 999-variable builds, not at this host: SQLite
+        3.50.4 here measures ``SQLITE_MAX_VARIABLE_NUMBER`` at 32766, so this passes
+        either way locally.  It is kept because the ledger ships to 8 projects and the
+        test universe a report covers is unbounded — and because B12 would turn the
+        failure it guards into a SILENT empty report rather than a raise.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path, test_ids = self._seed_n(tmp_path, 1200)
+
+        assert set(read_debt_many(db_path, test_ids)) == set(test_ids)
+
     def test_duplicate_ids_collapse_to_one_entry(self, tmp_path: Path) -> None:
         """The call site passes a set difference, but the parameter is an ``Iterable``:
         a caller handing the same id twice must not waste two of the bounded SQLite
@@ -2286,24 +2452,11 @@ class TestOneConnectionPerCall:
     NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
     TEST_ID = 'tests/test_a.py::test_one'
 
-    @staticmethod
-    def _count_connections(monkeypatch) -> list:
-        opened: list = []
-        real_connect = sqlite3.connect
-
-        def _recording_connect(*args, **kwargs):
-            conn = real_connect(*args, **kwargs)
-            opened.append(conn)
-            return conn
-
-        monkeypatch.setattr(sqlite3, 'connect', _recording_connect)
-        return opened
-
     async def test_open_debt_opens_one_connection(self, tmp_path: Path, monkeypatch) -> None:
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
-        opened = self._count_connections(monkeypatch)
+        opened = _count_connections(monkeypatch)
         row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
 
         assert len(opened) == 1, f'expected 1 connection, got {len(opened)}'
@@ -2317,7 +2470,7 @@ class TestOneConnectionPerCall:
         db_path = tmp_path / 'runs.db'
         await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
 
-        opened = self._count_connections(monkeypatch)
+        opened = _count_connections(monkeypatch)
         await resolve_debt(
             db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.NOW
         )
@@ -2328,12 +2481,13 @@ class TestOneConnectionPerCall:
         from orchestrator.flake_ledger import (
             list_open_debt,
             read_debt,
+            read_debt_many,
             read_occurrences,
             record_flake_occurrence,
         )
 
         db_path = tmp_path / 'runs.db'
-        opened = self._count_connections(monkeypatch)
+        opened = _count_connections(monkeypatch)
 
         for call in (
             lambda: record_flake_occurrence(
@@ -2341,6 +2495,7 @@ class TestOneConnectionPerCall:
             ),
             lambda: read_occurrences(db_path),
             lambda: read_debt(db_path, self.TEST_ID),
+            lambda: read_debt_many(db_path, [self.TEST_ID]),
             lambda: list_open_debt(db_path),
         ):
             opened.clear()
