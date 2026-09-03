@@ -1712,7 +1712,7 @@ class TestLoadTaskTitles:
         async def hang_fetch_tasks(client, config, project_root):
             await asyncio.Event().wait()
 
-        budget = 0.05
+        budget = 0.5
         monkeypatch.setattr(_mq, '_TASK_TITLES_BUDGET', budget)
         loop = asyncio.get_running_loop()
 
@@ -1733,11 +1733,24 @@ class TestLoadTaskTitles:
         assert results == [{}, {}]
         # The assertion is about SERIALIZATION, not merely about returning:
         # an inner-only wrap costs 2 x budget here and scales with waiters.
-        assert elapsed < 2 * budget, (
-            f'two concurrent callers took {elapsed:.3f}s against a {budget}s '
-            f'budget — that is the serialized cost of an inner-only wrap; '
-            'the wait_for must enclose get_or_refresh so a caller QUEUED on '
-            'the per-key lock is bounded too'
+        #
+        # The budget is deliberately LARGE for a test whose subject is a
+        # timeout. It is not scaled because the operation needs 0.5 s — it is
+        # scaled so the assertion's ABSOLUTE jitter margin exceeds real-world
+        # event-loop scheduling, GC and pytest overhead. Correct behaviour
+        # (outer wrap) costs ~1x budget; the inner-only-wrap regression costs
+        # ~2x; 1.5x sits exactly midway, giving 0.25 s of slack on BOTH sides.
+        # At the original 0.05 s the discrimination was sound in ratio and
+        # worthless in absolute terms (50 ms of slack), and it flaked at ~4%
+        # per run. Do NOT shrink the budget back to "speed up the suite" —
+        # that silently reintroduces the flake.
+        assert elapsed < 1.5 * budget, (
+            f'two concurrent callers took {elapsed:.3f}s against a '
+            f'{1.5 * budget}s threshold (1.5 x the {budget}s per-call '
+            f'budget); the inner-only-wrap regression costs ~{2 * budget}s — '
+            'that is the serialized cost of an inner-only wrap; the wait_for '
+            'must enclose get_or_refresh so a caller QUEUED on the per-key '
+            'lock is bounded too'
         )
 
 
