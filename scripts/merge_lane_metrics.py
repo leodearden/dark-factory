@@ -376,3 +376,200 @@ def reexport_names(source: str, *, path: str) -> list[str]:
             if bound not in used:
                 names.add(bound)
     return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# The complexipy adapter, and the tool-availability half of INV-11.
+#
+# WHY BOTH BOUNDS EXIST, measured 2026-09-03 against merge_queue.py (21,550
+# lines) in this worktree:
+#
+#   version | wall clock | file total | _verifier_loop | _run_post_merge_verify
+#   3.0.0   |     4.63s  |      2031  |  186           |  183
+#   4.0.0   |     4.31s  |      2124  |  188           |  183
+#   5.0.0   |     4.81s  |      2092  |  192           |  188
+#   6.0.0   |     5.18s  |      2133  |  245           |  175
+#   6.2.0   |     4.75s  |      2133  |  245           |  175
+#   7.0.1   |   247.00s  |      2133  |  245           |  175
+#
+# FLOOR (>=6.2) is CORRECTNESS: the algorithm changed across majors, so 3/4/5
+# compute different numbers for the identical file. An unpinned complexipy would
+# silently rewrite every baseline figure on upgrade, turning a ratchet into
+# noise. 6.x and 7.0.1 agree, and reproduce exactly the numbers the PRD
+# Background table quotes; 6.2.0 is the newest 6.x and the version every
+# committed baseline number was measured with.
+#
+# CEILING (<7) is PERFORMANCE, and it is not hygiene -- it is what keeps this
+# instrument from becoming a suite-truncating landmine. 7.0.1's cost grows
+# roughly cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so
+# the whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The
+# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s, and
+# exceeding it does not merely fail the test: pytest-timeout's thread method
+# os._exit()s the xdist worker and --max-worker-restart=0 then truncates the
+# ENTIRE orchestrator suite, reporting against an innocent test (the esc-3980-1
+# / esc-3787-1 mode documented at orchestrator/tests/_orch_helpers.py::
+# WHOLE_TREE_SCAN_TEST_TIMEOUT).
+#
+# The tuples are the source of truth; the human-readable specifier is derived
+# from them, so the message and the check can never disagree. The same string
+# is pinned against orchestrator/pyproject.toml's dev-group entry by
+# test_pyproject_pin_matches_the_scripts_requirement.
+COMPLEXIPY_MIN: tuple[int, ...] = (6, 2)
+COMPLEXIPY_MAX_EXCLUSIVE: tuple[int, ...] = (7,)
+COMPLEXIPY_REQUIRED = '>={},<{}'.format(
+    '.'.join(str(part) for part in COMPLEXIPY_MIN),
+    '.'.join(str(part) for part in COMPLEXIPY_MAX_EXCLUSIVE),
+)
+
+_COMPLEXIPY_RANGE_REASON = (
+    'complexipy majors compute DIFFERENT cognitive numbers for the same file '
+    '(merge_queue.py totals 2031 at 3.0.0, 2092 at 5.0.0, 2133 at 6.x/7.x), so '
+    'an unpinned engine would silently rewrite every baseline figure; and 7.x '
+    'is ~48x slower on the monolith (247.0s vs 4.75s at 6.2.0, ~330s+ vs 9.52s '
+    'cluster-wide) against the ratchet test\'s 300s timeout, which pytest-'
+    'timeout enforces by os._exit()ing the xdist worker and truncating the '
+    'whole suite. Install the pinned version: `uv sync --all-packages`.'
+)
+
+
+def _version_parts(version: str) -> tuple[int, ...]:
+    """Leading numeric release segments of *version*, e.g. '6.2.0rc1' -> (6, 2, 0).
+
+    Deliberately hand-rolled rather than reaching for ``packaging``: this module
+    is stdlib-only at import time (see the note at the top), and a two-clause
+    ``>=X,<Y`` range over release segments needs nothing more.
+    """
+    parts: list[int] = []
+    for segment in version.split('.'):
+        digits = ''
+        for char in segment:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def satisfies_complexipy_requirement(version: str) -> bool:
+    """True when *version* falls inside ``COMPLEXIPY_REQUIRED``."""
+    parts = _version_parts(version)
+    if not parts:
+        return False
+    return COMPLEXIPY_MIN <= parts < COMPLEXIPY_MAX_EXCLUSIVE
+
+
+def complexipy_version() -> str:
+    """The installed complexipy version, or ``MetricsError`` naming the tool."""
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version('complexipy')
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise MetricsError(
+            'complexipy is not installed, so cognitive complexity cannot be '
+            'measured. It belongs to orchestrator/pyproject.toml '
+            '[dependency-groups] dev, pinned '
+            f'{COMPLEXIPY_REQUIRED}. Run `uv sync --all-packages`.'
+        ) from exc
+
+
+def require_complexipy() -> str:
+    """Assert the installed complexipy is inside ``COMPLEXIPY_REQUIRED``.
+
+    Called once up front by ``build_report`` so a wrong-version environment
+    fails immediately with a named cause rather than after a 250-second
+    measurement whose numbers would be wrong anyway.
+    """
+    # Looked up through the module namespace on purpose, so a test can seed a
+    # version without installing one.
+    version = globals()['complexipy_version']()
+    if not satisfies_complexipy_requirement(version):
+        raise MetricsError(
+            f'complexipy {version} is installed but this instrument requires '
+            f'{COMPLEXIPY_REQUIRED}. {_COMPLEXIPY_RANGE_REASON}'
+        )
+    return version
+
+
+def _import_complexipy():  # noqa: ANN202 - third-party module object
+    """Import complexipy LAZILY, naming it in the failure.
+
+    Lazy so ``scripts/merge_lane_metrics.py`` stays importable and
+    type-checkable under the ``shared`` project that owns its ruff/pyright
+    gates, whose dev group carries neither complexipy nor radon. Lazy is not
+    soft: the moment a measure actually needs the tool, a missing one is an
+    instrument failure with a named cause.
+    """
+    try:
+        import complexipy  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise MetricsError(
+            'complexipy could not be imported, so cognitive complexity cannot '
+            'be measured. It belongs to orchestrator/pyproject.toml '
+            f'[dependency-groups] dev, pinned {COMPLEXIPY_REQUIRED}. '
+            f'Run `uv sync --all-packages`. ({exc})'
+        ) from exc
+    return complexipy
+
+
+def _file_complexity(path: Path):  # noqa: ANN202 - complexipy.FileComplexity
+    complexipy = _import_complexipy()
+    try:
+        return complexipy.file_complexity(str(path))
+    except MetricsError:
+        raise
+    except Exception as exc:
+        raise MetricsError(
+            f'{path}: complexipy could not measure this file -- '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
+
+
+def cognitive_complexity(path: Path) -> dict[str, int]:
+    """Per-function cognitive complexity of *path*, keyed by complexipy qualname.
+
+    complexipy already emits ``Class::method`` for methods, so the key needs no
+    post-processing. A module with no functions yields an empty map -- that is a
+    real measurement, not a skipped one.
+    """
+    result = _file_complexity(path)
+    return {function.name: function.complexity for function in result.functions}
+
+
+def file_cognitive_total(path: Path) -> int:
+    """complexipy's whole-file cognitive total for *path*.
+
+    Reported and ratcheted alongside the per-function map, because the file
+    total also counts module-level control flow that belongs to no function.
+    """
+    return int(_file_complexity(path).complexity)
+
+
+def maintainability_index(source: str, *, path: str) -> float:
+    """radon's maintainability index for *source*, in [0, 100].
+
+    REPORTED, never ratcheted: MI is a derived composite (Halstead volume,
+    cyclomatic complexity, SLOC, comment ratio) that already reads 0.00 for both
+    merge_queue.py and git_ops.py, so it has no headroom left to ratchet against
+    and would only ever restate what the line and cognitive measures already
+    say. It earns its place in ``--report`` as the PRD Background table's
+    "Maintainability index (radon) | 0" row -- and it is what makes the `radon`
+    dev-group entry genuinely exercised rather than dead weight.
+    """
+    try:
+        from radon.metrics import mi_visit  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise MetricsError(
+            'radon could not be imported, so the maintainability index cannot '
+            'be reported. It belongs to orchestrator/pyproject.toml '
+            f'[dependency-groups] dev. Run `uv sync --all-packages`. ({exc})'
+        ) from exc
+    try:
+        return float(mi_visit(source, True))
+    except Exception as exc:
+        raise MetricsError(
+            f'{path}: radon could not compute a maintainability index -- '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
