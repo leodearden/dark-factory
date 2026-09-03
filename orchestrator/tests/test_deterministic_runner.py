@@ -303,6 +303,8 @@ def _predicate_task(
     cwd: str = '/tmp',
     timeout_secs: int | float = 30,
     gate_escalated_at: str | None = None,
+    recurrence: dict | None = None,
+    milestone: dict | None = None,
 ) -> dict:
     """Build a deterministic PREDICATE task dict (before_done.kind='predicate', γ-predicate).
 
@@ -311,6 +313,14 @@ def _predicate_task(
     shape, minus the unit to deploy against).  ``gate_escalated_at``, when
     given, seeds ``metadata['gate_escalated_at']`` for the resume/quiescence
     tests (mirrors ``_gate_task``'s same-named parameter).
+
+    ``recurrence`` and ``milestone`` (task 4678 / r3) are seeded into
+    ``metadata`` ONLY when given — exactly like ``gate_escalated_at`` above —
+    so every pre-existing call site keeps producing a byte-identical
+    NON-carrier task and remains the control for the carrier/non-carrier
+    split.  Together with ``task_kind='deterministic'`` and
+    ``before_done['kind'] == 'predicate'``, passing both makes the real
+    PRD C-1 carrier shape.
     """
     before_done: dict = {
         'script': script,
@@ -328,6 +338,10 @@ def _predicate_task(
     }
     if gate_escalated_at is not None:
         metadata['gate_escalated_at'] = gate_escalated_at
+    if recurrence is not None:
+        metadata['recurrence'] = recurrence
+    if milestone is not None:
+        metadata['milestone'] = milestone
     return {
         'id': task_id,
         'title': title,
@@ -10080,6 +10094,141 @@ class TestPredicateDefaultRunnerInnerTimeout:
             'a verdict must still stamp gate_escalated_at (resolve-to-done path)'
         )
         scheduler.set_task_status.assert_awaited_once_with('705', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 4678 (r3) — RED: a RECURRENCE CARRIER's no-verdict legs file
+# `milestone_check_failed`, not `infra_issue`.
+#
+# PRD B7 / decision R-D6 / contract C-5.  The classes ABOVE are the controls:
+# `TestPredicateModeTimeout` (task ids 702/703) and
+# `TestPredicateDefaultRunnerInnerTimeout` (704) drive the SAME arms with no
+# `metadata.recurrence` and must stay `infra_issue`, untouched.
+#
+# What must NOT change with the category: a no-verdict leg still writes NO
+# `gate_escalated_at` stamp (task 4065), so the read-only check is simply
+# re-attempted on the next dispatch rather than latched into section-1's
+# resolve-to-done path.  Every case below asserts the stamp's ABSENCE.
+# ---------------------------------------------------------------------------
+
+def _carrier_recurrence(key: str = 'carrier-timeout-probe') -> dict:
+    """The `metadata.recurrence` payload for a carrier fixture (task 4678).
+
+    Built from r1's own `shared.task_metadata.Recurrence` (task 4676) and
+    round-tripped through `model_dump()` rather than hand-rolled, so a carrier
+    fixture cannot drift from the validated model — and so the round-tripped
+    form (which materialises an explicit `'minted_from': None`) is what the
+    runner actually sees.
+    """
+    from shared.task_metadata import Recurrence
+
+    return Recurrence(key=key, interval_secs=86400).model_dump()
+
+
+def _carrier_dated_milestone() -> dict:
+    """The dated `metadata.milestone` of a C-1 carrier (task 4678).
+
+    Inert for the runner — `DeterministicRunner` never reads
+    `metadata.milestone` (due-ness is a scheduler-eligibility concern) — but
+    carried so the fixture is a FAITHFUL C-1 carrier rather than a
+    `recurrence`-only approximation.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    return {'mode': 'dated', 'at': (datetime.now(UTC) + timedelta(days=1)).isoformat()}
+
+
+@pytest.mark.asyncio
+class TestCarrierPredicateNoVerdictCategory:
+    """DeterministicRunner — a recurrence carrier's no-verdict legs file
+    ``milestone_check_failed`` (task 4678 / r3, PRD B7 + R-D6 + C-5).
+
+    A carrier is one link of a recurring chain.  Contract C-5: EVERY escalation
+    a carrier's deterministic run files carries
+    ``category='milestone_check_failed'`` — the deny-listed
+    (``escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES``), discriminable
+    category — so a recurring job's failures never disappear into the crowded
+    ``infra_issue`` bucket.  The verdict leg (``rc != 0``) already did; these
+    tests are about the three arms that produce NO verdict.
+
+    r3 is a CATEGORY change ONLY.  Each case therefore pins:
+      * the summary is BYTE-IDENTICAL to the non-carrier arm — the summary is
+        the only thing telling a human WHICH guard fired, and diverging it for
+        carriers would double the arm vocabulary from three strings to six;
+      * ``update_task`` is never awaited — no ``gate_escalated_at`` stamp.
+    """
+
+    async def test_carrier_outer_guard_timeout_files_milestone_check_failed(
+        self, tmp_path: Path,
+    ):
+        """A carrier whose predicate seam HANGS files ``milestone_check_failed``.
+
+        Today's identical setup MINUS ``recurrence`` files ``infra_issue``
+        (``test_predicate_hang_files_infra_issue_and_blocks``, task 702, same
+        hanging runner and the same ``run_timeout_grace_secs=0.05``) — that
+        pairing is PRD B7's observable difference.
+
+        RED until ``_run_predicate``'s ``except TimeoutError`` arm resolves its
+        category from the carrier discriminator.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(
+            task_id='4678_1',
+            timeout_secs=0,
+            milestone=_carrier_dated_milestone(),
+            recurrence=_carrier_recurrence(),
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4678_1', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed', (
+            f'a RECURRENCE CARRIER\'s failure legs all sit in the deny-listed '
+            f'category (C-5) — the identical non-carrier setup at task 702 '
+            f'yields infra_issue: {esc.category!r}'
+        )
+
+        # Everything else about the escalation is unchanged by the category swap.
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.summary == 'Predicate check timed out (subprocess hung)', (
+            f'the arm-discriminating summary must survive the category swap '
+            f'byte-for-byte: {esc.summary!r}'
+        )
+
+        # The CATEGORY moved; task 4065's no-stamp semantics did NOT.  A
+        # no-verdict leg must never latch the task into section-1's
+        # resolve-to-done path.
+        scheduler.update_task.assert_not_awaited()
+        scheduler.set_task_status.assert_awaited_once_with('4678_1', 'blocked')
         unit_inspector.assert_not_awaited()
 
 
