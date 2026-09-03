@@ -3397,36 +3397,52 @@ class Harness:
             return None
         key = str(key)
         self._recovered_sessions[key] = session_data
-        # Best-effort: stash the surviving worktree's claude-config dir so the
-        # _run_slot guard (task γ) can RE-glob the transcript at dispatch. The
-        # dir name embeds the branch (``claude-config-<branch>``), not derivable
-        # from task_id at the pre-acquire dispatch point, so *entry* — the
-        # surviving worktree, known only here — is the last place to capture it.
-        # Never raises: a missing/globless .task simply leaves no stash, which
-        # the guard treats as 'no_transcript' (fail-safe fresh dispatch, I3).
+        # Best-effort: stash the surviving worktree's config dir so the
+        # _run_slot guard (task γ) can RE-glob the transcript at dispatch.
+        # *entry* — the surviving worktree — is known only here, which is why
+        # the capture happens at adoption rather than at the pre-acquire
+        # dispatch point.
+        #
+        # DERIVED, not searched. The dir name is a pure function of the task id
+        # by construction: the SOLE mkdir site in the tree is
+        # ``shared/src/shared/config_dir.py::TaskConfigDir.__init__``, which
+        # builds ``base / f'{CONFIG_DIR_PREFIX}{task_id}'`` from a task-id STEM,
+        # reached in production from
+        # ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
+        # ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``.
+        # And ``key`` above IS the real task id at every call arity (the
+        # plan-derived recovery id, the v2 sidecar's own ``task_id``, or the
+        # cold worktree's dir name — all the same identity).
+        #
+        # This replaces a wildcard ``glob('claude-config-*')`` + sort + take-[0]
+        # whose comment claimed the name "embeds the branch
+        # (``claude-config-<branch>``), not derivable from task_id". That was
+        # FALSE on two counts: the creator takes a task-id stem, and the full
+        # branch is ``task/<id>`` — TWO path components — so the name it
+        # described could not exist as one dir name. The glob was therefore
+        # strictly weaker than a derivation, and silently wrong whenever the
+        # lexically-first candidate was not this session's owner.
+        #
+        # Nothing else is EVER stashed. The one other creator,
+        # ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``,
+        # deliberately produces ``claude-config-<task_id>-unblock`` — a
+        # legitimate non-owner of this session's transcript, which this
+        # derivation correctly refuses. Converting "no candidate" into "wrong
+        # candidate" buys nothing (both end at 'no_transcript' once the
+        # dispatch-time re-glob comes up empty) and only the second lies
+        # about it.
+        #
+        # Never raises: a missing .task simply leaves no stash, which the guard
+        # treats as 'no_transcript' (fail-safe fresh dispatch, I3). ``.exists()``
+        # can still raise on a broken mount, hence the retained guard.
         try:
-            config_dirs = sorted((entry / '.task').glob('claude-config-*'))
-            if config_dirs:
-                if len(config_dirs) > 1:
-                    # >1 claude-config-<branch> dir in a single surviving
-                    # worktree is abnormal: the lexically-first pick may not be
-                    # the one holding THIS session's transcript, in which case
-                    # the dispatch-time re-glob degrades to a 'no_transcript'
-                    # fresh dispatch. Warn (loud-over-silent) so that otherwise
-                    # silent missed resume is observable.
-                    logger.warning(
-                        'Recovery: %s has %d claude-config dirs %s — stashing the '
-                        'lexically-first (%s) for session %s; if it lacks the '
-                        'transcript the resume degrades to fresh dispatch',
-                        entry.name, len(config_dirs),
-                        [str(d) for d in config_dirs], config_dirs[0],
-                        session_data.get('session_id'),
-                    )
-                self._recovered_session_config_dirs[key] = str(config_dirs[0])
+            expected = entry / '.task' / f'{CONFIG_DIR_PREFIX}{key}'
+            if expected.exists():
+                self._recovered_session_config_dirs[key] = str(expected)
         except OSError as e:
             logger.debug(
-                'Recovery: %s config-dir glob failed (%s) — guard will treat '
-                'the recovered session as uncorroborated', entry.name, e,
+                'Recovery: %s config-dir resolution failed (%s) — guard will '
+                'treat the recovered session as uncorroborated', entry.name, e,
             )
         logger.info(
             'Recovery: adopting agent session for task %s (role=%s, '
