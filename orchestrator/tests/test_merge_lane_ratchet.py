@@ -833,3 +833,133 @@ class TestPatchTargets:
                 continue
         assert len(union) >= 70, len(union)
         assert 'run_scoped_verification' in union
+
+
+# ---------------------------------------------------------------------------
+# Private-attribute reads from tests.
+
+
+class TestImportsLaneModule:
+    def test_import_from_a_cluster_module_is_lane_importing(self) -> None:
+        source = 'from orchestrator.merge_queue import SpeculativeMergeWorker\n'
+        assert metrics.imports_lane_module(source, path='t.py') is True
+
+    def test_plain_import_of_merge_lane_is_lane_importing(self) -> None:
+        assert metrics.imports_lane_module('import orchestrator.merge_lane\n', path='t.py') is True
+
+    def test_import_from_a_merge_lane_submodule_is_lane_importing(self) -> None:
+        source = 'from orchestrator.merge_lane.worker import W\n'
+        assert metrics.imports_lane_module(source, path='t.py') is True
+
+    def test_from_orchestrator_import_satellite_is_lane_importing(self) -> None:
+        assert metrics.imports_lane_module('from orchestrator import merge_gates\n', path='t.py') is True
+
+    def test_an_unrelated_orchestrator_module_is_not_lane_importing(self) -> None:
+        assert metrics.imports_lane_module('import orchestrator.workflow\n', path='t.py') is False
+
+    def test_a_module_with_no_imports_is_not_lane_importing(self) -> None:
+        assert metrics.imports_lane_module('x = 1\n', path='t.py') is False
+
+    def test_the_module_name_set_is_derived_from_cluster_paths(self) -> None:
+        # Derived, never hand-listed, so the two can't drift when Appendix A is
+        # edited.
+        assert 'orchestrator.merge_queue' in metrics.lane_module_names()
+        assert 'orchestrator.git_ops' in metrics.lane_module_names()
+        assert 'orchestrator.workflow' not in metrics.lane_module_names()
+
+
+class TestPrivateReads:
+    def test_a_single_private_attribute_read_counts_one(self) -> None:
+        assert metrics.private_reads('worker._inflight\n', path='t.py') == 1
+
+    def test_a_chained_private_read_counts_each_hop(self) -> None:
+        # Both hops reach into internals.
+        assert metrics.private_reads('worker._a._b\n', path='t.py') == 2
+
+    def test_a_dunder_is_not_a_private_read(self) -> None:
+        # Dunders are Python protocol, not lane internals.
+        assert metrics.private_reads('obj.__dict__\nobj.__class__\n', path='t.py') == 0
+
+    def test_self_and_cls_receivers_are_excluded(self) -> None:
+        # A test class's own helpers are not lane internals. This is a
+        # STRUCTURAL predicate, not a name list.
+        source = (
+            'class T:\n'
+            '    def t(self):\n'
+            '        self._helper()\n'
+            '        return cls._x\n'
+        )
+        assert metrics.private_reads(source, path='t.py') == 0
+
+    def test_a_public_attribute_is_not_counted(self) -> None:
+        assert metrics.private_reads('worker.snapshot()\n', path='t.py') == 0
+
+    def test_a_docstring_quoting_a_private_read_is_not_counted(self) -> None:
+        assert metrics.private_reads('"""Reads worker._inflight."""\n', path='t.py') == 0
+
+    def test_a_private_read_off_self_dot_something_is_counted(self) -> None:
+        # `self.worker._x` reaches into a lane object even though the chain
+        # starts at self -- only the BARE `self`/`cls` receiver is excluded.
+        assert metrics.private_reads('self.worker._x\n', path='t.py') == 1
+
+    def test_a_private_write_counts_too(self) -> None:
+        # Writes are reads of the internal surface for this measure's purpose:
+        # both couple the test to an internal name.
+        assert metrics.private_reads('worker._inflight = 1\n', path='t.py') == 1
+
+    def test_unparseable_source_raises_naming_the_path(self) -> None:
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.private_reads('def (:\n', path='broken.py')
+        assert 'broken.py' in str(excinfo.value)
+
+
+class TestTestFileMeasures:
+    def test_a_non_lane_importing_file_yields_none(self) -> None:
+        # The exclusion is a property of the MEASURE, not of the caller: a
+        # non-lane-importing file can never be summed into the report by
+        # accident.
+        source = 'import orchestrator.workflow\n\nworker._x\n'
+        assert metrics.test_file_measures(source, path='t.py') is None
+
+    def test_a_lane_importing_file_yields_both_measures(self) -> None:
+        source = (
+            'from orchestrator.merge_queue import W\n'
+            '\n'
+            "patch('orchestrator.merge_queue.foo', x)\n"
+            'worker._a._b\n'
+        )
+        assert metrics.test_file_measures(source, path='t.py') == {
+            'patch_targets': ['foo'],
+            'private_reads': 2,
+        }
+
+    def test_patch_targets_are_sorted(self) -> None:
+        source = (
+            'from orchestrator.merge_queue import W\n'
+            "patch('orchestrator.merge_queue.z', x)\n"
+            "patch('orchestrator.merge_queue.a', x)\n"
+        )
+        measures = metrics.test_file_measures(source, path='t.py')
+        assert measures is not None
+        assert measures['patch_targets'] == ['a', 'z']
+
+    def test_real_tree_anchors(self) -> None:
+        # Anti-vacuity: >= 150 lane-importing files (measured 167) and a
+        # cluster-wide private-read total > 5000 (measured 9,355).
+        lane_files = 0
+        total_private = 0
+        for path in sorted((_REPO_ROOT / 'orchestrator' / 'tests').rglob('*.py')):
+            try:
+                source = path.read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                continue
+            try:
+                measures = metrics.test_file_measures(source, path=str(path))
+            except metrics.MetricsError:
+                continue
+            if measures is None:
+                continue
+            lane_files += 1
+            total_private += measures['private_reads']
+        assert lane_files >= 150, lane_files
+        assert total_private > 5000, total_private
