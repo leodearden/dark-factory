@@ -850,6 +850,176 @@ class TestAdoptDerivesConfigDir:
         assert harness._recovered_session_config_dirs == {}
 
 
+def _ambiguity_emits(harness: Harness) -> list[dict]:
+    """Return the kwargs of every ``session_config_dir_ambiguous`` emit.
+
+    The new ``EventType`` member is referenced HERE, at call time, never at
+    module scope — the convention this module states at ``_session_resume_emits``
+    — so a missing member fails only the tests that need it instead of breaking
+    collection of the whole file.
+
+    Bound to a local BEFORE the comprehension deliberately: inlining it into the
+    ``if call.args and ...`` guard would short-circuit whenever no emit carried a
+    positional arg, so a NEGATIVE test would pass vacuously without the member
+    ever having to exist. Every caller now genuinely depends on it.
+    """
+    wanted = EventType.session_config_dir_ambiguous
+    return [
+        call.kwargs
+        for call in harness.event_store.emit.call_args_list  # type: ignore[attr-defined]
+        if call.args and call.args[0] == wanted
+    ]
+
+
+class TestAdoptEmitsConfigDirAmbiguous:
+    """An unresolvable config dir must be a STRUCTURED, queryable signal — and
+    must be emitted on that shape ONLY.
+
+    A derivation that refuses to stash the wrong dir (see
+    ``TestAdoptDerivesConfigDir``) is honest but still silent: the ensuing
+    dispatch is a GUARANTEED ``no_transcript`` fallback and an operator has
+    nothing that says why. ``session_config_dir_ambiguous`` closes that, keyed
+    on the real task id, with four structured fields rather than prose (INV-2).
+
+    The non-obvious half is the SCOPING, which is what the four negative tests
+    below pin. The event fires if and only if candidates EXIST and the expected
+    dir is absent:
+
+      - NO candidates at all is ABSENCE, not ambiguity. It is also the DOMINANT
+        recovered-session population: warm-lane acquire ALWAYS re-seeds a lane
+        from base, wiping ``<lane>/.task/`` and the whole transcript store with
+        it, which is why ``reseeded`` exists as a BY-DESIGN fallback reason.
+        Emitting there would fire on nearly every recovered lane and put the
+        most-expected outcome in the same bucket as a genuine defect,
+        destroying the discrimination this event exists to provide. It is also
+        no behaviour change: today's code stashes nothing there either.
+      - Resolution SUCCEEDING with siblings present is not a problem, so this
+        deliberately does NOT reinstate the old ``len(config_dirs) > 1``
+        warning — that warning fired on a healthy resolution and stayed silent
+        on the broken one, which is precisely backwards.
+    """
+
+    def test_emits_on_the_ambiguous_shape(self, harness: Harness):
+        """(a) Candidates present, expected dir absent → exactly one emit,
+        carrying four structured fields.
+
+        ``expected`` is pinned against the real CREATOR (``TaskConfigDir``), the
+        same agreement pin as the resolver test, so the payload cannot drift
+        from the resolution it reports on. ``found`` is asserted to be a SORTED
+        list of ``str`` (not ``Path``, not a set): it has to survive the
+        ``json.dumps`` round-trip into runs.db, and sorting makes
+        ``json_extract(data, '$.found')`` a stable group key — the discipline
+        already applied to ``session_resume_fallback``'s ``reasons``.
+        """
+        task_id = '3464'
+        wt = _setup_worktree(harness.git_ops.worktree_base, task_id)
+        task_dir = wt / '.task'
+        _adopt_sidecar(task_dir, 'sess-3464', task_id)
+        unblock = TaskConfigDir(f'{task_id}-unblock', base_dir=task_dir)
+        expected = task_dir / f'{CONFIG_DIR_PREFIX}{task_id}'
+        assert not expected.exists()
+
+        harness._adopt_recovered_session(wt, task_id)
+
+        emits = _ambiguity_emits(harness)
+        assert len(emits) == 1
+        assert emits[0]['task_id'] == task_id
+        assert emits[0]['data'] == {
+            'expected': str(TaskConfigDir(task_id, base_dir=task_dir).path),
+            'found': [str(unblock.path)],
+            'session_id': 'sess-3464',
+            'task_id': task_id,
+        }
+        found = emits[0]['data']['found']
+        assert isinstance(found, list)
+        assert all(isinstance(p, str) for p in found)
+        assert found == sorted(found)
+
+    def test_silent_when_there_are_no_candidates(self, harness: Harness):
+        """(b) The warm-lane-reseed / wiped-``.task`` shape stays SILENT.
+
+        ``test_session_resume_integration_gate.py::test_b4_foreign_acquire_falls_back_no_transcript``
+        models this same shape and asserts it degrades quietly through
+        ``no_transcript``/``reseeded``; that population is already instrumented
+        at DISPATCH by ``session_resume_fallback`` carrying
+        ``archive_available``, so nothing is lost by staying quiet at boot.
+        """
+        task_id = '55'
+        wt = _setup_worktree(harness.git_ops.worktree_base, task_id)
+        task_dir = wt / '.task'
+        _adopt_sidecar(task_dir, 'sess-55', task_id)
+        assert list(task_dir.glob(f'{CONFIG_DIR_PREFIX}*')) == []
+
+        adopted = harness._adopt_recovered_session(wt, task_id)
+
+        assert adopted == task_id
+        assert harness._recovered_session_config_dirs == {}
+        assert _ambiguity_emits(harness) == []
+
+    def test_silent_when_resolution_succeeded(self, harness: Harness):
+        """(c) Expected dir present alongside a lexically-earlier foreign
+        sibling → resolved, and SILENT. Siblings are not a problem once the
+        right dir was found.
+        """
+        task_id = '99'
+        wt = _setup_worktree(harness.git_ops.worktree_base, task_id)
+        task_dir = wt / '.task'
+        _adopt_sidecar(task_dir, 'sess-99', task_id)
+        expected = TaskConfigDir(task_id, base_dir=task_dir)
+        TaskConfigDir('000-foreign', base_dir=task_dir)
+
+        harness._adopt_recovered_session(wt, task_id)
+
+        assert harness._recovered_session_config_dirs == {
+            task_id: str(expected.path)
+        }
+        assert _ambiguity_emits(harness) == []
+
+    @pytest.mark.parametrize(
+        'payload', [None, 'unreadable', []],
+        ids=['missing-sidecar', 'unreadable-sidecar', 'non-object-sidecar'],
+    )
+    def test_silent_when_nothing_was_adopted(self, harness: Harness, payload):
+        """(d) A missing / unreadable / non-object sidecar returns BEFORE the
+        stash block, so no event — even with a non-matching candidate staged.
+
+        Guards against regressing ``TestAdoptNonDictSidecar``: an ambiguity
+        signal about a session that was never adopted would be noise about a
+        resume nobody was going to attempt.
+        """
+        task_id = '3464'
+        wt = _setup_worktree(harness.git_ops.worktree_base, task_id)
+        task_dir = wt / '.task'
+        task_dir.mkdir(parents=True, exist_ok=True)
+        if payload == 'unreadable':
+            (task_dir / 'agent_session.json').write_text('{truncated')
+        elif payload is not None:
+            (task_dir / 'agent_session.json').write_text(json.dumps(payload))
+        TaskConfigDir(f'{task_id}-unblock', base_dir=task_dir)
+
+        adopted = harness._adopt_recovered_session(wt, task_id)
+
+        assert adopted is None
+        assert harness._recovered_sessions == {}
+        assert _ambiguity_emits(harness) == []
+
+    def test_no_event_store_never_raises(self, harness: Harness):
+        """(e) I3 — with no event store the ambiguous shape still adopts,
+        still stashes nothing, and does not raise.
+        """
+        harness.event_store = None
+        task_id = '3464'
+        wt = _setup_worktree(harness.git_ops.worktree_base, task_id)
+        task_dir = wt / '.task'
+        _adopt_sidecar(task_dir, 'sess-3464', task_id)
+        TaskConfigDir(f'{task_id}-unblock', base_dir=task_dir)
+
+        adopted = harness._adopt_recovered_session(wt, task_id)  # must not raise
+
+        assert adopted == task_id
+        assert harness._recovered_session_config_dirs == {}
+
+
 def _setup_worktree_with_meta(base: Path, task_id: str, plan: dict, *, title: str):
     """Worktree with a plan AND a .task/metadata.json carrying ``title``."""
     wt = _setup_worktree(base, task_id, plan)
