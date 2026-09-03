@@ -330,3 +330,119 @@ async def test_metrics_loop_still_rereads_config_from_app_state_each_cycle(
         'client.app.state.config mid-test and depend on it. Only pool/http_client '
         'bind to arguments.'
     )
+
+
+@pytest.mark.asyncio
+async def test_metrics_loop_uses_the_handles_it_was_passed_not_app_state(
+    tmp_path: Path,
+) -> None:
+    """``_run_once`` must USE its ``pool``/``http_client`` arguments, not app.state.
+
+    The other tests in this module pin the CALL SITE (``lifespan`` hands each
+    loop the handles it built) and the config half of the asymmetry.  None of
+    them pins what ``_run_once`` does with the arguments it received: a
+    ``_metrics_loop`` whose signature still accepts ``pool``/``http_client`` but
+    whose body re-reads ``app.state.db`` / ``app.state.http_client`` reinstates
+    the exact cross-talk this task exists to remove, and was measured to leave
+    the whole dashboard suite green.
+
+    So this test makes argument and ``app.state`` *unmistakably* distinct: four
+    separate sentinels, two passed in and two installed on ``app.state``.  Both
+    pool sentinels get a working ``AsyncMock`` ``get``, so under the mutation the
+    loop still completes a cycle and the failure lands on a named binding
+    assertion rather than an incidental ``TypeError`` in an unrelated test.
+
+    Drives ``_metrics_loop`` directly, reusing the harness in
+    test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
+    """
+    store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
+    await store.open()
+
+    # A REAL config, not a MagicMock -- check_bare_magicmock_config.py Rule A.
+    config = DashboardConfig(project_root=tmp_path)
+
+    # The two handles handed to the loop...
+    arg_pool = MagicMock()
+    arg_pool.get = AsyncMock(return_value=None)
+    arg_http_client = MagicMock()
+
+    # ...and two DIFFERENT ones parked on app.state, standing in for the
+    # handles an interleaving (already shut down) lifespan leaves behind.
+    # state_pool.get is a working AsyncMock on purpose: a regression must fail
+    # on the named assertions below, not on an un-awaitable auto-MagicMock.
+    state_pool = MagicMock()
+    state_pool.get = AsyncMock(return_value=None)
+    state_http_client = MagicMock()
+
+    mock_app = MagicMock()
+    mock_app.state.config = config
+    mock_app.state.db = state_pool
+    mock_app.state.http_client = state_http_client
+
+    recorded: list[dict[str, Any]] = []
+    saw_call = asyncio.Event()
+
+    async def _recording_collect(*args: object, **kwargs: Any) -> None:
+        recorded.append(kwargs)
+        # Set from inside the recorder, so the wait below is racefree.
+        saw_call.set()
+
+    async def _noop_sleep(*a: object, **kw: object) -> None:
+        # Must actually suspend -- see the note in the config test above.
+        await asyncio.sleep(0)
+
+    try:
+        with (
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(side_effect=_recording_collect),
+            ),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+        ):
+            task = asyncio.create_task(
+                _metrics_loop(
+                    store,
+                    mock_app,
+                    pool=arg_pool,
+                    http_client=arg_http_client,
+                )
+            )
+            try:
+                # Suppressed, not raised: a bare TimeoutError explains nothing.
+                # Falling through lets the named assertions say what broke.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(saw_call.wait(), timeout=2.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await store.close()
+
+    # Without this every assertion below is vacuous: _run_once swallows any
+    # exception from its body into a generic 'Metrics snapshot error' warning.
+    assert recorded, (
+        'task 3771: collect_metrics_snapshot was never called -- the loop body never '
+        'completed a cycle, so nothing below proves anything'
+    )
+    kwargs = recorded[0]
+    assert kwargs['http_client'] is arg_http_client, (
+        'task 3771 CROSS-TALK: _run_once forwarded an http_client that is NOT the one '
+        '_metrics_loop was passed. The handle must come from the argument, never from '
+        'app.state -- app.state holds whichever lifespan wrote last, and its client may '
+        'already be closed.'
+    )
+    assert kwargs['http_client'] is not state_http_client, (
+        'task 3771 CROSS-TALK: _run_once forwarded the AsyncClient parked on '
+        'app.state.http_client (an interleaving lifespan closed handle) instead of its '
+        'own http_client argument'
+    )
+    assert arg_pool.get.await_count >= 1, (
+        'task 3771 CROSS-TALK: _run_once never touched the DbPool it was passed. It must '
+        'open every connection through the argument pool, never through app.state.db.'
+    )
+    assert state_pool.get.await_count == 0, (
+        'task 3771 CROSS-TALK: _run_once opened a connection through the DbPool parked on '
+        'app.state.db (an interleaving lifespan closed pool, whose get() silently returns '
+        'None) instead of its own pool argument'
+    )
