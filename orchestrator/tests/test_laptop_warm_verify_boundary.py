@@ -2859,10 +2859,17 @@ class FlockGateWait(NamedTuple):
     acquired: bool
 
 
+#: Task 5019: ``timeout``/``waited`` are bounded to the float shapes their
+#: format specifiers (``%r`` of a float, ``%.4f``) can actually produce,
+#: mirroring the fix to _WATCHDOG_GATE_RE's identical \S+ weakness -- the
+#: true last field on this line (``acquired``) is already anchored to the
+#: literal ``True|False`` alternation, so it isn't reachable by the exact
+#: trailing-abutment defect observed for the watchdog twin, but leaving the
+#: interior numeric groups unbounded would still make this fix half-done.
 _FLOCK_GATE_RE = re.compile(
     re.escape(FLOCK_GATE_MARKER)
-    + r' lock=(?P<lock>\S+) timeout=(?P<timeout>\S+) '
-    r'waited=(?P<waited>\S+) acquired=(?P<acquired>True|False)'
+    + r' lock=(?P<lock>\S+) timeout=(?P<timeout>-?\d+\.\d+) '
+    r'waited=(?P<waited>-?\d+\.\d{4}) acquired=(?P<acquired>True|False)'
 )
 
 
@@ -3092,9 +3099,16 @@ class WatchdogGateFire(NamedTuple):
     grace_secs: float
 
 
+#: Task 5019: the fraction groups are bounded to exactly 4 digits (rather
+#: than an unbounded ``\S+``) because WATCHDOG_GATE_LINE_FMT's ``%.4f``
+#: always renders exactly 4 fraction digits, and the child's stderr fd is
+#: shared with unrelated writers -- an interleaved log line landing with no
+#: separator right after the trailing field (observed in production,
+#: mr-ccc80440: 'grace=0.2023' + '2026-09-01...' collapsing into
+#: '0.20232026-09-01') must not be absorbed into the match.
 _WATCHDOG_GATE_RE = re.compile(
     re.escape(WATCHDOG_GATE_MARKER)
-    + r' fire_delay=(?P<fire_delay>\S+) grace=(?P<grace>\S+)'
+    + r' fire_delay=(?P<fire_delay>-?\d+\.\d{4}) grace=(?P<grace>-?\d+\.\d{4})'
 )
 
 
@@ -3147,6 +3161,38 @@ def test_parse_watchdog_gate_fire_delays_returns_empty_for_uninstrumented_stderr
     an empty list would pass by default.
     """
     assert parse_watchdog_gate_fire_delays('Traceback (most recent call last):\nboom\n') == []
+
+
+def test_parse_watchdog_gate_fire_delays_survives_abutting_log_line():
+    """An unrelated co-writer's stderr line landing with no separator must
+    not corrupt the parse.
+
+    Task 5019 -- observed in production (mr-ccc80440, task 4537's post-merge
+    verify): the child's stderr fd is shared with anything else that writes
+    to it, and under merge-verify load a timestamped log line landed
+    immediately after the marker line's trailing ``grace=`` field with no
+    intervening whitespace or newline, collapsing the real value (0.2023)
+    and a '2026-09-01...' timestamp into one unbroken token,
+    '0.20232026-09-01'. The old ``\\S+`` field regex swallowed that whole
+    token and ``float()`` raised inside the parser, which the merge worker
+    then mis-dispositioned as "branch_bug" against a branch that never
+    touched this test.
+
+    The fix bounds the numeric groups to the exact shape
+    WATCHDOG_GATE_LINE_FMT's ``%.4f`` can produce -- a run of digits, a dot,
+    and exactly 4 fraction digits -- so an abutting line's digits cannot be
+    absorbed into the match. This test reproduces the exact corrupted shape
+    and must fail against the unbounded ``\\S+`` regex (raises ValueError)
+    and pass once the fraction groups are bounded.
+    """
+    corrupted = (
+        f'{WATCHDOG_GATE_MARKER} fire_delay=0.6931 grace=0.2023'
+        '2026-09-01T00:00:00Z some unrelated interleaved log line\n'
+    )
+
+    assert parse_watchdog_gate_fire_delays(corrupted) == [
+        WatchdogGateFire(fire_delay_secs=0.6931, grace_secs=0.2023),
+    ]
 
 
 # ---------------------------------------------------------------------------
