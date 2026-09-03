@@ -369,6 +369,9 @@ async def _burndown_loop(
 async def _metrics_loop(
     store: _MetricsStore,
     app: FastAPI,
+    *,
+    pool: DbPool,
+    http_client: httpx.AsyncClient,
 ) -> None:
     """Periodically snapshot ephemeral system metrics into metrics.db.
 
@@ -381,8 +384,6 @@ async def _metrics_loop(
     async def _run_once() -> None:
         conn = store.connection
         config: DashboardConfig = app.state.config
-        pool: DbPool = app.state.db
-        http_client: httpx.AsyncClient = app.state.http_client
         recon_db = await pool.get(config.reconciliation_db)
         tickets_db = await pool.get(config.tickets_db)
         merge_dbs = await _project_scoped_dbs_labeled(
@@ -662,7 +663,9 @@ async def lifespan(app: FastAPI):
     await metrics_store.open()
     app.state.metrics_store = metrics_store
     app.state.metrics_db_path = metrics_path  # preserved for healthz / other callers
-    metrics_task = asyncio.create_task(_metrics_loop(metrics_store, app))
+    metrics_task = asyncio.create_task(
+        _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
+    )
 
     yield
 
