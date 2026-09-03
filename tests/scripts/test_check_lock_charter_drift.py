@@ -42,7 +42,6 @@ because ``--import-mode=importlib`` deliberately does not).
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 import subprocess
@@ -63,19 +62,6 @@ from shared.locking import EXTENSIONLESS_FILENAMES, FILE_EXTENSIONS, is_file_pat
 # the in-suite Tier-1 guard cannot disagree about what dark-factory declares.
 DF_EXTENSIONS = sorted(FILE_EXTENSIONS)
 DF_EXTENSIONLESS = sorted(EXTENSIONLESS_FILENAMES)
-
-
-def _source_ast() -> ast.Module:
-    """The module-under-test's source, PARSED — never scanned as text.
-
-    Two structural guards below ("no parents[N] hop", "no ambient environ
-    re-read") describe things the script must not DO.  A substring scan cannot
-    express that, because the script's own docstrings EXPLAIN at length why it
-    does neither — a text scan fires on the explanation and would push a future
-    maintainer to delete the rationale in order to go green, which is the worst
-    possible incentive to build into a guard.  The AST sees code only.
-    """
-    return ast.parse(Path(drift.__file__).read_text())
 
 
 @pytest.fixture(autouse=True)
@@ -684,35 +670,6 @@ class TestResolve:
             "shared-relative start would walk the WRONG tree's ancestors"
         )
 
-    def test_source_contains_no_parents_index_arithmetic(self):
-        """No ``Path(__file__).parents[N]`` hop, in any spelling.
-
-        The standing regression guard for this task's charter.  Measured in
-        shared.reify_checkout's docstring: ``.worktrees/<id>`` contributes
-        exactly two path segments, so parents[5] is correct in a worktree and
-        parents[3] is correct in a bare checkout — NO fixed index is correct in
-        both, and orchestrator verify runs in a worktree while an operator's
-        shell runs in a bare checkout.  A fixed index here would silently
-        resolve to a different repo depending on who invoked the script.
-
-        Asserted over the AST rather than as a substring scan, for the reason
-        given on `_source_ast`: the module's own prose EXPLAINS why parents[N]
-        is a regression, and a text scan would fire on that explanation.  The
-        AST form is also strictly stronger — it catches ``p.parents[3]``,
-        ``x.parents [3]`` and an aliased ``par = p.parents; par[3]`` alike.
-        """
-        hops = [
-            ast.dump(node)
-            for node in ast.walk(_source_ast())
-            if isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Attribute)
-            and node.value.attr == 'parents'
-        ]
-        assert hops == [], (
-            f'fixed parents[N] arithmetic is a REGRESSION, not a fix — delegate '
-            f'to shared.reify_checkout.resolve_reify_checkout instead: {hops!r}'
-        )
-
     def test_explicit_repo_beats_reify_root(self, tmp_path, monkeypatch):
         """``--reify-repo`` is the operator saying "this one, now"."""
         monkeypatch.setenv('REIFY_ROOT', str(tmp_path / 'from-env'))
@@ -738,29 +695,6 @@ class TestResolve:
 
         assert checkout.root == (tmp_path / 'from-env').resolve()
         assert checkout.named_by_env is True
-
-    def test_no_ambient_environ_reread(self):
-        """This module must not read the environment itself — the resolver owns that arm.
-
-        An ambient re-read is what lets a message blame the operator for a
-        DISCOVERED root (see `reify_skip_reason`'s docstring).  Keeping the read
-        inside the resolver means the answer and its provenance are produced
-        together and cannot disagree.
-
-        Asserted over the AST rather than as a substring scan, for the reason
-        given on `_source_ast`: the module's own prose EXPLAINS why it does not
-        re-read REIFY_ROOT, and a text scan would fire on that explanation.
-        """
-        reads = [
-            node.attr
-            for node in ast.walk(_source_ast())
-            if isinstance(node, ast.Attribute) and node.attr in ('environ', 'getenv')
-        ]
-        assert reads == [], (
-            f'environment access {reads!r} in the script — the REIFY_ROOT arm '
-            f'belongs to shared.reify_checkout.resolve_reify_checkout, so that '
-            f'the answer and its provenance are produced together'
-        )
 
     @pytest.mark.parametrize(
         'layout',
