@@ -130,3 +130,102 @@ def _client():
     def test_syntax_error_returns_no_violations(self):
         """An unparseable file is ruff's problem, not this checker's."""
         assert find_violations('def broken(:\n', 'test_x.py') == []
+
+
+class TestFindViolationsResolvesImportAliases:
+    """Regression for reviewer objection (c): the trailing-callee-name blind spot.
+
+    The deleted task-3571 guard keyed on the trailing callee NAME, so
+    ``from starlette.testclient import TestClient as TC`` followed by ``TC(app)``
+    walked straight past it — the exact blind spot its own docstring claimed to
+    close.  Matching is now the UNION of an import-alias map and trailing-name
+    matching, which is strictly broader than the deleted guard and never narrower.
+    """
+
+    def test_aliased_import_is_flagged(self):
+        """`from starlette.testclient import TestClient as TC` + `TC(app)` IS flagged."""
+        source = '''\
+import pytest
+from starlette.testclient import TestClient as TC
+
+
+@pytest.fixture(scope='module')
+def _client():
+    with TC(app) as c:
+        yield c
+'''
+        violations = find_violations(source, 'test_x.py')
+        assert len(violations) == 1, 'aliased TestClient import was not resolved'
+        assert violations[0].lineno == 7
+
+    def test_fastapi_testclient_import_is_flagged(self):
+        """`from fastapi.testclient import TestClient` is the same class from the other package."""
+        source = '''\
+import pytest
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture(scope='module')
+def _client():
+    with TestClient(app) as c:
+        yield c
+'''
+        violations = find_violations(source, 'test_x.py')
+        assert len(violations) == 1
+        assert violations[0].lineno == 7
+
+    def test_module_attribute_form_is_flagged(self):
+        """`from starlette import testclient` + `testclient.TestClient(app)` IS flagged."""
+        source = '''\
+import pytest
+from starlette import testclient
+
+
+@pytest.fixture(scope='module')
+def _client():
+    with testclient.TestClient(app) as c:
+        yield c
+'''
+        violations = find_violations(source, 'test_x.py')
+        assert len(violations) == 1
+        assert violations[0].lineno == 7
+
+    def test_decoy_alias_is_not_flagged(self):
+        """`from foo import Bar as TC` + `TC(app)` matches NEITHER arm of the union.
+
+        Broadening must not degenerate into flagging every short uppercase alias:
+        the alias map resolves TC to ``foo.Bar`` (not a TestClient), and the
+        trailing-name arm sees ``TC``, not ``TestClient``.
+        """
+        source = '''\
+import pytest
+from foo import Bar as TC
+
+
+@pytest.fixture(scope='module')
+def _thing():
+    with TC(app) as c:
+        yield c
+'''
+        assert find_violations(source, 'test_x.py') == []
+
+    def test_fixture_decorator_is_alias_resolved(self):
+        """`from pytest import fixture as fx` + `@fx(scope='module')` still marks a fixture.
+
+        Without this, the same class of hole the alias map closes for TestClient
+        would simply reopen one decorator up: rename the decorator import and the
+        function stops looking like a fixture.
+        """
+        source = '''\
+from pytest import fixture as fx
+from starlette.testclient import TestClient
+
+
+@fx(scope='module')
+def _client():
+    with TestClient(app) as c:
+        yield c
+'''
+        violations = find_violations(source, 'test_x.py')
+        assert len(violations) == 1, 'aliased pytest.fixture decorator was not resolved'
+        assert violations[0].lineno == 7
