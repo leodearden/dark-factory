@@ -354,3 +354,182 @@ class TestFileSizeMeasures:
         measures = metrics.file_size_measures(source, path='merge_queue.py')
         assert measures.lines == 21550
         assert measures.prose_lines > 0
+
+
+# ---------------------------------------------------------------------------
+# Structural import measures: function-local (reach-back) imports, and
+# re-export shim names.
+
+
+class TestFunctionLocalImports:
+    def test_import_from_inside_a_def_is_counted(self) -> None:
+        source = 'def f():\n    from x import y\n    return y\n'
+        assert metrics.function_local_imports(source, path='t.py') == 1
+
+    def test_plain_import_inside_a_def_is_counted(self) -> None:
+        source = 'def f():\n    import x\n    return x\n'
+        assert metrics.function_local_imports(source, path='t.py') == 1
+
+    def test_import_inside_an_async_def_is_counted(self) -> None:
+        source = 'async def f():\n    from x import y\n    return y\n'
+        assert metrics.function_local_imports(source, path='t.py') == 1
+
+    def test_import_inside_a_nested_def_is_counted_once(self) -> None:
+        # Walking from each function node would visit the inner import twice
+        # (once from the outer function, once from the inner); dedupe by node
+        # identity keeps this at 1.
+        source = (
+            'def outer():\n'
+            '    def inner():\n'
+            '        from x import y\n'
+            '        return y\n'
+            '    return inner\n'
+        )
+        assert metrics.function_local_imports(source, path='t.py') == 1
+
+    def test_module_level_import_is_not_counted(self) -> None:
+        source = 'from x import y\nimport z\n\n\ndef f():\n    return y\n'
+        assert metrics.function_local_imports(source, path='t.py') == 0
+
+    def test_import_in_a_class_body_outside_any_function_is_not_counted(self) -> None:
+        source = 'class C:\n    from x import y\n'
+        assert metrics.function_local_imports(source, path='t.py') == 0
+
+    def test_import_in_a_method_body_is_counted(self) -> None:
+        source = 'class C:\n    def m(self):\n        from x import y\n        return y\n'
+        assert metrics.function_local_imports(source, path='t.py') == 1
+
+    def test_a_docstring_quoting_an_import_is_not_counted(self) -> None:
+        # AST, not regex. The satellite modules' reach-back notes quote exactly
+        # this string in prose; counting them would inflate the measure.
+        source = (
+            'def f():\n'
+            '    """Resolves via ``from orchestrator.merge_queue import X``."""\n'
+            '    return 1\n'
+        )
+        assert metrics.function_local_imports(source, path='t.py') == 0
+
+    def test_each_import_statement_counts_once_regardless_of_names(self) -> None:
+        source = 'def f():\n    from x import a, b, c\n    return a\n'
+        assert metrics.function_local_imports(source, path='t.py') == 1
+
+    def test_unparseable_source_raises_naming_the_path(self) -> None:
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.function_local_imports('def (:\n', path='broken.py')
+        assert 'broken.py' in str(excinfo.value)
+
+    def test_cluster_total_is_positive_anchor(self) -> None:
+        # Anti-vacuity: the PRD's ceilings row counts the function-local imports
+        # inside the package; on this tree the count is well above zero.
+        total = 0
+        for relpath in metrics.resolve_cluster_paths(_REPO_ROOT).resolved:
+            source = (_REPO_ROOT / relpath).read_text(encoding='utf-8')
+            total += metrics.function_local_imports(source, path=relpath)
+        assert total > 0
+
+
+class TestReexportNames:
+    def test_unreferenced_module_level_import_from_names_are_reexports(self) -> None:
+        source = 'from a import (B, C)\n'
+        assert metrics.reexport_names(source, path='t.py') == ['B', 'C']
+
+    def test_a_referenced_binding_is_not_a_reexport(self) -> None:
+        source = 'from a import B\n\nx = B()\n'
+        assert metrics.reexport_names(source, path='t.py') == []
+
+    def test_an_alias_is_reported_under_the_bound_name(self) -> None:
+        source = 'from a import B as C\n'
+        assert metrics.reexport_names(source, path='t.py') == ['C']
+
+    def test_a_used_alias_is_not_a_reexport(self) -> None:
+        source = 'from a import B as C\n\nx = C()\n'
+        assert metrics.reexport_names(source, path='t.py') == []
+
+    def test_a_name_referenced_only_in_a_docstring_still_counts(self) -> None:
+        # AST, not regex: prose mentioning the name does not make it used.
+        source = '"""Re-exports B for consumers."""\nfrom a import B\n# B lives here\n'
+        assert metrics.reexport_names(source, path='t.py') == ['B']
+
+    def test_a_name_referenced_inside_a_nested_function_counts_as_used(self) -> None:
+        source = (
+            'from a import B\n'
+            '\n'
+            '\n'
+            'def outer():\n'
+            '    def inner():\n'
+            '        return B\n'
+            '    return inner\n'
+        )
+        assert metrics.reexport_names(source, path='t.py') == []
+
+    def test_a_function_local_import_from_is_not_a_reexport(self) -> None:
+        # Only MODULE-LEVEL ImportFrom bindings form the module's public
+        # surface; a deferred import inside a function is the reach-back
+        # measure's business, not this one's.
+        source = 'def f():\n    from a import B\n    return 1\n'
+        assert metrics.reexport_names(source, path='t.py') == []
+
+    def test_a_plain_import_is_not_counted(self) -> None:
+        # The PRD's measure is the `from X import (...)` shim block; a bare
+        # `import x` binds a module, not a re-exported name.
+        source = 'import a\n'
+        assert metrics.reexport_names(source, path='t.py') == []
+
+    def test_star_import_is_not_reported_as_a_name(self) -> None:
+        source = 'from a import *\n'
+        assert metrics.reexport_names(source, path='t.py') == []
+
+    def test_names_are_returned_sorted_and_deduped(self) -> None:
+        source = 'from a import Z\nfrom b import A\n'
+        assert metrics.reexport_names(source, path='t.py') == ['A', 'Z']
+
+    def test_unparseable_source_raises_naming_the_path(self) -> None:
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.reexport_names('def (:\n', path='broken.py')
+        assert 'broken.py' in str(excinfo.value)
+
+    def test_merge_queue_structural_reading_overlaps_the_annotated_shims(self) -> None:
+        # Anti-vacuity anchor AND the evidence for the STRUCTURAL-not-comment
+        # decision: the structural predicate (a module-level ImportFrom binding
+        # never referenced elsewhere -- exactly what ruff's F401 computes, which
+        # is why those blocks carry the suppression) must land squarely on the
+        # nine annotated `# noqa: F401  re-export shim` blocks at lines
+        # 57/64/89/112/118/150/154/188/198.
+        #
+        # OVERLAP, not containment, and the asymmetry is the interesting part:
+        # `# noqa: F401` suppresses a whole BLOCK, so a name that merge_queue.py
+        # both re-exports AND uses internally sits inside an annotated block
+        # while being perfectly F401-clean. MEASURED on this tree: 127 names
+        # across the nine blocks, 63 of them structurally unused. So the
+        # structural set is a proper subset per block (8 of the 9 blocks
+        # contribute at least one; merge_speculation_controller's two names are
+        # both used internally), and a proper SUPERSET cluster-wide, because it
+        # also catches pure re-exports nobody annotated.
+        import ast as _ast
+
+        path = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
+        source = path.read_text(encoding='utf-8')
+        reported = set(metrics.reexport_names(source, path=str(path)))
+        assert reported
+
+        annotated_linenos = {57, 64, 89, 112, 118, 150, 154, 188, 198}
+        tree = _ast.parse(source)
+        blocks = [
+            {a.asname or a.name for a in node.names}
+            for node in tree.body
+            if isinstance(node, _ast.ImportFrom) and node.lineno in annotated_linenos
+        ]
+        assert len(blocks) == len(annotated_linenos), 'shim block line numbers drifted'
+        hit_blocks = [names for names in blocks if names & reported]
+        assert len(hit_blocks) >= 6, f'{len(hit_blocks)}/{len(blocks)} annotated blocks hit'
+        annotated_names = set().union(*blocks)
+        assert len(annotated_names & reported) >= 50
+
+    def test_deleting_the_noqa_comment_does_not_change_the_measure(self) -> None:
+        # THE ungameable property, pinned directly. A comment-scanning detector
+        # would zero out on this purely cosmetic edit; the structural one cannot
+        # see comments at all.
+        source = 'from a import (  # noqa: F401  re-export shim\n    B,\n    C,\n)\n'
+        stripped = source.replace('  # noqa: F401  re-export shim', '')
+        assert metrics.reexport_names(source, path='t.py') == ['B', 'C']
+        assert metrics.reexport_names(stripped, path='t.py') == ['B', 'C']
