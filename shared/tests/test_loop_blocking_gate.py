@@ -44,14 +44,27 @@ fixtures prove it still fires.
 
 from __future__ import annotations
 
+import re
 import textwrap
+from pathlib import Path
+from typing import NamedTuple
 
 import pytest
+from loop_blocking_allowlist import (
+    ALLOWLIST_KEYS,
+    AUDITED_SITES,
+    DISPOSITIONS,
+)
 from loop_blocking_scan import (
     DOTTED_PRIMITIVES,
     METHOD_PRIMITIVES,
+    LoopBlockingSite,
     find_loop_blocking_sites,
     site_key,
+)
+from silent_fallthrough_scan import (
+    iter_first_party_files,
+    reconcile_against_allowlist,
 )
 
 
@@ -687,6 +700,270 @@ class TestPrimitiveTable:
         assert {'read_text', 'write_text', 'read_bytes', 'write_bytes'} <= set(
             METHOD_PRIMITIVES
         )
+
+
+# --------------------------------------------------------------------------- #
+# The whole-tree gate
+# --------------------------------------------------------------------------- #
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Task 4484's charter is "re-run the enumeration caller-side across
+# fused-memory", so the finding set is scoped to that package.
+# iter_first_party_files yields all SEVEN scope roots; orchestrator/src is also
+# heavily async and would balloon the baseline past anything a reviewer can
+# read, turning the ratchet into a merge blocker for unrelated work. Widening
+# is a deliberate follow-on decision with merge-lane consequences, not a
+# side effect of this audit.
+#
+# The scope is applied by FILTERING that generator's output, never by handing
+# it a narrower root: it validates repo_root against sentinel dirs
+# ('shared/src', 'orchestrator/src') and RAISES rather than yielding a
+# vacuously empty scan. Passing 'fused-memory/src' as the root would trip that
+# sentinel, and relaxing the sentinel to accommodate us would delete the
+# loud-failure property its existing consumers rely on.
+_SCOPE_PREFIX = 'fused-memory/src/'
+
+
+class _TreeScan(NamedTuple):
+    """Cached result of one whole-tree sweep (session-scoped)."""
+
+    scanned_files: int
+    findings: list
+
+
+@pytest.fixture(scope='session')
+def tree_scan() -> _TreeScan:
+    """Enumerate, read and scan ``fused-memory/src`` once per test session."""
+    sources: dict[str, str] = {}
+    for path in iter_first_party_files(_REPO_ROOT):
+        rel = path.relative_to(_REPO_ROOT).as_posix()
+        if not rel.startswith(_SCOPE_PREFIX):
+            continue
+        sources[rel] = path.read_text(encoding='utf-8', errors='replace')
+    return _TreeScan(scanned_files=len(sources), findings=find_loop_blocking_sites(sources))
+
+
+class TestSweepIsNotVacuous:
+    """A gate that scans nothing passes trivially and protects nothing."""
+
+    def test_scanned_file_floor(self, tree_scan):
+        """Floor deliberately BELOW the measured 167 files at HEAD 6696f1ce0c."""
+        assert tree_scan.scanned_files >= 100, (
+            f'only {tree_scan.scanned_files} files scanned under {_SCOPE_PREFIX} '
+            f'(167 at HEAD 6696f1ce0c) -- the SWEEP is broken, not the tree. '
+            f'Every assertion below would pass vacuously. Is _REPO_ROOT right? '
+            f'({_REPO_ROOT})'
+        )
+
+    def test_finding_floor(self, tree_scan):
+        """Floor deliberately BELOW the measured 60 findings at HEAD 6696f1ce0c.
+
+        Slack is the point.  Tasks 4201 and 3778 are in flight and will
+        legitimately REMOVE findings when they land; a floor set at the
+        measured value would turn red on success.  The floor exists only to
+        prove the detector still detects on the live tree, not to pin a count.
+        """
+        assert len(tree_scan.findings) >= 10, (
+            f'only {len(tree_scan.findings)} findings (60 at HEAD 6696f1ce0c) -- '
+            f'the detector has almost certainly stopped detecting. Check the '
+            f'synthetic fixtures above before believing the tree got clean.'
+        )
+
+    def test_every_finding_is_inside_the_declared_scope(self, tree_scan):
+        """The 7-root generator's output really was filtered to fused-memory/src."""
+        strays = sorted({
+            f.filename for f in tree_scan.findings
+            if not f.filename.startswith(_SCOPE_PREFIX)
+        })
+        assert strays == [], (
+            f'findings outside {_SCOPE_PREFIX}: {strays}. Widening the gate is a '
+            f'deliberate decision (see the _SCOPE_PREFIX comment), not a drift.'
+        )
+
+
+class TestKnownSiteFloor:
+    """The four ``task_curator.py`` sites task 4484 confirmed by hand."""
+
+    # (qualname, callee) pairs, all in
+    # fused-memory/src/fused_memory/middleware/task_curator.py.
+    _CURATOR = 'fused-memory/src/fused_memory/middleware/task_curator.py'
+
+    # No in-flight task removes these two, so they are asserted unconditionally.
+    # Both are `async def _maybe_*` guards lazily loading a YAML registry off
+    # disk on the loop thread -- the same shape as their two siblings below,
+    # and NEITHER had a task filed before task 4484 found them.
+    _UNFILED = {
+        ('TaskCurator._maybe_blocklist_drop', 'load_blocklist'),
+        ('TaskCurator._maybe_route_deterministic', 'load_operational_registry'),
+    }
+
+    # Task 4201 owns these two; when it lands they disappear, which must NOT
+    # turn this gate red.  Hence a subset check, never an equality.
+    _FILED_4201 = {
+        ('TaskCurator._maybe_premise_refuted_drop', 'load_premise_registry'),
+        ('TaskCurator._maybe_premise_refuted_drop', 'premise_refuted_entry'),
+    }
+
+    def _curator_sites(self, tree_scan):
+        return {
+            (f.qualname, f.callee)
+            for f in tree_scan.findings
+            if f.filename == self._CURATOR
+        }
+
+    def test_unfiled_curator_sites_are_found(self, tree_scan):
+        """The two previously-UNFILED sites must be found by the live sweep.
+
+        These are the ones that make task 4484's case: task 3778's census read
+        ``task_curator.py``'s neighbourhood as covered, task 4091 fixed one
+        sibling and task 4201 filed two more, and these two still had no task
+        at all.  A caller-side sweep names all four at once.
+        """
+        found = self._curator_sites(tree_scan)
+
+        assert found >= self._UNFILED, (
+            f'missing {sorted(self._UNFILED - found)} from {sorted(found)} -- '
+            f'the caller-side property regressed, or the sites were fixed '
+            f'without updating this floor.'
+        )
+
+    def test_task_4201_sites_are_a_subset_not_an_equality(self, tree_scan):
+        """Whichever of 4201's two sites remain must still be reported."""
+        found = self._curator_sites(tree_scan)
+        remaining = self._FILED_4201 & found
+
+        assert remaining <= found
+        assert found >= self._UNFILED
+
+
+class TestRatchet:
+    """Every live finding is dispositioned, and every disposition is live."""
+
+    def test_no_unblessed_findings(self, tree_scan):
+        unblessed, _stale = reconcile_against_allowlist(
+            tree_scan.findings, ALLOWLIST_KEYS
+        )
+
+        if unblessed:
+            offenders = '\n'.join(
+                f'  {f.filename}::{f.qualname} -> {f.callee}  [{f.primitive}] '
+                f'~L{f.lineno}  hash={f.content_hash}'
+                for f in unblessed
+            )
+            raise AssertionError(
+                'Coroutine call sites reaching a blocking primitive with no '
+                'recorded disposition:\n' + offenders + '\n\n'
+                'Fix it (wrap the call in asyncio.to_thread) OR add\n'
+                '  (relpath, qualname, content_hash, disposition, justification)\n'
+                'to loop_blocking_allowlist.AUDITED_SITES **in this same '
+                'change**. A justification of "existing" is a silent waiver and '
+                'defeats the gate -- say what makes the cost acceptable, or name '
+                'the task that will fix it.'
+            )
+
+    def test_no_stale_blessings(self, tree_scan):
+        """A landed fix must DELETE its blessing, so the ledger self-corrects.
+
+        This half is what stops the baseline becoming a comfortable lie: when
+        task 4201 lands and offloads its two sites, their rows go stale and
+        this test names them.
+        """
+        _unblessed, stale = reconcile_against_allowlist(
+            tree_scan.findings, ALLOWLIST_KEYS
+        )
+
+        assert stale == [], (
+            'blessed sites that no longer exist -- delete these rows from '
+            f'loop_blocking_allowlist.AUDITED_SITES: {stale}'
+        )
+
+    def test_ratchet_is_a_multiset_not_a_set(self):
+        """A SECOND site inside an already-blessed function is still unblessed.
+
+        Set membership would let it pass silently -- which is a per-function
+        restatement of exactly the per-module blindness that made task 3778's
+        census miss the ``task_curator.py`` callers.  ``reconcile_against_allowlist``
+        uses Counter subtraction for this reason; the assertion pins it here so
+        nobody "simplifies" it to a set.
+        """
+        def _site(content_hash):
+            return LoopBlockingSite(
+                filename='pkg/mod.py',
+                qualname='Cls.handler',
+                callee='load_registry',
+                primitive='read_text',
+                lineno=1,
+                content_hash=content_hash,
+                message='',
+            )
+
+        blessed = [('pkg/mod.py', 'Cls.handler', 'aaaaaaaaaaaa')]
+
+        one_unblessed, stale = reconcile_against_allowlist(
+            [_site('aaaaaaaaaaaa'), _site('aaaaaaaaaaaa')], blessed
+        )
+
+        assert len(one_unblessed) == 1, (
+            'a duplicate site in an already-blessed function must remain '
+            'unblessed -- the ratchet has been reduced to set membership'
+        )
+        assert stale == []
+
+
+class TestAllowlistHygiene:
+    """A blessing with no reason is a silent waiver."""
+
+    def test_disposition_vocabulary_is_fixed(self):
+        assert frozenset({'accepted', 'filed', 'to_file'}) == DISPOSITIONS
+
+    def test_every_entry_has_a_known_disposition(self):
+        for relpath, qualname, _hash, disposition, _why in AUDITED_SITES:
+            assert disposition in DISPOSITIONS, (
+                f'{relpath}::{qualname}: unknown disposition {disposition!r}'
+            )
+
+    def test_every_entry_carries_a_justification(self):
+        """"existing" is not a reason.  An accepted row must say what makes the
+        cost acceptable (cached, startup-only, measured cheap); a filed row must
+        name its task."""
+        for relpath, qualname, _hash, _disposition, why in AUDITED_SITES:
+            assert why.strip(), f'{relpath}::{qualname} has an empty justification'
+            assert len(why.strip()) > 40, (
+                f'{relpath}::{qualname}: justification is too short to be a '
+                f'reason -- {why!r}'
+            )
+
+    def test_filed_entries_name_their_task(self):
+        """A ``filed`` row without a task id points nowhere and closes nothing."""
+        for relpath, qualname, _hash, disposition, why in AUDITED_SITES:
+            if disposition != 'filed':
+                continue
+            assert re.search(r'\b\d{3,5}\b', why), (
+                f'{relpath}::{qualname}: disposition "filed" but the '
+                f'justification names no task id -- {why!r}'
+            )
+
+    def test_content_hashes_are_well_formed(self):
+        for relpath, qualname, content_hash, _disposition, _why in AUDITED_SITES:
+            assert len(content_hash) == 12 and all(
+                ch in '0123456789abcdef' for ch in content_hash
+            ), f'{relpath}::{qualname}: malformed content_hash {content_hash!r}'
+
+    def test_every_blessed_file_exists(self):
+        """A row for a deleted file is a stale record the ratchet cannot catch."""
+        missing = sorted({
+            relpath for relpath, _q, _h, _d, _w in AUDITED_SITES
+            if not (_REPO_ROOT / relpath).is_file()
+        })
+        assert missing == [], f'blessed rows naming files that do not exist: {missing}'
+
+    def test_allowlist_keys_match_the_entries(self):
+        """``ALLOWLIST_KEYS`` is derived, never hand-maintained alongside the rows."""
+        assert [
+            (relpath, qualname, content_hash)
+            for relpath, qualname, content_hash, _d, _w in AUDITED_SITES
+        ] == ALLOWLIST_KEYS
 
 
 if __name__ == '__main__':  # pragma: no cover
