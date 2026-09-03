@@ -893,6 +893,34 @@ verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
 # move in the SAME COMMIT as any change to the value below.
 verify_admission_pytest_n: "8"
 
+# TASK-ROLE VERIFY ADMISSION WIDTH (raised 1 -> 3, 2026-09-03).
+#
+# The code default is 1 (config.py::OrchestratorConfig.verify_admission_task_slots)
+# and it had never been set in either yaml, so ONE task-role pytest ran at a
+# time host-wide against max_concurrent_tasks: 48. That was tolerable while the
+# scheduler could only dispatch ~4.26 tasks/h; it stopped being tolerable when
+# the marker-index fix (fe4b34714c) lifted dispatch to ~24.7/h and mean
+# in-flight went 20.6 -> 39.9, because ~40 concurrent tasks then queued behind
+# this one flock.
+#
+# MEASURED across 34 runs: correlation between mean in-flight and MEDIAN TASK
+# DURATION is r=0.858, at ~+14 min of duration per additional concurrent task.
+# Controlling for run length (~8.3h runs only): ~20 in-flight -> ~3.9h duration,
+# ~40 in-flight -> ~6.8h. Duration then collided with the ~8.3h fleet-restart
+# window, so most attempts were killed before finishing: task 3728 needed NINE
+# dispatches over six days, and the only one that landed took 5.24h — the sole
+# attempt shorter than the window.
+#
+# This knob is GREEN-tier (config.py RELOADABLE_FIELDS), so it applies via
+# reload_config with no restart — which matters, because a restart is precisely
+# what destroys the in-flight work this is trying to protect.
+#
+# REVERSIBLE AND UNDER OBSERVATION: if median task duration does not fall on the
+# next run, put this back to 1 rather than raising it further — the box is CPU
+# constrained (verify was ~72% of a 99.3%-busy 32-core host on 2026-08-28) and
+# more verify concurrency is not free.
+verify_admission_task_slots: 3
+
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
@@ -1020,7 +1048,39 @@ sandbox:
 # plain boundary-safe string-prefix matching against changed file paths with
 # no filesystem check), chosen deliberately so a typo'd prefix fails CI
 # instead of silently never matching a changed file at fire time.
-orchestrator_restart_on_merge_enabled: true
+# DEPLOY PAUSE — TEMPORARY, 2026-09-03. Restore to `true` once tasks 3730,
+# 3733 and 4755 have landed (task 5020 is the deterministic gate that asks for
+# exactly that; do not remove this comment without closing it).
+#
+# WHY: this tier restarts the WHOLE FLEET (restart-all-orchestrators.sh restarts
+# all seven units) whenever a merge touches orchestrator_restart_watch_prefixes.
+# MEASURED 2026-08-28 -> 09-03: 8 of 12 run boundaries were this tier. Every
+# restart soft-cancels every in-flight task, and at the current ~6.8h median task
+# duration against an ~8.3h run, most tasks never finish. Runs <10h delivered
+# 0.254 done/h at 22.4 cancellations per completed task; runs >=10h delivered
+# 0.426 done/h at 7.5. So the fleet does ~1.7x more work per hour, and wastes 3x
+# less, when it is simply left alone.
+#
+# THE TRAP THIS BREAKS: the survival fixes (3730/3733/4755) are THEMSELVES
+# orchestrator code, so landing one triggers this tier, which restarts the fleet,
+# which kills the in-flight work — including, historically, those very fixes.
+# Task 3728 was killed eight times this way before landing on its ninth attempt.
+#
+# SCOPE — read before widening: this pauses the merge-landed COORDINATOR tier
+# only. The watchdog LIVENESS probe is deliberately untouched and must stay on;
+# it is not clock-gated, never invokes the sweep script, and is the only thing
+# that revives a genuinely wedged unit. The watchdog STALENESS tier is throttled
+# separately via ORCH_RESTART_MIN_INTERVAL_SECS in its own systemd unit env.
+#
+# COST: orchestrator code stops reaching the fleet while this is false (deploy
+# latency was a ~2h median). Unpausing deploys everything accumulated in one
+# restart. If something lands that fixes an actively-breaking fleet problem,
+# flip this back deliberately rather than waiting for 4907.
+#
+# RED TIER: not in RELOADABLE_FIELDS, so this takes effect at the next restart
+# — which is the point. It was edited ~1.6h before a scheduled 8h-clock restart
+# so it costs no additional restart of its own.
+orchestrator_restart_on_merge_enabled: false
 orchestrator_restart_script: "scripts/restart-all-orchestrators.sh"
 orchestrator_restart_watch_prefixes:
   - "orchestrator/src/"
