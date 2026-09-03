@@ -733,8 +733,13 @@ class RestartPlan:
         """
         if self.on_failure_escalation is None:
             logger.warning(
-                'proc_supervision: %s but no on_failure_escalation was '
-                'configured — no L2 escalation filed',
+                'proc_supervision: %s — this plan carries no '
+                'on_failure_escalation, so THIS PLAN did not file an L2 '
+                'itself. That claim is plan-scoped, NOT evidence of a '
+                'dropped escalation: a caller that owns escalation filing '
+                'passes on_failure_escalation=None deliberately and files '
+                'its own L2 for this same failure. Look for that record '
+                'before treating the report as lost.',
                 log_context,
             )
             return False
