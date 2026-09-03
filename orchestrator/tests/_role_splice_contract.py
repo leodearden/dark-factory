@@ -296,3 +296,72 @@ class SpliceContract:
                 f'{self.constant_name} no longer contains {name}. The composed '
                 f'halves must NEVER be spliced apart. {remedy}'
             )
+
+    def assert_placement(
+        self,
+        *,
+        constant: str | None = None,
+        constant_name: str | None = None,
+        follows: str | None = None,
+        follows_name: str | None = None,
+        char_budget: int | None = None,
+        remedy: str,
+    ) -> None:
+        """The constant lands in the one structurally correct spot for each role.
+
+        Two placement rules, both index comparisons against named constants — no
+        literal text and no magic number — and they COEXIST rather than being
+        unified, because the second is defined in terms of the first:
+
+        - UP-FRONT (``follows=None``, or a prompt that does not contain
+          ``follows``): the constant's own ``##`` heading must be the prompt's
+          FIRST ``##`` heading, i.e. nothing but the opening identity paragraph
+          precedes it. Optionally also within ``char_budget`` chars, a secondary
+          and deliberately loose bound that only catches a preamble which is
+          technically heading-free but pathologically long.
+        - FOLLOWS: the constant must land IMMEDIATELY after ``follows``, with no
+          gap. A second splice unit cannot go AHEAD of the first without breaking
+          the first's up-front invariant, so "immediately after" is the only spot
+          left; it falls back to the up-front rule for a role that carries no
+          such predecessor (``judge`` today), derived at runtime from whether the
+          predecessor is present rather than hardcoded to a role name.
+
+        ABSENT IS RECORDED, NEVER SKIPPED, in both modes. With no index to
+        compare, skipping would make "no offender found" read as "correctly
+        placed" on a role that dropped the splice entirely.
+
+        No heading TEXT is pinned in either mode, so renaming any section in
+        ``roles.py`` cannot silently turn this check into a no-op.
+        """
+        value, name = self._resolve(constant, constant_name)
+        offenders: dict[str, dict[str, object]] = {}
+        for role_name in sorted(self.roles):
+            prompt = self.all_roles[role_name].system_prompt
+            idx = prompt.find(value)
+            if idx == -1:
+                offenders[role_name] = {'offset': 'ABSENT'}
+                continue
+
+            predecessor_idx = -1 if follows is None else prompt.find(follows)
+            if predecessor_idx != -1:
+                assert follows is not None  # narrowed by predecessor_idx != -1
+                expected = predecessor_idx + len(follows)
+                if idx != expected:
+                    offenders[role_name] = {'offset': idx, 'expected_after': expected}
+            else:
+                first_heading = prompt.find(MARKDOWN_HEADING)
+                if idx != first_heading or (char_budget is not None and idx >= char_budget):
+                    offenders[role_name] = {'offset': idx, 'first_heading': first_heading}
+
+        rule = (
+            f'immediately after {follows_name} where that block is present, '
+            'otherwise the first `##`-headed section'
+            if follows is not None
+            else 'the first `##`-headed section'
+        )
+        budget = '' if char_budget is None else f', within {char_budget} chars'
+        assert offenders == {}, (
+            f'Roles placing {name} incorrectly: {offenders}. It must be '
+            f'{rule}{budget} (offset == the landmark index). An `offset` of '
+            f"'ABSENT' means the role dropped the splice entirely. {remedy}"
+        )
