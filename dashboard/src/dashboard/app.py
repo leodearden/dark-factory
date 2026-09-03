@@ -634,10 +634,11 @@ async def lifespan(app: FastAPI):
     # Config first: the shared client's pool bound is DERIVED from it (see
     # _build_http_limits above). DashboardConfig.from_env() has no dependency
     # on the client, so evaluating it first is safe.
-    app.state.config = DashboardConfig.from_env()
+    config = DashboardConfig.from_env()
+    app.state.config = config
     http_client = httpx.AsyncClient(
         follow_redirects=True,
-        limits=_build_http_limits(app.state.config),
+        limits=_build_http_limits(config),
     )
     app.state.http_client = http_client
     pool = DbPool()
@@ -645,20 +646,20 @@ async def lifespan(app: FastAPI):
     app.state.start_time = time.monotonic()
 
     # Burndown snapshot collector (writable WAL connection with full durability triad).
-    burndown_path = app.state.config.burndown_db
+    burndown_path = config.burndown_db
     burndown_store = _BurndownStore(burndown_path, busy_timeout_ms=5000)
     await burndown_store.open()
     app.state.burndown_store = burndown_store
     collector_task = asyncio.create_task(
         _burndown_loop(
             burndown_store,
-            app.state.config,
+            config,
             http_client,
         )
     )
 
     # Metrics snapshot collector (separate WAL writer with full durability triad).
-    metrics_path = app.state.config.metrics_db
+    metrics_path = config.metrics_db
     metrics_store = _MetricsStore(metrics_path, busy_timeout_ms=5000)
     await metrics_store.open()
     app.state.metrics_store = metrics_store
