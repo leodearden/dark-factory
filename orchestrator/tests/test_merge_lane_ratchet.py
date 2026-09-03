@@ -698,3 +698,138 @@ class TestMaintainabilityIndex:
         with pytest.raises(metrics.MetricsError) as excinfo:
             metrics.maintainability_index('def (:\n', path='broken.py')
         assert 'broken.py' in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Test-suite patch targets into lane internals.
+#
+# The two detector shapes are ported from
+# test_merge_queue_reachback_patch_guard.py -- this measure subsumes that
+# guard's allowlist as a COUNT, so PRD task delta can delete the guard once the
+# count reaches zero. Two deliberate generalisations there: the prefix set is
+# `orchestrator.merge_queue.` AND `orchestrator.merge_lane.`, and the guard's
+# `forbidden` filter is dropped so all leaves count, not only the private ones.
+
+
+class TestPatchTargets:
+    def test_string_path_patch_is_detected(self) -> None:
+        source = "patch('orchestrator.merge_queue.run_scoped_verification', x)\n"
+        assert metrics.patch_targets(source) == {'run_scoped_verification'}
+
+    def test_dotted_patch_is_detected(self) -> None:
+        source = "mock.patch('orchestrator.merge_queue.advance_main', x)\n"
+        assert metrics.patch_targets(source) == {'advance_main'}
+
+    def test_string_path_setattr_is_detected(self) -> None:
+        source = "monkeypatch.setattr('orchestrator.merge_queue.foo', x)\n"
+        assert metrics.patch_targets(source) == {'foo'}
+
+    def test_merge_lane_prefix_is_measured_too(self) -> None:
+        # Measured before the package exists, deliberately: without it, PRD task
+        # zeta2's `git mv` would move every patch target out from under the
+        # measure and the count would read 0 by RELOCATION rather than by the
+        # migration gamma1..gamma10 actually performs.
+        source = "monkeypatch.setattr('orchestrator.merge_lane.foo', x)\n"
+        assert metrics.patch_targets(source) == {'foo'}
+
+    def test_merge_lane_submodule_path_is_measured(self) -> None:
+        source = "patch('orchestrator.merge_lane.worker.spin', x)\n"
+        assert metrics.patch_targets(source) == {'worker.spin'}
+
+    def test_object_path_setattr_via_from_import_alias(self) -> None:
+        source = (
+            'from orchestrator import merge_queue\n'
+            '\n'
+            '\n'
+            'def t(monkeypatch):\n'
+            "    monkeypatch.setattr(merge_queue, 'x', 1)\n"
+        )
+        assert metrics.patch_targets(source) == {'x'}
+
+    def test_object_path_setattr_via_import_as_alias(self) -> None:
+        source = (
+            'import orchestrator.merge_queue as mq\n'
+            '\n'
+            '\n'
+            'def t(monkeypatch):\n'
+            "    monkeypatch.setattr(mq, 'y', 1)\n"
+        )
+        assert metrics.patch_targets(source) == {'y'}
+
+    def test_patch_object_on_the_bare_attribute_chain(self) -> None:
+        source = "patch.object(orchestrator.merge_queue, 'x', 1)\n"
+        assert metrics.patch_targets(source) == {'x'}
+
+    def test_patch_object_on_a_merge_lane_alias(self) -> None:
+        source = (
+            'from orchestrator import merge_lane\n'
+            '\n'
+            '\n'
+            "p = patch.object(merge_lane, 'z', 1)\n"
+        )
+        assert metrics.patch_targets(source) == {'z'}
+
+    def test_patch_object_on_a_satellite_is_not_counted(self) -> None:
+        # Already repointed to the defining satellite -- that is the END STATE
+        # this measure is driving towards, so counting it would penalise the fix.
+        source = (
+            'from orchestrator import merge_gates\n'
+            '\n'
+            '\n'
+            "p = patch.object(merge_gates, 'x', 1)\n"
+        )
+        assert metrics.patch_targets(source) == set()
+
+    def test_an_unrelated_attribute_named_merge_queue_is_not_counted(self) -> None:
+        source = "patch.object(workflow.merge_queue, 'x', 1)\n"
+        assert metrics.patch_targets(source) == set()
+
+    def test_a_docstring_quoting_the_dotted_path_is_not_counted(self) -> None:
+        source = '"""Patches orchestrator.merge_queue.foo at the lookup site."""\n'
+        assert metrics.patch_targets(source) == set()
+
+    def test_a_comment_quoting_the_dotted_path_is_not_counted(self) -> None:
+        source = "# patch('orchestrator.merge_queue.foo')\nx = 1\n"
+        assert metrics.patch_targets(source) == set()
+
+    def test_distinct_names_not_call_sites(self) -> None:
+        source = (
+            "patch('orchestrator.merge_queue.foo', a)\n"
+            "patch('orchestrator.merge_queue.foo', b)\n"
+            "patch('orchestrator.merge_queue.bar', c)\n"
+        )
+        assert metrics.patch_targets(source) == {'foo', 'bar'}
+
+    def test_a_bare_module_patch_with_no_leaf_is_not_counted(self) -> None:
+        source = "patch('orchestrator.merge_queue', x)\n"
+        assert metrics.patch_targets(source) == set()
+
+    def test_a_non_string_second_arg_is_not_counted(self) -> None:
+        source = (
+            'from orchestrator import merge_queue\n'
+            '\n'
+            '\n'
+            'p = patch.object(merge_queue, NAME, 1)\n'
+        )
+        assert metrics.patch_targets(source) == set()
+
+    def test_unparseable_source_raises_naming_the_path(self) -> None:
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.patch_targets('def (:\n', path='broken.py')
+        assert 'broken.py' in str(excinfo.value)
+
+    def test_real_tree_union_anchor(self) -> None:
+        # Anti-vacuity: the PRD Background table's "79 distinct names"; the
+        # string-path form alone measures 78 on this tree.
+        union: set[str] = set()
+        for path in sorted((_REPO_ROOT / 'orchestrator' / 'tests').rglob('*.py')):
+            try:
+                source = path.read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                continue
+            try:
+                union |= metrics.patch_targets(source, path=str(path))
+            except metrics.MetricsError:
+                continue
+        assert len(union) >= 70, len(union)
+        assert 'run_scoped_verification' in union
