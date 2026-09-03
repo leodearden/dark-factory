@@ -120,18 +120,21 @@ def _has_literal_prompt(role: AgentRole) -> bool:
     return role.prompt_spec is None
 
 
-def _contract(all_roles: Mapping[str, AgentRole], roles: frozenset[str], **kwargs: object):
+def _contract(
+    all_roles: Mapping[str, AgentRole], roles: frozenset[str], **overrides: object
+) -> SpliceContract:
     """A `SpliceContract` over synthetic roles, with the boilerplate defaulted."""
-    return SpliceContract(
-        constant_name='SPLICE_UNIT',
-        constant=_SPLICE,
-        roles=roles,
-        role_set_name='_SYNTHETIC_ROLE_SET',
-        capability=_has_bash,
-        capability_description='the synthetic capability',
-        all_roles=all_roles,
-        **kwargs,  # type: ignore[arg-type]
-    )
+    fields: dict[str, object] = {
+        'constant_name': 'SPLICE_UNIT',
+        'constant': _SPLICE,
+        'roles': roles,
+        'role_set_name': '_SYNTHETIC_ROLE_SET',
+        'capability': _has_bash,
+        'capability_description': 'the synthetic capability',
+        'all_roles': all_roles,
+    }
+    fields.update(overrides)
+    return SpliceContract(**fields)  # type: ignore[arg-type]
 
 
 def test_splice_contract_is_frozen_but_replaceable() -> None:

@@ -46,6 +46,11 @@ The leading underscore also keeps pytest from collecting it as a test module.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+
+from orchestrator.agents.roles import ROLES, AgentRole
+
 # A splice unit opens with its own ``\n## `` heading, so "spliced between the
 # identity paragraph and the role's first real section" is exactly "its heading
 # IS the first ``##`` heading in the prompt". That is a STRUCTURAL property of
@@ -88,3 +93,72 @@ def assert_brace_free(name: str, value: str, *, remedy: str) -> None:
         f'splice site (it raises at format time or mangles the rendered prompt). '
         f'{remedy}'
     )
+
+
+@dataclass(frozen=True)
+class SpliceContract:
+    """One prompt constant, the role set it is spliced into, and why.
+
+    Frozen so a consumer's module-level ``_CONTRACT`` cannot be mutated by one
+    test and silently change what a later test in the same module asserts.
+
+    THE ASYMMETRY THIS DATACLASS EXISTS TO HOLD. ``capability`` is injected
+    rather than unified because the two consumers ask genuinely DIFFERENT
+    questions, and each is correct for its own constant:
+
+    - ``'Bash' in role.allowed_tools`` — can this role launch a long-running
+      command, so the wait guidance is not dead weight? (Excludes
+      ``reviewer_comprehensive`` and ``judge``, which hold only
+      ``'Bash(git:*)'``.)
+    - ``role.prompt_spec is None`` — is this role's ``system_prompt`` literal
+      text a splice can reliably reach, rather than a ``PromptSpec`` whose
+      pinned artifact may override it at runtime? (Adds ``judge``.)
+
+    Unifying them would either splice the wait block into ``judge``, where it is
+    dead weight the wait file's comment explicitly justifies excluding, or drop
+    the rejection guidance from ``judge``, where it is needed. The duplication
+    this module removes is in the DERIVATION SHAPE, not the predicate.
+
+    Attributes:
+        constant_name: The constant's Python name, for failure messages.
+        constant: The splice unit itself.
+        roles: The hand-maintained role set the constant is spliced into.
+        role_set_name: That set's Python name, so a failure names the variable
+            a reader has to edit.
+        capability: The property that justifies the splice, applied over
+            ``all_roles`` to derive the set ``roles`` is checked against.
+        capability_description: Prose naming that property, for messages.
+        all_roles: The role mapping to derive over. Defaults to the real
+            ``ROLES``; injectable so this module's own contract test can drive
+            synthetic roles through the failure branches without mutating a
+            production prompt.
+    """
+
+    constant_name: str
+    constant: str
+    roles: frozenset[str]
+    role_set_name: str
+    capability: Callable[[AgentRole], bool]
+    capability_description: str
+    # ``default_factory``, not a bare default: ``dict`` is unhashable and
+    # ``dataclasses`` rejects a mutable default outright.
+    all_roles: Mapping[str, AgentRole] = field(default_factory=lambda: ROLES)
+
+    def assert_role_set_matches_capability(self, *, remedy: str) -> None:
+        """Drift tripwire: the hand-maintained role set equals the derived one.
+
+        Catches a role GAINING or LOSING the capability that justifies the
+        splice, which is the edit that silently leaves a newly-eligible role
+        without the constant (or leaves a no-longer-eligible role carrying dead
+        weight). Reported as ``gained=``/``lost=`` rather than a bare inequality
+        so the failure names the roles a reader has to act on.
+        """
+        derived = {name for name, role in self.all_roles.items() if self.capability(role)}
+
+        assert derived == self.roles, (
+            f'A role gained or lost {self.capability_description}, so the set of '
+            f'roles eligible for {self.constant_name} has changed: '
+            f'gained={sorted(derived - self.roles)} '
+            f'lost={sorted(self.roles - derived)}. '
+            f'The hand-maintained set is {self.role_set_name}. {remedy}'
+        )
