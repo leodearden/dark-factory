@@ -95,6 +95,7 @@ class TestProducerHook:
             await workflow._invoke(SIMPLE_TASK, 'p', cwd)
 
         sid = workflow._last_invoke_session_id
+        assert sid is not None
         archived = _archived(git_repo, task_assignment.task_id, sid)
         assert archived.exists()
         assert archived.read_bytes() == fake_bytes
@@ -427,6 +428,7 @@ class TestProducerHookIsUncancellable:
             await workflow._invoke(SIMPLE_TASK, 'p', cwd)
 
         sid = workflow._last_invoke_session_id
+        assert sid is not None
         archived = _archived(git_repo, task_assignment.task_id, sid)
         # Cancellation still propagates — teardown is cooperative. What changed
         # is that it can no longer take the archival with it.
@@ -459,6 +461,7 @@ class TestProducerHookIsUncancellable:
             await workflow._invoke(SIMPLE_TASK, 'p', cwd)
 
         sid = workflow._last_invoke_session_id
+        assert sid is not None
         archived = _archived(git_repo, task_assignment.task_id, sid)
         assert archived.read_bytes() == payload
 
