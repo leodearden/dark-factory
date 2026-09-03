@@ -45,7 +45,15 @@ Each entry is a 5-tuple::
 ``justification`` non-empty prose.  ``accepted`` must say what makes the cost
                   acceptable (cached / startup-only / measured cheap), not
                   merely that the call exists.  ``filed`` must name the task id.
-                  ``to_file`` names the follow-up task 4484 step-9 files.
+                  ``to_file`` names the TICKET task 4484 step-9 filed for it.
+                  ``submit_task`` returns a ticket, not a task id: the curator
+                  decides create / combine / drop asynchronously, so no task id
+                  exists at filing time.  These rows therefore stay ``to_file``
+                  rather than ``filed``, which must name a real task id --
+                  ``test_filed_entries_name_their_task`` enforces that, and a
+                  ``filed`` row naming a ticket would point at a decision that
+                  has not been made yet.  Flip a row to ``filed`` and swap in
+                  the task id once its ticket resolves.
 
 Keys are ``(relpath, qualname, content_hash)`` -- deliberately NOT line
 numbers, which drift on every unrelated edit above the site and would make
@@ -92,7 +100,7 @@ from __future__ import annotations
 DISPOSITIONS = frozenset({
     'accepted',  # measured cheap, cached, or startup-only -- say WHICH
     'filed',     # an existing task owns it -- justification carries the id
-    'to_file',   # confirmed defect; task 4484 step-9 files the follow-up
+    'to_file',   # confirmed defect; a task 4484 step-9 ticket is named
 })
 
 #: ``(relpath, qualname, content_hash, disposition, justification)``.
@@ -111,7 +119,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fcntl.flock on the loop thread. A lock wait is bounded only by '
         'ANOTHER process\'s hold time, which this one does not control -- '
         'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.',
+        'never enumerated. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
     ),
 
     # ---- middleware/task_curator.py ----
@@ -131,7 +140,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'curator write lock -- and NEITHER had a task filed before task '
         '4484 found them, which is the concrete cost of task 3778\'s '
         'definition-side census. Follow-up filed by task 4484 step-9 (one '
-        'task: one shape, one file, and 4201 already owns the sibling).',
+        'task: one shape, one file, and 4201 already owns the sibling).'
+        ' Ticket: tkt_0RT7QW5E7RQ3FHF2HQ0BRC6MH0.',
     ),
     (
         'fused-memory/src/fused_memory/middleware/task_curator.py',
@@ -181,7 +191,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'curator write lock -- and NEITHER had a task filed before task '
         '4484 found them, which is the concrete cost of task 3778\'s '
         'definition-side census. Follow-up filed by task 4484 step-9 (one '
-        'task: one shape, one file, and 4201 already owns the sibling).',
+        'task: one shape, one file, and 4201 already owns the sibling).'
+        ' Ticket: tkt_0RT7QW5E7RQ3FHF2HQ0BRC6MH0.',
     ),
 
     # ---- middleware/ticket_janitor.py ----
@@ -197,7 +208,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fcntl.flock on the loop thread. A lock wait is bounded only by '
         'ANOTHER process\'s hold time, which this one does not control -- '
         'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.',
+        'never enumerated. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
     ),
     (
         'fused-memory/src/fused_memory/middleware/ticket_janitor.py',
@@ -211,7 +223,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'fcntl.flock on the loop thread. A lock wait is bounded only by '
         'ANOTHER process\'s hold time, which this one does not control -- '
         'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.',
+        'never enumerated. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
     ),
 
     # ---- reconciliation/backlog_policy.py ----
@@ -225,7 +238,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_texts the record and reaches _restore_policy_keys (another '
         'read), and _maybe_write_escalation write_texts the escalation. '
         'Filesystem, the limb task 3778\'s subprocess-only vocabulary '
-        'omitted. Follow-up filed by task 4484 step-9.',
+        'omitted. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
@@ -237,7 +251,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_texts the record and reaches _restore_policy_keys (another '
         'read), and _maybe_write_escalation write_texts the escalation. '
         'Filesystem, the limb task 3778\'s subprocess-only vocabulary '
-        'omitted. Follow-up filed by task 4484 step-9.',
+        'omitted. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
@@ -249,7 +264,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_texts the record and reaches _restore_policy_keys (another '
         'read), and _maybe_write_escalation write_texts the escalation. '
         'Filesystem, the limb task 3778\'s subprocess-only vocabulary '
-        'omitted. Follow-up filed by task 4484 step-9.',
+        'omitted. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7RHRS9ZTJSQK328919XXEJW.',
     ),
 
     # ---- reconciliation/harness.py ----
@@ -268,7 +284,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -285,7 +302,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -302,7 +320,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -319,7 +338,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -336,7 +356,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -353,7 +374,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -370,7 +392,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -383,7 +406,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'orchestrator_started_at -> read_text). Filesystem, the limb task '
         '3778\'s subprocess-only vocabulary omitted; distinct from the '
         '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -396,7 +420,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'orchestrator_started_at -> read_text). Filesystem, the limb task '
         '3778\'s subprocess-only vocabulary omitted; distinct from the '
         '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -409,7 +434,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'orchestrator_started_at -> read_text). Filesystem, the limb task '
         '3778\'s subprocess-only vocabulary omitted; distinct from the '
         '_escalate cluster in the same file. Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -442,7 +468,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -459,7 +486,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'staying constant. 9 async callers, one fix (offload _escalate, or '
         'pre-fetch resolved_fps once per cycle -- the resolved_fps kwarg '
         'already exists for exactly that). Follow-up filed by task 4484 '
-        'step-9.',
+        'step-9.'
+        ' Ticket: tkt_0RT7QXR5AXGWVADW9T3S4DPC2M.',
     ),
 
     # ---- reconciliation/stages/memory_consolidator.py ----
@@ -472,7 +500,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'read_texts remediation inputs on the loop thread. Adjacent to -- '
         'but not covered by -- task 3778\'s live-workflow propagation set, '
         'which names only _build_live_workflow_section in this file. '
-        'Follow-up filed by task 4484 step-9.',
+        'Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7RK22JXVDXBHRXR2PVHKQ21.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py',
@@ -517,7 +546,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'cluster: a cold miss in models/scope.py::resolve_main_checkout '
         'runs subprocess.run(git) on the loop thread; _MAIN_CHECKOUT_CACHE '
         'makes it cold-miss-only. Filed together with that cluster by task '
-        '4484 step-9, since one fix closes both.',
+        '4484 step-9, since one fix closes both.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py',
@@ -546,7 +576,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'cluster: a cold miss in models/scope.py::resolve_main_checkout '
         'runs subprocess.run(git) on the loop thread; _MAIN_CHECKOUT_CACHE '
         'makes it cold-miss-only. Filed together with that cluster by task '
-        '4484 step-9, since one fix closes both.',
+        '4484 step-9, since one fix closes both.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
 
     # ---- reconciliation/targeted.py ----
@@ -560,7 +591,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'Task 3778 mentions is_orchestrator_live_for in its Part 3(a) '
         'hoisting discussion but reconciliation/targeted.py is not in its '
         'metadata.files, so this caller is nobody\'s today. Follow-up filed '
-        'by task 4484 step-9.',
+        'by task 4484 step-9.'
+        ' Ticket: tkt_0RT7RKWJG17W03JRC947R8FZZN.',
     ),
 
     # ---- reconciliation/verify.py ----
@@ -572,7 +604,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'The async read_file tool handed to the codebase-verification LLM '
         'does full_path.read_text() inline on the loop thread, once per '
         'tool call the model chooses to make -- an LLM-driven, unbounded '
-        'call count. Follow-up filed by task 4484 step-9.',
+        'call count. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ.',
     ),
 
     # ---- server/main.py ----
@@ -605,7 +638,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'alone is the same order as a subprocess spawn and this coroutine '
         'pays it twice plus two filesystem round trips. One '
         'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.',
+        'four. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
@@ -621,7 +655,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'alone is the same order as a subprocess spawn and this coroutine '
         'pays it twice plus two filesystem round trips. One '
         'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.',
+        'four. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
@@ -637,7 +672,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'alone is the same order as a subprocess spawn and this coroutine '
         'pays it twice plus two filesystem round trips. One '
         'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.',
+        'four. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
     ),
     (
         'fused-memory/src/fused_memory/server/manifest_stamping.py',
@@ -653,7 +689,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'alone is the same order as a subprocess spawn and this coroutine '
         'pays it twice plus two filesystem round trips. One '
         'asyncio.to_thread around the whole read-parse-write closes all '
-        'four. Follow-up filed by task 4484 step-9.',
+        'four. Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QYENVS6J9WVWCY3FJAVNFR.',
     ),
 
     # ---- server/tools.py ----
@@ -669,7 +706,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '3778\'s census asserted this module was "already offloaded at its '
         'call sites" -- true of the callers it looked at, false of these. '
         'This pair IS the counter-example that made task 4484 necessary. '
-        'Follow-up filed by task 4484 step-9.',
+        'Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7RHBAS4A3VH976CE1CJMGK8.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -683,7 +721,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         '3778\'s census asserted this module was "already offloaded at its '
         'call sites" -- true of the callers it looked at, false of these. '
         'This pair IS the counter-example that made task 4484 necessary. '
-        'Follow-up filed by task 4484 step-9.',
+        'Follow-up filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7RHBAS4A3VH976CE1CJMGK8.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -700,7 +739,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -717,7 +757,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -734,7 +775,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -751,7 +793,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -768,7 +811,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -785,7 +829,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -802,7 +847,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -819,7 +865,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -836,7 +883,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -853,7 +901,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -870,7 +919,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -887,7 +937,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -904,7 +955,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -921,7 +973,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -938,7 +991,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -955,7 +1009,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -972,7 +1027,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -989,7 +1045,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -1006,7 +1063,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -1023,7 +1081,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -1040,7 +1099,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',
@@ -1057,7 +1117,8 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'not act on. 22 rows, one fix: offload or pre-warm '
         'resolve_main_checkout once. Rows are kept per-site so a 23rd '
         'handler cannot be added silently under a blessed 22. Follow-up '
-        'filed by task 4484 step-9.',
+        'filed by task 4484 step-9.'
+        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
     ),
 ]
 

@@ -164,13 +164,49 @@ it stayed uncorrected across three subsequent discoveries.
 
 ## 6. Filed follow-ups
 
-One task per ROOT CAUSE, not per call site. Nothing is filed for `accepted`
-rows, and nothing is filed for work tasks 4201 or 3778 already own.
+One task per ROOT CAUSE, not per call site.
 
-_Filed in task 4484 step-9; ids are recorded here and in the `filed`
-justifications of `shared/tests/loop_blocking_allowlist.py`._
+_Filed in task 4484 step-9.  The ticket id for each root cause is also
+carried in the justification of every one of its rows in
+`shared/tests/loop_blocking_allowlist.py`, so a reader at a site reaches its
+follow-up without coming through this report._
 
-<!-- STEP-9-FILINGS -->
+`submit_task` returns a TICKET, not a task id: the curator decides
+create / combine / drop asynchronously.  Rows therefore stay `to_file` rather
+than `filed` in the ledger until a real task id exists — a `filed` row whose
+justification names no task id would point nowhere, and the gate's
+`test_filed_entries_name_their_task` enforces that.  Flipping a row to `filed`
+with its task id is the follow-up work when the tickets resolve.
+
+Eleven root causes, all 53 `to_file` rows.  The `scope.resolve_main_checkout`
+cold miss is one ticket covering two clusters (the 22 MCP handlers and the 2
+reconciliation callers) because one fix closes both.
+
+| root cause | rows | ticket |
+|---|---|---|
+| `task_curator.py` — the two previously-unfiled `_maybe_*` registry loaders | 2 | `tkt_0RT7QW5E7RQ3FHF2HQ0BRC6MH0` |
+| `scope.resolve_main_checkout` cold miss (22 MCP handlers + 2 recon callers) | 24 | `tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ` |
+| `ReconciliationHarness._escalate` — unbounded queue+archive scan | 9 | `tkt_0RT7QXR5AXGWVADW9T3S4DPC2M` |
+| `manifest_stamping._stamp_capability_manifests_impl` — 4 inline primitives | 4 | `tkt_0RT7QYENVS6J9WVWCY3FJAVNFR` |
+| `_orchestrator_running` — `fcntl.flock` on the loop (the LOCK limb) | 3 | `tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9` |
+| `backlog_policy.py` — judge-halt record read/write | 3 | `tkt_0RT7RHRS9ZTJSQK328919XXEJW` |
+| `harness.py::_run_remediation_pass` — orchestrator-state reads | 3 | `tkt_0RT7RJKQ0WXB0T87F8TJ7RTGQH` |
+| `server/tools.py` claim-verification pair — `recon_claim_verification_guard` inline | 2 | `tkt_0RT7RHBAS4A3VH976CE1CJMGK8` |
+| `memory_consolidator.py::_assemble_remediation_payload` | 1 | `tkt_0RT7RK22JXVDXBHRXR2PVHKQ21` |
+| `targeted.py::_sweep_cancelled_descendants` → `is_orchestrator_live_for` | 1 | `tkt_0RT7RKWJG17W03JRC947R8FZZN` |
+| `verify.py::CodebaseVerifier.verify.read_file` — LLM-driven call count | 1 | `tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ` |
+
+Two were filed at `medium` rather than `low`.  The `server/tools.py`
+claim-verification pair, because it is the direct counter-example to task
+3778's "already offloaded at its call sites" claim and reaches a `git`
+subprocess on the ordinary agent-completion path — the most expensive
+primitive on a hot path.  `verify.py`'s `read_file` tool, because the call
+count is chosen by the verifier LLM rather than by the code, so it trips the
+fan-out limb as well as the blocking limb.  Everything else is `low`.
+
+Nothing was filed for the one `accepted` row, and nothing was filed for the 6
+`filed` rows tasks 4201 and 3778 already own — those cite the owning task id
+instead.
 
 ## 7. What now stands behind INV-8
 
