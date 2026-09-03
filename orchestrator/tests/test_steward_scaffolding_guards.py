@@ -967,3 +967,162 @@ class TestMockWorkflowProjectRootContract:
             f'for the keyword-parameter shape) rather than deleting the directory '
             f'and this assertion.'
         )
+
+
+class TestAbsoluteTmpProjectRootLiteralsAreCensused:
+    """Every absolute-``/tmp`` ``project_root`` literal is adjudicated, with a reason.
+
+    This is the ENFORCEMENT of DECISION 2 — the ruling that the literals task
+    3551's sweep found are deliberate-but-inert placeholders, NAMED rather than
+    sandboxed.  The ruling and its three measurements are owned by
+    ``_orch_helpers.MOCK_WORKFLOW_PROJECT_ROOT.__doc__``; the allowlist below
+    records only the per-module reason, as a POINTER.
+
+    Same teeth as the steward census above, in both directions: a new
+    un-adjudicated literal cannot appear silently, and its author must either
+    use the shared constant or write down why they cannot.
+    """
+
+    # -- detector self-tests: synthetic sources, so this module never self-trips
+    #    and no test here triggers a full-tree scan.
+    #
+    # Kept inside string literals deliberately, for the same reason the sibling
+    # guards' self-tests are: the census above parses THIS module too, and real
+    # assignments here would make the guard flag itself.
+
+    def test_the_detector_matches_the_attribute_target_path_call_shape(self) -> None:
+        """The dominant shape — 16 of the 17 sites task 4389 adjudicated.
+
+        A detector that silently stops matching is worse than no detector,
+        because it reads as coverage.
+        """
+        tree = ast.parse("config.project_root = Path('/tmp/non-existent-for-test')\n")
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert '/tmp/non-existent-for-test' in sites[0], sites
+
+    def test_the_detector_matches_a_bare_string_value(self) -> None:
+        """The ``Path(...)`` wrapper is not what makes a literal an escape.
+
+        ``config.project_root = '/tmp/x'`` points just as far outside the
+        sandbox, and nothing stops an author writing it — several seams in the
+        tree accept a ``str`` root.  Matching only the wrapped form would leave
+        the plainer spelling invisible.
+        """
+        tree = ast.parse("config.project_root = '/tmp/bare'\n")
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert '/tmp/bare' in sites[0], sites
+
+    def test_the_detector_matches_a_module_constant_target(self) -> None:
+        """The NAMED form, which is what the fix itself produces.
+
+        ``_REVIEW_PROJECT_ROOT`` (test_out_of_band_routing.py,
+        test_routing_integration_gate.py) and ``_PROMPT_MARKER_PROJECT_ROOT``
+        (test_task_creation_migration.py) are module constants, not attribute
+        assignments.  Matching only the ``config.project_root`` form would mean
+        naming a literal EXEMPTED it from the census — the census would reward
+        exactly the move it is meant to make legible, and the sanctioned
+        population would be invisible to the guard that is supposed to pin it.
+        """
+        tree = ast.parse("_REVIEW_PROJECT_ROOT = Path('/tmp/dark-factory-review')\n")
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert '/tmp/dark-factory-review' in sites[0], sites
+
+    def test_the_detector_counts_every_site_not_just_the_first(self) -> None:
+        """The allowlist pins a COUNT per module, so the detector must return a
+        list, not a flag.  A detector that stopped at the first hit would let a
+        second literal appear beside a sanctioned one and inherit its sanction —
+        the silent appearance this census exists to stop, one line over.
+
+        A live instance of two-in-one-module exists in the tree:
+        ``test_workflow_train_halt_owner.py`` has two factories, and before task
+        4389 they spelled the same sentinel two different ways.
+        """
+        tree = ast.parse(
+            "def _make_one():\n"
+            "    config.project_root = Path('/tmp/non-existent-for-test')\n"
+            "\n"
+            "def _make_two():\n"
+            "    config.project_root = Path('/tmp/non-existent')\n"
+        )
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 2, sites
+        assert any('/tmp/non-existent-for-test' in site for site in sites), sites
+
+    def test_the_detector_ignores_the_sandboxed_shape(self) -> None:
+        """Negative: ``tmp_path / 'proj'`` is the SANCTIONED shape — the thing
+        the sandbox invariant asks for.  Flagging it would make the census
+        contradict ``assert_sandboxed_project_root``, and an author who
+        satisfied one guard would trip the other.
+        """
+        tree = ast.parse("config.project_root = tmp_path / 'proj'\n")
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    def test_the_detector_ignores_a_reference_to_the_shared_constant(self) -> None:
+        """Negative, and the load-bearing one: the FIX must not be flagged.
+
+        After task 4389 the 16 Family-A sites read
+        ``config.project_root = MOCK_WORKFLOW_PROJECT_ROOT``.  That is a Name
+        REFERENCE, not a literal — the literal lives once, in ``_orch_helpers``,
+        where it is adjudicated.  If this matched, the census would flag its own
+        remedy at 16 sites and the only way green would be to revert.
+        """
+        tree = ast.parse('config.project_root = MOCK_WORKFLOW_PROJECT_ROOT\n')
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    def test_the_detector_ignores_an_absolute_literal_outside_tmp(self) -> None:
+        """Negative: the adjudicated population is ``/tmp`` literals specifically.
+
+        ``/tmp`` is what pytest's ``tmp_path`` lives under, so a ``/tmp`` literal
+        is the one that LOOKS sandboxed while escaping the retention sweep — the
+        confusion the whole lineage is about.  ``Path('/var/x')`` is a different
+        (and rarer) problem that nobody has adjudicated; sweeping it in here
+        would force this task to rule on sites outside its scope.
+        """
+        tree = ast.parse("config.project_root = Path('/var/lib/thing')\n")
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    def test_the_detector_ignores_an_unrelated_target(self) -> None:
+        """Negative: the invariant is about ``project_root`` specifically,
+        because that is what the steward and the workflow WRITE through.  A
+        ``/tmp`` path bound to any other name is not this guard's business.
+        """
+        tree = ast.parse("worktree = Path('/tmp/some-worktree')\n")
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    def test_the_detector_ignores_the_call_keyword_shape(self) -> None:
+        """Negative, and this one is a DECISION rather than a limitation — pinned
+        here so it reads as deliberate to whoever finds the excluded sites.
+
+        The tree also holds ~16 ``project_root=<literal>`` CALL-KEYWORD sites
+        (test_merge_queue_landed_reconciler.py x13,
+        test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
+        Those bind a real constructor/dataclass PARAMETER rather than an
+        attribute on a ``spec_set`` MagicMock: a structurally different
+        population that nobody has adjudicated, and not the one task 3551's
+        sweep found or task 4389 was filed to rule on.
+
+        Widening the detector to cover them would force this guard to either fix
+        16 out-of-scope sites or pre-approve them wholesale in the allowlist —
+        and a wholesale sanction is precisely the silent appearance this guard
+        family exists to stop (see ``_Sanctioned.__doc__`` on why ``sites`` is a
+        COUNT rather than a flag).  So the boundary is drawn structurally, at
+        ``ast.keyword``, and a follow-up ticket carries the kwarg population.
+        """
+        tree = ast.parse("reconciler = LandedReconciler(project_root='/tmp/proj')\n")
+
+        assert _absolute_tmp_project_root_literals(tree) == []
