@@ -14,8 +14,11 @@ durable record.  Task 3647 therefore turns the two standing rulings into
 CHECKABLE invariants, matching the ethos the suite already states elsewhere
 ("Enforced, not merely documented" — ``test_out_of_band_routing.py``'s
 ``_REVIEW_PROJECT_ROOT`` block, ``conftest.py``'s ``make_steward`` worktree
-guard).  Three concerns live here, deliberately in ONE module because the
-lineage's actual failure mode is that they keep getting scattered and re-derived:
+guard).  Task 4389 extended the lineage one further, adjudicating the 17
+absolute-``/tmp`` ``project_root`` literals task 3551's sweep had found and left
+classified as "unknown", and turning that ruling into the fourth concern below.
+Four concerns live here, deliberately in ONE module because the lineage's actual
+failure mode is that they keep getting scattered and re-derived:
 
 1. :class:`TestAssertSandboxedProjectRoot` — the contract of
    ``_orch_helpers.assert_sandboxed_project_root``, the shared assertion that
@@ -24,6 +27,16 @@ lineage's actual failure mode is that they keep getting scattered and re-derived
    module re-implements that block inline (added in step-3).
 3. ``TestStewardConstructionSitesAreCensused`` — an AST census guard pinning the
    sanctioned steward-construction sites, each with a recorded reason (step-5).
+4. :class:`TestMockWorkflowProjectRootContract` and
+   ``TestAbsoluteTmpProjectRootLiteralsAreCensused`` — the contract of the shared
+   ``MOCK_WORKFLOW_PROJECT_ROOT`` placeholder, plus a second AST census pinning
+   every absolute-``/tmp`` ``project_root`` literal in the tree against an
+   allowlist carrying a reason per module (task 4389).  It lands HERE rather than
+   in a new module for both reasons this docstring already gives: cost — a fresh
+   module would land on a fresh xdist worker and pay the whole
+   ``_scan_tests_tree`` parse again — and cohesion, since concerns 1 and 2 are
+   already the ``project_root`` sandbox invariant and a fourth address is exactly
+   the scattering described above.
 
 Modelled on ``test_git_repo_isolation_guard.py``, which is exactly this shape for
 the esc-3072-3 incident class: helper unit tests, plus an AST recurrence guard
