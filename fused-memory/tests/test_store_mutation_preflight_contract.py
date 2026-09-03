@@ -15,16 +15,21 @@ Two things live here:
    docstring prose; the one docstring assertion pins *composition*, not
    wording.
 
-2. The AST drift guards (added in later steps) that keep the extraction from
-   silently re-diverging once it has landed.
+2. The whole-tree AST drift guards that keep the extraction from silently
+   re-diverging once it has landed. Extraction alone is a one-time dedupe; the
+   guards are what stop a suite copied from an older template reintroducing a
+   second source of truth for the same contract.
 """
 
 from __future__ import annotations
 
+import ast
 import logging
+import pathlib
 import types
 
 import pytest
+from _ast_guard import parse_python_module
 from _store_mutation_preflight_contract import (
     FAIL_CLOSED_MARKERS,
     SENTINEL,
@@ -306,3 +311,59 @@ class TestFailClosedRecords:
             logging.getLogger(_OTHER_LOGGER).error(_BOTH_MARKERS)
             log.error(_BOTH_MARKERS)
         assert [r.getMessage() for r in fail_closed_records(caplog, _LOGGER)] == [_BOTH_MARKERS]
+
+
+# ---------------------------------------------------------------------------
+# Drift guard #1 — no test module may hand-roll the neutralising fixture
+# ---------------------------------------------------------------------------
+
+TESTS_DIR = pathlib.Path(__file__).parent
+
+# The name every one of the 14 suites gave its hand-rolled autouse fixture
+# before the extraction. After it, the name exists nowhere in `tests/`: suites
+# call `neutralise_fixture(...)` and bind the result to `_neutralise`.
+_HAND_ROLLED_FIXTURE_NAME = '_neutralise_store_mutation_preflight'
+
+
+def _test_modules() -> list[pathlib.Path]:
+    """Every collected test module in this directory, in a stable order.
+
+    Deliberately globs `test_*.py` and NOT `*.py`: the helper home
+    `_store_mutation_preflight_contract.py` is underscore-prefixed (so pytest
+    does not collect it) and is therefore already excluded. Do not "fix" this
+    glob to `*.py` — that would sweep the helper itself and make every guard
+    below unsatisfiable.
+    """
+    return sorted(TESTS_DIR.glob('test_*.py'))
+
+
+class TestNoHandRolledNeutraliseFixture:
+    """Whole-tree AST drift guard: no test module may define its own
+    `_neutralise_store_mutation_preflight`.
+
+    Extraction alone is a one-time dedupe — the moment someone copies an older
+    suite as a template, the two-sources-of-truth problem this helper exists to
+    close comes straight back. This is what makes the collapse durable.
+
+    Asserts over PARSED source (`_ast_guard.parse_python_module`), so prose in a
+    docstring that merely names the old fixture cannot trip it.
+    """
+
+    def test_no_test_module_defines_its_own_neutralise_fixture(self) -> None:
+        offenders: list[str] = []
+        for path in _test_modules():
+            tree = parse_python_module(path)
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == _HAND_ROLLED_FIXTURE_NAME
+                ):
+                    offenders.append(f'{path.name}:{node.lineno}:{node.name}')
+
+        assert not offenders, (
+            f'{len(offenders)} hand-rolled `{_HAND_ROLLED_FIXTURE_NAME}` '
+            'definition(s) found. Route each through '
+            '`_store_mutation_preflight_contract.neutralise_fixture(_mod, '
+            "note='<this suite's seam and mock substrate>')` instead:\n  "
+            + '\n  '.join(offenders)
+        )
