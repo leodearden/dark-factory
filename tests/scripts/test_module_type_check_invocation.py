@@ -75,6 +75,7 @@ import shlex
 from collections.abc import Callable
 
 from orchestrator.config import ModuleConfig
+from verify_command_invariants import PYRIGHT, anchor_split, optional_token_segment
 
 from orchestrator import verify_cmd
 
@@ -420,6 +421,41 @@ def test_no_discovered_module_config_shells_a_guarded_command_through_npx(
             f'is a [tool.uv.workspace] member, else `uv run --project '
             f'shared ...`'
         )
+
+
+def _pyright_wrapper_tokens(mc: ModuleConfig) -> list[str] | None:
+    """The PRE-anchor wrapper tokens of the pyright segment of *mc*'s type_check_command.
+
+    ``None`` when *mc* declares no ``type_check_command`` at all, or when
+    none of its ``&&``-chained segments invoke ``pyright`` — both legitimate
+    states (a config may run a different type checker, or none), not
+    violations. Built entirely on the shared, imported helpers rather than a
+    hand-rolled ``tokens.index('pyright')`` — the exact duplication
+    ``anchor_split`` exists to end (its own docstring records that
+    ``test_scripts_module_config.py``'s ``_narrowing_flag_args`` had already
+    missed a slice its sibling ``_targets`` held from the start, task 4358).
+
+    Distinguishes ``None`` ("no opinion, skip") from ``[]`` ("a bare
+    ``pyright <dir>`` with no wrapper at all — a violation"): a bare pyright
+    invocation DOES have a pyright segment, it just has zero pre-anchor
+    tokens, so it must reach the caller as an empty list rather than be
+    conflated with "no pyright segment exists".
+
+    The ``label=`` passed to :func:`anchor_split` names *mc*'s prefix so an
+    unparseable segment raises a named ``AssertionError`` rather than a bare
+    ``ValueError: No closing quotation`` — the same diagnostic discipline
+    :func:`_npx_fronted_segments` applies above.
+    """
+    cmd = mc.type_check_command
+    if not cmd:
+        return None
+    segment = optional_token_segment(cmd, PYRIGHT)
+    if segment is None:
+        return None
+    pre, _post = anchor_split(
+        segment, PYRIGHT, label=f'{mc.prefix}/orchestrator.yaml type_check_command'
+    )
+    return pre
 
 
 def test_the_pyright_wrapper_read_skips_configs_with_no_pyright_type_gate() -> None:
