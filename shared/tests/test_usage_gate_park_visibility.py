@@ -181,17 +181,47 @@ class TestAllCappedParkIsVisible:
     async def test_the_heartbeat_repeats_rather_than_firing_once(
         self, caplog, fast_heartbeat
     ) -> None:
-        """One record at the start of a multi-hour park is not visibility."""
+        """One record at the start of a multi-hour park is not visibility.
+
+        ALSO PINS THAT ``elapsed_s`` GROWS, which no other test in this file
+        can see: the throttling test counts records and this one used to,
+        and both stay green against a park whose clock is stuck. That is a
+        reachable regression, not a hypothetical — returning
+        ``_park_started_at`` to a local while leaving ``_park_last_logged_at``
+        instance-scoped keeps the counts and the throttle exactly as they
+        are while reporting ``elapsed_s: 0.0`` on every heartbeat, which
+        destroys the half of the signal that separates a ten-minute park
+        from a two-day one. The values are asserted NON-DECREASING rather
+        than strictly increasing because the payload is rounded to 0.1s, so
+        consecutive fast-interval heartbeats legitimately tie.
+        """
         interval = fast_heartbeat(0.02)
         gate = _all_capped_gate()
 
-        await _park_for(gate, interval * 10)
+        # Long enough that the clock's growth clears the 0.1s rounding
+        # resolution several times over, so the assertion cannot pass or fail
+        # on a rounding boundary.
+        await _park_for(gate, interval * 25)
 
-        assert len(_park_records(caplog)) >= 2, (
-            'the park emitted at most one heartbeat across ten intervals, which '
-            'is the ONE-SHOT behaviour this task replaces: a single line logged '
-            'when the park began tells a reader nothing about whether it is '
-            'still going now'
+        records = _park_records(caplog)
+        assert len(records) >= 2, (
+            'the park emitted at most one heartbeat across the whole park, '
+            'which is the ONE-SHOT behaviour this task replaces: a single line '
+            'logged when the park began tells a reader nothing about whether '
+            'it is still going now'
+        )
+
+        elapsed = [payload['elapsed_s'] for _, payload in records]
+        assert elapsed == sorted(elapsed), (
+            f'elapsed_s went backwards across one park: {elapsed!r}. It '
+            'measures a single monotonic clock from the moment the pool '
+            'stopped serving anyone, so it can only rise until the park ends'
+        )
+        assert elapsed[-1] > elapsed[0], (
+            f'elapsed_s never advanced across the whole park: {elapsed!r}. A '
+            'heartbeat that repeats a frozen number is a clock stuck at the '
+            'start of the park — the reader still cannot tell a ten-minute '
+            'freeze from a two-day one, which is the whole point of the field'
         )
 
     async def test_the_heartbeat_is_throttled_under_repeated_wakeups(
@@ -287,6 +317,98 @@ class TestAllCappedParkIsVisible:
             'no heartbeat survived a non-serialisable soonest_resets_at — '
             'json.dumps must be called with default=str so a bad value is '
             'stringified rather than raised out of before_invoke'
+        )
+
+
+class TestAnAbandonedParkIsNotInherited:
+    """A park that ends by cancellation must not bequeath its clock.
+
+    ``before_invoke`` clears the heartbeat clock on exactly one path — the
+    one where it finally serves a lease. A parked caller is routinely
+    CANCELLED instead: callers wrap it in ``asyncio.wait_for``, which is
+    what ``_park_for`` above does, and what the eval runner's own timeouts
+    do. Left set, the timestamps make the NEXT park report an ``elapsed_s``
+    measured from a park that ended long ago and suppress its first
+    heartbeat for up to a full interval — reintroducing, on the
+    cancellation path, both of the observability failures this task exists
+    to fix.
+    """
+
+    async def test_an_abandoned_park_does_not_poison_the_next_one(
+        self, caplog, fast_heartbeat
+    ) -> None:
+        interval = fast_heartbeat(0.05)
+        gate = _all_capped_gate()
+
+        # A park that runs for a couple of intervals and is then abandoned.
+        await _park_for(gate, interval * 2.4)
+        assert _park_records(caplog), (
+            'the first park logged nothing, so this test cannot show that its '
+            'clock was or was not inherited'
+        )
+
+        caplog.clear()
+        await _park_for(gate, interval * 1.5)
+
+        records = _park_records(caplog)
+        assert records, (
+            'the second park emitted no heartbeat at all: the abandoned park '
+            "left `_park_last_logged_at` set, so the new park's first "
+            'heartbeat was throttled against a park that had already ended'
+        )
+        first_elapsed = records[0][1]['elapsed_s']
+        assert first_elapsed < interval, (
+            f'the second park opened at elapsed_s={first_elapsed!r}, i.e. it '
+            'inherited the abandoned park\'s start time. A pool frozen for '
+            'zero seconds would be reported as frozen for as long as some '
+            'earlier, unrelated park happened to last'
+        )
+
+    async def test_a_cancelled_sibling_does_not_reset_a_live_park(
+        self, caplog, fast_heartbeat
+    ) -> None:
+        """Clearing the shared clock is for the LAST waiter out, not any.
+
+        The clock is deliberately shared across concurrent callers so a
+        frozen pool announces itself once per interval rather than once per
+        waiter — which means clearing it on any cancellation would restart a
+        LIVE park's elapsed_s every time one of its many siblings timed out.
+        A fully-capped pool is exactly the situation with many waiters, so
+        this is the common case, not the exotic one.
+        """
+        interval = fast_heartbeat(0.02)
+        gate = _all_capped_gate()
+
+        survivor = asyncio.create_task(gate.before_invoke())
+        doomed = asyncio.create_task(gate.before_invoke())
+        await asyncio.sleep(interval * 10)
+
+        doomed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await doomed
+
+        before = [payload['elapsed_s'] for _, payload in _park_records(caplog)]
+        assert before and before[-1] > 0, (
+            f'the shared park clock never advanced before the cancellation '
+            f'({before!r}), so a reset afterwards would be undetectable'
+        )
+
+        caplog.clear()
+        try:
+            await asyncio.sleep(interval * 10)
+            after = [payload['elapsed_s'] for _, payload in _park_records(caplog)]
+        finally:
+            survivor.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await survivor
+
+        assert after, 'the surviving park stopped emitting heartbeats entirely'
+        assert after[0] >= before[-1], (
+            f'the surviving park restarted its clock at {after[0]!r} after a '
+            f'sibling was cancelled (it stood at {before[-1]!r}). The pool has '
+            'been frozen continuously throughout; elapsed_s must keep '
+            'measuring from when it froze, not from when some other waiter '
+            'gave up'
         )
 
 

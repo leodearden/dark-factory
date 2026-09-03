@@ -682,7 +682,12 @@ class UsageGate:
     # should announce itself once per interval, not once per waiter. Cleared
     # in `before_invoke` when a lease is finally served — the moment the park
     # actually ends — so elapsed_s measures how long the pool has been unable
-    # to serve ANYONE.
+    # to serve ANYONE, and cleared again when the LAST parked caller is
+    # cancelled or errors out (see `_wait_for_any_account_to_reopen`), so an
+    # abandoned park cannot bequeath its clock to an unrelated later one.
+    # `_park_waiters` exists only to make "the last one" answerable: a
+    # cancelled waiter must not reset the clock of a park its siblings are
+    # still inside.
     #
     # DECLARED ON THE CLASS RATHER THAN IN `__init__`, deliberately.
     # `orchestrator/tests/_orch_helpers.py::build_usage_gate` — the canonical
@@ -699,6 +704,7 @@ class UsageGate:
     # between instances the way a mutable one would.
     _park_started_at: float | None = None
     _park_last_logged_at: float | None = None
+    _park_waiters: int = 0
 
     def __init__(self, config: UsageCapConfig, *, cost_store: CostStore | None = None):
         self._config: UsageCapConfig = config
@@ -1216,15 +1222,36 @@ class UsageGate:
 
         THE CLOCK IS INSTANCE STATE, NOT A LOCAL, and that is what makes the
         paragraph above true rather than merely intended. An early draft kept
-        both timestamps as locals here and was caught by
-        ``test_usage_gate_park_visibility.py::
-        test_the_heartbeat_is_throttled_under_repeated_wakeups``: the caller
-        RE-ENTERS this helper on every wakeup, so per-call state reset the
-        throttle each time — one warning per wakeup, with ``elapsed_s``
-        pinned at 0.0 forever, i.e. both halves of the signal destroyed by
-        the same defect. ``before_invoke`` clears the pair when it finally
-        serves a lease, so ``elapsed_s`` measures how long the pool has been
-        unable to serve ANYONE.
+        both timestamps as locals here: the caller RE-ENTERS this helper on
+        every wakeup, so per-call state reset them each time — one warning
+        per wakeup, with ``elapsed_s`` pinned at 0.0 forever, i.e. both
+        halves of the signal destroyed by the same defect. The two halves are
+        pinned by two different tests in
+        ``shared/tests/test_usage_gate_park_visibility.py``: the throttle by
+        ``test_the_heartbeat_is_throttled_under_repeated_wakeups`` (counts),
+        and the growing clock by
+        ``test_the_heartbeat_repeats_rather_than_firing_once``, which asserts
+        ``elapsed_s`` rises across the park. Citing only the count test here
+        was itself wrong — it cannot observe ``elapsed_s`` at all, so a
+        refactor that returned ``_park_started_at`` to a local while leaving
+        the throttle instance-scoped would have left every assertion green
+        while reporting 0.0 forever.
+
+        AN ABANDONED PARK MUST NOT POISON THE NEXT ONE. ``before_invoke``
+        clears the pair when it finally serves a lease — the moment the park
+        genuinely ends — so ``elapsed_s`` measures how long the pool has been
+        unable to serve ANYONE. But a parked caller is routinely CANCELLED
+        instead (callers wrap this in ``asyncio.wait_for``), which reaches
+        neither that clear nor any other. Left set, the timestamps make the
+        next, unrelated park report an ``elapsed_s`` measured from a park
+        that ended long ago, and suppress its first heartbeat for up to a
+        full interval — both of them precisely the failures this helper
+        exists to fix. So the clock is cleared on the way out of an abandoned
+        park too, guarded by ``_park_waiters`` so a cancelled waiter cannot
+        reset a park its siblings are still inside. The staleness check in
+        the loop is the backstop for the residue no local handler can see: a
+        cancellation that lands at one of the caller's OTHER awaits, between
+        two re-entries of this helper.
 
         ``default=str`` on the dump is load-bearing, not decoration: it
         mirrors ``cli_invoke._check_cap_wait``, where a non-serialisable
@@ -1235,35 +1262,68 @@ class UsageGate:
         raise would escape ``before_invoke`` itself, turning an
         observability line into a hard failure on the fleet's hottest path.
         """
-        while not self._open.is_set():
-            now = time.monotonic()
-            if self._park_started_at is None:
-                self._park_started_at = now
-            if (
-                self._park_last_logged_at is None
-                or now - self._park_last_logged_at >= _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
-            ):
-                logger.warning(
-                    json.dumps(
-                        {
-                            'event': 'all_capped_park',
-                            'elapsed_s': round(now - self._park_started_at, 1),
-                            'account_count': self.account_count,
-                            'soonest_open_at': (
-                                self.soonest_resets_at.isoformat()
-                                if self.soonest_resets_at
-                                else None
-                            ),
-                        },
-                        default=str,
+        self._park_waiters += 1
+        try:
+            while not self._open.is_set():
+                now = time.monotonic()
+                if (
+                    self._park_last_logged_at is not None
+                    and now - self._park_last_logged_at
+                    > 2 * _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
+                ):
+                    # Stale clock. A LIVE park logs every interval, so a gap
+                    # of more than two means the park that set these
+                    # timestamps was abandoned somewhere the handler below
+                    # cannot see — a cancellation at one of the caller's other
+                    # awaits, between two re-entries of this helper. Reset
+                    # rather than inherit: inheriting reports an elapsed_s
+                    # measured from a park that is already over.
+                    self._park_started_at = None
+                    self._park_last_logged_at = None
+                if self._park_started_at is None:
+                    self._park_started_at = now
+                if (
+                    self._park_last_logged_at is None
+                    or now - self._park_last_logged_at
+                    >= _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
+                ):
+                    logger.warning(
+                        json.dumps(
+                            {
+                                'event': 'all_capped_park',
+                                'elapsed_s': round(now - self._park_started_at, 1),
+                                'account_count': self.account_count,
+                                'soonest_open_at': (
+                                    self.soonest_resets_at.isoformat()
+                                    if self.soonest_resets_at
+                                    else None
+                                ),
+                            },
+                            default=str,
+                        )
                     )
-                )
-                self._park_last_logged_at = now
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    self._open.wait(),
-                    timeout=_ALL_CAPPED_PARK_LOG_INTERVAL_SECS,
-                )
+                    self._park_last_logged_at = now
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._open.wait(),
+                        timeout=_ALL_CAPPED_PARK_LOG_INTERVAL_SECS,
+                    )
+        except BaseException:
+            # Abandoned park: cancellation (the routine case — callers wrap
+            # `before_invoke` in `asyncio.wait_for`) or an error out of the
+            # wait. `BaseException` because CancelledError is not an
+            # Exception, and it is re-raised untouched — this handler changes
+            # nothing about control flow, only the clock. Clear ONLY if no
+            # sibling is still parked: the timestamps are shared, and a
+            # frozen pool typically has many waiters, so an unguarded clear
+            # would restart a live park's elapsed_s every time any one of
+            # them was cancelled.
+            if self._park_waiters <= 1:
+                self._park_started_at = None
+                self._park_last_logged_at = None
+            raise
+        finally:
+            self._park_waiters -= 1
 
     @contextlib.asynccontextmanager
     async def invoke_slot(self, scope: str | None = None):
