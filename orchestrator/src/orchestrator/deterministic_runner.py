@@ -1429,6 +1429,7 @@ class DeterministicRunner:
         detail: str,
         *,
         metadata: dict | None = None,
+        category: str = 'infra_issue',
     ) -> WorkflowOutcome:
         """File a born-at-L2 infra_issue escalation and set the task to blocked.
 
@@ -1448,6 +1449,31 @@ class DeterministicRunner:
         must not propagate — doing so would defeat this method's "always
         returns BLOCKED, never a raw exception" contract in exactly the
         scenario it exists to cover.
+
+        ``category`` (task 4678 / r3, PRD ``docs/prds/
+        recurring-deterministic-tasks.md`` decision R-D6) overrides the filed
+        category.  The ONLY non-default caller is ``_run_predicate``'s three
+        no-verdict arms when the task is a RECURRENCE CARRIER, which file
+        ``MILESTONE_CHECK_FAILED_CATEGORY`` instead so every failure leg of a
+        recurring chain sits in one deny-listed, discriminable category
+        (contract C-5).  Nothing else changes: the dedup guard, the deploy-only
+        phase advance, the best-effort blocked write and the "always returns
+        BLOCKED, never a raw exception" contract are all category-agnostic, and
+        the three log lines below interpolate the category so a carrier's logs
+        read ``milestone_check_failed`` rather than a lie.
+
+        THIS method — not ``_file_milestone_check_failed_and_block`` — is the
+        right home for that override precisely BECAUSE it does not stamp
+        ``gate_escalated_at``.  The milestone helper does, and task 4065
+        established that a no-verdict leg must NOT (the check is re-attempted
+        on the next dispatch instead of being latched into section-1's
+        resolve-to-done path).  r3 is a CATEGORY change only, so routing the
+        carrier arms through the stamping helper would smuggle in a semantic
+        change nobody asked for.  Widened here rather than copied into a new
+        predicate-specific helper for the reason task 2632's amendment gave
+        when it extracted ``_deploy_outer_timeout``: a second copy of the dedup
+        guard and the best-effort blocked write could silently drift apart, on
+        a path whose whole contract is that it never raises.
 
         ``metadata``, when passed by a DEPLOY-path caller (``before_done``
         set — every ``run()``-internal call site qualifies; ``_run_predicate``
@@ -1492,8 +1518,8 @@ class DeterministicRunner:
         if existing_pending:
             logger.info(
                 'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (infra_issue dedup guard)',
-                task_id, len(existing_pending),
+                'skipping re-file (%s dedup guard)',
+                task_id, len(existing_pending), category,
             )
         else:
             esc = Escalation(
@@ -1501,15 +1527,15 @@ class DeterministicRunner:
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category='infra_issue',
+                category=category,
                 summary=summary[:200],
                 detail=detail,
                 level=2,
             )
             self.escalation_queue.submit(esc)
             logger.info(
-                'DeterministicRunner: filed L2 infra_issue escalation %s for task %s',
-                esc.id, task_id,
+                'DeterministicRunner: filed L2 %s escalation %s for task %s',
+                category, esc.id, task_id,
             )
 
         if metadata is not None and metadata.get('before_done') is not None:
@@ -1550,7 +1576,7 @@ class DeterministicRunner:
 
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
-            logger.info('DeterministicRunner: task %s blocked — infra_issue', task_id)
+            logger.info('DeterministicRunner: task %s blocked — %s', task_id, category)
         except Exception as exc:
             # Do NOT let a still-severed connection turn this into a
             # propagated exception — it would bubble past run() into the
@@ -2339,7 +2365,7 @@ class DeterministicRunner:
         return WorkflowOutcome.BLOCKED
 
     async def _run_predicate(
-        self, task_id: str, before_done: dict, description: str,
+        self, task_id: str, before_done: dict, description: str, metadata: dict,
     ) -> WorkflowOutcome:
         """Run a read-only predicate check and map its exit code to a verdict (γ-predicate).
 
@@ -2380,20 +2406,36 @@ class DeterministicRunner:
           on the next dispatch instead of being latched into the
           resolve-to-done path.  See the ``ScriptTimeout`` docstring.
         - Outer-guard timeout / unexpected error -> likewise an INFRA fault
-          (no verdict was produced): born-at-L2 ``infra_issue`` escalation +
-          blocked (re-attempted on the next dispatch, no ``gate_escalated_at``
-          stamp).  The outer ``asyncio.wait_for`` guard
+          (no verdict was produced): born-at-L2 escalation + blocked
+          (re-attempted on the next dispatch, no ``gate_escalated_at`` stamp).
+          The outer ``asyncio.wait_for`` guard
           (``timeout_secs + run_timeout_grace_secs``) stays the backstop for a
           seam that never returns at all.  All three infra arms share one
           category, so each carries deliberately distinct summary/detail
           wording — that text is the only thing telling a human which guard
           fired.
+        - CARRIER SPLIT (task 4678 / r3, PRD R-D6 + C-5): for a task carrying
+          ``metadata.recurrence`` — one link of a recurring chain — the
+          outer-guard arm files ``milestone_check_failed`` instead of
+          ``infra_issue``, so a recurring job's failures never disappear into
+          the crowded ``infra_issue`` bucket.  Every OTHER predicate is
+          unchanged.  The STAMP behaviour is identical either way: still no
+          ``gate_escalated_at``, because this is still a no-verdict leg — only
+          the label moves.
 
         Returns:
             WorkflowOutcome.DONE or WorkflowOutcome.BLOCKED.
         """
         run_fn = self._script_runner or self._default_run_script
         outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
+
+        # Task 4678 (r3): resolved ONCE, so all three no-verdict arms below
+        # cannot drift into different categories for the same task.
+        no_verdict_category = (
+            MILESTONE_CHECK_FAILED_CATEGORY
+            if _is_recurrence_carrier(metadata)
+            else 'infra_issue'
+        )
 
         async def _invoke_run_fn():
             # See run()'s identical inner wrapper: translate a seam-internal
@@ -2433,6 +2475,7 @@ class DeterministicRunner:
                 task_id,
                 summary='Predicate check timed out (subprocess hung)',
                 detail=timeout_detail,
+                category=no_verdict_category,
             )
         except ScriptTimeout as exc:
             # Task 4065: the DEFAULT runner's own per-script timeout fired — no
@@ -2768,7 +2811,7 @@ class DeterministicRunner:
                         'safe to repeat) before trusting the resolution',
                         task_id,
                     )
-                    return await self._run_predicate(task_id, before_done, description)
+                    return await self._run_predicate(task_id, before_done, description, metadata)
 
                 # Task 3341: bound here rather than only inside the pure-gate
                 # branch below, so the symmetric `if before_done is not None:`
@@ -2992,7 +3035,7 @@ class DeterministicRunner:
             # kind='predicate' + always_escalates=True task is not rejected
             # here and simply behaves as a plain predicate.
             if before_done.get('kind') == 'predicate':
-                return await self._run_predicate(task_id, before_done, description)
+                return await self._run_predicate(task_id, before_done, description, metadata)
 
             target_unit: str = before_done.get('target_unit', '')
             before_done_ran_at = metadata.get('before_done_ran_at')
