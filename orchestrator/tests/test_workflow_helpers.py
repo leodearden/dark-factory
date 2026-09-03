@@ -296,6 +296,43 @@ def test_transcript_archival_factories_smoke(tmp_path) -> None:
     assert armed.transcript_archive.enabled is True
 
 
+def test_transcript_archival_factories_identity() -> None:
+    """Anti-duplication guard: the producers re-export the SAME objects as the shared module."""
+    import test_transcript_archival_boundary_gate as bg  # noqa: PLC0415
+    import test_transcript_archive_backstop as bs  # noqa: PLC0415
+    import test_transcript_archive_producer_hook as ph  # noqa: PLC0415
+    from _workflow_helpers import (  # noqa: PLC0415
+        ENC,
+        _archived,
+        _config,
+        _config_dir,
+        _make_git_ops,
+        _make_workflow,
+        _write_transcript,
+    )
+
+    # alpha, the producer suite.
+    assert ph.ENC is ENC
+    assert ph._config is _config
+    assert ph._make_workflow is _make_workflow
+    assert ph._make_git_ops is _make_git_ops
+    assert ph._archived is _archived
+
+    # beta, the teardown-backstop suite.
+    assert bs._make_git_ops is _make_git_ops
+    assert bs._write_transcript is _write_transcript
+    assert bs._archived is _archived
+
+    # epsilon, the B+H boundary gate that had ported the fixtures from both.
+    assert bg.ENC is ENC
+    assert bg._archived is _archived
+    assert bg._config is _config
+    assert bg._config_dir is _config_dir
+    assert bg._make_git_ops is _make_git_ops
+    assert bg._make_workflow is _make_workflow
+    assert bg._write_transcript is _write_transcript
+
+
 # ---------------------------------------------------------------------------
 # Contract: the same-module-sibling constructor is depth-invariant (task 3866,
 # relocated here from test_workflow_status_on_resume.py by task 3903 so the
