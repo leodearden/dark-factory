@@ -371,6 +371,11 @@ class TestStewardInvokeWithCapRetryWiring:
 
         esc = _make_escalation()
         mcp_config = mock_mcp.mcp_config_json()
+        # Distinct from the module-default 'claude' (conftest.py) so the
+        # kwargs['backend'] assertion below actually discriminates a
+        # config-derived value from a hardcoded 'claude' in steward.py.
+        # Safe to mutate here since invoke_with_cap_retry is patched out.
+        mock_config.backends.steward = 'codex'
 
         with patch(
             'orchestrator.steward.invoke_with_cap_retry', new_callable=AsyncMock,
