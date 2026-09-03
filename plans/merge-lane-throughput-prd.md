@@ -312,3 +312,44 @@ B, C, D high; E, F, G medium; H medium.
 4. **Whether B enables `persistent_merge_worktree` on the laptop for Dark Factory**
    (warm worktree, faster; reify's setting). Suggested: yes, once C's host-level
    lock makes the per-project lock irrelevant for arbitration. Decide in B after C.
+
+---
+
+## Corrections (2026-09-03, post-decompose)
+
+This section is an append-only pointer, not a rewrite of the body above — the
+same discipline task C is told to apply to
+`plans/laptop-warm-verify-flock-orphan-prd.md`. The decompose walk and a
+four-agent adversarial review found the following statements in this PRD to be
+stale or unachievable. Each is corrected in
+`plans/merge-lane-throughput-prd.capability-manifest.md` (§ Corrections and
+§ Post-review findings) and in the filed task's own `details`. **Where this body
+and the manifest disagree, the manifest is current.**
+
+| § | Stale statement | Correction |
+|---|---|---|
+| Contract | the host-global admission dir "`shared.verify_admission`, default `/tmp/df-verify-slots-<uid>`" | that default was removed by task 2501 (`5392f4a357`); it is now **per-project**. C must mint and create its own host-global path. |
+| Contract | "`VerifyRunnerPool.dispatch` falls back to `LocalRunner`" | true in the abstract, **unreachable on the remote merge path**: `merge_queue.py::_run_post_merge_verify` builds the remote pool with no `LocalRunner`, so `dispatch` re-raises. C's fallback design needs re-scoping. |
+| Contract | the storm counter on the pool instance | the pool is constructed **per merge verify** (so a per-hour rate never accumulates) and takes **no `escalation_queue`** (so it cannot file the L1 at all). Counter belongs at `HostAllocator`'s worker lifetime. |
+| Boundary sketch row 1 | "one host (fixture project, subprocess ×2)" | one fixture project shares one slot dir, so the row passes without exercising cross-project arbitration. Use **two distinct project roots**. |
+| Decomposition, A | `--window 30d` reproduces § Background | that table is a **14-day** window except four explicitly-30d rows; and `--project-root` must be **repeatable** — the `events` table has no project column, so "void rate by project" is not derivable from one root. |
+| Decomposition, D1 | `check-config` "reports one enabled verify runner" | it is an unknown-key linter and emits no runner inventory. Re-homed onto `OrchestratorConfig.enabled_verify_runners`. |
+| Decomposition, D1/D2 | "the K value logged at startup will be 2" | `Harness._speculation_k` is computed but **never logged**. Use the `merge_verify` event with `runner: 'laptop'`. |
+| Decomposition, D2 | "zero `verify_host_unreachable`" | that event is deduped behind an open L1 and skipped when the queue is unwired, so zero ≠ reachable. Read it as *no open `verify_host_unreachable` L1 for `leo-laptop`*. |
+| Decomposition, F | "`landed_via_chain: true`" | it is an **int** (1 per item landed via chain), and F's 7-day observation cannot gate F, which completes on its deploy script's exit code. |
+| Cross-PRD table | `merge-lane-quality-prd.md` — **parallel** | true for this PRD's own files, but **F and H are transitively gated behind it**: F depends on 3188, whose dependencies are `[3186, 5036]`, and 5036 is that PRD's package-move gating anchor. |
+
+### Unreconciled prior ruling (blocks task C, needs Leo)
+
+`plans/cpu-load-robust-verify-prd.md` § 6 (RED-TIER, human decision) and
+`plans/integration-test-lane-prd.md` § 11 both rule out a **host-global
+cross-project verify admission semaphore** — the mechanism task C proposes — as
+*"TRIED-AND-REJECTED, not merely deferred … Do not revisit this as an option"*,
+after reify's 30-min+ cargo verifies starved dark_factory almost entirely.
+Neither PRD is cited anywhere in this document or its manifest.
+
+C's shape is arguably distinguishable — merge-only, capacity 1, bounded wait,
+and a fall back to local — but the local fallback is exactly the property the
+second row of the table above shows to be broken today. Task 5052 carries a
+STOP-AND-RECONCILE block instructing it to escalate rather than build through
+the ruling.

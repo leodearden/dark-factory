@@ -315,3 +315,88 @@ first tick *all* dependencies are `done`, so a sole dependency on F starts the
 14-day clock at the chain lever rather than at E. A reaches H through the
 transitive closure F→E→A. Nothing in this batch is wired behind tasks 3730,
 3733, 4755 or 5020.
+
+---
+
+## Post-review findings (2026-09-03) — the "all bindings PASS" claim did not hold
+
+After filing, four independent read-only agents re-walked this batch. The walk
+above was made at `383620ee5b`; these findings were verified by hand at
+`c0dc5f8926`. **Two bindings above are revised: one to FAIL, one to OPEN.** The
+sidecar carries the revised verdicts; the original text is left in place as
+dated provenance rather than rewritten.
+
+### Blocking
+
+**P1 — an unreconciled RED-TIER ruling forbids task C's mechanism.**
+`plans/cpu-load-robust-verify-prd.md` § 6 ("Out of scope — RED-TIER, human
+decision") and `plans/integration-test-lane-prd.md` § 11 both rule out a
+host-global cross-project verify admission semaphore by name:
+*"TRIED-AND-REJECTED, not merely deferred: under a single fair global semaphore,
+Reify's very long (30min+ cargo) verifies starved dark_factory almost entirely
+… Do not revisit this as an option."* Neither PRD is cited in the throughput PRD
+or in this manifest — the G4 seam check missed them. This is the same rejection
+that produced the per-project slots dir of correction (1); they are one fact.
+C's shape is plausibly distinguishable (merge-only, capacity 1, bounded wait,
+local fallback) but P2 shows the distinguishing property is broken. **Leo's call,
+not an implementer's.** Task 5052 carries a STOP-AND-RECONCILE block.
+
+**P2 — `local-fallback-arm-already-wired` revised PASS → FAIL
+(`producer-extent-short`).** `merge_queue.py::_run_post_merge_verify` builds the
+remote pool as `VerifyRunnerPool([runner], …)` with **no `LocalRunner`** — its
+own comment says so — so `dispatch`'s `except RunnerUnavailable` arm hits
+`self._local is None` and **re-raises**. The real fallback decision lives in
+`merge_queue.py`, which C must not edit (PRD decision 6; quality-PRD Appendix A).
+Knock-on: the cross-PRD table's κ row ("the contention branch becomes
+unreachable") is false too, so κ must not perform that deletion.
+
+**P3 — `storm-escape-reuses-shared-counter` revised PASS → OPEN.** C's storm
+escape cannot fire in production for two independent reasons: the pool is
+constructed **per merge verify**, so a pool-instance counter never accumulates a
+per-hour rate (contrast `HostAllocator`, which is worker-lifetime); and
+`VerifyRunnerPool.__init__` takes **no `escalation_queue`**, so the pool cannot
+file the L1 at all. Boundary row 3 would go green on a hand-built pool while the
+production path is dead — the same silent-no-op-that-passes-a-naive-test shape as
+correction (1), one layer up (INV-10).
+
+### Corrected in the filed tasks
+
+- **A** — the signal named `--window 30d`, but § Background is a **14-day**
+  window except four explicitly-30d rows; and `--project-root` must be
+  **repeatable**, since the `events` table has no project column and A's own
+  `--speculation` section promises "void rate by project" (which G's and E's
+  signals then depend on).
+- **D1/D2** — "the K value logged at startup will be 2" is unachievable;
+  `Harness._speculation_k` is computed but never logged.
+- **D2** — "zero `verify_host_unreachable`" is deduped behind an open L1 and
+  skipped when the queue is unwired, so zero ≠ reachable.
+- **F** — its 7-day signal cannot gate a task that completes on a deploy
+  script's exit code; D2 had the de-scoping sentence and F did not.
+- **H** — INV-7 was not walked for the milestone tasks: H's sole dependency on F
+  means a regressed F leaves H an **unbounded** hold (timer elapsed, deps
+  unsatisfied) with no overdue surface. Also gained E's anchor-persistence note.
+- **G** — its signal's invocation omitted `--project-root` while quoting
+  two-project rates.
+- **3188's dependencies are `[3186, 5036]`, not `[3186]`** — 5036 is the quality
+  PRD's package-move gating anchor, so F and H are transitively behind it.
+
+### `delivered_checks` audit
+
+Gates are re-evaluated against **current `main` every tick** (only `DELIVERED` is
+cached; any commit invalidates), so a check can go red *after* gating begins.
+Three were changed: `storm_counter` was **vacuously green** (`harness.py` already
+imports `StormCounter`) and is now scoped to C's own production files;
+`verify_runners:` is anchored to line start; and F's `chain_cap` grep — which
+gated H fourteen days later against a hand-edited ops file — was **removed**
+rather than hardened, since F cannot reach `done` without the knob and H is a
+measurement task for which a reverted cap is data, not grounds to withhold. All
+eight surviving gates verified red.
+
+### Not found
+
+G6 branch 1 (numeric premises) came back clean under adversarial review: D2's
+24h and F's 7d are windows on a direction with stated measured bases, C's
+`verify_host_busy_l1_per_hour: 20` is a config default rather than an asserted
+achievement, and E/H/G assert no thresholds. The `.md` and `.yaml` twins agree
+with each other; the divergence was between both of them and the PRD, which the
+PRD's own § Corrections block now closes.
