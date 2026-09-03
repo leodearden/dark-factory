@@ -1122,3 +1122,105 @@ class TestBuildReport:
     def test_cluster_cognitive_total_anchor(self, report: dict) -> None:
         # Anti-vacuity: measured 4,607 on this tree.
         assert metrics.derive_totals(report)['cognitive'] >= 4000
+
+
+# ---------------------------------------------------------------------------
+# Baseline serialization, and the per-path LINE LOCALITY that makes ten
+# parallel gamma branches rebase without conflicting.
+
+
+class TestRenderBaseline:
+    def test_round_trips_without_dropping_a_measure(self) -> None:
+        # A hand-rolled writer's failure mode is a silently omitted measure, so
+        # the round-trip is asserted structurally rather than eyeballed.
+        report = _synthetic_report()
+        loaded = json.loads(metrics.render_baseline(report))
+        assert loaded.pop('_README') == metrics.BASELINE_README
+        assert loaded == report
+
+    def test_every_per_path_entry_occupies_exactly_one_line(self) -> None:
+        # THE PARALLELISM PROPERTY. PRD gamma1..gamma10 run concurrently and each
+        # lowers only its own group's numbers, rebasing through the merge lane.
+        # One path per LINE makes those ten edits disjoint hunks; json.dumps(
+        # indent=2) would spread merge_queue.py's five measures over six lines
+        # and put two branches' unrelated edits inside one conflicting hunk.
+        report = _synthetic_report()
+        rendered = metrics.render_baseline(report)
+        lines = rendered.splitlines()
+        for section in ('files', 'functions', 'tests'):
+            for key, value in report[section].items():
+                prefix = json.dumps(key) + ':'
+                hits = [line for line in lines if line.lstrip().startswith(prefix)]
+                assert len(hits) == 1, f'{section}.{key} is not on exactly one line'
+                # The whole value must parse from that ONE line -- proving it was
+                # not merely started there and continued on the next.
+                tail = hits[0].lstrip()[len(prefix):].strip().rstrip(',')
+                assert json.loads(tail) == value, f'{section}.{key} value spans lines'
+
+    def test_per_path_keys_are_emitted_in_sorted_order(self) -> None:
+        report = _synthetic_report()
+        rendered = metrics.render_baseline(report)
+        for section in ('files', 'functions', 'tests'):
+            positions = [
+                rendered.index(json.dumps(key) + ':') for key in sorted(report[section])
+            ]
+            assert positions == sorted(positions), section
+
+    def test_ends_with_exactly_one_trailing_newline(self) -> None:
+        rendered = metrics.render_baseline(_synthetic_report())
+        assert rendered.endswith('\n')
+        assert not rendered.endswith('\n\n')
+
+    def test_rendering_is_idempotent(self) -> None:
+        # Regenerating a baseline from a baseline must be a no-op, or every
+        # regeneration would churn the file and manufacture conflicts.
+        once = metrics.render_baseline(_synthetic_report())
+        twice = metrics.render_baseline(json.loads(once))
+        assert twice == once
+
+    def test_leads_with_a_readme_key_stating_the_regeneration_rule(self) -> None:
+        rendered = metrics.render_baseline(_synthetic_report())
+        first_key_line = rendered.splitlines()[1]
+        assert first_key_line.lstrip().startswith('"_README":')
+        readme = metrics.BASELINE_README.lower()
+        assert 'ratchet baseline' in readme
+        assert 'regenerate' in readme or 'regenerated' in readme
+        assert 'same commit' in readme
+
+
+class TestBaselineIO:
+    def test_write_then_load_round_trips(self, tmp_path: Path) -> None:
+        report = _synthetic_report()
+        target = tmp_path / 'baseline.json'
+        metrics.write_baseline(target, report)
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(report)
+        loaded = metrics.load_baseline(target)
+        assert loaded['files'] == report['files']
+        assert loaded['functions'] == report['functions']
+
+    def test_write_is_atomic_leaving_no_debris(self, tmp_path: Path) -> None:
+        target = tmp_path / 'baseline.json'
+        metrics.write_baseline(target, _synthetic_report())
+        assert [p.name for p in tmp_path.iterdir()] == ['baseline.json']
+
+    def test_missing_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
+        # INV-11: a missing baseline is never an empty-baseline PASS, which
+        # would silently disarm the ratchet for every downstream task.
+        missing = tmp_path / 'nope.json'
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.load_baseline(missing)
+        assert 'nope.json' in str(excinfo.value)
+
+    def test_malformed_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
+        target = tmp_path / 'baseline.json'
+        target.write_text('{"files": ', encoding='utf-8')
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.load_baseline(target)
+        assert 'baseline.json' in str(excinfo.value)
+
+    def test_non_object_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
+        target = tmp_path / 'baseline.json'
+        target.write_text('[]', encoding='utf-8')
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.load_baseline(target)
+        assert 'baseline.json' in str(excinfo.value)
