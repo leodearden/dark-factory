@@ -48,6 +48,18 @@ tripwire, which asserts a config DEFAULT (``timeouts.working_idle_secs``) rather
 than anything about the prompts: the guidance's ~25-minute background threshold
 is derived from that 1800s bound, and the derivation going stale is checkable
 where the wording being "still correct" is not.
+
+The mechanical half of that shape — the offender-collection loops, the derived-
+vs-hardcoded role-set comparison, the count and index bookkeeping — lives in
+``_role_splice_contract.py`` (task 4405), shared with the sibling
+``test_roles_tool_call_rejection.py``. The tests below stay one thin function
+per invariant, each delegating its body to that helper while keeping its own
+docstring and its own remediation prose: a THIRD prompt constant now costs ~10
+lines of contract construction plus one-line bodies rather than a third clone of
+this file. What the helper deliberately does NOT absorb is the ``capability``
+predicate — ``'Bash' in role.allowed_tools`` answers a different question than
+the sibling's ``role.prompt_spec is None``, and both are correct for their own
+constant, so it is passed in.
 """
 
 from __future__ import annotations
@@ -57,6 +69,7 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from _role_splice_contract import SpliceContract, assert_brace_free, assert_nonempty
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import (
@@ -92,13 +105,19 @@ _BACKGROUND_CAPABLE_ROLES = frozenset({
 # headroom and will not fire merely because someone added a sentence.
 _UP_FRONT_CHAR_BUDGET = 1500
 
-# ``BACKGROUND_WAIT_GUIDANCE`` opens with its own ``\n## `` heading, so
-# "spliced between the identity paragraph and the role's first real section"
-# is exactly "its heading IS the first ``##`` heading in the prompt". That is a
-# structural property of the splice, not a prose pin: it keeps holding when
-# every heading in the file is renamed. It replaces an earlier ``'## Escalation'``
-# landmark that silently no-opped when the heading was not found.
-_MARKDOWN_HEADING = '\n## '
+# The splice contract for this constant: what is spliced, into which roles, and
+# the capability that justifies it. ``all_roles`` is omitted, so it binds the
+# real ``ROLES``. The structural ``\n## `` landmark the placement check compares
+# against lives in the helper as ``MARKDOWN_HEADING``; it is not referenced
+# directly here because ``assert_placement`` owns that comparison.
+_CONTRACT = SpliceContract(
+    constant_name='BACKGROUND_WAIT_GUIDANCE',
+    constant=BACKGROUND_WAIT_GUIDANCE,
+    roles=_BACKGROUND_CAPABLE_ROLES,
+    role_set_name='_BACKGROUND_CAPABLE_ROLES',
+    capability=lambda role: 'Bash' in role.allowed_tools,
+    capability_description='the unqualified `Bash` tool',
+)
 
 
 def test_wait_pattern_guidance_is_nonempty() -> None:
@@ -118,11 +137,13 @@ def test_wait_pattern_guidance_is_nonempty() -> None:
     regression the module docstring names as the motivating risk. This one-line
     assertion is the only thing standing between that edit and a green CI run.
     """
-    assert WAIT_PATTERN_GUIDANCE.strip(), (
-        'WAIT_PATTERN_GUIDANCE is empty. Every containment test in this file '
-        'still passes when it is — the empty string is a substring of anything — '
-        'so this assertion is the sole guard against the census-R3 guidance being '
-        'silently dropped in a prompt refactor.'
+    assert_nonempty(
+        'WAIT_PATTERN_GUIDANCE',
+        WAIT_PATTERN_GUIDANCE,
+        remedy=(
+            'Restore the census-R3 guidance: this assertion is the sole guard '
+            'against it being silently dropped in a prompt refactor.'
+        ),
     )
 
 
@@ -216,17 +237,19 @@ def test_combined_guidance_composes_both_rules() -> None:
     splice unit cannot carry the wait-pattern rule without also carrying task
     2761's don't-end-your-turn-on-a-background-command rule.
     """
-    assert BACKGROUND_TASK_WARNING in BACKGROUND_WAIT_GUIDANCE, (
-        "BACKGROUND_WAIT_GUIDANCE no longer contains task 2761's "
-        'BACKGROUND_TASK_WARNING. The two rules must NEVER be spliced apart: an '
-        'agent told only how to wait, without the prohibition on ending its turn '
-        'with a background command pending, simply trades one footgun for the other.'
-    )
-    assert WAIT_PATTERN_GUIDANCE in BACKGROUND_WAIT_GUIDANCE, (
-        'BACKGROUND_WAIT_GUIDANCE no longer contains WAIT_PATTERN_GUIDANCE. The '
-        'two rules must NEVER be spliced apart: an agent told only what not to do '
-        '(task 2761), with no sanctioned wait pattern, improvises a busy-loop or a '
-        'blocked sleep chain instead — the exact census-R3 defect this constant fixes.'
+    _CONTRACT.assert_composes(
+        [
+            ('BACKGROUND_TASK_WARNING', BACKGROUND_TASK_WARNING),
+            ('WAIT_PATTERN_GUIDANCE', WAIT_PATTERN_GUIDANCE),
+        ],
+        remedy=(
+            'Losing BACKGROUND_TASK_WARNING leaves an agent told only how to wait, '
+            "without task 2761's prohibition on ending its turn with a background "
+            'command pending — it simply trades one footgun for the other. Losing '
+            'WAIT_PATTERN_GUIDANCE leaves an agent told only what not to do, with '
+            'no sanctioned wait pattern, so it improvises a busy-loop or a blocked '
+            'sleep chain instead — the exact census-R3 defect this constant fixes.'
+        ),
     )
 
 
@@ -252,11 +275,15 @@ def test_wait_pattern_constants_have_no_literal_braces(name: str) -> None:
         'WAIT_PATTERN_REMINDER': WAIT_PATTERN_REMINDER,
     }[name]
 
-    assert '{' not in value and '}' not in value, (
-        f'{name} contains a literal brace. WAIT_PATTERN_REMINDER is interpolated '
-        'into build_amender_prompt in briefing.py, and WAIT_PATTERN_GUIDANCE is '
-        'held brace-free so it stays safe at any future interpolating splice '
-        'site — remove the brace or the prompt breaks at runtime.'
+    assert_brace_free(
+        name,
+        value,
+        remedy=(
+            'WAIT_PATTERN_REMINDER is interpolated into build_amender_prompt in '
+            'briefing.py, and WAIT_PATTERN_GUIDANCE is held brace-free so it stays '
+            'safe at any future interpolating splice site — remove the brace or the '
+            'prompt breaks at runtime.'
+        ),
     )
 
 
@@ -267,31 +294,23 @@ def test_background_capable_role_set_matches_bash_capability() -> None:
     match is on the exact string ``'Bash'``, so a ``'Bash(git:*)'`` grant does
     NOT qualify.
     """
-    derived = {name for name, role in ROLES.items() if 'Bash' in role.allowed_tools}
-
-    assert derived == _BACKGROUND_CAPABLE_ROLES, (
-        'A role gained or lost the unqualified `Bash` tool, so the set of roles '
-        'that can encounter background work has changed: '
-        f'gained={sorted(derived - _BACKGROUND_CAPABLE_ROLES)} '
-        f'lost={sorted(_BACKGROUND_CAPABLE_ROLES - derived)}. '
-        'A newly Bash-capable role must be added to _BACKGROUND_CAPABLE_ROLES AND '
-        'given BACKGROUND_WAIT_GUIDANCE up front in its system_prompt; if it is '
-        'genuinely exempt, justify the exclusion in the comment above the set.'
+    _CONTRACT.assert_role_set_matches_capability(
+        remedy=(
+            'A newly Bash-capable role must be added to _BACKGROUND_CAPABLE_ROLES '
+            'AND given BACKGROUND_WAIT_GUIDANCE up front in its system_prompt; if '
+            'it is genuinely exempt, justify the exclusion in the comment above '
+            'the set.'
+        ),
     )
 
 
 def test_background_capable_roles_carry_combined_guidance() -> None:
     """Every Bash-capable role's system_prompt embeds the combined block."""
-    offenders = sorted(
-        name
-        for name in _BACKGROUND_CAPABLE_ROLES
-        if BACKGROUND_WAIT_GUIDANCE not in ROLES[name].system_prompt
-    )
-
-    assert offenders == [], (
-        f'Roles missing BACKGROUND_WAIT_GUIDANCE from their system_prompt: {offenders}. '
-        'These roles can launch a build or a full test suite, so they will hit '
-        'background work with no sanctioned wait pattern to reach for.'
+    _CONTRACT.assert_every_role_carries(
+        remedy=(
+            'These roles can launch a build or a full test suite, so they will hit '
+            'background work with no sanctioned wait pattern to reach for.'
+        ),
     )
 
 
@@ -305,19 +324,13 @@ def test_excluded_roles_do_not_carry_combined_guidance() -> None:
     roles in the system, so an errant splice there is expensive and would ship
     silently. This makes the stated rationale enforced rather than aspirational.
     """
-    offenders = sorted(
-        name
-        for name in ROLES
-        if name not in _BACKGROUND_CAPABLE_ROLES
-        and BACKGROUND_WAIT_GUIDANCE in ROLES[name].system_prompt
-    )
-
-    assert offenders == [], (
-        f'Roles carrying BACKGROUND_WAIT_GUIDANCE without unqualified `Bash`: '
-        f'{offenders}. These roles cannot launch a long-running command, so the '
-        'block is dead weight in every one of their sessions. Either remove the '
-        'splice, or — if the role genuinely gained the capability — grant it '
-        '`Bash` and add it to _BACKGROUND_CAPABLE_ROLES.'
+    _CONTRACT.assert_no_other_role_carries(
+        remedy=(
+            'These roles cannot launch a long-running command, so the block is '
+            'dead weight in every one of their sessions. Either remove the splice, '
+            'or — if the role genuinely gained the capability — grant it `Bash` and '
+            'add it to _BACKGROUND_CAPABLE_ROLES.'
+        ),
     )
 
 
@@ -329,23 +342,27 @@ def test_combined_guidance_appears_exactly_once_per_role() -> None:
     ``BACKGROUND_TASK_WARNING`` count is checked separately because the combined
     unit CONTAINS it: a leftover bare ``+ BACKGROUND_TASK_WARNING`` tail would
     push that count to 2 while the combined count stayed at 1.
-    """
-    offenders = {}
-    for name in sorted(_BACKGROUND_CAPABLE_ROLES):
-        prompt = ROLES[name].system_prompt
-        combined = prompt.count(BACKGROUND_WAIT_GUIDANCE)
-        warning = prompt.count(BACKGROUND_TASK_WARNING)
-        if combined != 1 or warning != 1:
-            offenders[name] = {
-                'BACKGROUND_WAIT_GUIDANCE': combined,
-                'BACKGROUND_TASK_WARNING': warning,
-            }
 
-    assert offenders == {}, (
-        f'Roles whose guidance splice count is not exactly 1: {offenders}. '
-        'Expected 1 of each. A count of 2 for BACKGROUND_TASK_WARNING means a '
-        'stale tail `+ BACKGROUND_TASK_WARNING` survives beside the up-front '
-        'BACKGROUND_WAIT_GUIDANCE — delete the tail, it is now redundant.'
+    The two counts were one combined ``{role: {const: count}}`` payload before
+    task 4405 and are now two per-constant assertions, so a failure names the
+    specific constant whose count is wrong instead of printing both. Both keep
+    ``absent_ok=False``: a count of 0 IS an offender here, unlike the sibling
+    module's ``test_guidance_appears_exactly_once_per_role``.
+    """
+    _CONTRACT.assert_spliced_exactly_once(
+        remedy=(
+            'Restore the single up-front BACKGROUND_WAIT_GUIDANCE splice for that '
+            'role, or delete the duplicate.'
+        ),
+    )
+    _CONTRACT.assert_spliced_exactly_once(
+        constant=BACKGROUND_TASK_WARNING,
+        constant_name='BACKGROUND_TASK_WARNING',
+        remedy=(
+            'A count of 2 for BACKGROUND_TASK_WARNING means a stale tail '
+            '`+ BACKGROUND_TASK_WARNING` survives beside the up-front '
+            'BACKGROUND_WAIT_GUIDANCE — delete the tail, it is now redundant.'
+        ),
     )
 
 
@@ -368,25 +385,17 @@ def test_combined_guidance_is_stated_up_front() -> None:
     identity paragraph precedes it. No heading text is pinned, so renaming any
     section in ``roles.py`` cannot silently turn this check into a no-op.
     """
-    offenders = {}
-    for name in sorted(_BACKGROUND_CAPABLE_ROLES):
-        prompt = ROLES[name].system_prompt
-        idx = prompt.find(BACKGROUND_WAIT_GUIDANCE)
-        if idx == -1:
-            # Absent entirely -- record rather than skip, so this test can never
-            # pass vacuously on a role that dropped the block.
-            offenders[name] = {'offset': 'ABSENT'}
-            continue
-        first_heading = prompt.find(_MARKDOWN_HEADING)
-        if idx != first_heading or idx >= _UP_FRONT_CHAR_BUDGET:
-            offenders[name] = {'offset': idx, 'first_heading': first_heading}
-
-    assert offenders == {}, (
-        f'Roles stating the guidance too late: {offenders}. The block must be '
-        "spliced immediately after the opening identity paragraph, so that its "
-        'own `##` heading is the FIRST `##` heading in the prompt (offset == '
-        f'first_heading) and lands within {_UP_FRONT_CHAR_BUDGET} chars. A '
-        'first_heading BELOW offset means some other section now precedes it.'
+    # No ``follows``: this is the up-front rule, and the block absent entirely is
+    # recorded rather than skipped, so this can never pass vacuously on a role
+    # that dropped it.
+    _CONTRACT.assert_placement(
+        char_budget=_UP_FRONT_CHAR_BUDGET,
+        remedy=(
+            'The block must be spliced immediately after the opening identity '
+            'paragraph, so that its own `##` heading is the FIRST `##` heading in '
+            'the prompt. A first_heading BELOW offset means some other section now '
+            'precedes it.'
+        ),
     )
 
 
