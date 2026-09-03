@@ -37,6 +37,7 @@ can never masquerade as a clean tree.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -963,3 +964,161 @@ class TestTestFileMeasures:
             total_private += measures['private_reads']
         assert lane_files >= 150, lane_files
         assert total_private > 5000, total_private
+
+
+# ---------------------------------------------------------------------------
+# Report assembly, and DERIVED totals.
+
+
+def _synthetic_report() -> dict:
+    return {
+        'schema_version': 1,
+        'params': {
+            'complexipy_version': '6.2.0',
+            'cluster_paths': ['a.py', 'b.py'],
+            'file_line_ceiling': 1500,
+            'new_function_cognitive_ceiling': 15,
+        },
+        'enumeration': {
+            'requested': ['a.py', 'b.py'],
+            'resolved': ['a.py', 'b.py'],
+            'unreadable': [],
+            'complete': True,
+        },
+        'files': {
+            'a.py': {
+                'lines': 1000,
+                'prose_lines': 400,
+                'cognitive': 120,
+                'function_local_imports': 3,
+                'reexport_names': 5,
+            },
+            'b.py': {
+                'lines': 200,
+                'prose_lines': 50,
+                'cognitive': 30,
+                'function_local_imports': 1,
+                'reexport_names': 0,
+            },
+        },
+        'functions': {'a.py::f': 40, 'a.py::C::m': 12, 'b.py::g': 7},
+        'tests': {
+            't1.py': {'patch_targets': ['foo', 'bar'], 'private_reads': 20},
+            't2.py': {'patch_targets': ['bar', 'baz'], 'private_reads': 5},
+        },
+    }
+
+
+class TestDeriveTotals:
+    def test_sums_every_file_measure(self) -> None:
+        totals = metrics.derive_totals(_synthetic_report())
+        assert totals['lines'] == 1200
+        assert totals['prose_lines'] == 450
+        assert totals['cognitive'] == 150
+        assert totals['function_local_imports'] == 4
+        assert totals['reexport_names'] == 5
+
+    def test_private_reads_are_summed_over_tests(self) -> None:
+        assert metrics.derive_totals(_synthetic_report())['private_reads'] == 25
+
+    def test_patch_targets_total_is_the_union_size_not_the_sum(self) -> None:
+        # The PRD's measure is DISTINCT names: foo/bar/baz across two files that
+        # both patch `bar` is 3, not 4.
+        assert metrics.derive_totals(_synthetic_report())['patch_targets'] == 3
+
+    def test_moving_code_to_a_new_path_leaves_every_total_identical(self) -> None:
+        # THE ANTI-RENAME-GAMING PROPERTY. Totals are DERIVED by summing the
+        # stored per-path map rather than stored as their own key, so moving 500
+        # lines and 40 cognitive from a.py to a brand-new path cannot lower the
+        # cluster figure -- the ratchet still catches the move.
+        before = _synthetic_report()
+        after = _synthetic_report()
+        after['files']['a.py']['lines'] -= 500
+        after['files']['a.py']['cognitive'] -= 40
+        after['files']['new_module.py'] = {
+            'lines': 500,
+            'prose_lines': 0,
+            'cognitive': 40,
+            'function_local_imports': 0,
+            'reexport_names': 0,
+        }
+        assert metrics.derive_totals(after) == metrics.derive_totals(before)
+
+    def test_is_a_pure_function_of_the_report(self) -> None:
+        report = _synthetic_report()
+        snapshot = json.dumps(report, sort_keys=True)
+        metrics.derive_totals(report)
+        assert json.dumps(report, sort_keys=True) == snapshot
+
+
+class TestBuildReport:
+    @pytest.fixture(scope='class')
+    def report(self) -> dict:
+        return metrics.build_report(_REPO_ROOT)
+
+    def test_top_level_keys(self, report: dict) -> None:
+        assert set(report) == {
+            'schema_version',
+            'params',
+            'enumeration',
+            'files',
+            'functions',
+            'tests',
+        }
+
+    def test_no_stored_totals_key(self, report: dict) -> None:
+        # A stored totals block is the ONE shared line all ten of PRD
+        # gamma1..gamma10 would each rewrite, conflicting on every rebase. It is
+        # also two representations of one number, free to disagree (SPOT).
+        assert 'totals' not in report
+
+    def test_schema_version(self, report: dict) -> None:
+        assert report['schema_version'] == 1
+
+    def test_params_records_how_the_measurement_was_taken(self, report: dict) -> None:
+        params = report['params']
+        assert params['complexipy_version'] == metrics.complexipy_version()
+        assert params['cluster_paths'] == list(metrics.CLUSTER_PATHS)
+        assert params['file_line_ceiling'] == metrics.FILE_LINE_CEILING
+        assert params['new_function_cognitive_ceiling'] == (
+            metrics.NEW_FUNCTION_COGNITIVE_CEILING
+        )
+
+    def test_enumeration_is_complete(self, report: dict) -> None:
+        assert report['enumeration']['complete'] is True
+        assert report['enumeration']['unreadable'] == []
+
+    def test_file_entries_carry_the_five_measures(self, report: dict) -> None:
+        entry = report['files']['orchestrator/src/orchestrator/merge_queue.py']
+        assert set(entry) == {
+            'lines',
+            'prose_lines',
+            'cognitive',
+            'function_local_imports',
+            'reexport_names',
+        }
+        assert entry['lines'] == 21550
+        assert entry['cognitive'] == 2133
+
+    def test_functions_is_a_flat_path_qualname_map(self, report: dict) -> None:
+        key = 'orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_verifier_loop'
+        assert report['functions'][key] == 245
+        assert all(isinstance(value, int) for value in report['functions'].values())
+
+    def test_tests_entries_carry_both_measures_and_only_lane_files(
+        self, report: dict
+    ) -> None:
+        assert report['tests']
+        for path, entry in report['tests'].items():
+            assert set(entry) == {'patch_targets', 'private_reads'}
+            assert entry['patch_targets'] == sorted(entry['patch_targets']), path
+        assert len(report['tests']) >= 150
+
+    def test_every_path_key_is_repo_relative_forward_slash(self, report: dict) -> None:
+        for key in list(report['files']) + list(report['tests']):
+            assert not key.startswith('/'), key
+            assert '\\' not in key, key
+
+    def test_cluster_cognitive_total_anchor(self, report: dict) -> None:
+        # Anti-vacuity: measured 4,607 on this tree.
+        assert metrics.derive_totals(report)['cognitive'] >= 4000
