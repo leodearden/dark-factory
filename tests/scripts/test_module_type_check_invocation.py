@@ -74,6 +74,7 @@ from __future__ import annotations
 import shlex
 
 from orchestrator import verify_cmd
+from orchestrator.config import ModuleConfig
 
 
 def _npx_fronted_segments(cmd: str) -> list[str]:
@@ -215,4 +216,78 @@ def test_the_npx_scan_reads_exact_tokens_in_every_chain_segment() -> None:
     assert _npx_fronted_segments('pnpx pyright') == [], (
         "'pnpx' is a distinct token from 'npx' and this scan bans the exact "
         "token 'npx' only, by deliberate scope limit"
+    )
+
+
+def test_the_field_scan_covers_every_guarded_command_field() -> None:
+    """`_npx_fronted_fields` must scan type_check_command, lint_command AND test_command.
+
+    Six lettered cases, built on fabricated `ModuleConfig`s (a dataclass with
+    a required `prefix` plus optional command fields).
+    """
+    # (a) npx in type_check_command only.
+    mc = ModuleConfig(prefix='fake', type_check_command='npx pyright scripts/')
+    offenders = _npx_fronted_fields(mc)
+    assert set(offenders) == {'type_check_command'}, (
+        f'expected only type_check_command flagged, got {offenders!r}'
+    )
+    assert [s.strip() for s in offenders['type_check_command']] == [
+        'npx pyright scripts/'
+    ], f'expected the offending segment itself to be reported, got {offenders!r}'
+
+    # (b) npx in lint_command only — the field the task calls "arguably" in
+    # scope; pinning it here is what stops the scan quietly covering only the
+    # type gate.
+    mc = ModuleConfig(prefix='fake', lint_command='npx eslint src/')
+    offenders = _npx_fronted_fields(mc)
+    assert set(offenders) == {'lint_command'}, (
+        f'expected only lint_command flagged, got {offenders!r}'
+    )
+
+    # (c) npx in test_command only.
+    mc = ModuleConfig(prefix='fake', test_command='npx jest')
+    offenders = _npx_fronted_fields(mc)
+    assert set(offenders) == {'test_command'}, (
+        f'expected only test_command flagged, got {offenders!r}'
+    )
+
+    # (d) npx in a chained lint TAIL clause, mirroring the real chained
+    # lint_command shape every workspace member declares (e.g. cockpit's
+    # `ruff check ... && python3 .../check_bare_magicmock_config.py ...`).
+    mc = ModuleConfig(
+        prefix='fake',
+        lint_command='uv run --directory x ruff check src/ && npx some-linter',
+    )
+    offenders = _npx_fronted_fields(mc)
+    assert set(offenders) == {'lint_command'}, (
+        f'a chained TAIL clause must be flagged even though the head clause '
+        f'is clean `uv run`, got {offenders!r}'
+    )
+    assert [s.strip() for s in offenders['lint_command']] == ['npx some-linter'], (
+        f'expected the TAIL clause itself to be reported, got {offenders!r}'
+    )
+
+    # (e) all three fields None -> {}, not a crash. A module config declaring
+    # no commands at all is a legitimate state (verify renders a falsy
+    # command as a SKIPPED PlannedRun, not a violation).
+    mc = ModuleConfig(prefix='fake')
+    assert _npx_fronted_fields(mc) == {}, (
+        f'a module config with no commands declared must scan clean with no '
+        f'crash, got {_npx_fronted_fields(mc)!r}'
+    )
+
+    # (f) THE FALSE-POSITIVE FLOOR: the three REAL commands measured on this
+    # tree for cockpit/orchestrator.yaml must not be flagged.
+    mc = ModuleConfig(
+        prefix='cockpit',
+        test_command='uv run --directory cockpit pytest tests/ --tb=short -q',
+        lint_command=(
+            'uv run --directory cockpit ruff check src/ tests/ && '
+            'python3 fused-memory/scripts/check_bare_magicmock_config.py cockpit/tests'
+        ),
+        type_check_command='uv run --directory cockpit pyright src/ tests/',
+    )
+    assert _npx_fronted_fields(mc) == {}, (
+        f"cockpit's real, measured commands must not be flagged, got "
+        f'{_npx_fronted_fields(mc)!r}'
     )
