@@ -969,6 +969,110 @@ class TestMockWorkflowProjectRootContract:
         )
 
 
+class _Adjudicated(NamedTuple):
+    """One adjudicated absolute-``/tmp`` ``project_root`` literal: how many, and why.
+
+    Same shape and same two properties as ``_Sanctioned`` above, deliberately —
+    read that docstring for the reasoning rather than a paraphrase of it here.
+    In short: *sites* is a COUNT so a new literal added beside an adjudicated one
+    still trips instead of inheriting its neighbour's approval, and line numbers
+    are NOT pinned because they churn on unrelated edits above the site.  That
+    churn is not hypothetical for this population — task 4389 found
+    test_workflow.py's literal had already drifted 2378 -> 2395 since task 3551
+    recorded it.
+
+    *reason* is a POINTER.  Every one of these sites already carries its own
+    comment block or docstring saying why it is deliberate; restating that here
+    would re-create the drift this module exists to end.
+    """
+
+    sites: int
+    reason: str
+
+
+# Every module allowed to hold an absolute-`/tmp` `project_root` literal, keyed
+# by path RELATIVE TO the tests tree (not basename, for the same reason
+# `_SANCTIONED_STEWARD_CONSTRUCTION` is: the sweep is a full rglob, so a basename
+# key would let a same-named module in a subdir inherit a sanction it was never
+# adjudicated for).
+#
+# This mapping IS the adjudication record for task 4389. Task 3551's sweep found
+# 17 literals and left them classified as "unknown"; 4389 ruled all 17
+# deliberate-but-inert and named them, and this census is what makes that ruling
+# checkable rather than one more prose finding the next task re-derives.
+#
+# TWO FAMILIES survive here, and they are exceptions for DIFFERENT reasons:
+#   * the canonical constant in `_orch_helpers.py`, which the 16 Family-A sites
+#     now reference rather than re-spell;
+#   * the REVIEW family, five sites that must stay outside pytest's tmp_path
+#     because `ReviewCheckpoint._run_review` raises ValueError on `/tmp/pytest`.
+#
+# Adding an entry is a DECISION, not a formality — see the failure message.
+_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS: dict[str, _Adjudicated] = {
+    '_orch_helpers.py': _Adjudicated(
+        sites=1,
+        reason=(
+            'the canonical `MOCK_WORKFLOW_PROJECT_ROOT` itself — the one place '
+            'this literal is allowed to be SPELLED, and the thing the 16 '
+            'TaskWorkflow mock-config factories now reference. The full '
+            'classification and the three measurements behind it are owned by '
+            'its docstring; read them there'
+        ),
+    ),
+    'test_out_of_band_routing.py': _Adjudicated(
+        sites=1,
+        reason=(
+            '`_REVIEW_PROJECT_ROOT`: THE sanctioned exception to the sandboxed-'
+            'project_root invariant, examined by task 3551 and recorded in the '
+            'comment block directly above the literal — read it there, it names '
+            'the guard, the commit that added it, and the 5 tests that fail if '
+            'the root is moved under a pytest path'
+        ),
+    ),
+    'test_routing_integration_gate.py': _Adjudicated(
+        sites=1,
+        reason=(
+            'a SECOND `_REVIEW_PROJECT_ROOT`, same value and same reason as '
+            "test_out_of_band_routing.py's, reimplemented rather than imported "
+            "per that suite's fixtures-stay-module-local discipline (stated in "
+            'its own comment block above the literal). Not in task 3551\'s '
+            'sweep, which looked for `config.project_root` attribute '
+            'assignments and so could not see the module-constant form; found '
+            'by task 4389\'s detector and filed as esc-4389-1'
+        ),
+    ),
+    'test_review_checkpoint_cap.py': _Adjudicated(
+        sites=1,
+        reason=(
+            'same ReviewCheckpoint `/tmp/pytest`-guard family as '
+            '`_REVIEW_PROJECT_ROOT`, and named as such by that literal\'s '
+            'comment block. Censused rather than renamed: task 4389\'s scope is '
+            'the 17 sites task 3551 found, and this one was explicitly excluded '
+            'from that list as already-adjudicated'
+        ),
+    ),
+    'test_review_checkpoint_full_gate.py': _Adjudicated(
+        sites=1,
+        reason=(
+            'same ReviewCheckpoint `/tmp/pytest`-guard family, and censused '
+            'rather than renamed, for the same reason as '
+            'test_review_checkpoint_cap.py above'
+        ),
+    ),
+    'test_task_creation_migration.py': _Adjudicated(
+        sites=1,
+        reason=(
+            '`_PROMPT_MARKER_PROJECT_ROOT`: the prompt-interpolation marker. '
+            'Deliberate on two independent grounds, both recorded in the comment '
+            'block above the literal — it is the value a live assertion pins to '
+            'prove `_build_prompt` interpolates project_root, and it feeds a '
+            'real ReviewCheckpoint, so it is also in the `/tmp/pytest`-guard '
+            'family'
+        ),
+    ),
+}
+
+
 def _tmp_literal(value: ast.expr) -> str | None:
     """The ``/tmp`` string *value* denotes, or ``None`` if it does not denote one.
 
@@ -1089,6 +1193,28 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
     return sites
 
 
+@functools.cache
+def _tmp_literal_census_by_module() -> Mapping[str, tuple[str, ...]]:
+    """``{module path relative to the tests tree: (site, ...)}``, computed once.
+
+    Consumes ``_scan_tests_tree().modules`` UNFILTERED — deliberately NOT
+    ``_recurrence_swept_modules()``, which drops ``_orch_helpers.py`` as the
+    canonical owner of the sandbox-assert block.  That exclusion is right for the
+    recurrence guard and exactly wrong here: ``_orch_helpers.py`` is the module
+    that now OWNS the canonical literal, so reusing the filtered sweep would drop
+    the one site the whole remedy rests on and leave it unpinned.
+
+    Cached and returned read-only for the same reason ``_census_by_module`` is:
+    the full-tree walk is the expensive half of this module.
+    """
+    census: dict[str, tuple[str, ...]] = {}
+    for path, tree in _scan_tests_tree().modules:
+        sites = _absolute_tmp_project_root_literals(tree)
+        if sites:
+            census[str(path.relative_to(_TESTS_DIR))] = tuple(sites)
+    return MappingProxyType(census)
+
+
 class TestAbsoluteTmpProjectRootLiteralsAreCensused:
     """Every absolute-``/tmp`` ``project_root`` literal is adjudicated, with a reason.
 
@@ -1102,6 +1228,100 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
     un-adjudicated literal cannot appear silently, and its author must either
     use the shared constant or write down why they cannot.
     """
+
+    def test_every_absolute_tmp_project_root_literal_is_adjudicated(self) -> None:
+        """The whole census, in ONE full-tree scan.
+
+        Liveness, the unadjudicated-module check, the per-module site COUNT and
+        allowlist staleness are asserted together and IN THAT ORDER: a census
+        that read nothing sanctions everything, so it must report itself as
+        broken before it reports "all clear".  Not split into a test apiece on
+        purpose — see ``_scan_tests_tree`` for the cost.
+        """
+        census = _tmp_literal_census_by_module()
+
+        # -- liveness first, in both directions: did we read the tree, and does
+        #    the detector still match anything at all?
+        assert not _scan_tests_tree().unparseable, (
+            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'absent from this census — a module that cannot be read cannot be '
+            f'censused: {list(_scan_tests_tree().unparseable)}'
+        )
+        assert len(_scan_tests_tree().modules) >= _MIN_MODULES_SWEPT, (
+            f'the census parsed only {len(_scan_tests_tree().modules)} modules '
+            f'under {_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
+            f'census that reads nothing sanctions everything.'
+        )
+        assert census, (
+            'the census found NO absolute-/tmp project_root literal anywhere, '
+            'not even the canonical MOCK_WORKFLOW_PROJECT_ROOT in '
+            f'{_CANONICAL_OWNER} — the detector has stopped matching, so this '
+            'guard is vacuously green'
+        )
+
+        # -- a module nobody has adjudicated at all.
+        unadjudicated = {
+            module: sites
+            for module, sites in census.items()
+            if module not in _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS
+        }
+        assert not unadjudicated, (
+            'Un-adjudicated absolute-/tmp project_root literal(s).\n'
+            'A /tmp literal LOOKS sandboxed — it is where pytest\'s tmp_path '
+            'lives — while sitting outside the retention sweep, so anything '
+            'written through it escapes. Task 3551 found 17 of these and could '
+            'not tell deliberate from accident; task 4389 adjudicated them all '
+            'and this census is what stops that question being re-opened from '
+            'scratch a fourth time.\n'
+            'Fix, and it is a real choice between three options:\n'
+            '  (a) if it is a TaskWorkflow mock-config factory, use '
+            'MOCK_WORKFLOW_PROJECT_ROOT from _orch_helpers — that constant '
+            'exists exactly so this literal is spelled once; or\n'
+            '  (b) better, if the factory can take an argument, give it a '
+            '`project_root: Path` keyword and pass `tmp_path / "proj"` from each '
+            'call site (test_workflow_already_done.py:35-57 is the in-tree '
+            'shape). A sandboxed root needs no adjudication at all; or\n'
+            '  (c) if it structurally CANNOT be sandboxed — the review family '
+            'cannot, because ReviewCheckpoint._run_review raises ValueError on '
+            'any project_root containing /tmp/pytest — add the module to '
+            '_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS in this file with the REASON '
+            'recorded. That adjudication is this guard\'s whole purpose; an '
+            'entry with no reason defeats it.\n'
+            f'Un-adjudicated: {dict(unadjudicated)}'
+        )
+
+        # -- a NEW literal inside an already-adjudicated module. Adjudicating a
+        #    module wholesale would pre-approve it, which is the same silent
+        #    appearance one directory over.
+        miscounted = {
+            module: (sites, _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS[module].sites)
+            for module, sites in census.items()
+            if len(sites) != _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS[module].sites
+        }
+        assert not miscounted, (
+            'Absolute-/tmp project_root literal COUNT changed in an '
+            'already-adjudicated module.\n'
+            'The allowlist adjudicates a fixed number of sites per module, not '
+            'the module wholesale, precisely so a new literal added beside an '
+            'adjudicated one still has to be ruled on rather than inheriting its '
+            "neighbour's approval.\n"
+            'Fix: point the new site at MOCK_WORKFLOW_PROJECT_ROOT or sandbox it, '
+            "or bump the module's `sites=` count and extend its `reason` to cover "
+            'what you added. If the count went DOWN, a literal was named or '
+            'removed — lower the count to match, so the entry keeps its teeth.\n'
+            f'{{module: (found, adjudicated)}}: {miscounted}'
+        )
+
+        # -- an entry naming a module that no longer holds a literal is rot: it
+        #    silently pre-approves whatever that module does next. Same shape as
+        #    the steward census's staleness check above.
+        stale = sorted(set(_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS) - set(census))
+        assert not stale, (
+            f'_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS names {stale}, which no '
+            f'longer hold an absolute-/tmp project_root literal. Remove the '
+            f'entries — a stale adjudication pre-approves whatever that module '
+            f'writes next, unexamined.'
+        )
 
     # -- detector self-tests: synthetic sources, so this module never self-trips
     #    and no test here triggers a full-tree scan.
