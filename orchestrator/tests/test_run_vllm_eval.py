@@ -2186,17 +2186,36 @@ class TestBuildEvalEnvSharedPool:
 
     @staticmethod
     def _fake_project_root(
-        monkeypatch, tmp_path: Path, dotenv: str = "RUNPOD_API_KEY=rpa_test_fake_key\n"
+        monkeypatch,
+        tmp_path: Path,
+        dotenv: str = "RUNPOD_API_KEY=rpa_test_fake_key\n",
+        roster: str = _SHARED_POOL_YAML,
     ) -> Path:
-        """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``."""
+        """A tmp PROJECT_ROOT holding a shared pool config and a ``.env``.
+
+        THE ``PROJECT_ROOT`` MONKEYPATCH IS HERMETICITY, NOT EVIDENCE OF
+        DYNAMISM. ``launcher.PROJECT_ROOT`` is a module constant hardcoded
+        to the main checkout; it is redirected here only so a test reads a
+        roster and a ``.env`` it owns instead of the real ones. Nothing in
+        this class should be read as a claim that the launcher resolves its
+        root at runtime — it does not, and ``build_eval_env``'s docstring
+        says so.
+
+        A pool credential is seeded by default because ``build_eval_env``
+        now ABORTS when the roster resolves none (see
+        ``test_a_missing_pool_credential_aborts_the_run``); tests that want
+        a different arrangement re-clear and set their own.
+        """
         (tmp_path / "config").mkdir()
-        (tmp_path / "config" / "usage-accounts.yaml").write_text(_SHARED_POOL_YAML)
+        (tmp_path / "config" / "usage-accounts.yaml").write_text(roster)
         # Exercise the dotenv branch. It overwrites os.environ values into
         # the returned dict, so the fixture must control its content to keep
         # the token assertions deterministic; the default body deliberately
         # sets no CLAUDE_OAUTH_TOKEN_*, leaving monkeypatch.setenv in charge.
         (tmp_path / ".env").write_text(dotenv)
         monkeypatch.setattr(launcher, "PROJECT_ROOT", tmp_path)
+        TestBuildEvalEnvSharedPool._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
         return tmp_path
 
     @staticmethod
@@ -2288,24 +2307,96 @@ class TestBuildEvalEnvSharedPool:
             "eval costs him the account it was held back for."
         )
 
-    def test_a_alone_does_not_silently_seed_the_run(
-        self, monkeypatch, tmp_path, capsys
+    def test_a_missing_pool_credential_aborts_the_run(
+        self, monkeypatch, tmp_path
     ) -> None:
-        """With no pool token, fail LOUD rather than falling back to A."""
+        """With no pool token, ABORT — a print-and-continue is not loud.
+
+        The first version of this test pinned a warning plus an empty seed.
+        That is not failing loud: nothing stopped, and ``env[...] = ""``
+        additionally clobbered any valid ``CLAUDE_CODE_OAUTH_TOKEN``
+        inherited from the ambient environment, so the campaign launched a
+        pod and only then failed, at an invocation boundary, with a much
+        less legible error. An eval run with no credential cannot succeed;
+        continuing only defers and disguises the failure.
+        """
         self._fake_project_root(monkeypatch, tmp_path)
         self._clear_oauth_tokens(monkeypatch)
         monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_A", "SENTINEL-INTERACTIVE-A")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "SENTINEL-AMBIENT-SEED")
+
+        with pytest.raises(SystemExit) as excinfo:
+            launcher.build_eval_env()
+
+        message = str(excinfo.value)
+        assert "CLAUDE_OAUTH_TOKEN_B" in message and "CLAUDE_OAUTH_TOKEN_G" in message, (
+            "the abort must name the pool credentials it tried, or an "
+            f"operator cannot tell which one to set: {message!r}"
+        )
+        assert "SENTINEL-INTERACTIVE-A" not in message, (
+            "the interactive account's token must never be adopted OR echoed; "
+            f"it is not rostered, so it is not a candidate at all: {message!r}"
+        )
+
+    def test_the_seed_is_drawn_from_the_roster_in_failover_order(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Any POOL credential will do — take the first the roster names.
+
+        The seed used to be hardcoded to one account, which contradicted
+        the stated contract ("it only needs to be a valid pool credential,
+        not a specific one") and stranded a whole campaign the day that one
+        token was rotated or absent. Deriving it from the roster honours
+        the contract, keeps UsageGate's failover order as the tie-break,
+        and excludes account A structurally rather than by name.
+        """
+        self._fake_project_root(monkeypatch, tmp_path)
+        self._clear_oauth_tokens(monkeypatch)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "SENTINEL-POOL-B")
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_G", "SENTINEL-POOL-G")
+
+        first = launcher.build_eval_env()["CLAUDE_CODE_OAUTH_TOKEN"]
+
+        assert first == "SENTINEL-POOL-B", (
+            "with both rostered credentials present the seed must be the "
+            "roster's FIRST entry, matching the order UsageGate fails over "
+            f"in: {first!r}"
+        )
+
+        # ...and the roster's later entries are real fallbacks, not decoration.
+        monkeypatch.delenv("CLAUDE_OAUTH_TOKEN_B")
+        fallback = launcher.build_eval_env()["CLAUDE_CODE_OAUTH_TOKEN"]
+
+        assert fallback == "SENTINEL-POOL-G", (
+            "with the roster's first credential absent the seed must fall "
+            "through to the next rostered one; pinning a single hardcoded "
+            f"env var strands the campaign on a rotation: {fallback!r}"
+        )
+
+    def test_an_ambient_usage_accounts_file_is_overridden(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Setting the var is what stops a stale roster choosing the accounts.
+
+        This is the load-bearing half of "why set it rather than leave it
+        unset": ``env`` starts as ``os.environ.copy()`` and the ``.env``
+        loader writes into it too, so a shell still pointing at a retired
+        campaign's roster — exactly the kind that carried the injected
+        account this task removed — would otherwise silently win.
+        """
+        root = self._fake_project_root(monkeypatch, tmp_path)
+        stale = tmp_path / "retired-campaign-accounts.yaml"
+        stale.write_text(
+            "accounts:\n  - name: max-a\n    oauth_token_env: CLAUDE_OAUTH_TOKEN_A\n"
+        )
+        monkeypatch.setenv("USAGE_ACCOUNTS_FILE", str(stale))
 
         env = launcher.build_eval_env()
 
-        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "", (
-            "with no pool token available the seed must stay empty so the "
-            "missing credential surfaces; falling back to the interactive "
-            "account A would silently reintroduce the retired behaviour "
-            f"(got {env['CLAUDE_CODE_OAUTH_TOKEN']!r})"
-        )
-        assert "no CLAUDE_OAUTH_TOKEN found" in capsys.readouterr().out, (
-            "a missing pool credential must still be announced — the warning "
-            "is what turns an empty seed from a silent misconfiguration into "
-            "a legible one"
+        assert env["USAGE_ACCOUNTS_FILE"] == str(
+            root / "config" / "usage-accounts.yaml"
+        ), (
+            "an ambient USAGE_ACCOUNTS_FILE must not survive: the launcher "
+            "states the roster for the run it is launching, and the ambient "
+            f"value here rosters the retired interactive account: {env['USAGE_ACCOUNTS_FILE']!r}"
         )

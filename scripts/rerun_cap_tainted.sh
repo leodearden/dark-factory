@@ -24,10 +24,18 @@
 # its own roster of "shared pool + max-a"; account A is reserved for
 # INTERACTIVE use only — Leo's own sessions exhaust its weekly cap most
 # weeks, so it never was the uncapped reserve that injection assumed
-# (ruling 2026-08-30, tasks 4741/4945). USAGE_ACCOUNTS_FILE is still
-# exported below: the override is how a run selects its roster, and the
-# orchestrator config's own default is a hardcoded absolute path into the
-# main checkout. What was retired is what it pointed AT.
+# (ruling 2026-08-30, tasks 4741/4945). What was retired is what
+# USAGE_ACCOUNTS_FILE pointed AT, not the export itself, which is kept for
+# two reasons — neither of which is worktree self-consistency, an argument
+# this comment used to make and which cannot hold while the path below is
+# itself hardcoded to the main checkout. It is kept because (1) it
+# OVERRIDES an ambient value: this script sources .env with `set -a`, so a
+# dotenv or shell still pointing at a retired campaign's roster would
+# otherwise silently choose the accounts for the rerun; and (2) it is the
+# cross-project seam for "which roster does this run use", read by
+# shared.config_models.UsageCapConfig and by reify's orchestrator config,
+# so exporting it states the roster in the run's env and in the log line
+# below rather than leaving a reader to resolve a config default.
 
 set -uo pipefail
 
@@ -58,8 +66,10 @@ echo "[$(date +%H:%M:%S)] === Cloud baseline reruns ==="
 
 # Point at the shared fleet pool verbatim — no synthesised roster. This
 # mirrors run_vllm_eval.py's build_eval_env(), which was corrected in the
-# same change (task 4945). The variable name is kept so the per-invocation
-# override further down needs no restructuring.
+# same change (task 4945). The export lands AFTER the .env source above so
+# it wins over any ambient value (see THE ROSTER in the header). The
+# variable name is kept so the per-invocation override further down needs
+# no restructuring.
 EVAL_ACCOUNTS_FILE=/home/leo/src/dark-factory/config/usage-accounts.yaml
 export USAGE_ACCOUNTS_FILE="$EVAL_ACCOUNTS_FILE"
 echo "[$(date +%H:%M:%S)] Eval accounts file: $EVAL_ACCOUNTS_FILE"
