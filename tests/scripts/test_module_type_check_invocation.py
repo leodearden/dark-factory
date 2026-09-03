@@ -327,6 +327,42 @@ def test_the_field_scan_covers_every_guarded_command_field() -> None:
     )
 
 
+# The floor set: the nine module config prefixes MEASURED on this tree at
+# planning time by running the real production loader
+# (config._discover_module_configs). `tests/scripts` carries a slash — it is
+# not a depth-1 name, which is exactly why the guards below delegate to the
+# production walk rather than globbing depth-1 directories.
+#
+# A LOCAL COPY, not an import, for two reasons:
+#   * Importing `test_module_verify_budgets.py::KNOWN_MODULE_CONFIG_PREFIXES`
+#     would import a SIBLING TEST FILE — the coupling task 4320's corrected
+#     doctrine still forbids, because it lets a regression in one guard
+#     silence another. The repo already carries two deliberate copies of this
+#     same nine-element floor (that constant, and
+#     `test_fallback_verify_config.py::KNOWN_PER_MODULE_CONFIG_NAMES`), so a
+#     third is the established idiom here, not new drift.
+#   * Divergence is NOT silent: a prefix named here that discovery no longer
+#     registers fails RED at the floor assertion in the guards below, which is
+#     the whole reason the floor is asserted rather than merely documented.
+#
+# No edit to `test_module_verify_budgets.py` or `test_fallback_verify_config.py`
+# accompanies this constant; neither file is imported and neither imports this
+# one.
+KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
+    {
+        'cockpit',
+        'dashboard',
+        'escalation',
+        'fused-memory',
+        'orchestrator',
+        'sampler',
+        'scripts',
+        'shared',
+        'tests/scripts',
+    }
+)
+
+
 def test_no_discovered_module_config_shells_a_guarded_command_through_npx(
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],
 ) -> None:
