@@ -475,6 +475,15 @@ def deselecting_expression_for_command(
     load-bearing: were the two arms to answer differently, the arm with the
     weaker guards would over-fire on a config its command never applies.
 
+    That sharing is also how both arms acquired CLASS-level marker detection
+    (task 4561) without either one being edited: the probe's module-wide tier
+    is ``orchestrator/pytest_markers.py::guaranteed_marker_names``, which now
+    proves a class-level ``pytestmark`` or class decorator too — but only where
+    its all-items-accounted-for guard can show every collected item lives
+    inside a marked class. Widening that ONE tier gave both arms the capability
+    in one place; adding a second call site to "wire up" the other arm would
+    have created exactly the divergence this shared probe exists to prevent.
+
     *targets* are worktree-ROOT-relative (the frame *worktree_reader* reads in),
     while the command's own targets may be cwd-relative — only the CONFIG path
     below follows the command's ``cwd_rel``. A caller holding cwd-relative
