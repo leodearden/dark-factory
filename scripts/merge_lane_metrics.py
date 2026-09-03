@@ -251,3 +251,63 @@ def _comment_lines(source: str, *, path: str) -> set[int]:
             f'{path}: could not be tokenized -- {exc.__class__.__name__}: {exc}'
         ) from exc
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Per-file size measures.
+
+
+@dataclasses.dataclass(frozen=True)
+class FileSizeMeasures:
+    """Physical lines, and how many of them are docstring or comment."""
+
+    lines: int
+    prose_lines: int
+
+
+def _docstring_lines(tree: ast.Module) -> set[int]:
+    """Line numbers spanned by every docstring in *tree*.
+
+    A docstring is the FIRST body element of a module, class or function when it
+    is a bare string expression -- exactly Python's own rule, so a second string
+    expression in the same body is code, not prose.
+    """
+    lines: set[int] = set()
+    holders: tuple[type[ast.AST], ...] = (
+        ast.Module,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, holders):
+            continue
+        body = getattr(node, 'body', None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            end = first.end_lineno if first.end_lineno is not None else first.lineno
+            lines.update(range(first.lineno, end + 1))
+    return lines
+
+
+def file_size_measures(source: str, *, path: str) -> FileSizeMeasures:
+    """Measure *source*'s physical and prose line counts.
+
+    ``prose_lines`` is the UNION of two line-number sets -- docstring spans
+    (from the AST) and COMMENT-token lines (from stdlib ``tokenize``) -- so a
+    line that is both counts once. Token-based comment detection is what makes
+    ``url = 'http://x/#frag'`` correctly zero prose lines; a regex over source
+    text cannot.
+
+    Raises ``MetricsError`` naming *path* when the source cannot be parsed or
+    tokenized. INV-11: never a zero or None measure for a file we failed to read.
+    """
+    tree = _parse(source, path=path)
+    prose = _docstring_lines(tree) | _comment_lines(source, path=path)
+    return FileSizeMeasures(lines=len(source.splitlines()), prose_lines=len(prose))
