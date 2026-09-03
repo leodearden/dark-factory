@@ -1973,6 +1973,177 @@ class TestDebtReEntry:
         assert row.opened_at == self.T4.isoformat()
 
 
+def _seed_debt_raw(
+    db_path: Path,
+    *,
+    test_id: str,
+    opened_at: str = '2026-08-06T12:00:00+00:00',
+    resolved_at: str | None = None,
+    owner_task_id: str | None = '4396',
+    open_count: int = 1,
+    prior_resolved_at: str | None = None,
+    prior_resolving_commit: str | None = None,
+) -> None:
+    """Insert one ``flake_debt`` row with raw sqlite3 — never through ``open_debt``.
+
+    Same bypass-the-module-under-test convention :func:`_rows` follows: the batched
+    reader's job is to report what is ON DISK, so seeding it through the write path
+    would let a shared bug in the two hide the discrepancy.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'INSERT INTO flake_debt '
+            '(test_id, project_id, opened_at, resolved_at, owner_task_id, open_count, '
+            ' prior_resolved_at, prior_resolving_commit, last_occurrence_at) '
+            "VALUES (?, 'dark_factory', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                test_id,
+                opened_at,
+                resolved_at,
+                owner_task_id,
+                open_count,
+                prior_resolved_at,
+                prior_resolving_commit,
+                opened_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestReadDebtMany:
+    """The BATCHED debt reader ι's report needs so its chain build is O(1) connections.
+
+    ``read_debt`` is a primary-key lookup, and a report that calls it once per test pays
+    α's full ``_open`` cost per test — ``parent.mkdir`` → ``connect`` → the five-pragma
+    durability triad (including a ``journal_mode=WAL`` switch and ``synchronous=FULL``)
+    → ``executescript(_SCHEMA)`` — against the live ``runs.db`` the merge lane holds a
+    5s busy timeout on.  This reader answers the same question for a whole batch on ONE
+    connection.
+
+    The contract pinned here is that it is a faithful BATCHED FORM of ``read_debt``, not
+    a second reader with its own semantics: a miss is an ABSENT KEY (so a call site's
+    ``.get()`` reproduces ``read_debt``'s ``DebtRow | None`` exactly), and RESOLVED rows
+    come back, which is the entire point — the between-cycles chain is what needs them.
+    """
+
+    OPEN_A = 'tests/test_a.py::test_one'
+    OPEN_B = 'tests/test_b.py::test_two'
+    RESOLVED = 'tests/test_resolved.py::test_three'
+    NEVER_SEEN = 'tests/test_never.py::test_nope'
+
+    T_OPENED = '2026-08-06T12:00:00+00:00'
+    T_RESOLVED = '2026-08-07T12:00:00+00:00'
+    T_PRIOR = '2026-08-01T12:00:00+00:00'
+
+    def _seeded(self, tmp_path: Path) -> Path:
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        _seed_debt_raw(db_path, test_id=self.OPEN_A, opened_at=self.T_OPENED)
+        _seed_debt_raw(db_path, test_id=self.OPEN_B, opened_at=self.T_OPENED)
+        # BETWEEN CYCLES: resolved, so `list_open_debt` will not carry it — the case
+        # this reader exists to serve.
+        _seed_debt_raw(
+            db_path,
+            test_id=self.RESOLVED,
+            opened_at=self.T_OPENED,
+            resolved_at=self.T_RESOLVED,
+            open_count=3,
+            prior_resolved_at=self.T_PRIOR,
+            prior_resolving_commit='c0ffee',
+        )
+        return db_path
+
+    def test_returns_a_dict_of_debt_rows_keyed_by_test_id(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import DebtRow, read_debt_many
+
+        db_path = self._seeded(tmp_path)
+
+        result = read_debt_many(db_path, [self.OPEN_A, self.OPEN_B])
+
+        assert set(result) == {self.OPEN_A, self.OPEN_B}
+        assert all(isinstance(row, DebtRow) for row in result.values())
+        assert result[self.OPEN_A].test_id == self.OPEN_A
+        assert result[self.OPEN_A].opened_at == self.T_OPENED
+        assert result[self.OPEN_A].resolved_at is None
+        assert result[self.OPEN_A].owner_task_id == '4396'
+
+    def test_an_id_with_no_debt_row_is_absent_never_mapped_to_none(self, tmp_path: Path) -> None:
+        """A MISS is an absent key, not a ``None`` value.
+
+        That is what makes ``read_debt_many(db, ids).get(t)`` reproduce
+        ``read_debt(db, t)``'s ``DebtRow | None`` contract with no adaptation at the call
+        site — and it keeps "we looked and found nothing" from being indistinguishable
+        from "we never asked", which a ``dict[str, DebtRow | None]`` would collapse.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path = self._seeded(tmp_path)
+
+        result = read_debt_many(db_path, [self.OPEN_A, self.NEVER_SEEN])
+
+        assert self.NEVER_SEEN not in result
+        assert result.get(self.NEVER_SEEN) is None
+        assert set(result) == {self.OPEN_A}
+
+    def test_resolved_rows_are_returned_with_every_prior_cycle_field(
+        self, tmp_path: Path
+    ) -> None:
+        """The between-cycles case that motivates the batched reader at all.
+
+        §5.2 retains resolved rows DELIBERATELY because η's recurrence trigger reads
+        them, and ι's chain goes blank exactly when a test is between cycles unless they
+        come back here.  All four prior-cycle fields are round-tripped, not just
+        ``resolved_at``, because the report prints the whole cycle.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path = self._seeded(tmp_path)
+
+        row = read_debt_many(db_path, [self.RESOLVED])[self.RESOLVED]
+
+        assert row.resolved_at == self.T_RESOLVED
+        assert row.open_count == 3
+        assert row.prior_resolved_at == self.T_PRIOR
+        assert row.prior_resolving_commit == 'c0ffee'
+
+    def test_is_a_drop_in_batched_form_of_read_debt(self, tmp_path: Path) -> None:
+        """DROP-IN EQUIVALENCE, over a mixed batch of open, resolved and unknown ids.
+
+        The strongest available pin that this is the same reader one level up rather
+        than a second one free to drift: whatever ``read_debt`` says for each id
+        individually is exactly what the batch says collectively.
+        """
+        from orchestrator.flake_ledger import read_debt, read_debt_many
+
+        db_path = self._seeded(tmp_path)
+        ids = [self.OPEN_A, self.RESOLVED, self.NEVER_SEEN, self.OPEN_B]
+
+        assert read_debt_many(db_path, ids) == {
+            test_id: row for test_id in ids if (row := read_debt(db_path, test_id)) is not None
+        }
+
+    def test_an_empty_batch_returns_an_empty_dict(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_debt_many
+
+        assert read_debt_many(self._seeded(tmp_path), []) == {}
+
+    def test_duplicate_ids_collapse_to_one_entry(self, tmp_path: Path) -> None:
+        """The call site passes a set difference, but the parameter is an ``Iterable``:
+        a caller handing the same id twice must not waste two of the bounded SQLite
+        variable budget on it, and must not get a different answer for doing so."""
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path = self._seeded(tmp_path)
+
+        assert read_debt_many(db_path, [self.OPEN_A, self.OPEN_A, self.OPEN_A]) == read_debt_many(
+            db_path, [self.OPEN_A]
+        )
+
 def _blocked_path(tmp_path: Path) -> Path:
     """A db_path whose parent DIRECTORY cannot be created — a FILE sits where the
     directory must go, so ``mkdir(parents=True)`` raises.  Portable: no chmod, no root
@@ -2046,6 +2217,20 @@ class TestNeverRaisesSync:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
             assert read_debt(make_path(tmp_path), 'tests/test_a.py::test_one') is None
+        _assert_logged_loudly(caplog)
+
+    def test_read_debt_many(self, tmp_path: Path, caplog, make_path) -> None:
+        """The batched reader degrades to ``{}`` — the WHOLE call, not a partial result.
+
+        Uniform with every sibling here (``read_occurrences`` / ``list_open_debt`` →
+        ``[]``, ``read_debt`` → ``None``), and honest for the failures that actually
+        occur: a corrupt, truncated or lock-contended ``runs.db`` is broken per-DATABASE,
+        not per-row, so there is no chunk that could have succeeded.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert read_debt_many(make_path(tmp_path), ['tests/test_a.py::test_one']) == {}
         _assert_logged_loudly(caplog)
 
     def test_list_open_debt(self, tmp_path: Path, caplog, make_path) -> None:
