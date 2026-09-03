@@ -225,8 +225,28 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      check is simply re-attempted on the next dispatch.  The outer
      ``asyncio.wait_for`` guard is the backstop for a seam that never returns
      AT ALL (a detached/unkillable child, or a hanging custom runner).  All
-     three infra arms file the same category, so their escalation wording is
-     deliberately distinct.
+     three no-verdict arms file the same category as each other, so their
+     escalation wording is deliberately distinct.
+   - RECURRENCE CARRIER (task 4678 / r3, PRD
+     ``docs/prds/recurring-deterministic-tasks.md`` R-D6 + contract C-5): when
+     the task carries ``metadata.recurrence`` — one link of a recurring chain
+     — those THREE no-verdict arms file ``milestone_check_failed`` instead of
+     ``infra_issue``, so every failure leg of a recurring job sits in one
+     deny-listed, discriminable category
+     (``escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES``) rather than
+     vanishing into the fleet's largest bucket.  Three things are deliberately
+     NOT changed by that swap: the ``gate_escalated_at`` stamp is still never
+     written on a no-verdict leg (task 4065 — the check is re-attempted, not
+     latched into resolve-to-done); the three SUMMARIES stay byte-identical, so
+     wording remains the discriminator telling a human which guard fired; and a
+     NON-carrier predicate keeps ``infra_issue`` throughout.  Every DEPLOY path
+     is untouched too — the ``category`` override is passed only from
+     ``_run_predicate``, which no deploy branch reaches, so the
+     ``infra_issue``-keyed deploy-stranded population that
+     ``Harness._revalidate_open_deterministic_escalation`` auto-closes is
+     unaffected.  That population is structurally out of reach here anyway: it
+     additionally requires ``before_done_ran_at`` (or ``deploy_state.phase ==
+     RAN``), and a read-only predicate never writes either.
    - Section-1 resume: when ``gate_escalated_at`` is set and the
      ``milestone_check_failed`` escalation is resolved, RE-RUNS the predicate
      check (delegating back to ``_run_predicate`` — read-only, so repeating it
@@ -2401,10 +2421,14 @@ class DeterministicRunner:
           ``script_runner``, whatever its tail text says.
         - ``ScriptTimeout`` (task 4065) -> an INFRA fault, not a verdict: the
           DEFAULT runner's own inner per-script timeout fired, so no exit code
-          exists.  born-at-L2 ``infra_issue`` + blocked, with NO
+          exists.  born-at-L2 escalation + blocked, with NO
           ``gate_escalated_at`` stamp, so the read-only check is re-attempted
           on the next dispatch instead of being latched into the
-          resolve-to-done path.  See the ``ScriptTimeout`` docstring.
+          resolve-to-done path.  See the ``ScriptTimeout`` docstring.  This
+          arm's DETAIL is the one piece of wording the carrier split changes
+          (next bullet but one): its non-carrier text asserts "deliberately not
+          milestone_check_failed", which would contradict a carrier's own
+          category.
         - Outer-guard timeout / unexpected error -> likewise an INFRA fault
           (no verdict was produced): born-at-L2 escalation + blocked
           (re-attempted on the next dispatch, no ``gate_escalated_at`` stamp).
@@ -2415,13 +2439,18 @@ class DeterministicRunner:
           wording — that text is the only thing telling a human which guard
           fired.
         - CARRIER SPLIT (task 4678 / r3, PRD R-D6 + C-5): for a task carrying
-          ``metadata.recurrence`` — one link of a recurring chain — the
-          outer-guard arm files ``milestone_check_failed`` instead of
-          ``infra_issue``, so a recurring job's failures never disappear into
-          the crowded ``infra_issue`` bucket.  Every OTHER predicate is
-          unchanged.  The STAMP behaviour is identical either way: still no
-          ``gate_escalated_at``, because this is still a no-verdict leg — only
-          the label moves.
+          ``metadata.recurrence`` — one link of a recurring chain — ALL THREE
+          no-verdict arms above file ``milestone_check_failed`` instead of
+          ``infra_issue`` (one ``no_verdict_category``, resolved once from
+          ``_is_recurrence_carrier``), so a recurring job's failures never
+          disappear into the crowded ``infra_issue`` bucket.  Every OTHER
+          predicate — and every deploy path — is unchanged.  Two things do NOT
+          move with the label: the STAMP (still no ``gate_escalated_at``,
+          because these are still no-verdict legs) and the three SUMMARIES
+          (byte-identical, so the arm discriminator keeps working for carriers
+          too).  The single wording change is the ``ScriptTimeout`` arm's
+          detail sentence, which on the carrier path names R-D6 as the reason
+          for the category instead of asserting the opposite of it.
 
         Returns:
             WorkflowOutcome.DONE or WorkflowOutcome.BLOCKED.
@@ -2481,19 +2510,45 @@ class DeterministicRunner:
             # Task 4065: the DEFAULT runner's own per-script timeout fired — no
             # exit code, so no verdict (see ScriptTimeout).  Wording is
             # deliberately distinct from the two sibling arms: all three file
-            # the same infra_issue category, so the text is the only thing
-            # telling a human WHICH guard fired.
+            # the SAME category as each other (`no_verdict_category`), so the
+            # text is the only thing telling a human WHICH guard fired — which
+            # is why task 4678's carrier split moves the category and leaves
+            # every summary byte-identical.
+            # Task 4678: the non-carrier sentence below asserts a CATEGORY
+            # ("deliberately not milestone_check_failed"), so for a carrier —
+            # which IS filed under that category — it would tell a human
+            # reading the escalation the opposite of what the record says.
+            # Both spellings carry the same two FACTS (no exit code -> no
+            # verdict; no gate_escalated_at stamp -> simply re-attempted);
+            # only the category claim differs.
+            if no_verdict_category == MILESTONE_CHECK_FAILED_CATEGORY:
+                _no_verdict_sentence = (
+                    'No exit code was produced, so there is NO verdict and NO '
+                    'gate_escalated_at stamp is written — this read-only check is '
+                    'simply re-attempted on the next dispatch rather than latched '
+                    'into the resolve-to-done path. It is filed under '
+                    'milestone_check_failed because this task carries a '
+                    'metadata.recurrence chain link: PRD '
+                    'docs/prds/recurring-deterministic-tasks.md R-D6 / C-5 puts '
+                    'EVERY failure leg of a recurring chain in one deny-listed, '
+                    'discriminable category rather than in the crowded '
+                    'infra_issue bucket.'
+                )
+            else:
+                _no_verdict_sentence = (
+                    'No exit code was produced, so there is NO verdict — this is an '
+                    'INFRA fault, deliberately not milestone_check_failed ("the '
+                    'invariant does not hold").\n'
+                    'No gate_escalated_at stamp is written: this read-only check is '
+                    'simply re-attempted on the next dispatch rather than latched '
+                    'into the resolve-to-done path.'
+                )
             inner_timeout_detail = '\n'.join([
                 description,
                 f'Predicate check script exceeded its own per-script timeout '
                 f"({exc.timeout_secs}s = before_done['timeout_secs']) and its whole "
                 f'process group was SIGKILLed.',
-                'No exit code was produced, so there is NO verdict — this is an '
-                'INFRA fault, deliberately not milestone_check_failed ("the '
-                'invariant does not hold").',
-                'No gate_escalated_at stamp is written: this read-only check is '
-                'simply re-attempted on the next dispatch rather than latched '
-                'into the resolve-to-done path.',
+                _no_verdict_sentence,
                 "Either the check is genuinely too slow for its configured "
                 "before_done['timeout_secs'] budget (raise it), or whatever it "
                 'probes is itself wedged.',
@@ -2502,6 +2557,7 @@ class DeterministicRunner:
                 task_id,
                 summary='Predicate check script timed out (no verdict produced)',
                 detail=inner_timeout_detail,
+                category=no_verdict_category,
             )
         except Exception as exc:
             # Likewise an infra fault, not a verdict — an unexpected error
@@ -2514,6 +2570,7 @@ class DeterministicRunner:
                 task_id,
                 summary='Predicate check run_fn failed (unexpected error)',
                 detail=error_detail,
+                category=no_verdict_category,
             )
 
         if rc != 0:
