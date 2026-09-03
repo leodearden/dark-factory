@@ -34,7 +34,7 @@ it covers the integrated path those cannot.
 The ``git_repo``/``task_assignment`` fixtures are kept module-local (no
 conftest.py additions), matching ``test_transcript_archive_backstop.py``'s
 documented choice. The shared producer/backstop/gate harness pieces (``ENC``,
-``_config``, ``_make_git_ops``, ``_make_workflow``, ``_config_dir``,
+``_config``, ``_make_git_ops``, ``_make_transcript_workflow``, ``_config_dir``,
 ``_write_transcript``, ``_archived``) live in ``_workflow_helpers.py`` —
 promoted there from three divergent copies by task 4384.
 """
@@ -56,7 +56,7 @@ from _workflow_helpers import (
     _config,
     _config_dir,
     _make_git_ops,
-    _make_workflow,
+    _make_transcript_workflow,
     _write_transcript,
 )
 from shared.transcript_archive import _archival_failures, _reset_archival_failures
@@ -253,7 +253,7 @@ class TestE1ArchivedAtCompletion:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # transcript_archive enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         transcript_bytes = b'{"type":"user","cwd":"/tmp/x"}\n{"type":"assistant"}\n'
 
         result, sid, src = await _producer_invoke(
@@ -304,7 +304,7 @@ class TestE1ArchivedAtCompletion:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo, transcript_archive={'enabled': False})
         assert config.transcript_archive.enabled is False
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         result, sid, src = await _producer_invoke(
             workflow, cwd, payload=b'{"type":"user"}\n'
@@ -362,7 +362,7 @@ class TestE6ResumeReArchives:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         first_lines = [b'{"n":1}\n', b'{"n":2}\n', b'{"n":3}\n']
         result, sid, src = await _producer_invoke(
@@ -429,7 +429,7 @@ class TestE6ResumeReArchives:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         original = b'{"n":1}\n{"n":2}\n{"n":3}\n'
         _result, sid, src = await _producer_invoke(workflow, cwd, payload=original)
@@ -477,7 +477,7 @@ class TestE2SurvivesTeardown:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         transcript_bytes = b'{"type":"user"}\n{"type":"assistant"}\n'
 
         result, sid, src = await _producer_invoke(
@@ -558,7 +558,7 @@ class TestE3BackstopIdempotent:
         assert git_ops.transcript_archive is not None
         assert git_ops.transcript_archive.enabled is True
 
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         a_bytes = b'{"session":"A","n":1}\n'
         result, sid_a, _src_a = await _producer_invoke(
@@ -652,7 +652,7 @@ class TestE7FailureIsSoftAndLoud:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         # A regular FILE where the per-task archive DIRECTORY needs to be.
         archive_root = _archive_root(git_repo)

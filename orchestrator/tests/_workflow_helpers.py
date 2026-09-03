@@ -1237,10 +1237,16 @@ def _make_git_ops(git_repo: Path, **kwargs) -> GitOps:
     )
 
 
-async def _make_workflow(config, git_ops, task_assignment):
+async def _make_transcript_workflow(config, git_ops, task_assignment):
     """Build a probe TaskWorkflow over a REAL worktree, with ``_config_dir``
     set manually (driving ``_invoke`` directly skips ``run()``'s setup where
     ``_config_dir`` is normally created).
+
+    Named ``_make_transcript_workflow`` rather than the bare ``_make_workflow``
+    for the same reason Group B's ``_make_warmlane_workflow`` was: that bare
+    name is reused across the tests dir with different signatures (42
+    module-local definitions measured under orchestrator/tests/), so a shared
+    symbol carrying it is a shadowing hazard at every call site.
     """
     wt_info = await git_ops.create_worktree(task_assignment.task_id)
     cwd = wt_info.path

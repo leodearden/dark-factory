@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import ENC, _archived, _config, _make_git_ops, _make_workflow
+from _workflow_helpers import ENC, _archived, _config, _make_git_ops, _make_transcript_workflow
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
@@ -73,7 +73,7 @@ class TestProducerHook:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # transcript_archive enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         config_dir = workflow._config_dir
         fake_bytes = b'{"transcript":"hello"}\n'
 
@@ -103,7 +103,7 @@ class TestProducerHook:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo, transcript_archive={'enabled': False})
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         with patch('orchestrator.workflow.archive_task_transcripts') as mock_helper, patch(
             'orchestrator.workflow.invoke_with_cap_retry',
@@ -119,7 +119,7 @@ class TestProducerHook:
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         with patch('orchestrator.workflow.archive_task_transcripts') as mock_helper, patch(
             'orchestrator.workflow.invoke_with_cap_retry',
@@ -150,7 +150,7 @@ class TestProducerHook:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         with patch(
             'orchestrator.workflow.archive_task_transcripts',
@@ -181,7 +181,7 @@ class TestProducerHook:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # enabled by default
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
         with patch(
             'orchestrator.workflow.archive_task_transcripts',
@@ -222,7 +222,7 @@ class TestCleanupConfigDirArchivesFirst:
         """(a) The measured bug, closed at its source."""
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
         _src, payload = self._plant_transcript(workflow)
@@ -248,7 +248,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
 
@@ -273,7 +273,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
         src, payload = self._plant_transcript(workflow)
@@ -303,7 +303,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo, transcript_archive={'enabled': False})
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
         self._plant_transcript(workflow)
@@ -327,7 +327,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         workflow.worktree = cwd
         assert workflow._config_dir is not None
         src, payload = self._plant_transcript(workflow, sid='sess-wedged')
@@ -357,7 +357,7 @@ class TestCleanupConfigDirArchivesFirst:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, _cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, _cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         assert workflow._config_dir is not None
         config_dir_path = workflow._config_dir.path
         self._plant_transcript(workflow)
@@ -412,7 +412,7 @@ class TestProducerHookIsUncancellable:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"in flight at SIGTERM"}\n'
 
         def _boom():
@@ -443,7 +443,7 @@ class TestProducerHookIsUncancellable:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"synchronous"}\n'
 
         async def _explode(*_a, **_kw):
@@ -473,7 +473,7 @@ class TestProducerHookIsUncancellable:
         """
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
-        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         payload = b'{"transcript":"still live"}\n'
 
         with patch(

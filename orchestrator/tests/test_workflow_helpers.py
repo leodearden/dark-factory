@@ -235,7 +235,7 @@ def test_e2e_factories_identity() -> None:
 
 # ---------------------------------------------------------------------------
 # Group E: transcript-archival harness (task 4384): ENC, _config,
-# _make_git_ops, _make_workflow, _config_dir, _write_transcript, _archived —
+# _make_git_ops, _make_transcript_workflow, _config_dir, _write_transcript, _archived —
 # promoted out of three divergent copies (test_transcript_archive_producer_hook.py,
 # test_transcript_archive_backstop.py, test_transcript_archival_boundary_gate.py).
 # ---------------------------------------------------------------------------
@@ -244,7 +244,7 @@ def test_e2e_factories_identity() -> None:
 def test_transcript_archival_factories_smoke(tmp_path) -> None:
     """The transcript-archival factories build the paths and objects the suites assert on.
 
-    Only the cheap, pure-path contracts are exercised. `_make_workflow` is
+    Only the cheap, pure-path contracts are exercised. `_make_transcript_workflow` is
     deliberately NOT driven here: it needs a real git repo plus
     `create_worktree`, and all three consumer suites already drive it
     end-to-end, so duplicating that cost buys nothing.
@@ -307,14 +307,14 @@ def test_transcript_archival_factories_identity() -> None:
         _config,
         _config_dir,
         _make_git_ops,
-        _make_workflow,
+        _make_transcript_workflow,
         _write_transcript,
     )
 
     # alpha, the producer suite.
     assert ph.ENC is ENC
     assert ph._config is _config
-    assert ph._make_workflow is _make_workflow
+    assert ph._make_transcript_workflow is _make_transcript_workflow
     assert ph._make_git_ops is _make_git_ops
     assert ph._archived is _archived
 
@@ -329,7 +329,7 @@ def test_transcript_archival_factories_identity() -> None:
     assert bg._config is _config
     assert bg._config_dir is _config_dir
     assert bg._make_git_ops is _make_git_ops
-    assert bg._make_workflow is _make_workflow
+    assert bg._make_transcript_workflow is _make_transcript_workflow
     assert bg._write_transcript is _write_transcript
 
 
