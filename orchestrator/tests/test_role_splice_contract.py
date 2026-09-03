@@ -240,3 +240,128 @@ def test_the_capability_predicate_is_genuinely_a_parameter() -> None:
     with pytest.raises(AssertionError) as excinfo:
         only_alpha.assert_role_set_matches_capability(remedy=_REMEDY)
     assert "gained=['beta']" in str(excinfo.value)
+
+
+def test_every_role_carries_passes_when_the_whole_set_carries_the_constant() -> None:
+    """Every name in `contract.roles` has the constant in its system_prompt."""
+    contract = _contract(
+        _roles(alpha=f'ident{_SPLICE}', beta=f'ident{_SPLICE}', gamma='no splice here'),
+        frozenset({'alpha', 'beta'}),
+    )
+
+    assert contract.assert_every_role_carries(remedy=_REMEDY) is None
+
+
+def test_every_role_carries_fires_and_names_the_role_that_lost_the_constant() -> None:
+    """A covered role missing the constant is reported by name, as a sorted list."""
+    contract = _contract(
+        _roles(alpha=f'ident{_SPLICE}', beta='ident, but the splice was dropped'),
+        frozenset({'alpha', 'beta'}),
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_every_role_carries(remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert "['beta']" in message
+    assert 'SPLICE_UNIT' in message
+    assert _REMEDY in message
+
+
+def test_no_other_role_carries_passes_when_the_splice_stays_inside_the_set() -> None:
+    """No role outside `contract.roles` carries the constant."""
+    contract = _contract(
+        _roles(alpha=f'ident{_SPLICE}', gamma='an excluded role, correctly bare'),
+        frozenset({'alpha'}),
+    )
+
+    assert contract.assert_no_other_role_carries(remedy=_REMEDY) is None
+
+
+def test_no_other_role_carries_fires_and_names_the_errant_splice() -> None:
+    """A role OUTSIDE the set carrying the constant is reported by name."""
+    contract = _contract(
+        _roles(alpha=f'ident{_SPLICE}', gamma=f'excluded, but spliced anyway{_SPLICE}'),
+        frozenset({'alpha'}),
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_no_other_role_carries(remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert "['gamma']" in message
+    assert 'SPLICE_UNIT' in message
+    assert _REMEDY in message
+
+
+def test_containment_assertions_honour_the_half_scoped_constant_override() -> None:
+    """`constant=`/`constant_name=` re-scope both containment checks to one HALF.
+
+    This is the code path `test_artifact_pinned_role_does_not_carry_missing_'
+    `required_parameter_shape` needs: a hand-splice of just ONE half into an
+    excluded role is invisible to the whole-constant negative check (the composed
+    unit is not present), so the half is checked separately through the same body
+    rather than through a fourth copy of the offender-list idiom.
+    """
+    half = '\n### Half\n\nOne composed half.\n'
+    composed = f'{_SPLICE}{half}'
+    all_roles = _roles(
+        alpha=f'ident{composed}',
+        gamma=f'excluded, carrying ONLY the half{half}',
+    )
+    contract = _contract(all_roles, frozenset({'alpha'}), constant=composed)
+
+    # The whole-constant negative check does NOT see the errant half-splice...
+    assert contract.assert_no_other_role_carries(remedy=_REMEDY) is None
+
+    # ...but the half-scoped one does.
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_no_other_role_carries(
+            constant=half, constant_name='HALF_CONSTANT', remedy=_REMEDY
+        )
+    message = str(excinfo.value)
+    assert "['gamma']" in message
+    assert 'HALF_CONSTANT' in message
+
+    # The positive direction re-scopes the same way.
+    assert (
+        contract.assert_every_role_carries(
+            constant=half, constant_name='HALF_CONSTANT', remedy=_REMEDY
+        )
+        is None
+    )
+    bare = _contract(
+        _roles(alpha=f'ident{_SPLICE}'), frozenset({'alpha'}), constant=composed
+    )
+    with pytest.raises(AssertionError) as excinfo:
+        bare.assert_every_role_carries(
+            constant=half, constant_name='HALF_CONSTANT', remedy=_REMEDY
+        )
+    assert "['alpha']" in str(excinfo.value)
+
+
+def test_an_emptied_constant_makes_every_containment_check_pass_vacuously() -> None:
+    """The vacuous-pass hazard, pinned in executable form.
+
+    The empty string is a substring of every string, so a contract whose
+    `constant` has been emptied satisfies `assert_every_role_carries` for a role
+    whose prompt carries nothing at all. That is not a defect in this helper —
+    it is `str.__contains__`, and no containment check can detect it.
+
+    It IS why the guards around containment are not redundant with it: each
+    consumer keeps a separate `assert_nonempty` on its constant, and
+    `assert_composes` checks each half's non-emptiness before checking that the
+    half is contained. Removing either on the grounds that "the containment test
+    already covers it" would reopen exactly this hole — which is the
+    silent-removal-during-a-prompt-refactor regression both consumer modules name
+    as their motivating risk.
+    """
+    contract = _contract(_roles(alpha='no splice anywhere in this prompt'), frozenset({'alpha'}))
+
+    assert (
+        contract.assert_every_role_carries(constant='', constant_name='EMPTIED', remedy=_REMEDY)
+        is None
+    )
+    # ...and the guard that DOES catch it:
+    with pytest.raises(AssertionError):
+        assert_nonempty('EMPTIED', '', remedy=_REMEDY)
