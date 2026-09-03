@@ -1817,3 +1817,89 @@ class TestCliContract:
     def test_baseline_defaults_to_the_committed_path(self) -> None:
         args = metrics._build_parser().parse_args(['--check'])
         assert Path(args.baseline).name == 'merge_lane_ratchet_baseline.json'
+
+
+# ---------------------------------------------------------------------------
+# THE RATCHET ITSELF.
+#
+# Everything above pins the instrument. This is the gate: the live tree, the
+# committed baseline, and the comparator the CLI's --check runs verbatim.
+
+_BASELINE_PATH = _REPO_ROOT / metrics.BASELINE_RELPATH
+
+
+@pytest.fixture(scope='module')
+def committed_baseline() -> dict:
+    return metrics.load_baseline(_BASELINE_PATH)
+
+
+def test_merge_lane_ratchet_holds(
+    live_report: dict, committed_baseline: dict
+) -> None:
+    violations = metrics.check_against_baseline(live_report, committed_baseline)
+    assert not violations, (
+        'The merge-lane quality ratchet has been breached by '
+        f'{len(violations)} measure(s):\n'
+        + '\n'.join(f'  - {v.message}' for v in violations)
+        + '\n\nRemedy: LOWER the measure. A task that legitimately lowers one '
+        'regenerates the baseline in the SAME commit:\n'
+        '  python scripts/merge_lane_metrics.py --write-baseline '
+        f'{metrics.BASELINE_RELPATH}\n'
+        'A task may never RAISE a measure, and regenerating the baseline to '
+        'make this test go green silently widens the ratchet for every task '
+        'that follows.'
+    )
+
+
+class TestBaselineIsNotVacuous:
+    """Anti-vacuity floors, the shape every sibling guard here carries.
+
+    Without them the ratchet passes just as happily against a baseline that
+    measured NOTHING -- an empty files map compares clean against every path,
+    and a green gate would certify a cluster nobody looked at.
+    """
+
+    def test_the_baseline_names_the_whole_cluster(
+        self, committed_baseline: dict
+    ) -> None:
+        assert len(committed_baseline['files']) >= 20
+
+    def test_the_baseline_cognitive_total_is_real(
+        self, committed_baseline: dict
+    ) -> None:
+        # Measured 4,607 across 724 lane functions on the introducing commit.
+        assert metrics.derive_totals(committed_baseline)['cognitive'] >= 4000
+
+    def test_the_baseline_line_total_is_real(self, committed_baseline: dict) -> None:
+        # Measured 54,048 lines across the 22-path cluster.
+        assert metrics.derive_totals(committed_baseline)['lines'] >= 50000
+
+    def test_the_baseline_represents_the_lane_importing_test_files(
+        self, committed_baseline: dict
+    ) -> None:
+        # Measured 226 lane-importing files under orchestrator/tests.
+        assert len(committed_baseline['tests']) >= 150
+
+    def test_the_baseline_enumeration_was_complete_when_recorded(
+        self, committed_baseline: dict
+    ) -> None:
+        assert committed_baseline['enumeration']['complete'] is True
+        assert committed_baseline['enumeration']['unreadable'] == []
+
+
+def test_baseline_matches_a_fresh_measurement(live_report: dict) -> None:
+    """The committed bytes must equal what measuring this tree produces now.
+
+    Without this, a baseline could sit ABOVE the truth -- recording numbers
+    nobody ever lowered it to match -- and every one of those slack measures
+    would be headroom a later task could silently grow into while the ratchet
+    stayed green.
+    """
+    assert _BASELINE_PATH.read_text(encoding='utf-8') == metrics.render_baseline(
+        live_report
+    ), (
+        'The committed baseline is not what measuring this tree produces. '
+        'Regenerate it in this commit if you lowered a measure:\n'
+        '  python scripts/merge_lane_metrics.py --write-baseline '
+        f'{metrics.BASELINE_RELPATH}'
+    )
