@@ -969,6 +969,126 @@ class TestMockWorkflowProjectRootContract:
         )
 
 
+def _tmp_literal(value: ast.expr) -> str | None:
+    """The ``/tmp`` string *value* denotes, or ``None`` if it does not denote one.
+
+    Two shapes, and both are needed.  ``Path('/tmp/x')`` is how 20 of the 21
+    sites in the tree are spelled, but the ``Path(...)`` wrapper is not what
+    makes a literal an escape — a bare ``'/tmp/x'`` points just as far outside
+    pytest's sandbox, and several seams in the tree accept a ``str`` root.
+    Matching only the wrapped form would leave the plainer spelling invisible.
+
+    ``/tmp`` specifically, by prefix: it is where ``tmp_path`` lives, so a
+    ``/tmp`` literal is the one that LOOKS sandboxed while sitting outside the
+    retention sweep — the confusion this whole lineage is about.  The prefix is
+    ``/tmp`` and not ``/tmp/`` because ``Path('/tmp')`` itself is a live site
+    (test_review_checkpoint_cap.py, test_review_checkpoint_full_gate.py); the
+    cost is that a hypothetical ``/tmpfoo`` would also match, which is a
+    false-positive costing one allowlist line rather than a blind spot.
+
+    ONE DELIBERATE FALSE NEGATIVE, recorded so it reads as a decision and not an
+    oversight: a COMPOUND value is not inspected, so
+    ``test_harness_train_callbacks.py``'s
+    ``config.project_root = tmp_path or Path('/tmp/proj')`` does not match.  That
+    site is a hybrid — its ``_tc_config`` factory already takes the sandboxed
+    ``tmp_path`` keyword this task's remedy points authors at, and the ``/tmp``
+    literal is only the fallback when a caller omits it.  Recursing into
+    ``BoolOp``/``IfExp`` would flag it, but the census would then be asserting a
+    COUNT over sites whose literal may never be evaluated, which is a weaker
+    claim than the one the allowlist makes about the other 22.  It is left out
+    of the population rather than adjudicated into it.
+    """
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return value.value if value.value.startswith('/tmp') else None
+    if isinstance(value, ast.Call):
+        called = (
+            value.func.id if isinstance(value.func, ast.Name)
+            else value.func.attr if isinstance(value.func, ast.Attribute)
+            else None
+        )
+        # Both call forms, so `pathlib.Path(...)` cannot slip past a rule that
+        # only knew the bare name — the same Name/Attribute symmetry
+        # `_steward_construction_sites` keeps, and for the same reason.
+        if called == 'Path' and value.args:
+            first = value.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                return first.value if first.value.startswith('/tmp') else None
+    return None
+
+
+def _is_project_root_target(target: ast.expr) -> bool:
+    """True if *target* names a ``project_root``, in either shape that occurs.
+
+    * ``ast.Attribute`` with ``.attr == 'project_root'`` — ``config.project_root``,
+      the mock-config assignment that is 16 of the adjudicated sites;
+    * ``ast.Name`` whose id, lowercased and stripped of leading/trailing
+      underscores, ends with ``project_root`` — the module-constant form
+      (``_REVIEW_PROJECT_ROOT``, ``MOCK_WORKFLOW_PROJECT_ROOT``,
+      ``_PROMPT_MARKER_PROJECT_ROOT``).
+
+    The Name form is not optional.  Naming a literal is exactly what this task's
+    remedy does, so a detector that saw only ``config.project_root`` would treat
+    naming as an EXEMPTION: the census would reward the move it exists to make
+    legible, and the entire sanctioned population would be invisible to the
+    guard meant to pin it.
+    """
+    if isinstance(target, ast.Attribute):
+        return target.attr == 'project_root'
+    if isinstance(target, ast.Name):
+        return target.id.lower().strip('_').endswith('project_root')
+    return False
+
+
+def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
+    """Absolute-``/tmp`` ``project_root`` literals in *tree*: ``<lineno> (<literal>)``.
+
+    Shape matches ``_steward_construction_sites``'s return so both censuses read
+    the same way in a failure message.
+
+    WHAT IT MATCHES — an ``ast.Assign`` or ``ast.AnnAssign`` whose target names a
+    ``project_root`` (see ``_is_project_root_target``) and whose value is a
+    ``/tmp`` string literal, bare or wrapped in ``Path(...)`` (see
+    ``_tmp_literal``).  ``Assign.targets`` is a list, so a chained or tuple
+    assignment is covered by construction rather than by a special case.
+
+    WHAT IT DELIBERATELY DOES NOT MATCH, and this is a DECISION rather than a
+    limitation — ``ast.keyword``.  The tree holds ~16 call-keyword sites
+    (``LandedReconciler(project_root='/tmp/proj')`` and friends:
+    test_merge_queue_landed_reconciler.py x13,
+    test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
+    Those bind a real constructor/dataclass PARAMETER rather than an attribute on
+    a ``spec_set`` MagicMock — a structurally different population, and not the
+    one task 3551's sweep found or task 4389 was filed to adjudicate.  Widening
+    the rule to cover them would force this guard to either fix 16 out-of-scope
+    sites or pre-approve them wholesale in the allowlist, and a wholesale
+    sanction is precisely the silent appearance this guard family exists to stop
+    (see ``_Sanctioned.__doc__`` on why ``sites`` is a COUNT, not a flag).  So
+    the boundary is structural, it is pinned by a detector self-test so it reads
+    as deliberate rather than as an oversight, and the kwarg population is
+    carried by its own follow-up ticket.
+
+    A REFERENCE is not a literal.  ``config.project_root = MOCK_WORKFLOW_PROJECT_ROOT``
+    does not match: the literal lives once, in ``_orch_helpers``, where it is
+    adjudicated.  That is what makes the census compatible with its own remedy —
+    were it otherwise, the fix would trip the guard at 16 sites and the only
+    route to green would be to revert it.
+    """
+    sites: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if node.value is None or not any(_is_project_root_target(t) for t in targets):
+            continue
+        literal = _tmp_literal(node.value)
+        if literal is not None:
+            sites.append(f'{node.lineno} ({literal})')
+    return sites
+
+
 class TestAbsoluteTmpProjectRootLiteralsAreCensused:
     """Every absolute-``/tmp`` ``project_root`` literal is adjudicated, with a reason.
 
