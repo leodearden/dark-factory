@@ -56,7 +56,11 @@ Exit codes
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
+import json
+import os
+import tempfile
 import tokenize
 from io import StringIO
 from pathlib import Path
@@ -950,3 +954,140 @@ def derive_totals(report: dict) -> dict[str, int]:
         union.update(entry.get('patch_targets', ()))
     totals['patch_targets'] = len(union)
     return totals
+
+
+# ---------------------------------------------------------------------------
+# Baseline serialization.
+#
+# WHY A HAND-ROLLED WRITER instead of json.dumps(indent=2). PRD gamma1..gamma10
+# run in PARALLEL, each lowering only its own group's numbers and rebasing
+# through the merge lane. indent=2 spreads one path's five measures across six
+# lines, so two branches editing two unrelated paths land inside one diff hunk
+# and conflict. Emitting each files/functions/tests entry on exactly ONE line
+# makes those ten edits disjoint hunks that rebase cleanly. The property is
+# asserted by a test rather than left to formatting habit -- see
+# ``TestRenderBaseline::test_every_per_path_entry_occupies_exactly_one_line``.
+
+#: Emitted as the baseline's leading key, so the rule is in the file a reader
+#: is about to "fix" rather than only in a docstring they will not open.
+BASELINE_README = (
+    'This is a committed RATCHET BASELINE for the merge-lane cluster '
+    '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here is '
+    'frozen at its value on the commit that recorded it: the gate '
+    'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
+    'RISES above these numbers. Equality is fine, lowering is the point. NEVER '
+    'regenerate this file merely to make a test pass -- that silently widens '
+    'the ratchet for every downstream task. A task that legitimately LOWERS a '
+    'measure regenerates the baseline in the SAME commit: '
+    'python scripts/merge_lane_metrics.py --write-baseline '
+    'orchestrator/tests/merge_lane_ratchet_baseline.json'
+)
+
+#: The three per-path maps whose entries get one line each.
+_PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
+
+
+def _render_section(name: str, mapping: dict) -> str:
+    """Render one per-path map with exactly one line per entry, key-sorted."""
+    if not mapping:
+        return f'  {json.dumps(name)}: {{}}'
+    rows = ',\n'.join(
+        f'    {json.dumps(key)}: {json.dumps(mapping[key], sort_keys=True)}'
+        for key in sorted(mapping)
+    )
+    return f'  {json.dumps(name)}: {{\n{rows}\n  }}'
+
+
+def render_baseline(report: dict) -> str:
+    """Serialize *report* as the committed baseline's exact bytes.
+
+    Idempotent: ``render_baseline(json.loads(render_baseline(r)))`` reproduces
+    the same text, so regenerating a baseline from a baseline is a no-op rather
+    than a churned file full of manufactured conflicts. The ``_README`` key is
+    emitted from ``BASELINE_README`` and any inbound one is dropped, which is
+    what makes that hold across a round trip.
+    """
+    entries = [f'  "_README": {json.dumps(BASELINE_README)}']
+    for key, value in report.items():
+        if key == '_README':
+            continue
+        if key in _PER_PATH_SECTIONS and isinstance(value, dict):
+            entries.append(_render_section(key, value))
+        else:
+            # Top-level scalars and the small params/enumeration blocks are
+            # ordinary pretty-printed JSON, shifted one level in.
+            block = json.dumps(value, indent=2).replace('\n', '\n  ')
+            entries.append(f'  {json.dumps(key)}: {block}')
+    return '{\n' + ',\n'.join(entries) + '\n}\n'
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write *text* to *path* via a same-directory tempfile plus os.replace.
+
+    Mirrors ``scripts/census_tagger_debris.py::_atomic_write_text``. A reader --
+    or a concurrently running ratchet -- can never observe a half-written
+    baseline, and a failed write leaves the previous file intact rather than
+    truncated.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def write_baseline(path: Path, report: dict) -> Path:
+    """Render *report* and write it to *path* atomically.
+
+    THE TEXT IS RENDERED BEFORE THE DESTINATION IS TOUCHED, so a rendering
+    failure leaves the committed baseline byte-for-byte intact instead of
+    truncated -- a truncated baseline would be a *widened* ratchet, the one
+    failure mode this instrument must never produce silently.
+    """
+    text = render_baseline(report)
+    target = Path(path)
+    _atomic_write_text(target, text)
+    return target
+
+
+def load_baseline(path: Path) -> dict:
+    """Load the committed baseline, failing HARD and by name (INV-11).
+
+    A missing or malformed baseline is never an empty-baseline PASS. An empty
+    baseline compares clean against every measure, which would disarm the
+    ratchet for all twenty downstream PRD tasks while every gate stayed green --
+    exactly the silent fail-soft INV-11 forbids.
+    """
+    target = Path(path)
+    try:
+        text = target.read_text(encoding='utf-8')
+    except FileNotFoundError as exc:
+        raise MetricsError(
+            f'ratchet baseline {target} does not exist -- a missing baseline is '
+            'a hard failure, never an empty-baseline pass; regenerate it with '
+            '--write-baseline if this is the commit that introduces it'
+        ) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MetricsError(
+            f'ratchet baseline {target} could not be read: '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MetricsError(
+            f'ratchet baseline {target} is not valid JSON: {exc}'
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise MetricsError(
+            f'ratchet baseline {target} holds a '
+            f'{type(loaded).__name__} at top level, expected a JSON object'
+        )
+    return loaded
