@@ -67,6 +67,7 @@ import contextlib
 import json
 import logging
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -736,6 +737,69 @@ def read_debt(db_path: Path, test_id: str) -> DebtRow | None:
         )
         return None
 
+
+def read_debt_many(db_path: Path, test_ids: Iterable[str]) -> dict[str, DebtRow]:
+    """The debt rows for *test_ids*, keyed by ``test_id`` — one connection for the batch.
+
+    The batched form of :func:`read_debt`, and deliberately nothing more: it calls the
+    same :func:`_to_debt_row` on the same columns, so the two cannot drift in how a row
+    becomes a :class:`DebtRow`.  It exists because ι's report builds one chain per test
+    and a per-test :func:`read_debt` pays :func:`_open`'s full cost EACH TIME —
+    ``parent.mkdir`` → ``connect`` → the five-pragma durability triad (including a
+    ``journal_mode=WAL`` switch and ``synchronous=FULL``) → ``executescript(_SCHEMA)`` —
+    against the live ``runs.db`` the merge lane holds a 5s ``busy_timeout`` on.  That is
+    DDL per test on a nominally read-only report; here it is DDL once per report.
+
+    RESOLVED rows are returned, exactly as :func:`read_debt` returns them: §5.2 retains
+    them deliberately because η's recurrence trigger reads them, and they are the whole
+    reason a batched reader is wanted — ι's chain goes blank precisely when a test is
+    BETWEEN cycles, which is the PRD's motivating case.
+
+    A test_id with NO debt row is ABSENT from the result, never present with a ``None``
+    value.  That makes ``read_debt_many(db, ids).get(t)`` reproduce
+    ``read_debt(db, t)``'s ``DebtRow | None`` contract with zero adaptation at the call
+    site, and it keeps "we looked and found nothing" distinguishable from "we never
+    asked" — the collapse a ``dict[str, DebtRow | None]`` would force on every consumer.
+
+    B12: never raises.  A failure degrades the WHOLE call to ``{}`` rather than returning
+    whatever was read so far, uniform with every sibling reader here (``[]`` / ``None``)
+    — the realistic failures are per-DATABASE (corrupt, truncated, lock-contended), not
+    per-row, so a partial result is a state that essentially cannot arise.  The report
+    already renders a missing debt row honestly, and the loud ``exc_info`` warning still
+    names the cause.
+    """
+    # Deduped because the caller passes a set difference and a repeat would waste one of
+    # SQLite's bounded variable slots; SORTED because a `set` iterates in arbitrary
+    # order, and without this the emitted SQL — and, once chunked, the chunk CONTENTS —
+    # would vary run to run in a subsystem whose renderer is contractually byte-stable.
+    # Bound BEFORE the try so the handler's `len(ids)` can never itself raise NameError,
+    # mirroring `record_flake_occurrence`'s `test_ids: tuple[str, ...] = ()` precedent.
+    ids: tuple[str, ...] = ()
+    try:
+        ids = tuple(sorted(set(test_ids)))
+        # Short-circuit BEFORE `_open`: ι's contract is that printing a report never
+        # provisions a DB, and `_open` would `mkdir` + `connect` + run the schema DDL.
+        if not ids:
+            return {}
+
+        conn = _open(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            placeholders = ','.join('?' for _ in ids)
+            rows = conn.execute(
+                f'SELECT * FROM flake_debt WHERE test_id IN ({placeholders})', ids
+            ).fetchall()
+        finally:
+            conn.close()
+        return {row['test_id']: _to_debt_row(row) for row in rows}
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to read debt for %d test(s) from %s',
+            len(ids),
+            db_path,
+            exc_info=True,
+        )
+        return {}
 
 async def open_debt(
     db_path: Path,
