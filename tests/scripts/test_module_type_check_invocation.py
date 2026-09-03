@@ -420,3 +420,136 @@ def test_no_discovered_module_config_shells_a_guarded_command_through_npx(
             f'is a [tool.uv.workspace] member, else `uv run --project '
             f'shared ...`'
         )
+
+
+def test_the_pyright_wrapper_read_skips_configs_with_no_pyright_type_gate() -> None:
+    """`_pyright_wrapper_tokens` reads the PRE-anchor wrapper tokens of the pyright segment.
+
+    Seven lettered cases, built on fabricated `ModuleConfig`s, each pinning a
+    distinct way a naive read could get this wrong.
+    """
+    # (a) the real seven-member (workspace) shape.
+    mc = ModuleConfig(
+        prefix='cockpit',
+        type_check_command='uv run --directory cockpit pyright src/ tests/',
+    )
+    assert _pyright_wrapper_tokens(mc) == ['uv', 'run', '--directory', 'cockpit'], (
+        f'expected the real member shape to read its pre-anchor wrapper '
+        f'tokens, got {_pyright_wrapper_tokens(mc)!r}'
+    )
+
+    # (b) the real two-non-member shape. Together (a) and (b) pin that BOTH
+    # real spellings pass the `uv run` half, which is why the `--project`
+    # selector requirement is NOT generalized (see module docstring).
+    mc = ModuleConfig(
+        prefix='scripts', type_check_command='uv run --project shared pyright scripts/'
+    )
+    assert _pyright_wrapper_tokens(mc) == ['uv', 'run', '--project', 'shared'], (
+        f'expected the real non-member shape to read its pre-anchor wrapper '
+        f'tokens, got {_pyright_wrapper_tokens(mc)!r}'
+    )
+
+    # (c) a config declaring no type gate at all is a legitimate state —
+    # `verify` renders a falsy type_check_command as a SKIPPED PlannedRun —
+    # so the helper returns None rather than raising, for BOTH spellings of
+    # "no command".
+    mc = ModuleConfig(prefix='fake', type_check_command=None)
+    assert _pyright_wrapper_tokens(mc) is None, (
+        'a config with type_check_command=None must read as None, not raise'
+    )
+    mc = ModuleConfig(prefix='fake', type_check_command='')
+    assert _pyright_wrapper_tokens(mc) is None, (
+        "a config with type_check_command='' must read as None, not raise"
+    )
+
+    # (d) a non-pyright type gate is legitimate (verify._has_source_files
+    # already keys on `.rs` as well as `.py`), so this must read as None
+    # rather than crash or misreport.
+    mc = ModuleConfig(prefix='fake', type_check_command='uv run --directory x mypy src/')
+    assert _pyright_wrapper_tokens(mc) is None, (
+        'a non-pyright type gate must read as None, not raise or misreport '
+        'wrapper tokens for the wrong checker'
+    )
+
+    # (e) the pyright segment is the SECOND `&&` clause — proves the read
+    # selects the segment by token rather than assuming the head clause.
+    mc = ModuleConfig(prefix='fake', type_check_command='cd cockpit && uv run pyright src/')
+    assert _pyright_wrapper_tokens(mc) == ['uv', 'run'], (
+        f'expected the SECOND clause to be read as the pyright segment, got '
+        f'{_pyright_wrapper_tokens(mc)!r}'
+    )
+
+    # (f) the POST-anchor `--outputjson` must be excluded from the wrapper
+    # tokens. Position is the whole point of anchor_split, whose docstring
+    # records that the identically spelled `--project` means opposite things
+    # on either side of the anchor.
+    mc = ModuleConfig(
+        prefix='fake', type_check_command='uv run --directory x pyright --outputjson src/'
+    )
+    assert _pyright_wrapper_tokens(mc) == ['uv', 'run', '--directory', 'x'], (
+        f'expected the post-anchor `--outputjson` to be excluded from the '
+        f'wrapper tokens, got {_pyright_wrapper_tokens(mc)!r}'
+    )
+
+    # (g) the bare-PATH shape this guard must FAIL: `[]`, NOT `None`. `[]` and
+    # `None` must be distinguishable, because one means "no opinion, skip"
+    # and the other means "violation".
+    mc = ModuleConfig(prefix='fake', type_check_command='pyright src/')
+    result = _pyright_wrapper_tokens(mc)
+    assert result == [], f'expected an empty wrapper token list, got {result!r}'
+    assert result is not None, (
+        'a bare `pyright src/` type gate must read as `[]` (a violation the '
+        'repo-wide guard fails on), not `None` (which the guard would '
+        'silently skip)'
+    )
+
+
+def test_every_discovered_pyright_type_gate_resolves_through_uv_run(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """Every discovered pyright type gate must resolve pyright through `uv run`.
+
+    THE SECOND REPO-WIDE GUARD. Like the npx ban, this invariant is already
+    GREEN for all nine configs (measured at planning time), so this is
+    regression prevention, not a live defect.
+
+    The npx ban ALONE is insufficient, which is why this guard exists
+    alongside it: satisfying the ban by dropping to a bare `pyright <dir>`
+    resolves off PATH — where pyright does not exist at the worktree root,
+    only inside a member venv (`verify.py`'s `_FALLBACK_UV_PROJECT =
+    'shared'` encodes the same environment pairing) — trading a flaky red
+    for a command-not-found red.
+
+    SKIPS (does not fail) a config with no type_check_command or whose type
+    gate invokes no pyright — see module docstring and
+    `_pyright_wrapper_tokens`'s own docstring for why that is the correct
+    semantic rather than a violation.
+    """
+    discovered = discover_module_configs()
+
+    # Same anti-vacuity floor as the npx-ban guard above; see its comment for
+    # why this is asserted rather than merely assumed.
+    missing = KNOWN_MODULE_CONFIG_PREFIXES - set(discovered)
+    assert not missing, (
+        f'the production walk (config._discover_module_configs) failed to '
+        f'resolve known module config(s) {sorted(missing)} — discovery has '
+        f'regressed, and the uv-run loop below would pass vacuously on the '
+        f'shrunken set. Discovered: {sorted(discovered)}'
+    )
+
+    for prefix, mc in sorted(discovered.items()):
+        pre = _pyright_wrapper_tokens(mc)
+        if pre is None:
+            continue
+        assert pre[:2] == ['uv', 'run'], (
+            f'{prefix}/orchestrator.yaml resolves its pyright type gate '
+            f'through {pre!r} rather than `uv run`. The npx ban alone is '
+            f'insufficient here: dropping to a bare `pyright <dir>` would '
+            f'resolve off PATH — where pyright does not exist at the '
+            f"worktree root, only inside a member venv (verify.py's "
+            f"_FALLBACK_UV_PROJECT = 'shared' encodes the same pairing) — "
+            f'trading a flaky npm-cache red for a command-not-found red. '
+            f'Remedy: `uv run --directory {prefix} pyright ...` if {prefix} '
+            f'is a [tool.uv.workspace] member, else `uv run --project '
+            f'shared pyright ...`'
+        )
