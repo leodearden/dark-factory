@@ -55,11 +55,13 @@ Exit codes
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import contextlib
 import dataclasses
 import json
 import os
+import sys
 import tempfile
 import tokenize
 from io import StringIO
@@ -1340,3 +1342,164 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
         *_check_ceilings(current, baseline),
     ]
     return sorted(violations, key=lambda v: (v.measure, v.key))
+
+
+# ---------------------------------------------------------------------------
+# CLI, in the house shape of scripts/scan_task_toolcall_leaks.py: _build_parser()
+# / _render_table() / main(argv) -> int, with the exit ladder documented in the
+# module docstring above (0 clean, 1 ratchet violations, 2 instrument failure).
+
+#: Where the committed baseline lives, relative to the repo root.
+BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
+
+
+def repo_root() -> Path:
+    """The repo root, derived from this file's location (``<root>/scripts/``)."""
+    return Path(__file__).resolve().parents[1]
+
+
+def _render_table(report: dict, root: Path) -> str:
+    """The human-readable measure table printed by ``--report``.
+
+    ``mi`` (radon's maintainability index) is computed HERE rather than stored in
+    the report: it is reported, never ratcheted, so putting it in the baseline
+    would freeze a number nothing enforces and churn the file whenever radon
+    changed its formula.
+    """
+    files = report.get('files', {})
+    totals = derive_totals(report)
+    params = report.get('params', {})
+    width = max([len(p) for p in files] + [len('TOTALS')])
+
+    lines = [
+        f'merge-lane metrics -- {len(files)} cluster paths, '
+        f'complexipy {params.get("complexipy_version")}',
+        '',
+        f'{"path":<{width}}  {"lines":>7}  {"prose":>7}  {"cognitive":>9}  {"mi":>6}',
+        '-' * (width + 36),
+    ]
+    for path, entry in sorted(files.items()):
+        mi = maintainability_index(_read_source(root, path), path=path)
+        lines.append(
+            f'{path:<{width}}  {entry["lines"]:>7}  {entry["prose_lines"]:>7}  '
+            f'{entry["cognitive"]:>9}  {mi:>6.2f}'
+        )
+    lines.extend(
+        [
+            '-' * (width + 36),
+            f'{"TOTALS":<{width}}  {totals["lines"]:>7}  {totals["prose_lines"]:>7}  '
+            f'{totals["cognitive"]:>9}',
+            '',
+            f'function_local_imports  {totals["function_local_imports"]:>7}',
+            f'reexport_names          {totals["reexport_names"]:>7}',
+            '',
+            f'test suite -- {len(report.get("tests", {}))} lane-importing files '
+            f'under {TESTS_ROOT}',
+            f'  patch_targets (distinct)  {totals["patch_targets"]:>7}',
+            f'  private_reads             {totals["private_reads"]:>7}',
+            '',
+        ]
+    )
+
+    # INV-11's user-observable signal: completeness is legible in the RESULT,
+    # not only in a log line. A partial sweep measures LOW, so a reader who
+    # cannot see this row cannot tell an improvement from a skipped file.
+    enumeration = report.get('enumeration', {})
+    unreadable = list(enumeration.get('unreadable', ()))
+    lines.append(
+        f'enumeration: complete={enumeration.get("complete")}  '
+        f'requested={len(enumeration.get("requested", ()))}  '
+        f'resolved={len(enumeration.get("resolved", ()))}  '
+        f'unreadable={len(unreadable)}'
+    )
+    if unreadable:
+        lines.extend(f'  UNREADABLE: {path}' for path in unreadable)
+    return '\n'.join(lines)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Measure the merge-lane cluster (PRD plans/merge-lane-quality-prd.md '
+            'task alpha) and ratchet every measure against the committed '
+            'baseline. READ-ONLY except under --write-baseline.'
+        ),
+        epilog=(
+            'Exit codes: 0 clean; 1 ratchet violations (a measure rose above '
+            'the baseline, or a new file/function breached a ceiling); '
+            '2 instrument failure (an unparseable cluster file, complexipy '
+            f'missing or outside {COMPLEXIPY_REQUIRED}, a missing or malformed '
+            'baseline, or a baseline whose recorded parameters no longer match '
+            'this tree). 1 and 2 are deliberately distinct: a broken instrument '
+            'must never read as a clean tree or as a real regression.'
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        '--report', action='store_true', help='Print the measure table.'
+    )
+    mode.add_argument(
+        '--json', action='store_true', help='Print the report as JSON.'
+    )
+    mode.add_argument(
+        '--check', action='store_true',
+        help='Compare a fresh measurement against --baseline (the ratchet).',
+    )
+    mode.add_argument(
+        '--write-baseline', metavar='PATH',
+        help='Measure and write a baseline to PATH. Regenerating the committed '
+        'baseline merely to make a test pass silently widens the ratchet for '
+        'every downstream task -- see the file\'s own _README.',
+    )
+    parser.add_argument(
+        '--root', default=str(repo_root()),
+        help='Repo root to measure (default: this script\'s own checkout). '
+        'Pair it with --baseline; on its own it would compare another tree '
+        'against THIS checkout\'s baseline.',
+    )
+    parser.add_argument(
+        '--baseline', default=str(repo_root() / BASELINE_RELPATH),
+        help='Baseline JSON for --check (default: %(default)s).',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. See the module docstring for the exit-code contract."""
+    args = _build_parser().parse_args(argv)
+    root = Path(args.root)
+    try:
+        report = build_report(root)
+        if args.json:
+            print(json.dumps(report))
+            return 0
+        if args.report:
+            print(_render_table(report, root))
+            return 0
+        if args.write_baseline:
+            target = write_baseline(Path(args.write_baseline), report)
+            print(f'wrote {target}')
+            return 0
+        violations = check_against_baseline(report, load_baseline(Path(args.baseline)))
+        if not violations:
+            return 0
+        print(
+            f'{len(violations)} merge-lane ratchet violation(s) against '
+            f'{args.baseline}:',
+            file=sys.stderr,
+        )
+        for violation in violations:
+            print(f'  {violation.message}', file=sys.stderr)
+        print(
+            'A task that legitimately LOWERS a measure regenerates the baseline '
+            'in the SAME commit. A task may never raise one.',
+            file=sys.stderr,
+        )
+        return 1
+    except MetricsError as exc:
+        print(f'merge_lane_metrics: {exc}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
