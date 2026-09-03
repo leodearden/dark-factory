@@ -521,3 +521,143 @@ def test_flag_args_scope_is_the_callers_choice_not_a_default() -> None:
     prefixes = ("--skip", "-p", "--project")
     assert vci.flag_args(shlex.split(segment), prefixes) == ["--project"]
     assert vci.flag_args(vci.anchor_split(segment, "pyright")[1], prefixes) == []
+
+
+# ---------------------------------------------------------------------------
+# pyright_clause_cwds
+# ---------------------------------------------------------------------------
+
+# The live fleet chain's SHAPE, spelled out as a literal rather than read from
+# dark-factory-orchestrator.yaml — this file is the parser's oracle, so it must
+# be able to disagree with the config (the same reason _RUFF / _PYRIGHT /
+# _PYTEST above are literals). The two guards that read the REAL chain are
+# where the live value is asserted:
+# ``test_fallback_verify_config.py::TestRootTypeCheckCommandPyrightInterpreterPinned``
+# and ``test_contributing_type_check_command_drift.py``.
+_NPX_TYPE_CHECK_CHAIN = (
+    "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && "
+    "cd ../dashboard && npx pyright && cd ../shared && npx pyright && "
+    "cd ../escalation && npx pyright && cd ../sampler && npx pyright && "
+    "cd ../cockpit && npx pyright"
+)
+
+# The SAME chain in the runner a contributor is told to use. CONTRIBUTING.md
+# documents `uv run pyright` (wheel lane, uv.lock) against the gate's `npx
+# pyright` (Node lane, package.json) on purpose, and
+# ``test_pyright_version_pin.py`` holds the two to one version. Both spellings
+# must therefore walk through ONE code path — see the equivalence test below.
+_UV_TYPE_CHECK_CHAIN = _NPX_TYPE_CHECK_CHAIN.replace("npx pyright", "uv run pyright")
+
+_SEVEN_MEMBER_CWDS = [
+    "fused-memory",
+    "orchestrator",
+    "dashboard",
+    "shared",
+    "escalation",
+    "sampler",
+    "cockpit",
+]
+
+
+def test_pyright_clause_cwds_resolves_a_live_shaped_chain_in_order() -> None:
+    """(a) Each bare-pyright clause reports the cwd the chain has walked to.
+
+    The ORDERED list is asserted, never a set. Order is the walk's whole
+    semantics: a mis-tracked relative ``cd`` yields a wrong-but-same-set
+    result — swap two ``cd ../<member>`` hops and every member is still
+    present — so a set comparison would pass on exactly the bug this helper
+    exists to catch.
+    """
+    assert vci.pyright_clause_cwds(_NPX_TYPE_CHECK_CHAIN) == _SEVEN_MEMBER_CWDS
+
+
+def test_pyright_clause_cwds_walks_the_uv_and_npx_runners_identically() -> None:
+    """(b) The two lanes CONTRIBUTING.md documents parse through one code path.
+
+    The runner is not part of the walk: a clause is selected by MENTIONING
+    ``pyright``, and the cwd comes from the ``cd`` clauses around it. Pinning
+    that equivalence here is what lets the doc mirror compare a documented
+    ``uv run pyright`` chain against the live ``npx pyright`` one and know the
+    difference it reports is a real DIRECTORY difference, not a parser artifact.
+    """
+    assert vci.pyright_clause_cwds(_UV_TYPE_CHECK_CHAIN) == _SEVEN_MEMBER_CWDS
+    assert vci.pyright_clause_cwds(_UV_TYPE_CHECK_CHAIN) == vci.pyright_clause_cwds(
+        _NPX_TYPE_CHECK_CHAIN
+    )
+
+
+# A chain whose LAST member is entered by uv's own `--project` rather than by a
+# `cd`. The two callers ask genuinely different questions of this shape, which
+# is why `skip_uv_project` is a parameter and not a second function.
+_UV_PROJECT_CHAIN = "cd alpha && npx pyright && cd ../beta && uv run --project beta pyright"
+
+
+def test_pyright_clause_cwds_skips_a_uv_project_clause_by_default() -> None:
+    """(c) The DEFAULT preserves the interpreter-pin semantic verbatim.
+
+    ``uv run --project <member> pyright`` is interpreter-pinned by uv itself,
+    which selects the workspace venv, NOT by that directory's ``[tool.pyright]``
+    block. ``test_fallback_verify_config.py``'s interpreter-pin guard asks
+    "which clauses resolve their interpreter from ``[tool.pyright]``?", so such
+    a clause must stay excluded from what it inspects. Defaulting to ``True``
+    is what keeps that pre-existing caller byte-identical in behaviour after
+    task 4108 lifted the walk into this module.
+    """
+    assert vci.pyright_clause_cwds(_UV_PROJECT_CHAIN) == ["alpha"]
+
+
+def test_pyright_clause_cwds_includes_a_uv_project_clause_when_asked() -> None:
+    """(d) ``skip_uv_project=False`` answers the COVERAGE question instead.
+
+    The doc mirror asks "which directories does this command type-check?", and
+    for that question a ``--project`` spelling is a real answer: the clause
+    genuinely type-checks ``beta``. Were the flag not honoured, a yaml rewritten
+    into ``--project`` form would silently shrink the live side of the mirror
+    and the guard would report the DOC as carrying extra members — a red with a
+    backwards diagnosis.
+    """
+    assert vci.pyright_clause_cwds(_UV_PROJECT_CHAIN, skip_uv_project=False) == ["alpha", "beta"]
+
+
+def test_pyright_clause_cwds_ignores_a_clause_that_is_neither_cd_nor_pyright() -> None:
+    """(e) An unrelated clause is skipped and does not disturb cwd tracking.
+
+    Real chains interleave setup steps; ``npm ci`` is the one this repo's own
+    Node lane would plausibly grow. It must neither contribute a cwd nor reset
+    the one the walk has reached.
+    """
+    assert vci.pyright_clause_cwds("cd alpha && npm ci && npx pyright") == ["alpha"]
+
+
+@pytest.mark.parametrize(
+    ("malformed_cd", "case"),
+    [
+        ("cd beta gamma", "more than a lone `cd <dir>`"),
+        ("cd", "a no-op `cd` with no argument"),
+        ('cd "unclosed', "an unbalanced quote shlex cannot split"),
+    ],
+)
+def test_pyright_clause_cwds_leaves_cwd_unchanged_on_a_malformed_cd(
+    malformed_cd: str, case: str
+) -> None:
+    """(f) A clause that is not an exact two-token ``cd <dir>`` RETURNS, never RAISES.
+
+    This restates ``verify._cd_clause_target``'s documented contract at the
+    level of the walk, and it is restated because task 4108 gave this parser a
+    caller that reads HUMAN-EDITED PROSE. In a markdown bullet a stray
+    apostrophe is ordinary input, not a programming error, so the walker must
+    degrade to "cwd unchanged" rather than blow up inside an extractor whose
+    own failures are supposed to be loud, specific AssertionErrors.
+    """
+    cmd = f"cd alpha && {malformed_cd} && npx pyright"
+    assert vci.pyright_clause_cwds(cmd) == ["alpha"], case
+
+
+def test_pyright_clause_cwds_normalises_relative_hops() -> None:
+    """(g) A ``../`` hop is normalised, not accumulated.
+
+    Without ``normpath`` the second clause would report ``a/../b``, which
+    compares unequal to the plain ``b`` any other reader of the chain produces —
+    so the mirror would report drift between two commands that agree.
+    """
+    assert vci.pyright_clause_cwds("cd a && npx pyright && cd ../b && npx pyright") == ["a", "b"]
