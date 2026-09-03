@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'prune_recon_cycle_summaries.py'
 
@@ -974,14 +974,6 @@ class TestRunApplyStoreMutationPreflight:
         return {pid: '/some/path'}
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis.
 
@@ -1012,11 +1004,11 @@ class TestRunApplyStoreMutationPreflight:
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory=memory,
@@ -1031,7 +1023,7 @@ class TestRunApplyStoreMutationPreflight:
         ``scroll_by_metadata`` plus a conditional ``count_by_metadata`` PER
         PROJECT, and ``--project-id`` is optional, so the wasted work would
         otherwise scale with the size of the project registry."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -1047,7 +1039,7 @@ class TestRunApplyStoreMutationPreflight:
     async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the prune report stays obtainable from anywhere."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
         report = await _mod.run(
@@ -1107,7 +1099,7 @@ class TestRunApplyStoreMutationPreflight:
         Rigged so the scan WOULD abort: an empty scroll against a non-zero
         ground-truth count is the under-count case.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory([])
         memory.mem0.count_by_metadata = AsyncMock(return_value=7)
 
@@ -1131,7 +1123,7 @@ class TestRunApplyStoreMutationPreflight:
         Note ``--yes-i-am-sure`` is NOT a dry-run switch -- it only overrides
         this cap -- so it must not affect the preflight either way.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -1156,7 +1148,7 @@ class TestRunApplyStoreMutationPreflight:
         that ``run`` raises leaves the swallowed-on-the-way-out case -- the one
         that would read as a successful prune -- untested.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
         monkeypatch.setattr(
             sys, 'argv', ['prune_recon_cycle_summaries.py', '--apply'],
@@ -1175,7 +1167,7 @@ class TestRunApplyStoreMutationPreflight:
         monkeypatch.setattr(_mod.asyncio, 'run', _drive)
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 

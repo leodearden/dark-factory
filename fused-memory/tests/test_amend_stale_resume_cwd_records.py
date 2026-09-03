@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import deny, neutralise_fixture
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'amend_stale_resume_cwd_records.py'
@@ -811,10 +811,7 @@ class TestApplyStoreMutationPreflight:
 
     @pytest.mark.asyncio
     async def test_refused_preflight_performs_zero_writes(self, monkeypatch):
-        def _refuse(**_kw):
-            raise _mod.StoreMutationUnavailable('sandboxed: cannot write ~/.mem0')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        deny(_mod, monkeypatch)
         service = _memory_service()
         await _mod.run(service, project_id='dark_factory', apply=True)
         service.update_memory.assert_not_awaited()
@@ -825,10 +822,7 @@ class TestApplyStoreMutationPreflight:
     ):
         # A sandboxed operator must get the report back and see WHY, rather
         # than a stack trace they have to interpret.
-        def _refuse(**_kw):
-            raise _mod.StoreMutationUnavailable('sandboxed: cannot write ~/.mem0')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        deny(_mod, monkeypatch)
         report = await _mod.run(
             _memory_service(), project_id='dark_factory', apply=True,
         )

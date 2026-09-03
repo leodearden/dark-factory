@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params, load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 from fused_memory.maintenance.cross_graph_move import (
     CreateResult,
@@ -2224,14 +2224,6 @@ class TestRunApplyStoreMutationPreflight:
         return mocks, memory_service, graph
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis.
 
@@ -2270,12 +2262,12 @@ class TestRunApplyStoreMutationPreflight:
         a half-applied three-phase move is the worst outcome available (a home
         copy with no edges, or a deleted source whose edges never landed).
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         mocks, memory_service, _ = self._scenario(monkeypatch)
         manifest_path = self._manifest_path(tmp_path)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
@@ -2293,7 +2285,7 @@ class TestRunApplyStoreMutationPreflight:
         """It aborts without reading the reviewed manifest off disk, so a run
         that was never going to be allowed to mutate pays for nothing -- and
         no graph is resolved for the REKEY dispatch either."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _, memory_service, _ = self._scenario(monkeypatch)
         manifest_path = self._manifest_path(tmp_path)
 
@@ -2410,7 +2402,7 @@ class TestRunApplyStoreMutationPreflight:
         so without this record the operator sees a bare traceback naming an
         exception class and no remedy.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _, memory_service, _ = self._scenario(monkeypatch)
         manifest_path = self._manifest_path(tmp_path)
 

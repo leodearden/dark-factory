@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_orphan_flag_markers.py'
 
@@ -3950,14 +3950,6 @@ class TestRunApplyStoreMutationPreflight:
         return memory_service
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis, isolated from ``main``'s generic
         handler.
@@ -3993,11 +3985,11 @@ class TestRunApplyStoreMutationPreflight:
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
@@ -4012,7 +4004,7 @@ class TestRunApplyStoreMutationPreflight:
         counts plus the flag_for_stage2 census) and the scroll enumeration are
         all skipped in an environment that was never going to be allowed to
         delete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -4028,7 +4020,7 @@ class TestRunApplyStoreMutationPreflight:
     async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the sweep report stays obtainable from anywhere."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
 
         report = await _mod.run(
@@ -4091,7 +4083,7 @@ class TestRunApplyStoreMutationPreflight:
         exit code is non-zero, never 0, AND the journal an operator reads
         carries the diagnosis rather than only "fatal error during sweep".
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
         monkeypatch.setattr(
             sys, 'argv', ['sweep_orphan_flag_markers.py', '--apply'],
@@ -4131,7 +4123,7 @@ class TestRunApplyStoreMutationPreflight:
         the store" into "the backlog is within budget". Pin that the refusal
         wins: exit 2, never the predicate's 0.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
         monkeypatch.setattr(
             sys, 'argv',

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
@@ -768,14 +768,6 @@ class TestRunApplyStoreMutationPreflight:
         return {pid: '/some/path'}
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis.
 
@@ -811,11 +803,11 @@ class TestRunApplyStoreMutationPreflight:
         each sits behind its own swallowing ``except Exception``, so a
         zero-mutation claim covering only one of them would be vacuous.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True),
@@ -832,7 +824,7 @@ class TestRunApplyStoreMutationPreflight:
         """It aborts without a single round-trip: neither the first-pass entity
         enumeration nor the second-pass edge scan is paid for by a run that was
         never going to be allowed to mutate."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -850,7 +842,7 @@ class TestRunApplyStoreMutationPreflight:
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the audit report stays obtainable from anywhere, with the
         deny still installed."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         report = await _mod.run(
@@ -913,7 +905,7 @@ class TestRunApplyStoreMutationPreflight:
         than being converted into a 0 exit code, AND the journal an operator
         reads carries the diagnosis.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
         monkeypatch.setattr(sys, 'argv', ['cleanup_count_snapshots.py', '--apply'])
         real_asyncio_run = asyncio.run

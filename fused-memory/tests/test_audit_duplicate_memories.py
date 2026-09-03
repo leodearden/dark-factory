@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
@@ -6678,14 +6678,6 @@ class TestApplyStoreMutationPreflight:
     what makes that warning enforceable rather than advisory.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
     def _raw(self) -> dict:
         """A real two-member cluster, so ``--apply`` has work to refuse."""
         return {_PK: [
@@ -6704,7 +6696,7 @@ class TestApplyStoreMutationPreflight:
         ``finally: await memory.close()`` teardown of a service that was never
         initialized.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply', '--threshold', '0.75',
@@ -6712,7 +6704,7 @@ class TestApplyStoreMutationPreflight:
         ])
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _run(args)
 
@@ -6726,7 +6718,7 @@ class TestApplyStoreMutationPreflight:
         """It aborts without a single Qdrant read: neither ``fetch_memories``'
         per-category scroll (with_vectors=True) nor ``fetch_ann_neighbors``'
         per-record query fan-out is paid for."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         called: list[str] = []
         monkeypatch.setattr(
@@ -6752,7 +6744,7 @@ class TestApplyStoreMutationPreflight:
     ):
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the audit report stays obtainable from anywhere."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--threshold', '0.75',
@@ -6821,7 +6813,7 @@ class TestApplyStoreMutationPreflight:
         ``main`` is a separate claim, tested in
         ``TestApplyStoreMutationPreflightThroughMain``.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, {})
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply',
@@ -6842,14 +6834,6 @@ class TestApplyStoreMutationPreflightThroughMain:
     loop. Sibling suites (``purge``, ``sweep``, ``prune``) drive ``main`` the
     same way.
     """
-
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
 
     @staticmethod
     def _fail_closed_records(caplog) -> list:
@@ -6896,7 +6880,7 @@ class TestApplyStoreMutationPreflightThroughMain:
         import asyncio  # noqa: PLC0415
         import sys  # noqa: PLC0415
 
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, {})
         monkeypatch.setattr(sys, 'argv', [
             'audit_duplicate_memories.py', '--project-id', 'p', '--apply',
@@ -6908,7 +6892,7 @@ class TestApplyStoreMutationPreflightThroughMain:
         )
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 

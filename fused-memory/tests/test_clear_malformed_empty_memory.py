@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'clear_malformed_empty_memory.py'
 
@@ -512,14 +512,6 @@ class TestRunApplyStoreMutationPreflight:
     """
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis, isolated from ``main``'s generic
         handler.
@@ -555,13 +547,13 @@ class TestRunApplyStoreMutationPreflight:
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         args = types.SimpleNamespace(memory_id='id1', apply=True)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(args, client, 'fused_dark_factory')
 
@@ -573,7 +565,7 @@ class TestRunApplyStoreMutationPreflight:
     ):
         """It aborts without even retrieving -- one probe per run, and no
         round-trip to a store it was never going to be allowed to mutate."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         args = types.SimpleNamespace(memory_id='id1', apply=True)
@@ -590,7 +582,7 @@ class TestRunApplyStoreMutationPreflight:
         payload + classification report can always be obtained safely, from
         anywhere. That report IS the investigation (module docstring).
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         args = types.SimpleNamespace(memory_id='id1', apply=False)
@@ -653,7 +645,7 @@ class TestRunApplyStoreMutationPreflight:
         ``asyncio.run`` so ``_run_live`` never constructs a real MemoryService
         (``TestMainFatalErrorHandling``'s idiom).
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         payload = {'data': '', 'category': None, 'agent_id': None}
         client = _make_qdrant_mock([_make_record(payload)])
         monkeypatch.setattr(

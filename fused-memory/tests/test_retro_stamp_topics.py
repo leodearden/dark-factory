@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 from fused_memory import topic_slug as topic_slug_module
 
@@ -2739,14 +2739,6 @@ class TestRunApplyStoreMutationPreflight:
         )
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis.
 
@@ -2782,11 +2774,11 @@ class TestRunApplyStoreMutationPreflight:
         become N ``outcome: 'error'`` rows inside a report that otherwise looks
         like a completed sweep.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = self._service()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await self._run(service, apply=True)
 
@@ -2796,7 +2788,7 @@ class TestRunApplyStoreMutationPreflight:
     async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
         """It aborts without a single round-trip: source (1)'s canonical scroll
         is not paid for by a run that was never going to be allowed to stamp."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = self._service()
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -2809,7 +2801,7 @@ class TestRunApplyStoreMutationPreflight:
         """A rehearsal withholds only the writes, so it must not require the
         ability to write -- the report stays obtainable from anywhere, with the
         deny still installed."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = self._service()
 
         report = await self._run(service, apply=False)
@@ -2859,7 +2851,7 @@ class TestRunApplyStoreMutationPreflight:
         logger rather than ``print`` precisely so it stays off stdout, which
         this script reserves for its machine-read markdown/JSON report.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = self._service()
 
         with (

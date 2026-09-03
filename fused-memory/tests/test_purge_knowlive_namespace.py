@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'purge_knowlive_namespace.py'
 
@@ -894,14 +894,6 @@ class TestRunApplyStoreMutationPreflight:
         return memory_service, graph
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis.
 
@@ -937,7 +929,7 @@ class TestRunApplyStoreMutationPreflight:
         -- a zero-mutation claim that covered only one of the three would be
         vacuous, and the Graphiti DETACH DELETE is the largest of them.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service, graph = self._make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
@@ -945,7 +937,7 @@ class TestRunApplyStoreMutationPreflight:
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory_service,
@@ -962,7 +954,7 @@ class TestRunApplyStoreMutationPreflight:
         (a FalkorDB ro_query plus a mem0 count+get_all, --limit 1000 each) are
         not paid for in an environment that was never going to be allowed to
         purge."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service, graph = self._make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
@@ -988,7 +980,7 @@ class TestRunApplyStoreMutationPreflight:
         docstring calls the dry-run manifest "the only recovery record of what
         is about to be deleted", and it stays obtainable from anywhere.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service, graph = self._make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
@@ -1070,7 +1062,7 @@ class TestRunApplyStoreMutationPreflight:
         handler in ``main``, that record is the only thing standing between an
         operator and an unexplained traceback.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service, _ = self._make_memory_service(
             mem0_members=[_mem0_member('m1')],
         )
@@ -1092,7 +1084,7 @@ class TestRunApplyStoreMutationPreflight:
         monkeypatch.setattr(_mod.asyncio, 'run', _drive)
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 

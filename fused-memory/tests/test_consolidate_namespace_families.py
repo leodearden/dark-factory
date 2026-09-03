@@ -13,7 +13,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 from fused_memory.maintenance.cross_graph_move import SubgraphEdgeResult
 
@@ -2984,14 +2984,6 @@ class TestRunApplyStoreMutationPreflight:
         return memory_service, graphiti, qdrant_client
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis.
 
@@ -3029,12 +3021,12 @@ class TestRunApplyStoreMutationPreflight:
         is the worst outcome available: it strands records in the sibling
         namespace with the canonical copy already written.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         mocks = _patch_merge_primitives(monkeypatch)
         memory_service, graphiti, qdrant_client = self._scenario()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(_run_args(apply=True), memory_service, limit=1000)
 
@@ -3071,7 +3063,7 @@ class TestRunApplyStoreMutationPreflight:
         (task 525, scripts/check_asyncmock_assertion_style.py). Each half now
         asserts in the one style its mock supports.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _patch_merge_primitives(monkeypatch)
         memory_service, graphiti, _ = self._scenario()
 
@@ -3087,7 +3079,7 @@ class TestRunApplyStoreMutationPreflight:
         """The other half of the same claim: the raw Qdrant transport is never
         even opened, so the collection enumeration behind it is not paid for
         either."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _patch_merge_primitives(monkeypatch)
         memory_service, _, _ = self._scenario()
 
@@ -3101,7 +3093,7 @@ class TestRunApplyStoreMutationPreflight:
         """A PREVIEW mutates nothing, so it must not require the ability to
         mutate -- the consolidation report stays obtainable from anywhere, with
         the deny still installed."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         mocks = _patch_merge_primitives(monkeypatch)
         memory_service, _, qdrant_client = self._scenario()
 
@@ -3158,7 +3150,7 @@ class TestRunApplyStoreMutationPreflight:
         so without this record the operator sees a bare traceback naming an
         exception class and no remedy.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _patch_merge_primitives(monkeypatch)
         memory_service, _, _ = self._scenario()
 

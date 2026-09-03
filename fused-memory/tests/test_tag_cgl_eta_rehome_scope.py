@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
 
@@ -490,14 +490,6 @@ class TestRunApplyStoreMutationPreflight:
         return {pid: '/some/path'}
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis.
 
@@ -532,11 +524,11 @@ class TestRunApplyStoreMutationPreflight:
         The mutation asserted here is the raw ``memory.mem0.update`` a pattern
         sweep provably misses -- it is the ONLY write this script performs.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True),
@@ -556,7 +548,7 @@ class TestRunApplyStoreMutationPreflight:
         a full multi-project scroll of up to ``--scan-limit`` records per
         project. Nothing is TAGGED either, which is the point of the guard.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -574,7 +566,7 @@ class TestRunApplyStoreMutationPreflight:
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the tag report stays obtainable from anywhere, with the
         deny still installed."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         report = await _mod.run(
@@ -663,7 +655,7 @@ class TestRunApplyStoreMutationPreflight:
         so without this record the operator sees a bare traceback naming an
         exception class and no remedy.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         with (

@@ -48,7 +48,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 from fused_memory.models import SourceStore
 
@@ -1661,23 +1661,15 @@ class TestRunApplyStoreMutationPreflight:
     per-record probe would detect a fleet-wide condition one record too late.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with pytest.raises(_mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'):
+        with pytest.raises(_mod.StoreMutationUnavailable, match=SENTINEL):
             await _mod.run(_args(apply=True), service)
 
         service.delete_memory.assert_not_awaited()
@@ -1689,7 +1681,7 @@ class TestRunApplyStoreMutationPreflight:
     ):
         """It aborts without even scanning -- one probe per run, not per record,
         and no wasted pagination over a corpus it was never going to repair."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -1710,7 +1702,7 @@ class TestRunApplyStoreMutationPreflight:
         to reach main's container, and replace ``asyncio.run`` so ``_run_live``
         never constructs a real MemoryService.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
         monkeypatch.setattr(sys, 'argv', ['sweep_toolcall_xml_leak.py', '--apply'])
         progress = _mod.new_progress()
@@ -1737,7 +1729,7 @@ class TestRunApplyStoreMutationPreflight:
         mutate. Gating it would break the module's core promise -- that the
         classification report can always be obtained safely, from anywhere.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
         report = await _mod.run(_args(), service)

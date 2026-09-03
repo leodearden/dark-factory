@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import neutralise_fixture
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent
@@ -94,14 +94,6 @@ class TestRunApplyStoreMutationPreflight:
         )
 
     @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
     def _fail_closed_records(caplog) -> list:
         """The guard site's OWN diagnosis.
 
@@ -141,10 +133,10 @@ class TestRunApplyStoreMutationPreflight:
         would become N ``logger.error`` lines and a return of 0 -- an exit code
         an operator and any CI caller would read as a clean run.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod._run(self._args(apply=True))
 
@@ -159,7 +151,7 @@ class TestRunApplyStoreMutationPreflight:
         above the ``ro_query`` candidate scan and the ``update_edge`` calls
         that follow it.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_backend_sentinel(monkeypatch)
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -233,7 +225,7 @@ class TestRunApplyStoreMutationPreflight:
         so without this record the operator sees a bare traceback naming an
         exception class and no remedy.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
 
         with (
             caplog.at_level(logging.ERROR),
