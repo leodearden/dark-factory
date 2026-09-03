@@ -1139,31 +1139,40 @@ class MemoryConsolidator(BaseStage):
     ) -> list[dict]:
         """Return the subset of *records* strictly newer than *watermark*.
 
-        Thin wrapper around the pure ``_is_newer_than_watermark`` predicate
-        (task 4574) that keeps that predicate a trivially unit-testable
-        function of just (raw_ts, watermark) while ALSO classifying and
-        counting the "undatable" case here at the call site: a record whose
-        timestamp is missing, empty, or unparseable. An undatable record is
-        excluded from the result — same as a genuinely older record — but is
-        counted in ``self._undatable_freshness_records`` and logged with its
-        id and raw value via a single structured ``logger.warning``, rather
-        than silently dropped, per design invariant INV-2
-        ``structured-facts-at-failure``. Exclusion (not fail-open inclusion)
-        matters specifically here because a record whose timestamp can never
-        be parsed would otherwise re-surface as "new" on every single cycle
-        forever — the 894fbe90 incident's symptom, reached by a different
-        cause (a string-typed comparison degenerating to date-granularity,
-        vs. an outright unparseable value here).
+        Parses each record's raw timestamp exactly once via ``_parse_instant``
+        and compares it against *watermark* normalized to UTC exactly once per
+        call (hoisted out of the loop as ``wm_utc``) — the same two steps
+        ``_is_newer_than_watermark`` (task 4574) performs per call, inlined
+        here so a record's timestamp is never parsed twice and the watermark
+        is never re-normalized per record. ``_is_newer_than_watermark`` stays
+        the public, independently unit-tested predicate for external callers;
+        this method does not call it.
+
+        ALSO classifies and counts the "undatable" case here at the call
+        site: a record whose timestamp is missing, empty, or unparseable. An
+        undatable record is excluded from the result — same as a genuinely
+        older record — but is counted in ``self._undatable_freshness_records``
+        and logged with its id and raw value via a single structured
+        ``logger.warning``, rather than silently dropped, per design
+        invariant INV-2 ``structured-facts-at-failure``. Exclusion (not
+        fail-open inclusion) matters specifically here because a record
+        whose timestamp can never be parsed would otherwise re-surface as
+        "new" on every single cycle forever — the 894fbe90 incident's
+        symptom, reached by a different cause (a string-typed comparison
+        degenerating to date-granularity, vs. an outright unparseable value
+        here).
 
         *source* and *id_key* are caller-supplied purely to shape the log
         record (``'episodes'``/``'uuid'`` or ``'mem0'``/``'id'``); *get_raw_ts*
         lets the caller apply the mem0-only ``created_at`` -> ``updated_at``
         fallback without duplicating this method per record shape.
         """
+        wm_utc = _to_utc(watermark)
         new_records = []
         for record in records:
             raw_ts = get_raw_ts(record)
-            if _parse_instant(raw_ts) is None:
+            ts = _parse_instant(raw_ts)
+            if ts is None:
                 self._undatable_freshness_records += 1
                 logger.warning(
                     'reconciliation.stage1_undatable_freshness_record',
@@ -1175,7 +1184,7 @@ class MemoryConsolidator(BaseStage):
                     },
                 )
                 continue
-            if _is_newer_than_watermark(raw_ts, watermark):
+            if ts > wm_utc:
                 new_records.append(record)
         return new_records
 
