@@ -46,7 +46,7 @@ The leading underscore also keeps pytest from collecting it as a test module.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from orchestrator.agents.roles import ROLES, AgentRole
@@ -226,3 +226,73 @@ class SpliceContract:
             f'Roles carrying {name} without {self.capability_description}: '
             f'{offenders}. {remedy}'
         )
+
+    def assert_spliced_exactly_once(
+        self,
+        *,
+        constant: str | None = None,
+        constant_name: str | None = None,
+        absent_ok: bool = False,
+        remedy: str,
+    ) -> None:
+        """The constant appears exactly once in every role's ``system_prompt``.
+
+        ``absent_ok`` IS A PER-CONSUMER CHOICE, NOT A DEFAULT TO UNIFY. The three
+        consumer tests deliberately disagree about a count of 0:
+
+        - ``absent_ok=True`` SKIPS it, so a role that has not yet received the
+          splice fails exactly ONE test for that one root cause — the containment
+          test, whose job presence is — instead of two.
+        - ``absent_ok=False`` (the default) treats it as an offender. That is
+          right when the constant is a composed HALF whose composition into the
+          splice unit is separately pinned: a 0 count for the half then proves the
+          whole composed splice is missing from that role.
+
+        Both choices are argued in their own consumers' docstrings. Unifying them
+        would silently change one consumer's coverage.
+        """
+        value, name = self._resolve(constant, constant_name)
+        offenders: dict[str, int] = {}
+        for role_name in sorted(self.roles):
+            count = self.all_roles[role_name].system_prompt.count(value)
+            if count == 0 and absent_ok:
+                continue
+            if count != 1:
+                offenders[role_name] = count
+
+        # A count of 0 only reaches the offender dict when ``absent_ok`` is
+        # False, so the zero-direction sentence is only stated when it can fire.
+        zero_direction = (
+            ''
+            if absent_ok
+            else f' A count of 0 means {name} is missing from that role entirely.'
+        )
+        assert offenders == {}, (
+            f'Roles whose {name} splice count is not exactly 1: {offenders}. '
+            f'A count above 1 means a stale duplicate splice survives beside a '
+            f'new one — delete the extra copy.{zero_direction} {remedy}'
+        )
+
+    def assert_composes(self, halves: Sequence[tuple[str, str]], *, remedy: str) -> None:
+        """The splice unit carries every one of its named halves, none of them empty.
+
+        Structural enforcement of a MUST-COMPOSE mandate: a unit built from
+        several named constants cannot carry one without carrying the others, so
+        no future prompt refactor can splice them apart.
+
+        Each half is checked NON-EMPTY (via the module-level ``assert_nonempty``,
+        so there is one implementation of that message) BEFORE it is checked
+        contained. Containment alone is vacuous for an emptied half — the empty
+        string is a substring of everything — so a refactor could empty a half
+        and leave every containment, count and placement test in the consuming
+        module green while the half's content vanished from every spliced prompt.
+
+        Nothing here assumes two halves; a unit that grows a third census shape
+        needs no new helper.
+        """
+        for name, value in halves:
+            assert_nonempty(name, value, remedy=remedy)
+            assert value in self.constant, (
+                f'{self.constant_name} no longer contains {name}. The composed '
+                f'halves must NEVER be spliced apart. {remedy}'
+            )
