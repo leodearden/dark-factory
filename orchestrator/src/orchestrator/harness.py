@@ -3439,6 +3439,49 @@ class Harness:
             expected = entry / '.task' / f'{CONFIG_DIR_PREFIX}{key}'
             if expected.exists():
                 self._recovered_session_config_dirs[key] = str(expected)
+            else:
+                # The candidate scan happens ONLY here, on the miss path: the
+                # healthy path costs one stat rather than a directory scan, and
+                # `found` exists solely to populate the signal below — with no
+                # miss there is no consumer for it. (Same reasoning as the
+                # `archive_available` emit site: build the payload inside the
+                # guard that needs it.)
+                found = sorted(
+                    str(p) for p in (entry / '.task').glob(f'{CONFIG_DIR_PREFIX}*')
+                )
+                if found:
+                    # Candidates exist but not the derived one, so this worktree
+                    # belongs to another owner and NO transcript here can
+                    # corroborate the session — the ensuing dispatch is a
+                    # guaranteed 'no_transcript' fallback. Loud-over-silent, and
+                    # STRUCTURED so it is queryable rather than grep-able.
+                    #
+                    # An EMPTY .task/ deliberately falls through silently: that
+                    # is absence, not ambiguity, and it is the dominant
+                    # recovered-session population (acquire re-seeds a lane from
+                    # base, wiping the transcript store — the by-design
+                    # `reseeded` fallback reason). Signalling there would fire on
+                    # nearly every recovered lane and mute this signal by
+                    # putting the most-expected outcome in the same bucket as a
+                    # genuine defect.
+                    logger.warning(
+                        'Recovery: %s holds %d config dir(s) %s but NOT the '
+                        'derived %s for session %s — not stashing; the resume '
+                        'will degrade to a fresh dispatch',
+                        entry.name, len(found), found, expected,
+                        session_data.get('session_id'),
+                    )
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.session_config_dir_ambiguous,
+                            task_id=key,
+                            data={
+                                'expected': str(expected),
+                                'found': found,
+                                'session_id': session_data.get('session_id'),
+                                'task_id': key,
+                            },
+                        )
         except OSError as e:
             logger.debug(
                 'Recovery: %s config-dir resolution failed (%s) — guard will '
