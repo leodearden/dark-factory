@@ -1091,3 +1091,252 @@ def load_baseline(path: Path) -> dict:
             f'{type(loaded).__name__} at top level, expected a JSON object'
         )
     return loaded
+
+
+# ---------------------------------------------------------------------------
+# The ratchet comparator.
+#
+# PURE: two plain dicts in, a list of Violations out. No filesystem, no
+# complexipy, no clock. That is what lets the pytest gate and the CLI's --check
+# share ONE ratchet implementation (SPOT), and what lets the seeded-fixture
+# self-test in test_merge_lane_ratchet.py pin every branch in microseconds
+# instead of only ever reaching them through a 40-second measurement.
+
+#: The synthetic key derived totals are reported under, so a totals violation
+#: reads the same way a per-path one does.
+CLUSTER_TOTAL_KEY = '<cluster>'
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class Violation:
+    """One measure that rose above its baseline, or breached a ceiling."""
+
+    measure: str
+    key: str
+    baseline: int
+    current: int
+    message: str
+
+
+def _violation(measure: str, key: str, baseline: int, current: int) -> Violation:
+    return Violation(
+        measure=measure,
+        key=key,
+        baseline=baseline,
+        current=current,
+        message=(
+            f'{measure} rose {baseline} -> {current} for {key} -- the merge-lane '
+            'ratchet permits a measure to fall or hold, never to rise'
+        ),
+    )
+
+
+def _total_violation(measure: str, baseline: int, current: int) -> Violation:
+    name = f'total:{measure}'
+    return Violation(
+        measure=name,
+        key=CLUSTER_TOTAL_KEY,
+        baseline=baseline,
+        current=current,
+        message=(
+            f'{name} rose {baseline} -> {current} for {CLUSTER_TOTAL_KEY} -- totals '
+            'are DERIVED by summing the per-path baseline, so moving code to a '
+            'new path does not lower them'
+        ),
+    )
+
+
+def _section(report: dict, name: str) -> dict:
+    value = report.get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def _params(report: dict, which: str) -> dict:
+    params = report.get('params')
+    if not isinstance(params, dict):
+        raise MetricsError(
+            f'{which} report has no "params" block -- it was not produced by '
+            'build_report, so there is nothing to state how it was measured'
+        )
+    return params
+
+
+def _require_complete_enumeration(current: dict) -> None:
+    enumeration = current.get('enumeration')
+    if not isinstance(enumeration, dict):
+        raise MetricsError(
+            'current report has no "enumeration" block -- completeness must be '
+            'legible in the RESULT, not only in a log line (INV-11)'
+        )
+    if enumeration.get('complete') is True:
+        return
+    unreadable = list(enumeration.get('unreadable', ()))
+    raise MetricsError(
+        'refusing to compare a PARTIAL measurement against the baseline: '
+        f'{len(unreadable)} path(s) were skipped -- {unreadable}. A sweep that '
+        'skipped files measures LOWER than the truth, so comparing it would '
+        'read as a clean tree, or worse as an improvement worth writing into '
+        'the baseline (INV-11).'
+    )
+
+
+def _require_matching_params(current: dict, baseline: dict) -> None:
+    current_version = _params(current, 'current').get('complexipy_version')
+    baseline_version = _params(baseline, 'baseline').get('complexipy_version')
+    if current_version != baseline_version:
+        raise MetricsError(
+            f'complexipy version drift: the baseline was measured with '
+            f'{baseline_version!r}, this run used {current_version!r}. Cognitive '
+            'numbers are version-dependent -- the same merge_queue.py measures '
+            '2031 at 3.0.0, 2092 at 5.0.0 and 2133 at 6.x/7.x -- so a silent '
+            'drift rewrites every number at once and leaves the ratchet '
+            'comparing two incomparable measurements. Pin the dev group '
+            f'({COMPLEXIPY_REQUIRED}) or regenerate the baseline deliberately.'
+        )
+
+    recorded = list(_params(baseline, 'baseline').get('cluster_paths', ()))
+    live = list(CLUSTER_PATHS)
+    if recorded != live:
+        added = [p for p in recorded if p not in live]
+        removed = [p for p in live if p not in recorded]
+        raise MetricsError(
+            'the baseline\'s recorded cluster_paths no longer match '
+            f'CLUSTER_PATHS. Recorded but no longer in the cluster: {added}. '
+            f'In the cluster but not recorded: {removed}. Editing PRD Appendix A '
+            'forces a deliberate baseline regeneration, so a path can never '
+            'leave the cluster and take its frozen numbers with it.'
+        )
+
+
+def _check_files(current: dict, baseline: dict) -> list[Violation]:
+    violations: list[Violation] = []
+    current_files = _section(current, 'files')
+    for path, base_entry in _section(baseline, 'files').items():
+        entry = current_files.get(path)
+        if entry is None:
+            # The path is gone (deleted, or renamed by a task that moved code).
+            # Not a per-path violation -- lowering is the point -- and the
+            # derived totals are what catch a move that only relocated the mass.
+            continue
+        for measure in _SUMMED_FILE_MEASURES:
+            was, now = int(base_entry.get(measure, 0)), int(entry.get(measure, 0))
+            if now > was:
+                violations.append(_violation(measure, path, was, now))
+    return violations
+
+
+def _check_functions(current: dict, baseline: dict) -> list[Violation]:
+    current_functions = _section(current, 'functions')
+    return [
+        _violation('cognitive', key, int(was), int(current_functions[key]))
+        for key, was in _section(baseline, 'functions').items()
+        if key in current_functions and int(current_functions[key]) > int(was)
+    ]
+
+
+def _check_tests(current: dict, baseline: dict) -> list[Violation]:
+    violations: list[Violation] = []
+    current_tests = _section(current, 'tests')
+    for path, base_entry in _section(baseline, 'tests').items():
+        entry = current_tests.get(path)
+        if entry is None:
+            continue
+        was = int(base_entry.get('private_reads', 0))
+        now = int(entry.get('private_reads', 0))
+        if now > was:
+            violations.append(_violation('private_reads', path, was, now))
+        # DISTINCT names, matching the PRD's measure: re-patching the same leaf
+        # twice more in one file is not a new reach into lane internals.
+        was_targets = len(set(base_entry.get('patch_targets', ())))
+        now_targets = len(set(entry.get('patch_targets', ())))
+        if now_targets > was_targets:
+            violations.append(
+                _violation('patch_targets', path, was_targets, now_targets)
+            )
+    return violations
+
+
+def _check_totals(current: dict, baseline: dict) -> list[Violation]:
+    current_totals = derive_totals(current)
+    baseline_totals = derive_totals(baseline)
+    return [
+        _total_violation(measure, was, current_totals[measure])
+        for measure, was in sorted(baseline_totals.items())
+        if current_totals.get(measure, 0) > was
+    ]
+
+
+def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
+    """The two ceilings, applied ONLY to keys absent from the baseline.
+
+    Ceilings-on-new-only is what makes this a ratchet rather than a day-one
+    gate: 62 lane functions already exceed cognitive 15 and merge_queue.py is
+    fourteen times the line ceiling on the introducing commit. Grandfathering
+    can only ever shrink, because every new key is held to the ceiling.
+    """
+    violations: list[Violation] = []
+    baseline_files = _section(baseline, 'files')
+    for path, entry in _section(current, 'files').items():
+        if path in baseline_files or path in SIZE_CEILING_EXEMPT:
+            continue
+        lines = int(entry.get('lines', 0))
+        if lines > FILE_LINE_CEILING:
+            violations.append(
+                Violation(
+                    measure='new_file_over_ceiling',
+                    key=path,
+                    baseline=FILE_LINE_CEILING,
+                    current=lines,
+                    message=(
+                        f'new_file_over_ceiling: {path} is {lines} lines, above '
+                        f'the {FILE_LINE_CEILING}-line ceiling that applies to '
+                        'paths absent from the baseline'
+                    ),
+                )
+            )
+
+    baseline_functions = _section(baseline, 'functions')
+    for key, score in _section(current, 'functions').items():
+        if key in baseline_functions:
+            continue
+        score = int(score)
+        if score > NEW_FUNCTION_COGNITIVE_CEILING:
+            violations.append(
+                Violation(
+                    measure='new_function_over_ceiling',
+                    key=key,
+                    baseline=NEW_FUNCTION_COGNITIVE_CEILING,
+                    current=score,
+                    message=(
+                        f'new_function_over_ceiling: {key} has cognitive '
+                        f'complexity {score}, above the '
+                        f'{NEW_FUNCTION_COGNITIVE_CEILING} ceiling that applies '
+                        'to functions absent from the baseline'
+                    ),
+                )
+            )
+    return violations
+
+
+def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
+    """Compare a fresh report against the committed baseline. Pure.
+
+    Order of operations is deliberate. The three hard-failure preconditions run
+    FIRST and raise ``MetricsError``, so a wrong-version or partial measurement
+    reports its own named cause instead of a wall of downstream violations that
+    would send the reader hunting a regression which does not exist.
+
+    Returns violations sorted by ``(measure, key)`` so a failure message is
+    diffable run to run.
+    """
+    _require_complete_enumeration(current)
+    _require_matching_params(current, baseline)
+
+    violations = [
+        *_check_files(current, baseline),
+        *_check_functions(current, baseline),
+        *_check_tests(current, baseline),
+        *_check_totals(current, baseline),
+        *_check_ceilings(current, baseline),
+    ]
+    return sorted(violations, key=lambda v: (v.measure, v.key))
