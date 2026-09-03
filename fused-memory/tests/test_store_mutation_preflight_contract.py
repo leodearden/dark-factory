@@ -367,3 +367,50 @@ class TestNoHandRolledNeutraliseFixture:
             "note='<this suite's seam and mock substrate>')` instead:\n  "
             + '\n  '.join(offenders)
         )
+
+
+# ---------------------------------------------------------------------------
+# Drift guard #2 — no test module may hand-roll a StoreMutationUnavailable raiser
+# ---------------------------------------------------------------------------
+
+
+class TestNoHandRolledDenyRaiser:
+    """Whole-tree AST drift guard: no test module may `raise
+    StoreMutationUnavailable(...)` itself. Rigging the preflight to refuse goes
+    through `_store_mutation_preflight_contract.deny`, so the sentinel is
+    spelled in exactly one place.
+
+    KEYED ON THE `raise` SHAPE, NOT ON `monkeypatch.setattr`. There are ~70
+    `monkeypatch.setattr(..., 'assert_store_mutation_allowed', ...)` sites
+    across these suites, and the large majority are per-scenario rigs that must
+    NOT be shared: `lambda **kw: calls.append(kw)` operation-name recorders,
+    `order.append('preflight')` sequencing probes, and pass-through
+    `lambda **_kw: None` re-rigs inside "unchanged when the preflight passes"
+    tests. A setattr-keyed guard would condemn every one of those and need a
+    large allowlist, which is self-defeating for a drift guard. The `raise`
+    shape isolates exactly the deny helper.
+
+    False-positive-free by construction: `pytest.raises(_mod.
+    StoreMutationUnavailable)` parses as an `ast.Call`, never an `ast.Raise`,
+    so the assertion sites that name the exception are untouched.
+    """
+
+    def test_no_test_module_raises_store_mutation_unavailable(self) -> None:
+        offenders: list[str] = []
+        for path in _test_modules():
+            tree = parse_python_module(path)
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Raise)
+                    and node.exc is not None
+                    and 'StoreMutationUnavailable' in ast.unparse(node.exc)
+                ):
+                    offenders.append(f'{path.name}:{node.lineno}')
+
+        assert not offenders, (
+            f'{len(offenders)} hand-rolled `StoreMutationUnavailable` raiser(s) '
+            'found. Rig the refusal through '
+            '`_store_mutation_preflight_contract.deny(<script module>, '
+            'monkeypatch)` instead, so the sentinel is spelled once:\n  '
+            + '\n  '.join(offenders)
+        )
