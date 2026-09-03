@@ -10,7 +10,9 @@ review rejected a source-lint living inside the pytest suite.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
+import re
 import types
 from pathlib import Path
 
@@ -326,3 +328,127 @@ class TestFileSelection:
         assert len(
             find_violations(_MODULE_LOCAL_CLIENT_FIXTURE, 'dashboard/tests/test_x.py')
         ) == 1
+
+
+def _fixture_with_prefix(prefix_lines: str, call_line: str = '    with TestClient(app) as c:') -> str:
+    """A fixture whose TestClient construction is preceded by *prefix_lines*."""
+    return (
+        "import pytest\n"
+        "from starlette.testclient import TestClient\n"
+        "\n"
+        "\n"
+        "@pytest.fixture(scope='module')\n"
+        "def _client():\n"
+        f"{prefix_lines}"
+        f"{call_line}\n"
+        "        yield c\n"
+    )
+
+
+_REASON = 'module-scoped lifespan is the subject under test (task 3503)'
+
+
+class TestExemptionPragma:
+    """Regression for reviewer objections (a) and (b): a site-local, filename-independent escape hatch.
+
+    The deleted task-3571 guard asserted strict equality against a
+    ``_CLIENT_FIXTURE_EXEMPT = {'test_fixture_isolation.py'}`` whitelist living
+    in a THIRD module, so a module legitimately needing its own client fixture
+    went red in a file it never touched — fixable only by editing that whitelist
+    (a) — and renaming or splitting the exempt file broke it for a non-defect (b).
+
+    A pragma at the construction site travels with the code under both rename
+    and split.  The grammar is inherited verbatim from
+    check_bare_magicmock_config.py so the repo keeps ONE suppression grammar.
+    """
+
+    def test_pragma_on_preceding_non_blank_line_suppresses(self):
+        source = _fixture_with_prefix(f'    # noqa: module-local-testclient — {_REASON}\n')
+        assert find_violations(source, 'test_x.py') == []
+
+    def test_ascii_hyphen_separator_is_accepted(self):
+        """Both the em-dash and the ASCII hyphen are honored — same contract as bare-magicmock."""
+        em = _fixture_with_prefix(f'    # noqa: module-local-testclient — {_REASON}\n')
+        ascii_ = _fixture_with_prefix(f'    # noqa: module-local-testclient - {_REASON}\n')
+        assert find_violations(em, 'test_x.py') == []
+        assert find_violations(ascii_, 'test_x.py') == []
+
+    def test_reasonless_pragma_does_not_suppress(self):
+        """A suppression with no stated reason is not informed consent."""
+        for prefix in (
+            '    # noqa: module-local-testclient\n',
+            '    # noqa: module-local-testclient —\n',
+            '    # noqa: module-local-testclient -   \n',
+        ):
+            assert len(find_violations(_fixture_with_prefix(prefix), 'test_x.py')) == 1, (
+                f'reasonless pragma {prefix!r} must not suppress'
+            )
+
+    def test_inline_trailing_pragma_does_not_suppress(self):
+        """Only the nearest PRECEDING non-blank line is inspected — inline is intentionally ignored."""
+        source = _fixture_with_prefix(
+            '',
+            f'    with TestClient(app) as c:  # noqa: module-local-testclient — {_REASON}',
+        )
+        assert len(find_violations(source, 'test_x.py')) == 1
+
+    def test_intervening_blank_lines_are_tolerated(self):
+        source = _fixture_with_prefix(
+            f'    # noqa: module-local-testclient — {_REASON}\n\n\n'
+        )
+        assert find_violations(source, 'test_x.py') == []
+
+    def test_intervening_non_blank_line_breaks_the_exemption(self):
+        """Any non-blank, non-matching line between pragma and node breaks it."""
+        source = _fixture_with_prefix(
+            f'    # noqa: module-local-testclient — {_REASON}\n'
+            '    app = build_app()\n'
+        )
+        assert len(find_violations(source, 'test_x.py')) == 1
+
+    def test_a_different_rules_pragma_does_not_suppress(self):
+        """Codes are strictly separate: a bare-magicmock pragma is not consent for this rule."""
+        source = _fixture_with_prefix('    # noqa: bare-magicmock — unrelated\n')
+        assert len(find_violations(source, 'test_x.py')) == 1
+
+    def test_pragma_is_filename_independent(self):
+        """Objections (a) and (b) directly: the same source is exempt under ANY filename.
+
+        The deleted guard's whitelist keyed on ``test_fixture_isolation.py``,
+        so renaming or splitting that module broke the guard for a non-defect.
+        """
+        source = _fixture_with_prefix(f'    # noqa: module-local-testclient — {_REASON}\n')
+        for filename in (
+            'test_fixture_isolation.py',
+            'test_renamed_something_else.py',
+            'dashboard/tests/sub/test_split_out_half.py',
+        ):
+            assert find_violations(source, filename) == [], (
+                f'pragma failed to suppress under filename {filename!r}'
+            )
+
+    def test_checker_source_contains_no_filename_exemption_list(self):
+        """The mechanism this replaces must not survive anywhere in the script.
+
+        Scans the checker's own AST for any string constant that is a concrete
+        ``test_*.py`` filename. The rglob glob ``'test_*.py'`` carries a ``*``
+        and so is deliberately excluded by the pattern — a real exemption entry
+        could not be.
+        """
+        script_source = SCRIPT_PATH.read_text(encoding='utf-8')
+        assert 'test_fixture_isolation' not in script_source, (
+            'The checker names test_fixture_isolation.py — the whitelist the pragma replaces'
+        )
+
+        concrete_test_filename = re.compile(r'^test_[A-Za-z0-9_]+\.py$')
+        offenders = [
+            node.value
+            for node in ast.walk(ast.parse(script_source))
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and concrete_test_filename.match(node.value)
+        ]
+        assert offenders == [], (
+            f'The checker contains hardcoded test-module filenames {offenders} — '
+            f'exemptions belong at the site, as a # noqa pragma.'
+        )
