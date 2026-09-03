@@ -2828,6 +2828,14 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
 #: Marker token the instrumented bootstrap prints, one line per gate acquire.
 FLOCK_GATE_MARKER = '__FLOCK_GATE__'
 
+#: printf-style line format shared between the bootstrap's child-side print
+#: (embedded below via f-string substitution) and the parser self-test's
+#: synthetic ``emitted`` fixture, mirroring WATCHDOG_GATE_LINE_FMT (amendment
+#: pass) so a field rename is a rename in both places rather than two
+#: hand-written copies that can silently drift apart -- see
+#: test_flock_gate_timing_bootstrap_parses_its_own_marker_lines.
+FLOCK_GATE_LINE_FMT = f'{FLOCK_GATE_MARKER} lock=%s timeout=%r waited=%.4f acquired=%r'
+
 FLOCK_GATE_TIMING_BOOTSTRAP = f"""
 import sys, time
 import orchestrator.cli as _cli
@@ -2838,7 +2846,7 @@ def _timed_acquire(path, timeout_secs, **kwargs):
     _t0 = time.monotonic()
     fd = _real_acquire(path, timeout_secs, **kwargs)
     print(
-        '{FLOCK_GATE_MARKER} lock=%s timeout=%r waited=%.4f acquired=%r'
+        '{FLOCK_GATE_LINE_FMT}'
         % (path.name, timeout_secs, time.monotonic() - _t0, fd is not None),
         file=sys.stderr,
     )
@@ -2859,31 +2867,63 @@ class FlockGateWait(NamedTuple):
     acquired: bool
 
 
-#: Task 5019: ``timeout``/``waited`` are bounded to the float shapes their
-#: format specifiers (``%r`` of a float, ``%.4f``) can actually produce,
-#: mirroring the fix to _WATCHDOG_GATE_RE's identical \S+ weakness -- the
-#: true last field on this line (``acquired``) is already anchored to the
-#: literal ``True|False`` alternation, so it isn't reachable by the exact
-#: trailing-abutment defect observed for the watchdog twin, but leaving the
-#: interior numeric groups unbounded would still make this fix half-done.
+#: Task 5019 (amendment): ``waited`` is bounded to the exact shape its
+#: ``%.4f`` format specifier always produces -- a run of digits, a dot, and
+#: exactly 4 fraction digits, with no exponent notation possible regardless
+#: of magnitude -- mirroring the fix to _WATCHDOG_GATE_RE.  ``timeout``
+#: stays ``\S+``: it is emitted via ``%r`` of a float, whose repr switches
+#: to exponent notation outside [1e-4, 1e16) and can render ``inf``/``nan``,
+#: none of which a digit-shaped group would accept -- and unlike a TRAILING
+#: field, ``timeout`` is an INTERIOR field already delimited by the literal
+#: ``' waited='`` that follows it, so (like ``lock``, delimited by
+#: ``' timeout='``) it was never reachable by the trailing-abutment defect
+#: this task fixes; tightening it would only add a false-negative risk with
+#: no corresponding safety gain.  ``acquired`` stays anchored to the literal
+#: ``True|False`` alternation.
 _FLOCK_GATE_RE = re.compile(
     re.escape(FLOCK_GATE_MARKER)
-    + r' lock=(?P<lock>\S+) timeout=(?P<timeout>-?\d+\.\d+) '
+    + r' lock=(?P<lock>\S+) timeout=(?P<timeout>\S+) '
     r'waited=(?P<waited>-?\d+\.\d{4}) acquired=(?P<acquired>True|False)'
 )
 
 
+#: Task 5019 (amendment): matches just the marker plus the rest of its line,
+#: so :func:`parse_flock_gate_waits` can tell "marker present but its fields
+#: don't conform" (a genuine corruption -- must fail loudly) apart from
+#: "marker's fields matched, followed by an abutting co-writer's text" (the
+#: tolerated case _FLOCK_GATE_RE's bounded groups already handle via
+#: ``.match()`` not requiring end-of-line).
+_FLOCK_GATE_LINE_RE = re.compile(re.escape(FLOCK_GATE_MARKER) + r'[^\n]*')
+
+
 def parse_flock_gate_waits(stderr: str) -> list[FlockGateWait]:
-    """Parse the :data:`FLOCK_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
-    return [
-        FlockGateWait(
-            lock=m.group('lock'),
-            timeout_secs=float(m.group('timeout')),
-            waited_secs=float(m.group('waited')),
-            acquired=m.group('acquired') == 'True',
+    """Parse the :data:`FLOCK_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr.
+
+    Every marker occurrence must have its fields conform to
+    :data:`_FLOCK_GATE_RE` -- a marker line whose fields don't parse raises
+    ``ValueError`` instead of being silently dropped, so a partial
+    corruption can't quietly lower the ``max()`` the ceiling assertions in
+    this module are computed over (task 5019 amendment; mirrors
+    :func:`parse_watchdog_gate_fire_delays`).
+    """
+    waits = []
+    for line_match in _FLOCK_GATE_LINE_RE.finditer(stderr):
+        line = line_match.group(0)
+        m = _FLOCK_GATE_RE.match(line)
+        if m is None:
+            raise ValueError(
+                'flock gate marker line does not match the expected '
+                f'lock=/timeout=/waited=/acquired= field shape: {line!r}'
+            )
+        waits.append(
+            FlockGateWait(
+                lock=m.group('lock'),
+                timeout_secs=float(m.group('timeout')),
+                waited_secs=float(m.group('waited')),
+                acquired=m.group('acquired') == 'True',
+            )
         )
-        for m in _FLOCK_GATE_RE.finditer(stderr)
-    ]
+    return waits
 
 
 def test_flock_gate_timing_bootstrap_parses_its_own_marker_lines():
@@ -2895,13 +2935,18 @@ def test_flock_gate_timing_bootstrap_parses_its_own_marker_lines():
     test_flock_wait_env_override_speeds_up_contention_result vacuous rather
     than red.  The emit format and this parser are therefore pinned together
     here, with no subprocess involved.
+
+    ``emitted`` is built from FLOCK_GATE_LINE_FMT (amendment-pass fix,
+    mirroring test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines)
+    -- the SAME format string the bootstrap embeds into the child -- rather
+    than a hand-copied literal, so a field rename in the bootstrap breaks
+    this round-trip by construction instead of relying on two copies staying
+    in sync by discipline.
     """
     emitted = (
-        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
-        'waited=0.0001 acquired=True\n'
+        f'{FLOCK_GATE_LINE_FMT % ("_merge-verify.lock", 0.5, 0.0001, True)}\n'
         'some unrelated stderr chatter\n'
-        f'{FLOCK_GATE_MARKER} lock=.merge_verify.lock timeout=0.5 '
-        'waited=0.5083 acquired=False\n'
+        f'{FLOCK_GATE_LINE_FMT % (".merge_verify.lock", 0.5, 0.5083, False)}\n'
     )
 
     waits = parse_flock_gate_waits(emitted)
@@ -2922,6 +2967,49 @@ def test_parse_flock_gate_waits_returns_empty_for_uninstrumented_stderr():
     an empty list would pass by default.
     """
     assert parse_flock_gate_waits('Traceback (most recent call last):\nboom\n') == []
+
+
+def test_parse_flock_gate_waits_survives_abutting_log_line():
+    """An unrelated co-writer's stderr line landing with no separator must
+    not corrupt the parse.
+
+    Task 5019 amendment -- symmetric coverage for the flock twin of
+    test_parse_watchdog_gate_fire_delays_survives_abutting_log_line.  Unlike
+    the watchdog twin, the flock line's true last field (``acquired``) is
+    already anchored to the ``True|False`` literal alternation, so an
+    abutting line was never able to corrupt it via the exact mechanism
+    observed in production for the watchdog twin (see the _FLOCK_GATE_RE
+    docstring above) -- this test pins that already-correct behaviour so a
+    future regex change can't silently break it.
+    """
+    corrupted = (
+        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
+        'waited=0.5083 acquired=True'
+        '2026-09-01T00:00:00Z some unrelated interleaved log line\n'
+    )
+
+    assert parse_flock_gate_waits(corrupted) == [
+        FlockGateWait('_merge-verify.lock', 0.5, 0.5083, True),
+    ]
+
+
+def test_parse_flock_gate_waits_raises_loudly_on_malformed_marker_line():
+    """A marker line whose fields don't conform must raise, not vanish.
+
+    Task 5019 amendment -- symmetric coverage for the flock twin of
+    test_parse_watchdog_gate_fire_delays_raises_loudly_on_malformed_marker_line.
+    Silently dropping a genuinely-malformed marker line would quietly lower
+    the max() the ceiling assertion in
+    test_flock_wait_env_override_speeds_up_contention_result is computed
+    over instead of surfacing the corruption.
+    """
+    malformed = (
+        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
+        'waited=NOT_A_NUMBER acquired=True\n'
+    )
+
+    with pytest.raises(ValueError, match=re.escape(FLOCK_GATE_MARKER)):
+        parse_flock_gate_waits(malformed)
 
 
 # ---------------------------------------------------------------------------
@@ -3111,16 +3199,42 @@ _WATCHDOG_GATE_RE = re.compile(
     + r' fire_delay=(?P<fire_delay>-?\d+\.\d{4}) grace=(?P<grace>-?\d+\.\d{4})'
 )
 
+#: Task 5019 (amendment): matches just the marker plus the rest of its line,
+#: so :func:`parse_watchdog_gate_fire_delays` can tell "marker present but
+#: its fields don't conform" (a genuine corruption -- must fail loudly)
+#: apart from "marker's fields matched, followed by an abutting co-writer's
+#: text" (the exact production defect this task fixes, tolerated because
+#: ``.match()`` doesn't require end-of-line -- see
+#: test_parse_watchdog_gate_fire_delays_survives_abutting_log_line).
+_WATCHDOG_GATE_LINE_RE = re.compile(re.escape(WATCHDOG_GATE_MARKER) + r'[^\n]*')
+
 
 def parse_watchdog_gate_fire_delays(stderr: str) -> list[WatchdogGateFire]:
-    """Parse the :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
-    return [
-        WatchdogGateFire(
-            fire_delay_secs=float(m.group('fire_delay')),
-            grace_secs=float(m.group('grace')),
+    """Parse the :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr.
+
+    Every marker occurrence must have its fields conform to
+    :data:`_WATCHDOG_GATE_RE` -- a marker line whose fields don't parse
+    raises ``ValueError`` instead of being silently dropped, so a partial
+    corruption can't quietly lower the ``max()`` the ceiling assertions in
+    this module are computed over (task 5019 amendment; mirrors
+    :func:`parse_flock_gate_waits`).
+    """
+    fires = []
+    for line_match in _WATCHDOG_GATE_LINE_RE.finditer(stderr):
+        line = line_match.group(0)
+        m = _WATCHDOG_GATE_RE.match(line)
+        if m is None:
+            raise ValueError(
+                'watchdog gate marker line does not match the expected '
+                f'fire_delay=/grace= field shape: {line!r}'
+            )
+        fires.append(
+            WatchdogGateFire(
+                fire_delay_secs=float(m.group('fire_delay')),
+                grace_secs=float(m.group('grace')),
+            )
         )
-        for m in _WATCHDOG_GATE_RE.finditer(stderr)
-    ]
+    return fires
 
 
 def test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines():
@@ -3193,6 +3307,26 @@ def test_parse_watchdog_gate_fire_delays_survives_abutting_log_line():
     assert parse_watchdog_gate_fire_delays(corrupted) == [
         WatchdogGateFire(fire_delay_secs=0.6931, grace_secs=0.2023),
     ]
+
+
+def test_parse_watchdog_gate_fire_delays_raises_loudly_on_malformed_marker_line():
+    """A marker line whose fields don't conform must raise, not vanish.
+
+    Task 5019 amendment: bounding the field groups (to reject anything that
+    doesn't match WATCHDOG_GATE_LINE_FMT's exact shape) means a
+    genuinely-malformed marker line -- as opposed to one merely followed by
+    abutting unrelated text, which the abutment test above proves is still
+    tolerated -- no longer matches _WATCHDOG_GATE_RE at all. Silently
+    dropping such a line from the returned list would quietly lower the
+    max() the ceiling assertion in
+    test_watchdog_timeout_env_override_fires_fast_without_heartbeat is
+    computed over instead of surfacing the corruption, cutting against the
+    repo's no-silent-fail-soft / structured-facts-at-failure invariant.
+    """
+    malformed = f'{WATCHDOG_GATE_MARKER} fire_delay=NOT_A_NUMBER grace=0.2023\n'
+
+    with pytest.raises(ValueError, match=re.escape(WATCHDOG_GATE_MARKER)):
+        parse_watchdog_gate_fire_delays(malformed)
 
 
 # ---------------------------------------------------------------------------
