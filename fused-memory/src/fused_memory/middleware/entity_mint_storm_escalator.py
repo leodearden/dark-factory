@@ -97,14 +97,14 @@ _FINDING_CATEGORY: str = 'entity_mint_burst'
 
 
 def emit_entity_mint_storm_escalation(
-    project_root,
+    project_root: str,
     *,
-    project_id,
-    agent_id,
-    count,
-    threshold,
-    window_seconds,
-):
+    project_id: str,
+    agent_id: str,
+    count: int,
+    threshold: int,
+    window_seconds: float,
+) -> str | None:
     """File (or fold into) an ``entity_mint_storm`` escalation for *agent_id*.
 
     Called from ``MemoryService._record_entity_mint`` through

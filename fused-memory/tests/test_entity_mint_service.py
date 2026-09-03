@@ -624,26 +624,92 @@ class TestEntityMintStormAlarm:
 
     @pytest.mark.asyncio
     async def test_a_non_numeric_threshold_skips_the_alarm_without_raising(
-        self, stormy,
+        self, stormy, caplog,
     ):
-        """A corrupt config leaf costs the alarm, never the write."""
+        """A corrupt config leaf costs the alarm, never the write.
+
+        And it says so. Losing the alarm silently would leave an operator who
+        mistyped a leaf with NO signal that a mint loop is running — the very
+        silent-degradation shape this module argues the burst alarm exists to
+        rule out.
+        """
         service, _clock, emitter = stormy
         service.config.entity_mint.storm_threshold = 'ten'
 
-        result = await self._mint(service)
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.memory_service',
+        ):
+            result = await self._mint(service)
 
         assert result['minted'] is True, result
         emitter.assert_not_called()
+        text = caplog.text
+        assert 'entity_mint.storm_threshold' in text, (
+            f'the WARN must name the offending leaf, got {text!r}'
+        )
+        assert "'ten'" in text, (
+            f'the WARN must carry the offending value, got {text!r}'
+        )
 
     @pytest.mark.asyncio
-    async def test_a_non_numeric_window_skips_the_alarm_without_raising(self, stormy):
+    async def test_a_non_numeric_window_skips_the_alarm_without_raising(
+        self, stormy, caplog,
+    ):
         service, _clock, emitter = stormy
         service.config.entity_mint.storm_window_seconds = None
 
-        result = await self._mint(service)
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.memory_service',
+        ):
+            result = await self._mint(service)
 
         assert result['minted'] is True, result
         emitter.assert_not_called()
+        assert 'entity_mint.storm_window_seconds' in caplog.text, (
+            f'the WARN must name the offending leaf, got {caplog.text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_corrupt_leaf_warning_is_warn_once_and_re_arms(
+        self, stormy, caplog,
+    ):
+        """Once per contiguous run of bad config, not once per mint.
+
+        This branch is reached on EVERY mint, unlike the `_known_projects` miss
+        below it which only fires at a breach — so an unconditional WARN would
+        put one line per mint in the log and drown the very operator it is
+        meant to reach. It must also RE-ARM: `entity_mint.*` is green-tier
+        hot-reloadable, so an operator can fix the leaf and later break it
+        again, and the second break deserves its own line.
+        """
+        service, _clock, _emitter = stormy
+        service.config.entity_mint.storm_threshold = 'ten'
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.memory_service',
+        ):
+            for _ in range(3):
+                await self._mint(service)
+
+        assert caplog.text.count('entity_mint.storm_threshold') == 1, (
+            f'expected exactly one WARN across three mints, got {caplog.text!r}'
+        )
+
+        # Operator fixes the leaf (hot reload), then breaks it again.
+        service.config.entity_mint.storm_threshold = 10
+        await self._mint(service)
+        service.config.entity_mint.storm_threshold = 'ten'
+        caplog.clear()
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.services.memory_service',
+        ):
+            await self._mint(service)
+
+        assert 'entity_mint.storm_threshold' in caplog.text, (
+            'the warning must re-arm once the config has gone valid again, '
+            f'got {caplog.text!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_counters_are_keyed_per_agent(self, stormy):

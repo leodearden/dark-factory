@@ -2464,6 +2464,14 @@ class MemoryService:
         # is a module FUNCTION taking project_root explicitly, so there is no
         # queue cache to own and no set_known_projects lifecycle to keep in sync.
         self._entity_mint_storm_counters: dict[str, StormCounter] = {}
+        # Warn-ONCE latch for a corrupt/absent `entity_mint.storm_*` leaf. The
+        # corrupt-leaf branch of `_record_entity_mint` is reached on EVERY mint
+        # (unlike the `_known_projects` miss beside it, which only fires at a
+        # breach), so an unconditional WARN would put one line per mint in the
+        # log and drown the operator it exists to reach. Cleared whenever the
+        # leaves read back valid, so a green-tier hot reload that fixes and
+        # later re-breaks them earns a second line.
+        self._entity_mint_storm_config_warned = False
         # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
         # leaf epsilon). `_decode_referents` degrades an unreadable or absent
         # blob to ('none') rather than raising — losing the memory over a
@@ -8901,8 +8909,30 @@ class MemoryService:
                 or not isinstance(window_seconds, int | float) \
                 or isinstance(window_seconds, bool):
             # A corrupt or absent config leaf costs the ALARM, never the mint
-            # that already landed.
+            # that already landed — but it says so. Returning silently here
+            # would disable the only signal a mint loop produces and tell
+            # nobody, which is the same silent-degradation shape this alarm
+            # exists to rule out; an operator who mistypes a leaf would lose
+            # the alarm and never learn it. Deliberately LOUDER than the
+            # `_record_content_amend` branch this otherwise mirrors, and in
+            # the same shape as the `_known_projects` miss below: name the
+            # offending leaf, carry its value, say what it costs, and say that
+            # minting continues.
+            if not self._entity_mint_storm_config_warned:
+                self._entity_mint_storm_config_warned = True
+                logger.warning(
+                    'entity mint storm alarm DISABLED by a malformed config '
+                    'leaf: entity_mint.storm_threshold=%r (want a non-bool '
+                    'int), entity_mint.storm_window_seconds=%r (want a '
+                    'non-bool int/float). No mint burst can be escalated '
+                    'until this is fixed; minting continues meanwhile. Both '
+                    'leaves are green-tier, so reload_config repairs this '
+                    'with no restart. Logged once per contiguous run of bad '
+                    'config, not once per mint.',
+                    threshold, window_seconds,
+                )
             return
+        self._entity_mint_storm_config_warned = False
 
         storm = counter.record(
             threshold=threshold,
