@@ -296,6 +296,37 @@ def test_transcript_archival_factories_smoke(tmp_path) -> None:
     assert armed.transcript_archive.enabled is True
 
 
+@pytest.mark.asyncio
+async def test_init_transcript_repo_smoke(tmp_path) -> None:
+    """_init_transcript_repo seeds a real, committed git repo with the trivial greet stub.
+
+    A THIRD seeder beside _init_git_repo (README.md) and _init_repo (lib.py +
+    test_lib.py with a working greet); see its docstring for why it is not a
+    merge of them. The seed contents are what the transcript suites' worktrees
+    are branched from, so they are pinned here.
+    """
+    from _workflow_helpers import _init_transcript_repo  # noqa: PLC0415
+
+    from orchestrator.git_ops import _run  # noqa: PLC0415
+
+    await _init_transcript_repo(tmp_path)
+
+    assert (tmp_path / '.git').is_dir()
+    assert (tmp_path / 'lib.py').exists()
+    assert (tmp_path / 'lib.py').read_text() == 'def greet(name): return name\n'
+
+    # A committed, non-empty repo on branch main carrying the single
+    # "Initial commit" — an EMPTY repo has no HEAD, so create_worktree
+    # (which every consumer suite calls) would fail against it.
+    rc, branch, _ = await _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=tmp_path)
+    assert rc == 0
+    assert branch.strip() == 'main'
+
+    rc, log, _ = await _run(['git', 'log', '--format=%s'], cwd=tmp_path)
+    assert rc == 0
+    assert log.split() == ['Initial', 'commit']
+
+
 def test_transcript_archival_factories_identity() -> None:
     """Anti-duplication guard: the producers re-export the SAME objects as the shared module."""
     import test_transcript_archival_boundary_gate as bg  # noqa: PLC0415
@@ -306,6 +337,7 @@ def test_transcript_archival_factories_identity() -> None:
         _archived,
         _config,
         _config_dir,
+        _init_transcript_repo,
         _make_git_ops,
         _make_transcript_workflow,
         _write_transcript,
@@ -331,6 +363,12 @@ def test_transcript_archival_factories_identity() -> None:
     assert bg._make_git_ops is _make_git_ops
     assert bg._make_transcript_workflow is _make_transcript_workflow
     assert bg._write_transcript is _write_transcript
+
+    # All three share ONE real-git seeder object (their local copies hashed
+    # identically, md5 217898b53fcac640e02c5374ca2d4001, before promotion).
+    assert ph._init_transcript_repo is _init_transcript_repo
+    assert bs._init_transcript_repo is _init_transcript_repo
+    assert bg._init_transcript_repo is _init_transcript_repo
 
 
 # ---------------------------------------------------------------------------
