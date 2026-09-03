@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -48,6 +49,49 @@ class Violation(NamedTuple):
     lineno: int
     col_offset: int
     message: str
+
+
+# Exemption comment regex.
+# Matches: ``# noqa: module-local-testclient — <non-empty-reason>``
+# Accepts em-dash (—) or ASCII hyphen (-) as separator.
+# Requires at least one non-space character after the separator.
+#
+# Template and contract are inherited VERBATIM from
+# ``check_bare_magicmock_config.py::_EXEMPT_TEMPLATE`` so this repo keeps ONE
+# suppression grammar rather than two.  Keying on the rule's own code also
+# guarantees a ``bare-magicmock`` pragma can never silently exempt this rule:
+# the remedies are unrelated, so a pragma for one is not informed consent for
+# the other.
+_EXEMPT_TEMPLATE = r'#\s*noqa:\s*{code}\s*[—\-]+\s*\S.*'
+
+_RULE_CODE = 'module-local-testclient'
+
+_EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_CODE)))
+
+
+def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
+    """Return True if the node at *lineno* (1-based) carries a valid ``code`` exemption.
+
+    Walks upward from the line ABOVE *lineno* over blank lines to the nearest
+    non-blank line.  If that line matches the exemption regex the node is exempt.
+    Any intervening non-blank, non-matching line breaks the exemption.
+
+    Inline trailing exemption NOT honored: only the nearest *preceding* non-blank
+    line is inspected.  A ``# noqa: ...`` comment on the same line as the node is
+    intentionally ignored — same contract as ``check_bare_magicmock_config.py``.
+    """
+    if code != _RULE_CODE:
+        return False
+    # lineno is 1-based; convert to 0-based index of the line ABOVE the node.
+    idx = lineno - 2  # the line immediately above
+    while idx >= 0:
+        stripped = lines[idx].strip()
+        if stripped == '':
+            idx -= 1
+            continue
+        # Nearest non-blank line found — must match the exemption regex.
+        return bool(_EXEMPT_RE.match(stripped))
+    return False
 
 
 _VIOLATION_MSG = (
@@ -223,6 +267,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
         return []
 
     aliases = _build_alias_map(tree)
+    lines = source.splitlines()
 
     violations: list[Violation] = []
     seen: set[int] = set()
@@ -243,6 +288,10 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                 if not _is_testclient_construction(child, aliases):
                     continue
                 seen.add(id(child))
+                # Computed LAZILY — only after a construction has matched — so
+                # the upward line walk never runs on every call node in the body.
+                if _is_exempted(lines, child.lineno, _RULE_CODE):
+                    continue
                 violations.append(
                     Violation(
                         filename=filename,
