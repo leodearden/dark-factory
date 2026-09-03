@@ -9703,6 +9703,105 @@ class TestPredicateModeFailPath:
 
 
 # ---------------------------------------------------------------------------
+# Task 4678 (r3) — RED: the recurrence-carrier discriminator's boundary matrix.
+#
+# PRD docs/prds/recurring-deterministic-tasks.md decision R-D6 / contract C-5:
+# every failure leg of a RECURRENCE CARRIER's deterministic run must land in
+# the deny-listed, discriminable `milestone_check_failed` category rather than
+# the crowded `infra_issue` bucket.  `_is_recurrence_carrier` is the one
+# predicate that decides which population a task belongs to, so its whole
+# truth table is pinned here, at unit level, independent of the runner.
+# ---------------------------------------------------------------------------
+
+class TestIsRecurrenceCarrier:
+    """`_is_recurrence_carrier` — presence of a non-empty `metadata.recurrence` dict.
+
+    Task 4678.  The predicate answers "does this task CARRY a recurrence?",
+    deliberately NOT "is this a valid carrier?" — its output selects an
+    escalation LABEL, not a mint (see the production docstring for why the two
+    have opposite failure costs).
+    """
+
+    def test_absent_recurrence_is_not_a_carrier(self):
+        """The overwhelmingly common shape — a plain deterministic task."""
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier({}) is False
+        assert _is_recurrence_carrier(
+            {'task_kind': 'deterministic', 'always_escalates': False}
+        ) is False
+
+    def test_empty_recurrence_dict_is_not_a_carrier(self):
+        """An empty dict carries no chain link — it is not a carrier.
+
+        Reachable only by a hand edit or an `update_task` that cleared the
+        payload; the submit guard rejects it.  Failing it closed here keeps
+        the discriminator's boundary at "a chain link is actually present".
+        """
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier({'recurrence': {}}) is False
+
+    @pytest.mark.parametrize(
+        'value',
+        ['daily', True, 86400, ['reify-closure-staleness'], None],
+        ids=['str', 'bool', 'int', 'list', 'none'],
+    )
+    def test_non_dict_recurrence_is_not_a_carrier(self, value):
+        """A stray `recurrence: 'daily'` hand edit must not read as a carrier.
+
+        The Recurrence model is an object; anything scalar is a malformed hand
+        edit, and reading it as a chain link would relabel an ordinary
+        predicate's infra faults for no reason.
+        """
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier({'recurrence': value}) is False
+
+    def test_hand_written_recurrence_dict_is_a_carrier(self):
+        """The as-authored seed shape (no `minted_from` key at all)."""
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier(
+            {'recurrence': {'key': 'reify-closure-staleness', 'interval_secs': 86400}}
+        ) is True
+
+    def test_round_tripped_recurrence_model_is_a_carrier(self):
+        """The ROUND-TRIPPED shape, built from r1's own model so it cannot drift.
+
+        `Recurrence.minted_from` is declared with a `None` default, so
+        `model_dump()` materialises an explicit `'minted_from': None` on a seed
+        link an author wrote without one — the shape the `Recurrence` docstring
+        warns consumers to read "by VALUE, never key presence".  Both forms are
+        carriers.
+        """
+        from shared.task_metadata import Recurrence
+
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        dumped = Recurrence(key='reify-closure-staleness', interval_secs=86400).model_dump()
+        assert dumped['minted_from'] is None, (
+            'this test only pins the round-tripped shape while model_dump() '
+            f'still materialises an explicit minted_from: {dumped!r}'
+        )
+        assert _is_recurrence_carrier({'recurrence': dumped}) is True
+
+    def test_malformed_but_present_recurrence_is_still_a_carrier(self):
+        """A `recurrence` missing its required `key` is STILL read as a carrier.
+
+        The submit guard rejects this shape, so it is reachable only by a hand
+        edit or a raw `update_task`.  Deliberate: this predicate tests presence,
+        not validity — mislabelling a malformed carrier's escalation is inert
+        (both categories are born-at-L2, `orchestrator-deterministic`, severity
+        critical, task blocked), whereas failing closed would silently drop a
+        real recurring job's failure into the crowded `infra_issue` bucket.
+        """
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier({'recurrence': {'interval_secs': 86400}}) is True
+
+
+# ---------------------------------------------------------------------------
 # Step-5: RED — B9 predicate timeout/unexpected-error -> infra_issue + blocked
 # (RED until step-6 wraps _run_predicate's asyncio.wait_for call in the
 # deploy path's except-TimeoutError / except-Exception outer-guard branches)
