@@ -544,6 +544,13 @@ CURATOR_ADJUDICATION_MISSING_CATEGORY: str = 'curator_adjudication_missing'
 MILESTONE_GATE_CATEGORY: str = 'milestone_gate'
 MILESTONE_CHECK_FAILED_CATEGORY: str = 'milestone_check_failed'
 
+# `metadata.recurrence` — one link of a recurring deterministic chain (task
+# 4676 / r1, modelled by `shared.task_metadata.Recurrence`).  Read here by
+# `_is_recurrence_carrier` only; this module never constructs or validates the
+# payload, so the key is named rather than imported from `shared` (which
+# exports the MODEL, not a key constant).
+RECURRENCE_KEY: str = 'recurrence'
+
 # Rendered in place of the configured project_root when the runner's duck-typed
 # `scheduler` collaborator cannot supply a usable one.  A VISIBLE placeholder,
 # not an omission: it keeps the runbook's update_task call syntactically valid
@@ -812,6 +819,58 @@ def _curator_adjudication_confirmed(metadata: dict) -> bool:
     """
     stamp = metadata.get(HUMAN_CURATOR_ADJUDICATED_AT_KEY)
     return isinstance(stamp, str) and bool(stamp.strip())
+
+
+def _is_recurrence_carrier(metadata: dict) -> bool:
+    """Return True iff *metadata* carries a recurring-chain link (γ-predicate).
+
+    Task 4678 (r3) / PRD ``docs/prds/recurring-deterministic-tasks.md``
+    decision R-D6, contract C-5.  A task carrying ``metadata.recurrence`` is
+    one link of a recurring deterministic chain, and every failure leg of such
+    a run must file ``milestone_check_failed`` — the deny-listed, discriminable
+    category — instead of dropping into the crowded ``infra_issue`` bucket
+    where a recurring job's failures become indistinguishable from fleet noise.
+
+    PRESENCE of a non-empty ``recurrence`` dict is the WHOLE test.  The other
+    two conditions of the PRD's C-1 carrier contract — ``task_kind
+    ='deterministic'`` and ``before_done['kind'] == 'predicate'`` — hold BY
+    CONSTRUCTION at the only call site: ``_run_predicate`` is reachable only
+    from inside ``run()``'s ``before_done.get('kind') == 'predicate'`` branch
+    of a deterministic dispatch, so re-checking them here would re-derive what
+    the call path already proves.
+
+    It deliberately does NOT re-validate the ``Recurrence`` shape or the dated
+    milestone, even though ``docs/task-authoring.md`` §6.1 warns that the
+    carrier contract is enforced at SUBMIT time only and that "any consumer
+    acting on a chain link (the mint above all) should re-verify the carrier".
+    That instruction is aimed at r2's MINT, which creates state: minting off a
+    malformed link writes a bad successor.  This output selects an escalation
+    LABEL, and the failure costs are asymmetric —
+
+    * mislabelling a hand-edited malformed carrier is INERT: both categories
+      are born-at-L2, ``orchestrator-deterministic``, severity ``critical``,
+      task ``blocked``, and both are un-auto-closable (``milestone_check_failed``
+      by category, ``orchestrator-deterministic`` by role);
+    * failing CLOSED would silently drop a real recurring job's failure into
+      the largest, most crowded category — the exact degradation r3 exists to
+      remove.
+
+    So it fails OPEN on validity and CLOSED on presence: a non-``dict`` value
+    (a stray ``recurrence: 'daily'`` hand edit) and the empty dict are both
+    rejected, so nothing scalar or vacant can be read as a chain link.
+
+    Deliberately PRIVATE to this module, following its three sibling metadata
+    predicates above.  r2's mint (fused-memory) and r4's gauge (dashboard)
+    are NOT prospective sharers as-is: the mint must re-verify the full carrier
+    contract before writing a successor, which is strictly more than presence.
+    A genuine second consumer needing THESE semantics is the trigger to hoist
+    it into ``shared.task_metadata`` — not before.
+
+    Pinned by ``TestIsRecurrenceCarrier`` in
+    orchestrator/tests/test_deterministic_runner.py.
+    """
+    recurrence = metadata.get(RECURRENCE_KEY)
+    return isinstance(recurrence, dict) and bool(recurrence)
 
 
 def _is_scheduled_self_deploy_complete(task: dict | None) -> bool:
