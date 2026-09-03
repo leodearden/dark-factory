@@ -71,17 +71,100 @@ def _trailing_name(node: ast.expr) -> str | None:
     return None
 
 
-def _is_fixture(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+def _bound_name(node: ast.expr) -> str | None:
+    """Return the LOCAL BINDING *node* resolves to, or None if it is not a plain name.
+
+    ``X`` and ``X(...)`` both resolve to ``X``; ``a.b.X`` resolves to None,
+    because the binding introduced by the import statement is ``a``, not ``X``.
+    """
+    if isinstance(node, ast.Call):
+        return _bound_name(node.func)
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+class _AliasMap(NamedTuple):
+    """Local bindings a module's imports attach to the two symbols this rule cares about."""
+
+    testclient: frozenset[str]
+    fixture: frozenset[str]
+
+
+def _build_alias_map(tree: ast.AST) -> _AliasMap:
+    """Record which local names this module binds to ``*.testclient.TestClient`` / ``pytest.fixture``.
+
+    Only ``ast.ImportFrom`` introduces a binding this map can use.  ``import
+    a.b`` binds the ROOT package name ``a`` alone, so ``a.b.TestClient(app)``
+    reaches the matcher through the trailing-name arm instead — which is exactly
+    why the matcher is a union rather than an alias lookup alone.
+    """
+    testclient: set[str] = set()
+    fixture: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        # Compare on the module's LAST segment so starlette.testclient,
+        # fastapi.testclient and a bare testclient are all recognised.
+        tail = (node.module or '').rpartition('.')[2]
+        for alias in node.names:
+            local = alias.asname or alias.name
+            if alias.name == 'TestClient' and tail == 'testclient':
+                testclient.add(local)
+            elif alias.name == 'fixture' and tail == 'pytest':
+                fixture.add(local)
+
+    return _AliasMap(frozenset(testclient), frozenset(fixture))
+
+
+# WHY BOTH ARMS, IN BOTH MATCHERS BELOW.
+#
+# The deleted task-3571 guard matched on the trailing callee NAME alone, so
+# ``from starlette.testclient import TestClient as TC`` then ``TC(app)`` walked
+# straight past it — the blind spot its own docstring claimed to close.  An
+# alias map ALONE would be narrower than that guard in the other direction: it
+# cannot see ``testclient.TestClient(app)`` (module-attribute access), nor any
+# import shape it does not model.
+#
+# The UNION is deliberately BROADER than the deleted guard and never narrower.
+# That is the correct direction of error for a guard: a false positive is
+# locally suppressible with a one-line
+# ``# noqa: module-local-testclient — <reason>`` pragma, while a false negative
+# is SILENT — and a silent false negative is exactly how the deleted guard
+# shipped green over a live duplicate for eleven days.
+
+
+def _is_fixture(func: ast.FunctionDef | ast.AsyncFunctionDef, aliases: _AliasMap) -> bool:
     """Return True if *func* carries a pytest fixture decorator.
 
-    Accepts both the bare ``@pytest.fixture`` and the called
-    ``@pytest.fixture(scope='module')`` forms.
+    Union of (decorator resolves through an alias bound to ``pytest.fixture``)
+    OR (decorator's trailing name is ``fixture``).  Accepts both the bare
+    ``@pytest.fixture`` and the called ``@pytest.fixture(scope='module')`` forms.
+
+    The decorator is alias-resolved for the same reason the construction is: a
+    rule that keys on the literal name ``fixture`` reopens one level up, where
+    ``from pytest import fixture as fx`` stops the function looking like a
+    fixture at all.
     """
-    return any(_trailing_name(dec) == 'fixture' for dec in func.decorator_list)
+    for dec in func.decorator_list:
+        if _bound_name(dec) in aliases.fixture:
+            return True
+        if _trailing_name(dec) == 'fixture':
+            return True
+    return False
 
 
-def _is_testclient_construction(call: ast.Call) -> bool:
-    """Return True if *call* constructs a TestClient."""
+def _is_testclient_construction(call: ast.Call, aliases: _AliasMap) -> bool:
+    """Return True if *call* constructs a TestClient.
+
+    Union of (callee is a local name bound to ``*.testclient.TestClient``) OR
+    (callee's trailing ``Name.id``/``Attribute.attr`` is ``TestClient``).
+    A decoy alias (``from foo import Bar as TC`` then ``TC(app)``) matches
+    neither arm.
+    """
+    if _bound_name(call.func) in aliases.testclient:
+        return True
     return _trailing_name(call.func) == 'TestClient'
 
 
@@ -107,13 +190,15 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     except SyntaxError:
         return []
 
+    aliases = _build_alias_map(tree)
+
     violations: list[Violation] = []
     seen: set[int] = set()
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not _is_fixture(node):
+        if not _is_fixture(node, aliases):
             continue
         for stmt in node.body:
             for child in ast.walk(stmt):
@@ -123,7 +208,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                 # twice; key on node identity so each construction is reported once.
                 if id(child) in seen:
                     continue
-                if not _is_testclient_construction(child):
+                if not _is_testclient_construction(child, aliases):
                     continue
                 seen.add(id(child))
                 violations.append(
