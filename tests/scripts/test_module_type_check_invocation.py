@@ -74,8 +74,9 @@ from __future__ import annotations
 import shlex
 from collections.abc import Callable
 
+import pytest
 from orchestrator.config import ModuleConfig
-from verify_command_invariants import PYRIGHT, anchor_split, optional_token_segment
+from verify_command_invariants import PYRIGHT, anchor_split
 
 from orchestrator import verify_cmd
 
@@ -168,7 +169,7 @@ def _npx_fronted_fields(mc: ModuleConfig) -> dict[str, list[str]]:
 def test_the_npx_scan_reads_exact_tokens_in_every_chain_segment() -> None:
     """`_npx_fronted_segments` must scan every `&&`-chained segment by exact shlex token.
 
-    Eight lettered cases, each pinning a distinct way a naive scan could get
+    Nine lettered cases, each pinning a distinct way a naive scan could get
     this wrong.
     """
     # (a) The historical `scripts` violation — a bare, unchained npx-fronted
@@ -252,6 +253,17 @@ def test_the_npx_scan_reads_exact_tokens_in_every_chain_segment() -> None:
         "'pnpx' is a distinct token from 'npx' and this scan bans the exact "
         "token 'npx' only, by deliberate scope limit"
     )
+
+    # (i) An unparseable segment (unbalanced quote) must RAISE a named
+    # AssertionError rather than be silently skipped. This scan CERTIFIES
+    # THE ABSENCE of npx across the WHOLE command (see docstring): unlike
+    # `verify_command_invariants.optional_token_segment`, which skips an
+    # unparseable segment because it is choosing ONE among several
+    # candidates and has no opinion about the rest, this scan has already
+    # committed to reading every segment, so one it cannot read must not
+    # silently pass as though it had been checked and found clean.
+    with pytest.raises(AssertionError, match='cannot tokenise'):
+        _npx_fronted_segments('uv run pyright "src/')
 
 
 def test_the_field_scan_covers_every_guarded_command_field() -> None:
@@ -416,52 +428,89 @@ def test_no_discovered_module_config_shells_a_guarded_command_through_npx(
             f'asyncio-gathers over ALL module_configs and this repo\'s root '
             f'sets merge_verify_breadth: "full", that is a FLEET-WIDE '
             f'false-red blocking every merge, review checkpoint and main-tip '
-            f'sweep — on a branch with no defect. Remedy: resolve the '
-            f'checker through `uv run --directory {prefix} ...` if {prefix} '
-            f'is a [tool.uv.workspace] member, else `uv run --project '
-            f'shared ...`'
+            f'sweep — on a branch with no defect. Remedy: for a PYTHON '
+            f'checker, resolve it through `uv run --directory {prefix} ...` '
+            f'if {prefix} is a [tool.uv.workspace] member, else `uv run '
+            f'--project shared ...`; for a JS/TS checker (e.g. `vitest`, '
+            f'`tsc`), resolve it through the locally-installed '
+            f'`./node_modules/.bin/<bin>`, backed by the committed '
+            f"`package-lock.json` — the same remedy the repo root's own "
+            f'pinned `npx pyright` chain models via its `npm ci` '
+            f'pre-provision (see test_pyright_version_pin.py)'
         )
 
 
-def _pyright_wrapper_tokens(mc: ModuleConfig) -> list[str] | None:
-    """The PRE-anchor wrapper tokens of the pyright segment of *mc*'s type_check_command.
+def _pyright_wrapper_tokens(mc: ModuleConfig) -> list[list[str]] | None:
+    """The PRE-anchor wrapper tokens of EVERY pyright-bearing segment of *mc*'s type gate.
 
     ``None`` when *mc* declares no ``type_check_command`` at all, or when
-    none of its ``&&``-chained segments invoke ``pyright`` — both legitimate
+    NONE of its ``&&``-chained segments invoke ``pyright`` — both legitimate
     states (a config may run a different type checker, or none), not
-    violations. Built entirely on the shared, imported helpers rather than a
+    violations.
+
+    Returns ONE pre-anchor token list per matching segment, not just the
+    first. Scanning every segment — like :func:`_npx_fronted_segments`
+    above, and for the identical reason — matters because
+    ``verify_command_invariants.optional_token_segment`` returns only its
+    FIRST match: a chained TAIL clause
+    (``uv run --directory x pyright src/ && pyright tests/``) is exactly the
+    bare-``pyright <dir>`` shape this guard exists to reject, and a
+    first-match-only read would report the clean head clause and never look
+    at the violating tail.
+
+    Distinguishes ``None`` ("no pyright segment anywhere in the command, no
+    opinion, skip") from a list containing ``[]`` ("a pyright segment
+    exists with zero pre-anchor tokens — a bare ``pyright <dir>``, a
+    violation"): a bare pyright invocation DOES have a pyright segment, it
+    just has zero pre-anchor tokens, so that segment must reach the caller
+    as an empty list element rather than be conflated with "no pyright
+    segment exists".
+
+    Each segment's tokens are read LOCALLY (mirroring
+    :func:`_npx_fronted_segments`, deliberately NOT delegating to
+    ``optional_token_segment`` — that helper's first-match contract is
+    exactly what this function must not inherit); the PRE/POST split itself
+    still goes through the shared :func:`anchor_split` rather than a
     hand-rolled ``tokens.index('pyright')`` — the exact duplication
     ``anchor_split`` exists to end (its own docstring records that
     ``test_scripts_module_config.py``'s ``_narrowing_flag_args`` had already
     missed a slice its sibling ``_targets`` held from the start, task 4358).
 
-    Distinguishes ``None`` ("no opinion, skip") from ``[]`` ("a bare
-    ``pyright <dir>`` with no wrapper at all — a violation"): a bare pyright
-    invocation DOES have a pyright segment, it just has zero pre-anchor
-    tokens, so it must reach the caller as an empty list rather than be
-    conflated with "no pyright segment exists".
-
-    The ``label=`` passed to :func:`anchor_split` names *mc*'s prefix so an
-    unparseable segment raises a named ``AssertionError`` rather than a bare
-    ``ValueError: No closing quotation`` — the same diagnostic discipline
-    :func:`_npx_fronted_segments` applies above.
+    A segment ``shlex`` cannot tokenise raises a named ``AssertionError``
+    naming *mc*'s prefix, never a bare ``ValueError: No closing quotation``
+    — the same diagnostic discipline :func:`_npx_fronted_segments` applies,
+    and deliberately NOT the skip-on-unparseable behaviour
+    ``optional_token_segment`` uses: this scan has already committed to
+    reading every segment of *cmd*, so one it cannot read must not silently
+    pass as though it had been checked and found clean.
     """
     cmd = mc.type_check_command
     if not cmd:
         return None
-    segment = optional_token_segment(cmd, PYRIGHT)
-    if segment is None:
-        return None
-    pre, _post = anchor_split(
-        segment, PYRIGHT, label=f'{mc.prefix}/orchestrator.yaml type_check_command'
-    )
-    return pre
+    pre_lists: list[list[str]] = []
+    for segment in verify_cmd.split_top_level_and(cmd):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError as exc:
+            raise AssertionError(
+                f'cannot tokenise a `&&`-chained segment of the '
+                f'{mc.prefix}/orchestrator.yaml type_check_command while '
+                f'scanning for pyright wrapper tokens: {exc}; '
+                f'segment: {segment!r}'
+            ) from exc
+        if PYRIGHT not in tokens:
+            continue
+        pre, _post = anchor_split(
+            segment, PYRIGHT, label=f'{mc.prefix}/orchestrator.yaml type_check_command'
+        )
+        pre_lists.append(pre)
+    return pre_lists or None
 
 
 def test_the_pyright_wrapper_read_skips_configs_with_no_pyright_type_gate() -> None:
-    """`_pyright_wrapper_tokens` reads the PRE-anchor wrapper tokens of the pyright segment.
+    """`_pyright_wrapper_tokens` reads the PRE-anchor wrapper tokens of every pyright segment.
 
-    Seven lettered cases, built on fabricated `ModuleConfig`s, each pinning a
+    Nine lettered cases, built on fabricated `ModuleConfig`s, each pinning a
     distinct way a naive read could get this wrong.
     """
     # (a) the real seven-member (workspace) shape.
@@ -469,7 +518,7 @@ def test_the_pyright_wrapper_read_skips_configs_with_no_pyright_type_gate() -> N
         prefix='cockpit',
         type_check_command='uv run --directory cockpit pyright src/ tests/',
     )
-    assert _pyright_wrapper_tokens(mc) == ['uv', 'run', '--directory', 'cockpit'], (
+    assert _pyright_wrapper_tokens(mc) == [['uv', 'run', '--directory', 'cockpit']], (
         f'expected the real member shape to read its pre-anchor wrapper '
         f'tokens, got {_pyright_wrapper_tokens(mc)!r}'
     )
@@ -480,7 +529,7 @@ def test_the_pyright_wrapper_read_skips_configs_with_no_pyright_type_gate() -> N
     mc = ModuleConfig(
         prefix='scripts', type_check_command='uv run --project shared pyright scripts/'
     )
-    assert _pyright_wrapper_tokens(mc) == ['uv', 'run', '--project', 'shared'], (
+    assert _pyright_wrapper_tokens(mc) == [['uv', 'run', '--project', 'shared']], (
         f'expected the real non-member shape to read its pre-anchor wrapper '
         f'tokens, got {_pyright_wrapper_tokens(mc)!r}'
     )
@@ -510,7 +559,7 @@ def test_the_pyright_wrapper_read_skips_configs_with_no_pyright_type_gate() -> N
     # (e) the pyright segment is the SECOND `&&` clause — proves the read
     # selects the segment by token rather than assuming the head clause.
     mc = ModuleConfig(prefix='fake', type_check_command='cd cockpit && uv run pyright src/')
-    assert _pyright_wrapper_tokens(mc) == ['uv', 'run'], (
+    assert _pyright_wrapper_tokens(mc) == [['uv', 'run']], (
         f'expected the SECOND clause to be read as the pyright segment, got '
         f'{_pyright_wrapper_tokens(mc)!r}'
     )
@@ -522,22 +571,54 @@ def test_the_pyright_wrapper_read_skips_configs_with_no_pyright_type_gate() -> N
     mc = ModuleConfig(
         prefix='fake', type_check_command='uv run --directory x pyright --outputjson src/'
     )
-    assert _pyright_wrapper_tokens(mc) == ['uv', 'run', '--directory', 'x'], (
+    assert _pyright_wrapper_tokens(mc) == [['uv', 'run', '--directory', 'x']], (
         f'expected the post-anchor `--outputjson` to be excluded from the '
         f'wrapper tokens, got {_pyright_wrapper_tokens(mc)!r}'
     )
 
-    # (g) the bare-PATH shape this guard must FAIL: `[]`, NOT `None`. `[]` and
-    # `None` must be distinguishable, because one means "no opinion, skip"
-    # and the other means "violation".
+    # (g) the bare-PATH shape this guard must FAIL: a list containing ONE
+    # empty token list, `[[]]` — NOT `None`. Distinguishing the two is the
+    # whole point: cases (c)/(d) above already establish that `None` means
+    # "no pyright segment anywhere, skip"; this case is the informative
+    # negative — a config that DOES have a pyright segment reads a
+    # non-None, specifically-shaped result even when that segment's own
+    # wrapper is empty, because the repo-wide guard must FAIL on it rather
+    # than skip it.
     mc = ModuleConfig(prefix='fake', type_check_command='pyright src/')
     result = _pyright_wrapper_tokens(mc)
-    assert result == [], f'expected an empty wrapper token list, got {result!r}'
-    assert result is not None, (
-        'a bare `pyright src/` type gate must read as `[]` (a violation the '
-        'repo-wide guard fails on), not `None` (which the guard would '
-        'silently skip)'
+    assert result == [[]], f'expected a single empty wrapper token list, got {result!r}'
+
+    # (h) MULTIPLE pyright-bearing segments — a chained TAIL clause with a
+    # bare `pyright <dir>` after a clean head clause is exactly the shape a
+    # first-match-only read would MISS, because
+    # `verify_command_invariants.optional_token_segment` (like any
+    # first-match reader) stops at the first segment invoking `pyright` and
+    # never inspects the tail. Both segments must be reported.
+    mc = ModuleConfig(
+        prefix='fake',
+        type_check_command='uv run --directory x pyright src/ && pyright tests/',
     )
+    result = _pyright_wrapper_tokens(mc)
+    assert result == [['uv', 'run', '--directory', 'x'], []], (
+        f'expected BOTH pyright-bearing segments reported — the clean head '
+        f'clause and the bare-PATH tail clause (a violation) — got '
+        f'{result!r}. A read that stops at the first match would silently '
+        f'pass this command, because its head clause alone is clean'
+    )
+
+    # (i) An unparseable segment (unbalanced quote) must RAISE a named
+    # AssertionError naming *mc*'s prefix, never a bare
+    # `ValueError: No closing quotation` and never a silent skip — the same
+    # CERTIFY-THE-ABSENCE reasoning case (i) of
+    # `test_the_npx_scan_reads_exact_tokens_in_every_chain_segment` pins,
+    # applied here to the SECONDARY hazard it was masking: read via
+    # `optional_token_segment` (which SKIPS an unparseable segment), the
+    # uv-run guard would have silently had no opinion about a command it
+    # never actually read.
+    with pytest.raises(AssertionError, match='fake/orchestrator.yaml type_check_command'):
+        _pyright_wrapper_tokens(
+            ModuleConfig(prefix='fake', type_check_command='uv run pyright "src/')
+        )
 
 
 def test_every_discovered_pyright_type_gate_resolves_through_uv_run(
@@ -556,10 +637,14 @@ def test_every_discovered_pyright_type_gate_resolves_through_uv_run(
     'shared'` encodes the same environment pairing) — trading a flaky red
     for a command-not-found red.
 
-    SKIPS (does not fail) a config with no type_check_command or whose type
-    gate invokes no pyright — see module docstring and
+    SKIPS (does not fail) a config with no type_check_command, or none of
+    whose `&&`-chained segments invoke pyright — see module docstring and
     `_pyright_wrapper_tokens`'s own docstring for why that is the correct
-    semantic rather than a violation.
+    semantic rather than a violation. Checks EVERY pyright-bearing segment
+    of a config that has at least one, not just the first — a chained TAIL
+    clause can resolve differently than its head clause (see
+    `_pyright_wrapper_tokens`'s docstring and case (h) of
+    `test_the_pyright_wrapper_read_skips_configs_with_no_pyright_type_gate`).
     """
     discovered = discover_module_configs()
 
@@ -574,18 +659,20 @@ def test_every_discovered_pyright_type_gate_resolves_through_uv_run(
     )
 
     for prefix, mc in sorted(discovered.items()):
-        pre = _pyright_wrapper_tokens(mc)
-        if pre is None:
+        pre_lists = _pyright_wrapper_tokens(mc)
+        if pre_lists is None:
             continue
-        assert pre[:2] == ['uv', 'run'], (
-            f'{prefix}/orchestrator.yaml resolves its pyright type gate '
-            f'through {pre!r} rather than `uv run`. The npx ban alone is '
-            f'insufficient here: dropping to a bare `pyright <dir>` would '
-            f'resolve off PATH — where pyright does not exist at the '
-            f"worktree root, only inside a member venv (verify.py's "
-            f"_FALLBACK_UV_PROJECT = 'shared' encodes the same pairing) — "
-            f'trading a flaky npm-cache red for a command-not-found red. '
-            f'Remedy: `uv run --directory {prefix} pyright ...` if {prefix} '
-            f'is a [tool.uv.workspace] member, else `uv run --project '
-            f'shared pyright ...`'
-        )
+        for pre in pre_lists:
+            assert pre[:2] == ['uv', 'run'], (
+                f'{prefix}/orchestrator.yaml resolves a pyright type gate '
+                f'segment through {pre!r} rather than `uv run`. The npx '
+                f'ban alone is insufficient here: dropping to a bare '
+                f'`pyright <dir>` would resolve off PATH — where pyright '
+                f'does not exist at the worktree root, only inside a '
+                f"member venv (verify.py's _FALLBACK_UV_PROJECT = 'shared' "
+                f'encodes the same pairing) — trading a flaky npm-cache '
+                f'red for a command-not-found red. Remedy: '
+                f'`uv run --directory {prefix} pyright ...` if {prefix} '
+                f'is a [tool.uv.workspace] member, else `uv run --project '
+                f'shared pyright ...`'
+            )
