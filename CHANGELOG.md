@@ -540,11 +540,13 @@ run corpus-wide.
 
 A `design_decisions` entry whose `decision` and `rationale` are each well-formed
 prose but wrongly **paired** — a different damage class from the envelope
-leakage above, and disjoint from it at the detector (`shared.toolcall_markup.detect`
-cannot see a mis-pairing by construction, not by oversight). The full account —
-the shape, why repair is impossible, why no deterministic write-time predicate
-can contain it, and the containment measurement — lives in
-[`docs/plan-decision-cross-pairing.md`](docs/plan-decision-cross-pairing.md).
+leakage above, and invisible to that detector by construction, not by
+oversight (`shared.toolcall_markup.detect` cannot see a mis-pairing) — though
+the two classes do co-occur on individual plans, which is why the scanner
+reports an `envelope_leak` column rather than deferring to a second sweep.
+The full account — the shape, why repair is impossible, why no deterministic
+write-time predicate can contain it, and the containment measurement — lives
+in [`docs/plan-decision-cross-pairing.md`](docs/plan-decision-cross-pairing.md).
 Treat every prevalence figure there as a dated, strict lower bound, not a
 number to trust — the corpus keeps growing — and re-run the scanner instead of
 citing it.
