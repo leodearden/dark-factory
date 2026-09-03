@@ -33,14 +33,17 @@ The contract asserted here has two halves, and the asymmetry is deliberate:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from dashboard.app import _BurndownStore
+from dashboard.app import _BurndownStore, _metrics_loop, _MetricsStore
 from dashboard.config import DashboardConfig
 
 
@@ -236,4 +239,94 @@ async def test_lifespan_binds_burndown_loop_to_the_config_it_built() -> None:
         'task 3771 INTERLEAVE: _burndown_loop received a config installed on app.state '
         'AFTER its own lifespan built one -- lifespan must bind config to a local before '
         'the first await, not re-read app.state.config across it'
+    )
+
+
+@pytest.mark.asyncio
+async def test_metrics_loop_still_rereads_config_from_app_state_each_cycle(
+    tmp_path: Path,
+) -> None:
+    """config stays an app.state re-read -- the deliberate half of the asymmetry.
+
+    The handles bind to arguments (see the tests above), but ``config`` must NOT:
+    ~25 dashboard tests swap ``client.app.state.config`` mid-test
+    (test_tab_escalation_analytics.py, test_escalation_lifecycle_gate.py,
+    test_memory_evals_data.py, ...) and depend on the swap being picked up.
+    This guard is what makes an over-eager "make it consistent" refactor break
+    ONE test here instead of ~25 elsewhere.
+
+    Drives ``_metrics_loop`` directly, reusing the harness in
+    test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
+    """
+    store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
+    await store.open()
+
+    # Two REAL configs (not MagicMocks -- check_bare_magicmock_config.py Rule A),
+    # distinct in both identity and value.
+    config_a = DashboardConfig(project_root=tmp_path)
+    config_b = DashboardConfig(project_root=tmp_path / 'swapped')
+
+    mock_pool = MagicMock()
+    mock_pool.get = AsyncMock(return_value=None)
+    mock_http_client = MagicMock()
+    mock_app = MagicMock()
+    mock_app.state.config = config_a
+
+    seen_configs: list[Any] = []
+    saw_swapped = asyncio.Event()
+
+    async def _recording_collect(*args: object, **kwargs: Any) -> None:
+        seen = kwargs['config']
+        seen_configs.append(seen)
+        if seen is config_a:
+            # Stand in for the mid-test swap those ~25 sites perform.
+            mock_app.state.config = config_b
+        elif seen is config_b:
+            # Set from inside the recorder, so the wait below is racefree.
+            saw_swapped.set()
+
+    async def _noop_sleep(*a: object, **kw: object) -> None:
+        # Must actually suspend.  A plain AsyncMock never yields, creating a
+        # tight synchronous loop that starves asyncio.wait_for of event-loop
+        # cycles -- see test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
+        await asyncio.sleep(0)
+
+    try:
+        with (
+            patch(
+                'dashboard.app.collect_metrics_snapshot',
+                new=AsyncMock(side_effect=_recording_collect),
+            ),
+            patch('dashboard.app._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
+        ):
+            task = asyncio.create_task(
+                _metrics_loop(
+                    store,
+                    mock_app,
+                    pool=mock_pool,
+                    http_client=mock_http_client,
+                )
+            )
+            try:
+                # Suppressed, not raised: on regression the swap never lands and
+                # a bare TimeoutError says nothing.  Falling through lets the
+                # named assertions below explain what actually broke.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(saw_swapped.wait(), timeout=2.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    finally:
+        await store.close()
+
+    assert seen_configs, 'task 3771: collect_metrics_snapshot was never called'
+    assert seen_configs[0] is config_a, (
+        'task 3771: the first cycle must use the config installed on app.state at the time'
+    )
+    assert any(cfg is config_b for cfg in seen_configs), (
+        'task 3771: a later cycle never picked up the swapped app.state.config. '
+        'config must stay an app.state re-read inside _run_once -- ~25 tests swap '
+        'client.app.state.config mid-test and depend on it. Only pool/http_client '
+        'bind to arguments.'
     )
