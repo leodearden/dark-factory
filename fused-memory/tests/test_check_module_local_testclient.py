@@ -13,6 +13,8 @@ from __future__ import annotations
 import ast
 import importlib.util
 import re
+import subprocess
+import sys
 import types
 from pathlib import Path
 
@@ -544,4 +546,44 @@ class TestCliErrorHandling:
         assert 'test_a_unreadable.py' in captured.err
         assert 'test_b_violating.py' in captured.out, (
             'a read error discarded violations collected from other files'
+        )
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DASHBOARD_TESTS = _REPO_ROOT / 'dashboard' / 'tests'
+
+
+class TestRealDashboardTestsDirectoryIsClean:
+    """Regression guard: dashboard/tests/ must produce zero violations.
+
+    This is the assertion the whole task exists to make durable. Task 3571
+    deleted an in-suite guard that made the same claim and shipped GREEN over a
+    live, byte-identical duplicate of conftest's `_client` in
+    test_tab_tasks_offline_banner.py — which sat in the tree for eleven days
+    while a dedup task, its purpose-built guard and a human review all reported
+    "conftest is the only home".
+    """
+
+    def test_real_dashboard_tests_directory_is_clean_under_check(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(_DASHBOARD_TESTS)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f'Unexpected module-local TestClient fixtures in dashboard/tests/:\n'
+            f'{result.stdout}\n'
+            f'Each offender should either request conftest.py\'s shared `_client`'
+            f' fixture, or carry a # noqa: module-local-testclient — <reason> pragma'
+            f' on the preceding non-blank line.'
+        )
+        assert result.stdout == ''
+
+    def test_dashboard_tests_scan_is_non_vacuous(self):
+        """The scan must actually discover files, so this cannot pass against a moved tree."""
+        assert _DASHBOARD_TESTS.is_dir(), f'{_DASHBOARD_TESTS} is not a directory'
+        discovered = list(_DASHBOARD_TESTS.rglob('test_*.py'))
+        assert len(discovered) > 0, (
+            f'No test_*.py files discovered under {_DASHBOARD_TESTS} — the cleanliness'
+            f' assertion above would pass vacuously.'
         )
