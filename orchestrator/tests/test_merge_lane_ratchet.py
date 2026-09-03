@@ -59,7 +59,18 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # module's sweep lives in scripts/merge_lane_metrics.py instead. Adding a marked
 # module cannot break that guard either -- its family invariant uses ``>=``
 # floors.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+#
+# The xdist_group pins the WHOLE module to one worker. Without it, --dist
+# loadgroup distributes these items individually and every worker that draws one
+# pays build_report's measured 72.7s over again -- 22 complexipy runs plus a
+# 559-file AST sweep -- for a single cached result. Grouped, the module takes
+# that cost exactly ONCE (module-scoped `live_report` below) while running in
+# parallel with the rest of the suite. `xdist_group` is a registered marker; see
+# test_marker_registration_drift.py's allowlist.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group('merge_lane_ratchet'),
+]
 
 # Make scripts/merge_lane_metrics.py importable. This is the sanctioned
 # precedent for an orchestrator/tests/ module importing a scripts/ one -- see
@@ -72,6 +83,19 @@ if str(_SCRIPTS) not in sys.path:
 import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
+
+
+@pytest.fixture(scope='module')
+def live_report() -> dict:
+    """THE single real measurement this module takes.
+
+    build_report measures 72.7s on an idle 32-core box: 22 complexipy runs over
+    the cluster (13.0s), the cluster AST/tokenize sweep (4.1s) and the 559-file
+    orchestrator/tests AST sweep (38.6s). Every test that needs live numbers
+    shares this one result, and the module's xdist_group keeps them on one
+    worker so it is paid once per session rather than once per worker.
+    """
+    return metrics.build_report(_REPO_ROOT)
 
 # The 18 orchestrator/src literal paths of PRD Appendix A, verbatim. git_ops.py
 # is listed separately below because Appendix A adds it under a different rule
@@ -1053,9 +1077,9 @@ class TestDeriveTotals:
 
 
 class TestBuildReport:
-    @pytest.fixture(scope='class')
-    def report(self) -> dict:
-        return metrics.build_report(_REPO_ROOT)
+    @pytest.fixture()
+    def report(self, live_report: dict) -> dict:
+        return live_report
 
     def test_top_level_keys(self, report: dict) -> None:
         assert set(report) == {
@@ -1624,3 +1648,172 @@ class TestViolationShape:
         metrics.check_against_baseline(current, baseline)
         after = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
         assert after == before
+
+
+# ---------------------------------------------------------------------------
+# CLI surface.
+#
+# --check is the face twenty downstream PRD tasks will actually run, so its exit
+# ladder is pinned as carefully as the comparator itself: 0 clean, 1 ratchet
+# violations, 2 instrument failure. Collapsing 1 and 2 would let a broken
+# instrument read as a real regression, or a real regression as a broken
+# instrument -- both send the reader to the wrong file.
+
+
+@pytest.fixture()
+def stub_measurement(monkeypatch: pytest.MonkeyPatch, live_report: dict) -> dict:
+    """Hand the CLI this module's one cached measurement.
+
+    The CLI's own job is dispatch, rendering and the exit ladder; build_report
+    is already pinned by TestBuildReport against the real tree. Re-measuring
+    once per CLI test would add ~6 x 72.7s to every orchestrator verify leg to
+    re-prove something already proven.
+    """
+    monkeypatch.setattr(
+        metrics, 'build_report', lambda root: copy.deepcopy(live_report)
+    )
+    return live_report
+
+
+class TestReportCli:
+    def test_report_returns_zero_and_names_every_cluster_path(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert metrics.main(['--report']) == 0
+        out = capsys.readouterr().out
+        for path in stub_measurement['files']:
+            assert path in out, path
+
+    def test_report_carries_the_per_file_column_set(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        metrics.main(['--report'])
+        out = capsys.readouterr().out
+        for column in ('lines', 'prose', 'cognitive', 'mi'):
+            assert column in out, column
+
+    def test_report_carries_the_derived_cluster_totals(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        metrics.main(['--report'])
+        out = capsys.readouterr().out
+        assert 'TOTALS' in out
+        totals = metrics.derive_totals(stub_measurement)
+        assert str(totals['cognitive']) in out
+        assert str(totals['lines']) in out
+
+    def test_report_carries_the_test_suite_measures(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        metrics.main(['--report'])
+        out = capsys.readouterr().out
+        totals = metrics.derive_totals(stub_measurement)
+        assert 'private_reads' in out
+        assert 'patch_targets' in out
+        assert str(totals['private_reads']) in out
+
+    def test_report_carries_an_explicit_enumeration_completeness_row(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # INV-11's user-observable signal: completeness is legible in the
+        # RESULT, not only in a log line.
+        metrics.main(['--report'])
+        out = capsys.readouterr().out
+        assert 'enumeration' in out
+        assert 'complete' in out
+
+    def test_json_returns_zero_and_stdout_parses_as_the_report(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert metrics.main(['--json']) == 0
+        assert json.loads(capsys.readouterr().out) == stub_measurement
+
+
+class TestCheckCli:
+    def test_check_is_clean_against_a_baseline_of_the_same_measurement(
+        self, stub_measurement: dict, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        baseline = tmp_path / 'baseline.json'
+        metrics.write_baseline(baseline, stub_measurement)
+        assert metrics.main(['--check', '--baseline', str(baseline)]) == 0
+        assert capsys.readouterr().err == ''
+
+    def test_check_returns_one_and_prints_violations_for_a_doctored_baseline(
+        self, stub_measurement: dict, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        doctored = copy.deepcopy(stub_measurement)
+        doctored['files'][_MQ]['lines'] -= 10
+        baseline = tmp_path / 'baseline.json'
+        metrics.write_baseline(baseline, doctored)
+        assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
+        err = capsys.readouterr().err
+        assert _MQ in err
+        assert 'lines' in err
+
+    def test_check_is_clean_against_the_committed_baseline(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # No stub and no --baseline: the exact invocation the twenty downstream
+        # PRD tasks will run. RED until the baseline is generated and committed.
+        assert metrics.main(['--check']) == 0
+        assert capsys.readouterr().err == ''
+
+
+class TestWriteBaselineCli:
+    def test_write_baseline_returns_zero_and_writes_the_rendered_bytes(
+        self, stub_measurement: dict, tmp_path: Path
+    ) -> None:
+        target = tmp_path / 'b.json'
+        assert metrics.main(['--write-baseline', str(target)]) == 0
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(
+            stub_measurement
+        )
+
+
+class TestCliContract:
+    @pytest.mark.parametrize(
+        'argv',
+        [
+            ['--report', '--json'],
+            ['--check', '--report'],
+            ['--json', '--write-baseline', 'x.json'],
+            ['--check', '--write-baseline', 'x.json'],
+        ],
+    )
+    def test_the_four_modes_are_mutually_exclusive(self, argv: list[str]) -> None:
+        with pytest.raises(SystemExit):
+            metrics.main(argv)
+
+    def test_an_instrument_failure_exits_two_with_a_named_cause(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Exit 2 is deliberately DISTINCT from the exit-1 ratchet violation, so
+        # a broken instrument is never mistaken for a clean tree or for a real
+        # regression.
+        def explode(root: Path) -> dict:
+            raise metrics.MetricsError('complexipy 7.0.1 is outside >=6.2,<7')
+
+        monkeypatch.setattr(metrics, 'build_report', explode)
+        assert metrics.main(['--report']) == 2
+        err = capsys.readouterr().err
+        assert 'complexipy 7.0.1' in err
+
+    def test_a_missing_baseline_exits_two_not_one(
+        self, stub_measurement: dict, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # The failure INV-11 exists to prevent: a missing baseline must not read
+        # as "no violations".
+        missing = tmp_path / 'absent.json'
+        assert metrics.main(['--check', '--baseline', str(missing)]) == 2
+        assert 'absent.json' in capsys.readouterr().err
+
+    def test_root_defaults_to_the_repo_root(self) -> None:
+        args = metrics._build_parser().parse_args(['--report'])
+        assert Path(args.root).resolve() == _REPO_ROOT.resolve()
+
+    def test_baseline_defaults_to_the_committed_path(self) -> None:
+        args = metrics._build_parser().parse_args(['--check'])
+        assert Path(args.baseline).name == 'merge_lane_ratchet_baseline.json'
