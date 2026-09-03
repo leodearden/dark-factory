@@ -245,7 +245,15 @@ class TestDeny:
 
 _LOGGER = 'contract_probe_logger'
 _OTHER_LOGGER = 'contract_probe_other_logger'
-_BOTH_MARKERS = 'sweep NOT started (fail-closed): route it through the MCP server'
+
+# Probe messages are COMPOSED from the exported markers rather than spelled
+# out, so `TestPinnedLiterals` stays the one place in this file that types
+# either marker -- and so a marker rename cannot leave these probes silently
+# testing the wrong string.
+_MARKER_FAIL_CLOSED, _MARKER_REMEDY = FAIL_CLOSED_MARKERS
+_BOTH_MARKERS = f'sweep {_MARKER_FAIL_CLOSED}: route it through the {_MARKER_REMEDY}'
+_ONLY_REMEDY = f'fatal error during sweep: route it through the {_MARKER_REMEDY}'
+_ONLY_FAIL_CLOSED = f'sweep {_MARKER_FAIL_CLOSED}: boom'
 
 
 class TestFailClosedRecords:
@@ -276,15 +284,14 @@ class TestFailClosedRecords:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         with caplog.at_level(logging.DEBUG):
-            logging.getLogger(_LOGGER).error('fatal error during sweep: route it '
-                                             'through the MCP server')
+            logging.getLogger(_LOGGER).error(_ONLY_REMEDY)
         assert fail_closed_records(caplog, _LOGGER) == []
 
     def test_excludes_a_record_missing_the_remedy_marker(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         with caplog.at_level(logging.DEBUG):
-            logging.getLogger(_LOGGER).error('sweep NOT started (fail-closed): boom')
+            logging.getLogger(_LOGGER).error(_ONLY_FAIL_CLOSED)
         assert fail_closed_records(caplog, _LOGGER) == []
 
     def test_includes_critical(self, caplog: pytest.LogCaptureFixture) -> None:
@@ -413,4 +420,58 @@ class TestNoHandRolledDenyRaiser:
             '`_store_mutation_preflight_contract.deny(<script module>, '
             'monkeypatch)` instead, so the sentinel is spelled once:\n  '
             + '\n  '.join(offenders)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Drift guard #3 — the fail-closed marker literal lives only in the helper
+# ---------------------------------------------------------------------------
+
+# Guarding the marker LITERAL rather than a `_fail_closed_records` function
+# name is the stronger check: it also catches a re-divergence that inlines the
+# filter into a test body, or renames the helper. Once green,
+# `FAIL_CLOSED_MARKERS` is the only place either marker is spelled anywhere in
+# `tests/`, so adding a third is a one-line change instead of a 12-file sweep --
+# which is precisely the drift this extraction exists to close.
+_GUARDED_MARKER = FAIL_CLOSED_MARKERS[0]
+
+
+class TestNoInlinedFailClosedMarker:
+    """Whole-tree AST drift guard: the fail-closed marker may not be spelled in
+    any test module. Filtering a guard site's own diagnosis out of the log goes
+    through `_store_mutation_preflight_contract.fail_closed_records`.
+
+    Sweeps `ast.Constant` string nodes, so docstring prose that refers to "the
+    fail-closed marker" without quoting it does not trip the guard -- which is
+    what lets the surviving per-suite rationale keep discussing the contract in
+    words.
+
+    The scripts under `scripts/` do contain the literal, since they EMIT it,
+    and are correctly outside this sweep.
+    """
+
+    def test_no_test_module_spells_the_fail_closed_marker(self) -> None:
+        offenders: list[str] = []
+        for path in _test_modules():
+            if path.name == pathlib.Path(__file__).name:
+                # The helper HOME's own test module. `TestPinnedLiterals` must
+                # spell both markers to pin them; every other reference in this
+                # file is composed from `FAIL_CLOSED_MARKERS`, so this exemption
+                # covers exactly the one deliberate pin and nothing else.
+                continue
+            tree = parse_python_module(path)
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and _GUARDED_MARKER in node.value
+                ):
+                    offenders.append(f'{path.name}:{node.lineno}')
+
+        assert not offenders, (
+            f'{len(offenders)} inlined `{_GUARDED_MARKER}` literal(s) found. '
+            'Filter the guard record through '
+            '`_store_mutation_preflight_contract.fail_closed_records(caplog, '
+            "'<the script's logger name>')` instead, so both markers are "
+            'spelled once:\n  ' + '\n  '.join(offenders)
         )
