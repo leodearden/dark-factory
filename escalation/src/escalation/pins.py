@@ -234,7 +234,12 @@ def _classify_record(
     # JSON on disk can carry a null `severity` despite the `str` annotation.
     sev = str(record.severity or '').strip().lower()
 
-    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.
+    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Since
+    # task 3976, `escalation.server.promote_to_l2`'s inherited
+    # max(member severities) default can mint this at level=2 (previously
+    # every L2 filed >= 'blocking'), so this link now also decides an
+    # inherited-info L2 as NON_PINNING — see TestInfoAtL2Coupling in
+    # escalation/tests/test_pins.py (task 4402).
     if sev == 'info':
         return PinClass.NON_PINNING
 

@@ -417,6 +417,39 @@ class TestBornAtL2SeverityAtLevelZeroFailsSafe:
         )
 
 
+class TestInfoAtL2Coupling:
+    """The info-at-L2 / promote_to_l2 coupling (task 4402, follow-up to 3976).
+
+    Task 3976 changed ``promote_to_l2`` so an OMITTED ``severity`` argument
+    inherits ``max(member severities)`` instead of defaulting to
+    ``'blocking'`` — so an L2 can now be BORN with ``severity='info'``, a
+    state no producer could previously create (``promote_to_l2`` was the
+    only L2 minter and always filed ``>= 'blocking'``). Link 1 above
+    short-circuits on ``severity == 'info'`` BEFORE the ``level != 0`` link,
+    so this inherited-info L2 classifies ``NON_PINNING`` — where every prior
+    L2 classified ``QUEUE_HANDOFF``. This is documented as INTENDED
+    semantics on ``escalation.server.promote_to_l2``'s docstring (its members
+    were themselves non-pinning, and the classifier is not yet wired to any
+    production veto site — task 3541) — this test pins that outcome so a
+    future re-ordering of pins.py's precedence chain fails loudly instead of
+    only contradicting prose."""
+
+    @pytest.mark.parametrize('live_claimant', [True, False])
+    @pytest.mark.parametrize('filing', [OTHER_ID, LIVE_ID, None])
+    def test_inherited_info_l2_is_non_pinning(
+        self, live_claimant: bool, filing: str | None,
+    ) -> None:
+        report = classify_pins(
+            '42',
+            [_rec(level=2, severity='info', filing=filing)],
+            live_claimant=live_claimant,
+            live_claimant_id=LIVE_ID,
+        )
+        assert report.non_pinning == ('esc-42-1',)
+        assert report.queue_handoff == ()
+        assert report.pins is False
+
+
 class TestLiveClaimantIdShapeGuard:
     """``live_claimant_id`` must be a full ``compose_claimant_run_id`` string.
 
