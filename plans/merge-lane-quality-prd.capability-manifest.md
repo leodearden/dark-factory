@@ -1,5 +1,9 @@
 # Capability manifest — `plans/merge-lane-quality-prd.md`
 
+Every mechanical `delivered_check` below was verified at decompose to FAIL on main as authored — a
+check that already passes cannot distinguish delivered from undelivered. Two that did already pass
+(β `exercise_merge_verify`, τ `restart`) were converted to `manual`.
+
 Mechanizes G3 (assumed-substrate verified) and G6 (premise validity) for the 29-task
 decomposition of the merge-lane quality PRD. Every binding below was resolved at decompose time
 against **main `4811d62883`** (2026-09-03) — the commit that carries the PRD itself. Main moves
@@ -20,8 +24,8 @@ excluded from the dispatch gate.
 | PASS | 93 |
 | FAIL (would block the batch) | 0 |
 | OPEN | 0 |
-| Mechanical `delivered_check`s copied to producers | 29 |
-| `manual` checks (recorded, not gated) | 64 |
+| Mechanical `delivered_check`s copied to producers | 27 |
+| `manual` checks (recorded, not gated) | 66 |
 
 ## Gate walk — what was checked and what it cost
 
@@ -141,8 +145,8 @@ no-claimant branches for exactly this reason. Recorded, not waived.
   - binding: capability→producer (upstream=self) — orchestrator/tests/_merge_lane_fakes.py is new in β; γ1..γ10 and σ all consume it
   - delivered_check: `grep class FakeVerifier` in `orchestrator/tests/_merge_lane_fakes.py` — expect **present**
 - **`exercise-merge-verify-optout-preserved`** — PASS
-  - binding: capability→producer (wired) — the marker is registered in orchestrator/pyproject.toml and honoured at orchestrator/tests/conftest.py (request.node.get_closest_marker); σ boundary row 2 depends on it surviving β
-  - delivered_check: `grep exercise_merge_verify` in `orchestrator/tests/conftest.py` — expect **present**
+  - binding: capability→producer (wired) — the marker is registered in orchestrator/pyproject.toml and honoured at orchestrator/tests/conftest.py (request.node.get_closest_marker); σ boundary row 2 depends on it surviving β | NOT a mechanical delivered_check: verified at decompose that this pattern ALREADY passes on main, so it could never distinguish delivered from undelivered.
+  - delivered_check: manual — the marker already exists on main and β must PRESERVE it, so a present-check on it passes whether or not β ran — vacuous as a delivered_check. Preservation is pinned by β's updated test_merge_verify_mock_autouse.py and by σ boundary row 2, which EXERCISES the opt-out.
 - **`ports-available-upstream`** — PASS
   - binding: DAG-direction — VerifyPort/ClockPort/EscalationPort are produced by ζ1, which is UPSTREAM of β (α → ζ1 → β)
   - delivered_check: manual — DAG-direction only; ζ1 carries the mechanical check for the ports themselves
@@ -456,8 +460,8 @@ no-claimant branches for exactly this reason. Recorded, not waived.
 ### τ — Deterministic fleet redeploy
 
 - **`restart-script-exists-and-is-executable`** — PASS
-  - binding: capability→producer (wired) — scripts/restart-all-orchestrators.sh verified present and mode 0775 on main at decompose; before_done validation requires it AT FILING TIME, so this had to be checked here, not at dispatch
-  - delivered_check: `grep restart` in `scripts/restart-all-orchestrators.sh` — expect **present**
+  - binding: capability→producer (wired) — scripts/restart-all-orchestrators.sh verified present and mode 0775 on main at decompose; before_done validation requires it AT FILING TIME, so this had to be checked here, not at dispatch | NOT a mechanical delivered_check: verified at decompose that this pattern ALREADY passes on main, so it could never distinguish delivered from undelivered.
+  - delivered_check: manual — the script already exists on main — a present-check on it passes whether or not τ ran. Its existence and executability are validated by before_done at submit_task time, which is the enforcing mechanism; τ has no dependents for a gate to protect anyway.
 - **`target-unit-exists`** — PASS
   - binding: capability→producer (wired) — orchestrator-dark-factory.service is a live systemd --user unit (loaded active running) with a unit file at ~/.config/systemd/user/. It equals the dispatching orchestrator's own unit, so the DeterministicRunner takes the detached systemd-run path and closes with done_provenance kind deterministic-deploy-scheduled — exactly the PRD's signal.
   - delivered_check: manual — systemd unit liveness is host state, not a repo pattern
