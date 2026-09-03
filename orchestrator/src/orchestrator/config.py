@@ -841,9 +841,14 @@ class SessionResumeConfig(BaseModel):
     reason-carrying ``session_resume_fallback``/``session_resume_capped``
     event; a run of UNEXPLAINED fallbacks above
     ``fallback_storm_threshold``, each chained within ``storm_window_secs``
-    of the previous, files one L1 escalation (INV-4). By-design
-    degradations (``capped``, and ``reseeded`` since task 3256) emit their
-    event but never feed that run.
+    of the previous, files one L1 escalation (INV-4). Since task 3728 EVERY
+    by-design degradation emits its event but never feeds that run —
+    ``harness.py::_BY_DESIGN_SESSION_RESUME_REASONS`` enumerates them
+    (``capped``, ``reseeded``, and now ``stale`` / ``no_transcript``, which
+    were classified genuine while being documented as the anticipated
+    clock/reseed cases). The fallback event reports ALL reasons a session was
+    ineligible, not the first one matched, so a by-design reason co-occurring
+    with a genuine one is visible beside it rather than hiding it.
 
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
@@ -896,7 +901,10 @@ class SessionResumeConfig(BaseModel):
         description=(
             'A recovered sidecar is eligible only if (now - started_at) is '
             'below this many seconds; a staler sidecar degrades to fresh '
-            'dispatch with a session_resume_fallback(reason=stale) event. '
+            'dispatch with a session_resume_fallback event carrying "stale" in '
+            'its data.reasons list — alongside any OTHER reason the same '
+            'session failed, since the reasons are reported as a set rather '
+            'than a first match (task 3728). '
             'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
             'absolute cap plus slack, so a sidecar is rejected only once it '
             'clearly outlives any legitimate in-flight invocation.'
@@ -918,15 +926,26 @@ class SessionResumeConfig(BaseModel):
         ge=1,
         description=(
             'Consecutive UNEXPLAINED session_resume_fallback degradations '
-            'before one L1 escalation is filed (INV-4 storm escape — '
-            'suspected systematic clock skew, or transcripts vanishing while '
-            'their config dir survives). Only reason in {stale, no_transcript} '
-            'counts: reason=reseeded is a by-design lane reseed and is '
-            'excluded, exactly as session_resume_capped is. The run is chained '
-            'within storm_window_secs (and reset to 0 on any eligible resume) '
-            'rather than accumulating unbounded per boot. Must be >= 1. '
-            'Default 5 is above both the resume cap and ordinary collision '
-            'noise, so only systematic corroboration breakage trips it.'
+            'before one L1 escalation is filed (INV-4 storm escape). Only a '
+            'reason OUTSIDE harness.py::_BY_DESIGN_SESSION_RESUME_REASONS '
+            'counts: every by-design outcome — the per-task cap, a lane '
+            'reseed, an out-of-window sidecar, an uncorroborable transcript — '
+            'is excluded by construction, so reaching this threshold means a '
+            'genuinely unexplained failure mode fired repeatedly. A reason '
+            'is genuine BY DEFAULT: a new one feeds this streak unless it is '
+            'added to that constant. The run is chained within '
+            'storm_window_secs (and reset to 0 on any eligible resume) rather '
+            'than accumulating unbounded per boot. Must be >= 1. Default 5 is '
+            'above both the resume cap and ordinary collision noise, so only '
+            'systematic breakage trips it. '
+            'NOT CURRENTLY REACHABLE, by design and only for now: with '
+            "today's reason vocabulary EVERY producible reason is by-design, "
+            'so the streak has no feeder and this threshold cannot fire at '
+            'any value. Tuning it changes nothing until PRD leaf epsilon '
+            '(task 3733) installs the first genuine feeder '
+            '(archive-restore failure); the mechanism is retained unfed so '
+            'that lands on a tested path. Until then, watch the '
+            'session_resume_fallback event rate directly.'
         ),
     )
     storm_window_secs: int = Field(
@@ -945,7 +964,13 @@ class SessionResumeConfig(BaseModel):
             'with a wide margin on both sides. Measured on the monotonic '
             'clock, deliberately: the stale reason is itself PRODUCED by '
             'clock skew, so a wall-clock decay would be corrupted by the very '
-            'failure mode it must detect.'
+            'failure mode it must detect. '
+            'Its ESCALATION-driving role is inert for the same reason '
+            'fallback_storm_threshold is (see above) — nothing feeds the '
+            'streak until task 3733 — but the window is still LIVE as the '
+            'expiry clock: it is evaluated on every dispatch carrying a '
+            'recovered session, so shortening it still changes when a run '
+            'is considered over.'
         ),
     )
 

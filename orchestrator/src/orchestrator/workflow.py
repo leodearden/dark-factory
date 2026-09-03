@@ -13156,7 +13156,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         )
             # RE-CORROBORATE against the config dir we are about to USE.
             #
-            # The harness eligibility guard (_session_resume_eligible) checks a
+            # The harness eligibility guard (_session_resume_reasons) checks a
             # BOOT-TIME snapshot path — the config dir that existed when
             # recovery ran.  self._config_dir is constructed fresh (see
             # _setup_worktree) from whatever lane was acquired AFTERWARDS, and

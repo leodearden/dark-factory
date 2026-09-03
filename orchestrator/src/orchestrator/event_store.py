@@ -317,36 +317,56 @@ class EventType(StrEnum):
     # session was present for the dispatched task:
     #   session_resume          — an eligible session was injected as --resume.
     #   session_resume_fallback — an ineligible session degraded to fresh
-    #                             dispatch; data.reason ∈ {stale, no_transcript,
-    #                             reseeded}.
-    #   session_resume_capped   — resume_count reached max_resumes_per_task;
-    #                             by-design throttling, degrades to fresh dispatch.
+    #                             dispatch; data.reasons is a SORTED list of
+    #                             EVERY reason it was ineligible, drawn from
+    #                             {stale, capped, no_transcript, reseeded}.
+    #   session_resume_capped   — resume_count reached max_resumes_per_task and
+    #                             was the ONLY disqualifier; by-design
+    #                             throttling of an otherwise healthy session,
+    #                             degrades to fresh dispatch. A capped session
+    #                             that ALSO failed freshness or corroboration
+    #                             emits session_resume_fallback instead, with
+    #                             `capped` still present in data.reasons — it
+    #                             would not have resumed anyway, so counting it
+    #                             as throttling would overstate that population.
     # (enabled=False degrades silently — no event.)
     #
     # Of the fallback reasons, `reseeded` is EXPECTED, not a failure (task
     # 3256): warm-lane acquire ALWAYS re-seeds a lane from base, wiping
     # <lane>/.task/ and the whole claude-config transcript store with it, so a
-    # session adopted at boot routinely finds its store gone by re-dispatch. It
-    # therefore does NOT feed the fallback-storm streak (like
-    # session_resume_capped); only {stale, no_transcript} do. The event is still
-    # emitted so the rate stays measurable (PRD open question 3 — lane-collision
-    # rate is read off these reasons post-deploy).
+    # session adopted at boot routinely finds its store gone by re-dispatch. The
+    # event is still emitted so the rate stays measurable (PRD open question 3 —
+    # lane-collision rate is read off these reasons post-deploy). Which reasons
+    # feed the fallback-storm streak is a SEPARATE question from which event is
+    # emitted; the _run_slot guard's streak branch in harness.py is the answer.
     #
     # Ratio recipe: there is no separate "attempt" row — attempts are the SUM of
     # the three outcome events (session_resume + session_resume_fallback +
     # session_resume_capped) for a window, since the guard emits exactly one per
     # dispatch that carried a recovered session. Read the fallback RATE as a
     # ratio against that denominator rather than as an absolute count, and split
-    # the numerator by json_extract(data, '$.reason') to separate expected
-    # reseeds from genuine corroboration failures. (enabled=False emits nothing,
-    # so a zero total means either no recovered sessions or the kill switch.)
+    # the numerator by json_extract(data, '$.reasons'). Because the list is
+    # SORTED, that expression is a stable string and a plain GROUP BY 1 is a
+    # CO-OCCURRENCE census — '["no_transcript","stale"]' is its own bucket,
+    # distinct from '["stale"]' — with no json_each needed. (enabled=False emits
+    # nothing, so a zero total means either no recovered sessions or the kill
+    # switch.)
+    #
+    # TIME SPLIT — rows emitted BEFORE task 3728 carry a SCALAR '$.reason'
+    # holding only the FIRST matching reason, and no '$.reasons' at all. A naive
+    # lifetime query therefore mixes two code generations: '$.reasons' silently
+    # skips every pre-change row, and '$.reason' silently skips every one after,
+    # each returning a confident partial answer rather than an error. Bound any
+    # query by ts, or coalesce the two fields deliberately — and do not compare
+    # a pre-change reason census against a post-change one, because the older
+    # generation UNDER-counts every reason that lost a first-match race.
     #
     # session_resume_fallback additionally carries `data.archive_available: bool`
-    # (task 3727) on BOTH reasons — reseeded and {stale, no_transcript} alike —
+    # (task 3727) on EVERY fallback — reseeded and genuine alike —
     # answering "was this session actually RECOVERABLE from the durable
     # transcript archive?", i.e. did its transcript survive outside the wiped
     # worktree. Query it as json_extract(data, '$.archive_available') alongside
-    # the existing '$.reason' split, so the fallback population can be cut into
+    # the '$.reasons' split, so the fallback population can be cut into
     # recoverable vs genuinely lost.
     #
     # session_resume and session_resume_capped deliberately do NOT carry the
@@ -407,7 +427,8 @@ class EventType(StrEnum):
     #                which a plain fresh dispatch can reach, and counting those
     #                would inflate the ratio below past 1.
     #
-    # SQL split, alongside the existing '$.reason' / '$.archive_available' ones:
+    # SQL split, alongside session_resume_fallback's '$.reasons' /
+    # '$.archive_available' ones:
     #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
     #     FROM events WHERE event_type = 'session_resume_failed'
     #    GROUP BY stage;
