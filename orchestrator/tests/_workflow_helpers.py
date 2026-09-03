@@ -1263,6 +1263,29 @@ async def _make_transcript_workflow(config, git_ops, task_assignment):
     return workflow, cwd
 
 
+async def _init_transcript_repo(repo: Path) -> None:
+    """Seed a real, committed git repo for the transcript-archival suites.
+
+    A THIRD seeder beside the two already in this module, deliberately not a
+    merge of them: ``_init_git_repo`` seeds README.md, and ``_init_repo``
+    seeds lib.py PLUS test_lib.py with a working ``greet`` implementation (and
+    is imported by test_workflow_e2e.py). This one seeds only lib.py with a
+    trivial ``greet`` stub. Reusing either existing name would silently hand
+    the transcript suites the wrong repo contents — a failure that surfaces as
+    a confusing assertion error far from its cause, not an ImportError.
+
+    Folding all three behind a ``seed=`` parameter was rejected: it would
+    touch test_workflow_e2e.py and test_harness_warm_lane_wiring.py, and would
+    trade three legible factories for one branchy one.
+    """
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'lib.py').write_text('def greet(name): return name\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
 def _config_dir(worktree: Path, task_id: str) -> Path:
     """The on-disk per-task Claude config dir the β backstop reconstructs
     (``<worktree>/.task/claude-config-<task_id>``, git_ops.py's derivation)."""

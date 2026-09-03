@@ -25,28 +25,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from _workflow_helpers import _archived, _make_git_ops, _write_transcript
+from _workflow_helpers import (
+    _archived,
+    _init_transcript_repo,
+    _make_git_ops,
+    _write_transcript,
+)
 from shared.transcript_archive import ArchiveBeforeDelete
 
 from orchestrator.config import TranscriptArchiveConfig
-from orchestrator.git_ops import _run
 
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    asyncio.run(_init_transcript_repo(repo))
     return repo
-
-
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'lib.py').write_text('def greet(name): return name\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 @pytest.mark.asyncio

@@ -35,8 +35,9 @@ The ``git_repo``/``task_assignment`` fixtures are kept module-local (no
 conftest.py additions), matching ``test_transcript_archive_backstop.py``'s
 documented choice. The shared producer/backstop/gate harness pieces (``ENC``,
 ``_config``, ``_make_git_ops``, ``_make_transcript_workflow``, ``_config_dir``,
-``_write_transcript``, ``_archived``) live in ``_workflow_helpers.py`` —
-promoted there from three divergent copies by task 4384.
+``_write_transcript``, ``_archived``, ``_init_transcript_repo``) live in
+``_workflow_helpers.py`` — promoted there from three divergent copies by
+task 4384.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ from _workflow_helpers import (
     _archived,
     _config,
     _config_dir,
+    _init_transcript_repo,
     _make_git_ops,
     _make_transcript_workflow,
     _write_transcript,
@@ -74,24 +76,18 @@ TASK_ID = '42'
 
 
 # ---------------------------------------------------------------------------
-# Real-git fixture harness (ported from test_transcript_archive_backstop.py)
+# Real-git fixture harness. The seeding body was triplicated with
+# test_transcript_archive_backstop.py and
+# test_transcript_archive_producer_hook.py; task 4384 promoted it to
+# _workflow_helpers._init_transcript_repo, leaving only this thin wrapper.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    asyncio.run(_init_transcript_repo(repo))
     return repo
-
-
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'lib.py').write_text('def greet(name): return name\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 @pytest.fixture

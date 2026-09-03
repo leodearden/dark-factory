@@ -2,13 +2,16 @@
 (task 2742, plans/agent-transcript-archival-prd.md α).
 
 Reuses the _invoke-probe pattern (build TaskWorkflow + patch
-invoke_with_cap_retry) from test_invoke_role_config_resolution.py, with the
-git_repo/git_ops/task_assignment fixture trio duplicated module-local per the
-established convention. These probes drive _invoke directly (skipping run()'s
-setup), so workflow._config_dir is set MANUALLY.
+invoke_with_cap_retry) from test_invoke_role_config_resolution.py. These probes
+drive _invoke directly (skipping run()'s setup), so workflow._config_dir is set
+MANUALLY.
 
-Fixtures are kept module-local (no conftest.py) — see
-test_config_verify_admission_reload.py's rationale.
+The git_repo/git_ops/task_assignment fixtures are kept module-local (no
+conftest.py) — see test_config_verify_admission_reload.py's rationale — but
+their BODIES are no longer duplicated: the shared harness (``ENC``,
+``_config``, ``_make_git_ops``, ``_make_transcript_workflow``, ``_archived``,
+``_init_transcript_repo``) lives in ``_workflow_helpers.py``, promoted there
+from three divergent copies by task 4384.
 """
 
 from __future__ import annotations
@@ -19,11 +22,18 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import ENC, _archived, _config, _make_git_ops, _make_transcript_workflow
+from _workflow_helpers import (
+    ENC,
+    _archived,
+    _config,
+    _init_transcript_repo,
+    _make_git_ops,
+    _make_transcript_workflow,
+)
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 
 
@@ -31,17 +41,8 @@ from orchestrator.scheduler import TaskAssignment
 def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    asyncio.run(_init_transcript_repo(repo))
     return repo
-
-
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'lib.py').write_text('def greet(name): return name\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 @pytest.fixture
