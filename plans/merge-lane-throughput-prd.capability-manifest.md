@@ -291,3 +291,27 @@ scope:
 | `one-fact-one-home` | the PRD's §Background table, E's report and H's report all hold the same measured facts | home is `runs.db` via A's script for a stated window; every table is dated provenance that names its window, and E/H's signals require agreement with a live script run |
 | `guards-exercise-behaviour` | boundary row 1 would pass without the behaviour it protects | row 1 uses two distinct project roots (correction 2) |
 | `no-silent-fail-soft` | `verify_admission` is documented **C-fail-open**: a missing slots dir silently disables admission | C creates the host-global dir up front and distinguishes three outcomes — acquired / busy (`RunnerBusy`) / **admission-unavailable**, the last emitted as a distinct storm-counted signal rather than proceeding as if acquired |
+
+---
+
+## Filed batch (2026-09-03)
+
+| Label | Task | Depends on | Priority | Kind |
+|---|---|---|---|---|
+| A | 5050 | — | high | normal |
+| B | 5051 | A | high | normal |
+| C | 5052 | A | high | normal (`design_first`) |
+| D1 | 5053 | A, B, C | high | normal |
+| D2 | 5054 | D1 | high | deterministic (`before_done` deploy) |
+| E | 5056 | A, D2 | medium | normal + `milestone{delayed, 1209600}` |
+| F | 5057 | **3188**, E | medium | deterministic (`before_done` deploy) |
+| G | 5058 | A | medium | normal |
+| H | 5059 | **F only** | medium | normal + `milestone{delayed, 1209600}` |
+
+Task **3188** (deep merge-ahead ε, chain telemetry) is an existing out-of-batch
+task wired as a real `add_dependency` edge on F — not re-filed. H's single edge
+to F is deliberate (PRD §Open questions #3): the `delayed` anchor stamps the
+first tick *all* dependencies are `done`, so a sole dependency on F starts the
+14-day clock at the chain lever rather than at E. A reaches H through the
+transitive closure F→E→A. Nothing in this batch is wired behind tasks 3730,
+3733, 4755 or 5020.
