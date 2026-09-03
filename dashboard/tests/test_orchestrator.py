@@ -761,6 +761,9 @@ class TestDiscoverOrchestratorsBudget:
         than either mechanism: a refactor that walked processes instead of
         roots would make a two-PID host pay 2x the budget on every poll, and
         that is what must not regress.
+
+        The deterministic ``len(calls) == 1`` assertion is what actually pins
+        that property; the timing assertion below is a secondary backstop.
         """
         import asyncio
         from unittest.mock import patch
@@ -776,7 +779,7 @@ class TestDiscoverOrchestratorsBudget:
             await asyncio.Event().wait()
 
         monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
-        budget = 0.05
+        budget = 0.5
         monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', budget)
 
         proj = tmp_path / 'proj_shared'
@@ -795,6 +798,17 @@ class TestDiscoverOrchestratorsBudget:
             'dashboard.data.orchestrator.find_running_orchestrators',
             return_value=mock_procs,
         ):
+            # Pre-warm the default executor so its FIRST-USE thread spin-up (a
+            # one-off cost of tens of ms) is not charged to the budget: the
+            # first act of dashboard/src/dashboard/data/orchestrator.py::
+            # discover_orchestrators is
+            # `await asyncio.to_thread(find_running_orchestrators)`, and that
+            # spin-up is not the budget under test. `_resolve_project_root`'s
+            # filesystem walks run inside the timed region too and CANNOT be
+            # pre-warmed away from the test side — they are absorbed by the
+            # widened 1.5x margin instead. Both remedies are needed here;
+            # neither alone suffices.
+            await asyncio.to_thread(lambda: None)
             started = loop.time()
             result = await asyncio.wait_for(
                 discover_orchestrators(client=dummy_client, config=config),
@@ -811,9 +825,22 @@ class TestDiscoverOrchestratorsBudget:
         assert sorted(result[0]['pids']) == [1234, 5678]
         assert result[0]['offline'] is True
         assert result[0]['error']
-        assert elapsed < 2 * budget, (
-            f'two PIDs on one root took {elapsed:.3f}s against a {budget}s '
-            'per-root budget — the budget is being paid per process'
+        # Secondary backstop to `len(calls) == 1` above. The budget is
+        # deliberately large for a test whose subject is a timeout: it is
+        # scaled so the ABSOLUTE jitter margin exceeds host scheduling noise,
+        # not because the operation needs 0.5 s. One root fetched once costs
+        # ~1x budget; the per-process regression costs 2 PIDs x budget = ~2x;
+        # 1.5x sits midway, giving 0.25 s of slack on both sides instead of
+        # the 50 ms that flaked at ~4% per run. Do NOT shrink it back.
+        assert elapsed < 1.5 * budget, (
+            f'one root took {elapsed:.3f}s against a {1.5 * budget}s '
+            f'threshold (1.5 x the {budget}s per-root budget). The '
+            'len(calls) == 1 assertion above already passed, so the root was '
+            'fetched EXACTLY ONCE and this is not per-process payment: a '
+            'single fetch overran one budget of wall time. Look at the '
+            'per-root wait_for wiring and the min(remaining, '
+            '_ORCHESTRATORS_PER_ROOT_BUDGET) deadline arithmetic in '
+            'discover_orchestrators — or, failing that, at host jitter.'
         )
 
 
