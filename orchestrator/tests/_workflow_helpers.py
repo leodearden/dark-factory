@@ -25,11 +25,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
+from shared.config_dir import TaskConfigDir
 from shared.locking import normalize_lock
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
@@ -1181,6 +1182,102 @@ def _build_workflow_with_escalation(
         merge_worker=worker,
     )
     return workflow, scheduler, queue
+
+
+# ---------------------------------------------------------------------------
+# Transcript-archival test harness (task 4384): promoted out of three
+# divergent copies — test_transcript_archive_producer_hook.py (α),
+# test_transcript_archive_backstop.py (β) and
+# test_transcript_archival_boundary_gate.py (the ε B+H gate, which had ported
+# the fixtures from the first two). A change to the workflow constructor
+# signature or the archive layout now has exactly one place to land instead
+# of three.
+#
+# _config_dir/_write_transcript/_archived take ``task_id`` as an explicit,
+# non-defaulted parameter (backstop.py's original shape) rather than
+# defaulting it — a shared helper module cannot correctly default it to a
+# value that differs per consuming file (backstop.py's task id is '2786',
+# boundary_gate.py's is '42').
+# ---------------------------------------------------------------------------
+
+# The encoded-project dir the fake transcript is laid down under (the
+# hyphen-encoded form Claude Code's config layout uses for a project path).
+ENC = '-home-leo-projX'
+
+
+def _config(git_repo: Path, **overrides) -> OrchestratorConfig:
+    """Build an OrchestratorConfig rooted at *git_repo* for a transcript-archival probe."""
+    kwargs: dict[str, Any] = dict(
+        project_root=git_repo,
+        max_concurrent_tasks=1,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    kwargs.update(overrides)
+    return OrchestratorConfig(**kwargs)
+
+
+def _make_git_ops(git_repo: Path, **kwargs) -> GitOps:
+    """Build a GitOps rooted at *git_repo*; ``**kwargs`` pass through to
+    ``__init__`` (notably ``transcript_archive=...``, which arms the β
+    teardown backstop — omitting it leaves the backstop inert)."""
+    return GitOps(
+        GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+        git_repo,
+        **kwargs,
+    )
+
+
+async def _make_workflow(config, git_ops, task_assignment):
+    """Build a probe TaskWorkflow over a REAL worktree, with ``_config_dir``
+    set manually (driving ``_invoke`` directly skips ``run()``'s setup where
+    ``_config_dir`` is normally created).
+    """
+    wt_info = await git_ops.create_worktree(task_assignment.task_id)
+    cwd = wt_info.path
+    workflow = TaskWorkflow(
+        assignment=task_assignment,
+        config=config,
+        git_ops=git_ops,
+        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        briefing=FakeBriefing(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),  # type: ignore[arg-type]
+    )
+    workflow.artifacts = None
+    workflow._config_dir = TaskConfigDir(task_assignment.task_id, base_dir=cwd / '.task')
+    return workflow, cwd
+
+
+def _config_dir(worktree: Path, task_id: str) -> Path:
+    """The on-disk per-task Claude config dir the β backstop reconstructs
+    (``<worktree>/.task/claude-config-<task_id>``, git_ops.py's derivation)."""
+    return worktree / '.task' / f'claude-config-{task_id}'
+
+
+def _write_transcript(worktree: Path, task_id: str, sid: str, data: bytes) -> Path:
+    """Lay down an un-archived transcript at
+    ``<config_dir>/projects/<ENC>/<sid>.jsonl`` and return its path."""
+    p = _config_dir(worktree, task_id) / 'projects' / ENC / f'{sid}.jsonl'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
+def _archived(git_repo: Path, task_id: str, sid: str) -> Path:
+    """The durable plain-.jsonl mirror the archiver should produce for *sid*."""
+    return (
+        git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
+        / task_id / ENC / f'{sid}.jsonl'
+    )
 
 
 # ---------------------------------------------------------------------------

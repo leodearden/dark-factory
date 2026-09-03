@@ -9,8 +9,11 @@ completed resume. It is idempotent with the producer (same archive_root +
 task_id → the helper's size/mtime skip fires) and best-effort (a broken
 archiver can never block ``git worktree remove``).
 
-Fixtures are kept module-local (no conftest.py), mirroring
-test_transcript_archive_producer_hook.py's established convention.
+The ``git_repo`` fixture is kept module-local (no conftest.py), mirroring
+test_transcript_archive_producer_hook.py's established convention. The shared
+producer/backstop/gate harness pieces (``ENC``, ``_make_git_ops``,
+``_write_transcript``, ``_archived``) live in ``_workflow_helpers.py`` —
+promoted there from three divergent copies by task 4384.
 """
 
 from __future__ import annotations
@@ -22,13 +25,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _workflow_helpers import _archived, _make_git_ops, _write_transcript
 from shared.transcript_archive import ArchiveBeforeDelete
 
-from orchestrator.config import GitConfig, TranscriptArchiveConfig
-from orchestrator.git_ops import GitOps, _run
-
-# The encoded-project dir the fake transcript is laid down under.
-ENC = '-home-leo-projX'
+from orchestrator.config import TranscriptArchiveConfig
+from orchestrator.git_ops import _run
 
 
 @pytest.fixture
@@ -46,43 +47,6 @@ async def _init_repo(repo: Path) -> None:
     (repo / 'lib.py').write_text('def greet(name): return name\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
-def _make_git_ops(git_repo: Path, **kwargs) -> GitOps:
-    """Build a GitOps rooted at *git_repo*; **kwargs pass through to __init__
-    (notably ``transcript_archive=...``)."""
-    return GitOps(
-        GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-        git_repo,
-        **kwargs,
-    )
-
-
-def _config_dir(worktree: Path, task_id: str) -> Path:
-    """The on-disk per-task Claude config dir the backstop reconstructs."""
-    return worktree / '.task' / f'claude-config-{task_id}'
-
-
-def _write_transcript(worktree: Path, task_id: str, sid: str, data: bytes) -> Path:
-    """Lay down an un-archived transcript at
-    ``<config_dir>/projects/<ENC>/<sid>.jsonl`` and return its path."""
-    p = _config_dir(worktree, task_id) / 'projects' / ENC / f'{sid}.jsonl'
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(data)
-    return p
-
-
-def _archived(git_repo: Path, task_id: str, sid: str) -> Path:
-    """The durable plain-.jsonl mirror the backstop should produce for *sid*."""
-    return (
-        git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-        / task_id / ENC / f'{sid}.jsonl'
-    )
 
 
 @pytest.mark.asyncio

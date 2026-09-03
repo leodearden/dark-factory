@@ -16,22 +16,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
-from shared.config_dir import TaskConfigDir
+from _workflow_helpers import ENC, _config, _make_workflow
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
-
-# The encoded-project dir the fake transcript is laid down under.
-ENC = '-home-leo-projX'
 
 
 @pytest.fixture
@@ -78,39 +72,6 @@ def task_assignment() -> TaskAssignment:
         },
         modules=['lib'],
     )
-
-
-def _config(git_repo: Path, **overrides) -> OrchestratorConfig:
-    kwargs: dict[str, Any] = dict(
-        project_root=git_repo,
-        max_concurrent_tasks=1,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    kwargs.update(overrides)
-    return OrchestratorConfig(**kwargs)
-
-
-async def _make_workflow(config, git_ops, task_assignment):
-    """Build a probe TaskWorkflow with _config_dir set manually (run() skipped)."""
-    wt_info = await git_ops.create_worktree(task_assignment.task_id)
-    cwd = wt_info.path
-    workflow = TaskWorkflow(
-        assignment=task_assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-    )
-    workflow.artifacts = None
-    # Direct _invoke skips run() setup where _config_dir is created.
-    workflow._config_dir = TaskConfigDir(task_assignment.task_id, base_dir=cwd / '.task')
-    return workflow, cwd
 
 
 @pytest.mark.asyncio

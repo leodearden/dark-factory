@@ -31,8 +31,12 @@ from the ``session_id=`` kwarg ``_invoke`` forwards. The per-leaf suites
 archiver itself to assert argument wiring; this gate deliberately does not, so
 it covers the integrated path those cannot.
 
-Fixtures are kept module-local (no conftest.py additions), matching
-``test_transcript_archive_backstop.py``'s documented choice.
+The ``git_repo``/``task_assignment`` fixtures are kept module-local (no
+conftest.py additions), matching ``test_transcript_archive_backstop.py``'s
+documented choice. The shared producer/backstop/gate harness pieces (``ENC``,
+``_config``, ``_make_git_ops``, ``_make_workflow``, ``_config_dir``,
+``_write_transcript``, ``_archived``) live in ``_workflow_helpers.py`` —
+promoted there from three divergent copies by task 4384.
 """
 
 from __future__ import annotations
@@ -46,19 +50,22 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
-from shared.config_dir import TaskConfigDir
+from _workflow_helpers import (
+    ENC,
+    _archived,
+    _config,
+    _config_dir,
+    _make_git_ops,
+    _make_workflow,
+    _write_transcript,
+)
 from shared.transcript_archive import _archival_failures, _reset_archival_failures
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
-from orchestrator.config import GitConfig, OrchestratorConfig, TranscriptArchiveConfig
+from orchestrator.config import TranscriptArchiveConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
-
-# The encoded-project dir the fake transcript is laid down under.
-ENC = '-home-leo-projX'
 
 # The task id every row runs under (matches the branch name `git_ops`
 # creates, which is what cleanup_worktree's backstop keys the config-dir path
@@ -87,22 +94,6 @@ async def _init_repo(repo: Path) -> None:
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
-def _make_git_ops(git_repo: Path, **kwargs) -> GitOps:
-    """Build a GitOps rooted at *git_repo*; ``**kwargs`` pass through to
-    ``__init__`` (notably ``transcript_archive=...``, which arms the β
-    teardown backstop — omitting it leaves the backstop inert)."""
-    return GitOps(
-        GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-        git_repo,
-        **kwargs,
-    )
-
-
 @pytest.fixture
 def git_ops(git_repo: Path) -> GitOps:
     """A backstop-INERT GitOps (no transcript_archive), the default for rows
@@ -110,30 +101,10 @@ def git_ops(git_repo: Path) -> GitOps:
     return _make_git_ops(git_repo)
 
 
-def _config_dir(worktree: Path, task_id: str = TASK_ID) -> Path:
-    """The on-disk per-task Claude config dir the β backstop reconstructs
-    (``<worktree>/.task/claude-config-<branch>``, git_ops.py's derivation)."""
-    return worktree / '.task' / f'claude-config-{task_id}'
-
-
-def _write_transcript(worktree: Path, sid: str, data: bytes, task_id: str = TASK_ID) -> Path:
-    """Lay down an un-archived transcript at
-    ``<config_dir>/projects/<ENC>/<sid>.jsonl`` and return its path."""
-    p = _config_dir(worktree, task_id) / 'projects' / ENC / f'{sid}.jsonl'
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(data)
-    return p
-
-
 def _archive_root(git_repo: Path) -> Path:
     """The durable archive root the producer composes
     (``config.project_root / transcript_archive.root``) — OUTSIDE the worktree."""
     return git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-
-
-def _archived(git_repo: Path, sid: str, task_id: str = TASK_ID) -> Path:
-    """The durable plain-.jsonl mirror the archiver should produce for *sid*."""
-    return _archive_root(git_repo) / task_id / ENC / f'{sid}.jsonl'
 
 
 # ---------------------------------------------------------------------------
@@ -154,39 +125,6 @@ def task_assignment() -> TaskAssignment:
         },
         modules=['lib'],
     )
-
-
-def _config(git_repo: Path, **overrides) -> OrchestratorConfig:
-    kwargs: dict[str, Any] = dict(
-        project_root=git_repo,
-        max_concurrent_tasks=1,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    kwargs.update(overrides)
-    return OrchestratorConfig(**kwargs)
-
-
-async def _make_workflow(config, git_ops, task_assignment):
-    """Build a probe TaskWorkflow over a REAL worktree, with ``_config_dir``
-    set manually (driving ``_invoke`` directly skips ``run()``'s setup)."""
-    wt_info = await git_ops.create_worktree(task_assignment.task_id)
-    cwd = wt_info.path
-    workflow = TaskWorkflow(
-        assignment=task_assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-    )
-    workflow.artifacts = None
-    workflow._config_dir = TaskConfigDir(task_assignment.task_id, base_dir=cwd / '.task')
-    return workflow, cwd
 
 
 # The per-task OAuth credential every live config dir holds beside projects/.
@@ -326,7 +264,7 @@ class TestE1ArchivedAtCompletion:
         assert workflow._last_invoke_session_id == sid
 
         archive_root = _archive_root(git_repo)
-        archived = _archived(git_repo, sid)
+        archived = _archived(git_repo, TASK_ID, sid)
 
         # Archived, at the layout the durable root defines, plain .jsonl.
         assert archived.exists()
@@ -377,7 +315,7 @@ class TestE1ArchivedAtCompletion:
         assert src.exists()
         # ...and the hook really was the only thing that would have archived it.
         assert not _archive_root(git_repo).exists()
-        assert not _archived(git_repo, sid).exists()
+        assert not _archived(git_repo, TASK_ID, sid).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +370,7 @@ class TestE6ResumeReArchives:
         )
         assert result.success is True
 
-        archived = _archived(git_repo, sid)
+        archived = _archived(git_repo, TASK_ID, sid)
         assert archived.exists()
         assert archived.read_bytes().splitlines() == [
             line.rstrip(b'\n') for line in first_lines
@@ -463,7 +401,7 @@ class TestE6ResumeReArchives:
         # LAST-WRITE-WINS at the SAME archive path — not the stale 3-line copy.
         grown = src.read_bytes()
         assert len(grown.splitlines()) == len(first_lines) + len(extra_lines)
-        assert _archived(git_repo, sid).read_bytes() == grown
+        assert _archived(git_repo, TASK_ID, sid).read_bytes() == grown
 
         # Exactly ONE archived artefact for this session: no `.1` rotation, no
         # `.gz`, and no `.archive-tmp` staging debris left behind by the
@@ -495,7 +433,7 @@ class TestE6ResumeReArchives:
 
         original = b'{"n":1}\n{"n":2}\n{"n":3}\n'
         _result, sid, src = await _producer_invoke(workflow, cwd, payload=original)
-        archived = _archived(git_repo, sid)
+        archived = _archived(git_repo, TASK_ID, sid)
         before = _identity(archived)
 
         with src.open('ab') as fh:
@@ -547,10 +485,10 @@ class TestE2SurvivesTeardown:
         )
         assert result.success is True
 
-        archived = _archived(git_repo, sid)
+        archived = _archived(git_repo, TASK_ID, sid)
         assert archived.exists()
         before = _identity(archived)
-        config_dir = _config_dir(cwd)
+        config_dir = _config_dir(cwd, TASK_ID)
         assert config_dir.exists()
         assert src.exists()
 
@@ -627,7 +565,7 @@ class TestE3BackstopIdempotent:
             workflow, cwd, payload=a_bytes
         )
         assert result.success is True
-        archived_a = _archived(git_repo, sid_a)
+        archived_a = _archived(git_repo, TASK_ID, sid_a)
         assert archived_a.exists()
 
         # Session B: written into the same config dir but NEVER archived — the
@@ -635,15 +573,15 @@ class TestE3BackstopIdempotent:
         # _invoke minted, so only a session_id=None sweep can find it.
         sid_b = 'sess-B-abandoned-in-flight'
         b_bytes = b'{"session":"B","n":1}\n{"session":"B","n":2}\n'
-        src_b = _write_transcript(cwd, sid_b, b_bytes)
-        assert not _archived(git_repo, sid_b).exists()
+        src_b = _write_transcript(cwd, TASK_ID, sid_b, b_bytes)
+        assert not _archived(git_repo, TASK_ID, sid_b).exists()
 
         before_a = _identity(archived_a)
 
         await git_ops.cleanup_worktree(cwd, TASK_ID)
 
         # The backstop archived what was missing, byte-verbatim...
-        archived_b = _archived(git_repo, sid_b)
+        archived_b = _archived(git_repo, TASK_ID, sid_b)
         assert archived_b.exists()
         assert archived_b.read_bytes() == b_bytes
 
