@@ -47,7 +47,12 @@ from __future__ import annotations
 import textwrap
 
 import pytest
-from loop_blocking_scan import find_loop_blocking_sites, site_key
+from loop_blocking_scan import (
+    DOTTED_PRIMITIVES,
+    METHOD_PRIMITIVES,
+    find_loop_blocking_sites,
+    site_key,
+)
 
 
 def _src(text: str) -> str:
@@ -468,6 +473,220 @@ class TestScannerHygiene:
         findings = find_loop_blocking_sites(sources)
 
         assert [f.qualname for f in findings] == ['b']
+
+
+# --------------------------------------------------------------------------- #
+# The primitive table (task 4484 gap B)
+# --------------------------------------------------------------------------- #
+#
+# Task 3778's census enumerated `subprocess.run` and nothing else, while INV-8's
+# own Rule text names "subprocess, network, filesystem, lock, sleep".  Both of
+# task 4201's missed sites and one of task 4091's are FILESYSTEM, not
+# subprocess, so this narrowing alone accounts for them even if the census had
+# been caller-side.  One parameter per primitive, so a regression names the
+# offender rather than reporting "the table shrank".
+
+_PRIMITIVE_CASES = [
+    # (case id, helper body line, expected LoopBlockingSite.primitive)
+    ('subprocess.run', "return subprocess.run(['git', 'status'])", 'subprocess.run'),
+    ('subprocess.check_output', "return subprocess.check_output(['git'])",
+     'subprocess.check_output'),
+    ('subprocess.check_call', "return subprocess.check_call(['git'])",
+     'subprocess.check_call'),
+    ('subprocess.Popen', "return subprocess.Popen(['git'])", 'subprocess.Popen'),
+    ('yaml.safe_load', 'return yaml.safe_load(payload)', 'yaml.safe_load'),
+    ('yaml.safe_dump', 'return yaml.safe_dump(payload)', 'yaml.safe_dump'),
+    ('Path.read_text', 'return payload.read_text()', 'read_text'),
+    ('Path.write_text', "return payload.write_text('x')", 'write_text'),
+    ('Path.read_bytes', 'return payload.read_bytes()', 'read_bytes'),
+    ('Path.write_bytes', "return payload.write_bytes(b'x')", 'write_bytes'),
+    ('fcntl.flock', 'return fcntl.flock(payload, 2)', 'fcntl.flock'),
+    ('time.sleep', 'return time.sleep(0.1)', 'time.sleep'),
+    ('socket.create_connection', "return socket.create_connection(('h', 1))",
+     'socket.create_connection'),
+    ('os.system', "return os.system('ls')", 'os.system'),
+]
+
+
+class TestPrimitiveTable:
+    """Gap B: the census vocabulary must be the WHOLE INV-8 vocabulary."""
+
+    @pytest.mark.parametrize(
+        ('body', 'expected'),
+        [pytest.param(body, expected, id=case_id)
+         for case_id, body, expected in _PRIMITIVE_CASES],
+    )
+    def test_primitive_is_detected_through_a_sync_helper(self, body, expected):
+        """Each INV-8 primitive is blocking when a coroutine reaches it without a hop."""
+        sources = {
+            'pkg/mod.py': _module(
+                'import fcntl\nimport os\nimport socket\nimport subprocess\nimport time\n\nimport yaml',
+                f'def helper(payload):\n    {body}',
+                """
+                async def caller(payload):
+                    return helper(payload)
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert len(findings) == 1, (
+            f'{expected} not detected through a sync helper; '
+            f'got {[(f.callee, f.primitive) for f in findings]}'
+        )
+        assert findings[0].primitive == expected
+        assert findings[0].qualname == 'caller'
+        assert findings[0].callee == 'helper'
+
+    @pytest.mark.parametrize(
+        ('body', 'expected'),
+        [pytest.param(body, expected, id=case_id)
+         for case_id, body, expected in _PRIMITIVE_CASES],
+    )
+    def test_primitive_is_detected_directly_in_an_async_body(self, body, expected):
+        """A primitive written INLINE in a coroutine needs no helper hop to count.
+
+        This is the ``manifest_stamping::_stamp_capability_manifests_impl``
+        shape: ``read_text`` + ``yaml.safe_load`` + ``write_text`` +
+        ``yaml.safe_dump`` all in one coroutine body, with no helper anywhere
+        for a definition-side census to point at.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                'import fcntl\nimport os\nimport socket\nimport subprocess\nimport time\n\nimport yaml',
+                f'async def caller(payload):\n    {body}',
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert len(findings) == 1, (
+            f'{expected} not detected inline in a coroutine; '
+            f'got {[(f.callee, f.primitive) for f in findings]}'
+        )
+        assert findings[0].primitive == expected
+        assert findings[0].qualname == 'caller'
+
+    def test_manifest_stamping_shape_yields_one_finding_per_primitive(self):
+        """The four-primitive inline coroutine yields FOUR findings, not one.
+
+        Per call site, never per function: blessing one row must not silently
+        bless the other three.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                'import yaml',
+                """
+                async def stamp(path, out):
+                    raw = path.read_text()
+                    doc = yaml.safe_load(raw)
+                    out.write_text(yaml.safe_dump(doc))
+                    return doc
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert sorted(f.primitive for f in findings) == [
+            'read_text', 'write_text', 'yaml.safe_dump', 'yaml.safe_load'
+        ]
+
+    def test_from_import_binding_resolves_to_the_dotted_primitive(self):
+        """``from subprocess import run`` then a bare ``run(...)`` still counts.
+
+        Matching the bare name ``run`` on its own would be a false-RED
+        generator; matching it only once the module's import bindings resolve
+        it to ``subprocess.run`` is precise.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                'from subprocess import run',
+                """
+                async def caller(cmd):
+                    return run(cmd)
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert [f.primitive for f in findings] == ['subprocess.run']
+
+    def test_asyncio_sleep_is_not_flagged(self):
+        """``await asyncio.sleep(...)`` is the NON-blocking sibling of ``time.sleep``.
+
+        A table that cannot tell them apart flags every correctly-written
+        coroutine in the tree and is worthless.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                'import asyncio',
+                """
+                async def caller():
+                    await asyncio.sleep(0.1)
+                """,
+            )
+        }
+
+        assert find_loop_blocking_sites(sources) == []
+
+    def test_asyncio_siblings_are_excluded_wholesale(self):
+        """Neither ``asyncio.*`` nor ``anyio.*`` may be read as blocking."""
+        for dotted in DOTTED_PRIMITIVES:
+            assert not dotted.startswith(('asyncio.', 'anyio.')), (
+                f'{dotted} is an async sibling and must never be in the table'
+            )
+
+    def test_yaml_safe_load_justification_cites_task_4201_measurement(self):
+        """The table must carry WHY yaml parsing counts, with the measurement.
+
+        Task 4201 measured ``yaml.safe_load`` at 8.15 ms for an 11 KB document
+        -- the same order as a subprocess spawn.  Without that number recorded
+        at the table, the next census re-reads it as "just parsing" and drops
+        it back out, which is precisely how gap B happened the first time.
+        """
+        justification = DOTTED_PRIMITIVES['yaml.safe_load']
+
+        assert '4201' in justification, justification
+        assert '8.15' in justification, justification
+        assert '11' in justification, justification
+
+    def test_filesystem_justifications_cite_their_discovering_tasks(self):
+        """Filesystem primitives carry the tasks that found them (4091 / 4201).
+
+        These are the entries task 3778's ``subprocess.run``-only vocabulary
+        omitted, so their justification is the record of why the vocabulary is
+        wider now.
+        """
+        for name in ('read_text', 'write_text', 'read_bytes', 'write_bytes'):
+            justification = METHOD_PRIMITIVES[name]
+            assert '4091' in justification or '4201' in justification, (
+                f'{name}: {justification}'
+            )
+
+    def test_every_table_entry_carries_a_justification(self):
+        """A primitive with no stated reason is one a future census can drop unchallenged."""
+        for table in (DOTTED_PRIMITIVES, METHOD_PRIMITIVES):
+            for name, justification in table.items():
+                assert justification.strip(), f'{name} has an empty justification'
+
+    def test_table_covers_every_inv8_limb(self):
+        """subprocess / network / filesystem / lock / sleep -- all five, not just the first.
+
+        INV-8's Rule text names all five.  Task 3778's census enumerated one.
+        """
+        dotted = set(DOTTED_PRIMITIVES)
+        assert {'subprocess.run', 'subprocess.check_output', 'subprocess.check_call',
+                'subprocess.Popen', 'os.system'} <= dotted
+        assert 'socket.create_connection' in dotted
+        assert 'fcntl.flock' in dotted
+        assert 'time.sleep' in dotted
+        assert {'yaml.safe_load', 'yaml.safe_dump'} <= dotted
+        assert {'read_text', 'write_text', 'read_bytes', 'write_bytes'} <= set(
+            METHOD_PRIMITIVES
+        )
 
 
 if __name__ == '__main__':  # pragma: no cover
