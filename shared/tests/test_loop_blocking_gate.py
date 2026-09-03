@@ -51,8 +51,23 @@ from loop_blocking_scan import find_loop_blocking_sites, site_key
 
 
 def _src(text: str) -> str:
-    """Dedent a triple-quoted synthetic module source."""
-    return textwrap.dedent(text).lstrip('\n')
+    """Dedent one triple-quoted chunk of a synthetic module source."""
+    return textwrap.dedent(text).strip('\n')
+
+
+def _module(*chunks: str) -> str:
+    """Compose a synthetic module from independently-dedented chunks.
+
+    Each chunk is dedented ON ITS OWN and only then joined.  Interpolating an
+    unindented fragment into an indented f-string block instead would defeat
+    ``textwrap.dedent`` (the common prefix collapses to ``''``), leaving the
+    surrounding lines indented and the "module" an unparseable string -- which
+    this scanner is fail-soft about, so every such fixture would pass
+    VACUOUSLY.  These fixtures are the only thing proving the detector still
+    detects, so a vacuous pass here is the same class of silent hole the gate
+    exists to close.
+    """
+    return '\n\n\n'.join(_src(chunk) for chunk in chunks) + '\n'
 
 
 # --------------------------------------------------------------------------- #
@@ -77,7 +92,7 @@ class TestCallerSideEnumeration:
 
         Task 3778's census would return ZERO findings here.  It counted the
         helper's definition site and recorded the module as "already offloaded
-        at its call sites" because *a* caller offloads — which is true, and
+        at its call sites" because *a* caller offloads -- which is true, and
         which is exactly why ``b`` stayed invisible.  A definition-side census
         cannot express the difference between these two callers; a caller-side
         one returns EXACTLY ONE finding, naming ``b``.
@@ -87,19 +102,17 @@ class TestCallerSideEnumeration:
         methodology that produced the three missed batches.
         """
         sources = {
-            'pkg/mod.py': _src(
-                f"""
-                import asyncio
-
-                {_HELPER_DEF}
-
+            'pkg/mod.py': _module(
+                'import asyncio',
+                _HELPER_DEF,
+                """
                 async def a(path):
                     return await asyncio.to_thread(load_registry, path)
-
-
+                """,
+                """
                 async def b(path):
                     return load_registry(path)
-                """
+                """,
             )
         }
 
@@ -114,30 +127,28 @@ class TestCallerSideEnumeration:
         assert findings[0].filename == 'pkg/mod.py'
 
     def test_second_inline_caller_yields_second_finding(self):
-        """Findings are per call site, never per helper — a THIRD caller adds a row.
+        """Findings are per call site, never per helper -- a THIRD caller adds a row.
 
         A per-helper (or per-module) ledger would collapse ``b`` and ``c`` into
         one entry, and blessing that entry would silently bless every future
         caller.  Two findings here is what keeps the ratchet honest.
         """
         sources = {
-            'pkg/mod.py': _src(
-                f"""
-                import asyncio
-
-                {_HELPER_DEF}
-
+            'pkg/mod.py': _module(
+                'import asyncio',
+                _HELPER_DEF,
+                """
                 async def a(path):
                     return await asyncio.to_thread(load_registry, path)
-
-
+                """,
+                """
                 async def b(path):
                     return load_registry(path)
-
-
+                """,
+                """
                 async def c(path):
                     return load_registry(path)
-                """
+                """,
             )
         }
 
@@ -148,16 +159,14 @@ class TestCallerSideEnumeration:
     def test_run_in_executor_is_an_offload_hop(self):
         """``loop.run_in_executor(None, fn, ...)`` offloads just as ``to_thread`` does."""
         sources = {
-            'pkg/mod.py': _src(
-                f"""
-                import asyncio
-
-                {_HELPER_DEF}
-
+            'pkg/mod.py': _module(
+                'import asyncio',
+                _HELPER_DEF,
+                """
                 async def a(path):
                     loop = asyncio.get_running_loop()
                     return await loop.run_in_executor(None, load_registry, path)
-                """
+                """,
             )
         }
 
@@ -173,19 +182,17 @@ class TestCallerSideEnumeration:
         reviewers to bless rows unread.
         """
         sources = {
-            'pkg/mod.py': _src(
-                f"""
-                import asyncio
-
-                {_HELPER_DEF}
-
+            'pkg/mod.py': _module(
+                'import asyncio',
+                _HELPER_DEF,
+                """
                 async def inner(path):
                     return await asyncio.to_thread(load_registry, path)
-
-
+                """,
+                """
                 async def outer(path):
                     return await inner(path)
-                """
+                """,
             )
         }
 
@@ -204,13 +211,12 @@ class TestCallerSideEnumeration:
         """One unparseable module must not silence the rest of the sweep."""
         sources = {
             'pkg/broken.py': 'def ( oops\n',
-            'pkg/mod.py': _src(
-                f"""
-                {_HELPER_DEF}
-
+            'pkg/mod.py': _module(
+                _HELPER_DEF,
+                """
                 async def b(path):
                     return load_registry(path)
-                """
+                """,
             ),
         }
 
@@ -219,7 +225,7 @@ class TestCallerSideEnumeration:
         assert [f.qualname for f in findings] == ['b']
 
     def test_unresolvable_bare_name_is_silence_not_a_finding(self):
-        """An unbound callee is NOT a finding — unresolvable is silence, never a false RED.
+        """An unbound callee is NOT a finding -- unresolvable is silence, never a false RED.
 
         The throwaway script used to size task 4484's audit matched callees by
         bare name across the whole tree, so a common name like ``check`` or
@@ -228,18 +234,18 @@ class TestCallerSideEnumeration:
         until someone blesses a non-defect.
         """
         sources = {
-            'pkg/mod.py': _src(
+            'pkg/mod.py': _module(
                 """
                 async def b(path):
                     return mystery_helper(path)
-                """
+                """,
             )
         }
 
         assert find_loop_blocking_sites(sources) == []
 
     def test_cross_module_import_binding_resolves(self):
-        """``from X import Y`` then an inline ``Y(...)`` — the real task_curator shape.
+        """``from X import Y`` then an inline ``Y(...)`` -- the real task_curator shape.
 
         All four confirmed ``task_curator.py`` sites are written exactly this
         way (a function-local ``from fused_memory.middleware.<registry> import
@@ -247,18 +253,14 @@ class TestCallerSideEnumeration:
         that has to work for the whole-tree gate to find them.
         """
         sources = {
-            'pkg/registry.py': _src(
-                f"""
-                {_HELPER_DEF}
-                """
-            ),
-            'pkg/caller.py': _src(
+            'pkg/registry.py': _module(_HELPER_DEF),
+            'pkg/caller.py': _module(
                 """
                 async def b(path):
                     from pkg.registry import load_registry
 
                     return load_registry(path)
-                """
+                """,
             ),
         }
 
@@ -271,33 +273,83 @@ class TestCallerSideEnumeration:
         assert findings[0].qualname == 'b'
         assert findings[0].callee == 'load_registry'
 
+    def test_cross_module_call_to_a_clean_helper_is_not_a_finding(self):
+        """The cross-module resolver must not flag an imported helper that never blocks.
+
+        Pairs with the test above: together they show the resolver is deciding
+        on the callee's BODY, not merely on the fact that it was imported.
+        """
+        sources = {
+            'pkg/registry.py': _module(
+                """
+                def parse_registry(text):
+                    return text.split(',')
+                """,
+            ),
+            'pkg/caller.py': _module(
+                """
+                async def b(text):
+                    from pkg.registry import parse_registry
+
+                    return parse_registry(text)
+                """,
+            ),
+        }
+
+        assert find_loop_blocking_sites(sources) == []
+
     def test_sync_caller_of_a_blocking_helper_is_not_a_finding(self):
         """Only coroutines can block the loop; a sync caller is out of scope."""
         sources = {
-            'pkg/mod.py': _src(
-                f"""
-                {_HELPER_DEF}
-
+            'pkg/mod.py': _module(
+                _HELPER_DEF,
+                """
                 def b(path):
                     return load_registry(path)
-                """
+                """,
             )
         }
 
         assert find_loop_blocking_sites(sources) == []
 
+    def test_self_method_call_resolves(self):
+        """``self.<method>(...)`` resolves within the enclosing class.
+
+        This is the ``reconciliation/harness.py::ReconciliationHarness._escalate``
+        shape -- a sync method with ~10 async callers, all of them written
+        ``self._escalate(...)``.  Without this resolution path that whole
+        cluster is invisible to the sweep.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                """
+                class Harness:
+                    def _escalate(self, path):
+                        return path.read_text()
+
+                    async def run(self, path):
+                        return self._escalate(path)
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert [(f.qualname, f.callee) for f in findings] == [
+            ('Harness.run', '_escalate')
+        ]
+
 
 class TestFindingIdentity:
-    """Findings carry a drift-resistant key — never a line number."""
+    """Findings carry a drift-resistant key -- never a line number."""
 
     _SOURCES = {
-        'pkg/mod.py': _src(
-            f"""
-            {_HELPER_DEF}
-
+        'pkg/mod.py': _module(
+            _HELPER_DEF,
+            """
             async def b(path):
                 return load_registry(path)
-            """
+            """,
         )
     }
 
@@ -329,22 +381,21 @@ class TestFindingIdentity:
         (before,) = find_loop_blocking_sites(self._SOURCES)
 
         shifted = {
-            'pkg/mod.py': _src(
-                f"""
-                # a new comment
-                # and another
-
-
-                {_HELPER_DEF}
-
+            'pkg/mod.py': _module(
+                '# a new comment\n# and another',
+                _HELPER_DEF,
+                """
                 async def b(path):
                     return load_registry(path)
-                """
+                """,
             )
         }
         (after,) = find_loop_blocking_sites(shifted)
 
         assert site_key(before) == site_key(after)
+        assert before.lineno != after.lineno, (
+            'fixture is not exercising line drift -- the site did not move'
+        )
 
     def test_identity_names_the_callee(self):
         """``(relpath, qualname, callee)`` is the human-readable identity.
@@ -375,19 +426,19 @@ class TestScannerHygiene:
         this pair and take the whole suite down with it.
         """
         sources = {
-            'pkg/mod.py': _src(
+            'pkg/mod.py': _module(
                 """
                 def ping(path):
                     return pong(path)
-
-
+                """,
+                """
                 def pong(path):
                     return ping(path)
-
-
+                """,
+                """
                 async def b(path):
                     return ping(path)
-                """
+                """,
             )
         }
 
@@ -396,21 +447,21 @@ class TestScannerHygiene:
     def test_recursive_helper_that_blocks_is_still_found(self):
         """A cycle must not become an escape hatch that hides a real primitive."""
         sources = {
-            'pkg/mod.py': _src(
+            'pkg/mod.py': _module(
                 """
                 def ping(path, depth=0):
                     if depth > 3:
                         return path.read_text()
                     return pong(path, depth + 1)
-
-
+                """,
+                """
                 def pong(path, depth):
                     return ping(path, depth)
-
-
+                """,
+                """
                 async def b(path):
                     return ping(path)
-                """
+                """,
             )
         }
 
