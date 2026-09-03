@@ -73,8 +73,9 @@ from __future__ import annotations
 
 import shlex
 
-from orchestrator import verify_cmd
 from orchestrator.config import ModuleConfig
+
+from orchestrator import verify_cmd
 
 
 def _npx_fronted_segments(cmd: str) -> list[str]:
@@ -128,6 +129,38 @@ def _npx_fronted_segments(cmd: str) -> list[str]:
         if 'npx' in tokens:
             offending.append(segment)
     return offending
+
+
+# ALL THREE fields are guarded, not just the type gate this task's title
+# names. The npm-cache dependency esc-3473-2 measured is a property of HOW a
+# command resolves its binaries, not of WHICH checker it runs — an
+# npx-fronted lint_command or test_command carries the identical
+# shared-mutable-cache hazard. Only the type gate has any npx HISTORY
+# (scripts/ and tests/scripts/ were both once npx-fronted pyright
+# invocations); the other two fields are pure regression prevention and were
+# measured clean on all nine discovered configs at planning time.
+_GUARDED_COMMAND_FIELDS = ('type_check_command', 'lint_command', 'test_command')
+
+
+def _npx_fronted_fields(mc: ModuleConfig) -> dict[str, list[str]]:
+    """Map each guarded command field of *mc* to its offending npx-fronted segments.
+
+    Iterates :data:`_GUARDED_COMMAND_FIELDS`, skipping a falsy value — a
+    module config declaring no command in a given field is a legitimate
+    state (``verify`` renders it as a SKIPPED PlannedRun, not a violation),
+    not something :func:`_npx_fronted_segments` has an opinion about. Returns
+    only the fields with at least one offending segment, so a clean config
+    (or one declaring no commands at all) yields ``{}``.
+    """
+    offenders: dict[str, list[str]] = {}
+    for field in _GUARDED_COMMAND_FIELDS:
+        cmd = getattr(mc, field)
+        if not cmd:
+            continue
+        segments = _npx_fronted_segments(cmd)
+        if segments:
+            offenders[field] = segments
+    return offenders
 
 
 def test_the_npx_scan_reads_exact_tokens_in_every_chain_segment() -> None:
