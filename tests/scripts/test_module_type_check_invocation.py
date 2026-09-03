@@ -72,6 +72,7 @@ it, and ``test_line_pin_policy.py`` is a live guard in this same directory.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Callable
 
 from orchestrator.config import ModuleConfig
 
@@ -324,3 +325,62 @@ def test_the_field_scan_covers_every_guarded_command_field() -> None:
         f"cockpit's real, measured commands must not be flagged, got "
         f'{_npx_fronted_fields(mc)!r}'
     )
+
+
+def test_no_discovered_module_config_shells_a_guarded_command_through_npx(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """No module config `_discover_module_configs` returns may shell a guarded command through npx.
+
+    THE FIRST REPO-WIDE GUARD. The invariant it asserts is already GREEN on
+    all nine configs (measured at planning time), so this is regression
+    prevention: task 3842 fixed ``tests/scripts/``, task 4358 fixed
+    ``scripts/`` (the last holdout), and nothing since has reintroduced an
+    npx-fronted command anywhere `_discover_module_configs` looks.
+
+    Takes the `discover_module_configs` fixture as a CALLABLE and calls it
+    inside the test body (never hoisted to setup) — see that fixture's own
+    docstring in conftest.py for why.
+
+    Does NOT cover ``dark-factory-orchestrator.yaml``, the repo root config,
+    which is deliberately npx-fronted (see this module's docstring, "THE
+    ROOT-CONFIG CARVE-OUT") and is pinned in that exact shape by
+    ``test_pyright_version_pin.py::test_the_fleet_chain_stays_bare_npx_pyright``.
+    `_discover_module_configs` never returns that config, so this loop cannot
+    see it.
+    """
+    discovered = discover_module_configs()
+
+    # ANTI-VACUITY FLOOR, asserted FIRST. Without it, a regression in the
+    # production walk would shrink `discovered` and the loop below would pass
+    # VACUOUSLY on whatever remained — the same hole
+    # `test_module_verify_budgets.py::test_every_discovered_module_config_declares_its_own_verify_budget`
+    # closes for the sibling guard. SUBSET, not equality: a newly-registered
+    # module config must be covered by the loop automatically, with no edit
+    # here.
+    missing = KNOWN_MODULE_CONFIG_PREFIXES - set(discovered)
+    assert not missing, (
+        f'the production walk (config._discover_module_configs) failed to '
+        f'resolve known module config(s) {sorted(missing)} — discovery has '
+        f'regressed, and the npx-ban loop below would pass vacuously on the '
+        f'shrunken set. Discovered: {sorted(discovered)}'
+    )
+
+    for prefix, mc in sorted(discovered.items()):
+        offenders = _npx_fronted_fields(mc)
+        assert not offenders, (
+            f'{prefix}/orchestrator.yaml shells {sorted(offenders)} through '
+            f'npx: {offenders!r}. MEASURED (esc-3473-2): a bare `npx pyright` '
+            f're-resolves through the shared, mutable, concurrently-written '
+            f'npm cache under $HOME on EVERY invocation, and once turned a '
+            f'clean 0-error type leg RED on a transient npm-cache write '
+            f'failure (npm could not write ~/.npm/_logs) with no real defect '
+            f'in the tree. Because verify.run_full_verification '
+            f'asyncio-gathers over ALL module_configs and this repo\'s root '
+            f'sets merge_verify_breadth: "full", that is a FLEET-WIDE '
+            f'false-red blocking every merge, review checkpoint and main-tip '
+            f'sweep — on a branch with no defect. Remedy: resolve the '
+            f'checker through `uv run --directory {prefix} ...` if {prefix} '
+            f'is a [tool.uv.workspace] member, else `uv run --project '
+            f'shared ...`'
+        )
