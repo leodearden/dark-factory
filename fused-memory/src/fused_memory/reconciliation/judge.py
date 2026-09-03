@@ -606,18 +606,19 @@ Review this run and provide your verdict as JSON.
 
         The verdict contract rides ``output_schema=JUDGE_VERDICT_SCHEMA`` rather
         than prose in the system prompt, so it survives every cap-retry resume:
-        ``build_claude_argv`` emits ``--json-schema`` unconditionally
-        (cli_invoke.py:1552-1553) while it drops ``--system-prompt-file`` on the
-        resume path (:1501-1503).
+        ``build_claude_argv``'s ``if output_schema:`` block emits
+        ``--json-schema`` unconditionally, and its ``--system-prompt-file``
+        write now precedes (and is unconditional on) the ``if
+        resume_session_id:`` branch too — both the schema and the system
+        prompt survive every resume (cli_invoke.py, task 3983).
 
         ``disallowed_tools=['*']`` is still passed VERBATIM.  cli_invoke expands
         the wildcard into ``_REAL_BUILTIN_TOOLS_DENYLIST`` when a schema is
-        present (:1533-1536) — a list that omits the synthetic
-        ``StructuredOutput`` tool the schema is delivered through — so no real
-        file/bash/web tool access is preserved while the schema tool gets
-        through.  Pre-expanding here would duplicate a list documented as needing
-        to stay in sync with the CLI's built-ins and would skip future central
-        fixes.
+        present — a list that omits the synthetic ``StructuredOutput`` tool the
+        schema is delivered through — so no real file/bash/web tool access is
+        preserved while the schema tool gets through.  Pre-expanding here would
+        duplicate a list documented as needing to stay in sync with the CLI's
+        built-ins and would skip future central fixes.
 
         MCP tools are closed SEPARATELY, by ``mcp_config=no_mcp_servers_config()``
         + ``strict_mcp_config=True``.  The wildcard expansion above covers
