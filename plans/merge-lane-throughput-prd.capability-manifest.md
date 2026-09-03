@@ -400,3 +400,47 @@ G6 branch 1 (numeric premises) came back clean under adversarial review: D2's
 achievement, and E/H/G assert no thresholds. The `.md` and `.yaml` twins agree
 with each other; the divergence was between both of them and the PRD, which the
 PRD's own § Corrections block now closes.
+
+---
+
+## RULED 2026-09-03 — task C cancelled; P1 and P2 resolved by removal
+
+Leo's ruling on the P1/P2/P3 findings above: **task C (5052) is cancelled**, and
+D1 no longer depends on it. The question that settled it — *why can two projects
+verify concurrently on the workstation but not on the laptop?* — exposed that
+C's founding premise was false.
+
+**The two projects cannot collide.** The laptop-side merge-verify lock is scoped
+to `project_root / config.worktree_dir` (`git_ops.py`), so reify's locks are
+under `/home/leo/src/reify/.worktrees/` and dark_factory's under
+`/home/leo/src/dark-factory/.worktrees/`. The born-at-L2
+`FLOCK_CONTENTION_CATEGORY` branch is a **within-project orphan detector**, not a
+co-tenant detector. And nothing else serializes merge verifies across projects on
+any host: `verify_admission.py::acquire_task_slot` returns immediately for any
+role outside `{task, background}` ("C-merge-priority"), which is exactly why both
+projects already share the workstation ungated.
+
+**Consequences for this manifest:**
+
+- Every C capability is now `OPEN` and marked MOOT; C's block is retained as the
+  record of why the design could not have worked as specified.
+- D1's `arbitration-config-fields-upstream` binding is `OPEN`/MOOT — the three
+  arbitration config fields will never exist. D1 adds only `verify_runners` and
+  `verify_drift_check_every_n_lands`, both pre-existing schema fields.
+- **P1 (the RED-TIER prohibition) is resolved by compliance, not by exception.**
+  Nothing host-global is being built.
+- **P2's knock-on outlives the cancellation:** the throughput PRD's κ row is
+  wrong either way — C would not have made the contention branch unreachable, and
+  with C gone the branch is plainly still live. **κ must not delete
+  `is_flock_contention_failure`.** This is the one item that needs carrying to the
+  quality PRD.
+- The decompose session's "1–3 blocked merges per day without arbitration"
+  estimate is **retracted** — it was arithmetic on the false premise.
+
+**What replaces the mechanism:** measurement. Task E now carries laptop
+oversubscription as a headline section — reify's laptop verify p50/p90 against
+its 17.4 / 20.6 min baseline, dark_factory's against its 40.7 / 52.4 min local
+baseline, and the overlapping-span contention rate. The residual risk is verify
+*duration*, which cannot block a merge.
+
+Revised DAG: **A → B → D1 → D2 → E → F → H**, with **A → G**.

@@ -84,9 +84,9 @@ tasks:
   title: 'merge-lane throughput: cross-project verify-host arbitration (RunnerBusy + host-global admission)'
   capabilities:
   - name: flock-slot-primitive-exists
-    binding: capability→producer (wired) — shared/src/shared/verify_admission.py::_acquire/_try_once,
-      in production use by the task-verify admission path
-    verdict: PASS
+    binding: 'capability→producer (wired) — shared/src/shared/verify_admission.py::_acquire/_try_once,
+      in production use by the task-verify admission path [MOOT 2026-09-03: task cancelled.]'
+    verdict: OPEN
     delivered_check:
       kind: manual
       reason: pre-existing substrate; the novel part is the host-global path C creates
@@ -94,8 +94,8 @@ tasks:
     binding: 'capability→producer — CORRECTION (1): task 2501 (5392f4a357) made verify_admission_slots_dir
       per-project (uid + sha256(project_root)[:12]); reusing it would make arbitration a silent no-op.
       C mints its own host-global path AND creates it, because verify_admission never creates slots_dir
-      and fails OPEN when it is missing'
-    verdict: PASS
+      and fails OPEN when it is missing [MOOT 2026-09-03: task cancelled.]'
+    verdict: OPEN
     delivered_check:
       kind: grep
       pattern: verify_merge_host_max_concurrent
@@ -105,8 +105,8 @@ tasks:
   - name: runner-busy-typed-wire-contract
     binding: 'capability→producer — RunnerBusy is a sibling of RunnerUnavailable (verify_runner.py:701),
       NOT a VerifyResult; payload round-trips as JSON per result_to_dict. INV-1: validated on parse by
-      a shared typed model, never a prose convention'
-    verdict: PASS
+      a shared typed model, never a prose convention [MOOT 2026-09-03: task cancelled.]'
+    verdict: OPEN
     delivered_check:
       kind: grep
       pattern: RunnerBusy
@@ -114,17 +114,18 @@ tasks:
       - orchestrator/src/orchestrator/
       expect: present
   - name: holder-field-is-populated-not-declared
-    binding: field-population (G6 result-field twin) — nothing on main writes an owner identity into a
-      slot file, so the HOLDING process must write project_id+pid into its slot file for the waiter's
-      RunnerBusy.holder / verify_host_busy.holder to be non-sentinel
-    verdict: PASS
+    binding: 'field-population (G6 result-field twin) — nothing on main writes an owner identity into
+      a slot file, so the HOLDING process must write project_id+pid into its slot file for the waiter''s
+      RunnerBusy.holder / verify_host_busy.holder to be non-sentinel [MOOT 2026-09-03: task cancelled.]'
+    verdict: OPEN
     delivered_check:
       kind: manual
       reason: non-sentinel population is asserted by C's boundary row 2, not by a pattern match
   - name: verify-host-busy-event-wired-in-dispatch
-    binding: capability→producer — EventType.verify_host_busy is ABSENT on main (verified); C builds it
-      and wires the emit into VerifyRunnerPool.dispatch, upstream of D1/D2 and of A's occupancy attribution
-    verdict: PASS
+    binding: 'capability→producer — EventType.verify_host_busy is ABSENT on main (verified); C builds
+      it and wires the emit into VerifyRunnerPool.dispatch, upstream of D1/D2 and of A''s occupancy attribution
+      [MOOT 2026-09-03: task cancelled.]'
+    verdict: OPEN
     delivered_check:
       kind: grep
       pattern: verify_host_busy
@@ -164,22 +165,32 @@ tasks:
       kind: manual
       reason: extension of an existing arm; proven by boundary rows 2 and 5
   - name: boundary-rows-1-to-5-green
-    binding: DAG-direction — the B+H integration-gate signal; row 1 amended per CORRECTION (2) to TWO
+    binding: 'DAG-direction — the B+H integration-gate signal; row 1 amended per CORRECTION (2) to TWO
       DISTINCT project roots so it exercises cross-project arbitration (INV-10), row 5 pins the unchanged
-      RunnerUnavailable quarantine/reprobe behaviour
-    verdict: PASS
+      RunnerUnavailable quarantine/reprobe behaviour [MOOT 2026-09-03: task cancelled.]'
+    verdict: OPEN
     delivered_check:
       kind: manual
       reason: the boundary matrix IS the check suite
   - name: admission-unavailable-is-not-silent
-    binding: rejection-mechanism (INV-11) — verify_admission is documented C-fail-open; C must distinguish
+    binding: 'rejection-mechanism (INV-11) — verify_admission is documented C-fail-open; C must distinguish
       acquired / busy / admission-unavailable and signal the third distinctly instead of proceeding as
-      if acquired
-    verdict: PASS
+      if acquired [MOOT 2026-09-03: task cancelled.]'
+    verdict: OPEN
     delivered_check:
       kind: manual
       reason: three-way outcome distinction is asserted by C's own tests, not by a pattern
   task_id: 5052
+  note: 'CANCELLED 2026-09-03 (Leo''s ruling). The premise was false: the laptop-side merge-verify lock
+    is scoped to project_root / config.worktree_dir, so reify''s and dark_factory''s locks are different
+    files and cannot collide; the born-at-L2 FLOCK_CONTENTION_CATEGORY branch is a WITHIN-PROJECT orphan
+    detector. Nothing else serializes merge verifies across projects on any host (verify_admission.acquire_task_slot
+    returns immediately for any role outside {task, background} -- ''C-merge-priority''), which is why
+    both projects already run merge verifies concurrently on the workstation. Building the arbitration
+    would additionally have created the host-global semaphore that cpu-load-robust-verify-prd.md section
+    6 rules out RED-TIER. The capability verdicts below are left as revised -- they record why the design
+    could not have worked as specified. No task depends on this one any more; its delivered_checks gate
+    nothing.'
 - label: D1
   title: 'merge-lane throughput: enable the laptop verify runner for Dark Factory (config)'
   capabilities:
@@ -191,9 +202,11 @@ tasks:
       kind: manual
       reason: pre-existing substrate on main
   - name: arbitration-config-fields-upstream
-    binding: capability→producer:task-C UPSTREAM (real add_dependency edge) — verify_merge_host_max_concurrent
-      / verify_merge_host_wait_secs / verify_host_busy_l1_per_hour. DAG-direction correct
-    verdict: PASS
+    binding: 'MOOT 2026-09-03: task C is CANCELLED and D1 no longer depends on it. D1 adds only the verify_runners
+      block and verify_drift_check_every_n_lands, both pre-existing schema fields in config.py. The three
+      arbitration fields (verify_merge_host_max_concurrent / verify_merge_host_wait_secs / verify_host_busy_l1_per_hour)
+      will never exist.'
+    verdict: OPEN
     delivered_check:
       kind: manual
       reason: gated by C's own delivered_checks via the dependency edge

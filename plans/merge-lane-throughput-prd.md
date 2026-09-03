@@ -339,7 +339,7 @@ and the manifest disagree, the manifest is current.**
 | Decomposition, F | "`landed_via_chain: true`" | it is an **int** (1 per item landed via chain), and F's 7-day observation cannot gate F, which completes on its deploy script's exit code. |
 | Cross-PRD table | `merge-lane-quality-prd.md` — **parallel** | true for this PRD's own files, but **F and H are transitively gated behind it**: F depends on 3188, whose dependencies are `[3186, 5036]`, and 5036 is that PRD's package-move gating anchor. |
 
-### Unreconciled prior ruling (blocks task C, needs Leo)
+### RULED 2026-09-03 — task C is cancelled (superseded, kept for the record)
 
 `plans/cpu-load-robust-verify-prd.md` § 6 (RED-TIER, human decision) and
 `plans/integration-test-lane-prd.md` § 11 both rule out a **host-global
@@ -353,3 +353,57 @@ and a fall back to local — but the local fallback is exactly the property the
 second row of the table above shows to be broken today. Task 5052 carries a
 STOP-AND-RECONCILE block instructing it to escalate rather than build through
 the ruling.
+
+
+### The ruling, and the premise that turned out to be false
+
+**Task C (5052) is cancelled.** Leo's question — *"on the local host we run reify
+and Dark Factory verifies concurrently, lots of each. Why can't we run them
+concurrently on the remote host?"* — has no good answer, because **we can**.
+
+The premise C rested on, stated in § Background as *"two projects sharing the
+laptop under today's code would either thrash it or page Leo"*, is wrong on the
+paging half:
+
+- The laptop-side merge-verify lock is scoped to the **project**:
+  `git_ops.py` sets `self.worktree_base = (project_root / config.worktree_dir).resolve()`,
+  and both contention gates in `cli.py::verify_merge` key on that base. So on
+  `leo-laptop`, reify's locks live under `/home/leo/src/reify/.worktrees/` and
+  dark_factory's under `/home/leo/src/dark-factory/.worktrees/` — **different
+  files, which cannot collide**. The born-at-L2 `FLOCK_CONTENTION_CATEGORY`
+  branch is a **within-project orphan detector** (that is what
+  `laptop-warm-verify-flock-orphan-prd.md`, tasks 2306/2307, is about), never a
+  co-tenant detector.
+- Nothing else serializes merge verifies across projects on **any** host:
+  `shared/src/shared/verify_admission.py::acquire_task_slot` returns immediately
+  for any role outside `{task, background}` — *"C-merge-priority: merge can never
+  be starved by task"*. That is precisely why reify and dark_factory merge
+  verifies already run concurrently on the workstation, and the same code runs on
+  the laptop.
+
+So the two projects will simply run concurrently on the laptop, as they do
+locally, with no new mechanism. Building C's arbitration would additionally have
+**created** the host-global semaphore the RED-TIER ruling above forbids, inside a
+system whose per-project design is what that ruling calls correct. Cancelling C
+complies with the ruling rather than fighting it.
+
+**Retracted with it:** the decompose session's estimate of "1–3 blocked merges and
+L2 pages per day" without arbitration, which was arithmetic on the false premise.
+
+**Still live, independent of the cancellation:** the cross-PRD table's κ row is
+wrong. C would not have made the merge-queue contention branch unreachable (the
+remote pool is built with no `LocalRunner`, so `dispatch` re-raises), and with C
+cancelled the branch is plainly still live and still useful. **κ must not delete
+`is_flock_contention_failure`.**
+
+**What now guards the risk:** the residual concern is CPU contention on a laptop,
+which degrades verify *duration* and cannot block a merge or file an L2 — and is
+not cappable via `verify_admission_pytest_n`, since the merge role is never
+`-n`-capped. Task **E** carries it as a headline measurement: reify's laptop
+verify p50/p90 against its 17.4 / 20.6 min baseline, dark_factory's against its
+40.7 / 52.4 min local baseline, and the overlapping-span contention rate nobody
+has measured. If the host turns out oversubscribed, arbitration becomes a
+decision to make **with data** — in some shape other than the one ruled out.
+
+Revised DAG: **A → B → D1 → D2 → E → F → H**, with **A → G** alongside. No
+RED-TIER conflict anywhere in it.
