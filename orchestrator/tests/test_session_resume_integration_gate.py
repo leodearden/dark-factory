@@ -1550,7 +1550,7 @@ async def test_b4c_foreign_config_dir_is_signalled_not_silently_stashed(
     # `cap.emits` and this module's existing `len(cap.emits) == 1` assertions
     # are unaffected.
     ambiguous = [
-        call.kwargs for call in harness.event_store.emit.call_args_list
+        call.kwargs for call in harness.event_store.emit.call_args_list  # type: ignore[attr-defined]
         if call.args and call.args[0] == EventType.session_config_dir_ambiguous
     ]
     assert len(ambiguous) == 1
