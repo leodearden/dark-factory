@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from shared.config_dir import CONFIG_DIR_PREFIX
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import SessionResumeConfig, TranscriptArchiveConfig
@@ -712,6 +712,142 @@ class TestAdoptNonDictSidecar:
             await harness._run_slot(assignment, sem)  # must not raise
 
         assert MockWorkflow.call_args.kwargs['resume_session_id'] is None
+
+
+def _adopt_sidecar(task_dir: Path, session_id: str, task_id: str) -> dict:
+    """Write a minimal v2 ``agent_session.json`` into *task_dir*; return it."""
+    task_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'session_id': session_id,
+        'role': 'implementer',
+        'started_at': datetime.now(UTC).isoformat(),
+        'owner_pid': 4242,
+        'task_id': task_id,
+        'resume_count': 0,
+        'schema_version': 2,
+    }
+    (task_dir / 'agent_session.json').write_text(json.dumps(payload))
+    return payload
+
+
+class TestAdoptDerivesConfigDir:
+    """The recovered config dir must be DERIVED from the adopted task id, and a
+    dir that is not the derived one must never be stashed (D5).
+
+    ``_adopt_recovered_session`` currently globs ``<entry>/.task/claude-config-*``,
+    sorts, and stashes ``[0]``, justified by an in-code comment claiming "the dir
+    name embeds the branch (``claude-config-<branch>``), not derivable from
+    task_id". That claim is FALSE, and this class is the evidence:
+
+      - the SOLE mkdir site is
+        ``shared/src/shared/config_dir.py::TaskConfigDir.__init__``, which builds
+        ``base / f'{CONFIG_DIR_PREFIX}{task_id}'`` from a task-id STEM, never a
+        branch — reached in production from
+        ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
+        ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``;
+      - the full branch is ``task/<id>``, TWO path components, so the name the
+        comment describes could not exist as one dir name;
+      - ``key`` is the real task id at every one of the four call arities.
+
+    So the expected path is ``entry / '.task' / f'{CONFIG_DIR_PREFIX}{key}'`` by
+    construction, and the wildcard glob is strictly weaker: when it lands on the
+    wrong dir the dispatch-time re-glob in ``_session_resume_reasons`` finds no
+    transcript and the session degrades to ``no_transcript`` with zero operator
+    signal.
+
+    Every expected path here is built by the real CREATOR (``TaskConfigDir``)
+    rather than by restating ``'claude-config-'``, so the assertions pin
+    creator/resolver AGREEMENT rather than a literal (INV-5) — the same shape as
+    ``fused_memory/reconciliation/cli_stage_runner.py::gc_run_config_dir``.
+    """
+
+    def test_derivation_beats_lexical_order(self, harness: Harness):
+        """(a) With a foreign sibling sorting BEFORE the expected dir, only a
+        derivation can land on the right one.
+
+        The fixture deliberately INVERTS the ordering seen in the live
+        ``.worktrees/2971/.task/`` (``claude-config-2971`` alongside
+        ``claude-config-df_task_13``, where the correct dir happens to sort
+        first): a fixture copying that ordering would pass under the buggy
+        sorted-glob too, and so would prove nothing. The precondition assertion
+        below pins the inversion, so this test cannot silently decay into
+        passing by the same lexical luck the bug depends on.
+        """
+        task_id = '99'
+        wt = _setup_worktree(harness.git_ops.worktree_base, task_id)
+        task_dir = wt / '.task'
+        _adopt_sidecar(task_dir, 'sess-99', task_id)
+        # Both dirs staged through the real creator — including the foreign one,
+        # whose name shape mirrors a genuine non-owner (see the -unblock case).
+        expected = TaskConfigDir(task_id, base_dir=task_dir)
+        foreign = TaskConfigDir('000-foreign', base_dir=task_dir)
+        # PRECONDITION: the sorted glob picks the FOREIGN dir, so the assertion
+        # that follows is decided by derivation and nothing else.
+        assert sorted(task_dir.glob(f'{CONFIG_DIR_PREFIX}*'))[0] == foreign.path
+
+        adopted = harness._adopt_recovered_session(wt, task_id)
+
+        assert adopted == task_id
+        assert harness._recovered_session_config_dirs == {
+            task_id: str(expected.path)
+        }
+
+    def test_single_non_matching_dir_is_not_stashed(self, harness: Harness):
+        """(b) D5 — the ``.worktrees/3464`` shape: exactly ONE config dir, and
+        it is not the expected one.
+
+        The dir name is the real one produced by
+        ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``
+        (``TaskConfigDir(f'{task_id}-unblock', ...)``), which is a legitimate
+        non-owner of this session's transcript. Today ``len(config_dirs) == 1``
+        so the ``> 1`` warning never fires and the wrong dir is stashed
+        SILENTLY.
+
+        Reproduced entirely from a fixture because the live ``.worktrees/3464``
+        has since been reaped (measured 2026-09-03) — the fixture is now the
+        sole carrier of this signal, not a backup for it.
+
+        Adoption and corroboration are INDEPENDENT: refusing to stash must not
+        suppress the resume machinery, only refuse to lie about it. So the
+        session is still adopted and only the stash stays empty; the dispatch
+        guard then reaches ``no_transcript`` on its own terms.
+        """
+        task_id = '3464'
+        wt = _setup_worktree(harness.git_ops.worktree_base, task_id)
+        task_dir = wt / '.task'
+        payload = _adopt_sidecar(task_dir, 'sess-3464', task_id)
+        unblock = TaskConfigDir(f'{task_id}-unblock', base_dir=task_dir)
+        assert list(task_dir.glob(f'{CONFIG_DIR_PREFIX}*')) == [unblock.path]
+
+        adopted = harness._adopt_recovered_session(wt, task_id)
+
+        assert harness._recovered_session_config_dirs == {}
+        assert adopted == task_id
+        assert harness._recovered_sessions[task_id] == payload
+
+    def test_absent_task_dir_adopts_and_stashes_nothing(self, harness: Harness):
+        """(c) Regression guard — no ``.task/`` at all still adopts, stashes
+        nothing, and never raises (the I3 fail-safe must survive the rewrite).
+
+        The sidecar is placed in the ``.task-meta`` sibling root so
+        ``_resolve_recovery_artifact``'s new-then-old resolution finds it with
+        no legacy ``<entry>/.task`` on disk — which is exactly the state that
+        makes the resolver's own path absent.
+        """
+        task_id = '77'
+        wt = harness.git_ops.worktree_base / task_id
+        wt.mkdir(parents=True, exist_ok=True)
+        meta_root = TaskArtifacts.meta_root_for(
+            harness.git_ops.worktree_base, wt.name
+        )
+        payload = _adopt_sidecar(meta_root, 'sess-77', task_id)
+        assert not (wt / '.task').exists()
+
+        adopted = harness._adopt_recovered_session(wt, task_id)  # must not raise
+
+        assert adopted == task_id
+        assert harness._recovered_sessions[task_id] == payload
+        assert harness._recovered_session_config_dirs == {}
 
 
 def _setup_worktree_with_meta(base: Path, task_id: str, plan: dict, *, title: str):
