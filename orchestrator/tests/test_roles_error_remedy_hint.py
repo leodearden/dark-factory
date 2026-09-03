@@ -53,7 +53,11 @@ wording, never a byte-size figure.
 
 from __future__ import annotations
 
-from orchestrator.agents.roles import ERROR_REMEDY_HINT_GUIDANCE
+from orchestrator.agents.roles import (
+    ERROR_REMEDY_HINT_GUIDANCE,
+    ROLES,
+    TOOL_CALL_REJECTION_GUIDANCE,
+)
 
 # `ERROR_REMEDY_HINT_GUIDANCE` opens with its own `\n## ` heading — reused
 # here as a structural landmark, not any particular heading's text, so
@@ -116,4 +120,130 @@ def test_guidance_is_brace_free() -> None:
         'are deliberately not f-strings, but this constant is held '
         'brace-free defensively so it stays interpolation-safe if a future '
         'splice site needs it.'
+    )
+
+
+def test_carried_by_exactly_the_tool_call_rejection_role_set() -> None:
+    """`ERROR_REMEDY_HINT_GUIDANCE` and `TOOL_CALL_REJECTION_GUIDANCE` share one carrier set.
+
+    The set of eligible roles is not re-derived or hand-maintained here —
+    see this task's design decision on the coupling invariant. Rather than a
+    second `_UNPINNED_PROMPT_ROLES`-style frozenset that could silently
+    drift from the sibling module's copy, this test asserts the two blocks
+    simply travel together.
+    `test_roles_tool_call_rejection.py::test_unpinned_prompt_role_set_matches_prompt_spec_capability`
+    already owns the tripwire pinning WHICH roles have unpinned prompts, and
+    that module's `test_artifact_pinned_role_does_not_carry_guidance`
+    already pins `reviewer_comprehensive` out of the
+    `TOOL_CALL_REJECTION_GUIDANCE` carrier set — so an accidental splice
+    into `reviewer_comprehensive` here shows up as `extra_new` below,
+    without a separate negative test duplicating that coverage.
+    """
+    tcrg_carriers = {
+        name for name, role in ROLES.items() if TOOL_CALL_REJECTION_GUIDANCE in role.system_prompt
+    }
+    new_carriers = {
+        name for name, role in ROLES.items() if ERROR_REMEDY_HINT_GUIDANCE in role.system_prompt
+    }
+
+    # Guard-before-containment, same discipline the sibling module's
+    # test_missing_required_parameter_shape_is_composed_into_the_splice_unit
+    # documents: if both blocks were ever dropped from every role, the
+    # equality check below would hold VACUOUSLY (empty == empty) and this
+    # test would pass on a total regression. This assertion is the sole
+    # guard against that.
+    shared = tcrg_carriers & new_carriers
+    assert shared, (
+        'No role carries both TOOL_CALL_REJECTION_GUIDANCE and '
+        'ERROR_REMEDY_HINT_GUIDANCE. The equality check below still passes '
+        'on two independently-empty sets — this assertion is the sole '
+        'guard against both blocks being silently dropped from every role '
+        'prompt at once.'
+    )
+
+    missing_new = sorted(tcrg_carriers - new_carriers)
+    extra_new = sorted(new_carriers - tcrg_carriers)
+    assert missing_new == [] and extra_new == [], (
+        f'ERROR_REMEDY_HINT_GUIDANCE carrier set diverges from '
+        f'TOOL_CALL_REJECTION_GUIDANCE: missing_new={missing_new} (carry '
+        f'TOOL_CALL_REJECTION_GUIDANCE but not the new block) '
+        f'extra_new={extra_new} (carry the new block without '
+        'TOOL_CALL_REJECTION_GUIDANCE). A role gaining or losing an '
+        'unpinned prompt is '
+        'test_roles_tool_call_rejection.py::'
+        'test_unpinned_prompt_role_set_matches_prompt_spec_capability to '
+        'adjudicate — this test only enforces that the two blocks move '
+        'together.'
+    )
+
+
+def test_guidance_appears_exactly_once_per_role() -> None:
+    """No duplicate splice — the block is carried once, and only once, per role.
+
+    Scoped to catching a stale duplicate splice left beside a new one, NOT
+    to enforcing presence — that is
+    `test_carried_by_exactly_the_tool_call_rejection_role_set`'s job. A role
+    where the block is entirely absent is skipped here rather than flagged,
+    so a role that has not yet received the splice fails exactly one test
+    for that one root cause instead of two. Mirrors the sibling module's
+    `test_guidance_appears_exactly_once_per_role`.
+    """
+    offenders = {}
+    for name in sorted(ROLES):
+        count = ROLES[name].system_prompt.count(ERROR_REMEDY_HINT_GUIDANCE)
+        if count == 0:
+            continue
+        if count != 1:
+            offenders[name] = count
+
+    assert offenders == {}, (
+        f'Roles carrying more than one copy of ERROR_REMEDY_HINT_GUIDANCE: '
+        f'{offenders}. A stale duplicate splice was probably left beside a '
+        'new one — delete the extra copy.'
+    )
+
+
+def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
+    """The new block lands immediately after `TOOL_CALL_REJECTION_GUIDANCE`, always.
+
+    Iterates `TOOL_CALL_REJECTION_GUIDANCE`'s own carrier set, not the new
+    block's — a role where the new block is absent is recorded as an
+    offender (`'ABSENT'`) rather than skipped, so this test can never pass
+    vacuously on a role that dropped the splice.
+
+    Why the new block cannot be placed EARLIER: two pre-existing invariants
+    constrain the front of every role prompt. For the 7 roles carrying
+    `BACKGROUND_WAIT_GUIDANCE`,
+    `test_roles_wait_pattern.py::test_combined_guidance_is_stated_up_front`
+    requires that block's heading to remain the prompt's FIRST `##` heading
+    and to land within `_UP_FRONT_CHAR_BUDGET` chars, so splicing ahead of
+    it would break both halves of that invariant. For `judge` (which
+    carries no wait block),
+    `test_roles_tool_call_rejection.py::test_guidance_placement_is_structural`
+    requires `TOOL_CALL_REJECTION_GUIDANCE`'s heading to be the prompt's
+    first `##` heading. Appending strictly after `TOOL_CALL_REJECTION_GUIDANCE`
+    is the one position that satisfies both, uniformly, with no per-role
+    branching.
+    """
+    tcrg_carriers = {
+        name for name, role in ROLES.items() if TOOL_CALL_REJECTION_GUIDANCE in role.system_prompt
+    }
+
+    offenders = {}
+    for name in sorted(tcrg_carriers):
+        prompt = ROLES[name].system_prompt
+        idx = prompt.find(ERROR_REMEDY_HINT_GUIDANCE)
+        if idx == -1:
+            offenders[name] = 'ABSENT'
+            continue
+
+        expected = prompt.find(TOOL_CALL_REJECTION_GUIDANCE) + len(TOOL_CALL_REJECTION_GUIDANCE)
+        if idx != expected:
+            offenders[name] = {'offset': idx, 'expected': expected}
+
+    assert offenders == {}, (
+        f'Roles placing ERROR_REMEDY_HINT_GUIDANCE incorrectly: {offenders}. '
+        'It must immediately follow TOOL_CALL_REJECTION_GUIDANCE in every '
+        "role that carries the latter — 'ABSENT' means the splice is "
+        'missing entirely for that role.'
     )
