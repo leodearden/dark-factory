@@ -10404,6 +10404,198 @@ class TestCarrierPredicateNoVerdictCategory:
 
 
 # ---------------------------------------------------------------------------
+# Task 4678 (r3) — the SCOPE and LEG-DISTINCTION pins.
+#
+# Green by construction after the carrier routing lands, exactly like the
+# precedent pin `test_custom_script_runner_nonzero_rc_is_still_a_verdict`
+# ("green before and after task 4065").  They exist so the scoping the PRD
+# mandates is a MACHINE-CHECKED invariant rather than a comment.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestCarrierCategoryScope:
+    """PINS: the carrier category reaches predicate NO-VERDICT legs, and nothing else.
+
+    Task 4678 / PRD "SCOPE STRICTLY TO CARRIERS".  Three boundaries, each with
+    a different consumer that would be harmed by a leak:
+
+    * the DEPLOY population must stay ``infra_issue`` — ``Harness._revalidate_
+      open_deterministic_escalation`` (the deterministic-recon sweep's Source
+      B) keys on ``category == 'infra_issue'`` to auto-close deploy-stranded
+      escalations, so a leak would make that population un-auto-closable;
+    * a NON-carrier predicate must stay ``infra_issue`` — the discriminator's
+      documented boundary, pinned here through the RUNNER rather than only
+      through ``TestIsRecurrenceCarrier``'s unit matrix;
+    * a carrier's VERDICT leg must keep BOTH the category and the
+      ``gate_escalated_at`` stamp — r3 unified the LABEL across a carrier's
+      legs without collapsing the verdict/no-verdict distinction, which stays
+      discriminable by the stamp.
+    """
+
+    async def test_deploy_task_with_recurrence_still_files_infra_issue(
+        self, tmp_path: Path,
+    ):
+        """A DEPLOY-shaped task carrying a `recurrence` dict still files
+        ``infra_issue`` on its outer-guard timeout.
+
+        The submit guard rejects this combination (C-1 scopes carriers to
+        predicates), but a hand edit or a raw ``update_task`` can still produce
+        it — so the pin drives the state rather than assuming it unreachable.
+
+        Two independent guarantees hold it: the ``category`` override is passed
+        only from ``_run_predicate``, which no deploy branch reaches; and
+        Source B additionally requires ``before_done_ran_at`` (or
+        ``deploy_state.phase == RAN``), which a read-only predicate never
+        writes, so its designed population is structurally out of reach from
+        the predicate path either way.  This test pins the first.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4678_deploy', target_unit=None, timeout_secs=0)
+        # Hand-attached, deliberately: this is the shape a hand edit produces,
+        # and _deploy_task has no `recurrence` parameter precisely because the
+        # combination is never legitimately authored.
+        task['metadata']['recurrence'] = _carrier_recurrence('deploy-shaped-hand-edit')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4678_deploy', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue', (
+            f'the carrier rule must not leak into the deploy population that '
+            f"Harness._revalidate_open_deterministic_escalation auto-closes on "
+            f'category == infra_issue: {pending[0].category!r}'
+        )
+
+    async def test_predicate_with_empty_recurrence_still_files_infra_issue(
+        self, tmp_path: Path,
+    ):
+        """A predicate carrying ``recurrence={}`` is NOT a carrier — still
+        ``infra_issue`` on a hang.
+
+        The discriminator's documented boundary (an empty dict carries no chain
+        link), pinned through the real ``run()`` rather than only through
+        ``TestIsRecurrenceCarrier``.  Tasks 702/703/704 and integration 9003
+        remain the plain no-``recurrence`` controls.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='4678_empty', timeout_secs=0, recurrence={})
+        assert task['metadata']['recurrence'] == {}, (
+            'the fixture must actually carry the empty dict, not drop the key'
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4678_empty', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue', (
+            f'an empty recurrence dict is not a chain link: {pending[0].category!r}'
+        )
+        scheduler.update_task.assert_not_awaited()
+
+    async def test_carrier_nonzero_rc_still_stamps_gate_escalated_at(self, tmp_path: Path):
+        """A carrier's VERDICT leg keeps BOTH ``milestone_check_failed`` AND
+        the ``gate_escalated_at`` stamp.
+
+        r3 unified the LABEL across a carrier's legs; it did NOT collapse the
+        verdict/no-verdict distinction.  Read together with the
+        ``update_task.assert_not_awaited()`` assertions on the three no-verdict
+        arms, this pins C-5's "both legs, one category" while keeping the two
+        legs discriminable by the STAMP — which is what decides whether a human
+        resolving the escalation drives the task to done (verdict) or merely
+        lets the check be re-attempted (no verdict).
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(
+            task_id='4678_verdict',
+            milestone=_carrier_dated_milestone(),
+            recurrence=_carrier_recurrence(),
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=AsyncMock(return_value=(1, 'VIOLATED: flakiness 0.08 > 0.05')),
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4678_verdict', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed'
+        assert esc.summary == 'Milestone predicate check failed (rc=1)', (
+            f'the VERDICT arm keeps its own summary — the leg is still '
+            f'discriminable from the three no-verdict arms: {esc.summary!r}'
+        )
+
+        # THE distinction from the no-verdict legs: this one stamps.
+        scheduler.update_task.assert_awaited_once()
+        stamp_call = scheduler.update_task.call_args
+        metadata_update = (
+            stamp_call.args[1] if len(stamp_call.args) > 1
+            else stamp_call.kwargs.get('metadata', {})
+        )
+        assert metadata_update.get('gate_escalated_at'), (
+            f'a VERDICT must still latch the task into section-1\'s '
+            f'resolve-to-done path: {metadata_update!r}'
+        )
+        scheduler.set_task_status.assert_awaited_once_with('4678_verdict', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Step-7: RED — B10 predicate resume: gate_escalated_at set + escalation
 # resolved -> done with deterministic-milestone provenance (NOT
 # deterministic-deploy). (RED until step-8 adds the predicate-aware resume

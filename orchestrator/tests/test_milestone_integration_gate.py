@@ -110,6 +110,68 @@ def _delayed_predicate_milestone_task(
     }
 
 
+def _carrier_predicate_task(
+    task_id: str,
+    script_path: Path,
+    *,
+    args: list[str] | None = None,
+    timeout_secs: int | float = 30,
+    recurrence_key: str = 'merge-flakiness-watch',
+    interval_secs: int = 86400,
+) -> dict:
+    """Build a pending RECURRENCE-CARRIER predicate task (task 4678 / r3).
+
+    The exact PRD C-1 carrier shape: ``task_kind='deterministic'``,
+    ``always_escalates=False``, ``before_done`` pointing at the REAL exemplar
+    script with ``kind='predicate'``/``target_unit=None``, a DATED
+    ``metadata.milestone``, and a ``metadata.recurrence`` chain link.
+
+    ``recurrence`` is built from ``shared.task_metadata.Recurrence`` (r1 /
+    task 4676) and round-tripped through ``model_dump()`` rather than
+    hand-rolled, so the fixture provably matches r1's validated model — and so
+    the round-tripped form (which materialises an explicit
+    ``'minted_from': None``) is what the runner actually sees.
+
+    Sibling of ``_delayed_predicate_milestone_task`` above; kept separate
+    rather than bolted on as a flag because the two differ in milestone MODE as
+    well as in the recurrence link, and the non-carrier builder is the control
+    for every B7/B8/B9 case in this module.
+    """
+    from shared.task_metadata import Recurrence
+
+    before_done: dict = {
+        'script': str(script_path),
+        'args': args if args is not None else [
+            '--window-days', '7', '--threshold', '0.05', '--value', '0.03',
+        ],
+        'env': {},
+        'cwd': None,
+        'timeout_secs': timeout_secs,
+        'target_unit': None,
+        'kind': 'predicate',
+    }
+    metadata: dict = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': before_done,
+        'milestone': {
+            'mode': 'dated',
+            'at': (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+        },
+        'recurrence': Recurrence(
+            key=recurrence_key, interval_secs=interval_secs,
+        ).model_dump(),
+    }
+    return {
+        'id': task_id,
+        'title': 'Merge-flakiness recurring check',
+        'description': 'One link of a recurring merge-flakiness predicate chain',
+        'status': 'pending',
+        'dependencies': [],
+        'metadata': metadata,
+    }
+
+
 def _dated_milestone_task(task_id: str, at: datetime, *, task_kind: str | None = None) -> dict:
     """Build a pending, dated-milestone task dict (no dependencies — the
     'dated' mode gates purely on wall-clock, no deps-satisfied anchor)."""
@@ -488,6 +550,7 @@ class TestExemplarFailAndTimeout:
 
     TASK_ID_FAIL = '9002'
     TASK_ID_TIMEOUT = '9003'
+    TASK_ID_CARRIER_TIMEOUT = '9004'
 
     async def test_check_fails_files_milestone_check_failed_and_blocks(
         self, exemplar_script: Path, tmp_path: Path,
@@ -566,6 +629,74 @@ class TestExemplarFailAndTimeout:
 
         scheduler.set_task_status.assert_awaited_once_with(self.TASK_ID_TIMEOUT, 'blocked')
         scheduler.update_task.assert_not_awaited()
+        unit_inspector.assert_not_awaited()
+
+    async def test_carrier_check_timeout_files_milestone_check_failed(
+        self, exemplar_script: Path, tmp_path: Path,
+    ):
+        """B7 in the product shape: a seeded RECURRENCE CARRIER whose predicate
+        sleeps past a small ``timeout_secs`` files ``milestone_check_failed``,
+        not ``infra_issue`` (task 4678 / r3, PRD R-D6 + contract C-5).
+
+        The control is directly above —
+        ``test_predicate_hang_files_infra_issue_not_milestone_check_failed``
+        (TASK_ID 9003): the same real ``run()``/``_run_predicate`` composition
+        and the same real ``EscalationQueue``, with NO ``metadata.recurrence``,
+        still yields ``infra_issue``.  Both sides of B7 therefore sit in one
+        class.
+
+        Driven through the REAL subprocess (``script_runner=None``) and the
+        REAL exemplar script, using the ``--sleep-secs`` knob the script
+        already advertises for exactly this
+        (``test_script_sleep_secs_delays_execution``: "the knob that lets this
+        SAME fixture drive a check timeout under test").  ``--value 0.03``
+        against ``--threshold 0.05`` means the check would PASS if it ever
+        finished, so the escalation provably comes from the timeout, not from a
+        verdict.  ``timeout_secs=1`` against a 30s sleep leaves the outer guard
+        at the default ``1 + 30 = 31s``, so the INNER per-script timeout is
+        what fires.
+        """
+        task = _carrier_predicate_task(
+            self.TASK_ID_CARRIER_TIMEOUT, exemplar_script,
+            args=['--threshold', '0.05', '--value', '0.03', '--sleep-secs', '30'],
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        unit_inspector = AsyncMock()
+        runner = _real_runner(tmp_path, task, unit_inspector)
+
+        started = time.monotonic()
+        # Hang tripwire: fail loudly instead of stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 15, (
+            f'the INNER 1s timeout must be what fires, not the 31s outer '
+            f'guard — run took {elapsed:.1f}s'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = runner.escalation_queue.get_by_task(
+            self.TASK_ID_CARRIER_TIMEOUT, status='pending',
+        )
+        assert len(pending) == 1, f'expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed', (
+            f'C-5: every failure leg of a recurring chain sits in the '
+            f'deny-listed category — the non-carrier control at TASK_ID 9003 '
+            f'yields infra_issue: {esc.category!r}'
+        )
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+
+        # Still a NO-VERDICT leg: the label moved, task 4065's semantics did
+        # not — no gate_escalated_at stamp, so the read-only check is simply
+        # re-attempted on the next dispatch.
+        runner.scheduler.update_task.assert_not_awaited()
+        runner.scheduler.set_task_status.assert_awaited_once_with(
+            self.TASK_ID_CARRIER_TIMEOUT, 'blocked',
+        )
         unit_inspector.assert_not_awaited()
 
 
