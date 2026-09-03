@@ -242,17 +242,50 @@ _LIMITS_PROVENANCE_KEYS = (
 # would put a multi-megabyte artifact into every poll's payload, making
 # the naming of the discard its own degradation.
 #
+# A THIRD shape reaches a detail without ever going through `_short_repr`:
+# `str(exc)` on the `unreadable_*` sites, and `entry["error"]` (itself a
+# `str(exc)`, built by
+# dashboard/src/dashboard/data/escalations.py::load_queue_escalations) on
+# `unreadable_escalation_file`.  These stay raw because they are bounded
+# BY the exception types each site's `try` actually narrows to
+# (`_ARTIFACT_ERRORS = (OSError, ValueError)`, at a read/parse boundary
+# BEFORE the artifact exists as Python data): a `json.JSONDecodeError`
+# message is one of a handful of fixed internal literals plus a
+# line/column/char offset, never the document's own bytes; `OSError`
+# carries the path (OS-length-bounded) and a fixed errno string;
+# `UnicodeDecodeError` carries one byte value and a position — none of
+# those can embed an artifact-derived string of attacker-chosen length.
+# The two `internal_error` sites are the exception: they catch bare
+# `Exception` as the last-resort bug boundary (see `build_memory_evals`'s
+# docstring), which is NOT bounded by construction the same way — a
+# future code path that let a builtin conversion raise on a JSON-derived
+# value (`int()`, `datetime.strptime()`, …) would leak it here unbounded.
+# Today nothing does: every such conversion in this module already
+# catches narrowly and routes the value through `_short_repr` at its own
+# point of failure (`unparseable_run_stamp` above is the pattern to
+# follow).  That is where a real fix belongs if a future conversion needs
+# one — capping `str(exc)` at the wide `internal_error` catch would trade
+# a shorter usually-fine bug message for no real protection, since a
+# leaked value is not guaranteed to fall within the first 120 characters
+# of it either.
+#
 # The invariant this enforces: no raw `!r` on an artifact-derived value in
-# an `_issue` detail anywhere in this module — held by the closure test
-# `tests/test_memory_evals_data.py::TestAllIssueDetailsAreBounded` rather
-# than by convention alone, so a future `_issue` call that reintroduces a
-# raw `!r` fails loudly instead of silently reopening this exposure.  Two
-# deliberate exceptions stay uncapped: the `seen_kinds` dedup key below
-# (an internal `repr`, never emitted — capping it would collide two
-# distinct oversized kinds on their shared prefix and silently swallow a
-# real second issue), and `_issue`'s structured `eval_id=` / `path=`
-# kwargs (identity/locator fields the UI groups and links on, where
-# truncation would corrupt identity rather than trim prose).
+# an `_issue` detail, at any of the fifteen interpolations this task swept
+# — held by the closure test
+# `tests/test_memory_evals_data.py::TestAllIssueDetailsAreBounded` for the
+# twelve issue kinds its hostile tree exercises (see `required_kinds`
+# there), so an edit that reintroduces a raw `!r` at one of THOSE sites
+# fails loudly instead of silently reopening this exposure.  That test
+# does not enumerate the module's full issue-kind vocabulary: a brand-new
+# `_issue` call, or one for a kind its hostile tree does not already
+# trigger, is not covered by it and needs its own per-site bound and
+# test.  Two further deliberate exceptions stay uncapped: the
+# `seen_kinds` dedup key below (an internal `repr`, never emitted —
+# capping it would collide two distinct oversized kinds on their shared
+# prefix and silently swallow a real second issue), and `_issue`'s
+# structured `eval_id=` / `path=` kwargs (identity/locator fields the UI
+# groups and links on, where truncation would corrupt identity rather
+# than trim prose).
 _MAX_DISCARDED_VALUE_REPR = 120
 
 
