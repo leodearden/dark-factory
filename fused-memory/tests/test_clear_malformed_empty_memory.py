@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'clear_malformed_empty_memory.py'
 
@@ -42,27 +43,14 @@ def _make_record(payload: dict | None = None) -> MagicMock:
     return record
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    retrieves (task 4127). That probe touches the real filesystem, so without
-    this fixture every ``--apply`` test would pass or fail according to whether
-    the machine running pytest happens to be able to write mem0's history
-    directory -- and it genuinely cannot inside an agent sandbox, which is the
-    whole reason the guard exists. This suite is deliberately MOCK-unit (an
-    AsyncMock Qdrant client, MagicMock points, no live Qdrant), so the
-    environment must not be an input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
-    to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it retrieves (task
+    4127). This suite is deliberately MOCK-unit (an AsyncMock Qdrant client,
+    MagicMock points, no live Qdrant). ``TestRunApplyStoreMutationPreflight``
+    re-rigs this per test -- to refuse, to record, or to pass -- so the guard's
+    own behaviour is still pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================

@@ -13,6 +13,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import neutralise_fixture
 
 from fused_memory.maintenance.cross_graph_move import SubgraphEdgeResult
 
@@ -22,27 +23,15 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'consolidate_namespace_
 _mod = load_script_module(SCRIPT_PATH, mod_name='consolidate_namespace_families')
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    enumerates or scrolls (task 4293). That probe touches the real filesystem,
-    so without this fixture every ``--apply`` test would pass or fail according
-    to whether the machine running pytest happens to be able to write mem0's
-    history directory -- and it genuinely cannot inside an agent sandbox, which
-    is the whole reason the guard exists. This suite is deliberately MOCK-unit
-    (MagicMock graphiti + AsyncMock Qdrant, no live backends), so the
-    environment must not be an input to it.
-
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it enumerates or
+    scrolls (task 4293). This suite is deliberately MOCK-unit (MagicMock
+    graphiti + AsyncMock Qdrant, no live backends).
     ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
     to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
