@@ -17,7 +17,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_orphan_flag_markers.py'
 
@@ -3949,37 +3954,6 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.delete_memory = AsyncMock(return_value=None)
         return memory_service
 
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis, isolated from ``main``'s generic
-        handler.
-
-        Both emit ERROR from this script's logger, so neither the level nor the
-        logger name can tell them apart -- only the fail-closed marker and the
-        remedy can, and carrying those is the entire reason the site-specific
-        message exists. ``main`` logs "fatal error during sweep", which tells
-        an operator reading the journal nothing about what was refused or what
-        to do instead.
-
-        Pinned on those two clauses ONLY -- the marker and the remedy noun --
-        so every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content. Level and logger name are
-        shared with ``main``'s own ERROR record, and mere record-existence would
-        still pass if the whole diagnosis were replaced by "boom" -- precisely
-        the regression this exists to catch. Verified non-vacuous: mutating the
-        marker in the script turns this assertion red (task 4127 amendment).
-        """
-        return [
-            r for r in caplog.records
-            if r.name == 'sweep_orphan_flag_markers'
-            and r.levelno >= logging.ERROR
-            and 'NOT started (fail-closed)' in r.getMessage()
-            and 'MCP server' in r.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -4105,7 +4079,9 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2
-        assert self._fail_closed_records(caplog), (
+        # ``main``'s own generic "fatal error during sweep" ERROR shares this
+        # logger AND this level, so only the markers can tell the two apart.
+        assert fail_closed_records(caplog, 'sweep_orphan_flag_markers'), (
             "main's blanket handler only says 'fatal error during sweep', so "
             'the guard site must log the fail-closed diagnosis itself; got: '
             f'{[r.getMessage() for r in caplog.records]}'
@@ -4146,7 +4122,9 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2, 'a refused --apply must never satisfy the --check gate'
-        assert self._fail_closed_records(caplog), (
+        # ``main``'s own generic "fatal error during sweep" ERROR shares this
+        # logger AND this level, so only the markers can tell the two apart.
+        assert fail_closed_records(caplog, 'sweep_orphan_flag_markers'), (
             'a gate that fails must say WHY it failed -- an exit 2 with no '
             'fail-closed diagnosis is indistinguishable from a crashed sweep; '
             f'got: {[r.getMessage() for r in caplog.records]}'

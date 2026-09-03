@@ -20,7 +20,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params, load_script_module
-from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory.maintenance.cross_graph_move import (
     CreateResult,
@@ -2223,32 +2228,6 @@ class TestRunApplyStoreMutationPreflight:
         memory_service = _make_memory_service({'reify': graph})
         return mocks, memory_service, graph
 
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here -- it hands ``_run_live`` straight
-        to ``asyncio.run`` -- so the refusal exits as an uncaught traceback and
-        this ERROR record is the ONLY place the operator is told what was
-        refused and what to do instead. Pinned on the fail-closed marker and
-        the remedy noun ONLY, so every other word stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'migrate_cross_graph_leak'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, tmp_path, monkeypatch,
@@ -2414,7 +2393,7 @@ class TestRunApplyStoreMutationPreflight:
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
             )
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'migrate_cross_graph_leak'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

@@ -13,7 +13,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'clear_malformed_empty_memory.py'
 
@@ -511,37 +516,6 @@ class TestRunApplyStoreMutationPreflight:
     than an exception to it.
     """
 
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis, isolated from ``main``'s generic
-        handler.
-
-        Both emit ERROR from this script's logger, so neither the level nor the
-        logger name can tell them apart -- only the fail-closed marker and the
-        remedy can, and carrying those is the entire reason the site-specific
-        message exists. ``main`` logs "fatal error during cleanup", which tells
-        an operator reading the journal nothing about what was refused or what
-        to do instead.
-
-        Pinned on those two clauses ONLY -- the marker and the remedy noun --
-        so every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content. Level and logger name are
-        shared with ``main``'s own ERROR record, and mere record-existence would
-        still pass if the whole diagnosis were replaced by "boom" -- precisely
-        the regression this exists to catch. Verified non-vacuous: mutating the
-        marker in the script turns this assertion red (task 4127 amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'clear_malformed_empty_memory'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -665,7 +639,9 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2
-        assert self._fail_closed_records(caplog), (
+        # ``main``'s own generic "fatal error during cleanup" ERROR shares this
+        # logger AND this level, so only the markers can tell the two apart.
+        assert fail_closed_records(caplog, 'clear_malformed_empty_memory'), (
             "main's blanket handler only says 'fatal error during cleanup', so "
             'the guard site must log the fail-closed diagnosis itself; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

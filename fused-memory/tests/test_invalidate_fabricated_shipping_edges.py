@@ -19,7 +19,12 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent
@@ -92,36 +97,6 @@ class TestRunApplyStoreMutationPreflight:
             apply=apply,
             keep_unverified=keep_unverified,
         )
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here -- it hands ``_run`` straight to
-        ``asyncio.run`` -- so the refusal exits as an uncaught traceback and
-        this ERROR record is the ONLY place the operator is told what was
-        refused and what to do instead. Pinned on the fail-closed marker and
-        the remedy noun ONLY, so every other word stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-
-        NOTE the logger name is ``invalidate_shipping_edges``, which is NOT the
-        module name -- filtering on the module name would silently match
-        nothing and make every assertion below vacuous.
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'invalidate_shipping_edges'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
 
     @pytest.mark.asyncio
     async def test_apply_refuses_to_start_when_the_store_is_unwritable(
@@ -233,7 +208,9 @@ class TestRunApplyStoreMutationPreflight:
         ):
             await _mod._run(self._args(apply=True))
 
-        assert self._fail_closed_records(caplog), (
+        # The logger is ``invalidate_shipping_edges``, NOT the module name --
+        # filtering on the module name would match nothing and be vacuous.
+        assert fail_closed_records(caplog, 'invalidate_shipping_edges'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'
