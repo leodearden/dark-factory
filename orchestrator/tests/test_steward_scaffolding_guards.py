@@ -41,7 +41,11 @@ from typing import NamedTuple
 from unittest.mock import MagicMock
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT, assert_sandboxed_project_root
+from _orch_helpers import (
+    MOCK_WORKFLOW_PROJECT_ROOT,
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
+    assert_sandboxed_project_root,
+)
 
 # Both AST guards below rglob() every *.py under orchestrator/tests/ and
 # ast.parse() each one, which is the family the pyproject default 60s timeout is
@@ -851,3 +855,115 @@ class TestStewardConstructionSitesAreCensused:
         )
 
         assert _steward_construction_sites(tree) == []
+
+
+# ===========================================================================
+# Census guard: DECISION 2 — the absolute-/tmp project_root literals are
+# DELIBERATE-BUT-INERT, and are NAMED rather than sandboxed (task 4389)
+# ===========================================================================
+
+
+class TestMockWorkflowProjectRootContract:
+    """The contract of ``_orch_helpers.MOCK_WORKFLOW_PROJECT_ROOT``.
+
+    That constant is the canonical name for the 16 inert ``project_root``
+    placeholders task 3551's sweep found in the ``TaskWorkflow`` mock-config
+    factories, and task 4389 adjudicated as deliberate.  Its docstring owns the
+    classification and the measurements behind it; this class owns the four
+    properties the classification DEPENDS on, so that "inert placeholder"
+    remains a checked claim rather than a comment that was true once.
+
+    Deliberately NOT ``assert_sandboxed_project_root``: that helper's clauses 2
+    and 4 demand the exact opposite of clause 4 here — a CREATED directory
+    strictly below ``tmp_path``.  This constant must be neither, which is why it
+    is adjudicated in the census below instead of being folded onto the sandbox
+    invariant.
+
+    No tree scan in this class, so unlike the two sweeping guards above these
+    are split one clause per test — see ``_scan_tests_tree`` for which tests the
+    cost directive actually applies to.
+    """
+
+    def test_it_is_a_real_path(self) -> None:
+        """Clause 1, mirroring clause 1 of ``assert_sandboxed_project_root``.
+
+        A ``MagicMock`` child silently satisfies every ``/``-join a workflow
+        performs without ever producing a directory, so a mock root is never
+        caught downstream — and it would also make clause 4's ``.exists()``
+        tripwire vacuously true, since a mock's ``.exists()`` returns a truthy
+        mock either way.  This clause is what keeps that tripwire meaningful.
+        """
+        assert isinstance(MOCK_WORKFLOW_PROJECT_ROOT, Path), (
+            f'expected a real Path, got {type(MOCK_WORKFLOW_PROJECT_ROOT).__name__!r} '
+            f'({MOCK_WORKFLOW_PROJECT_ROOT!r})'
+        )
+
+    def test_it_is_absolute(self) -> None:
+        """Clause 2.  A relative placeholder would resolve against whatever
+        ``cwd`` the test process happened to have — which for this suite is the
+        checkout — so anything that did write through it would land in the
+        working tree rather than harmlessly nowhere.
+        """
+        assert MOCK_WORKFLOW_PROJECT_ROOT.is_absolute(), (
+            f'{MOCK_WORKFLOW_PROJECT_ROOT} must be absolute; a relative root '
+            f'resolves against the test process cwd (this checkout)'
+        )
+
+    def test_it_could_never_trip_the_review_checkpoint_guard(self) -> None:
+        """Clause 3.  ``ReviewCheckpoint._run_review`` (review_checkpoint.py:148-155)
+        raises ``ValueError`` on any ``project_root`` containing ``/tmp/pytest``,
+        as its FIRST statement, ahead of every seam these tests patch.
+
+        ``ReviewCheckpoint`` is not on the ``TaskWorkflow`` path today
+        (workflow.py:273 says so explicitly), so this is not a live constraint —
+        it is a FUTURE-PROOFING clause.  Pinning it costs one line and means a
+        review-touching config could adopt this constant without rediscovering
+        the trap task 3551 hit; without it, the safe value is an accident of
+        spelling that a later rename could silently undo.
+        """
+        assert '/tmp/pytest' not in str(MOCK_WORKFLOW_PROJECT_ROOT), (
+            f'{MOCK_WORKFLOW_PROJECT_ROOT} contains "/tmp/pytest", which '
+            f'ReviewCheckpoint._run_review rejects with ValueError before any '
+            f'patched seam is reached'
+        )
+
+    def test_it_is_never_actually_created_on_disk(self) -> None:
+        """Clause 4 — THE INERTNESS TRIPWIRE, and the whole reason the
+        classification is checkable rather than merely asserted.
+
+        The claim being kept honest: nothing ever writes through these mock
+        configs' ``project_root``.  It is not structurally guaranteed.  Four
+        ``config.project_root`` reads in workflow.py call
+        ``mkdir(parents=True, exist_ok=True)`` (:8488 and :13387 transcript
+        archive, :9458 verify archive, :9568 chronic-flake ledger), and their
+        gates read ``spec_set`` MagicMock attributes
+        (``config.transcript_archive.enabled``, ``config.chronic_flake.enabled``)
+        which are TRUTHY by default.  The only thing preventing a real ``mkdir``
+        is that those paths are not currently exercised under these mocks.  If
+        that changes, the directory appears and this test goes RED.
+
+        THE CAVEAT, stated plainly so a later reader does not mistake this for a
+        rigorous barrier: under ``-n auto`` this assertion is ORDER-SENSITIVE.
+        It may run on a worker before whichever test would have created the
+        directory.  But nothing ever removes it once created, so the signal is
+        MONOTONE, and that asymmetry is what makes it worth keeping:
+
+        * a RED here is ALWAYS a real regression — the directory exists, so
+          something did write through a mock ``project_root``;
+        * a GREEN may merely be EARLY, and proves nothing on its own.
+
+        Evidence that it is green for the right reason today, measured under
+        task 4389: ``/tmp/non-existent-for-test``, ``/tmp/non-existent`` and
+        ``/tmp/pr`` — the three literals this constant replaces — are all absent
+        from this machine's ``/tmp`` despite a long history of suite runs.
+        """
+        assert not MOCK_WORKFLOW_PROJECT_ROOT.exists(), (
+            f'{MOCK_WORKFLOW_PROJECT_ROOT} EXISTS on disk. It is an inert '
+            f'placeholder for TaskWorkflow mock configs and nothing should ever '
+            f'write through it, so something now reaches one of the four '
+            f'mkdir-capable config.project_root sites in workflow.py under a '
+            f'MagicMock config. That is a real leak: find the caller and give it '
+            f'a tmp_path-rooted project_root (see test_workflow_already_done.py '
+            f'for the keyword-parameter shape) rather than deleting the directory '
+            f'and this assertion.'
+        )
