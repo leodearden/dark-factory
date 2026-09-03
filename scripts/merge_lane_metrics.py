@@ -573,3 +573,124 @@ def maintainability_index(source: str, *, path: str) -> float:
             f'{path}: radon could not compute a maintainability index -- '
             f'{exc.__class__.__name__}: {exc}'
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Test-suite patch targets into lane internals.
+#
+# The two detector shapes below are PORTED from
+# orchestrator/tests/test_merge_queue_reachback_patch_guard.py --
+# `_merge_queue_module_aliases()` and the is_setattr / is_dotted_patch /
+# is_bare_patch / is_patch_object call classification inside
+# `_find_merge_queue_private_patches()` -- with two deliberate generalisations:
+# the alias helper takes a SET of lane module paths rather than the single
+# hardcoded `orchestrator.merge_queue`, and that guard's `forbidden` filter is
+# dropped so ALL leaves are counted rather than only the satellite-private ones.
+# This measure therefore subsumes the guard's allowlist as a COUNT, which is
+# what lets PRD task delta delete the guard once the count reaches zero.
+
+#: Dotted module paths whose attributes count as lane internals when patched.
+#: `merge_lane` is here from day one, before the package exists, precisely so
+#: PRD task zeta2's `git mv` cannot make the count read 0 by relocation.
+LANE_PATCH_MODULES: tuple[str, ...] = (
+    'orchestrator.merge_queue',
+    'orchestrator.merge_lane',
+)
+
+
+def _lane_module_aliases(tree: ast.AST) -> set[str]:
+    """Names bound directly to a lane module object anywhere in *tree*.
+
+    e.g. ``import orchestrator.merge_queue as mq`` or
+    ``from orchestrator import merge_lane``. Used to recognise the object-path
+    idiom, which targets the identical lookup site as the string-path form
+    without embedding the module path as a string constant.
+    """
+    leaves = {path.rsplit('.', 1)[-1] for path in LANE_PATCH_MODULES}
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in LANE_PATCH_MODULES and alias.asname:
+                    aliases.add(alias.asname)
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module == 'orchestrator'
+            and not node.level
+        ):
+            for alias in node.names:
+                if alias.name in leaves:
+                    aliases.add(alias.asname or alias.name)
+    return aliases
+
+
+def patch_targets(source: str, *, path: str = '<source>') -> set[str]:
+    """Distinct leaf names patched through a lane module path in *source*.
+
+    Distinct NAMES, not call sites: the PRD's measure is "79 distinct names"
+    across "1,111 call sites", and the ratchet freezes the former.
+
+    AST-based, so a docstring or comment quoting the dotted path -- which the
+    satellite module docstrings and the reachback guard's own ALLOWLIST literal
+    both do -- is never mistaken for a real patch site.
+    """
+    tree = _parse(source, path=path)
+    aliases = _lane_module_aliases(tree)
+    leaves = {module.rsplit('.', 1)[-1] for module in LANE_PATCH_MODULES}
+
+    def _is_lane_ref(expr: ast.expr) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in aliases
+        # The bare attribute chain `orchestrator.merge_queue`. Anchored on the
+        # `orchestrator` root so an unrelated `workflow.merge_queue` attribute
+        # that merely shares the leaf name is not counted.
+        return (
+            isinstance(expr, ast.Attribute)
+            and expr.attr in leaves
+            and isinstance(expr.value, ast.Name)
+            and expr.value.id == 'orchestrator'
+        )
+
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        is_setattr = isinstance(func, ast.Attribute) and func.attr == 'setattr'
+        is_dotted_patch = isinstance(func, ast.Attribute) and func.attr == 'patch'
+        is_bare_patch = isinstance(func, ast.Name) and func.id == 'patch'
+        is_patch_object = (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'object'
+            and (
+                (isinstance(func.value, ast.Name) and func.value.id == 'patch')
+                or (isinstance(func.value, ast.Attribute) and func.value.attr == 'patch')
+            )
+        )
+
+        leaf: str | None = None
+
+        # String-path form: the dotted path IS the first positional argument.
+        if is_setattr or is_dotted_patch or is_bare_patch:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                for module in LANE_PATCH_MODULES:
+                    prefix = module + '.'
+                    if first.value.startswith(prefix):
+                        leaf = first.value[len(prefix):]
+                        break
+
+        # Object-path form: first arg is a lane module reference, second is the
+        # leaf name string.
+        if leaf is None and (is_setattr or is_patch_object) and len(node.args) >= 2:
+            target, name_arg = node.args[0], node.args[1]
+            if (
+                _is_lane_ref(target)
+                and isinstance(name_arg, ast.Constant)
+                and isinstance(name_arg.value, str)
+            ):
+                leaf = name_arg.value
+
+        if leaf:
+            targets.add(leaf)
+    return targets
