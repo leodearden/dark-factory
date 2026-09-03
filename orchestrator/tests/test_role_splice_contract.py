@@ -29,7 +29,6 @@ recreate the very clone this task is closing.
 from __future__ import annotations
 
 import pytest
-
 from _role_splice_contract import assert_brace_free, assert_nonempty
 
 # Synthetic remedy prose. The helper must render the caller's remedy into every
