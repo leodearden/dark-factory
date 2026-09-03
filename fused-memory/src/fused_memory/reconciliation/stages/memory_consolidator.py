@@ -1343,7 +1343,7 @@ class MemoryConsolidator(BaseStage):
 {json.dumps(status, indent=2, default=str)}
 
 ### Previous Reconciliation
-{_format_watermark(watermark)}
+{_format_watermark(watermark, include_freshness_cutoffs=True)}
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
@@ -1588,12 +1588,18 @@ def _parse_instant(raw_ts: str | None) -> datetime | None:
     missing, empty, or unparseable ("undatable" — see
     ``_is_newer_than_watermark`` and ``MemoryConsolidator._filter_records_newer_than_watermark``,
     which count and log this case rather than silently dropping it).
+
+    Catches both ``ValueError`` (malformed ISO-8601 text) and ``TypeError``
+    (a non-str, non-None value such as a ``datetime``, an int epoch, or a
+    dict — ``datetime.fromisoformat`` raises ``TypeError`` rather than
+    ``ValueError`` for these) so one malformed record is classified as
+    undatable rather than raising out of the caller's filter loop.
     """
     if not raw_ts:
         return None
     try:
         ts = datetime.fromisoformat(raw_ts)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     return _to_utc(ts)
 
@@ -1786,26 +1792,43 @@ def _format_findings(findings: list[dict]) -> str:
     return '\n'.join(lines)
 
 
-def _format_watermark(watermark: Watermark) -> str:
+def _format_watermark(watermark: Watermark, *, include_freshness_cutoffs: bool = False) -> str:
+    """Render the "Previous Reconciliation" section.
+
+    *include_freshness_cutoffs* must be True ONLY from the caller that
+    actually ran the episode/mem0 "new since last reconciliation" filters
+    against these cutoffs — today that is exclusively the time-windowed
+    ``assemble_payload`` path. ``_format_assembled_payload`` (the
+    ContextAssembler/token-budget path) does no freshness filtering at all
+    and formats ``### Related Context`` instead of a filtered episode/mem0
+    count, so it leaves this False (the default): showing the cutoffs there
+    would claim a relationship to the displayed items that does not exist
+    (task 4574 review amendment).
+    """
     if watermark.last_full_run_completed is None:
         return 'First run — no previous reconciliation.'
     lines = [
         f'Last full run: {watermark.last_full_run_id} '
         f'at {watermark.last_full_run_completed.isoformat()}'
     ]
-    # Disclose the freshness cutoffs the episode/mem0 "new since last
-    # reconciliation" filters above actually compared against (task 4574).
-    # Previously invisible here — the payload showed a filtered COUNT
-    # ("New Episodes Since Last Reconciliation (N)") with no way to see
-    # what cursor N was computed against, which is why the 894fbe90
-    # incident survived three full cycles of re-investigation undiagnosed.
-    # Rendered via .isoformat() (never str(datetime), which uses a space
-    # separator — see _is_newer_than_watermark) and omitted entirely
-    # (rather than printed as the literal 'None') when unset, e.g. on a
-    # watermark that has a completed full run but has not yet recorded an
-    # episode or memory cutoff.
-    if watermark.last_episode_timestamp is not None:
-        lines.append(f'Episode freshness cutoff: {watermark.last_episode_timestamp.isoformat()}')
-    if watermark.last_memory_timestamp is not None:
-        lines.append(f'Mem0 memory freshness cutoff: {watermark.last_memory_timestamp.isoformat()}')
+    if include_freshness_cutoffs:
+        # Disclose the freshness cutoffs the episode/mem0 "new since last
+        # reconciliation" filters above actually compared against (task 4574).
+        # Previously invisible here — the payload showed a filtered COUNT
+        # ("New Episodes Since Last Reconciliation (N)") with no way to see
+        # what cursor N was computed against, which is why the 894fbe90
+        # incident survived three full cycles of re-investigation undiagnosed.
+        # Rendered via .isoformat() (never str(datetime), which uses a space
+        # separator — see _is_newer_than_watermark) and omitted entirely
+        # (rather than printed as the literal 'None') when unset, e.g. on a
+        # watermark that has a completed full run but has not yet recorded an
+        # episode or memory cutoff.
+        if watermark.last_episode_timestamp is not None:
+            lines.append(
+                f'Episode freshness cutoff: {watermark.last_episode_timestamp.isoformat()}'
+            )
+        if watermark.last_memory_timestamp is not None:
+            lines.append(
+                f'Mem0 memory freshness cutoff: {watermark.last_memory_timestamp.isoformat()}'
+            )
     return '\n'.join(lines)

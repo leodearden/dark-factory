@@ -19,7 +19,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.reconciliation import (
+    AssembledPayload,
+    StageId,
+    StageReport,
+    Watermark,
+)
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import (
@@ -310,6 +315,24 @@ class TestIsNewerThanWatermarkFalse:
             f'Expected {raw_ts!r} to NOT be newer than watermark {_WM.isoformat()!r}'
         )
 
+    @pytest.mark.parametrize(
+        'raw_ts',
+        [
+            pytest.param(12345, id='non-str-int-type-error'),
+            pytest.param(datetime(2026, 8, 21, 0, 0, 0, tzinfo=UTC), id='non-str-datetime-type-error'),
+        ],
+    )
+    def test_non_str_value_returns_false_not_raise(self, raw_ts):
+        """datetime.fromisoformat raises TypeError (not ValueError) for a
+        non-str, non-None argument — e.g. a mem0 record whose created_at
+        arrives as a datetime object or an int epoch rather than text. Must
+        be classified as undatable (False) like any other unparseable
+        value, never escape as an uncaught TypeError."""
+        assert _is_newer_than_watermark(raw_ts, _WM) is False, (
+            f'Expected non-str value {raw_ts!r} to be treated as undatable '
+            f'(False), not raise'
+        )
+
 
 class TestIsNewerThanWatermarkNaiveWatermarkSymmetry:
     """A naive watermark must behave identically to its UTC-aware twin."""
@@ -467,6 +490,104 @@ class TestUndatableFreshnessRecords:
             f'got {stage._undatable_freshness_records}'
         )
 
+    @pytest.mark.asyncio
+    async def test_non_str_created_at_excluded_and_counted_not_raised(self):
+        """A record whose created_at arrives as a non-str value (e.g. an int
+        epoch from a malformed record) must be classified as undatable
+        rather than raising out of assemble_payload —
+        datetime.fromisoformat raises TypeError (not ValueError) for a
+        non-str, non-None argument, and _parse_instant must catch it too."""
+        stage = _make_consolidator()
+        stage.memory.get_episodes = AsyncMock(
+            return_value=[{'uuid': 'ep-non-str-ts', 'created_at': 12345, 'content': 'x'}]
+        )
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value={
+                'results': [
+                    {'id': 'mem-non-str-ts', 'created_at': 12345, 'memory': 'x', 'metadata': {}},
+                ]
+            }
+        )
+        watermark = Watermark(
+            project_id='test_project',
+            last_episode_timestamp=WATERMARK_TS,
+            last_memory_timestamp=WATERMARK_TS,
+        )
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert '### New Episodes Since Last Reconciliation (0)' in result, (
+            f'Expected header (0); got result:\n{result!r}'
+        )
+        assert '### New Mem0 Memories Since Last Reconciliation (0)' in result, (
+            f'Expected header (0); got result:\n{result!r}'
+        )
+        assert stage._undatable_freshness_records == 2, (
+            f'Expected 2 undatable records (1 episode + 1 memory) from the '
+            f'non-str created_at values, got {stage._undatable_freshness_records}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_end_to_end_surfaces_real_undatable_count(self):
+        """Drives MemoryConsolidator.run() with assemble_payload NOT
+        pre-set and NOT itself patched — only BaseStage.run's CLI-invoking
+        tail is replaced (mirroring this file's existing
+        patch.object(BaseStage, 'run', ...) convention), but the substitute
+        actually calls the real stage.assemble_payload() first, exactly as
+        BaseStage.run does before invoking the CLI. This guards the
+        ORDERING, not just the assignment: a future edit that moved
+        report.stats['stage1_undatable_freshness_records'] = ... ahead of
+        the super().run() call would leave the counter at its __init__
+        value of 0 here, where a pre-set-instance-attr test (as in
+        test_run_copies_undatable_freshness_records_into_stats above)
+        cannot detect the regression."""
+        stage = _make_consolidator()
+        stage.memory.get_episodes = AsyncMock(
+            return_value=[
+                {'uuid': 'ep-garbage', 'created_at': 'not-a-timestamp', 'content': 'x'},
+                {'uuid': 'ep-none', 'created_at': None, 'content': 'x'},
+            ]
+        )
+        stage.memory.mem0.get_all = AsyncMock(
+            return_value={
+                'results': [
+                    {'id': 'mem-garbage', 'created_at': 'not-a-timestamp', 'memory': 'x', 'metadata': {}},
+                ]
+            }
+        )
+        watermark = Watermark(
+            project_id='test_project',
+            last_episode_timestamp=WATERMARK_TS,
+            last_memory_timestamp=WATERMARK_TS,
+        )
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+        async def _fake_base_run(events, watermark, prior_reports, run_id, model=None, resume_session_id=None):
+            # Mirrors BaseStage.run's real ordering — call assemble_payload
+            # before returning a report — without spinning up the actual
+            # CLI subprocess.
+            await stage.assemble_payload(events, watermark, prior_reports)
+            return base_report
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(side_effect=_fake_base_run)):
+            report = await stage.run(
+                events=[],
+                watermark=watermark,
+                prior_reports=[],
+                run_id='run-undatable-e2e',
+            )
+
+        assert report.stats['stage1_undatable_freshness_records'] == 3, (
+            f'Expected 3 undatable records (2 episodes + 1 memory) surfaced through '
+            f'the REAL assemble_payload call, got stats={report.stats!r}'
+        )
+
 
 class TestWatermarkCutoffDisclosure:
     """The '### Previous Reconciliation' section must disclose the episode
@@ -564,4 +685,61 @@ class TestWatermarkCutoffDisclosure:
         assert memory_ts.isoformat() in section, (
             f'Expected memory cutoff {memory_ts.isoformat()!r} still disclosed; '
             f'got:\n{section!r}'
+        )
+
+
+class TestAssembledPathOmitsFreshnessCutoffs:
+    """The assembled/token-budget path (self.assembled_payload set, formatted
+    by _format_assembled_payload) does NO freshness filtering at all — it
+    formats ContextAssembler's ``### Related Context`` items directly, never
+    the episode/mem0 "new since last reconciliation" lists. It must
+    therefore NOT emit the episode/memory freshness cutoff lines
+    _format_watermark adds for the time-windowed assemble_payload path:
+    showing them here would claim a relationship to the displayed items that
+    does not exist (task 4574 review amendment)."""
+
+    @pytest.mark.asyncio
+    async def test_assembled_path_omits_freshness_cutoff_lines(self):
+        stage = _make_consolidator()
+        episode_ts = datetime(2026, 8, 20, 12, 0, 0, tzinfo=UTC)
+        memory_ts = datetime(2026, 8, 21, 6, 30, 0, tzinfo=UTC)
+        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        watermark = Watermark(
+            project_id='test_project',
+            last_full_run_id='run-abc',
+            last_full_run_completed=datetime(2026, 8, 22, 0, 0, 0, tzinfo=UTC),
+            last_episode_timestamp=episode_ts,
+            last_memory_timestamp=memory_ts,
+        )
+
+        result = await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert 'Episode freshness cutoff' not in result, (
+            f'Assembled path does no freshness filtering and must not show the '
+            f'episode cutoff; got:\n{result!r}'
+        )
+        assert 'Mem0 memory freshness cutoff' not in result, (
+            f'Assembled path does no freshness filtering and must not show the '
+            f'memory cutoff; got:\n{result!r}'
+        )
+        # The non-freshness watermark line is unaffected by the scoping change.
+        assert 'Last full run: run-abc' in result, (
+            f'Expected the last-full-run line to still render; got:\n{result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_assembled_path_resets_undatable_counter(self):
+        """A reused stage instance must not leak a stale undatable count
+        from a prior time-windowed assemble_payload call into the assembled
+        path — mirrors the existing _fetch_degraded_sources reset hazard."""
+        stage = _make_consolidator()
+        stage._undatable_freshness_records = 7  # simulate a stale leak from a prior call
+        stage.assembled_payload = AssembledPayload(events=[], context_items={})
+        watermark = Watermark(project_id='test_project')
+
+        await stage.assemble_payload(events=[], watermark=watermark, prior_reports=[])
+
+        assert stage._undatable_freshness_records == 0, (
+            f'Expected the assembled path to reset the undatable counter to 0, '
+            f'got {stage._undatable_freshness_records}'
         )
