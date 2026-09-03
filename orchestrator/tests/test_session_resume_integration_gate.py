@@ -48,7 +48,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from shared.cli_invoke import transcript_exists
-from shared.config_dir import TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
@@ -157,17 +157,28 @@ def _attach_pool(harness: Harness, size: int = 2) -> WarmLanePool:
     return pool
 
 
-def _make_transcript(base: Path, session_id: str) -> Path:
-    """Create ``<base>/claude-config-<sid>/projects/<slug>/<sid>.jsonl`` and
-    return the ``claude-config-<sid>`` dir.
+def _make_transcript(base: Path, session_id: str, *, task_id: str) -> Path:
+    """Create ``<base>/<CONFIG_DIR_PREFIX><task_id>/projects/<slug>/<sid>.jsonl``
+    and return the config dir.
 
-    Mirrors test_crash_recovery.py. Recovery globs
-    ``<entry>/.task/claude-config-*`` at boot and ``transcript_exists`` re-globs
-    ``<cfg>/projects/*/<sid>.jsonl`` at dispatch — placing the transcript under
-    the lane's ``.task/`` satisfies BOTH the boot glob and the dispatch re-glob,
-    so a composed recover→dispatch reaches ``(True, 'eligible')``.
+    The dir stem and the transcript filename are DIFFERENT IDENTITIES and must
+    not be conflated: the dir is named after the TASK, the ``.jsonl`` inside it
+    after the SESSION. That is what production creates —
+    ``shared/src/shared/config_dir.py::TaskConfigDir.__init__`` builds
+    ``base / f'{CONFIG_DIR_PREFIX}{task_id}'``, reached from
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
+    ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``.
+
+    Recovery resolves that dir by DERIVING it from the adopted task id, and
+    ``transcript_exists`` re-globs ``<cfg>/projects/*/<sid>.jsonl`` at dispatch
+    — so placing the transcript under the lane's ``.task/`` with the
+    production dir name satisfies BOTH the boot resolution and the dispatch
+    re-glob, and a composed recover→dispatch reaches ``(True, 'eligible')``.
+
+    ``CONFIG_DIR_PREFIX`` is imported rather than restated so the creator and
+    this fixture provably share one string (INV-5).
     """
-    cfg = base / f'claude-config-{session_id}'
+    cfg = base / f'{CONFIG_DIR_PREFIX}{task_id}'
     proj = cfg / 'projects' / 'some-slug'
     proj.mkdir(parents=True, exist_ok=True)
     (proj / f'{session_id}.jsonl').write_text('{"type": "summary"}\n')
@@ -254,7 +265,7 @@ def _setup_warm_lane_session(
             sidecar_version=sidecar_version, resume_count=resume_count,
         )))
     if with_transcript:
-        _make_transcript(task_dir, session_id)
+        _make_transcript(task_dir, session_id, task_id=task_id)
     return wt
 
 
@@ -382,7 +393,7 @@ async def _make_real_git_lane(
         session_id, role, task_id=task_id, fresh=True,
         sidecar_version=2, resume_count=0,
     )))
-    _make_transcript(task_dir, session_id)
+    _make_transcript(task_dir, session_id, task_id=task_id)
     # Durable ASSIGNED record → record-driven adopt path (branchless).
     _seed_lane_record(
         harness.git_ops._lane_lifecycle, lane, task_id=task_id, branch=None,

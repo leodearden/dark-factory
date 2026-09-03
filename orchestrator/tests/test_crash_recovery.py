@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.config_dir import CONFIG_DIR_PREFIX
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import SessionResumeConfig, TranscriptArchiveConfig
@@ -134,14 +135,27 @@ def _setup_worktree(base: Path, task_id: str, plan: dict | None = None):
 # ── Session-resume γ guard helpers (task 2774) ───────────────────────────────
 def _make_transcript(base: Path, session_id: str) -> Path:
     """Create a real ``<cfg>/projects/<slug>/<session_id>.jsonl`` transcript and
-    return the ``<cfg>`` claude-config dir path.
+    return the ``<cfg>`` config dir path.
 
     Mirrors the on-disk layout that ``transcript_exists(config_dir,
     session_id)`` globs (``<config_dir>/projects/*/<session_id>.jsonl``), so a
     stashed ``_recovered_session_config_dirs`` entry pointing at the returned
     dir corroborates the session as eligible.
+
+    The dir STEM here is the session id, and that is arbitrary on THIS path —
+    it is NOT the production naming contract. Production names the dir after
+    the TASK (``shared/src/shared/config_dir.py::TaskConfigDir.__init__`` builds
+    ``base / f'{CONFIG_DIR_PREFIX}{task_id}'``), and
+    ``Harness._adopt_recovered_session`` DERIVES that name from the adopted task
+    id. Every call site below passes a bare ``tmp_path`` rather than a
+    worktree's ``.task/``, and every consumer stashes
+    ``_recovered_session_config_dirs`` MANUALLY (``_drive_session_slot``, and
+    the storm driver), so the adoption resolver never reads this stem and the
+    stem cannot matter. A fixture that DOES exercise adoption must use the
+    task-id name — see ``test_session_resume_integration_gate.py``'s sibling
+    helper, whose two call sites both pass a ``.task/`` dir.
     """
-    cfg = base / f'claude-config-{session_id}'
+    cfg = base / f'{CONFIG_DIR_PREFIX}{session_id}'
     proj = cfg / 'projects' / 'some-slug'
     proj.mkdir(parents=True, exist_ok=True)
     (proj / f'{session_id}.jsonl').write_text('{"type": "summary"}\n')
