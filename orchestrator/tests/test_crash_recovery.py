@@ -1020,6 +1020,190 @@ class TestAdoptEmitsConfigDirAmbiguous:
         assert harness._recovered_session_config_dirs == {}
 
 
+class TestAdoptFilesConfigDirAmbiguousL1:
+    """The ambiguity also files ONE deduped L1, under its OWN sentinel, and
+    never touches the session-resume fallback-storm streak.
+
+    WHY AN L1 AND NOT A STREAK. A single ambiguous worktree is already a
+    definite lost resume with a definite, nameable cause — unlike a fallback
+    storm, whose whole point is that only a RUN distinguishes systematic
+    breakage from expected noise. So this dedups via ``has_open_l1`` (one open
+    at a time, like ``_file_pool_storage_absent_escalation``) rather than
+    counting against a threshold, and consequently adds no config knob: a
+    ``*_threshold`` here would be dead config an operator could reasonably
+    expect to have an effect.
+
+    WHY ITS OWN SENTINEL (INV-4, task 3528). A sentinel shared with another
+    queue lets a reap of THAT queue's resolved escalation close this one's
+    still-open gate — the cross-queue decision-id collision. Task 3619 already
+    solved exactly this for the archival-storm L1; this mirrors it.
+
+    D7 — WHY THE STREAK EXCLUSION NEEDS NO CARVE-OUT BRANCH. The ``capped``
+    exclusion needs an explicit ``elif`` only because it lives INSIDE the
+    ``_run_slot`` dispatch guard, in the same chain whose ``else`` increments
+    the streak. This ambiguity is detected somewhere else entirely —
+    ``_adopt_recovered_session``, at BOOT, inside ``_recover_crashed_tasks`` —
+    while ``_session_resume_fallback_streak`` and its comparison stamp are
+    touched ONLY in ``_run_slot`` at DISPATCH. The exclusion therefore holds by
+    construction, and a carve-out branch would be unreachable code asserting a
+    condition that cannot arise. It is pinned by test (d) below and documented
+    in config.py instead of being left to call-graph reasoning.
+
+    The exclusion MATTERS because the storm L1's own remediation prose sends
+    operators to check clock skew, warm-lane reseeds and the ``$.reasons``
+    census — all actively misdirecting for this cause.
+    """
+
+    @staticmethod
+    def _queue() -> MagicMock:
+        """The escalation-queue stand-in, mirroring ``TestSessionResumeStorm._queue``."""
+        q = MagicMock()
+        q.has_open_l1 = MagicMock(return_value=False)
+        q.make_id = MagicMock(return_value='esc-ambig-1')
+        return q
+
+    @staticmethod
+    def _ambiguous_worktree(harness: Harness, task_id: str = '3464') -> Path:
+        """Stage the D5 shape: a sidecar plus exactly one NON-matching config dir."""
+        wt = _setup_worktree(harness.git_ops.worktree_base, task_id)
+        task_dir = wt / '.task'
+        _adopt_sidecar(task_dir, f'sess-{task_id}', task_id)
+        TaskConfigDir(f'{task_id}-unblock', base_dir=task_dir)
+        return wt
+
+    def test_sentinel_collides_with_no_other_sentinel(self):
+        """(a) The sentinel and role are DISTINCT from every other one on the class.
+
+        Introspected over ``vars(Harness)`` rather than compared against a
+        hand-listed pair, so a sentinel added later by an unrelated task cannot
+        silently collide with this one — the failure mode is a reap of one
+        queue's resolved escalation closing another's still-open gate, and it is
+        invisible until an operator notices a gate that will not stay shut.
+        """
+        sentinel = Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL
+        role = Harness._CONFIG_DIR_AMBIGUOUS_ROLE
+        assert sentinel != Harness._SESSION_RESUME_STORM_SENTINEL
+        assert sentinel != Harness._ARCHIVAL_STORM_SENTINEL
+
+        others = {
+            name: value for name, value in vars(Harness).items()
+            if name.endswith('_SENTINEL')
+            and name != '_CONFIG_DIR_AMBIGUOUS_SENTINEL'
+            and isinstance(value, str)
+        }
+        assert sentinel not in others.values(), (
+            f'{sentinel!r} collides with {[n for n, v in others.items() if v == sentinel]}'
+        )
+        roles = {
+            name: value for name, value in vars(Harness).items()
+            if name.endswith('_ROLE')
+            and name != '_CONFIG_DIR_AMBIGUOUS_ROLE'
+            and isinstance(value, str)
+        }
+        assert role not in roles.values(), (
+            f'{role!r} collides with {[n for n, v in roles.items() if v == role]}'
+        )
+
+    def test_files_one_l1_naming_expected_and_found(self, harness: Harness):
+        """(b) Exactly one L1, carrying the sentinel/role and a detail that NAMES
+        the expected path and the found candidate — the operator must not have to
+        guess which dir was expected.
+        """
+        harness._escalation_queue = self._queue()
+        wt = self._ambiguous_worktree(harness)
+        task_dir = wt / '.task'
+        expected = TaskConfigDir('3464', base_dir=task_dir).path
+        found = str(task_dir / f'{CONFIG_DIR_PREFIX}3464-unblock')
+        # The creator above made `expected` exist (that is how the path is
+        # derived — from the real creator, not a restated literal); remove it so
+        # the shape under test is genuinely "expected absent, candidate present".
+        shutil.rmtree(expected)
+
+        harness._adopt_recovered_session(wt, '3464')
+
+        assert harness._escalation_queue.submit.call_count == 1
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.task_id == Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL
+        assert esc.agent_role == Harness._CONFIG_DIR_AMBIGUOUS_ROLE
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == 'infra_issue'
+        assert str(expected) in esc.detail
+        assert found in esc.detail
+
+    def test_dedup_checks_this_sentinel_not_the_storm_one(self, harness: Harness):
+        """(c) With an L1 already open, nothing is filed — and the dedup probe
+        asked about THIS sentinel.
+
+        Asserting the ARGUMENT, not merely that dedup happened, is what catches
+        a copy-paste of the storm filing method: a wrong sentinel still dedups,
+        just against the wrong gate.
+        """
+        harness._escalation_queue = self._queue()
+        harness._escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        wt = self._ambiguous_worktree(harness)
+
+        harness._adopt_recovered_session(wt, '3464')
+
+        harness._escalation_queue.submit.assert_not_called()
+        probed = [
+            c.args[0] for c in harness._escalation_queue.has_open_l1.call_args_list
+        ]
+        assert probed == [Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL]
+        assert Harness._SESSION_RESUME_STORM_SENTINEL not in probed
+
+    def test_streak_and_stamp_are_untouched(self, harness: Harness):
+        """(d) D7 — the fallback-storm streak, its comparison stamp, and its
+        sentinel are all untouched by an ambiguous adoption.
+
+        A structural pin, not a carve-out: boot-time adoption cannot reach the
+        dispatch-time streak. Pinned anyway so the exclusion is CHECKABLE rather
+        than re-derived from the call graph by whoever next edits either site.
+        """
+        harness._escalation_queue = self._queue()
+        wt = self._ambiguous_worktree(harness)
+
+        harness._adopt_recovered_session(wt, '3464')
+
+        assert harness._session_resume_fallback_streak == 0
+        assert harness._last_session_resume_fallback_at is None
+        filed_under = [
+            c.args[0].task_id
+            for c in harness._escalation_queue.submit.call_args_list
+        ]
+        assert Harness._SESSION_RESUME_STORM_SENTINEL not in filed_under
+
+    def test_no_queue_and_a_raising_submit_never_break_recovery(
+        self, harness: Harness
+    ):
+        """(e) I3 — filing is best-effort in both directions.
+
+        With NO queue the ambiguous shape still adopts, still emits the event,
+        and still stashes nothing; with a queue whose ``submit`` RAISES, the
+        exception is swallowed and recovery completes unchanged. Filing must
+        never break the path it exists to report on.
+        """
+        harness._escalation_queue = None
+        wt = self._ambiguous_worktree(harness)
+
+        adopted = harness._adopt_recovered_session(wt, '3464')  # must not raise
+
+        assert adopted == '3464'
+        assert harness._recovered_session_config_dirs == {}
+        assert len(_ambiguity_emits(harness)) == 1
+
+        harness2_queue = self._queue()
+        harness2_queue.submit = MagicMock(side_effect=RuntimeError('queue down'))
+        harness._escalation_queue = harness2_queue
+        harness._recovered_sessions.clear()
+        wt2 = self._ambiguous_worktree(harness, task_id='3465')
+
+        adopted2 = harness._adopt_recovered_session(wt2, '3465')  # must not raise
+
+        assert adopted2 == '3465'
+        assert harness._recovered_session_config_dirs == {}
+
+
 def _setup_worktree_with_meta(base: Path, task_id: str, plan: dict, *, title: str):
     """Worktree with a plan AND a .task/metadata.json carrying ``title``."""
     wt = _setup_worktree(base, task_id, plan)
