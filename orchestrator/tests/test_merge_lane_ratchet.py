@@ -37,6 +37,7 @@ can never masquerade as a clean tree.
 """
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -1224,3 +1225,402 @@ class TestBaselineIO:
         with pytest.raises(metrics.MetricsError) as excinfo:
             metrics.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# The ratchet comparator, and INV-10 tier 1.
+#
+# Every assertion below drives check_against_baseline with SYNTHETIC dicts, so
+# each branch is pinned directly rather than only ever reached through a real
+# measurement that happens to walk over it. The comparator is a pure function of
+# two plain dicts -- no filesystem, no complexipy -- which is what makes the
+# seeded-fixture self-test run in microseconds AND lets the CLI's --check reuse
+# the identical code path this test asserts on (SPOT: one ratchet, not two).
+
+_MQ = 'orchestrator/src/orchestrator/merge_queue.py'
+_GIT_OPS = 'orchestrator/src/orchestrator/git_ops.py'
+_VERIFIER_LOOP = f'{_MQ}::SpeculativeMergeWorker::_verifier_loop'
+_TEST_FILE = 'orchestrator/tests/test_merge_queue.py'
+
+
+def _ratchet_baseline() -> dict:
+    """A miniature but REAL-SHAPED baseline: real paths, real measured numbers."""
+    return {
+        'schema_version': 1,
+        'params': {
+            'complexipy_version': '6.2.0',
+            'cluster_paths': list(metrics.CLUSTER_PATHS),
+            'file_line_ceiling': metrics.FILE_LINE_CEILING,
+            'new_function_cognitive_ceiling': (
+                metrics.NEW_FUNCTION_COGNITIVE_CEILING
+            ),
+        },
+        'enumeration': {
+            'requested': [_MQ, _GIT_OPS],
+            'resolved': [_MQ, _GIT_OPS],
+            'unreadable': [],
+            'complete': True,
+        },
+        'files': {
+            _MQ: {
+                'lines': 21550,
+                'prose_lines': 9000,
+                'cognitive': 2133,
+                'function_local_imports': 12,
+                'reexport_names': 9,
+            },
+            _GIT_OPS: {
+                'lines': 14721,
+                'prose_lines': 6000,
+                'cognitive': 1361,
+                'function_local_imports': 5,
+                'reexport_names': 2,
+            },
+        },
+        'functions': {_VERIFIER_LOOP: 245, f'{_GIT_OPS}::GitOps::advance_main': 108},
+        'tests': {
+            _TEST_FILE: {
+                'patch_targets': ['run_scoped_verification', 'time'],
+                'private_reads': 300,
+            },
+        },
+    }
+
+
+def _blank_file_entry(**overrides: int) -> dict:
+    entry = {
+        'lines': 0,
+        'prose_lines': 0,
+        'cognitive': 0,
+        'function_local_imports': 0,
+        'reexport_names': 0,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _bump_file(measure: str):
+    def mutate(current: dict) -> None:
+        current['files'][_MQ][measure] += 1
+
+    return mutate
+
+
+def _add_file(measure: str):
+    def mutate(current: dict) -> None:
+        # A brand-new path carrying +1 of exactly ONE measure. It is absent from
+        # the baseline, so no per-path comparison fires -- only the derived
+        # cluster total can catch it, which is precisely the rename-gaming shape.
+        current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
+            _blank_file_entry(**{measure: 1})
+        )
+
+    return mutate
+
+
+#: (test id, mutation, expected violation measure, expected violation key).
+#: THE SEEDED-FIXTURE SELF-TEST (INV-10 tier 1): every ratcheted measure and
+#: every derived total gets its own +1, and the ratchet must EXECUTE to a named
+#: violation for it. A measure missing from this table is a measure nothing
+#: proves is actually compared.
+_SEEDS = [
+    ('files.lines', _bump_file('lines'), 'lines', _MQ),
+    ('files.prose_lines', _bump_file('prose_lines'), 'prose_lines', _MQ),
+    ('files.cognitive', _bump_file('cognitive'), 'cognitive', _MQ),
+    (
+        'files.function_local_imports',
+        _bump_file('function_local_imports'),
+        'function_local_imports',
+        _MQ,
+    ),
+    ('files.reexport_names', _bump_file('reexport_names'), 'reexport_names', _MQ),
+    (
+        'functions',
+        lambda cur: cur['functions'].__setitem__(
+            _VERIFIER_LOOP, cur['functions'][_VERIFIER_LOOP] + 1
+        ),
+        'cognitive',
+        _VERIFIER_LOOP,
+    ),
+    (
+        'tests.private_reads',
+        lambda cur: cur['tests'][_TEST_FILE].__setitem__(
+            'private_reads', cur['tests'][_TEST_FILE]['private_reads'] + 1
+        ),
+        'private_reads',
+        _TEST_FILE,
+    ),
+    (
+        'tests.patch_targets',
+        lambda cur: cur['tests'][_TEST_FILE]['patch_targets'].append('_new_leaf'),
+        'patch_targets',
+        _TEST_FILE,
+    ),
+    ('total.lines', _add_file('lines'), 'total:lines', metrics.CLUSTER_TOTAL_KEY),
+    (
+        'total.prose_lines',
+        _add_file('prose_lines'),
+        'total:prose_lines',
+        metrics.CLUSTER_TOTAL_KEY,
+    ),
+    (
+        'total.cognitive',
+        _add_file('cognitive'),
+        'total:cognitive',
+        metrics.CLUSTER_TOTAL_KEY,
+    ),
+    (
+        'total.function_local_imports',
+        _add_file('function_local_imports'),
+        'total:function_local_imports',
+        metrics.CLUSTER_TOTAL_KEY,
+    ),
+    (
+        'total.reexport_names',
+        _add_file('reexport_names'),
+        'total:reexport_names',
+        metrics.CLUSTER_TOTAL_KEY,
+    ),
+    (
+        'total.private_reads',
+        lambda cur: cur['tests'].__setitem__(
+            'orchestrator/tests/test_brand_new.py',
+            {'patch_targets': [], 'private_reads': 1},
+        ),
+        'total:private_reads',
+        metrics.CLUSTER_TOTAL_KEY,
+    ),
+    (
+        'total.patch_targets',
+        lambda cur: cur['tests'].__setitem__(
+            'orchestrator/tests/test_brand_new.py',
+            {'patch_targets': ['_brand_new_leaf'], 'private_reads': 0},
+        ),
+        'total:patch_targets',
+        metrics.CLUSTER_TOTAL_KEY,
+    ),
+]
+
+
+class TestCheckAgainstBaseline:
+    @pytest.mark.parametrize(
+        ('mutate', 'measure', 'key'),
+        [pytest.param(m, meas, k, id=name) for name, m, meas, k in _SEEDS],
+    )
+    def test_a_plus_one_on_every_ratcheted_measure_is_caught(
+        self, mutate, measure: str, key: str
+    ) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        mutate(current)
+
+        violations = metrics.check_against_baseline(current, baseline)
+
+        matching = [v for v in violations if v.measure == measure and v.key == key]
+        assert len(matching) == 1, f'{measure} at {key} not reported once: {violations}'
+        assert measure in matching[0].message
+        assert key in matching[0].message
+        # The ONLY collateral a per-path rise may produce is the cluster total
+        # that mechanically follows from it. Anything else means the comparator
+        # is firing on a measure nobody touched.
+        others = [v for v in violations if v is not matching[0]]
+        assert all(v.measure == f'total:{measure}' for v in others), others
+
+    def test_an_identical_current_is_clean(self) -> None:
+        baseline = _ratchet_baseline()
+        assert metrics.check_against_baseline(copy.deepcopy(baseline), baseline) == []
+
+    def test_equality_is_permitted_this_is_a_ratchet_not_a_gate(self) -> None:
+        # 62 lane functions already exceed cognitive 15 on the introducing
+        # commit. A day-one gate would be red on arrival and get disabled.
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        assert current['functions'][_VERIFIER_LOOP] == 245
+        assert metrics.check_against_baseline(current, baseline) == []
+
+    def test_lowering_a_measure_is_clean(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['files'][_MQ]['lines'] -= 4000
+        current['files'][_MQ]['cognitive'] -= 400
+        current['functions'][_VERIFIER_LOOP] = 12
+        current['tests'][_TEST_FILE]['private_reads'] = 0
+        assert metrics.check_against_baseline(current, baseline) == []
+
+
+class TestCeilingsApplyOnlyToNewKeys:
+    def test_a_new_file_over_the_line_ceiling_is_a_violation(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        new_path = 'orchestrator/src/orchestrator/merge_new.py'
+        current['files'][new_path] = _blank_file_entry(lines=1501)
+        ceilings = [
+            v
+            for v in metrics.check_against_baseline(current, baseline)
+            if v.measure == 'new_file_over_ceiling'
+        ]
+        assert len(ceilings) == 1
+        assert new_path in ceilings[0].message
+
+    def test_a_new_file_exactly_at_the_line_ceiling_is_allowed(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
+            _blank_file_entry(lines=1500)
+        )
+        assert not [
+            v
+            for v in metrics.check_against_baseline(current, baseline)
+            if v.measure == 'new_file_over_ceiling'
+        ]
+
+    def test_grandfathered_merge_queue_is_not_a_ceiling_violation(self) -> None:
+        # 21,550 lines, fourteen times the ceiling, and clean -- because the
+        # ceiling applies only to paths ABSENT from the baseline. That is what
+        # makes this a ratchet whose grandfathering can only ever shrink.
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        assert current['files'][_MQ]['lines'] == 21550
+        assert metrics.check_against_baseline(current, baseline) == []
+
+    def test_size_ceiling_exemption_covers_git_ops_even_when_new(self) -> None:
+        # PRD decision 9. Exercised with git_ops.py ABSENT from the baseline,
+        # because that is the only configuration in which the ceiling would
+        # otherwise fire -- an exemption never reached is an exemption never
+        # tested.
+        baseline = _ratchet_baseline()
+        del baseline['files'][_GIT_OPS]
+        current = copy.deepcopy(baseline)
+        current['files'][_GIT_OPS] = _blank_file_entry(lines=14721)
+        assert not [
+            v
+            for v in metrics.check_against_baseline(current, baseline)
+            if v.measure == 'new_file_over_ceiling'
+        ]
+
+    def test_a_non_exempt_path_at_the_same_size_is_a_violation(self) -> None:
+        # The contrast that proves the previous test measured the EXEMPTION and
+        # not merely a comparator that never fires.
+        baseline = _ratchet_baseline()
+        del baseline['files'][_GIT_OPS]
+        current = copy.deepcopy(baseline)
+        current['files']['orchestrator/src/orchestrator/merge_new.py'] = (
+            _blank_file_entry(lines=14721)
+        )
+        assert [
+            v
+            for v in metrics.check_against_baseline(current, baseline)
+            if v.measure == 'new_file_over_ceiling'
+        ]
+
+    def test_the_exemption_is_scoped_to_the_ceiling_not_to_the_ratchet(self) -> None:
+        # git_ops.py's 14,721 lines are exempt from the CEILING and still frozen
+        # by the RATCHET, so they cannot grow unwatched.
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['files'][_GIT_OPS]['lines'] += 1
+        assert [
+            v
+            for v in metrics.check_against_baseline(current, baseline)
+            if v.measure == 'lines' and v.key == _GIT_OPS
+        ]
+
+    def test_a_new_function_over_the_cognitive_ceiling_is_a_violation(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['functions'][f'{_MQ}::brand_new'] = 16
+        ceilings = [
+            v
+            for v in metrics.check_against_baseline(current, baseline)
+            if v.measure == 'new_function_over_ceiling'
+        ]
+        assert len(ceilings) == 1
+        assert 'brand_new' in ceilings[0].message
+
+    def test_a_new_function_exactly_at_the_cognitive_ceiling_is_allowed(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['functions'][f'{_MQ}::brand_new'] = 15
+        assert metrics.check_against_baseline(current, baseline) == []
+
+    def test_a_grandfathered_function_at_245_is_clean(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['functions'][_VERIFIER_LOOP] = 245
+        assert metrics.check_against_baseline(current, baseline) == []
+
+
+class TestComparatorPreconditions:
+    def test_a_complexipy_version_drift_is_a_hard_failure(self) -> None:
+        # Cognitive numbers are version-dependent: the SAME merge_queue.py
+        # measures 2031 at complexipy 3.0.0, 2092 at 5.0.0 and 2133 at 6.x/7.x.
+        # A silent version drift would rewrite every number at once and leave a
+        # green ratchet comparing two incomparable measurements.
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['params']['complexipy_version'] = '7.0.1'
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.check_against_baseline(current, baseline)
+        assert '7.0.1' in str(excinfo.value)
+        assert '6.2.0' in str(excinfo.value)
+
+    def test_a_cluster_path_edit_forces_a_deliberate_regeneration(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        baseline['params']['cluster_paths'] = [
+            p for p in metrics.CLUSTER_PATHS if p != _GIT_OPS
+        ] + ['orchestrator/src/orchestrator/ghost.py']
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.check_against_baseline(current, baseline)
+        message = str(excinfo.value)
+        assert _GIT_OPS in message
+        assert 'ghost.py' in message
+
+    def test_an_incomplete_enumeration_is_never_silently_compared(self) -> None:
+        # INV-11. A sweep that skipped files measures LOWER than the truth, so
+        # comparing it would read as a clean tree -- or worse, as an
+        # improvement worth writing into the baseline.
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['enumeration']['complete'] = False
+        current['enumeration']['unreadable'] = ['orchestrator/tests/test_broken.py']
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.check_against_baseline(current, baseline)
+        assert 'test_broken.py' in str(excinfo.value)
+
+    def test_preconditions_are_checked_before_any_comparison(self) -> None:
+        # Order matters: a wrong-version or partial measurement must fail with
+        # its own named cause, not with a wall of downstream violations that
+        # sends the reader hunting a regression that does not exist.
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['enumeration']['complete'] = False
+        current['files'][_MQ]['lines'] += 5000
+        with pytest.raises(metrics.MetricsError):
+            metrics.check_against_baseline(current, baseline)
+
+
+class TestViolationShape:
+    def test_a_violation_carries_both_numbers_and_a_stable_order(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['files'][_MQ]['lines'] += 1
+        current['files'][_GIT_OPS]['cognitive'] += 1
+        violations = metrics.check_against_baseline(current, baseline)
+        per_path = [v for v in violations if v.key in (_MQ, _GIT_OPS)]
+        assert len(per_path) == 2
+        for violation in per_path:
+            assert violation.current == violation.baseline + 1
+        # Sorted, so a failure message is diffable run to run.
+        assert violations == sorted(
+            violations, key=lambda v: (v.measure, v.key)
+        )
+
+    def test_the_comparator_mutates_neither_input(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        current['files'][_MQ]['lines'] += 1
+        before = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
+        metrics.check_against_baseline(current, baseline)
+        after = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
+        assert after == before
