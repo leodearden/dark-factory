@@ -3482,6 +3482,16 @@ class Harness:
                                 'task_id': key,
                             },
                         )
+                    # AFTER the emit, deliberately: the structured event lands
+                    # in runs.db even when filing is suppressed by dedup or
+                    # fails outright, so the census stays complete while the
+                    # escalation stays at one-open-at-a-time.
+                    self._file_config_dir_ambiguous_escalation(
+                        key=key,
+                        session_id=session_data.get('session_id'),
+                        expected=expected,
+                        found=found,
+                    )
         except OSError as e:
             logger.debug(
                 'Recovery: %s config-dir resolution failed (%s) — guard will '
@@ -7142,6 +7152,18 @@ class Harness:
     _ARCHIVAL_STORM_SENTINEL: str = '__transcript_archival_storm__'
     _ARCHIVAL_STORM_ROLE: str = 'orchestrator-transcript-archival-storm'
 
+    # Synthetic task_id + agent_role for the recovered-config-dir ambiguity L1
+    # (task 3620, INV-4).  DEDICATED, not shared with any sentinel above: a
+    # shared sentinel lets a reap of one queue's resolved escalation close the
+    # OTHER queue's still-open gate (the cross-queue decision-id collision,
+    # task 3528).  Deduped via has_open_l1 — one open ambiguity L1 at a time,
+    # NOT counted against a threshold like the two storm escalations: a single
+    # ambiguous worktree is already a definite lost resume with a definite
+    # cause, whereas a storm needs a RUN to tell breakage from expected noise.
+    # There is consequently nothing to tune and no config knob to add.
+    _CONFIG_DIR_AMBIGUOUS_SENTINEL: str = '__session_config_dir_ambiguous__'
+    _CONFIG_DIR_AMBIGUOUS_ROLE: str = 'orchestrator-session-config-dir-ambiguous'
+
     @staticmethod
     def _errno_label(err: object) -> str:
         """Render a payload errno as ``ENOSPC(28)`` — symbol AND number.
@@ -7292,6 +7314,109 @@ class Harness:
         except Exception:
             logger.warning(
                 'Failed to file transcript-archival-storm escalation', exc_info=True,
+            )
+
+    def _file_config_dir_ambiguous_escalation(
+        self, *, key: str, session_id: object, expected: Path, found: list[str],
+    ) -> None:
+        """File an L1 when a recovered session's config dir cannot be resolved
+        (task 3620, INV-4).
+
+        Called from :meth:`_adopt_recovered_session` when the surviving worktree
+        holds ``claude-config-*`` candidates but NOT the derived
+        ``claude-config-<task_id>``.  Modelled on
+        ``_file_archival_storm_escalation`` / ``_file_pool_storage_absent_escalation``:
+        ``has_open_l1`` dedup so repeated boots do not stack duplicate L1s, a
+        bare-Harness guard so unit-test shapes stay green, and a blanket
+        ``except`` so filing can never break the recovery path it reports on.
+
+        Deduped rather than counted against a threshold: one ambiguous worktree
+        is already a definite lost resume with a definite cause, so there is no
+        RUN to wait for and nothing to tune.
+
+        What is at stake: nothing is stashed, so the dispatch-time transcript
+        re-glob has nothing to corroborate and this session is a GUARANTEED
+        ``session_resume_fallback`` with ``no_transcript``.  Recovery degrades
+        SAFELY — this is a lost-resume/throughput signal, not a correctness
+        incident.
+        """
+        if not self._escalation_queue:        # bare-Harness unit tests stay green
+            return
+        try:
+            if self._escalation_queue.has_open_l1(self._CONFIG_DIR_AMBIGUOUS_SENTINEL):
+                return                         # dedup: one open L1 at a time
+            from escalation.models import Escalation  # noqa: PLC0415
+            shown = found[:20]
+            more = len(found) - len(shown)
+            candidates = '\n'.join(f'  - {p}' for p in shown)
+            if more > 0:
+                # Never let a truncated list read as the whole list.
+                candidates += f'\n  ... and {more} more dir(s) not listed'
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._CONFIG_DIR_AMBIGUOUS_SENTINEL),
+                task_id=self._CONFIG_DIR_AMBIGUOUS_SENTINEL,
+                agent_role=self._CONFIG_DIR_AMBIGUOUS_ROLE,
+                severity='blocking',
+                category='infra_issue',
+                summary=(
+                    f'Recovered session for task {key} cannot be corroborated: '
+                    f'{expected.parent} holds {len(found)} config dir(s) but '
+                    f'not {expected.name} — the resume is lost'
+                )[:200],
+                detail=(
+                    f'Crash recovery adopted an agent session for task {key} '
+                    f'(session_id={session_id}) from the surviving worktree '
+                    f'{expected.parent.parent}, but could not resolve its '
+                    f'config dir.\n\n'
+                    f'Expected (derived from the task id, which is how '
+                    f'shared/src/shared/config_dir.py::TaskConfigDir names '
+                    f'every config dir it creates):\n  {expected}\n\n'
+                    f'Found instead:\n{candidates}\n\n'
+                    'Consequence: nothing was stashed, so the dispatch-time '
+                    'transcript re-glob has nothing to corroborate the session '
+                    'against. This task is a GUARANTEED session_resume_fallback '
+                    'with no_transcript — the resume is ALREADY LOST, safely, '
+                    'and the agent context it would have preserved is gone. '
+                    'The task itself re-dispatches fresh and completes '
+                    'normally; no manual repair of it is needed.\n\n'
+                    'Likely causes, in this cause\'s terms:\n'
+                    '  - a FOREIGN task\'s config dir left behind in a shared '
+                    'or warm lane (a lane holding claude-config-<other_id> '
+                    'alongside, or instead of, this task\'s);\n'
+                    '  - a NON-SESSION dir being the only candidate — notably '
+                    'claude-config-<task_id>-unblock, created by '
+                    'orchestrator/src/orchestrator/dry_run_unblock.py, which '
+                    'is a legitimate non-owner of this session\'s transcript.\n\n'
+                    'Census of the population, from runs.db:\n'
+                    "  SELECT json_extract(data, '$.expected'), "
+                    "json_extract(data, '$.found'), COUNT(*)\n"
+                    "    FROM events WHERE event_type = "
+                    "'session_config_dir_ambiguous'\n"
+                    '   GROUP BY 1, 2;\n\n'
+                    'This is NOT the session-resume fallback storm and shares '
+                    'none of its remediation: clock skew, warm-lane reseeds '
+                    'and the $.reasons census are all irrelevant here. It also '
+                    'does not feed that storm streak — it is detected at BOOT '
+                    'during adoption, while the streak is only touched at '
+                    'DISPATCH.'
+                ),
+                suggested_action=(
+                    'Identify which process created the non-matching dir(s) '
+                    'listed above and whether they should have been cleaned '
+                    'up. Resolve this escalation once the worktree is reaped '
+                    'or the stray dir removed. Recovery already degraded '
+                    'safely, so this is a lost-resume/throughput signal rather '
+                    'than a correctness incident — no repair of the recovered '
+                    'task is required.'
+                ),
+                level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning('Filed L1 config-dir-ambiguous escalation %s', esc.id)
+        except Exception:
+            logger.warning(
+                'Failed to file config-dir-ambiguous escalation', exc_info=True,
             )
 
     def _file_pool_storage_absent_escalation(self) -> None:
