@@ -522,6 +522,64 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
 # prefix pairs the stamp unambiguously with its marker.
 
+# The born-at-L2 escalation categories this runner files — EVERY one of which
+# `escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES` must refuse to auto-close.
+#
+# DUPLICATED — not imported — in that denylist (task 3181).  escalation is the
+# lower fleet-wide package and must not import orchestrator, so each pair of
+# literals is pinned in lockstep by the cross-layer TEST imports in
+# `escalation/tests/test_authority.py`, mirroring the `_WATCHER_AUTO_IDENTITY`
+# convention documented in authority.py's module docstring.  If any of these
+# strings changes, update both sides together.
+#
+# All three are named here rather than just the curator one (reviewer
+# amendment): they are siblings with identical exposure, so pinning one and
+# leaving the others as bare literals would leave a reader of the denylist an
+# unexplained asymmetry — and would leave the same silent-rename hole open on
+# the unpinned members.  `curator_adjudication_missing` is the re-ask raised
+# when a `human_curator_gate` task resumes with no `human_curator_adjudicated_at`
+# stamp; `milestone_gate` is the gate itself; `milestone_check_failed` is a
+# failed predicate check.
+CURATOR_ADJUDICATION_MISSING_CATEGORY: str = 'curator_adjudication_missing'
+MILESTONE_GATE_CATEGORY: str = 'milestone_gate'
+MILESTONE_CHECK_FAILED_CATEGORY: str = 'milestone_check_failed'
+
+# Rendered in place of the configured project_root when the runner's duck-typed
+# `scheduler` collaborator cannot supply a usable one.  A VISIBLE placeholder,
+# not an omission: it keeps the runbook's update_task call syntactically valid
+# and still NAMES the required parameter.
+_PROJECT_ROOT_PLACEHOLDER: str = '<project_root>'
+
+
+def _snippet_project_root(scheduler) -> str:
+    """Return the configured project_root for the operator runbook snippet.
+
+    Falls back to a VISIBLE placeholder rather than raising or interpolating a
+    repr.  ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
+    builds the runner "with only the minimal dependencies needed" — and
+    ``_file_curator_adjudication_missing_and_block``'s contract is that a
+    durable on-disk safety escalation is filed no matter what.  The attribute
+    chain is read while formatting the detail string, i.e. BEFORE
+    ``escalation_queue.submit()``, so an ``AttributeError`` there does not just
+    skip the BLOCK — it loses the escalation entirely and propagates, exactly
+    what that method's docstring forbids.
+
+    Accepts the value ONLY when it is a non-empty ``str``/``Path`` that is not
+    the literal ``'None'``, so a test double's Mock attribute cannot reach an
+    operator as ``<MagicMock id=...>``.  The ``'None'`` rejection mirrors the
+    scheduler's own project_root guard, which defends against a value that
+    bypassed pydantic validation.
+
+    Deliberately no broad ``except Exception``: the two ``getattr`` defaults
+    plus the isinstance/non-empty check are the entire failure surface.
+    """
+    root = getattr(getattr(scheduler, 'config', None), 'project_root', None)
+    if isinstance(root, (str, Path)):
+        text = str(root).strip()
+        if text and text != 'None':
+            return text
+    return _PROJECT_ROOT_PLACEHOLDER
+
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.
 #
@@ -1591,6 +1649,13 @@ class DeterministicRunner:
 
         title = task.get('title') or task_id
         summary = f'Human curator gate {task_id} resumed without content adjudication'
+        # The configured per-project root — the SAME value the scheduler puts on
+        # its own real update_task MCP calls. Deliberately NOT os.getcwd(): every
+        # fleet orchestrator unit pins WorkingDirectory to the dark-factory
+        # checkout (so `uv run --project orchestrator` resolves) while selecting
+        # its actual target project via --config, so a cwd-derived value would
+        # silently aim most operators at the wrong project.
+        project_root = _snippet_project_root(self.scheduler)
         detail = (
             f"Task {task_id} ({title!r}) is a deterministic pure gate marked "
             f"`metadata.{HUMAN_CURATOR_GATE_KEY}`, meaning it closes only when a "
@@ -1608,7 +1673,8 @@ class DeterministicRunner:
             f"REMEDIATION — one of:\n"
             f"  (a) Perform the per-entry content review this gate asks for, then "
             f"stamp the proof and resolve this escalation:\n"
-            f"      update_task({task_id}, metadata={{'{HUMAN_CURATOR_ADJUDICATED_AT_KEY}': "
+            f"      update_task(id={task_id!r}, project_root={project_root!r}, "
+            f"metadata={{'{HUMAN_CURATOR_ADJUDICATED_AT_KEY}': "
             f"'<ISO-8601 timestamp>'}}, metadata_mode='merge')\n"
             f"      The stamp must be a non-empty string; a bare `true` is NOT "
             f"accepted (it asserts the conclusion without recording when the "
@@ -1627,7 +1693,7 @@ class DeterministicRunner:
             task_id=task_id,
             agent_role=DETERMINISTIC_AGENT_ROLE,
             severity='critical',
-            category='curator_adjudication_missing',
+            category=CURATOR_ADJUDICATION_MISSING_CATEGORY,
             summary=summary[:200],
             detail=detail,
             level=2,
@@ -2077,7 +2143,7 @@ class DeterministicRunner:
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category='milestone_gate',
+                category=MILESTONE_GATE_CATEGORY,
                 summary=summary,
                 detail=detail,
                 options=list(gate_options),
@@ -2171,7 +2237,7 @@ class DeterministicRunner:
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category='milestone_check_failed',
+                category=MILESTONE_CHECK_FAILED_CATEGORY,
                 summary=summary[:200],
                 detail=detail,
                 level=2,
