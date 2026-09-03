@@ -694,3 +694,113 @@ def patch_targets(source: str, *, path: str = '<source>') -> set[str]:
         if leaf:
             targets.add(leaf)
     return targets
+
+
+# ---------------------------------------------------------------------------
+# Private-attribute reads from tests.
+#
+# THIS MEASURE IS DELIBERATELY RECEIVER-AGNOSTIC. It counts every `_x` attribute
+# access in a lane-importing test file except on the bare `self`/`cls`, and it
+# does NOT maintain a list of blessed receiver variable names (`worker`, `mq`,
+# ...). Two reasons, and the first is the decisive one:
+#
+# (1) A receiver-name allowlist is a single SHARED list that all ten of PRD
+#     gamma1..gamma10 would have to edit concurrently -- the same rebase-conflict
+#     hazard the per-path baseline format exists to avoid.
+# (2) It silently UNDER-counts the moment a test uses a receiver name nobody
+#     listed, which is how a ratchet rots into a vacuous pass. Over-counting is
+#     the safe direction here: a ratchet only ever refuses to let a number RISE,
+#     so a superset costs a little extra friction and never lets a regression
+#     through.
+#
+# The `self`/`cls` exclusion is a STRUCTURAL predicate, not a name list: a test
+# class's own helpers are not lane internals, which is the distinction the
+# measure is actually about. Note it excludes only the BARE receiver, so
+# `self.worker._x` still counts.
+#
+# Measured magnitudes on this tree: 18,952 private attribute nodes across all
+# 559 test files, 9,355 restricted to the 167 lane-importing ones. (The PRD
+# Background table's 5,735 came from a narrower ad-hoc receiver set.)
+
+_SELF_RECEIVERS = frozenset({'self', 'cls'})
+
+
+def lane_module_names() -> frozenset[str]:
+    """Dotted module names of the cluster, DERIVED from ``CLUSTER_PATHS``.
+
+    Derived rather than hand-listed so the lane-importing predicate and
+    Appendix A can never drift apart.
+    """
+    names: set[str] = set()
+    for entry in CLUSTER_PATHS:
+        if '*' in entry or not entry.endswith('.py'):
+            continue
+        parts = entry[: -len('.py')].split('/')
+        if 'src' in parts:
+            names.add('.'.join(parts[parts.index('src') + 1:]))
+    return frozenset(names)
+
+
+def imports_lane_module(source: str, *, path: str) -> bool:
+    """True when *source* imports any cluster module, or anything under
+    ``orchestrator.merge_lane``."""
+    tree = _parse(source, path=path)
+    lane_names = lane_module_names()
+    lane_leaves = {name.rsplit('.', 1)[-1] for name in lane_names}
+
+    def _is_lane(dotted: str) -> bool:
+        return dotted in lane_names or dotted == 'orchestrator.merge_lane' or dotted.startswith(
+            'orchestrator.merge_lane.'
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(_is_lane(alias.name) for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            if _is_lane(node.module):
+                return True
+            # `from orchestrator import merge_gates` binds the module itself.
+            if node.module == 'orchestrator' and any(
+                alias.name in lane_leaves or alias.name == 'merge_lane'
+                for alias in node.names
+            ):
+                return True
+    return False
+
+
+def private_reads(source: str, *, path: str) -> int:
+    """Count accesses of a single-underscore attribute in *source*.
+
+    Writes count too: both directions couple the test to an internal name, which
+    is the coupling the measure exists to shrink. Dunders are excluded (Python
+    protocol, not lane internals) and so is the bare ``self``/``cls`` receiver.
+    """
+    tree = _parse(source, path=path)
+    count = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        if not node.attr.startswith('_') or node.attr.startswith('__'):
+            continue
+        receiver = node.value
+        if isinstance(receiver, ast.Name) and receiver.id in _SELF_RECEIVERS:
+            continue
+        count += 1
+    return count
+
+
+def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
+    """The two test-suite measures for *source*, or None when it is not
+    lane-importing.
+
+    Returning None rather than a zeroed dict makes the exclusion a property of
+    the MEASURE rather than of the caller, so a non-lane-importing file can
+    never be summed into the report by accident.
+    """
+    if not imports_lane_module(source, path=path):
+        return None
+    return {
+        'patch_targets': sorted(patch_targets(source, path=path)),
+        'private_reads': private_reads(source, path=path),
+    }
