@@ -306,33 +306,69 @@ def find_violations(source: str, filename: str) -> list[Violation]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point.  Accepts file paths and/or directories."""
+    """CLI entry point.  Accepts file paths and/or directories.
+
+    For directories, recursively scans for ``test_*.py`` files only (never
+    ``conftest.py`` — see ``is_scannable``).  Prints violations to stdout in
+    ``path:lineno:col: message`` format (ruff-style).
+
+    Explicit file paths are validated up front; a missing explicit path fails
+    fast with exit code 2 before any scan work.  Mid-scan read failures (a file
+    yanked between rglob discovery and read, or undecodable bytes) are
+    accumulated and reported on stderr without discarding violations already
+    collected from earlier files.
+
+    Returns 0 if clean, 1 if only violations were found, 2 on any fatal error
+    (missing explicit path or transient read failure).
+    """
     parser = argparse.ArgumentParser(
         description='Check for pytest fixtures constructing their own TestClient.'
     )
     parser.add_argument('paths', nargs='+', help='Files or directories to check')
     args = parser.parse_args(argv)
 
+    # Phase 1: discovery + upfront validation of explicit paths.
+    # rglob results are guaranteed to exist at discovery time, so only
+    # non-directory (explicit) paths need the existence check.
     files_to_scan: list[Path] = []
     for path_str in args.paths:
         p = Path(path_str)
         if p.is_dir():
             files_to_scan.extend(sorted(p.rglob('test_*.py')))
         else:
+            if not p.exists():
+                print(f'error: {p}: No such file or directory', file=sys.stderr)
+                return 2
             files_to_scan.append(p)
 
-    # The same gate as find_violations, applied to discovery so an explicitly
-    # passed conftest.py is never even read.
+    # The same gate find_violations applies, enforced at discovery so an
+    # explicitly passed conftest.py is never even read.
     files_to_scan = [f for f in files_to_scan if is_scannable(str(f))]
 
+    # Phase 2: scan.  Accumulate per-file read errors without returning early,
+    # so a transient failure on one file never discards violations already
+    # collected from earlier files.
     all_violations: list[Violation] = []
+    read_errors: list[tuple[Path, Exception]] = []
     for file_path in files_to_scan:
-        source = file_path.read_text(encoding='utf-8')
+        try:
+            source = file_path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
+            read_errors.append((file_path, exc))
+            continue
+
         all_violations.extend(find_violations(source, str(file_path)))
 
+    # Phase 3: reporting.  Sort across files too, so multi-file output is
+    # deterministic regardless of discovery order.
+    all_violations.sort(key=lambda v: (v.filename, v.lineno, v.col_offset))
     for v in all_violations:
         print(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}')
+    for file_path, exc in read_errors:
+        print(f'error reading {file_path}: {exc}', file=sys.stderr)
 
+    if read_errors:
+        return 2
     return 1 if all_violations else 0
 
 
