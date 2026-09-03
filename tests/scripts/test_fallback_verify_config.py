@@ -28,7 +28,6 @@ This test loads the *committed* ``dark-factory-orchestrator.yaml`` directly
 in ``test_orchestrator_restart_config_drift.py``.
 """
 
-import os
 import pathlib
 import re
 import shlex
@@ -36,9 +35,9 @@ import sys
 import tomllib
 from typing import NamedTuple
 
+import verify_command_invariants as vci
 import yaml
 from orchestrator.config import ModuleConfig, _discover_module_configs
-from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
@@ -885,40 +884,34 @@ def test_nested_module_configs_are_covered_by_the_per_test_timeout_guard() -> No
 def _pyright_clause_cwds(cmd: str) -> list[str]:
     """Return, in order, the normalised cwd of each bare-pyright clause in *cmd*.
 
-    Walks the ``&&``-chain tracking cwd through ``cd <dir>`` clauses, using the
+    Thin delegation to ``verify_command_invariants.pyright_clause_cwds`` (task
+    4108), which is where the walk itself now lives. The shared parser uses the
     same PRODUCTION helpers ``verify._AND_CLAUSE_SPLIT_RE`` /
     ``verify._cd_clause_target`` that ``verify._scope_fallback_tool_to_subproject``
-    (task 3022) itself uses to read this exact command — so this helper cannot
-    drift from how the scoper interprets the chain.
+    (task 3022) itself uses to read this exact command — so this helper still
+    cannot drift from how the scoper interprets the chain.
 
     A "bare" pyright clause mentions ``pyright`` and is not already wrapped in
     ``uv run --project`` (interpreter-pinned by uv itself, not by
-    ``[tool.pyright]``, so it is excluded from the result).
+    ``[tool.pyright]``, so it is excluded from the result). That exclusion is the
+    shared parser's ``skip_uv_project`` DEFAULT, which is what keeps this call
+    site byte-identical in behaviour across the extraction; the CONTRIBUTING.md
+    mirror added by task 4108 passes ``skip_uv_project=False`` because it asks
+    the other question — which directories the command type-checks, rather than
+    which clauses are pinned by ``[tool.pyright]``.
 
-    Extracted (task 3397) from what was originally inlined in
-    ``TestRootTypeCheckCommandPyrightInterpreterPinned``'s own test method
-    (task 3367), so that test and the fleet TYPE-chain coverage invariant
-    below walk the chain identically and cannot drift apart — the same "must
-    not drift apart" convention ``_assert_pyright_pins_worktree_venv`` already
-    states.
+    Originally inlined in ``TestRootTypeCheckCommandPyrightInterpreterPinned``'s
+    own test method (task 3367), extracted to this module (task 3397) so that
+    test and the fleet TYPE-chain coverage invariant below walk the chain
+    identically and cannot drift apart — the same "must not drift apart"
+    convention ``_assert_pyright_pins_worktree_venv`` already states. Task 4108
+    widened that scope one level: the walk moved to
+    ``tests/scripts/verify_command_invariants.py``, the module task 3745 created
+    to hold shared command parsing precisely so a THIRD caller could not become a
+    third copy ("IMPORT ME, DO NOT COPY ME ... add a PARAMETER here rather than a
+    variant there").
     """
-    parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
-    cwd = "."
-    cwds: list[str] = []
-    for i in range(0, len(parts), 2):
-        clause = parts[i]
-        cd_target = _cd_clause_target(clause)
-        if cd_target is not None:
-            cwd = os.path.normpath(os.path.join(cwd, cd_target))
-            continue
-        if "pyright" not in clause:
-            continue
-        if "uv run --project" in clause:
-            # Already interpreter-pinned, by uv rather than by [tool.pyright]:
-            # `uv run --project <sub>` selects the workspace venv itself.
-            continue
-        cwds.append(cwd)
-    return cwds
+    return vci.pyright_clause_cwds(cmd)
 
 
 class TestRootTypeCheckCommandPyrightInterpreterPinned:

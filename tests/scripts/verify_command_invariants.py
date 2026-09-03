@@ -50,8 +50,11 @@ precedent, as ``systemd_unit_invariants.py``, ``setup_host_parsing.py`` and
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import shlex
+
+from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
 
 from orchestrator import verify_cmd
 
@@ -352,3 +355,67 @@ def flag_args(tokens: list[str], prefixes: tuple[str, ...]) -> list[str]:
     choice stays visible at the call site.
     """
     return [t for t in tokens if t.startswith(prefixes)]
+
+
+def pyright_clause_cwds(
+    cmd: str, *, skip_uv_project: bool = True, label: str | None = None
+) -> list[str]:
+    """Return, in order, the normalised cwd of each pyright clause in *cmd*.
+
+    Walks the ``&&``-chain tracking cwd through ``cd <dir>`` clauses using the
+    PRODUCTION helpers ``orchestrator/src/orchestrator/verify.py::_AND_CLAUSE_SPLIT_RE``
+    and ``orchestrator/src/orchestrator/verify.py::_cd_clause_target`` — the same
+    pair ``orchestrator/src/orchestrator/verify.py::_scope_fallback_tool_to_subproject``
+    (task 3022) itself uses to read this exact command. So no caller of this
+    function can drift from how the scoper interprets the chain at runtime.
+
+    ``_cd_clause_target`` recognises only an exact two-token ``cd <dir>``.
+    Anything else — an unbalanced quote, a bare ``cd``, a clause holding more
+    than a lone ``cd`` — leaves cwd tracking unchanged rather than raising.
+    That degradation is load-bearing rather than incidental since task 4108,
+    because one caller now reads a command out of HUMAN-EDITED PROSE
+    (``test_contributing_type_check_command_drift.py``), where a stray
+    apostrophe is ordinary input and not a programming error.
+
+    *skip_uv_project* is a PARAMETER rather than a second variant of this
+    function, per this module's own "add a PARAMETER here rather than a variant
+    there" rule. The two callers ask genuinely different questions of the same
+    walk:
+
+      * ``True`` (the default) — "which clauses resolve their interpreter from
+        that directory's ``[tool.pyright]`` block?" A ``uv run --project <member>
+        pyright`` clause is pinned by uv, which selects the workspace venv
+        itself, so it is EXCLUDED. This is the semantic
+        ``test_fallback_verify_config.py::_pyright_clause_cwds`` has had since
+        task 3397, preserved byte-for-byte by the default.
+      * ``False`` — "which directories does this command type-check?" For that
+        question a ``--project`` spelling is a real answer, so it is INCLUDED.
+        This is what the CONTRIBUTING.md mirror needs (task 4108).
+
+    *label* is accepted for signature symmetry with this module's other helpers
+    (:func:`required_segment`, :func:`anchor_split`, :func:`positional_targets`),
+    so a guard parsing two commands can pass it uniformly. It is currently
+    unread, and that is not an oversight: those helpers thread *label* into
+    ASSERTION messages, and this one raises nothing — see the next paragraph.
+
+    THIS FUNCTION PARSES; IT DOES NOT DECIDE. It reports what the chain says and
+    makes no claim that the answer is non-empty or correct. NON-VACUITY is
+    asserted by each caller, never here: an empty return is a legitimate parse of
+    a command with no pyright clause, and only the caller knows whether that
+    means "nothing to check" or "this guard just went vacuous".
+    """
+    parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
+    cwd = "."
+    cwds: list[str] = []
+    for i in range(0, len(parts), 2):
+        clause = parts[i]
+        cd_target = _cd_clause_target(clause)
+        if cd_target is not None:
+            cwd = os.path.normpath(os.path.join(cwd, cd_target))
+            continue
+        if PYRIGHT not in clause:
+            continue
+        if skip_uv_project and "uv run --project" in clause:
+            continue
+        cwds.append(cwd)
+    return cwds
