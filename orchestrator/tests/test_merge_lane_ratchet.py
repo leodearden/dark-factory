@@ -251,3 +251,106 @@ class TestEnumerationRoundTrip:
         )
         assert enumeration.complete is False
         assert 'a.py' in enumeration.to_dict()['unreadable']
+
+
+# ---------------------------------------------------------------------------
+# file_size_measures -- lines and prose lines.
+#
+# Pinned against INLINE synthetic snippets, never against a real repo file, so
+# these tests cannot drift when the cluster changes. The one real-tree
+# assertion below is an explicit anti-vacuity anchor, not a definition.
+
+
+class TestFileSizeMeasures:
+    def test_lines_counts_physical_lines(self) -> None:
+        source = 'a = 1\nb = 2\nc = 3\n'
+        assert metrics.file_size_measures(source, path='t.py').lines == 3
+
+    def test_lines_counts_a_final_line_without_a_trailing_newline(self) -> None:
+        assert metrics.file_size_measures('a = 1\nb = 2', path='t.py').lines == 2
+
+    def test_blank_lines_are_lines_but_not_prose(self) -> None:
+        measures = metrics.file_size_measures('a = 1\n\n\nb = 2\n', path='t.py')
+        assert measures.lines == 4
+        assert measures.prose_lines == 0
+
+    def test_module_docstring_counts_as_prose(self) -> None:
+        measures = metrics.file_size_measures('"""Doc."""\na = 1\n', path='t.py')
+        assert measures.prose_lines == 1
+
+    def test_function_and_class_docstrings_count_as_prose(self) -> None:
+        source = (
+            'class C:\n'
+            '    """Class doc."""\n'
+            '\n'
+            '    def m(self):\n'
+            '        """Method doc."""\n'
+            '        return 1\n'
+        )
+        assert metrics.file_size_measures(source, path='t.py').prose_lines == 2
+
+    def test_async_function_docstring_counts_as_prose(self) -> None:
+        source = 'async def f():\n    """Doc."""\n    return 1\n'
+        assert metrics.file_size_measures(source, path='t.py').prose_lines == 1
+
+    def test_multiline_docstring_counts_once_per_line_it_spans(self) -> None:
+        source = '"""Line one.\n\nLine three.\n"""\na = 1\n'
+        measures = metrics.file_size_measures(source, path='t.py')
+        assert measures.lines == 5
+        assert measures.prose_lines == 4
+
+    def test_standalone_comment_lines_count_as_prose(self) -> None:
+        source = '# one\n# two\na = 1\n'
+        assert metrics.file_size_measures(source, path='t.py').prose_lines == 2
+
+    def test_trailing_inline_comment_makes_its_code_line_prose(self) -> None:
+        source = 'a = 1  # why\nb = 2\n'
+        assert metrics.file_size_measures(source, path='t.py').prose_lines == 1
+
+    def test_a_line_that_is_both_docstring_and_comment_counts_once(self) -> None:
+        # The two line-number sets are unioned, not summed.
+        source = '"""Doc."""  # trailing\na = 1\n'
+        assert metrics.file_size_measures(source, path='t.py').prose_lines == 1
+
+    def test_a_string_literal_mentioning_hash_is_not_a_comment(self) -> None:
+        # THE tokenize-vs-regex discriminator: no regex over source text gets
+        # this right, and getting it wrong would inflate prose_lines on any file
+        # that formats a '#'-bearing string.
+        source = "url = 'http://x/#frag'\nheading = '# not a comment'\n"
+        assert metrics.file_size_measures(source, path='t.py').prose_lines == 0
+
+    def test_a_non_docstring_string_expression_is_not_prose(self) -> None:
+        # Only the FIRST body element of a module/class/function is a docstring.
+        source = '"""Doc."""\n"""Not a docstring."""\na = 1\n'
+        assert metrics.file_size_measures(source, path='t.py').prose_lines == 1
+
+    def test_unparseable_source_raises_naming_the_path(self) -> None:
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.file_size_measures('def (:\n', path='broken.py')
+        message = str(excinfo.value)
+        assert 'broken.py' in message
+        assert 'SyntaxError' in message
+
+    def test_unparseable_source_never_returns_a_zero_measure(self) -> None:
+        # INV-11: an unmeasurable cluster file is the finding, not a 0 that
+        # silently satisfies every ratchet comparison.
+        with pytest.raises(metrics.MetricsError):
+            metrics.file_size_measures('class ???:\n', path='broken.py')
+
+    def test_measures_are_frozen(self) -> None:
+        import dataclasses
+
+        measures = metrics.file_size_measures('a = 1\n', path='t.py')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            measures.lines = 99  # type: ignore[misc]
+
+    def test_real_merge_queue_line_count_anchor(self) -> None:
+        # Anti-vacuity anchor: the PRD Background table's 21,550. Not a
+        # definition of the measure -- if this drifts, merge_queue.py changed
+        # (which the ratchet itself will report against the baseline).
+        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py').read_text(
+            encoding='utf-8'
+        )
+        measures = metrics.file_size_measures(source, path='merge_queue.py')
+        assert measures.lines == 21550
+        assert measures.prose_lines > 0
