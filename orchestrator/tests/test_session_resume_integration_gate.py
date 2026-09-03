@@ -1481,6 +1481,102 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
     assert harness._escalation_queue.submit.call_count == 0
 
 
+# ── B4'': a FOREIGN config dir is the only candidate → accounted-for loss ────
+@pytest.mark.asyncio
+async def test_b4c_foreign_config_dir_is_signalled_not_silently_stashed(
+    harness: Harness,
+):
+    """B4'' — the lane holds a config dir that is NOT this session's, and the
+    loss is now ACCOUNTED FOR instead of silent (task 3620).
+
+    The third member of the B4 family, and the one that used to be invisible.
+    B4 has NO candidate (nothing stashed, quiet by design); B4' has the RIGHT
+    candidate, later wiped (`reseeded`, quiet by design). Here exactly one
+    candidate exists and it belongs to someone else —
+    ``claude-config-<task_id>-unblock``, the real name produced by
+    ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``. That
+    is the ``.worktrees/3464`` shape, reproduced as a fixture because the live
+    dir has since been reaped (measured 2026-09-03).
+
+    Before task 3620 the resolver globbed ``claude-config-*``, found exactly
+    one, and stashed it — no ``> 1`` warning fired, the dispatch-time re-glob
+    found nothing, and the session degraded to ``no_transcript`` with ZERO
+    operator signal.
+
+    The ``-unblock`` dir deliberately CONTAINS a real transcript for this very
+    session id. That is what makes the gate non-vacuous: it proves the resolver
+    refuses on the NAME, not merely because no transcript existed anywhere. A
+    resolver that always returned "not found" would pass the assertions below
+    without it.
+
+    Two-way, across the real boot→dispatch seam: adoption genuinely happened
+    (the session and plan are recovered and the plan flows through as
+    ``initial_plan``), the boot side refused to stash and SAID SO — one
+    structured event plus one L1 under its own sentinel — and the dispatch side
+    independently degraded to ``no_transcript``. D7 is pinned end-to-end: the
+    fallback-storm streak is untouched and nothing was filed under the storm
+    sentinel, because the ambiguity is detected at BOOT while the streak is only
+    touched at DISPATCH.
+    """
+    task_id, session_id = '3464', 'uuid-b4c-foreign-dir'
+    lane = _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', with_transcript=False,
+    )
+    # A dir that HOLDS a real transcript for this session, under a name that is
+    # not this session's — built via the real creator, so the refusal is proven
+    # against a genuine non-owner rather than a hand-spelled string.
+    unblock = TaskConfigDir(f'{task_id}-unblock', base_dir=lane / '.task')
+    proj = unblock.path / 'projects' / 'some-slug'
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / f'{session_id}.jsonl').write_text('{"type": "summary"}\n')
+    assert transcript_exists(unblock.path, session_id)
+    expected_dir = lane / '.task' / f'{CONFIG_DIR_PREFIX}{task_id}'
+    assert not expected_dir.exists()
+
+    harness.config.session_resume = SessionResumeConfig()
+    harness._escalation_queue = _storm_queue()
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): session adopted, but NOTHING stashed ──
+    assert task_id in harness._recovered_sessions
+    assert task_id in harness._recovered_plans
+    assert task_id not in harness._recovered_session_config_dirs
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── The signal that used to be missing ──
+    # Read off event_store directly: `_session_resume_emits` filters to the
+    # three dispatch-guard members, so the ambiguity event never appears in
+    # `cap.emits` and this module's existing `len(cap.emits) == 1` assertions
+    # are unaffected.
+    ambiguous = [
+        call.kwargs for call in harness.event_store.emit.call_args_list
+        if call.args and call.args[0] == EventType.session_config_dir_ambiguous
+    ]
+    assert len(ambiguous) == 1
+    assert ambiguous[0]['data']['expected'] == str(expected_dir)
+    assert ambiguous[0]['data']['found'] == [str(unblock.path)]
+    assert harness._escalation_queue.submit.call_count == 1
+    filed = harness._escalation_queue.submit.call_args.args[0]
+    assert filed.task_id == Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL
+
+    # ── INJECT side (γ): the degradation still happens, now accounted for ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is None
+    assert cap.initial_plan is recovered_plan
+    assert len(cap.emits) == 1
+    et, kwargs = cap.emits[0]
+    assert et == EventType.session_resume_fallback
+    assert 'no_transcript' in kwargs['data']['reasons']
+
+    # ── D7 end-to-end: the boot-time signal never feeds the dispatch streak ──
+    assert harness._session_resume_fallback_streak == 0
+    filed_under = [
+        c.args[0].task_id for c in harness._escalation_queue.submit.call_args_list
+    ]
+    assert Harness._SESSION_RESUME_STORM_SENTINEL not in filed_under
+
+
 # ── B5: stale sidecar beyond the freshness window ────────────────────────────
 @pytest.mark.asyncio
 async def test_b5_stale_sidecar_falls_back(harness: Harness):
