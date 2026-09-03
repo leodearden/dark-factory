@@ -1,0 +1,293 @@
+# Machine-readable twin of merge-lane-throughput-prd.capability-manifest.md
+# Path is strictly derived from the PRD path (never hand-named), so a downstream
+# stamper can locate it from metadata.prd_path alone.
+# Schema: shared/src/shared/capability_manifest.py::CapabilityManifestDoc
+# task_id values are stamped by commit_planning from metadata.prd_task_label.
+prd: plans/merge-lane-throughput-prd.md
+schema_version: 1
+tasks:
+  - label: "A"
+    title: "merge-lane throughput: scripts/merge_lane_throughput.py + fixture test"
+    capabilities:
+      - name: "merge-lane-event-schema-on-main"
+        binding: "capability→producer (wired) — EventType.{merge_queued,merge_dequeued,merge_verify,merge_heartbeat,merge_attempt,merge_finalized,speculative_merge,verdict_voided} emitted from production paths (event_store.py::EventType; verify_runner.py::VerifyRunnerPool.dispatch emit)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "pre-existing substrate on main, not this task's deliverable"
+      - name: "throughput-script-reads-heartbeat-occupancy"
+        binding: "capability→producer — built by A; occupancy from merge_heartbeat.hosts[].slot_state LOCF integral, shown beside the verify-duration-sum and raw-sample fractions"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_heartbeat"
+          paths: ["scripts/merge_lane_throughput.py"]
+          expect: present
+      - name: "fixture-runs-db-with-known-answers"
+        binding: "capability→producer — built by A under scripts/tests/ (directory + conftest.py exist; 20+ sibling script tests)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_lane_throughput"
+          paths: ["scripts/tests/"]
+          expect: present
+      - name: "no-numeric-target-asserted"
+        binding: "G6 branch 1 — reproduction of a dated baseline, no threshold; the three disagreeing occupancy estimators are printed side by side rather than reconciled"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "absence of a threshold is a review property, not a grep"
+  - label: "B"
+    title: "merge-lane throughput: refresh the laptop dark-factory checkout + per-host verify config"
+    capabilities:
+      - name: "ssh-leo-laptop-batch-reachable"
+        binding: "capability→producer (wired) — probed live 2026-09-03 in BatchMode with no prompt; leo-laptop git remote present in project_root"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "remote host reachability is not expressible as a repo grep"
+      - name: "per-host-config-present-on-laptop"
+        binding: "capability→producer (wired) — ~/.config/orchestrator/dark-factory-laptop.yaml present beside reify-laptop.yaml, carrying project_root + git.{remote,persistent_merge_worktree}"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the artifact lives on the remote host, outside the repo"
+      - name: "setup-md-remote-verify-host-section"
+        binding: "capability→producer — the one repo artifact B lands"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Remote verify host"
+          paths: ["SETUP.md"]
+          expect: present
+      - name: "nothing-lost-refusal-fires"
+        binding: "rejection-mechanism — built and bound by B: a reset is withheld and escalated when the live tree carries anything not reproducible from main; today's residue is three UNTRACKED dirs reset --hard would not touch"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the refusal is exercised against live remote state at act time, not against a fixture"
+  - label: "C"
+    title: "merge-lane throughput: cross-project verify-host arbitration (RunnerBusy + host-global admission)"
+    capabilities:
+      - name: "flock-slot-primitive-exists"
+        binding: "capability→producer (wired) — shared/src/shared/verify_admission.py::_acquire/_try_once, in production use by the task-verify admission path"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "pre-existing substrate; the novel part is the host-global path C creates"
+      - name: "host-global-slot-dir-created-not-per-project"
+        binding: "capability→producer — CORRECTION (1): task 2501 (5392f4a357) made verify_admission_slots_dir per-project (uid + sha256(project_root)[:12]); reusing it would make arbitration a silent no-op. C mints its own host-global path AND creates it, because verify_admission never creates slots_dir and fails OPEN when it is missing"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_merge_host_max_concurrent"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "runner-busy-typed-wire-contract"
+        binding: "capability→producer — RunnerBusy is a sibling of RunnerUnavailable (verify_runner.py:701), NOT a VerifyResult; payload round-trips as JSON per result_to_dict. INV-1: validated on parse by a shared typed model, never a prose convention"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "RunnerBusy"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "holder-field-is-populated-not-declared"
+        binding: "field-population (G6 result-field twin) — nothing on main writes an owner identity into a slot file, so the HOLDING process must write project_id+pid into its slot file for the waiter's RunnerBusy.holder / verify_host_busy.holder to be non-sentinel"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "non-sentinel population is asserted by C's boundary row 2, not by a pattern match"
+      - name: "verify-host-busy-event-wired-in-dispatch"
+        binding: "capability→producer — EventType.verify_host_busy is ABSENT on main (verified); C builds it and wires the emit into VerifyRunnerPool.dispatch, upstream of D1/D2 and of A's occupancy attribution"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_host_busy"
+          paths: ["orchestrator/src/"]
+          expect: present
+      - name: "storm-escape-reuses-shared-counter"
+        binding: "capability→producer (wired) — shared/src/shared/storm_counter.py::StormCounter exists; C reuses it rather than minting a second streak helper (INV-4 escape, INV-5 no duplication). Settles PRD Open question #2"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "storm_counter"
+          paths: ["orchestrator/src/"]
+          expect: present
+      - name: "local-fallback-arm-already-wired"
+        binding: "capability→producer (wired) — VerifyRunnerPool.dispatch already falls back to LocalRunner on RunnerUnavailable; C extends that production arm rather than adding a parallel path"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "extension of an existing arm; proven by boundary rows 2 and 5"
+      - name: "boundary-rows-1-to-5-green"
+        binding: "DAG-direction — the B+H integration-gate signal; row 1 amended per CORRECTION (2) to TWO DISTINCT project roots so it exercises cross-project arbitration (INV-10), row 5 pins the unchanged RunnerUnavailable quarantine/reprobe behaviour"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the boundary matrix IS the check suite"
+      - name: "admission-unavailable-is-not-silent"
+        binding: "rejection-mechanism (INV-11) — verify_admission is documented C-fail-open; C must distinguish acquired / busy / admission-unavailable and signal the third distinctly instead of proceeding as if acquired"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "three-way outcome distinction is asserted by C's own tests, not by a pattern"
+  - label: "D1"
+    title: "merge-lane throughput: enable the laptop verify runner for Dark Factory (config)"
+    capabilities:
+      - name: "verify-runners-is-a-live-schema-field"
+        binding: "capability→producer (wired) — config.py::VerifyRunnerConfig + OrchestratorConfig.verify_runners; the field docstring records that the block was silently inert before the model landed"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "pre-existing substrate on main"
+      - name: "arbitration-config-fields-upstream"
+        binding: "capability→producer:task-C UPSTREAM (real add_dependency edge) — verify_merge_host_max_concurrent / verify_merge_host_wait_secs / verify_host_busy_l1_per_hour. DAG-direction correct"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "gated by C's own delivered_checks via the dependency edge"
+      - name: "check-config-exits-zero-no-phantom-keys"
+        binding: "capability→producer (wired) — cli.py::check_config lints the raw YAML against the schema via census_config_keys and exits 1 on a genuinely-unknown key; OrchestratorConfig uses extra='ignore', so exit 0 is what proves nothing was silently dropped"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "verify_runners:"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+      - name: "enabled-verify-runners-resolves-to-one"
+        binding: "CORRECTION (3) — the PRD's 'check-config reports one enabled verify runner' is unachievable (check_config emits no runner inventory). Re-homed onto OrchestratorConfig.enabled_verify_runners (config.py), which exists; K = 1 + len(enabled_verify_runners) = 2 is the post-D2 startup-log confirmation"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "resolved by loading the config, not by a repo pattern"
+  - label: "D2"
+    title: "merge-lane throughput: deterministic fleet restart to activate the laptop runner"
+    capabilities:
+      - name: "restart-script-committed-and-executable"
+        binding: "capability→producer (wired) — scripts/restart-all-orchestrators.sh, SELF_UNIT defaults to orchestrator-dark-factory.service, which is a loaded+active user unit on this host"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "deploy outcome is a runtime event, not a repo pattern"
+      - name: "deterministic-deploy-scheduled-provenance"
+        binding: "capability→producer (wired) — the documented done_provenance kind for a DeterministicRunner self-restart scheduled via detached systemd-run, which is exactly D2's shape (the restarted unit runs the task)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "provenance is stamped by the runner at completion"
+      - name: "verify-runners-is-restart-only"
+        binding: "capability→producer (wired) — OPERATIONS.md 'Config reload vs restart' lists verify_runners red-tier; this is why D1 alone is not the deploy"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "tier membership is documented, not greppable as a delivery"
+      - name: "laptop-runner-observed-within-24h"
+        binding: "G6 branch 1 — not a tuned threshold: dark_factory's measured median is 12 landings/day over the 14-day baseline, so >=1 merge verify inside 24h is near-certain; merge_verify carries runner on every emit and verify_host_unreachable is an existing EventType, so 'stays at zero' is observable"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "runtime observation over a window"
+  - label: "E"
+    title: "merge-lane throughput: 14-day measurement after the laptop lever"
+    capabilities:
+      - name: "throughput-script-upstream"
+        binding: "capability→producer:task-A UPSTREAM (direct edge, and transitively via D1->D2). DAG-direction correct"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "gated by A's delivered_checks via the dependency edge"
+      - name: "after-window-anchored-on-the-deploy"
+        binding: "capability→producer — metadata.milestone {mode:'delayed', after_secs:1209600} anchors on E's dependency set going done; the last dependency to complete is D2, so the 14 days run from the deploy. Frozen-once anchor per docs/task-authoring.md section 6"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "anchor semantics are enforced by the scheduler, not by a repo pattern"
+      - name: "no-threshold-only-a-dated-comparison"
+        binding: "G6 branch 1 — PRD decision 3 forbids a percentage target; the achievability basis for DIRECTION (not magnitude) is reify's measured laptop verify p50 17.4 min vs 43.4 local on the same workload class"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "absence of a threshold is a review property"
+  - label: "F"
+    title: "merge-lane throughput: deep-chain canary on Dark Factory (chain_cap=6)"
+    capabilities:
+      - name: "chain-cap-knob-read-by-select-chain-depth"
+        binding: "capability→producer (wired) — config.py::MergeDeepConfig.chain_cap is read by merge_queue.py::select_chain_depth; the config docstring's 'nothing reads the knob yet' is stale"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "pre-existing substrate on main"
+      - name: "chain-telemetry-from-task-3188"
+        binding: "capability→producer:task-3188 UPSTREAM (out-of-batch, exists, status=pending; wired as a real add_dependency edge, not re-filed). DAG-direction correct"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "gated by the real dependency edge on 3188"
+      - name: "set-cap-deploy-script-committed"
+        binding: "capability→producer (wired) — scripts/merge-deep-set-cap.sh (fbaf4dc526) sets the knob, commits only that file, hot-reloads via the target escalation MCP (df port 8102) and exits non-zero unless the knob appears in the reload's applied disposition — which surfaces the PRD's restart_required branch as a born-at-L2 rather than a silent skip"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "chain_cap"
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+      - name: "landed-via-chain-observable-in-7-days"
+        binding: "G6 branch 1 — basis: dark_factory queue depth p90 = 8 over the 14-day baseline, so chains of >=2 form routinely at cap 6, and the deep-merge PRD's study validated cap 6. CORRECTION (4): landed_via_chain is an INT (1 on an item landed via chain), so the signal binds a truthy int >= 1, not == true"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "runtime observation over a window"
+  - label: "G"
+    title: "merge-lane throughput: speculation-waste diagnosis (reify 58% void vs dark_factory 30%)"
+    capabilities:
+      - name: "speculation-mode-of-the-throughput-script"
+        binding: "capability→producer:task-A UPSTREAM (real edge). G may extend A's script; both declare scripts/merge_lane_throughput.py and are serialized by that edge (same-file rule)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "gated by A's delivered_checks via the dependency edge"
+      - name: "diagnosis-code-symbols-exist"
+        binding: "capability→producer (wired) — select_probe_depth, _chain_dead_link, verdict_voided/chain_dead, gate_retry + CAS retry paths and the K=2 placement are all on main"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "pre-existing substrate on main"
+      - name: "committed-ranked-proposal-report"
+        binding: "capability→producer — plans/merge-lane-throughput-prd.speculation-diagnosis.md, each proposal naming the quality PRD seam (kappa or lambda) it would land in"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "report path is created by this leaf; a grep on a not-yet-existing path would gate nothing (G is a leaf)"
+      - name: "named-consumer-despite-unauthored-policy-prd"
+        binding: "G1 resolution (a) — the policy follow-up PRD is unauthored, so the named consumer is Leo's authoring session plus task A. G introduces no MECHANISM, only a report, so no producer-orphan is created"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "consumer naming is a gate outcome, not a mechanical check"
+      - name: "measured-rates-are-observations-not-targets"
+        binding: "G6 branch 1 — the 58% / 30% / 3.6% / 40% figures are baseline observations to be EXPLAINED; G's signal binds reproduction of the rates by the script, not attainment of a target"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "absence of a threshold is a review property"
+  - label: "H"
+    title: "merge-lane throughput: 14-day measurement after the chain lever"
+    capabilities:
+      - name: "throughput-script-in-transitive-closure"
+        binding: "capability→producer:task-A upstream TRANSITIVELY via F->E->A. H's only DIRECT dependency is F, by operator instruction, so the delayed clock anchors on F rather than on E. DAG-direction correct"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "gated transitively; H has exactly one direct edge, to F"
+      - name: "chains-section-of-the-script"
+        binding: "capability→producer:task-A upstream — the --chains section (landed_via_chain, chain length) is declared in A's spec"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "gated by A's delivered_checks through the F->E->A chain"
+      - name: "no-threshold-only-a-dated-comparison"
+        binding: "G6 branch 1 — same shape as E: comparison against the dated baseline, no threshold"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "absence of a threshold is a review property"
