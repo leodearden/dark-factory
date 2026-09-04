@@ -50,6 +50,7 @@ cross-tree gates still live there; they are enumerated, with measured counts, in
 """
 import ast
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 # tests/scripts/<file>.py and shared/tests/<file>.py are both exactly two levels
@@ -230,14 +231,18 @@ _ALLOWED_RENAMERS = {
     # from a neighbour: an entry whose reason came from the entry above it is
     # indistinguishable from a triaged decision and is worse than no entry.
     # Where an argument already exists above, it is CITED rather than re-argued.
-    ('fused-memory/src/fused_memory/middleware/curator_escalator.py', 'CuratorEscalator._persist_state'):
-        'DETECTOR-NESTING ARTIFACT — this function contains no rename of its '
-        'own. The os.replace lives in the nested ``_write`` closure, which is '
-        'allowlisted separately below; the outer name is reported only because '
-        '_find_renamers uses ast.walk, which descends into nested functions '
-        '(the limitation its docstring states). There is nothing here to '
-        'migrate, and no semantic justification is offered because there is '
-        'none to offer — the entry exists solely to keep the detector honest.',
+    # NOTE: this file's OUTER ``CuratorEscalator._persist_state`` used to need an
+    # entry here too — a "DETECTOR-NESTING ARTIFACT" line stating outright that
+    # it had nothing to migrate and no semantic justification to offer.  It is
+    # gone because the detector was fixed rather than the allowlist widened
+    # (amendment to task 3388): _find_renamers now attributes a rename to its
+    # INNERMOST enclosing function only, so the closure below is reported and
+    # its enclosing method is not.  Recorded rather than silently deleted,
+    # because an artifact entry is not free: an _ALLOWED_RENAMERS key also
+    # silences test_atomic_write_text_helpers_only_delegate for that (file,
+    # name) pair, so every artifact entry widened a real hole while diluting
+    # the list's stated invariant that each entry is an individually-reasoned
+    # survivor.
     (
         'fused-memory/src/fused_memory/middleware/curator_escalator.py',
         'CuratorEscalator._persist_state._write',
@@ -393,7 +398,52 @@ def _find_renamers(source: str) -> list[str]:
 
     Limitation, stated rather than papered over: this finds the rename, which
     is the half of the pattern that cannot be omitted.  A copy that factored
-    its rename out into a helper would be attributed to that helper instead.
+    its rename out into a helper would be attributed to that helper instead —
+    including a helper NESTED inside it, since attribution stops at the
+    innermost enclosing function (see :func:`_own_body`).  That is a deliberate
+    narrowing, not a hole: the nested function gets its own qualname from
+    ``visit`` below and its own allowlist entry, so the rename is still
+    reported, just at one site instead of a chain of them.
+    """
+    return _find_renamers_in_tree(ast.parse(source))
+
+
+def _own_body(fn: ast.AST) -> Iterator[ast.AST]:
+    """Yield the nodes of *fn* that belong to *fn* rather than to a nested def.
+
+    ``ast.walk`` descends into nested ``FunctionDef`` nodes, so a rename inside
+    a closure used to be attributed to the closure AND to every function
+    lexically enclosing it.  That is not free: each spurious qualname needs its
+    own ``_ALLOWED_RENAMERS`` key, an allowlist key ALSO silences
+    ``test_atomic_write_text_helpers_only_delegate`` for that (file, name)
+    pair, and an entry whose only honest reason is "the detector did this"
+    dilutes the list's invariant that every entry is a reasoned survivor.
+
+    ``Lambda`` is deliberately NOT cut here, and the asymmetry with
+    ``FunctionDef`` is the whole point: ``visit`` assigns qualnames to
+    ``FunctionDef``/``AsyncFunctionDef``/``ClassDef`` only, so a nested def has
+    a name of its own to carry the attribution while a lambda has none.
+    Cutting lambdas too would attribute ``f = lambda p: p.replace(dest)`` to
+    nothing at all — trading a duplicate report for a missed one.  A nested
+    ``ClassDef`` body IS walked (its statements execute in this function's
+    frame) while its methods are not (they get ``outer.Inner.method``).
+    """
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _find_renamers_in_tree(tree: ast.AST) -> list[str]:
+    """The already-parsed half of :func:`_find_renamers`, whose docstring documents
+    every detector semantic below.
+
+    Split out so the batch scan can parse each file ONCE and hand the same tree
+    to both AST tests — see :func:`_scan_source_trees` for the measurement that
+    made that worth doing.
     """
     found: list[str] = []
 
@@ -415,13 +465,13 @@ def _find_renamers(source: str) -> list[str]:
                 visit(child, f'{prefix}{child.name}.')
             elif isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
                 qualname = f'{prefix}{child.name}'
-                if any(is_rename(sub) for sub in ast.walk(child)):
+                if any(is_rename(sub) for sub in _own_body(child)):
                     found.append(qualname)
                 visit(child, f'{qualname}.')
             else:
                 visit(child, prefix)
 
-    visit(ast.parse(source), '')
+    visit(tree, '')
     return found
 
 
@@ -497,6 +547,53 @@ class TestNoRegrownAtomicWriters:
             '    tmp.replace(path)\n'
         )
         assert _find_renamers(path_replace_variant) == ['_write']
+
+    def test_detector_attributes_a_rename_to_its_innermost_function(self):
+        """A rename in a closure names the CLOSURE, not the chain enclosing it.
+
+        The original detector used ``ast.walk``, which descends into nested
+        defs, so a nested writer was reported once per enclosing function.
+        Measured at the base this amendment was written against, that produced
+        exactly one spurious qualname across all six trees
+        (``curator_escalator.py::CuratorEscalator._persist_state``, whose only
+        ``os.replace`` lives in its nested ``_write``) and it had to be bought
+        off with an allowlist entry whose stated reason was that there was no
+        reason — while ALSO silencing the delegate check for that name.
+
+        The lambda case is the other half of the contract and the reason
+        ``_own_body`` cuts at ``FunctionDef`` but not at ``Lambda``: a lambda
+        gets no qualname of its own, so cutting there would report the rename
+        NOWHERE.  A narrowing that loses a site is worse than the duplication
+        it removes.
+        """
+        nested = (
+            'import os\n'
+            'class S:\n'
+            '    def _persist(self, payload):\n'
+            '        def _write():\n'
+            '            os.replace(tmp, self._path)\n'
+            '        return _write\n'
+        )
+        assert _find_renamers(nested) == ['S._persist._write']
+
+        lambda_body = (
+            'def outer(dest):\n'
+            '    f = lambda p: p.replace(dest)\n'
+            '    return f\n'
+        )
+        assert _find_renamers(lambda_body) == ['outer']
+
+        # A nested class's METHOD gets its own qualname; a rename in the class
+        # BODY executes in the enclosing function's frame and stays there.
+        nested_class = (
+            'import os\n'
+            'def outer():\n'
+            '    class Inner:\n'
+            '        os.replace(a, b)\n'
+            '        def m(self):\n'
+            '            os.replace(c, d)\n'
+        )
+        assert _find_renamers(nested_class) == ['outer', 'outer.Inner.m']
 
     def test_detector_ignores_str_replace(self):
         """``str.replace(old, new)`` is not a rename.
