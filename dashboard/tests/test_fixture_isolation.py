@@ -47,6 +47,13 @@ def _client():
     """
     from dashboard.app import app
 
+    # This is the ONE module-local client fixture dashboard/tests keeps. The
+    # module-scoped TestClient lifespan is the SUBJECT UNDER TEST here (task
+    # 3503) — it is the scope a function-scoped isolation fixture provably
+    # cannot protect — so it is not a copy of conftest's shared fixture.
+    # The pragma must sit on the line immediately above the construction:
+    # any intervening non-blank line breaks it.
+    # noqa: module-local-testclient — module-scoped lifespan is the subject under test (3503)
     with TestClient(app) as c:
         yield c
 

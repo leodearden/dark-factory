@@ -404,11 +404,24 @@ async def empty_recon_conn(empty_reconciliation_db):
 # module-scoped TestClient like this one cannot request a function-scoped
 # monkeypatch.
 #
-# SHADOWING IS INTENDED.  A module that defines its own ``_client`` overrides
-# this one; that is not a leftover to be cleaned up.  test_fixture_isolation.py
-# in particular MUST keep its copy — there the module-scoped TestClient is the
-# SUBJECT UNDER TEST (its docstring: "only a *session*-scoped fix satisfies
-# both" scopes), so deleting it would delete the coverage.
+# SHADOWING IS INTENDED, BUT IT MUST SAY SO AT THE SITE.  A module that defines
+# its own ``_client`` overrides this one; that is not automatically a leftover to
+# be cleaned up.  test_fixture_isolation.py in particular MUST keep its copy —
+# there the module-scoped TestClient is the SUBJECT UNDER TEST (its docstring:
+# "only a *session*-scoped fix satisfies both" scopes), so deleting it would
+# delete the coverage.
+#
+# The MECHANISM that records such an exception is a
+# ``# noqa: module-local-testclient — <reason>`` pragma on the line above the
+# construction, enforced by
+# ``fused-memory/scripts/check_module_local_testclient.py`` (task 4485) from
+# dashboard's ``lint_command`` and ``hooks/project-checks``.  Without that pragma
+# the lint rejects the fixture and names conftest's shared ``_client`` as the
+# remedy — so this note and the gate cannot drift apart, which is exactly what
+# happened before: task 3571 deleted five copies, asserted in its own commit
+# message that conftest and test_fixture_isolation.py were the only survivors,
+# and left a byte-identical copy in test_tab_tasks_offline_banner.py that no
+# human reviewer or purpose-built guard caught.  Task 4485 burned that copy down.
 #
 # APPEND ONLY BELOW THE sys.path BLOCK.  Adding a top-level non-stdlib import
 # above it fails test_conftest_import_guard.py's AST ordering guard.
