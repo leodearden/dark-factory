@@ -168,7 +168,7 @@ class TestClusterPathSpec:
         # scheduler and recovery -- not only the merge lane -- and its split is
         # a follow-up PRD. The exemption is scoped to the CEILING; git_ops.py is
         # still ratcheted (pinned by TestSizeCeilingExemptionIsScoped).
-        assert metrics.SIZE_CEILING_EXEMPT == frozenset({_GIT_OPS})
+        assert set(metrics.SIZE_CEILING_EXEMPT) == {_GIT_OPS}
 
     def test_ceiling_constants(self) -> None:
         assert metrics.FILE_LINE_CEILING == 1500
@@ -276,7 +276,9 @@ class TestEnumerationRoundTrip:
             requested=('a.py',), resolved=(), unreadable=('a.py',), complete=False
         )
         assert enumeration.complete is False
-        assert 'a.py' in enumeration.to_dict()['unreadable']
+        unreadable = enumeration.to_dict()['unreadable']
+        assert isinstance(unreadable, list)
+        assert 'a.py' in unreadable
 
 
 # ---------------------------------------------------------------------------
@@ -519,11 +521,11 @@ class TestReexportNames:
         # decision: the structural predicate (a module-level ImportFrom binding
         # never referenced elsewhere -- exactly what ruff's F401 computes, which
         # is why those blocks carry the suppression) must land squarely on the
-        # nine annotated `# noqa: F401  re-export shim` blocks at lines
+        # nine annotated `noqa: F401  re-export shim` blocks at lines
         # 57/64/89/112/118/150/154/188/198.
         #
         # OVERLAP, not containment, and the asymmetry is the interesting part:
-        # `# noqa: F401` suppresses a whole BLOCK, so a name that merge_queue.py
+        # a `noqa: F401` suppresses a whole BLOCK, so a name that merge_queue.py
         # both re-exports AND uses internally sits inside an annotated block
         # while being perfectly F401-clean. MEASURED on this tree: 127 names
         # across the nine blocks, 63 of them structurally unused. So the
@@ -986,7 +988,9 @@ class TestTestFileMeasures:
             if measures is None:
                 continue
             lane_files += 1
-            total_private += measures['private_reads']
+            private_reads = measures['private_reads']
+            assert isinstance(private_reads, int)
+            total_private += private_reads
         assert lane_files >= 150, lane_files
         assert total_private > 5000, total_private
 
