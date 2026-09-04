@@ -29,14 +29,14 @@ here is never misread as a liveness regression.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from test_liveness_boundary_gate import _make_workflow, _stub_iteration_helpers
 
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.scheduler import is_transient_api_requeue
-from orchestrator.workflow import ZERO_OUTPUT_HANG_REASON, WorkflowOutcome
+from orchestrator.scheduler import TerminalExitRejection, is_transient_api_requeue
+from orchestrator.workflow import ZERO_OUTPUT_HANG_REASON, WorkflowOutcome, WorkflowState
 
 
 def _zero_output_result(*, api_error_status: int | None = None, **overrides: object) -> AgentResult:
@@ -238,3 +238,93 @@ class TestExecuteIterationsRow2Row3Regression:
         assert outcome == WorkflowOutcome.BLOCKED
         assert mock_invoke.await_count == 2
         assert 'consecutive_zero_output=2' in wf._zero_output_hang_info['detail']  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# _execute_verify_review_loop — caller propagation of REQUEUED / CANCELLED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestExecuteVerifyReviewLoopPropagation:
+    """A REQUEUED (or terminal-override CANCELLED) exec outcome must leave
+    the EXECUTE→VERIFY→REVIEW loop instead of falling through into VERIFY.
+
+    Today the loop's EXECUTE arm branches only on ESCALATED and BLOCKED, so
+    an un-propagated REQUEUED would silently continue into VERIFY on a task
+    that has already been re-pended to ``pending`` elsewhere.
+    """
+
+    async def test_row1_requeued_leaves_loop_without_running_verify(
+        self, tmp_path,
+    ) -> None:
+        """(a) A 529 zero-output result requeues out of the loop; VERIFY and
+        _mark_blocked never run, and the machine stays in EXECUTE (so
+        run()'s SM-2 report.phase == machine.state check holds)."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.artifacts.get_review_cycles_total = MagicMock(return_value=0)  # type: ignore[method-assign]
+        wf.artifacts.get_amendment_rounds_total = MagicMock(return_value=0)  # type: ignore[method-assign]
+        wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
+        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+        _stub_iteration_helpers(wf, _zero_output_result(api_error_status=529))
+        wf.scheduler.set_task_status = AsyncMock()  # type: ignore[method-assign]
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        wf._verify_debugfix_loop.assert_not_awaited()
+        wf._mark_blocked.assert_not_awaited()
+        assert wf.machine.state is WorkflowState.EXECUTE
+        assert wf._terminal_report is not None
+        assert wf._terminal_report.outcome is WorkflowOutcome.REQUEUED
+        wf.scheduler.set_task_status.assert_awaited_once_with(wf.task_id, 'pending')
+
+    async def test_terminal_override_returns_cancelled_without_running_verify(
+        self, tmp_path,
+    ) -> None:
+        """(b) A terminal-exit rejection observed during the re-pend write
+        wins over the requeue intent: the loop returns CANCELLED, not
+        REQUEUED, still without running VERIFY, and leaves no REQUEUED
+        report stashed."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.artifacts.get_review_cycles_total = MagicMock(return_value=0)  # type: ignore[method-assign]
+        wf.artifacts.get_amendment_rounds_total = MagicMock(return_value=0)  # type: ignore[method-assign]
+        wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
+        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+        _stub_iteration_helpers(wf, _zero_output_result(api_error_status=529))
+        wf.scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
+            side_effect=TerminalExitRejection(
+                task_id=wf.task_id, old_status='cancelled',
+                target_status='pending', raw='terminal-exit gate',
+            )
+        )
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.CANCELLED
+        wf._verify_debugfix_loop.assert_not_awaited()
+        assert wf.machine.state is WorkflowState.CANCELLED
+        assert wf._terminal_report is None
+
+    async def test_row3_caller_regression_blocks_with_infra_issue(
+        self, tmp_path,
+    ) -> None:
+        """(c) Row 3 at the caller layer: two consecutive no-status
+        zero-output results block via ``_mark_blocked(category='infra_issue')``
+        — green before and after this task (regression guard)."""
+        wf = _make_workflow(tmp_path=tmp_path, max_consecutive_zero_output_timeouts=2)
+        wf.artifacts.get_review_cycles_total = MagicMock(return_value=0)  # type: ignore[method-assign]
+        wf.artifacts.get_amendment_rounds_total = MagicMock(return_value=0)  # type: ignore[method-assign]
+        wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
+        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+        _stub_iteration_helpers(wf, _zero_output_result(api_error_status=None))
+        wf.scheduler.set_task_status = AsyncMock()  # type: ignore[method-assign]
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        wf._mark_blocked.assert_awaited_once()
+        call_args, call_kwargs = wf._mark_blocked.await_args
+        assert ZERO_OUTPUT_HANG_REASON in call_args[0]
+        assert call_kwargs['category'] == 'infra_issue'
+        wf.scheduler.set_task_status.assert_not_awaited()
