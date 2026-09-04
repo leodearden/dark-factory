@@ -316,15 +316,22 @@ class SpliceContract:
         - UP-FRONT (``follows=None``, or a prompt that does not contain
           ``follows``): the constant's own ``##`` heading must be the prompt's
           FIRST ``##`` heading, i.e. nothing but the opening identity paragraph
-          precedes it. Optionally also within ``char_budget`` chars, a secondary
-          and deliberately loose bound that only catches a preamble which is
-          technically heading-free but pathologically long.
+          precedes it.
         - FOLLOWS: the constant must land IMMEDIATELY after ``follows``, with no
           gap. A second splice unit cannot go AHEAD of the first without breaking
           the first's up-front invariant, so "immediately after" is the only spot
           left; it falls back to the up-front rule for a role that carries no
           such predecessor (``judge`` today), derived at runtime from whether the
           predecessor is present rather than hardcoded to a role name.
+
+        ``char_budget`` is an INDEPENDENT secondary bound, applied on top of
+        WHICHEVER of those two rules was selected — not a sub-clause of the
+        up-front one. It is deliberately loose: it only catches a preamble that
+        is technically heading-free (or a predecessor block that is correctly
+        abutted) but pathologically long. Applying it in one arm only would hand
+        a caller who passes both ``follows`` and ``char_budget`` a check that
+        does nothing on every role carrying the predecessor, which is the
+        vacuous-assertion class this whole module exists to prevent.
 
         ABSENT IS RECORDED, NEVER SKIPPED, in both modes. With no index to
         compare, skipping would make "no offender found" read as "correctly
@@ -342,16 +349,29 @@ class SpliceContract:
                 offenders[role_name] = {'offset': 'ABSENT'}
                 continue
 
+            payload: dict[str, object] = {}
             predecessor_idx = -1 if follows is None else prompt.find(follows)
             if predecessor_idx != -1:
                 assert follows is not None  # narrowed by predecessor_idx != -1
                 expected = predecessor_idx + len(follows)
                 if idx != expected:
-                    offenders[role_name] = {'offset': idx, 'expected_after': expected}
+                    payload = {'offset': idx, 'expected_after': expected}
             else:
                 first_heading = prompt.find(MARKDOWN_HEADING)
-                if idx != first_heading or (char_budget is not None and idx >= char_budget):
-                    offenders[role_name] = {'offset': idx, 'first_heading': first_heading}
+                if idx != first_heading:
+                    payload = {'offset': idx, 'first_heading': first_heading}
+
+            # The budget is applied AFTER whichever placement rule was selected,
+            # never only inside the up-front arm: a caller passing BOTH `follows`
+            # and `char_budget` would otherwise get a budget that silently does
+            # nothing on every role that carries the predecessor, while the
+            # failure message below claims the bound was enforced.
+            if char_budget is not None and idx >= char_budget:
+                payload['offset'] = idx
+                payload['over_budget'] = char_budget
+
+            if payload:
+                offenders[role_name] = payload
 
         rule = (
             f'immediately after {follows_name} where that block is present, '
@@ -359,9 +379,11 @@ class SpliceContract:
             if follows is not None
             else 'the first `##`-headed section'
         )
-        budget = '' if char_budget is None else f', within {char_budget} chars'
+        budget = '' if char_budget is None else f', and within {char_budget} chars'
         assert offenders == {}, (
             f'Roles placing {name} incorrectly: {offenders}. It must be '
             f'{rule}{budget} (offset == the landmark index). An `offset` of '
-            f"'ABSENT' means the role dropped the splice entirely. {remedy}"
+            f"'ABSENT' means the role dropped the splice entirely; an "
+            f'`over_budget` entry means it landed at or past the char budget. '
+            f'{remedy}'
         )

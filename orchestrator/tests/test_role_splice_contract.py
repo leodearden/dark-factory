@@ -683,3 +683,56 @@ def test_placement_char_budget_none_means_no_budget_check(follows: str | None) -
         contract.assert_placement(follows=follows, follows_name='PREDECESSOR', remedy=_REMEDY)
         is None
     )
+
+
+def test_placement_char_budget_applies_in_follows_mode_too() -> None:
+    """`char_budget` is enforced ALONGSIDE `follows`, not only in the up-front arm.
+
+    The regression this pins: the budget comparison once lived inside the
+    up-front fallback branch, so a role that DID carry the predecessor took the
+    `follows` branch and never met the budget at all — while the failure message
+    still claimed "within N chars". A caller passing both got a silently
+    vacuous bound, which is the exact failure class this module exists to catch.
+
+    Both roles below are structurally PERFECT in `follows` mode — the splice
+    abuts its predecessor with no gap — so the budget is the only thing that can
+    distinguish them, and the fire half cannot pass by accident on the
+    placement rule.
+    """
+    preamble = 'A very long identity paragraph. ' * 60  # ~1920 chars, no heading
+    far = _contract(
+        _roles(alpha=f'{preamble}{_PREDECESSOR}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    # Structurally correct on the placement rule alone: no budget, no offender.
+    assert (
+        far.assert_placement(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+        is None
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        far.assert_placement(
+            follows=_PREDECESSOR,
+            follows_name='PREDECESSOR',
+            char_budget=1500,
+            remedy=_REMEDY,
+        )
+    message = str(excinfo.value)
+    assert 'alpha' in message
+    assert 'over_budget' in message
+    assert _REMEDY in message
+
+    near = _contract(
+        _roles(alpha=f'{_IDENTITY}{_PREDECESSOR}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+    assert (
+        near.assert_placement(
+            follows=_PREDECESSOR,
+            follows_name='PREDECESSOR',
+            char_budget=1500,
+            remedy=_REMEDY,
+        )
+        is None
+    )
