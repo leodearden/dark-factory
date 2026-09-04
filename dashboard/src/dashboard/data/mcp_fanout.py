@@ -331,6 +331,15 @@ async def first_success(
 
     - ``httpx.ConnectError`` / ``httpx.TimeoutException`` / ``httpx.HTTPStatusError``
       — a transport-level failure;
+    - the builtin ``TimeoutError`` — a whole-operation expiry. It is listed
+      *in addition to* ``httpx.TimeoutException`` because the two are
+      unrelated types: ``httpx.TimeoutException`` derives from
+      ``httpx.HTTPError``, **not** from the builtin, so catching one does not
+      catch the other. Before it was listed here a bare ``TimeoutError`` (the
+      type ``asyncio.wait_for`` raises on expiry) propagated uncaught, which
+      is why ``metrics.py`` hand-converts ``TimeoutError`` into ``ValueError``
+      before calling in. That conversion is still correct — it happens before
+      this frame sees the exception — and is deliberately left in place;
     - ``ValueError`` — a caller-detected "soft failure" (e.g. a structured
       MCP error dict or an empty/malformed result) that *call* raises to
       signal fall-through;
@@ -373,7 +382,7 @@ async def first_success(
         try:
             result = await call(url)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
+                TimeoutError, ValueError) as e:
             if log_failures:
                 log_fanout_failure(log_label, url, e)
             errors.append(f'{url}: {describe_exc(e)}')
