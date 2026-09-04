@@ -13,10 +13,14 @@ from __future__ import annotations
 import ast
 import importlib.util
 import re
+import shutil
 import subprocess
 import sys
 import types
 from pathlib import Path
+
+import pytest
+import yaml
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -587,3 +591,140 @@ class TestRealDashboardTestsDirectoryIsClean:
             f'No test_*.py files discovered under {_DASHBOARD_TESTS} — the cleanliness'
             f' assertion above would pass vacuously.'
         )
+
+
+_HOOKS_PATH = _REPO_ROOT / 'hooks' / 'project-checks'
+_DASHBOARD_YAML = _REPO_ROOT / 'dashboard' / 'orchestrator.yaml'
+_VERIFY_CMD_PATH = _REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'verify_cmd.py'
+
+
+def _live_dashboard_lint_command() -> str:
+    """The dashboard lint_command as the orchestrator actually reads it — through YAML."""
+    config = yaml.safe_load(_DASHBOARD_YAML.read_text(encoding='utf-8'))
+    return config['lint_command']
+
+
+def _load_verify_cmd() -> types.ModuleType:
+    """Load orchestrator.verify_cmd by PATH.
+
+    ``orchestrator`` is not installed in fused-memory's environment, but
+    verify_cmd.py's top-level imports are all stdlib (posixpath, re, shlex,
+    collections.abc, dataclasses, enum), so it loads standalone.  The module
+    must be registered in ``sys.modules`` BEFORE exec_module: its ``@dataclass``
+    decorators resolve ``cls.__module__`` through that table and raise
+    AttributeError otherwise.
+
+    Loading the REAL module (rather than skipping, or reimplementing the split)
+    is what keeps this assertion non-vacuous.
+    """
+    spec = importlib.util.spec_from_file_location('_vc_for_4485', _VERIFY_CMD_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {_VERIFY_CMD_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['_vc_for_4485'] = module
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+class TestWiring:
+    """The gate must actually be wired, in both places, in the shape verify can scope.
+
+    Mirrors TestHooksIntegration in test_check_asyncmock_assertion_style.py,
+    including its comment-stripping and word-boundary technique.
+    """
+
+    def test_hook_invokes_check_with_python3_not_uv_run(self):
+        """hooks/project-checks must invoke the checker via a python3 token, scoped to dashboard/tests.
+
+        The filter checks `'check_module_local_testclient.py' in line.split('#')[0]`
+        so the script name must appear in the NON-COMMENT portion of the line.
+        That excludes both full-line bash comments and inline trailing ones,
+        either of which would otherwise land in invocation_lines and fail the
+        python3/no-uv-run assertions on a benign edit.
+        """
+        content = _HOOKS_PATH.read_text(encoding='utf-8')
+        invocation_lines = [
+            line for line in content.splitlines()
+            if 'check_module_local_testclient.py' in line.split('#')[0]
+        ]
+        assert invocation_lines, (
+            'No invocation of check_module_local_testclient.py found in hooks/project-checks'
+        )
+        assert any(
+            'dashboard/tests' in line.split('#')[0] for line in content.splitlines()
+        ), 'Expected dashboard/tests scan target in non-comment code in hooks/project-checks'
+
+        for line in invocation_lines:
+            assert re.search(r'\bpython3(?:\.\d+)?\b', line), (
+                f'Expected a python3 token (plain, versioned, or absolute path), got: {line!r}'
+            )
+            assert 'uv run' not in line, (
+                f'Found uv run in the checker invocation (should use plain python3): {line!r}'
+            )
+
+    def test_dashboard_lint_command_carries_the_checker_leg(self):
+        """Read through YAML, exactly as the orchestrator reads it — not grepped."""
+        cmd = _live_dashboard_lint_command()
+
+        assert cmd.startswith('uv run --directory dashboard ruff check'), (
+            f'dashboard lint_command lost its ruff head: {cmd!r}'
+        )
+        legs = [leg.strip() for leg in cmd.split('&&')]
+        checker_legs = [
+            leg for leg in legs if 'check_module_local_testclient.py' in leg
+        ]
+        assert len(checker_legs) == 1, f'Expected exactly one checker leg, got {checker_legs}'
+        assert checker_legs[0].endswith('dashboard/tests'), (
+            f'Checker leg must target dashboard/tests: {checker_legs[0]!r}'
+        )
+        assert re.search(r'\bpython3(?:\.\d+)?\b', checker_legs[0]), checker_legs[0]
+
+    def test_split_chain_tail_preserves_both_checker_legs_verbatim(self):
+        """The 3-segment chain must survive verify's scoper with BOTH checker legs intact.
+
+        This is the property orchestrator/tests/test_verify_cmd.py already pins
+        for the 3-segment FM_LINT_COMMAND — the standing precedent that a second
+        `&& python3` leg survives scoping. Dashboard becomes the second such chain.
+        """
+        verify_cmd = _load_verify_cmd()
+        cmd = _live_dashboard_lint_command()
+
+        head, tail = verify_cmd.split_chain_tail(cmd, 'ruff check')
+        assert tail, f'split_chain_tail dropped the whole chain for {cmd!r}'
+        assert head + tail == cmd, 'split_chain_tail is not byte-exact on the dashboard chain'
+        assert 'check_bare_magicmock_config.py' in tail, 'the magicmock leg was dropped'
+        assert 'check_module_local_testclient.py' in tail, 'the new checker leg was dropped'
+
+    def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
+        """Running under `python3 -I -S` proves the script imports only stdlib.
+
+        `-I` alone does not block venv site-packages; `-I -S` additionally skips
+        site.py, so any accidental third-party import raises ModuleNotFoundError
+        at interpreter startup. Uses PATH python3 (not sys.executable) on purpose:
+        that mirrors the hook's runtime assumption.
+
+        Two cases, so a third-party import added inside a scan-only or
+        print-only code path cannot slip past: an empty directory (startup), and
+        a violating file (parse, scan AND the violation-printing branch).
+        """
+        if shutil.which('python3') is None:
+            pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
+
+        empty = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True, text=True,
+        )
+        assert empty.returncode == 0, (
+            f'Script failed under python3 -I -S (unexpected import?):\n{empty.stderr}'
+        )
+        assert empty.stdout == ''
+
+        (tmp_path / 'test_bad.py').write_text(_MODULE_LOCAL_CLIENT_FIXTURE)
+        bad = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True, text=True,
+        )
+        assert bad.returncode == 1, (
+            f'Expected exit 1 under python3 -I -S:\n{bad.stdout}\n{bad.stderr}'
+        )
+        assert 'test_bad.py' in bad.stdout
