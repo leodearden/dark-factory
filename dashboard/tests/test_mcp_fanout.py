@@ -112,6 +112,72 @@ class TestFirstSuccessPerExceptionFailover:
         )
 
 
+
+# ── (b2) a builtin TimeoutError is a per-URL failure, not a propagating error ─
+
+
+class TestFirstSuccessTimeoutIsAFailure:
+    """A bare builtin ``TimeoutError`` from *call* falls through like any failure.
+
+    ``httpx.TimeoutException`` is NOT a subclass of the builtin
+    ``TimeoutError`` — they share only ``Exception`` — so a ``call`` closure
+    raising the builtin (the type ``asyncio.wait_for`` raises on expiry)
+    escaped first_success's catch tuple entirely and propagated to the caller,
+    skipping the WARNING, the collected error string and the session teardown.
+    ``metrics.py`` hand-converts ``TimeoutError`` into ``ValueError`` before it
+    can reach here precisely because of that gap; catching it directly closes
+    it for the call sites that do not.
+    """
+
+    async def test_timeout_error_falls_through_and_invalidates(self, caplog):
+        from dashboard.data.memory import _get_session, _sessions
+
+        _get_session('http://x')
+        assert 'http://x' in _sessions
+
+        async def call(url):
+            if url == 'http://x':
+                raise TimeoutError('slow')
+            return 'ok'
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            result = await first_success(
+                ['http://x', 'http://y'], call,
+                log_label='test', offline_result=_offline_result,
+            )
+
+        assert result == 'ok', 'a timed-out url must fall through to the next one'
+        assert 'http://x' not in _sessions, (
+            "a builtin TimeoutError must invalidate the failing url's session"
+        )
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f'expected exactly one WARNING for the timed-out url, got {warnings}'
+        )
+        assert 'http://x' in warnings[0] and 'TimeoutError' in warnings[0], (
+            f'the warning must name the url and the exception type, got {warnings[0]}'
+        )
+
+    async def test_all_urls_timing_out_returns_the_offline_sentinel(self):
+        urls = ['http://a', 'http://b']
+
+        async def call(url):
+            raise TimeoutError(f'{url} slow')
+
+        result = await first_success(
+            urls, call, log_label='test', offline_result=_offline_result,
+        )
+
+        assert result['offline'] is True
+        assert 'http://a' in result['error']
+        assert 'http://b' in result['error']
+        assert 'TimeoutError' in result['error'], (
+            f'the operator must be told the cause was a timeout, got {result["error"]}'
+        )
+
 # ── (c) all-fail → offline_result(errors) ────────────────────────────
 
 
