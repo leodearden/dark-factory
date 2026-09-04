@@ -1796,7 +1796,29 @@ class TargetedReconciler:
         # I/O and _on_task_done runs on the shared fused-memory event loop
         # (INV-8) — following _escalation_pin_index_for's precedent, not
         # _sweep_escalate_l1's older un-offloaded inline call.
-        esc_id = await asyncio.to_thread(_file)
+        #
+        # Contained HERE rather than at the call site, and this placement is
+        # the whole point rather than a stylistic choice.  The call site sits
+        # inside _on_task_done's broad verify `except`, so an escaping raise
+        # would (a) skip the contradiction memory write entirely, costing the
+        # corpus its record over a filesystem outage, (b) emit a spurious
+        # `post_verify_error` row that both double-counts task 4343's verify
+        # census and blames the verifier for a queue failure, and (c) log the
+        # misleading generic 'Verification failed for task' message.  A broken
+        # escalation store must cost the escalation and nothing else — which is
+        # also why this is a warn-and-return-None arm (_sweep_escalate_l1's
+        # precedent) and not a silent `except Exception: pass`: the failure
+        # still has to be visible to an operator.
+        # asyncio.to_thread re-raises in the awaiting coroutine, so this one
+        # try covers construction, make_id and submit alike.
+        try:
+            esc_id = await asyncio.to_thread(_file)
+        except Exception as e:
+            logger.warning(
+                'verification_contradicted_escalate_failed task=%s project_root=%s: %s',
+                task_id, project_root, e,
+            )
+            return None
         return {
             'type': 'verification_contradicted_escalated',
             'task_id': task_id,
