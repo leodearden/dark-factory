@@ -970,6 +970,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # loud-failure property its existing consumers rely on.
 _SCOPE_PREFIX = 'fused-memory/src/'
 
+# How many out-of-scope first-party files the scope-filter test may read before
+# giving up. It stops at the FIRST file that yields a finding (the 4th, at the
+# task 4484 amendment pass); the cap only bounds the pathological case, so the
+# gate cannot become slow because the other six scope roots got clean.
+_OUT_OF_SCOPE_PROBE_CAP = 80
+
 
 class _TreeScan(NamedTuple):
     """Cached result of one whole-tree sweep (session-scoped)."""
@@ -1016,15 +1022,48 @@ class TestSweepIsNotVacuous:
             f'synthetic fixtures above before believing the tree got clean.'
         )
 
-    def test_every_finding_is_inside_the_declared_scope(self, tree_scan):
-        """The 7-root generator's output really was filtered to fused-memory/src."""
-        strays = sorted({
-            f.filename for f in tree_scan.findings
-            if not f.filename.startswith(_SCOPE_PREFIX)
-        })
+    def test_the_prefix_filter_is_what_keeps_the_ledger_scoped(self, tree_scan):
+        """Out-of-scope first-party files DO yield findings; the filter excludes them.
+
+        Asserting that no finding in ``tree_scan`` lies outside
+        ``_SCOPE_PREFIX`` would test nothing: the fixture only inserts a path
+        into ``sources`` when it starts with that prefix, so the property holds
+        by construction one function above the assertion.
+
+        This scans out-of-scope files INDEPENDENTLY (bounded, one file at a
+        time, stopping at the first that yields anything -- ~4 files and well
+        under a second in practice) and then checks those keys are absent from
+        the ledger sweep.  Delete the prefix filter from the fixture and this
+        goes red, which is what the earlier version could not do.
+        """
+        probe: list[LoopBlockingSite] = []
+        scanned = 0
+        for path in iter_first_party_files(_REPO_ROOT):
+            rel = path.relative_to(_REPO_ROOT).as_posix()
+            if rel.startswith(_SCOPE_PREFIX):
+                continue
+            scanned += 1
+            probe.extend(find_loop_blocking_sites(
+                {rel: path.read_text(encoding='utf-8', errors='replace')}
+            ))
+            if probe or scanned >= _OUT_OF_SCOPE_PROBE_CAP:
+                break
+
+        assert probe, (
+            f'no out-of-scope finding in the first {scanned} first-party files '
+            f'outside {_SCOPE_PREFIX} -- either the other six scope roots got '
+            f'clean (measured: 123 findings across 294 files at the task 4484 '
+            f'amendment pass) or the sweep is broken. Without one, this test '
+            f'cannot show the filter is doing anything.'
+        )
+
+        swept = {site_key(f) for f in tree_scan.findings}
+        strays = sorted(site_key(f) for f in probe if site_key(f) in swept)
         assert strays == [], (
-            f'findings outside {_SCOPE_PREFIX}: {strays}. Widening the gate is a '
-            f'deliberate decision (see the _SCOPE_PREFIX comment), not a drift.'
+            f'out-of-scope sites reached the ledger sweep: {strays}. Widening '
+            f'the gate past {_SCOPE_PREFIX} is a deliberate decision with '
+            f'merge-lane consequences (see the _SCOPE_PREFIX comment), not a '
+            f'drift.'
         )
 
 
@@ -1074,13 +1113,37 @@ class TestKnownSiteFloor:
             f'without updating this floor.'
         )
 
-    def test_task_4201_sites_are_a_subset_not_an_equality(self, tree_scan):
-        """Whichever of 4201's two sites remain must still be reported."""
-        found = self._curator_sites(tree_scan)
-        remaining = self._FILED_4201 & found
+    def test_surviving_4201_sites_are_still_dispositioned_filed(self, tree_scan):
+        """Whichever of 4201's sites remain must still be blessed as ``filed``.
 
-        assert remaining <= found
-        assert found >= self._UNFILED
+        A subset check is right -- when 4201 lands its sites disappear and this
+        gate must not go red -- but ``remaining <= found`` on an intersection is
+        a tautology and asserts nothing.  The falsifiable property is the one
+        that actually matters while 4201 is in flight: a site 4201 owns must
+        keep a ledger row saying so, rather than being quietly re-blessed as
+        ``accepted`` (a permanent waiver for a defect somebody is fixing) or
+        losing its row.
+        """
+        filed_keys = {
+            (relpath, qualname, content_hash)
+            for relpath, qualname, content_hash, disposition, _why in AUDITED_SITES
+            if disposition == 'filed'
+        }
+
+        surviving = [
+            f for f in tree_scan.findings
+            if f.filename == self._CURATOR and (f.qualname, f.callee) in self._FILED_4201
+        ]
+        undispositioned = sorted(
+            (f.qualname, f.callee) for f in surviving if site_key(f) not in filed_keys
+        )
+
+        assert undispositioned == [], (
+            f'task 4201 owns {undispositioned}, but the ledger no longer carries '
+            f'a "filed" row for them. If 4201 landed, DELETE the rows (and this '
+            f'floor entry); do not downgrade them to "accepted", which turns a '
+            f'defect someone is fixing into a permanent waiver.'
+        )
 
 
 class TestRatchet:
