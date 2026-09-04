@@ -79,12 +79,23 @@ def _cli_timeout_from_env(default: float = 60.0) -> float:
     always exports the var) is treated as "not overridden" rather than an
     error — otherwise this escape hatch would itself fail the *entire*
     module's collection, including the pure-unit tests here that never spawn
-    a subprocess.
+    a subprocess. A present-but-malformed value (non-numeric or non-positive)
+    still fails loudly, naming the offending value, rather than silently
+    falling back and masking a typo'd override.
     """
     raw = os.environ.get("RECON_BUSY_CHECK_TEST_TIMEOUT", "").strip()
     if not raw:
         return default
-    return float(raw)
+    error = ValueError(
+        f"RECON_BUSY_CHECK_TEST_TIMEOUT must be a positive number of seconds; got {raw!r}"
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        raise error from None
+    if value <= 0:
+        raise error
+    return value
 
 
 def _run_cli(stdin_text: str) -> subprocess.CompletedProcess:
