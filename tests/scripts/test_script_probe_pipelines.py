@@ -41,6 +41,7 @@ from shell_sections import (
     REPO_ROOT,
     run_with_preamble,
     slice_section,
+    slice_shell_function,
     stub_bin_dir,
     write_stub,
 )
@@ -363,6 +364,21 @@ _HEALTHY = "OK FalkorDB healthy"
 _NOT_HEALTHY = "WARN FalkorDB did not become healthy in 30s"
 
 
+def _falkordb_probe(start, end, *, end_after=None):
+    """An import-data.sh section, with the real `falkordb_pings` prepended.
+
+    Both `redis-cli ping` sites call that helper, and it is defined up beside
+    the logging shims — OUTSIDE either slice, so a bare slice would die at exit
+    127. `slice_shell_function` lifts the SHIPPED definition, so these tests
+    still assert on the script's own probe rather than on a copy the harness
+    wrote for itself; and it fails LOUDLY if the helper is ever renamed, rather
+    than leaving the suite green against a probe the script no longer has.
+    """
+    return slice_shell_function(IMPORT_DATA_PATH, "falkordb_pings") + slice_section(
+        IMPORT_DATA_PATH, start, end, end_after=end_after
+    )
+
+
 def _run_import_wait(tmp_path, exec_body):
     """Slice import-data.sh's section-7 wait loop and run it against a scripted docker.
 
@@ -372,7 +388,7 @@ def _run_import_wait(tmp_path, exec_body):
     """
     return _run_probe(
         tmp_path,
-        slice_section(IMPORT_DATA_PATH, _IMPORT_WAIT_START, _IMPORT_WAIT_END),
+        _falkordb_probe(_IMPORT_WAIT_START, _IMPORT_WAIT_END),
         docker_body=_dispatch_stub_body((('*" exec "*', exec_body),)),
     )
 
@@ -440,8 +456,7 @@ def _run_import_health(tmp_path, exec_body):
     """Slice import-data.sh's section-8 health check and run it against a scripted docker."""
     return _run_probe(
         tmp_path,
-        slice_section(
-            IMPORT_DATA_PATH,
+        _falkordb_probe(
             _IMPORT_HEALTH_START,
             _IMPORT_HEALTH_END,
             end_after=_IMPORT_HEALTH_END_AFTER,
