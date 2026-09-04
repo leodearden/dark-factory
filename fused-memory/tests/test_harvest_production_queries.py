@@ -698,6 +698,49 @@ class TestTheJournalPathIsRepoRelative:
         assert Path(result.journal_path).name == 'journal.db'
 
 
+class TestTheCommittedArtifactsCarryNoAbsolutePath:
+    """The published artifacts must not name anyone's home directory either.
+
+    NEW coverage: nothing anywhere read
+    `fixtures/production_query_sample.provenance.json` from disk, so the leak
+    was entirely unguarded.  Pure file reads -- no network, no Qdrant, no
+    OPENAI_API_KEY -- so this stays inside the lane discipline stated in this
+    module's header docstring.
+    """
+
+    def test_the_committed_sidecar_records_a_repo_relative_journal_path(self):
+        import json  # noqa: PLC0415
+
+        sidecar = FIXTURES_DIR / 'production_query_sample.provenance.json'
+        value = json.loads(sidecar.read_text(encoding='utf-8'))['journal_path']
+
+        assert not Path(value).is_absolute()
+        assert '/home/' not in value
+        # So the guard cannot be satisfied by blanking the field.
+        assert value.endswith('write_journal.db')
+
+    def test_the_committed_selection_report_carries_the_same_relative_path(self):
+        """Pins the PROPAGATION path, which is otherwise invisible.
+
+        `read_transform_selection.py` copies sidecar keys into
+        `block['harvest']` through a key-name whitelist guarded by
+        `if key in sidecar`, so a silent divergence between the two committed
+        artifacts would produce no error anywhere.
+        """
+        import json  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        report = Path(__file__).parents[2] / 'plans' / 'read-transform-selection-report.json'
+        if not report.exists():  # partial checkout
+            pytest.skip('selection report not present in this checkout')
+        sidecar = FIXTURES_DIR / 'production_query_sample.provenance.json'
+
+        expected = json.loads(sidecar.read_text(encoding='utf-8'))['journal_path']
+        published = json.loads(report.read_text(encoding='utf-8'))
+        assert published['production_queries']['harvest']['journal_path'] == expected
+
+
 class TestLoudDegradation:
     """An unreadable journal is a named error, never an empty sample."""
 
