@@ -31,11 +31,21 @@ holds this exact class of repo-wide structural sweep:
     verify budget.
 
 Being repo-level is also what makes this module's two HARD assertions correct:
-``assert root.is_dir()`` in ``_iter_source_files`` and the stale-entry assertion
-in ``test_no_unapproved_renamers_in_source_trees``.  At the repo root every
-declared tree is guaranteed present, so neither needs the ``pytest.skip`` /
+``assert root.is_dir()`` in ``_read_tree`` (which backs ``_iter_source_files``)
+and the stale-entry assertion in
+``test_no_unapproved_renamers_in_source_trees``.  At the repo root every SCANNED
+tree is guaranteed present, so neither needs the ``pytest.skip`` /
 warning-downgrade fallback that a package-local guard would have had to adopt.
 Both carry a comment saying so at their site.
+
+That word SCANNED is load-bearing and was added by measurement, not by
+tidying.  The argument above — a missing tree means the fence silently covers
+less — holds only for trees the fence walks.  ``_POINTER_OPTIONAL_TREES`` names
+sibling packages this guard does NOT fence and reads only for
+documentation-pointer hygiene; those DO warn and skip, because an absent
+optional package there once turned this guard red for a reason with nothing to
+do with atomic writes.  The two dispositions are the same
+loud-over-silent rule applied to different stakes, not an inconsistency.
 
 COLLECTED TWICE, DELIBERATELY.  ``tests/scripts/orchestrator.yaml`` collects
 this directory, and so does ``scripts/orchestrator.yaml``
