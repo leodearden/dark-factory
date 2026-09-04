@@ -755,35 +755,44 @@ class TestAddEpisode:
         assert call_kwargs['payload']['project_id'] == 'test'
 
     @pytest.mark.asyncio
-    async def test_enqueue_payload_contains_uuid(self, service):
-        """The enqueue payload must include 'uuid' matching the returned episode_id."""
-        result = await service.add_episode(
+    async def test_enqueue_payload_omits_uuid(self, service):
+        """The enqueue payload must NOT carry 'uuid' (task 3561).
+
+        Inverted from the old contract ("payload must include 'uuid' matching
+        the returned episode_id"), which was fatal: graphiti_core reads a
+        caller-supplied uuid as "LOAD this existing episode", so a
+        freshly-minted one is unconditionally NodeNotFoundError. The uuid is
+        minted by graphiti_core and read back off result.episode.uuid.
+        """
+        await service.add_episode(
             content='User discussed auth changes',
             project_id='test',
         )
         call_kwargs = service.durable_queue.enqueue.call_args[1]
         payload = call_kwargs['payload']
-        assert 'uuid' in payload, "Payload must include 'uuid' field"
-        assert payload['uuid'] == result.episode_id
+        assert 'uuid' not in payload, (
+            "Payload must not carry 'uuid' — graphiti_core would try to LOAD "
+            f'that node and raise NodeNotFoundError; got {payload.get("uuid")!r}'
+        )
 
 
 class TestExecuteGraphitiWrite:
     @pytest.mark.asyncio
-    async def test_uuid_passed_to_graphiti_backend(self, service):
-        """_execute_graphiti_write must forward uuid from payload to graphiti.add_episode."""
-        test_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-        payload = {
-            'uuid': test_uuid,
-            'name': 'episode_aaaaaaaa',
-            'content': 'test content',
-            'source': 'text',
-            'group_id': 'test',
-            'source_description': '',
-        }
+    async def test_none_uuid_passed_to_graphiti_backend(self, service):
+        """The enqueue->execute path must reach graphiti.add_episode with uuid=None.
+
+        Inverted from the old contract ("must forward uuid from payload to
+        graphiti.add_episode", task 3561). uuid=None is the only value
+        graphiti_core's CREATE branch accepts — any other value is read as
+        "LOAD this existing episode" and raises NodeNotFoundError.
+        """
+        await service.add_episode(content='test content', project_id='test')
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+
         await service._execute_graphiti_write('add_episode', payload)
         service.graphiti.add_episode.assert_called_once()
         call_kwargs = service.graphiti.add_episode.call_args[1]
-        assert call_kwargs.get('uuid') == test_uuid
+        assert call_kwargs.get('uuid') is None
 
     @pytest.mark.asyncio
     async def test_missing_uuid_passes_none(self, service):
@@ -6313,13 +6322,24 @@ class TestExecuteGraphitiWritePlanningRegistration:
     @pytest.mark.asyncio
     async def test_planning_episode_registered_in_registry(self, service):
         """After successful graphiti.add_episode with temporal_context='planning',
-        the episode UUID should be registered in the planned_episode_registry."""
+        the MINTED episode UUID (result.episode.uuid) is registered.
+
+        Task 3561: registration used to key on payload['uuid'], a caller-minted
+        value that named no graph node — so the search filter could never match
+        it. It now keys on the uuid graphiti_core actually created.
+        """
+        from types import SimpleNamespace
+
+        from _fm_helpers import MockAddEpisodeResult
+
         mock_registry = MagicMock()
         mock_registry.register = AsyncMock()
         service.planned_episode_registry = mock_registry
+        service.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid='real-uuid'))
+        )
 
         payload = {
-            'uuid': 'episode-plan-uuid',
             'name': 'episode_plan',
             'content': 'PRD content',
             'source': 'text',
@@ -6329,7 +6349,7 @@ class TestExecuteGraphitiWritePlanningRegistration:
         }
         await service._execute_graphiti_write('add_episode', payload)
 
-        mock_registry.register.assert_called_once_with('episode-plan-uuid', 'myproject')
+        mock_registry.register.assert_called_once_with('real-uuid', 'myproject')
 
     @pytest.mark.asyncio
     async def test_no_temporal_context_skips_registration(self, service):

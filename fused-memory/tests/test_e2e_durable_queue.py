@@ -102,8 +102,16 @@ class TestIntegrationFlow:
         assert stats['counts'].get('completed', 0) == 0
 
     @pytest.mark.asyncio
-    async def test_add_episode_uuid_survives_full_flow(self, integrated_service):
-        """add_episode uuid passes through queue serialization to graphiti.add_episode."""
+    async def test_add_episode_reaches_backend_with_no_uuid_full_flow(
+        self, integrated_service
+    ):
+        """The full enqueue/serialize/drain path calls graphiti.add_episode with uuid=None.
+
+        Retargeted from the old "uuid survives the full flow" contract (task
+        3561): surviving the flow was the DEFECT. graphiti_core reads a
+        caller-supplied uuid as "LOAD this existing episode", so anything but
+        None here is NodeNotFoundError once the write actually executes.
+        """
         svc = integrated_service
         svc.graphiti.add_episode.return_value = None
 
@@ -121,7 +129,7 @@ class TestIntegrationFlow:
         )
         svc.graphiti.add_episode.assert_called_once()
         call_kwargs = svc.graphiti.add_episode.call_args[1]
-        assert call_kwargs.get('uuid') == result.episode_id
+        assert call_kwargs.get('uuid') is None
 
     @pytest.mark.asyncio
     async def test_add_episode_processed_with_callback(self, integrated_service):

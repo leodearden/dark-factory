@@ -5580,9 +5580,20 @@ class MemoryService:
                 payload['group_id'], reconcile_stats,
             )
 
-        # Register planning episodes so they can be filtered from search results
+        # Register planning episodes so they can be filtered from search results.
+        #
+        # Keys on the uuid graphiti_core actually MINTED (result.episode.uuid),
+        # not on any payload uuid (task 3561). The payload never carries one
+        # any more, and even when it did the value named no graph node — so
+        # registration was vacuous and the search filter at _search_graphiti
+        # (which matches these uuids against edge episode provenance) could
+        # never match anything.
+        #
+        # getattr-chained rather than attribute access because a None result
+        # must not crash this path — see
+        # test_execute_graphiti_write_none_result_no_crash.
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
-            episode_uuid = payload.get('uuid')
+            episode_uuid = getattr(getattr(result, 'episode', None), 'uuid', None)
             group_id = payload.get('group_id')
             if episode_uuid and group_id:
                 await self.planned_episode_registry.register(episode_uuid, group_id)
@@ -5889,11 +5900,25 @@ class MemoryService:
         success = True
         error_msg = None
         try:
+            # NO 'uuid' KEY — deliberately (task 3561). graphiti_core's
+            # Graphiti.add_episode does
+            #     episode = (await EpisodicNode.get_by_uuid(self.driver, uuid)
+            #                if uuid is not None
+            #                else EpisodicNode(...))
+            # so a caller-supplied uuid means "LOAD this EXISTING episode",
+            # never "create the new episode under this uuid". Handing it a
+            # freshly-minted uuid is therefore unconditionally
+            # NodeNotFoundError — which is exactly what commit 64cb2538fe did
+            # when it added this key. That commit was written against the
+            # older upstream behaviour where a supplied uuid became the new
+            # node's uuid; upstream reversed the semantic in PR 219 (commit
+            # e42d3ae, 2024-12-02), and every add_episode write has failed
+            # since. Let graphiti_core mint the uuid and read the real one
+            # back off result.episode.uuid in _execute_graphiti_write.
             await self.durable_queue.enqueue(
                 group_id=scope.graphiti_group_id,
                 operation='add_episode',
                 payload={
-                    'uuid': episode_id,
                     'name': f'episode_{episode_id[:8]}',
                     'content': content,
                     'source': source_name,

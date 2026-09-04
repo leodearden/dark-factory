@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -287,10 +288,18 @@ class TestBatchPlanAutoTagRoundTrip:
         registers the episode as planned, excludes its edge from default search,
         and surfaces it with include_planned=True.
         """
-        from _fm_helpers import MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         svc, reg = service_with_real_registry
         project_id = 'integ-batch-plan-001'
+
+        # The uuid graphiti_core mints for this episode (task 3561). Registration
+        # keys on result.episode.uuid, NOT on the tool's returned episode_id —
+        # that value is a correlation id for the queued write and names no node.
+        episode_uuid = 'graphiti-minted-batch-plan-uuid'
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=episode_uuid))
+        )
 
         # Inline the durable queue: capture the enqueued payload and run it
         # through _execute_graphiti_write synchronously so registration runs
@@ -304,7 +313,7 @@ class TestBatchPlanAutoTagRoundTrip:
 
         mcp_server = create_mcp_server(svc)
 
-        result = await mcp_server._tool_manager.call_tool(
+        await mcp_server._tool_manager.call_tool(
             'add_episode',
             {
                 'content': (
@@ -314,11 +323,10 @@ class TestBatchPlanAutoTagRoundTrip:
                 'project_id': project_id,
             },
         )
-        episode_id = result['episode_id']
 
-        # (a) auto-tag → registered as planned
-        assert await reg.is_planned(episode_id) is True, (
-            f'Batch-plan episode {episode_id!r} should be auto-tagged planning '
+        # (a) auto-tag → registered as planned, under the MINTED uuid
+        assert await reg.is_planned(episode_uuid) is True, (
+            f'Batch-plan episode {episode_uuid!r} should be auto-tagged planning '
             f'and registered in the planned-episode registry'
         )
 
@@ -327,7 +335,7 @@ class TestBatchPlanAutoTagRoundTrip:
             MockEdge(
                 fact='Merge-queue modularization was extracted',
                 uuid='edge-batch-1',
-                episodes=[episode_id],
+                episodes=[episode_uuid],
             )
         ])
         scope = Scope(project_id=project_id)
@@ -377,10 +385,18 @@ class TestProposedResolutionAutoTagRoundTrip:
         temporal_context: registers the episode as planned, excludes its edge
         from default search, and surfaces it with include_planned=True.
         """
-        from _fm_helpers import MockEdge
+        from _fm_helpers import MockAddEpisodeResult, MockEdge
 
         svc, reg = service_with_real_registry
         project_id = 'integ-proposed-resolution-001'
+
+        # The uuid graphiti_core mints for this episode (task 3561). Registration
+        # keys on result.episode.uuid, NOT on the tool's returned episode_id —
+        # that value is a correlation id for the queued write and names no node.
+        episode_uuid = 'graphiti-minted-proposed-resolution-uuid'
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=episode_uuid))
+        )
 
         # Inline the durable queue: capture the enqueued payload and run it
         # through _execute_graphiti_write synchronously so registration runs
@@ -394,7 +410,7 @@ class TestProposedResolutionAutoTagRoundTrip:
 
         mcp_server = create_mcp_server(svc)
 
-        result = await mcp_server._tool_manager.call_tool(
+        await mcp_server._tool_manager.call_tool(
             'add_episode',
             {
                 'content': (
@@ -405,11 +421,10 @@ class TestProposedResolutionAutoTagRoundTrip:
                 'project_id': project_id,
             },
         )
-        episode_id = result['episode_id']
 
-        # (a) auto-tag → registered as planned
-        assert await reg.is_planned(episode_id) is True, (
-            f'Proposed-resolution episode {episode_id!r} should be auto-tagged '
+        # (a) auto-tag → registered as planned, under the MINTED uuid
+        assert await reg.is_planned(episode_uuid) is True, (
+            f'Proposed-resolution episode {episode_uuid!r} should be auto-tagged '
             f'planning and registered in the planned-episode registry'
         )
 
@@ -422,7 +437,7 @@ class TestProposedResolutionAutoTagRoundTrip:
                     'to FINALIZING occurs'
                 ),
                 uuid='edge-proposed-resolution-1',
-                episodes=[episode_id],
+                episodes=[episode_uuid],
             )
         ])
         scope = Scope(project_id=project_id)
