@@ -5745,6 +5745,292 @@ class TestDedupFlagsCrossProjectDiscovery:
 
 
 # ---------------------------------------------------------------------------
+# task 4864 step-11 — THE ACCEPTANCE TEST: the real producer -> gate seam
+# ---------------------------------------------------------------------------
+
+
+class TestCrossProjectFixTaskProducerToGateSeam:
+    """END TO END over a real ledger: the live repro finding is suppressed on
+    its second cycle by a citation NOTHING IN THIS TEST WROTE (task 4864).
+
+    This is the seam the task says is untested.  Every existing cross-project
+    test hand-writes a ``cited_tasks`` literal whose title it authored to match
+    its own ``AsyncMock`` — which exercises the GATE but proves nothing about
+    whether any producer can reach it.  The measured answer before this task
+    was that none could: Stage 1 sees only its own project's task tree, so it
+    has nothing to cite a FOREIGN fix task from, and the gate had never fired.
+
+    So this class contains NO ``cited_tasks`` literal anywhere.  The only
+    inputs are a finding and a foreign backlog; the citation is produced by
+    the code under test.
+
+    THE ACCEPTANCE CRITERION IS RETARGETED, deliberately.  The task's literal
+    wording — "a foreign citation landing in a ``stage1_flag_marker``
+    payload" — became UNSATISFIABLE BY DESIGN when task 4712 retired
+    ``cited_tasks`` from the payload and added ``TestMarkerPayloadKeyInvariant``
+    to guard it; a test asserting it would have to break a landed invariant to
+    pass.  Its INTENT (drive the REAL producer through to the gate, no
+    hand-built fixture) is preserved in full and asserted here on the gate's
+    OUTCOME instead: suppression happened, the stats counter incremented, and
+    the marker still keys to the citation-less identity.  That last assertion
+    is strictly STRONGER than the original, because it also pins the
+    anti-relocation constraint the payload assertion never touched.
+
+    Shape is the live repro: know_live flag e3527208 (task 598, flag_type
+    ``remediation_payload_live_workflow_signals_gap``), whose complaint is
+    literally that no fix task has been filed, against a dark_factory backlog
+    where 3833/3839 are blocked/pending — the same statuses that let the
+    finding survive the pre-ruling done-only filter.
+    """
+
+    PROJECT = 'know_live'
+    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    KNOWN = {'know_live': '/kl', 'dark_factory': '/df'}
+    #: The identity a citation-less flag keys to, and must keep.
+    TID = '598'
+
+    #: The finding, in the originating wording — the "no fix task has been
+    #: filed" complaint class of Leo's 2026-08-17 ruling on gate 3841.
+    DESCRIPTION = (
+        'Stage 2 remediation payloads omit the live workflow signals an '
+        'operator needs to diagnose a stalled task — merge-queue depth and '
+        'scheduler state never appear in the payload. This has recurred for '
+        'many cycles and no fix task has been filed.'
+    )
+
+    #: The dark_factory backlog as the live repro had it: two genuine fix
+    #: tasks (blocked/pending, both covering the complaint) and one unrelated
+    #: task that must never be discovered.  Measured against the production
+    #: thresholds: 3839 and 3833 both score coverage 0.86 / precision >= 0.73,
+    #: while 4102 scores 0.00 — so a "matches anything" regression in the
+    #: matcher would surface here rather than hide behind a rigged fixture.
+    BACKLOG = [
+        {
+            'id': '3839',
+            'status': 'pending',
+            'title': 'Remediation payload omits live workflow signals',
+            'description': (
+                'Stage 2 emits a remediation payload without the live workflow '
+                'signals an operator needs — merge-queue depth and scheduler '
+                'state never appear — so a stalled task cannot be diagnosed '
+                'from the payload. Recurred for many cycles; fix the payload '
+                'builder.'
+            ),
+        },
+        {
+            'id': '3833',
+            'status': 'blocked',
+            'title': 'Carry live workflow signals through the remediation payload',
+            'description': (
+                'The remediation payload an operator reads omits merge-queue '
+                'depth, scheduler state and every other live workflow signal '
+                'needed to diagnose a stalled task; it has recurred for many '
+                'cycles. Fix stage 2 so the signals appear.'
+            ),
+        },
+        {
+            'id': '4102',
+            'status': 'in-progress',
+            'title': 'Rotate the OpenAI embedding key',
+            'description': 'The embedding key is due for rotation this quarter.',
+        },
+    ]
+    #: Either genuine fix task may win — they tie on coverage, so the winner
+    #: is backlog-order-dependent and pinning one would over-specify.
+    FIX_TASK_IDS = frozenset({'3833', '3839'})
+
+    @classmethod
+    def _flag(cls) -> dict:
+        """The finding as Stage 1 emits it — with NO citations."""
+        return {
+            'task_id': 598,
+            'flag_type': cls.FLAG_TYPE,
+            'description': cls.DESCRIPTION,
+        }
+
+    @classmethod
+    def _taskmaster(cls):
+        """A backend serving the dark_factory backlog and per-id task reads.
+
+        ``get_task`` answers from the SAME records ``get_tasks`` listed, so the
+        live title a discovered citation carries is the real one — which is
+        what makes a discovered citation corroborate by construction.
+        """
+        by_id = {task['id']: task for task in cls.BACKLOG}
+
+        def _get_tasks(project_root, *, statuses=None):
+            return {'tasks': list(cls.BACKLOG) if project_root == '/df' else []}
+
+        def _get_task(task_id, project_root):
+            task = by_id.get(str(task_id))
+            if task is None or project_root != '/df':
+                return {'error': f'No tasks found for id {task_id}',
+                        'error_type': 'TaskmasterError'}
+            return dict(task)
+
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(side_effect=_get_tasks)
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_second_cycle_is_suppressed_by_a_citation_the_code_produced(
+        self, ledger_memory_service, caplog
+    ):
+        """THE ACCEPTANCE TEST. Cycle 1 records the marker and re-asserts the
+        finding; cycle 2 suppresses it — on a citation this test never wrote."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        assert compute_flag_signature(self._flag()) == (self.TID, self.FLAG_TYPE), (
+            'the finding must key to the CITATION-LESS identity — the whole '
+            'point is that it cites nothing'
+        )
+        taskmaster = self._taskmaster()
+
+        # ---- cycle 1: first sighting -----------------------------------
+        cycle1_stats: dict[str, Any] = {}
+        cycle1 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[self._flag()],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=cycle1_stats,
+        )
+
+        assert len(cycle1) == 1, (
+            f'the first sighting must be re-asserted, never suppressed; got {cycle1!r}'
+        )
+        assert 'persisted_from_run' not in cycle1[0]
+        assert cycle1_stats == {}, (
+            f'no suppression may be counted on a first cycle; got {cycle1_stats!r}'
+        )
+        assert taskmaster.get_tasks.call_count == 0, (
+            'HIT-only: a first cycle must not even attempt discovery'
+        )
+
+        # ---- cycle 2: carried forward, and now suppressed ---------------
+        flag2 = self._flag()
+        cycle2_stats: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.reconciliation.flag_dedup',
+        ):
+            cycle2 = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag2],
+                taskmaster=taskmaster,
+                known_projects=self.KNOWN,
+                stats=cycle2_stats,
+            )
+
+        assert cycle2 == [], (
+            'the carried-forward finding must be suppressed by the DISCOVERED '
+            f'fix task; got {cycle2!r}'
+        )
+        assert cycle2_stats.get('cross_project_fix_task_suppressed') == 1, (
+            f'the suppression must be counted; got {cycle2_stats!r}'
+        )
+
+        # The citation was PRODUCED, not supplied: the suppression log names a
+        # real dark_factory fix task from the backlog.
+        suppressed_lines = [
+            rec.getMessage() for rec in caplog.records
+            if 'stage1_flag_cross_project_fix_task_suppressed' in rec.getMessage()
+        ]
+        assert len(suppressed_lines) == 1, (
+            f'expected exactly one suppression log line; got {suppressed_lines!r}'
+        )
+        line = suppressed_lines[0]
+        assert 'fix_project_id=dark_factory' in line, line
+        assert any(f'fix_task_id={tid}' in line for tid in self.FIX_TASK_IDS), (
+            'the gate must name one of the real foreign fix tasks discovery '
+            f'found (3833/3839); got {line!r}'
+        )
+        assert 'fix_task_id=4102' not in line, (
+            f'the unrelated backlog task must never be discovered; got {line!r}'
+        )
+
+        # A discovered citation carries the LIVE title, so it takes the gate's
+        # strongly-corroborated branch — the WARNING stays a signal about
+        # genuinely stale LLM-authored citations (task 4864 step-4).
+        assert not [
+            rec for rec in caplog.records
+            if 'cross_project_fix_task_title_uncorroborated' in rec.getMessage()
+        ], 'a discovered citation must corroborate by construction'
+
+        # ---- the marker identity survived untouched --------------------
+        ledger = ledger_memory_service.recon_ledger
+        row = await _get_marker(ledger, self.PROJECT, self.TID, self.FLAG_TYPE)
+        assert row is not None, (
+            'the suppressing cycle must still refresh the marker — skipping '
+            'the write would let it age out and lose the recurrence history'
+        )
+        assert row.task_id == self.TID, (
+            'the marker must still key to the CITATION-LESS identity after a '
+            f'discovery-driven suppression; got {row.task_id!r}'
+        )
+        payload = json.loads(row.payload_json)
+        assert 'cited_tasks' not in payload, (
+            f'task 4712 payload invariant must hold; got {payload!r}'
+        )
+        assert payload['last_seen_run_id'] == 'r2'
+        for fix_task_id in self.FIX_TASK_IDS:
+            assert await _get_marker(
+                ledger, self.PROJECT, f'{fix_task_id},{self.TID}', self.FLAG_TYPE,
+            ) is None, (
+                f'a row keyed {fix_task_id},{self.TID} means the discovered '
+                'citation reached compute_flag_signature and RELOCATED the '
+                'marker — under a HIT-only gate that cycle becomes a MISS'
+            )
+        assert flag2 == self._flag(), (
+            f'the caller-owned flag dict must come back unmutated; got {flag2!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_backlog_without_a_covering_task_still_re_asserts(
+        self, ledger_memory_service
+    ):
+        """The seam's negative control: with the two genuine fix tasks removed
+        from the foreign backlog, the SAME two cycles re-assert the finding.
+
+        Without this, a suppression bug that fires on any carried-forward flag
+        would pass the acceptance test above and look like success.
+        """
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        taskmaster = self._taskmaster()
+        unrelated = [task for task in self.BACKLOG if task['id'] == '4102']
+
+        def _get_tasks(project_root, *, statuses=None):
+            return {'tasks': list(unrelated) if project_root == '/df' else []}
+
+        taskmaster.get_tasks = AsyncMock(side_effect=_get_tasks)
+
+        for run_id in ('r1', 'r2'):
+            stats: dict[str, Any] = {}
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id=run_id,
+                flags=[self._flag()],
+                taskmaster=taskmaster,
+                known_projects=self.KNOWN,
+                stats=stats,
+            )
+            assert len(result) == 1, (
+                f'with no covering foreign task the finding must survive cycle '
+                f'{run_id}; got {result!r}'
+            )
+            assert stats == {}, f'nothing may be suppressed; got {stats!r}'
+
+
+# ---------------------------------------------------------------------------
 # task-1656 step-3 — RED: dedup_flags write-guard integration tests
 # ---------------------------------------------------------------------------
 
