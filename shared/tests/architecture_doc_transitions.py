@@ -50,7 +50,7 @@ DOC_PATH = REPO_ROOT / 'ARCHITECTURE.md'
 #: wrong diagram.
 SECTION_HEADING = '### 3.1 Status vocabulary'
 
-_NEXT_HEADING_RE = re.compile(r'^### ', re.MULTILINE)
+_NEXT_HEADING_RE = re.compile(r'^#{1,3} ', re.MULTILINE)
 _MERMAID_FENCE_RE = re.compile(r'```mermaid\n(.*?)```', re.DOTALL)
 
 
@@ -76,14 +76,24 @@ def read_architecture_doc(root: Path = REPO_ROOT) -> str:
 def extract_lifecycle_mermaid(text: str) -> str:
     """Return the body of section 3.1's mermaid fence (no backticks/prose).
 
-    Slices *text* from :data:`SECTION_HEADING` to the next ``### `` heading,
-    then requires that slice to contain EXACTLY one ```` ```mermaid ```` fence.
-    Raises :class:`RuntimeError` — naming what was expected and what was
-    found — when the heading is absent, or the section holds zero or more
-    than one mermaid fence. A tolerant "best effort" extractor here would
-    let a renamed heading or a relocated diagram silently produce an empty
-    or wrong result, which is precisely the drift this guard exists to
-    catch.
+    Slices *text* from :data:`SECTION_HEADING` to the next heading of the
+    same or shallower depth (``#``, ``##``, or ``###``), then requires that
+    slice to contain EXACTLY one ```` ```mermaid ```` fence. Raises
+    :class:`RuntimeError` — naming what was expected and what was found —
+    when the heading is absent, or the section holds zero or more than one
+    mermaid fence. A tolerant "best effort" extractor here would let a
+    renamed heading or a relocated diagram silently produce an empty or
+    wrong result, which is precisely the drift this guard exists to catch.
+
+    The terminator is deliberately NOT anchored to ``### `` alone: if
+    section 3.1 ever lost its ``### 3.2`` sibling (renumbering, or 3.2's
+    removal), a ``### ``-only terminator would run the slice past the
+    enclosing ``## `` chapter boundary and into the next chapter's content.
+    ARCHITECTURE.md's own section 6 shows this is a real shape to guard
+    against: it carries a mermaid fence directly under ``## 6`` before its
+    own first ``### 6.1`` subheading, so an over-long slice reaching that
+    far would find "exactly one fence" and silently return the WRONG
+    diagram instead of raising.
     """
     heading_idx = text.find(SECTION_HEADING)
     if heading_idx == -1:
@@ -119,9 +129,11 @@ def _build_node_aliases() -> dict[str, TaskStatus]:
 
     Mermaid ``stateDiagram-v2`` state ids cannot contain ``-``, so the
     diagram spells hyphenated statuses with underscores (``in_progress``,
-    ``merge_deferred``, ``infra_hold``). Both the underscore-folded id and
-    the literal value map to the same status, so this single table serves
-    every status regardless of whether its value contains a hyphen.
+    ``merge_deferred``, ``infra_hold``). The map is keyed ONLY on the
+    underscore-folded id: ``_EDGE_RE``'s node-id group
+    (``[A-Za-z_][A-Za-z0-9_]*``) cannot capture a hyphen, so a raw,
+    un-folded ``status.value`` key would never be reachable through
+    :func:`_resolve_node` and would be dead code.
 
     Deliberately NOT a hand-listed alias table: a hand-maintained copy of
     the three hyphenated names would itself rot the moment a fourth
@@ -133,16 +145,16 @@ def _build_node_aliases() -> dict[str, TaskStatus]:
     """
     aliases: dict[str, TaskStatus] = {}
     for status in TaskStatus:
-        for alias in (status.value, status.value.replace('-', '_')):
-            existing = aliases.get(alias)
-            if existing is not None and existing is not status:
-                raise RuntimeError(
-                    f'mermaid node-id alias collision: {alias!r} would map to both '
-                    f'{existing!r} and {status!r} -- TaskStatus has grown a '
-                    'hyphen/underscore-ambiguous pair that architecture_doc_transitions.py '
-                    '(task 4535) cannot disambiguate.'
-                )
-            aliases[alias] = status
+        alias = status.value.replace('-', '_')
+        existing = aliases.get(alias)
+        if existing is not None and existing is not status:
+            raise RuntimeError(
+                f'mermaid node-id alias collision: {alias!r} would map to both '
+                f'{existing!r} and {status!r} -- TaskStatus has grown a '
+                'hyphen/underscore-ambiguous pair that architecture_doc_transitions.py '
+                '(task 4535) cannot disambiguate.'
+            )
+        aliases[alias] = status
     return aliases
 
 

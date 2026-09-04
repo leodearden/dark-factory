@@ -10,13 +10,14 @@ module (together with its ``architecture_doc_transitions`` helper sibling)
 pins the two artifacts together: it parses the diagram out of the doc,
 reads the table, and asserts the edge sets are identical.
 
-Built up TDD-pair by TDD-pair, mirroring the helper's own structure:
-
-* pair 1 (this step) — the doc reader + section-3.1 extractor.
-* pair 2 — the mermaid edge parser.
-* pair 3 — the table-side reader + the diff comparator.
-* pair 4 — the failure-message renderer.
-* pair 5 — the mutation / failure-direction proofs, and the real gate.
+Organized to mirror the helper module's own structure, one test class per
+concern: doc reader + section-3.1 extractor (``TestDocPath``,
+``TestReadArchitectureDoc``, ``TestExtractLifecycleMermaid``); mermaid edge
+parser (``TestParseStateDiagramEdges``); table-side reader + diff comparator
+(``TestTableTransitionEdges``, ``TestDiffTransitionEdges``); failure-message
+renderer (``TestFormatParityFailure``); and the mutation / failure-direction
+proofs plus the real gate (``TestCheckArchitectureTransitionParity``,
+``TestArchitectureDiagramGate``).
 
 Mirrors the established scanner+gate triad in this directory (see
 ``silent_fallthrough_scan.py`` + ``test_silent_fallthrough_gate.py``;
@@ -32,10 +33,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import architecture_doc_transitions
 import pytest
 from architecture_doc_transitions import (
     DOC_PATH,
+    check_architecture_transition_parity,
     diff_transition_edges,
     extract_lifecycle_mermaid,
     format_parity_failure,
@@ -160,6 +161,35 @@ class TestExtractLifecycleMermaid:
         body = extract_lifecycle_mermaid(text)
         assert 'stateDiagram-v2' in body
         assert 'in_progress' in body
+
+    def test_raises_rather_than_grabbing_a_fence_from_the_next_chapter(self):
+        # Regression guard for a latent risk: the section is terminated by
+        # the next heading of the SAME OR SHALLOWER depth, not just the
+        # next `### `. If section 3.1 ever lost its `### 3.2` sibling
+        # (renumbering, or 3.2's removal), a terminator anchored only on
+        # `### ` would run the slice past the enclosing `## ` chapter
+        # boundary and into the next chapter's content. This is not a
+        # hypothetical shape: ARCHITECTURE.md's own escalation-ladder
+        # chapter (section 6) carries a mermaid fence directly under `## 6`
+        # before its own first `### 6.1` subheading. Reproduced here with a
+        # synthetic doc of that same shape: if the over-long slice found
+        # exactly one fence, the extractor would silently return the WRONG
+        # diagram instead of raising that section 3.1 has none of its own.
+        doc = (
+            "# ARCHITECTURE\n\n"
+            "## 3. Task lifecycle\n\n"
+            "### 3.1 Status vocabulary\n\n"
+            "Prose with no fence in this subsection at all.\n\n"
+            "## 6. Escalation ladder\n\n"
+            "```mermaid\n"
+            "flowchart LR\n"
+            "    A --> B\n"
+            "```\n\n"
+            "### 6.1 Ladder stages\n\n"
+            "More prose.\n"
+        )
+        with pytest.raises(RuntimeError):
+            extract_lifecycle_mermaid(doc)
 
 
 class TestParseStateDiagramEdges:
@@ -366,21 +396,16 @@ class TestFormatParityFailure:
 class TestCheckArchitectureTransitionParity:
     """Mutation / failure-direction proofs for ``check_architecture_transition_parity``.
 
-    This is the step the task exists for: "a parity test that passes under
+    This is the reason the guard exists: "a parity test that passes under
     an injected mutation is worthless, and this repo has a recorded case of
     four assertions staying green through a full semantic reversal." Each
     case here monkeypatches ``shared.task_transitions.TRANSITIONS`` to a
     one-edge-mutated COPY of the real table (never the real frozensets
     themselves) and calls the exact function the real gate calls, with
-    ARCHITECTURE.md left untouched throughout.
-
-    ``check_architecture_transition_parity`` is deliberately referenced via
-    ``architecture_doc_transitions.check_architecture_transition_parity``
-    (module-attribute access), not a top-level ``from ... import``: it does
-    not exist yet, and a top-level import would fail the whole module at
-    collection (ImportError), taking every already-green test above down
-    with it. Attribute access instead fails each of THIS class's tests
-    individually with ``AttributeError``, which is this step's RED.
+    ARCHITECTURE.md left untouched throughout. The monkeypatch targets
+    ``task_transitions.TRANSITIONS``, not ``check_architecture_transition_parity``
+    itself, so importing the function normally at module scope (with the
+    other names above) does not interfere with any of these proofs.
     """
 
     def test_control_unmutated_table_passes_and_returns_nonempty_edges(self, monkeypatch):
@@ -388,7 +413,7 @@ class TestCheckArchitectureTransitionParity:
         # of the real table must NOT be reported as divergent.
         unmutated = {actor: frozenset(edges) for actor, edges in TRANSITIONS.items()}
         monkeypatch.setattr(task_transitions, 'TRANSITIONS', unmutated)
-        result = architecture_doc_transitions.check_architecture_transition_parity()
+        result = check_architecture_transition_parity()
         assert result
 
     def test_added_edge_raises_naming_exactly_that_edge(self, monkeypatch):
@@ -399,7 +424,7 @@ class TestCheckArchitectureTransitionParity:
         mutated = {actor: frozenset(edges) | {added_edge} for actor, edges in TRANSITIONS.items()}
         monkeypatch.setattr(task_transitions, 'TRANSITIONS', mutated)
         with pytest.raises(AssertionError) as exc_info:
-            architecture_doc_transitions.check_architecture_transition_parity()
+            check_architecture_transition_parity()
         message = str(exc_info.value)
         assert 'review -> merge-deferred' in message
         assert 'NOT drawn in ARCHITECTURE.md section 3.1' in message
@@ -413,7 +438,7 @@ class TestCheckArchitectureTransitionParity:
         }
         monkeypatch.setattr(task_transitions, 'TRANSITIONS', mutated)
         with pytest.raises(AssertionError) as exc_info:
-            architecture_doc_transitions.check_architecture_transition_parity()
+            check_architecture_transition_parity()
         message = str(exc_info.value)
         assert 'pending -> in-progress' in message
         assert 'NOT in TRANSITIONS' in message
@@ -429,7 +454,7 @@ class TestCheckArchitectureTransitionParity:
         }
         monkeypatch.setattr(task_transitions, 'TRANSITIONS', added_mutated)
         with pytest.raises(AssertionError) as added_exc:
-            architecture_doc_transitions.check_architecture_transition_parity()
+            check_architecture_transition_parity()
 
         removed_edge = (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
         removed_mutated = {
@@ -438,9 +463,42 @@ class TestCheckArchitectureTransitionParity:
         }
         monkeypatch.setattr(task_transitions, 'TRANSITIONS', removed_mutated)
         with pytest.raises(AssertionError) as removed_exc:
-            architecture_doc_transitions.check_architecture_transition_parity()
+            check_architecture_transition_parity()
 
         assert str(added_exc.value) != str(removed_exc.value)
+
+    def test_root_argument_is_threaded_to_the_doc_reader(self, tmp_path):
+        # Every case above only ever mutates the TABLE side and calls with
+        # the default `root=REPO_ROOT` -- a regression where
+        # `check_architecture_transition_parity` silently ignored its `root`
+        # argument (e.g. by calling `read_architecture_doc()` with no
+        # argument, always reading the real ARCHITECTURE.md) would leave
+        # every test in this module green, since the real doc already
+        # matches the real table. Writing a synthetic ARCHITECTURE.md into
+        # `tmp_path` and passing `tmp_path` as `root` proves both that
+        # `root` actually reaches the doc reader AND that the doc side of
+        # the comparison (not just the table side) is exercised.
+        #
+        # (done, pending) is a genuinely absent edge: `done` is terminal and
+        # has no outgoing pair in `shared.task_transitions._UNION` at all
+        # (its only legal exit is the reopen flag, which bypasses the table
+        # entirely) -- see shared/src/shared/task_transitions.py::_UNION.
+        synthetic_doc = tmp_path / 'ARCHITECTURE.md'
+        synthetic_doc.write_text(
+            '# ARCHITECTURE\n\n'
+            '## 3. Task lifecycle\n\n'
+            '### 3.1 Status vocabulary\n\n'
+            '```mermaid\n'
+            'stateDiagram-v2\n'
+            '    done --> pending\n'
+            '```\n\n'
+            '### 3.2 Submit\n\n'
+        )
+        with pytest.raises(AssertionError) as exc_info:
+            check_architecture_transition_parity(tmp_path)
+        message = str(exc_info.value)
+        assert 'done -> pending' in message
+        assert 'NOT in TRANSITIONS' in message
 
 
 class TestArchitectureDiagramGate:
@@ -449,11 +507,14 @@ class TestArchitectureDiagramGate:
     on the real files -- no monkeypatching, no synthetic doc."""
 
     def test_architecture_diagram_matches_transitions_table(self):
-        doc_edges = architecture_doc_transitions.check_architecture_transition_parity()
-        # A parser regression that returned frozenset() would make BOTH diff
-        # sides empty and the bare parity call above would pass silently --
-        # the exact vacuous-green failure this task exists to prevent.
-        # Cardinality is derived from the table, not pinned to the literal
-        # 37, so this assertion does not itself become the next stale pin.
+        doc_edges = check_architecture_transition_parity()
+        # `assert doc_edges` pins non-vacuity: if TRANSITIONS were ever
+        # refactored down to empty (or the parser regressed to always
+        # return an empty set) on both sides at once, the diff would be
+        # empty/empty and the bare parity call above would pass on "nothing
+        # matches nothing" -- the exact vacuous-green failure this task
+        # exists to prevent. (Note this is NOT the doc-empty-only case: an
+        # empty doc against the real ~37-edge table already fails the
+        # parity call above via `missing_from_doc`, so it never reaches
+        # this line.)
         assert doc_edges
-        assert len(doc_edges) == len(table_transition_edges())
