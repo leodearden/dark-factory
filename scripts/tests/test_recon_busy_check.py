@@ -11,6 +11,7 @@ wedging on an endpoint it cannot read.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -61,6 +62,29 @@ def test_classify_non_dict_is_unreachable():
 # ---------------------------------------------------------------------------
 # CLI (reads /health body from stdin) — driven via subprocess.run
 # ---------------------------------------------------------------------------
+
+def _cli_timeout_from_env(default: float = 60.0) -> float:
+    """Resolve the default wall-clock budget (seconds) for a CLI subprocess.
+
+    10s was tight enough to flake under machine load: concurrent
+    orchestrator agents can push interpreter startup + imports past 10s even
+    though the CLI under test behaves correctly (returncode/stderr already
+    correct at the moment the old budget expired). 60s gives real headroom
+    without materially slowing an idle-machine run (measured baseline for
+    the whole file is ~1.1s).
+
+    RECON_BUSY_CHECK_TEST_TIMEOUT overrides the default for further tuning
+    without a code change. An unset or blank value (e.g. a CI template that
+    always exports the var) is treated as "not overridden" rather than an
+    error — otherwise this escape hatch would itself fail the *entire*
+    module's collection, including the pure-unit tests here that never spawn
+    a subprocess.
+    """
+    raw = os.environ.get("RECON_BUSY_CHECK_TEST_TIMEOUT", "").strip()
+    if not raw:
+        return default
+    return float(raw)
+
 
 def _run_cli(stdin_text: str) -> subprocess.CompletedProcess:
     return subprocess.run(
