@@ -282,3 +282,50 @@ def diff_transition_edges(
         missing_from_doc=frozenset(table_edges - doc_edges),
         extra_in_doc=frozenset(doc_edges - table_edges),
     )
+
+
+# ---------------------------------------------------------------------------
+# Failure-message renderer
+# ---------------------------------------------------------------------------
+
+_ARCHITECTURE_DOC_REF = 'ARCHITECTURE.md section 3.1'
+_TABLE_REF = 'TRANSITIONS (shared/src/shared/task_transitions.py)'
+
+
+def _render_edge_lines(edges: frozenset[tuple[TaskStatus, TaskStatus]]) -> str:
+    """Render *edges* sorted by ``(frm.value, to.value)`` for determinism."""
+    ordered = sorted(edges, key=lambda edge: (edge[0].value, edge[1].value))
+    return '\n'.join(f'  {frm.value} -> {to.value}' for frm, to in ordered)
+
+
+def format_parity_failure(
+    missing_from_doc: frozenset[tuple[TaskStatus, TaskStatus]],
+    extra_in_doc: frozenset[tuple[TaskStatus, TaskStatus]],
+) -> str:
+    """Render a :class:`ParityDiff`'s two halves as a self-routing failure message.
+
+    Each present half becomes its own labelled, sorted section (rendered
+    with the real hyphenated ``TaskStatus`` VALUES, e.g. ``in-progress ->
+    review`` — not the enum repr, not the diagram's underscore spelling —
+    so the reader can grep ``task_transitions.py`` for it directly). A
+    section whose set is empty is omitted entirely. Returns ``''`` when
+    both halves are empty (nothing to report).
+    """
+    sections: list[str] = []
+    if extra_in_doc:
+        sections.append(
+            f'drawn in {_ARCHITECTURE_DOC_REF} but NOT in {_TABLE_REF}:\n'
+            + _render_edge_lines(extra_in_doc)
+        )
+    if missing_from_doc:
+        sections.append(
+            f'in {_TABLE_REF} but NOT drawn in {_ARCHITECTURE_DOC_REF}:\n'
+            + _render_edge_lines(missing_from_doc)
+        )
+    if not sections:
+        return ''
+    sections.append(
+        f'{_TABLE_REF} is the authority (task 4535) -- redraw {_ARCHITECTURE_DOC_REF} '
+        'to match it.'
+    )
+    return '\n\n'.join(sections)
