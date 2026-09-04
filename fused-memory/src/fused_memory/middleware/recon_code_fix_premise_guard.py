@@ -46,16 +46,19 @@ def _resolve_yaml_loader(yaml_module: Any = yaml) -> type:
     """Return the fastest available SAFE YAML loader from *yaml_module*.
 
     Prefers ``CSafeLoader`` (the libyaml-backed C implementation, measured
-    ~8x faster than the pure-Python ``SafeLoader`` on the shipped registry)
-    and falls back to ``SafeLoader`` when PyYAML was built without libyaml.
-    Both are *safe* loaders: same restricted tag set, no arbitrary object
-    construction.
+    ~8x faster than the pure-Python ``SafeLoader`` on a single parse of the
+    shipped registry) and falls back to ``SafeLoader`` when PyYAML was built
+    without libyaml. Both are *safe* loaders: same restricted tag set, no
+    arbitrary object construction.
     """
     return getattr(yaml_module, "CSafeLoader", None) or yaml_module.SafeLoader
 
 
-#: Resolved once at import — the parse path is hot enough that a per-call
-#: availability check would give back part of what the C loader wins.
+#: Resolved once at import for tidiness — NOT because this is a hot loop.
+#: load_premise_registry runs at most once per TaskCurator instance
+#: (task_curator.py caches the parsed entries for the instance's lifetime
+#: behind its `_premise_registry_load_attempted` guard), so this buys a
+#: one-time ~8ms saving on the registry parse, not a per-call one.
 _YAML_LOADER: type = _resolve_yaml_loader()
 
 
@@ -144,7 +147,13 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
         )
         return []
 
-    # Parse
+    # Parse. The `except yaml.YAMLError` below is exhaustive only because
+    # `text` was already decoded as strict UTF-8 above — that rejects lone
+    # surrogates before the parser ever sees them. On a scalar containing a
+    # lone surrogate, CSafeLoader raises UnicodeEncodeError (a ValueError,
+    # NOT a yaml.YAMLError) where SafeLoader raises yaml.reader.ReaderError
+    # (which IS a YAMLError) — so a future change to a bytes/errors="replace"
+    # read path must re-check this handler.
     try:
         data = yaml.load(text, Loader=_YAML_LOADER)
     except yaml.YAMLError as exc:
