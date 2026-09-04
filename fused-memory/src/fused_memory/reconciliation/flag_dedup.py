@@ -980,16 +980,43 @@ async def dedup_flags(
     * **HIT-only.** A first-cycle finding is never suppressed — the point is to
       stop re-asserting a complaint that has already been converted into
       tracked work, not to pre-empt the first report of it.
+    * **TWO producers, one gate (task 4864).** The flag's own
+      ``cited_tasks`` are tried FIRST; only when they name no live foreign fix
+      task does :func:`_discover_foreign_fix_task_citations` look one up
+      DETERMINISTICALLY — matching the finding's key terms against every
+      foreign project's non-cancelled backlog — and the discovered citation is
+      then fed back through the SAME
+      :func:`_resolve_live_cross_project_fix_task` call, so it inherits the
+      identical resolution and the identical policy below rather than forking
+      a second one.  This is what makes the gate reachable at all: Stage 1's
+      context is its own project's task tree, so the model has nothing to cite
+      a FOREIGN fix task from, and before this the gate was enabled but inert.
+      Discovery is a FALLBACK, not a second sweep: a flag whose own citation
+      resolves issues no lookup, a cycle with no qualifying flag issues ZERO
+      ``get_tasks`` calls, and every foreign project's backlog is fetched at
+      most once per ``dedup_flags`` call.
+    * **The discovered citation NEVER touches the flag or the payload.**
+      ``compute_flag_signature`` read ``cited_tasks`` at the top of the loop
+      and folds them into the marker row's KEY, so writing a discovered
+      citation back would RELOCATE the row instead of annotating it; under a
+      HIT-only gate the relocated cycle is a MISS, and because discovery
+      matches a live backlog that shifts between cycles the row would keep
+      relocating and never accumulate a HIT at all — strictly worse than the
+      inertness it fixes, and a violation of task 4712's payload invariant.
+      A discovery-driven suppression therefore leaves the marker identity
+      byte-identical to a citation-less cycle.
     * **ONE anchor: the current cycle's citation.** The gate resolves ONLY
-      against the flag's OWN ``cited_tasks`` this cycle — there is no
-      cross-cycle citation anchor in the marker payload (task 4712).  The
-      accepted consequence: a carried-forward finding whose LLM output
-      re-emits NO citation on a given cycle keys to a DIFFERENT row (see
+      against the flag's OWN ``cited_tasks`` this cycle plus whatever
+      discovery finds for it — there is no cross-cycle citation anchor in the
+      marker payload (task 4712).  The accepted consequence for the CITATION
+      producer: a carried-forward finding whose LLM output re-emits NO
+      citation on a given cycle keys to a DIFFERENT row (see
       :func:`compute_flag_signature`'s cited_tasks union), so that cycle is a
-      MISS and the finding is RE-ASSERTED rather than suppressed.
-      Suppression is reliable exactly when the LLM keeps re-citing the same
-      fix task — the common case for a still-open remediation — which is why
-      this is a genuine, if narrower, mitigation rather than a no-op.
+      MISS and the finding is RE-ASSERTED rather than suppressed.  Citation-
+      driven suppression is reliable exactly when the LLM keeps re-citing the
+      same fix task — the common case for a still-open remediation.  The
+      discovery producer is not subject to that at all, because it never
+      changes the row a flag keys to.
     * **Foreign-project-only.** See
       :func:`_resolve_live_cross_project_fix_task` — a finding's own subject
       task is routinely its own first citation.
@@ -1052,6 +1079,13 @@ async def dedup_flags(
     # amendment): the gate below runs per carried-forward flag, and findings in
     # one family routinely cite the same remediation task.
     fix_task_cache: dict[tuple[str, str], Any] = {}
+    # ONE per-project backlog memo for the whole batch (task 4864): discovery
+    # pulls each FOREIGN project's non-cancelled task list, which is multi-MB
+    # and seconds of CPU on a real backlog, so a family of carried-forward
+    # findings must pay for it once rather than once per flag.  Populated
+    # LAZILY — a cycle with no qualifying flag never touches it, so it stays
+    # empty and no get_tasks call is issued at all.
+    discovery_task_lists: dict[str, list[Any] | None] = {}
     for flag in flags:
         sig = compute_flag_signature(flag)
         # Content-fingerprint fallback (task-1654 Fix 2): for null-task_id flags
@@ -1249,6 +1283,44 @@ async def dedup_flags(
                 cited_tasks,
                 cache=fix_task_cache,
             )
+            if fix_task is None:
+                # --- Deterministic DISCOVERY fallback (task 4864) ---
+                # The flag's own citations named no live foreign fix task —
+                # usually because it cited nothing at all, which is the normal
+                # case: Stage 1 only sees its own project's task tree, so the
+                # gate above was never reachable in practice.  Look the fix
+                # task up deterministically instead, then re-enter the SAME
+                # resolver with the discovered citation so the discovered path
+                # inherits the identical resolution and the identical policy
+                # below — never a parallel branch.
+                #
+                # THE CITATION IS A LOCAL VALUE.  It must not be assigned to
+                # flag['cited_tasks'] and must not enter `payload`:
+                # compute_flag_signature already read cited_tasks at the top of
+                # this loop and folds them into the marker row KEY, so
+                # enriching the flag would RELOCATE the row; the gate is
+                # HIT-only, so the first relocated cycle would be a MISS, and
+                # since discovery matches a live backlog that shifts between
+                # cycles the row would keep relocating and never accumulate a
+                # HIT at all (task 4712's invariant / the anti-relocation
+                # design decision).
+                discovered = await _discover_foreign_fix_task_citations(
+                    taskmaster,
+                    known_projects,
+                    project_id,
+                    [flag],
+                    task_list_cache=discovery_task_lists,
+                    get_task_cache=fix_task_cache,
+                )
+                discovered_cite = discovered.get(0)
+                if discovered_cite is not None:
+                    fix_task = await _resolve_live_cross_project_fix_task(
+                        taskmaster,
+                        known_projects,
+                        project_id,
+                        [discovered_cite],
+                        cache=fix_task_cache,
+                    )
         if fix_task is not None:
             if fix_task.status != TaskStatus.DONE.value:
                 # Filed and still outstanding — suppresses for as long as it
