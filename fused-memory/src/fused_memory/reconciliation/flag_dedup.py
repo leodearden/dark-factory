@@ -3036,6 +3036,15 @@ class _LiveFixTask(NamedTuple):
     *title_corroborated* records whether the citation's title agreed with the
     live record's.  Since task 4864 that is a STRENGTH signal only — it does
     not affect whether this value is returned at all.
+
+    *cited* may be EITHER an LLM-authored citation off the flag or one
+    synthesized by :func:`_discover_foreign_fix_task_citations` (task 4864).
+    Both arrive through the same :func:`_resolve_live_cross_project_fix_task`
+    call and are indistinguishable here BY DESIGN: the discovered citation
+    carries the same ``{project_id, task_id, title}`` shape read from the live
+    record, so ``dedup_flags``' suppression and exhaustion log lines name the
+    real foreign project/task either way, and the ruled status policy applies
+    to one producer's output exactly as it does to the other's.
     """
 
     cited: dict[str, Any]

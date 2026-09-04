@@ -5861,7 +5861,14 @@ class TestDedupFlagsCrossProjectDiscovery:
         assert len(exhausted) == 1, (
             f'exhaustion must be audible at WARNING; got {caplog.records!r}'
         )
+        # _LiveFixTask.cited carries the DISCOVERED citation, so the log line
+        # names the real foreign task rather than degrading to a bare "some
+        # fix task" — the same identification a cited-path exhaustion gives.
         assert 'fix_project_id=dark_factory' in exhausted[0]
+        assert 'fix_task_id=3839' in exhausted[0], (
+            f'the exhaustion log must name the discovered fix task; got '
+            f'{exhausted[0]!r}'
+        )
         assert await self._done_suppressions(ledger_memory_service) == (
             _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES
         ), (
