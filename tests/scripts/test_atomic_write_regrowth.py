@@ -49,9 +49,11 @@ cross-tree gates still live there; they are enumerated, with measured counts, in
 ``test_atomic_write_guard_does_not_scan_sibling_package_trees`` below.
 """
 import ast
+import functools
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import NamedTuple
 
 # tests/scripts/<file>.py and shared/tests/<file>.py are both exactly two levels
 # below the repo root, so this constant carried over verbatim from the guard's
@@ -475,6 +477,103 @@ def _find_renamers_in_tree(tree: ast.AST) -> list[str]:
     return found
 
 
+def _find_write_helpers(source: str, tree: ast.AST) -> list[tuple[str, bool]]:
+    """``(name, delegates)`` for every ``(_)atomic_write_text`` def in *tree*.
+
+    The structural half of ``test_atomic_write_text_helpers_only_delegate``,
+    split out for the same single-parse reason as
+    :func:`_find_renamers_in_tree`.  Deliberately carries NO policy: the
+    ``safe_io.py``-is-the-implementation skip and the ``_ALLOWED_RENAMERS``
+    skip both stay in the test, where they can be read next to the invariant
+    they qualify.
+    """
+    return [
+        (node.name, 'safe_io.atomic_write_text(' in (ast.get_source_segment(source, node) or ''))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name in ('_atomic_write_text', 'atomic_write_text')
+    ]
+
+
+@functools.cache
+def _read_tree(tree: str) -> tuple[tuple[str, str], ...]:
+    """Read every ``*.py`` under ONE tree — once per process, then cached.
+
+    Cached PER TREE rather than per tuple-of-trees on purpose: ``_SRC_TREES``
+    and the pointer sweep's tree list overlap, and a per-tuple cache would
+    re-read the six source trees for the sweep.
+    """
+    root = _REPO_ROOT / tree
+    # HARD assert, kept rather than downgraded to pytest.skip, and that is
+    # only correct BECAUSE this guard is now repo-level (task 3388): at the
+    # repo root every declared tree is guaranteed present, so a missing one
+    # is a real defect rather than a legitimate partial checkout.  The skip
+    # fallback was the price of NOT relocating; having relocated, do not
+    # also pay it.  Paired with
+    # test_every_declared_tree_contributes_scanned_files below, which
+    # catches the case this assert cannot: a tree that IS a directory and
+    # rglobs nothing.
+    assert root.is_dir(), (
+        f'{tree} not found under {_REPO_ROOT} — this guard walks fixed tree '
+        f'names, so a moved/renamed package must update its tree list rather '
+        f'than let the guard silently scan nothing.'
+    )
+    return tuple(
+        (py.relative_to(_REPO_ROOT).as_posix(), py.read_text(encoding='utf-8'))
+        for py in sorted(root.rglob('*.py'))
+    )
+
+
+def _walk_trees(trees: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """``(relpath, source)`` for every ``*.py`` under *trees*, in tree order.
+
+    Duplicates are NOT removed here — ``scripts/tests`` sits inside the
+    ``scripts`` scan root — because only the pointer sweep spans overlapping
+    trees and it dedupes by relpath itself.
+    """
+    return tuple(item for tree in trees for item in _read_tree(tree))
+
+
+class _ScannedModule(NamedTuple):
+    """The derived facts one scanned module contributes — never its AST."""
+
+    relpath: str
+    #: Qualnames that rename a path into place (:func:`_find_renamers`).
+    renamers: tuple[str, ...]
+    #: ``(name, delegates)`` per ``(_)atomic_write_text`` def.
+    write_helpers: tuple[tuple[str, bool], ...]
+
+
+@functools.cache
+def _scan_source_trees() -> tuple[_ScannedModule, ...]:
+    """Parse every file in ``_SRC_TREES`` exactly ONCE and cache the derived facts.
+
+    WHY THIS EXISTS AND WHY IT CACHES FACTS RATHER THAN TREES — measured on
+    this worktree, because the answer is not the obvious one.  Walking and
+    reading the six trees is 509 files / 21.2 MB / 0.36s; ``ast.parse``-ing
+    the same 509 files is 10.05s.  So the dominant cost was never the I/O the
+    ``_read_tree`` cache above removes — it was the two AST tests each parsing
+    the whole corpus.  They now share one pass, which is worth ~10s of this
+    module's wall clock against ~1s for de-duplicating the reads.
+
+    Caching the parsed trees instead would save the same 10s and retain
+    352.5 MB (tracemalloc, same 509 files) for the rest of the pytest session,
+    on a box this suite already shares with concurrent verify legs.  The
+    per-file facts below are a few KB.  Re-measure before trading that back.
+    """
+    scanned = []
+    for relpath, source in _walk_trees(_SRC_TREES):
+        tree = ast.parse(source)
+        scanned.append(
+            _ScannedModule(
+                relpath,
+                tuple(_find_renamers_in_tree(tree)),
+                tuple(_find_write_helpers(source, tree)),
+            )
+        )
+    return tuple(scanned)
+
+
 def _iter_source_files():
     """Yield (repo-relative posix path, source text) for every scanned tree.
 
@@ -483,25 +582,13 @@ def _iter_source_files():
     count in this sentence used to say "the three src trees" and stayed there
     through the widening to six, which is precisely the stale-prose failure
     this module exists to prevent (task 3388).
+
+    A thin view over the cached ``_read_tree``, which carries the hard
+    ``assert root.is_dir()`` and the argument for keeping it hard.  Kept as a
+    named function because the tests and comments below refer to it, and
+    because "the set of files this guard scans" is a concept worth a name.
     """
-    for tree in _SRC_TREES:
-        root = _REPO_ROOT / tree
-        # HARD assert, kept rather than downgraded to pytest.skip, and that is
-        # only correct BECAUSE this guard is now repo-level (task 3388): at the
-        # repo root every declared tree is guaranteed present, so a missing one
-        # is a real defect rather than a legitimate partial checkout.  The skip
-        # fallback was the price of NOT relocating; having relocated, do not
-        # also pay it.  Paired with
-        # test_every_declared_tree_contributes_scanned_files below, which
-        # catches the case this assert cannot: a tree that IS a directory and
-        # rglobs nothing.
-        assert root.is_dir(), (
-            f'{tree} not found under {_REPO_ROOT} — this guard walks fixed tree '
-            f'names, so a moved/renamed package must update _SRC_TREES rather '
-            f'than let the guard silently scan nothing.'
-        )
-        for py in sorted(root.rglob('*.py')):
-            yield py.relative_to(_REPO_ROOT).as_posix(), py.read_text(encoding='utf-8')
+    yield from _walk_trees(_SRC_TREES)
 
 
 class TestNoRegrownAtomicWriters:
@@ -628,9 +715,9 @@ class TestNoRegrownAtomicWriters:
         written here.
         """
         actual = {
-            (relpath, qualname)
-            for relpath, source in _iter_source_files()
-            for qualname in _find_renamers(source)
+            (module.relpath, qualname)
+            for module in _scan_source_trees()
+            for qualname in module.renamers
         }
 
         unapproved = actual - set(_ALLOWED_RENAMERS)
@@ -679,23 +766,18 @@ class TestNoRegrownAtomicWriters:
         _ALLOWED_RENAMERS).  Re-run the test to learn today's numbers.
         """
         offenders = []
-        for relpath, source in _iter_source_files():
-            if relpath == 'shared/src/shared/safe_io.py':
+        for module in _scan_source_trees():
+            if module.relpath == 'shared/src/shared/safe_io.py':
                 continue  # the blessed implementation lives here
-            for node in ast.walk(ast.parse(source)):
-                if (relpath, node.__dict__.get('name')) in _ALLOWED_RENAMERS:
+            for name, delegates in module.write_helpers:
+                if (module.relpath, name) in _ALLOWED_RENAMERS:
                     # Same documented exceptions as the sibling guard above.
                     # session_registry in particular MUST keep an inlined body:
                     # it is stdlib-only so spawn-claude.sh can run it with no
                     # venv, and importing shared makes it unimportable there.
                     continue
-                if (
-                    isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-                    and node.name in ('_atomic_write_text', 'atomic_write_text')
-                ):
-                    body = ast.get_source_segment(source, node) or ''
-                    if 'safe_io.atomic_write_text(' not in body:
-                        offenders.append(f'{relpath}::{node.name} does not delegate')
+                if not delegates:
+                    offenders.append(f'{module.relpath}::{name} does not delegate')
 
         assert not offenders, (
             'These helpers stopped delegating to shared.safe_io.atomic_write_text '
@@ -909,27 +991,20 @@ _POINTER_EXTRA_TREES = (
 
 
 def _iter_pointer_candidates():
-    """Yield (repo-relative posix path, source) over _SRC_TREES + the tests trees."""
+    """Yield (repo-relative posix path, source) over _SRC_TREES + the tests trees.
+
+    Deduped by relpath because the tree lists overlap by construction
+    (``scripts/tests`` sits inside the ``scripts`` scan root, ``tests/scripts``
+    inside ``tests``).  The reads are shared with the source-tree walk through
+    ``_read_tree``'s per-tree cache, so sweeping a tree this module already
+    scans costs nothing beyond the dedupe.
+    """
     seen: set[str] = set()
-    for relpath, source in _iter_source_files():
+    for relpath, source in _walk_trees(_SRC_TREES + _POINTER_EXTRA_TREES):
+        if relpath in seen:
+            continue
         seen.add(relpath)
         yield relpath, source
-    for tree in _POINTER_EXTRA_TREES:
-        root = _REPO_ROOT / tree
-        # Same loud-not-silent contract as _iter_source_files: a sweep that
-        # quietly stops covering a tree it can no longer find reports green by
-        # scanning nothing, which is the failure this whole module exists for.
-        assert root.is_dir(), (
-            f'{tree} not found under {_REPO_ROOT} — this sweep walks fixed tree '
-            f'names, so a moved/renamed package must update _POINTER_EXTRA_TREES '
-            f'rather than let the sweep silently cover less.'
-        )
-        for py in sorted(root.rglob('*.py')):
-            relpath = py.relative_to(_REPO_ROOT).as_posix()
-            if relpath in seen:
-                continue
-            seen.add(relpath)
-            yield relpath, py.read_text(encoding='utf-8')
 
 
 def test_allowlist_pointers_resolve_to_the_guard_module():
