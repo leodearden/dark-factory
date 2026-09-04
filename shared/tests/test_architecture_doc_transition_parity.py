@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import architecture_doc_transitions
 import pytest
 from architecture_doc_transitions import (
     DOC_PATH,
@@ -360,3 +361,83 @@ class TestFormatParityFailure:
     def test_empty_and_empty_renders_no_edge_lines(self):
         msg = format_parity_failure(frozenset(), frozenset())
         assert '->' not in msg
+
+
+class TestCheckArchitectureTransitionParity:
+    """Mutation / failure-direction proofs for ``check_architecture_transition_parity``.
+
+    This is the step the task exists for: "a parity test that passes under
+    an injected mutation is worthless, and this repo has a recorded case of
+    four assertions staying green through a full semantic reversal." Each
+    case here monkeypatches ``shared.task_transitions.TRANSITIONS`` to a
+    one-edge-mutated COPY of the real table (never the real frozensets
+    themselves) and calls the exact function the real gate calls, with
+    ARCHITECTURE.md left untouched throughout.
+
+    ``check_architecture_transition_parity`` is deliberately referenced via
+    ``architecture_doc_transitions.check_architecture_transition_parity``
+    (module-attribute access), not a top-level ``from ... import``: it does
+    not exist yet, and a top-level import would fail the whole module at
+    collection (ImportError), taking every already-green test above down
+    with it. Attribute access instead fails each of THIS class's tests
+    individually with ``AttributeError``, which is this step's RED.
+    """
+
+    def test_control_unmutated_table_passes_and_returns_nonempty_edges(self, monkeypatch):
+        # Guards against a guard that always raises: a byte-identical copy
+        # of the real table must NOT be reported as divergent.
+        unmutated = {actor: frozenset(edges) for actor, edges in TRANSITIONS.items()}
+        monkeypatch.setattr(task_transitions, 'TRANSITIONS', unmutated)
+        result = architecture_doc_transitions.check_architecture_transition_parity()
+        assert result
+
+    def test_added_edge_raises_naming_exactly_that_edge(self, monkeypatch):
+        added_edge = (TaskStatus.REVIEW, TaskStatus.MERGE_DEFERRED)
+        real_union = frozenset().union(*TRANSITIONS.values())
+        assert added_edge not in real_union, 'test fixture must pick a genuinely absent edge'
+
+        mutated = {actor: frozenset(edges) | {added_edge} for actor, edges in TRANSITIONS.items()}
+        monkeypatch.setattr(task_transitions, 'TRANSITIONS', mutated)
+        with pytest.raises(AssertionError) as exc_info:
+            architecture_doc_transitions.check_architecture_transition_parity()
+        message = str(exc_info.value)
+        assert 'review -> merge-deferred' in message
+        assert 'NOT drawn in ARCHITECTURE.md section 3.1' in message
+        assert message.count('->') == 1, f'expected exactly one named edge, got: {message!r}'
+
+    def test_removed_edge_raises_naming_exactly_that_edge(self, monkeypatch):
+        removed_edge = (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
+        mutated = {
+            actor: frozenset(e for e in edges if e != removed_edge)
+            for actor, edges in TRANSITIONS.items()
+        }
+        monkeypatch.setattr(task_transitions, 'TRANSITIONS', mutated)
+        with pytest.raises(AssertionError) as exc_info:
+            architecture_doc_transitions.check_architecture_transition_parity()
+        message = str(exc_info.value)
+        assert 'pending -> in-progress' in message
+        assert 'NOT in TRANSITIONS' in message
+        assert message.count('->') == 1, f'expected exactly one named edge, got: {message!r}'
+
+    def test_added_and_removed_edge_messages_are_different(self, monkeypatch):
+        # A semantic reversal that reported both directions identically
+        # would satisfy every substring check above while proving nothing —
+        # this is the check that rules that out.
+        added_edge = (TaskStatus.REVIEW, TaskStatus.MERGE_DEFERRED)
+        added_mutated = {
+            actor: frozenset(edges) | {added_edge} for actor, edges in TRANSITIONS.items()
+        }
+        monkeypatch.setattr(task_transitions, 'TRANSITIONS', added_mutated)
+        with pytest.raises(AssertionError) as added_exc:
+            architecture_doc_transitions.check_architecture_transition_parity()
+
+        removed_edge = (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
+        removed_mutated = {
+            actor: frozenset(e for e in edges if e != removed_edge)
+            for actor, edges in TRANSITIONS.items()
+        }
+        monkeypatch.setattr(task_transitions, 'TRANSITIONS', removed_mutated)
+        with pytest.raises(AssertionError) as removed_exc:
+            architecture_doc_transitions.check_architecture_transition_parity()
+
+        assert str(added_exc.value) != str(removed_exc.value)
