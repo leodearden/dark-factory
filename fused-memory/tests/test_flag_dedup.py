@@ -3318,12 +3318,11 @@ class TestFilterFalsePhantomTaskCreationFlags:
 class TestCitedFixTaskLive:
     """Tests for ``_cited_fix_task_live(cited, get_task_result) -> bool``.
 
-    Layers the ruled status policy on top of :func:`_cited_task_corroborated`:
-    a cited fix task counts as LIVE when it is positively present, its title
-    corroborates the citation, and its status is any filed status OTHER than
-    ``cancelled``.
-
-    RED until step-4 adds ``_cited_fix_task_live`` to flag_dedup.py.
+    A cited fix task counts as LIVE when it is positively present and its
+    status is any filed status OTHER than ``cancelled``.  As of task 4864 the
+    TITLE is not part of that test (see the block comment below): it is a
+    cosmetic, never-refreshed snapshot, so requiring equality made an ordinary
+    retitle silently disable the gate.
     """
 
     CITED = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix the thing'}
@@ -3391,19 +3390,91 @@ class TestCitedFixTaskLive:
             f'an inconclusive status must not suppress; got {result!r}'
         )
 
-    def test_false_on_title_mismatch(self):
-        """Id-collision / hallucinated-citation guard inherited from
-        _cited_task_corroborated: task ids are per-project sequential integers,
-        so a bare id match is routinely an unrelated task."""
+    # ---- task 4864 step-3: titles are COSMETIC for this gate ---------------
+    #
+    # ``recon_report.cite_task`` snapshots a title at cite time and NEVER
+    # refreshes it (first-cited title wins), so title equality is defeated by
+    # an ordinary retitle — and by a title-less ``get_task`` record, which
+    # cite_task itself stores as ``title=''``.  Contract A wins: the title is
+    # display text, not identity.  What replaces the lost protection is not
+    # nothing — ``_resolve_live_cross_project_fix_task`` issues a LIVE
+    # ``get_task`` for every citation on EVERY cycle (gate-time
+    # re-verification), bounded by HIT-only, foreign-only, non-cancelled and
+    # done-bounded-to-8-cycles.  The STRICT sibling
+    # ``_cited_task_corroborated`` is deliberately left alone; see
+    # ``test_strict_phantom_guard_still_rejects_the_titleless_citation``.
+
+    @pytest.mark.parametrize(
+        'cited',
+        [
+            {'project_id': 'dark_factory', 'task_id': '3839'},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': ''},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': '   '},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': None},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Stale old name'},
+        ],
+        ids=['title-missing', 'title-empty', 'title-blank', 'title-none', 'title-stale'],
+    )
+    def test_true_for_weakly_corroborated_titles(self, cited):
+        """A missing, empty or STALE title must not veto the gate.
+
+        RED until step-4 stops delegating the title veto to
+        ``_cited_task_corroborated``.
+        """
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        result = {'id': 3839, 'title': 'Fix the thing', 'status': 'pending'}
+        assert _cited_fix_task_live(cited, result) is True, (
+            f'a cosmetic title must not veto a present, non-cancelled fix '
+            f'task; got cited={cited!r}'
+        )
+
+    def test_true_on_a_title_that_matches_nothing(self):
+        """The contract stated at its bluntest: a live, filed, non-cancelled
+        task at the cited id counts, whatever its title says."""
         from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
 
         result = {'id': 3839, 'title': 'A completely unrelated task', 'status': 'pending'}
-        assert _cited_fix_task_live(self.CITED, result) is False, (
-            f'a title mismatch must not suppress; got {result!r}'
+        assert _cited_fix_task_live(self.CITED, result) is True, (
+            f'a title mismatch must not veto the fix-task gate; got {result!r}'
+        )
+
+    def test_false_for_weak_title_when_the_task_is_cancelled(self):
+        """Dropping the title veto must not weaken the ABANDONED guard, which
+        is the one that prevents permanent silencing."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        cited = {'project_id': 'dark_factory', 'task_id': '3839'}
+        result = {'id': 3839, 'title': 'Fix the thing', 'status': 'cancelled'}
+        assert _cited_fix_task_live(cited, result) is False, (
+            f'a cancelled task must never suppress, title or no title; got {result!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'cited',
+        [
+            {'project_id': 'dark_factory', 'task_id': '3839'},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': ''},
+        ],
+        ids=['title-missing', 'title-empty'],
+    )
+    def test_strict_phantom_guard_still_rejects_the_titleless_citation(self, cited):
+        """The SPLIT: ``_cited_task_corroborated`` stays strict.
+
+        A false drop there silences a phantom-task finding with no bounded
+        expiry, and ``test_phantom_finding_kept_when_cited_title_missing``
+        pins that.  Only the fix-task gate relaxes.
+        """
+        from fused_memory.reconciliation.flag_dedup import _cited_task_corroborated
+
+        result = {'id': 3839, 'title': 'Fix the thing', 'status': 'pending'}
+        assert _cited_task_corroborated(cited, result) is False, (
+            f'the strict phantom guard must keep requiring a title; got {cited!r}'
         )
 
     def test_true_on_title_match_with_different_case_and_whitespace(self):
-        """Title normalisation (casefold + whitespace-collapse) is inherited."""
+        """Title normalisation (casefold + whitespace-collapse) still applies —
+        it now decides STRENGTH (INFO vs WARNING), not admission."""
         from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
 
         result = {'id': 3839, 'title': '  FIX   THE    THING ', 'status': 'pending'}
@@ -4765,13 +4836,13 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         return sig
 
     @staticmethod
-    def _taskmaster(*, status='pending', side_effect=None):
+    def _taskmaster(*, status='pending', side_effect=None, title='Fix'):
         taskmaster = AsyncMock()
         if side_effect is not None:
             taskmaster.get_task = AsyncMock(side_effect=side_effect)
         else:
             taskmaster.get_task = AsyncMock(
-                return_value={'id': 3839, 'title': 'Fix', 'status': status}
+                return_value={'id': 3839, 'title': title, 'status': status}
             )
         return taskmaster
 
@@ -5160,6 +5231,175 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
             and 'fix_task_id=3839' in m
             for m in messages
         ), f'expected a structured suppression log naming the fix task; got {messages!r}'
+
+
+    # ---- task 4864 step-3: weakly-corroborated citations, audibly ----------
+    #
+    # The three shapes no test covered, all reachable from the real producer:
+    # a citation whose ``title`` key is MISSING, one whose title is ``''``
+    # (exactly what ``recon_report.cite_task`` stores for a title-less
+    # ``get_task`` record), and a STALE title (the live task was renamed after
+    # it was cited).  Each must SUPPRESS — the title is cosmetic — and each
+    # must say so at WARNING, because a suppression resting on an
+    # uncorroborated title is a weaker decision than one resting on an exact
+    # match and must not be indistinguishable from it in a log.
+
+    WEAK_CITES = {
+        'title-missing': {'project_id': 'dark_factory', 'task_id': '3839'},
+        'title-empty': {'project_id': 'dark_factory', 'task_id': '3839', 'title': ''},
+        'title-stale': {
+            'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Old name',
+        },
+    }
+    LOGGER = 'fused_memory.reconciliation.flag_dedup'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('shape', sorted(WEAK_CITES), ids=sorted(WEAK_CITES))
+    async def test_weakly_corroborated_citation_suppresses_and_warns(
+        self, shape, ledger_memory_service, caplog
+    ):
+        """(i)+(ii)+(iii): suppressed, counted, and logged at WARNING."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.WEAK_CITES[shape]])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1'
+        )
+        stats: dict[str, int] = {}
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag],
+                taskmaster=self._taskmaster(title='Live current name'),
+                known_projects=self.KNOWN,
+                stats=stats,
+            )
+
+        assert result == [], (
+            f'a cosmetic title must not disable the gate ({shape}); got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1, (
+            f'the drop must be counted ({shape}); got {stats!r}'
+        )
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'cross_project_fix_task_title_uncorroborated' in r.message
+        ]
+        assert warnings, (
+            f'a weakly-corroborated suppression must be logged at WARNING '
+            f'({shape}); got {[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+        message = warnings[0].message
+        assert 'cited_project_id=dark_factory' in message and 'cited_task_id=3839' in message, (
+            f'the warning must name the cited project/task; got {message!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_exact_title_match_suppresses_without_a_warning(
+        self, ledger_memory_service, caplog
+    ):
+        """REGRESSION: the WARNING must stay a SIGNAL. A strongly-corroborated
+        suppression still logs only at INFO, or the new level means nothing."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1'
+        )
+        stats: dict[str, int] = {}
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag],
+                taskmaster=self._taskmaster(title='Fix'),
+                known_projects=self.KNOWN,
+                stats=stats,
+            )
+
+        assert result == [] and stats.get('cross_project_fix_task_suppressed') == 1
+        assert not [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ], (
+            'an exact title match must suppress at INFO only; got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+        assert any(
+            'stage1_flag_cross_project_fix_task_suppressed' in r.message
+            for r in caplog.records
+        ), f'the INFO suppression log must still fire; got {caplog.text!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('shape', sorted(WEAK_CITES), ids=sorted(WEAK_CITES))
+    async def test_cancelled_foreign_task_never_suppresses_whatever_the_title(
+        self, shape, ledger_memory_service
+    ):
+        """REGRESSION: relaxing the title veto must not weaken the ABANDONED
+        guard — that is the one preventing permanent silencing."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.WEAK_CITES[shape]])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1'
+        )
+        stats: dict[str, int] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(status='cancelled', title='Live current name'),
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert len(result) == 1, (
+            f'a cancelled fix task must never suppress ({shape}); got {result!r}'
+        )
+        assert 'cross_project_fix_task_suppressed' not in stats, (
+            f'no drop must be counted ({shape}); got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_foreign_task_never_suppresses_whatever_the_title(
+        self, ledger_memory_service
+    ):
+        """The presence check is now the WHOLE admission test, so pin it: a
+        citation naming a task that does not exist must still fail open."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.WEAK_CITES['title-missing']])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1'
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(side_effect=RuntimeError(
+                'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 3839'
+            )),
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, (
+            f'an absent fix task must fail open even title-less; got {result!r}'
+        )
+
 
 
 # ---------------------------------------------------------------------------
@@ -9587,8 +9827,18 @@ class TestCrossProjectGateAmendments:
     async def test_present_but_uncorroborated_citation_logs_the_near_miss(
         self, ledger_memory_service, caplog
     ):
-        """The near-miss log the docstring sells: a renamed fix task fails OPEN,
-        and that non-suppression must be observable rather than silent."""
+        """The near-miss log the docstring sells: a citation that is PRESENT but
+        not live must fail OPEN observably rather than silently.
+
+        RETARGETED by task 4864.  This case used to be driven by a RENAMED fix
+        task, because a title mismatch was then a veto.  Titles are cosmetic
+        now, so a rename suppresses (loudly — see
+        ``TestDedupFlagsCrossProjectFixTaskSuppression.
+        test_weakly_corroborated_citation_suppresses_and_warns``) and can no
+        longer produce a near miss.  The near-miss path is unchanged and still
+        reachable by the two conditions that DO disqualify a present task:
+        an abandoned status, and an inconclusive (absent/non-``str``) one.
+        """
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
         flag = self._flag(cited=[self.FIX_CITE])
@@ -9600,12 +9850,12 @@ class TestCrossProjectGateAmendments:
                 project_id=self.PROJECT,
                 run_id='r2',
                 flags=[flag],
-                taskmaster=self._taskmaster(title='Renamed fix'),
+                taskmaster=self._taskmaster(status='cancelled'),
                 known_projects=self.KNOWN,
             )
 
         assert len(result) == 1, (
-            f'a title mismatch must fail OPEN (no suppression); got {result!r}'
+            f'a cancelled fix task must fail OPEN (no suppression); got {result!r}'
         )
         assert 'cross_project_fix_task_present_but_uncorroborated' in caplog.text, (
             f'the near-miss must be logged; got {caplog.text!r}'
