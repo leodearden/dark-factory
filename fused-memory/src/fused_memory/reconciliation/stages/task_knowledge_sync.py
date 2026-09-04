@@ -9,7 +9,7 @@ import itertools
 import json
 import logging
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -43,6 +43,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_false_phantom_task_creation_flags,
 )
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
 )
@@ -940,6 +941,18 @@ _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
 # a {'source': ...} filter — it is enumerated by the boolean payload key
 # {'flag_for_stage2': True} instead (Qdrant payload filters are
 # type-sensitive; the stored value is boolean True, not the string 'true').
+#
+# THIS FILTER IS INTENTIONALLY WIDE — do not "fix" it by narrowing (task
+# 4375). Adding a positive kind/source discriminator here was evaluated
+# against the tombstone ledger and rejected on measurement: of the 288 records
+# this sweep has destroyed, 165 carried NO 'kind' key at all and 248 no
+# 'source', so a positive allowlist would enumerate ~0 records and silently
+# reinstate the unbounded leak this sweep exists to prevent. Qdrant payload
+# filters are exact-equality and AND-only with no key-existence operator, so
+# the genuine relay pool is not expressible as a filter. ALL discrimination
+# therefore lives in _sweep_stale_mem0_pool's per-member eligibility
+# predicate — see _sweep_stale_mem0_flag_for_stage2_markers' docstring for
+# the full four-part composite rule.
 # A marker Stage 2 hasn't consumed in 14+ days can never be "current" per
 # _query_stage2_flags' run_id/run-window semantics (run_ids are per-cycle;
 # Stage 2 runs many times/day) — so it is definitionally unconsumed dead
@@ -1066,6 +1079,7 @@ async def _gc_recon_markers(
     run_id: str,
     *,
     now: datetime | None = None,
+    terminal_task_ids: list[str] | None = None,
 ) -> int:
     """Garbage-collect ``recon_ledger`` marker rows for *scope* in ONE DELETE pass.
 
@@ -1133,6 +1147,24 @@ async def _gc_recon_markers(
             helper — the marker write is not factored out), so the
             ledger's lexicographic TEXT comparison against stored
             ``expires_at`` values is correct.
+        terminal_task_ids: Optionally PRE-RESOLVED terminal task ids (task
+            4375). ``None`` (the default) preserves the original behaviour
+            exactly — this function resolves them itself via
+            :func:`_resolve_terminal_task_ids` — so every existing caller and
+            test is unaffected. When supplied, the internal resolve is skipped
+            and the caller's list is used verbatim.
+
+            This is purely an EFFICIENCY hoist, which is why a default is safe
+            here and deliberately is NOT on
+            :func:`_sweep_stale_mem0_flag_for_stage2_markers`: there the
+            argument is a correctness gate, so a forgotten argument must be a
+            loud ``TypeError`` rather than a silent fallback.
+            :meth:`TaskKnowledgeSync.run` supplies it so ONE bulk
+            ``get_statuses`` read serves both this pass and the Mem0
+            ``flag_for_stage2`` sweep, which additionally guarantees both see
+            the SAME view of terminality within a cycle. The bounding
+            intersection with ``marker_task_ids`` below still applies either
+            way.
 
     Returns:
         Number of rows deleted by the ``gc()`` pass (``0`` on any failure or
@@ -1143,7 +1175,12 @@ async def _gc_recon_markers(
         return 0
 
     now_iso = _assume_utc(now or datetime.now(UTC)).isoformat()
-    terminal_task_ids = await _resolve_terminal_task_ids(taskmaster, scope, run_id)
+    # A pre-resolved list from run() skips this pass's own bulk get_statuses
+    # round-trip (task 4375); None keeps the original self-resolving path.
+    if terminal_task_ids is None:
+        terminal_task_ids = await _resolve_terminal_task_ids(taskmaster, scope, run_id)
+    else:
+        terminal_task_ids = list(terminal_task_ids)
 
     if terminal_task_ids:
         try:
@@ -1182,6 +1219,7 @@ async def _sweep_stale_mem0_pool(
     scroll_limit: int = 1000,
     count_short_circuit: bool = False,
     enum_filters: dict | Sequence[dict] | None = None,
+    terminal_task_ids: Collection[str] | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1222,17 +1260,96 @@ async def _sweep_stale_mem0_pool(
     silently refilling the pool this sweep just drained (task 3915 step-8;
     never raises, never alters the member list or returned count).
 
-    **Protected-mirror invariant (task 3041): this skeleton NEVER deletes a
-    ``kind='cycle_summary'`` / ``record_type='ledger_stamp'`` record**, no
-    matter which pool filter selected it. Every enumerated member is tested
-    against
-    :func:`~fused_memory.reconciliation.mem0_tombstone.is_protected_mirror_record`
-    BEFORE the age check; a match is skipped with a WARNING naming the
-    memory_id, its kind/record_type and *log_name*, and is excluded from the
-    returned count. An over-broad payload filter therefore degrades to a LOUD
-    skip rather than collateral mirror loss.
+    **Protected-record invariant (tasks 3041, 4375): this skeleton NEVER
+    deletes a protected record**, no matter which pool filter selected it.
+    Every enumerated member is tested against TWO independent predicates
+    BEFORE the age check, each with its OWN attributable WARNING naming the
+    memory_id and *log_name*, and each skip excluded from the returned count:
 
-    The guard lives HERE rather than in each caller's payload filter because
+    - :func:`~fused_memory.reconciliation.mem0_tombstone.is_protected_mirror_record`
+      (task 3041) — a ``kind='cycle_summary'`` / ``record_type='ledger_stamp'``
+      ledger mirror.
+    - :func:`~fused_memory.reconciliation.mem0_tombstone.is_protected_audit_record`
+      (task 4375) — a DELIBERATELY-PERMANENT audit-log record whose ``kind`` is
+      in ``PROTECTED_AUDIT_KINDS``. The motivating case is measured: 40
+      ``kind='cadence_check'`` records in autopilot_video were destroyed by
+      this skeleton's ``flag_for_stage2`` caller, every one at exactly
+      ``max_age_days`` old — pure age-GC. They carried the full Stage-1 relay
+      contract and so were indistinguishable from genuine relay markers by
+      every field except ``kind``.
+
+    The two predicates are deliberately SEPARATE rather than one widened
+    predicate, so a skipped audit record is never logged as a skipped mirror
+    (which would send an operator to tighten the wrong thing). An over-broad
+    payload filter therefore degrades to a LOUD, correctly-attributed skip
+    rather than collateral loss.
+
+    **Terminal-task-closure gate (task 4375, opt-in per caller).** When
+    *terminal_task_ids* is supplied, an age-stale member is additionally
+    required to cite a ``metadata.task_id`` that is confirmed TERMINAL before
+    it may be retired, mirroring on the Mem0 side the ``task_id IN (...)``
+    arm that
+    :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc`
+    already applies to ledger rows. The semantics are AND, never OR: the gate
+    is ADDITIONAL to — never an alternative to — the age cutoff and the two
+    protected-record guards above.
+
+    The ``None``-vs-``[]`` sentinel is load-bearing:
+
+    - ``None`` (the default) means "NO gate requested" and leaves this
+      skeleton byte-for-byte as it was for the two age-only callers
+      (:func:`_sweep_stale_persistence_markers`,
+      :func:`_sweep_stale_mem0_flag_markers`), which are age-only by design.
+    - An EMPTY collection means "gate active, nothing is terminal" and
+      therefore retires nothing this cycle. :func:`_resolve_terminal_task_ids`
+      is explicitly fail-safe to ``[]`` on a falsy taskmaster, a raising
+      ``get_statuses``, or an unexpected result shape — so a Taskmaster outage
+      degrades to a FULL KEEP, not to unconditional age-deletion during
+      exactly the window in which nothing can be verified. Collapsing the two
+      sentinels would invert that.
+
+    Matching is exact-string against ``str(task_id).strip()``, deliberately
+    reusing ``_gc_recon_markers``' documented precedent and its consequence: a
+    marker whose stored ``task_id`` is a comma-joined multi-task list never
+    matches even when every cited task is terminal, and is KEPT. So is a
+    marker with no ``task_id`` at all, an empty one, or a non-Taskmaster
+    pseudo-id. That is a KEEP-direction leak and it is deliberate — this
+    module's documented posture is "uncertain => keep, never delete on
+    partial/failed information", and bounded recoverable growth outranks
+    permanent loss.
+
+    **The leak is SIZED, not merely asserted bounded** (amendment pass;
+    reviewer finding robustness/unbounded-growth, which correctly noted the
+    original census measured ``kind`` and ``source`` coverage but never
+    ``task_id``). Direct Qdrant scroll of every live ``flag_for_stage2`` pool,
+    2026-09-02: **56 live records across 5 projects, 41 (73%) carry a
+    non-empty ``task_id`` and 15 (27%) do not** — dark_factory 3/11, reify
+    12/24, autopilot_video 0/12, know_live 0/9, solar_challenge_platform 0
+    (pool empty). So the permanently-un-retireable cohort is a minority of the
+    pool, and the sweep still retires the ~73% majority once their cited task
+    closes; it does not degrade to retiring nothing. The 27% is real growth
+    and is why the aggregate WARNING below exists.
+
+    The matching HISTORICAL census — ``task_id`` coverage on the 289 records
+    this sweep already destroyed — is **unmeasurable, permanently**:
+    ``mem0_tombstone._VICTIM_IDENTITY_KEYS`` projects only
+    ``kind``/``record_type``/``source``/``recon_pool``/``run_id`` into a
+    tombstone payload, and the ledger row's own ``task_id`` column holds the
+    VICTIM'S MEMORY UUID (it is the tombstone's lookup key), not the task the
+    victim cited. Verified: ``json_extract(payload_json,'$.task_id') IS NOT
+    NULL`` matches 0 of 289 rows. Recorded here so a future reader does not
+    re-attempt the query and conclude the data is merely missing.
+
+    The leak is surfaced, not hidden: when the gate withholds at
+    least one AGE-STALE member, ONE aggregate WARNING per sweep names the
+    retained count, so a persistently growing number becomes visible as the
+    signal that this pool needs a real closure path for task_id-less markers.
+    The gate is evaluated only for members that already cleared the age
+    cutoff, so that count means "old enough to retire but cannot be" and never
+    "not yet old enough" — a still-young marker citing an open task is the
+    healthy steady state of a live pool and must not inflate the signal.
+
+    The guards live HERE rather than in each caller's payload filter because
     filter-tightening cannot guarantee precision:
     :data:`_FLAG_FOR_STAGE2_ENUM_FILTERS` is ``{'flag_for_stage2': True}``
     with no ``kind``/``source``/``record_type`` discriminator at all, and
@@ -1305,11 +1422,30 @@ async def _sweep_stale_mem0_pool(
             and unioned by ``id`` — see the "Multi-variant union" note
             above. ``source`` itself always supplies the human-readable log
             label regardless of which filter(s) are actually applied.
+        terminal_task_ids: Opt-in terminal-task-closure gate (task 4375).
+            ``None`` (default) disables the gate entirely, preserving the
+            age-only behaviour every caller had before this task. A supplied
+            collection — INCLUDING an empty one — activates it: an age-stale
+            member is retired only if ``str(metadata['task_id']).strip()`` is
+            a member. Accepts any ``Collection`` (list, set, frozenset); it is
+            normalized to a ``frozenset`` once so the per-member test is O(1).
+            See the "Terminal-task-closure gate" note above for the
+            ``None``-vs-``[]`` distinction and the deliberate KEEP-direction
+            consequences.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
+    # Normalize the terminal-closure gate ONCE (task 4375) so the per-member
+    # membership test below is O(1) and a caller may hand us any Collection.
+    # `None` is preserved as a distinct sentinel meaning "no gate requested" —
+    # it is NOT the same as an empty set, which means "gate active, nothing is
+    # terminal" and correctly retires nothing this cycle.
+    terminal_ids: frozenset[str] | None = (
+        None if terminal_task_ids is None else frozenset(terminal_task_ids)
+    )
+
     # Normalize enum_filters to a list of one-or-more filter variants (task
     # 3915): a bare dict is the pre-3915 single-filter shape (one-element
     # list); None preserves the {'source': source} default; a Sequence[dict]
@@ -1467,6 +1603,20 @@ async def _sweep_stale_mem0_pool(
     # as one list so the zip(..., strict=True) delete/result pairing below is
     # structurally unchanged.
     stale_members: list[dict] = []
+    # Count of age-stale members withheld by the terminal-closure gate, used
+    # for the single aggregate WARNING after the loop (task 4375).
+    retained_unclosed = 0
+    # Same, for members withheld by the protected-audit-record guard (task
+    # 4375 amendment pass). Aggregated for the SAME reason retained_unclosed
+    # is: this cohort is by definition permanent and expected — autopilot_video
+    # alone holds 7 live kind='cadence_check' records carrying
+    # flag_for_stage2=True (measured 2026-09-02) — so a per-member WARNING
+    # every cycle would be a forever-firing signal with no operator action
+    # behind it, which is exactly the "train an operator to ignore the one
+    # signal that matters" failure the retained-unclosed block below is shaped
+    # to avoid. The per-member detail is not lost, only demoted to DEBUG.
+    protected_audit = 0
+    protected_audit_kinds: set[str] = set()
     for member in members:
         mid = member.get('id')
         if not mid:
@@ -1494,6 +1644,42 @@ async def _sweep_stale_mem0_pool(
             )
             continue
 
+        # Protected-audit-record exclusion (task 4375), checked alongside the
+        # mirror guard and BEFORE the age test for the same reason: an
+        # over-broad payload filter must degrade to a loud skip rather than
+        # collateral loss of a record that is SUPPOSED to outlive the window
+        # in which its subject was interesting.
+        #
+        # Reported as ONE aggregate WARNING after the loop rather than one per
+        # member (amendment pass), unlike the mirror branch above. The two
+        # cases differ in expected frequency, not in importance: a matched
+        # MIRROR is a rare accident and its WARNING correctly says "tighten
+        # this filter", whereas a matched AUDIT RECORD is the documented
+        # steady state of this pool and recurs identically every cycle
+        # forever. The per-member identity still reaches an operator who wants
+        # it, at DEBUG. Attribution is preserved either way: the aggregate
+        # message and `log_name` keep it distinguishable from the mirror skip.
+        if is_protected_audit_record(member_metadata):
+            metadata = member_metadata if isinstance(member_metadata, dict) else {}
+            kind = metadata.get('kind')
+            protected_audit += 1
+            if isinstance(kind, str) and kind:
+                protected_audit_kinds.add(kind)
+            logger.debug(
+                'reconciliation.%s: SKIPPING protected audit record memory_id=%s '
+                '(kind=%s) — this pool filter matched a deliberately-permanent '
+                'audit-log record it must never delete; it is retained regardless '
+                'of age (task 4375).',
+                log_name, mid, kind,
+                extra={
+                    'project_id': project_id,
+                    'memory_id': mid,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+            continue
+
         raw = member.get('created_at')
         if raw is None:
             continue
@@ -1503,7 +1689,109 @@ async def _sweep_stale_mem0_pool(
             continue
 
         if created_at < cutoff:
+            # Terminal-task-closure gate (task 4375). Ordering within the
+            # eligibility chain is deliberate on BOTH sides:
+            #
+            # - AFTER the two protected-record guards, so a protected record
+            #   still produces its own attributable WARNING above rather than
+            #   being silently absorbed into the retained-unclosed tally.
+            # - AFTER the age test, so `retained_unclosed` counts only members
+            #   that are OLD ENOUGH TO RETIRE BUT CANNOT BE. A marker younger
+            #   than max_age_days citing an open task is the normal, healthy
+            #   steady state of a live relay pool; counting it would fire the
+            #   aggregate WARNING below every cycle for every healthy project
+            #   and train an operator to ignore the one signal that matters.
+            #   The gate is a `continue` either way, so the SET OF DELETED
+            #   RECORDS is identical under either ordering — only the
+            #   diagnostic's meaning changes.
+            #
+            # Exact-string match on the stripped task_id, reusing
+            # _gc_recon_markers' precedent verbatim — so a comma-joined
+            # multi-task task_id, a non-Taskmaster pseudo-id, an empty string
+            # and a missing key all fail the test and are KEPT. Never raises
+            # on a weird payload.
+            if terminal_ids is not None:
+                raw_task_id = (
+                    member_metadata.get('task_id')
+                    if isinstance(member_metadata, dict)
+                    else None
+                )
+                key = str(raw_task_id).strip() if raw_task_id is not None else ''
+                if not key or key not in terminal_ids:
+                    retained_unclosed += 1
+                    continue
+
             stale_members.append(member)
+
+    if protected_audit > 0:
+        # Protected-audit-record diagnostic (task 4375 amendment pass). Same
+        # shape and same fail-safe wrapper as the two other aggregate
+        # diagnostics in this function: emitted ONCE per sweep, purely
+        # informational, and it must never alter `members` or the returned
+        # count. The distinct kinds are carried because they are the actionable
+        # part — they say WHICH audit vocabulary this pool's filter is
+        # colliding with, which is what a filter fix would have to target.
+        try:
+            logger.warning(
+                'reconciliation.%s: RETAINED %d protected audit record(s) '
+                '(kinds=%s) matched by this %s pool filter — deliberately-'
+                'permanent audit-log records, kept regardless of age (task '
+                '4375). Expected and recurring: this pool filter is wide by '
+                'design, so a steady count here is healthy, not a failure. '
+                'Per-record ids are logged at DEBUG.',
+                log_name, protected_audit,
+                ','.join(sorted(protected_audit_kinds)) or '<none>', source,
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: protected-audit-record diagnostic raised; '
+                'skipping (fail-safe, does not affect the sweep count).',
+                log_name,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+
+    if retained_unclosed > 0:
+        # Retained-unclosed diagnostic (task 4375). The gate's KEEP direction
+        # is deliberate and correct — permanent loss outranks bounded,
+        # recoverable growth — but a marker with no task_id, a pseudo-id, or a
+        # comma-joined task_id can now NEVER be retired, so the cohort only
+        # grows. Surfaced rather than hidden, per the project's
+        # loud-over-silent-degradation invariant.
+        #
+        # Modelled on the task-3915 under-tagged-drift block above: purely
+        # diagnostic, emitted ONCE per sweep rather than per member, wrapped so
+        # it can never raise into the sweep, and it must never alter `members`
+        # or the returned count. Following that precedent is also why no new
+        # cycle stat is introduced for this cohort.
+        try:
+            logger.warning(
+                'reconciliation.%s: RETAINED %d age-stale %s record(s) — their '
+                'referencing task is not terminal, or they cite no resolvable '
+                'task id (missing/empty/comma-joined/non-Taskmaster). This is '
+                'the deliberate fail-safe KEEP direction, not a failure; a '
+                'persistently growing count means this pool needs a closure '
+                'path for task_id-less markers (task 4375).',
+                log_name, retained_unclosed, source,
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: retained-unclosed diagnostic raised; skipping '
+                '(fail-safe, does not affect the sweep count).',
+                log_name,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
 
     if not stale_members:
         return 0
@@ -1790,11 +2078,14 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     project_id: str,
     run_id: str,
     *,
+    terminal_task_ids: Collection[str],
     max_age_days: int = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
     now: datetime | None = None,
     scroll_limit: int = 1000,
 ) -> int:
-    """Age-GC the Mem0-only ``flag_for_stage2`` relay pool (task 2966).
+    """Composite-gated GC for the Mem0-only ``flag_for_stage2`` relay pool.
+
+    Tasks 2966 (the sweep) and 4375 (the composite eligibility rule).
 
     ``flag_for_stage2`` markers are the Stage-1 -> Stage-2 relay channel:
     written ONLY to Mem0 by the Stage-1 flag_dedup/LLM ``add_memory`` path
@@ -1819,12 +2110,46 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     dark_factory Mem0 confirmed this shape). See
     :func:`_sweep_stale_mem0_pool`'s docstring for the fail-safe posture.
 
-    That boolean-only filter has NO ``kind``/``source``/``record_type``
-    discriminator, so on its own it matches any record an LLM writer happened
-    to stamp ``flag_for_stage2=True`` on — including a cycle_summary mirror.
-    This sweep is therefore the concrete motivating case for the skeleton's
-    protected-mirror invariant (task 3041), which makes that over-breadth
-    degrade to a loud skip instead of collateral mirror loss.
+    **The pool filter is deliberately WIDE, and retirement is decided by a
+    composite rule instead (task 4375).** That boolean-only filter has NO
+    ``kind``/``source``/``record_type`` discriminator, so on its own it
+    matches any record an LLM writer happened to stamp ``flag_for_stage2=True``
+    on — a cycle_summary mirror, or a permanent audit-log record. Both harms
+    are measured, not hypothetical: this sweep destroyed 288 records, 40 of
+    them ``kind='cadence_check'`` audit records in autopilot_video, every one
+    at exactly ``max_age_days`` old.
+
+    Narrowing the filter is NOT the fix and cannot be. Of those 288 victims,
+    165 (57%, across 5 of 6 projects) carried no ``kind`` key at all and 248
+    (86%) carried no ``source``; the kinds that do appear are a ~37-value long
+    tail of free-form LLM-authored strings. Qdrant payload filters are
+    exact-equality and AND-only within one dict with no key-existence
+    operator, so neither "has a flag_type" nor "kind in {...}" is expressible
+    as a pool filter at all. A positive allowlist would enumerate ~0 records
+    and silently reinstate the unbounded leak this sweep exists to prevent.
+    So the filter stays wide and ALL discrimination lives in the eligibility
+    predicate. A future reader should not "fix" ``_FLAG_FOR_STAGE2_ENUM_FILTERS``
+    by narrowing it.
+
+    A marker is retired only when ALL of the following hold:
+
+    1. ``created_at`` is older than ``max_age_days`` (task 2966).
+    2. It is not a protected cycle_summary mirror (task 3041).
+    3. Its ``kind`` is not in ``mem0_tombstone.PROTECTED_AUDIT_KINDS`` (task
+       4375, Part B).
+    4. Its ``task_id`` is confirmed TERMINAL via *terminal_task_ids* (task
+       4375, Part A).
+
+    Gate 4 is the PRIMARY defence and gate 3 is defence in depth for the
+    residual intersection, not the other way round: every one of the 40
+    destroyed ``cadence_check`` records cites autopilot_video task 452, whose
+    status is ``deferred`` — not in ``TERMINAL_STATUSES`` — so gate 4 alone
+    would have preserved all of them. Gate 4 is also structurally opt-IN,
+    demanding positive evidence of closure, so an audit-log kind nobody
+    remembered to register in ``PROTECTED_AUDIT_KINDS`` is still protected
+    while its cited task stays open. See :func:`_sweep_stale_mem0_pool` for
+    the gate's ``None``-vs-``[]`` sentinel and its deliberate KEEP-direction
+    consequences.
 
     Passes ``count_short_circuit=True``: unlike ``stage2_persistence_marker``
     (written nearly every cycle that has surviving flags), Stage-1 writes a
@@ -1850,6 +2175,17 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         project_id: Project scope for enumeration and delete calls.
         run_id: Current reconciliation run identifier used as ``causation_id``
             in the audit journal.
+        terminal_task_ids: Task ids confirmed terminal this cycle, forwarded
+            verbatim to :func:`_sweep_stale_mem0_pool`'s closure gate.
+            REQUIRED and deliberately given NO default (task 4375): a caller
+            who forgets it must get a loud ``TypeError`` at call time rather
+            than silently reverting to unconditional age-only deletion
+            (permanent loss, visible only weeks later as missing records) or
+            silently disabling the sweep (an unbounded pool). Resolved ONCE
+            per cycle in :meth:`TaskKnowledgeSync.run` via
+            :func:`_resolve_terminal_task_ids` and shared with
+            :func:`_gc_recon_markers`, so both passes see the same view of
+            terminality within a cycle.
         max_age_days: Staleness cutoff in days (default
             ``_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS`` == 14).
         now: Reference "current time" for the cutoff calculation. Defaults to
@@ -1872,6 +2208,7 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
         enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
+        terminal_task_ids=terminal_task_ids,
     )
     # Diagnostic-only; never affects the returned sweep count (task 2966
     # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).
@@ -3383,8 +3720,26 @@ class TaskKnowledgeSync(BaseStage):
         # sweep. Runs unconditionally on both full and remediation paths so
         # the pool is bounded every cycle. Explicit zero so downstream
         # consumers never need a .get(..., 0) fallback.
+        #
+        # Terminal-task ids are resolved ONCE here (task 4375) and shared by
+        # both consumers below: the ledger GC pass and the Mem0
+        # flag_for_stage2 sweep. _resolve_terminal_task_ids issues a bulk
+        # taskmaster.get_statuses() over the whole task tree, so a second
+        # independent resolve would be a pure duplicate round-trip on the
+        # cycle's critical path, every cycle, for every project — the same
+        # efficiency argument that made it a single bulk read instead of a
+        # per-marker get_task loop in the first place. Sharing ONE list also
+        # buys a correctness property: both passes necessarily see the SAME
+        # view of terminality within a cycle, so a task that transitions
+        # mid-cycle cannot be terminal for the ledger arm and still open for
+        # the Mem0 arm. It is fail-safe to [] (see that helper), which the
+        # Mem0 sweep reads as "gate active, nothing terminal" => full KEEP.
+        terminal_task_ids = await _resolve_terminal_task_ids(
+            self.taskmaster, self.scope, run_id,
+        )
         report.stats['recon_markers_gc_swept'] = await _gc_recon_markers(
             self.memory, self.taskmaster, self.scope, run_id,
+            terminal_task_ids=terminal_task_ids,
         )
 
         # stage2_persistence_marker (task 2095) is GC'd separately from Mem0,
@@ -3431,9 +3786,20 @@ class TaskKnowledgeSync(BaseStage):
         # gap as stage2_persistence_marker above). Runs unconditionally every
         # cycle, per-project, alongside the three sibling GC passes; explicit
         # value so downstream consumers never need a .get(..., 0) fallback.
+        #
+        # Retirement here is COMPOSITE, not age-only (task 4375): a marker is
+        # deleted only when it is past the 14-day cutoff AND is not a
+        # protected cycle_summary mirror AND its kind is not in
+        # PROTECTED_AUDIT_KINDS AND its task_id is confirmed terminal in the
+        # list hoisted above. The terminal gate is the primary arm — it was
+        # added because 40 kind='cadence_check' audit records in
+        # autopilot_video were destroyed by the age-only sweep, all citing a
+        # task that is merely 'deferred'. The two sibling Mem0 sweeps above
+        # are deliberately age-only and are NOT gated.
         report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
             await _sweep_stale_mem0_flag_for_stage2_markers(
                 self.memory, self.project_id, run_id,
+                terminal_task_ids=terminal_task_ids,
             )
         )
 
