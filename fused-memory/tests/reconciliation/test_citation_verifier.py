@@ -10,6 +10,7 @@ plan for the full three-way contract (keep / drop+mark / keep+mark).
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
@@ -18,11 +19,13 @@ import pytest
 
 from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.citation_verifier import (
+    PROSE_CITATION_FIELDS,
     STAGE_STAT_PREFIX,
     X_CITATION_TOMBSTONE_KEY,
     build_citation_tombstone,
     find_citation_occurrences,
     find_live_citation_occurrences,
+    find_prose_uuids,
     is_concrete_memory_id,
     repoint_metadata,
     repoint_task_citations,
@@ -1422,3 +1425,145 @@ class TestTombstoneLedgerIsNotACitation:
         assert not any(
             p.startswith(X_CITATION_TOMBSTONE_KEY) for p in tombstones[1]['paths']
         )
+
+
+# --------------------------------------------------------------------------- #
+# Prose citation scanning (task 4818)
+# --------------------------------------------------------------------------- #
+
+# The near-miss specimen pair from the incident this task closes. Recon Stage-2
+# run ``ab330f59-7335-4962-b9a8-e2fdaa96d3e9`` emitted Stage-1 finding
+# ``0490e20e-cce2-4e68-a2ce-80f3b31987a1``, whose prose named a FABRICATED
+# memory id that escaped into gate task 4423's description and needed a
+# hand-written hygiene note so a reader would not chase it.
+#
+# The two ids share a 26-character common prefix (`5197cac6-9a7c-4682-b4dc-8b`)
+# and diverge only inside the final 12-hex group. Both pass ``is_full_uuid``.
+# That is exactly what a prefix/loose/truncating matcher collapses into ONE
+# key — and collapsing them is the difference between warning about the
+# fabrication and warning about the real memory.
+_SPECIMEN_FABRICATED = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+_SPECIMEN_REAL = '5197cac6-9a7c-4682-b4dc-8b77b5f48689'
+
+
+class TestFindProseUuids:
+    """``find_prose_uuids`` locates UUID-shaped substrings in a finding's free
+    text (``PROSE_CITATION_FIELDS``), returning an insertion-ordered
+    ``{lowercase_uuid: [field, ...]}`` map. Pure: never mutates, never raises."""
+
+    def test_near_miss_specimen_pair_yields_two_distinct_full_ids(self):
+        """THE load-bearing regression: the fabricated and real specimen ids
+        share a 26-char prefix and must come back as TWO separate full 36-char
+        keys, byte-identical to the input."""
+        finding = {
+            'description': (
+                f'Memory {_SPECIMEN_FABRICATED} contradicts the canonical entry '
+                f'{_SPECIMEN_REAL} recorded during the earlier sweep.'
+            ),
+            'suggested_action': 'no ids here',
+        }
+
+        found = find_prose_uuids(finding)
+
+        assert set(found) == {_SPECIMEN_FABRICATED, _SPECIMEN_REAL}
+        # Each key is the FULL 36-char id, not a shared prefix or a truncation.
+        for key in found:
+            assert len(key) == 36
+        assert found[_SPECIMEN_FABRICATED] == ['description']
+        assert found[_SPECIMEN_REAL] == ['description']
+
+    def test_suggested_action_is_scanned_too(self):
+        """A uuid present ONLY in suggested_action is found — both prose fields
+        reach a human reader, so both are in scope."""
+        finding = {
+            'description': 'nothing cited here',
+            'suggested_action': f'Delete {_SPECIMEN_FABRICATED} from the cluster.',
+        }
+
+        assert find_prose_uuids(finding) == {_SPECIMEN_FABRICATED: ['suggested_action']}
+
+    def test_id_in_both_fields_yields_one_key_listing_both_fields(self):
+        """One id, one key — with both field names in PROSE_CITATION_FIELDS order."""
+        finding = {
+            'description': f'see {_SPECIMEN_REAL}',
+            'suggested_action': f'repoint {_SPECIMEN_REAL} then re-run',
+        }
+
+        found = find_prose_uuids(finding)
+
+        assert list(found) == [_SPECIMEN_REAL]
+        assert found[_SPECIMEN_REAL] == list(PROSE_CITATION_FIELDS)
+
+    @pytest.mark.parametrize(
+        'prose',
+        [
+            f'a{_SPECIMEN_REAL}',        # leading hex digit
+            f'{_SPECIMEN_REAL}a',        # trailing hex digit
+            _SPECIMEN_REAL[:-1],         # 35 chars
+            _SPECIMEN_REAL + '9',        # 37 chars
+            _SPECIMEN_REAL.replace('-', ''),  # 32-char undashed hex run
+        ],
+        ids=['leading-hex', 'trailing-hex', '35-char', '37-char', 'undashed-32'],
+    )
+    def test_boundary_rejection(self, prose):
+        """Hex lookarounds (not ``\\b``) reject an id embedded in a longer hex
+        run, and the canonical 36-char dashed shape rejects near-shapes."""
+        assert find_prose_uuids({'description': prose}) == {}
+
+    def test_non_hex_adjacent_prefix_is_accepted(self):
+        """``run-<uuid>.`` still yields the uuid: a dash and a period are not
+        hex, so they do not extend the run."""
+        finding = {'description': f'during run-{_SPECIMEN_REAL}.'}
+
+        assert find_prose_uuids(finding) == {_SPECIMEN_REAL: ['description']}
+
+    def test_uppercase_rendering_is_normalised_to_lowercase(self):
+        """Casing is a rendering choice, not a different identifier
+        (``is_full_uuid``'s docstring). Mem0 point ids render lowercase, so
+        lowercasing can only avoid a false phantom, never create one."""
+        finding = {'description': f'MEMORY {_SPECIMEN_REAL.upper()} is stale'}
+
+        assert find_prose_uuids(finding) == {_SPECIMEN_REAL: ['description']}
+
+    def test_non_prose_fields_are_never_scanned(self):
+        """``finding_id``/``task_id``/``cited_memories`` are uuid-bearing but are
+        NOT prose: the structured half owns cited_memories, and the identity
+        fields are not claims a reader would chase."""
+        finding = {
+            'finding_id': '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'task_id': 'ab330f59-7335-4962-b9a8-e2fdaa96d3e9',
+            'cited_memories': [{'memory_id': _SPECIMEN_REAL, 'store': 'mem0'}],
+            'description': 'clean prose',
+            'suggested_action': 'clean prose',
+        }
+
+        assert find_prose_uuids(finding) == {}
+
+    @pytest.mark.parametrize(
+        'finding',
+        [
+            None,
+            'a bare string',
+            12345,
+            {},
+            {'description': None, 'suggested_action': None},
+            {'description': 7, 'suggested_action': ['a', 'list']},
+        ],
+        ids=['none', 'str', 'int', 'empty-dict', 'none-fields', 'wrong-typed-fields'],
+    )
+    def test_degenerate_input_never_raises(self, finding):
+        """Malformed input degrades to ``{}`` rather than raising mid-scan."""
+        assert find_prose_uuids(finding) == {}
+
+    def test_is_pure_and_never_mutates_the_finding(self):
+        """Deep-compare against a pre-call copy: the scanner is a read."""
+        finding = {
+            'description': f'{_SPECIMEN_FABRICATED} and {_SPECIMEN_REAL}',
+            'suggested_action': f'drop {_SPECIMEN_FABRICATED}',
+            'cited_memories': [{'memory_id': _SPECIMEN_REAL, 'store': 'mem0'}],
+        }
+        before = copy.deepcopy(finding)
+
+        find_prose_uuids(finding)
+
+        assert finding == before
