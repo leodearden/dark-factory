@@ -5485,6 +5485,22 @@ class MemoryService:
         # the tag reaches the persisted episodic node (and, via
         # _dual_write_callback, every fact derived from it).
         unverified_claim = bool(payload.pop('unverified_claim', False))
+        # task 3561: rows enqueued BEFORE the fix still carry the fatal 'uuid'
+        # key, and the durable queue outlives the deploy that removed it — so
+        # the defect would survive its own fix for as long as the backlog does
+        # unless execution neutralises the key too. POP rather than get, so the
+        # dead key cannot leak onward to _dual_write_callback, which receives
+        # this same payload dict.
+        legacy_uuid = payload.pop('uuid', None)
+        if legacy_uuid is not None:
+            logger.warning(
+                "Ignoring legacy 'uuid' key %r in queued add_episode payload "
+                '(group_id=%r, causation_id=%r): the key predates task 3561 and '
+                'naming an episode uuid upstream means "LOAD this existing '
+                'episode", which raises NodeNotFoundError. Letting graphiti_core '
+                'mint the uuid instead; the episode content is preserved.',
+                legacy_uuid, payload.get('group_id'), causation_id,
+            )
         # task 3670: the referent set resolved at the write boundary, popped on
         # the same channel. An ABSENT key decodes to ((), 'none'), so a queue
         # row written before this feature executes byte-identically to today.
@@ -5556,7 +5572,14 @@ class MemoryService:
                     source=episode_type,
                     group_id=payload['group_id'],
                     source_description=payload.get('source_description', ''),
-                    uuid=payload.get('uuid'),
+                    # UNCONDITIONALLY None, and deliberately NOT parameterised
+                    # (task 3561). None is the only value graphiti_core's CREATE
+                    # branch accepts: any other value selects the LOAD branch
+                    # (EpisodicNode.get_by_uuid), which for a not-yet-existing
+                    # episode is NodeNotFoundError. A legacy payload uuid was
+                    # popped and warned about above; nothing may re-introduce
+                    # one here.
+                    uuid=None,
                     temporal_context=temporal_context,
                     reference_time=reference_time,
                     unverified_claim=unverified_claim,
