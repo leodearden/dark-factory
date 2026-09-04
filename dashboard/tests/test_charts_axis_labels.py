@@ -37,6 +37,20 @@ composition is byte-identical for the three callers that pass no formatter at
 all (tabs.jsx:1259, tabs.jsx:1329, tab_escalation_analytics.jsx:244 — all
 integer counts), which ``test_default_format_y_callers_keep_integer_count_axes``
 pins executably rather than by inspection.
+
+ALSO HERE: THE LINECHART CALLER AUDIT (task 4232) — task 4059 deferred the
+audit of LineChart's non-rounding default, and this file now carries its
+outcome.  Of the four call sites that inherit that default, three plot integer
+COUNTS (memory reads/writes, merge attempts per bucket, escalation churn) and
+have gained ``formatY={formatCountTick}``; the fourth plots
+``escalation_analytics.py::_esc_per_done``'s ``filings / done``, a genuine
+fraction, and must keep the raw default.  That asymmetry is what makes a
+rounding default unsafe — it would collapse the ratio axis exactly as
+pre-4059 pre-rounding collapsed WorkflowPanel's percent axis — so the ratio
+site is pinned as an ANTI-regression alongside the three fixes, with a frozen
+rounding-default control proving the guard actually fires.  The helper itself
+lives in spark_path.js and is behaviourally tested under ``node --test``; what
+is measured HERE is the wiring only charts.jsx and the tabs can express.
 """
 
 from __future__ import annotations
@@ -90,17 +104,20 @@ def _component_body(src: str, name: str) -> str:
     return extract_function_body(src, name)
 
 
-def _default_format_y(charts_jsx_body: str) -> str:
-    """The ``formatY = ...`` default from the ``StackedAreaChart`` signature.
+def _default_format_y(charts_jsx_body: str, component: str = 'StackedAreaChart') -> str:
+    """The ``formatY = ...`` default from ``component``'s signature.
 
     The default arrow contains neither a comma nor a brace (``v => String(v)``
     before the fix, ``v => String(Math.round(v))`` after), so a ``[^,}]+`` run
-    over the signature slice captures exactly it.
+    over the signature slice captures exactly it. ``component`` defaults to
+    StackedAreaChart, whose default task 4059 moved the rounding into; task
+    4232's caller audit passes ``'LineChart'`` to read the default the four
+    no-formatY callers actually inherit.
     """
-    signature = _extract_signature(charts_jsx_body, 'StackedAreaChart')
+    signature = _extract_signature(charts_jsx_body, component)
     m = re.search(r'formatY\s*=\s*([^,}]+)', signature)
     assert m is not None, (
-        'StackedAreaChart no longer declares a `formatY = <default>` in its '
+        f'{component} no longer declares a `formatY = <default>` in its '
         f'signature. Signature was: {signature!r}'
     )
     return m.group(1).strip()
@@ -240,6 +257,143 @@ def _spark_path_module_surface() -> dict:
         'Object.keys(api).map(k => [k, typeof api[k]]))));'
         % json.dumps(str(_SPARK_PATH_JS))
     )
+
+
+# ---------------------------------------------------------------------------
+# Caller-audit extractors (task 4232) — what each LineChart CALL SITE passes.
+#
+# The audit's outcome is a per-caller fact, not a property of charts.jsx, so it
+# has to be read out of the tab sources. `_line_chart_format_y` returns None for
+# a site that passes no formatter — a real, load-bearing answer here (three
+# sites must stop relying on the default and one must keep relying on it), which
+# is why a MISSING ELEMENT asserts instead of also returning None.
+# ---------------------------------------------------------------------------
+
+# Both spellings the two tabs use: tabs.jsx aliases `LineChart: LC` in its
+# line-2 DF_CHARTS destructure, tab_escalation_analytics.jsx goes through its
+# `const C = window.DF_CHARTS` namespace.
+_LINE_CHART_TAG_RE = re.compile(r'<(?:LC|C\.LineChart)\b')
+
+
+def _jsx_elements(body: str, tag_re: re.Pattern) -> list:
+    """Every self-closing JSX element in `body` whose tag matches `tag_re`.
+
+    Walks to the element's own `/>` at brace depth 0, so a `series={[{...}]}`
+    prop containing braces (or a `${...}` inside a template literal) cannot end
+    the element early. A regex cannot do this: these props nest.
+    """
+    out = []
+    for m in tag_re.finditer(body):
+        depth = 0
+        i = m.end()
+        while i < len(body):
+            ch = body[i]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+            elif depth == 0 and ch == '/' and body[i + 1 : i + 2] == '>':
+                out.append(body[m.start() : i + 2])
+                break
+            i += 1
+    return out
+
+
+def _line_chart_format_y(body: str, anchor: str):
+    """The `formatY={...}` expression of the LineChart call site containing `anchor`.
+
+    Returns the expression text, or ``None`` when the site passes no formatY at
+    all and therefore inherits LineChart's default. `body` is an already-sliced
+    COMPONENT body: several tabs render more than one LineChart, and the anchor
+    (a series expression such as ``ts.reads``) is what names the axis.
+    """
+    matches = [el for el in _jsx_elements(body, _LINE_CHART_TAG_RE) if anchor in el]
+    assert len(matches) == 1, (
+        f'expected exactly one <LC>/<C.LineChart> element whose props mention '
+        f'{anchor!r}, found {len(matches)}. The chart was renamed, removed, or '
+        'its series expression changed — either way the caller-audit assertion '
+        'that depends on it must FAIL rather than quietly measure a different '
+        'chart (or nothing at all).'
+    )
+    element = matches[0]
+    m = re.search(r'formatY=\{', element)
+    if m is None:
+        return None
+    depth = 1
+    i = m.end()
+    while i < len(element) and depth > 0:
+        if element[i] == '{':
+            depth += 1
+        elif element[i] == '}':
+            depth -= 1
+        i += 1
+    assert depth == 0, f'unbalanced formatY={{...}} in the element anchored at {anchor!r}'
+    return element[m.end() : i - 1].strip()
+
+
+def _line_chart_axis_scalars(body: str) -> str:
+    """LineChart's verbatim ``const minV = ...;`` / ``const range = ...;`` lines.
+
+    LineChart's tick generator is written in terms of `minV` and `range` (where
+    StackedAreaChart's is written in terms of `maxV`), so a program that runs
+    the real generator has to carry LineChart's real scale arithmetic too.
+    Extracted rather than hardcoded, for the same reason as everything else in
+    this file: changing `minV = 0` or dropping the `|| 1` degenerate-range guard
+    must move these assertions rather than slip past them.
+    """
+    min_v = re.search(r'^\s*(const minV\s*=\s*[^;]+;)', body, re.MULTILINE)
+    rng = re.search(r'^\s*(const range\s*=\s*[^;]+;)', body, re.MULTILINE)
+    assert min_v is not None, (
+        'the component body no longer declares `const minV = ...;` — LineChart '
+        "'s scale arithmetic changed shape and the extracted tick generator has "
+        'nothing to run against.'
+    )
+    assert rng is not None, (
+        'the component body no longer declares `const range = ...;` — see above.'
+    )
+    return f'{min_v.group(1)}\n  {rng.group(1)}'
+
+
+def _line_chart_axis_program(body: str, format_y: str, max_vs) -> str:
+    """Render a LineChart y-axis by executing its REAL committed pipeline.
+
+    Sibling of `_axis_labels_program` above, differing in two ways: it also
+    carries LineChart's own `minV`/`range` lines (see `_line_chart_axis_scalars`),
+    and it binds the real spark_path.js module first, so a caller expression such
+    as `formatCountTick` or `C.formatCountTick` resolves to the genuinely SHIPPED
+    function rather than to more extracted text.
+
+    `C` is bound to the spark_path API rather than to the real DF_CHARTS (which
+    is charts.jsx, unparseable by node). That is sound precisely because
+    test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts pins
+    the DF_SPARK_PATH -> DF_CHARTS hop separately: this program measures what the
+    caller's expression RENDERS, that one measures that the name is routed.
+    """
+    return f"""
+const DF_SPARK_PATH = require({json.dumps(str(_SPARK_PATH_JS))});
+const {{ formatCountTick }} = DF_SPARK_PATH;
+const C = Object.assign({{}}, DF_SPARK_PATH);
+const formatY = {format_y};
+function yTicksFor(maxV) {{
+  {_line_chart_axis_scalars(body)}
+  {_tick_generator(body)}
+  return yTicks;
+}}
+const out = {{}};
+for (const maxV of {json.dumps(list(max_vs))}) {{
+  out[maxV] = yTicksFor(maxV).map(({_tick_map_param(body)}, i) => formatY({_tick_label_arg(body)}));
+}}
+console.log(JSON.stringify(out));
+"""
+
+
+def _render_caller_axis(charts_jsx_body: str, caller_body: str, anchor: str, max_vs) -> dict:
+    """Render the axis the caller at `anchor` actually draws, defaults included."""
+    line_chart = _component_body(charts_jsx_body, 'LineChart')
+    format_y = _line_chart_format_y(caller_body, anchor)
+    if format_y is None:
+        format_y = _default_format_y(charts_jsx_body, 'LineChart')
+    return _run_node(_line_chart_axis_program(line_chart, format_y, max_vs))
 
 
 # ---------------------------------------------------------------------------
@@ -610,4 +764,182 @@ def test_probes_and_extractors_actually_fire_on_pre_fix_source(tab_analytics_jsx
         'pinned by test_default_format_y_callers_keep_integer_count_axes are no '
         'longer the pre-fix ones and that test no longer proves the '
         'no-formatY callers kept their axes.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# The caller audit, pinned executably (task 4232).
+#
+# Four LineChart call sites pass no formatY and inherit its default. Three plot
+# integer COUNTS and must gain `formatCountTick`; the fourth plots a genuine
+# RATIO and must keep the raw default. That split is the whole reason this fix
+# is a per-caller wiring change rather than a new default — so it is pinned in
+# both directions, with a frozen rounding-default control proving the ratio
+# guard actually fires.
+# ---------------------------------------------------------------------------
+
+# maxV=7 is the fractional-label case from this task's title (the default draws
+# 1.75 / 3.5 / 5.25); maxV=1 is the `plottableMax(values, 1)` seed floor that
+# every idle count series sits at, and the case a ROUNDING helper would render
+# as the duplicate 0/0/1/1/1.
+_COUNT_AXIS_MAX_VS = [7, 1]
+_COUNT_AXIS_EXPECTED = {'7': ['0', '', '', '', '7'], '1': ['0', '', '', '', '1']}
+
+
+def test_memory_tab_reads_writes_axis_labels_whole_counts_only(
+    charts_jsx_body: str, tabs_jsx_body: str
+) -> None:
+    """MemoryTab's reads-vs-writes axis is a COUNT axis and must read as one.
+
+    `write_journal.get_memory_timeseries` is a SQL ``COUNT(*)`` bucketed per
+    hour, so a "3.5" gridline label is not a rounding nicety — it is a count
+    that cannot exist.
+    """
+    axes = _render_caller_axis(
+        charts_jsx_body, _component_body(tabs_jsx_body, 'MemoryTab'), 'ts.reads', _COUNT_AXIS_MAX_VS
+    )
+    assert axes == _COUNT_AXIS_EXPECTED, (
+        f'MemoryTab reads/writes renders {axes}; expected {_COUNT_AXIS_EXPECTED}. '
+        'It is still inheriting LineChart\'s raw default (1.75/3.5/5.25 at '
+        'maxV=7) instead of passing formatY={formatCountTick}.'
+    )
+
+
+def test_merge_tab_attempt_axis_labels_whole_counts_only(
+    charts_jsx_body: str, tabs_jsx_body: str
+) -> None:
+    """MergeTab's "Merge attempts · 15-min buckets" axis counts events per bucket."""
+    axes = _render_caller_axis(
+        charts_jsx_body,
+        _component_body(tabs_jsx_body, 'MergeTab'),
+        'd.depth.values',
+        _COUNT_AXIS_MAX_VS,
+    )
+    assert axes == _COUNT_AXIS_EXPECTED, (
+        f'MergeTab merge attempts renders {axes}; expected {_COUNT_AXIS_EXPECTED}.'
+    )
+
+
+def test_workflow_panel_churn_axis_labels_whole_counts_only(
+    charts_jsx_body: str, tab_analytics_jsx_body: str
+) -> None:
+    """WorkflowPanel's churn axis counts same-task re-filings per day."""
+    axes = _render_caller_axis(
+        charts_jsx_body,
+        _component_body(tab_analytics_jsx_body, 'WorkflowPanel'),
+        'churnDaily',
+        _COUNT_AXIS_MAX_VS,
+    )
+    assert axes == _COUNT_AXIS_EXPECTED, (
+        f'WorkflowPanel churn renders {axes}; expected {_COUNT_AXIS_EXPECTED}.'
+    )
+
+
+def test_esc_per_done_ratio_axis_keeps_its_exact_fractions(
+    charts_jsx_body: str, tab_analytics_jsx_body: str
+) -> None:
+    """THE CALLER THAT MAKES A ROUNDING DEFAULT UNSAFE — do not "fix" this axis.
+
+    WorkflowPanel's escalations-per-task-done chart plots
+    ``escalation_analytics.py::_esc_per_done``'s ``filings / done`` — a genuine
+    float (``None`` when ``done == 0``). It is the fourth of the four call sites
+    that inherit LineChart's default, and the reason task 4232 wires a helper
+    per caller instead of rounding by default: a rounding default would collapse
+    this axis to 0/0/0/1/1, re-filing task 4059's own defect one primitive over.
+
+    So it must pass NO count formatter, and its labels must stay the exact
+    fractions the raw default produces. The 0.6000000000000001 is not a typo:
+    ``(0.8 * 3) / 4`` is genuinely that double, and it is pinned as what node
+    actually prints rather than as what the arithmetic ought to look like.
+    """
+    body = _component_body(tab_analytics_jsx_body, 'WorkflowPanel')
+    assert _line_chart_format_y(body, 'row.ratio') is None, (
+        'the escalations-per-done chart has gained a formatY. If that is '
+        '`formatCountTick`, its axis now blanks every non-integer gridline on a '
+        'series whose values are almost never integers — the ratio would be '
+        'unreadable. This chart is a FRACTION and must keep the raw default.'
+    )
+
+    axes = _render_caller_axis(charts_jsx_body, body, 'row.ratio', [0.8, 1])
+    assert axes == {
+        '0.8': ['0', '0.2', '0.4', '0.6000000000000001', '0.8'],
+        '1': ['0', '0.25', '0.5', '0.75', '1'],
+    }, (
+        f'the esc-per-done ratio axis renders {axes} — its intermediate '
+        'gridlines are no longer the exact tick values. Something rounded or '
+        'blanked a ratio axis.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Negative control for the caller audit — mirrors _PRE_FIX_SOURCE above.
+# ---------------------------------------------------------------------------
+
+
+# LineChart's scale/tick/label lines verbatim from charts.jsx, with ONE change:
+# the formatY default rounds. This is option (a), the rounding default this task
+# rejected — kept executable so the guard above is discriminating rather than
+# vacuous.
+_ROUNDING_DEFAULT_LINE_CHART = """
+function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(Math.round(v)), formatX = (v) => v }) {
+  const maxV = plottableMax(all, 1);
+  const minV = 0;
+  const range = maxV - minV || 1;
+  const ticks = 4;
+  const yTicks = Array.from({ length: ticks + 1 }, (_, i) => minV + (range * i) / ticks);
+  return (
+    <svg>
+      {yTicks.map((t, i) => (
+        <g key={i}>
+          <text x={padL - 6} y={y + 3} fontSize="9" fill={PALETTE.fg3} textAnchor="end" fontFamily="JetBrains Mono">{formatY(t)}</text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+"""
+
+# The MergeTab call site exactly as it stood BEFORE this fix — no formatY at all.
+_PRE_FIX_COUNT_CALL_SITE = """
+<div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatX={window.DF_SHELL.fmtDateTime} /></div>
+"""
+
+
+def test_rounding_default_control_shows_the_ratio_guard_actually_fires() -> None:
+    """The rejected option (a) really does wreck the ratio axis, measured.
+
+    Without this, `test_esc_per_done_ratio_axis_keeps_its_exact_fractions` would
+    be a guard against a danger no one had ever demonstrated — and the design
+    decision it defends (default stays non-rounding) would read as taste. Here
+    the rounding default is executed against the same real tick shape and shown
+    to produce the collapse.
+
+    Also checks `_line_chart_format_y` still returns None on a verbatim pre-fix
+    count call site: that None is what routes a caller to the default, so an
+    extractor that silently found nothing would make all three count assertions
+    above measure the default forever and pass for the wrong reason.
+    """
+    frozen = _component_body(_ROUNDING_DEFAULT_LINE_CHART, 'LineChart')
+    rounding_default = _default_format_y(_ROUNDING_DEFAULT_LINE_CHART, 'LineChart')
+    assert rounding_default == '(v) => String(Math.round(v))', (
+        'the default-formatY extractor no longer reads the rounding default out '
+        f'of the frozen control — it returned {rounding_default!r}.'
+    )
+
+    axes = _run_node(_line_chart_axis_program(frozen, rounding_default, [0.8, 1]))
+    assert axes['0.8'] == ['0', '0', '0', '1', '1'], (
+        'a rounding default no longer collapses the esc-per-done ratio axis '
+        f'(got {axes["0.8"]}). The control has gone stale, so the ratio guard '
+        'above no longer defends against anything.'
+    )
+    assert axes['1'] == ['0', '0', '1', '1', '1'], (
+        'a rounding default no longer duplicates labels at the maxV=1 seed '
+        f'floor (got {axes["1"]}) — the task-4059 shape this fix declined to '
+        'reproduce.'
+    )
+
+    assert _line_chart_format_y(_PRE_FIX_COUNT_CALL_SITE, 'd.depth.values') is None, (
+        'the caller extractor no longer reports "no formatY" on a verbatim '
+        'pre-fix count call site, so it can no longer tell a wired caller from '
+        'an unwired one.'
     )
