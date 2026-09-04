@@ -6626,3 +6626,89 @@ class TestContradictedEscalation:
             a for a in result.get('actions', [])
             if a['type'] == 'verification_contradicted_escalated'
         ], f'A {label} verdict must not escalate, got {result.get("actions")}'
+
+
+class TestContradictedEscalationFailureContainment:
+    """A broken escalation store must cost the escalation and nothing else.
+
+    This is the sharp edge of ordering the escalation inside `_on_task_done`'s
+    verify `try`: an uncontained raise there is swallowed by the broad verify
+    `except`, which SKIPS the contradiction memory write, emits a spurious
+    `post_verify_error` row misattributing a filesystem outage to the verifier
+    (double-counting task 4343's census), and logs the misleading generic
+    'Verification failed for task'. Containment has to live inside the
+    escalation method so none of that can happen.
+    """
+
+    @staticmethod
+    def _raising_queue_class(stage: str):
+        class _BrokenQueue:
+            def __init__(self, queue_dir):
+                if stage == 'init':
+                    raise OSError('read-only fs')
+                self.queue_dir = queue_dir
+
+            def make_id(self, task_id):
+                return f'esc-{task_id}-1'
+
+            def submit(self, escalation):
+                raise RuntimeError('disk full')
+
+        return _BrokenQueue
+
+    @pytest.mark.parametrize('stage', ['init', 'submit'])
+    @pytest.mark.asyncio
+    async def test_broken_escalation_store_does_not_damage_the_run(
+        self, reconciler, journal, mock_memory_service, caplog, tmp_path, stage
+    ):
+        reconciler.verifier.verify = AsyncMock(return_value=_contradicted_result())
+
+        with caplog.at_level(logging.WARNING), patch(
+            'fused_memory.reconciliation.targeted.EscalationQueue',
+            self._raising_queue_class(stage),
+        ):
+            result = await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        # No exception escaped _on_task_done.
+        assert 'task_id' in result, f'Expected a normal result dict, got {result!r}'
+
+        # A broken escalation queue must not cost the memory corpus its record.
+        writes = _verdict_writes(mock_memory_service)
+        assert len(writes) == 1, (
+            f'The contradiction memory must still be written, got {writes}'
+        )
+        assert writes[0].kwargs['content'] == (
+            "Codebase evidence CONTRADICTS the completion claim of task 'Test': "
+            'UNIQUESUMMARYTOKEN — no such handler exists'
+        ), f'Got {writes[0].kwargs["content"]!r}'
+
+        # The verify census stays clean: one outcome row, correctly attributed.
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+        rows = _verify_rows(actions)
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase row, got '
+            f'{[(a["operation"]) for a in rows]}'
+        )
+        assert rows[0]['operation'] == 'contradicted', (
+            f'A queue outage must not be attributed to the verifier, got '
+            f'{rows[0]["operation"]!r}'
+        )
+        assert not [
+            a for a in rows if a['operation'] in ('post_verify_error', 'error')
+        ], f'No failure row may be emitted, got {[a["operation"] for a in rows]}'
+
+        # The WARNING names the task and identifies the escalation as the
+        # failed stage — the generic verify failure message would misdiagnose it.
+        msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'escalat' in m.lower() and ('task=1' in m or 'task 1' in m) for m in msgs
+        ), f'Expected an escalation-specific WARNING naming the task, got {msgs}'
+        assert not any('Verification failed for task' in m for m in msgs), (
+            f'A queue outage must not log as a verification failure, got {msgs}'
+        )
+
+        assert not [
+            a for a in result.get('actions', [])
+            if a['type'] == 'verification_contradicted_escalated'
+        ], f'Nothing was filed, so no escalated action, got {result.get("actions")}'
