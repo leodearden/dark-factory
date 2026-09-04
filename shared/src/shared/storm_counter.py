@@ -21,6 +21,18 @@ Uses bulk_reset_guard's guard-side injectable-clock convention
 (``time_provider`` stored as ``self._now``) so a 3600s window can be tested by
 advancing a fake clock instead of sleeping.
 
+FIRE POLICY — two modes, chosen at construction via ``fire_mode``. The default
+``rate_limited`` answers "this burst is still going" at most once per window,
+which is what a consumer wants when it logs or escalates a STANDING condition.
+``latched`` instead fires exactly once on the threshold CROSSING and re-arms
+only when the window drains back below it. The consumer that needs the latch is
+``fused_memory/services/memory_metadata_census.py::UnknownKeyStormDetector``,
+which sits on the live memory-write path: the crossing is the event, not the
+state, and a counter that kept returning a summary would push its escalation
+filer into an open-escalation ``queue.get_by_task`` read on every memory write
+for a condition already filed. Task 4519 moved that policy in here rather than
+leaving a second count-compare-and-fire body outside this module (INV-5).
+
 RELOAD SAFETY — the one contract difference from ``MarkupStormCounter``, and
 the reason this class takes them as arguments rather than storing them:
 ``threshold`` and ``window_seconds`` are supplied PER :meth:`record` CALL.
@@ -39,6 +51,11 @@ import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any
+
+#: The accepted ``fire_mode`` spellings, public so a consumer can name the
+#: policy against the constant rather than re-typing the literal. See the
+#: module docstring's FIRE POLICY note for what each one means.
+FIRE_MODES: tuple[str, ...] = ('rate_limited', 'latched')
 
 
 class StormCounter:
@@ -80,6 +97,15 @@ class StormCounter:
     ``count_distinct`` mode is a WIRING BUG, not a benign extra argument, and
     :meth:`record` raises rather than ignoring it — see that method.
 
+    ``fire_mode`` is a THIRD dimension, orthogonal to both: ``count_distinct``
+    decides what is counted, ``fire_mode`` decides when a crossed threshold is
+    reported (see the module docstring's FIRE POLICY note). It is structural in
+    exactly the sense ``count_distinct`` is — fixed by the call site, never a
+    config leaf — so capturing it at construction cannot go stale and the
+    RELOAD SAFETY rule, which constrains config VALUES only, permits it. It is
+    likewise readable back off :attr:`fire_mode`, and an unrecognised spelling
+    raises at construction for the same reason a mismatched ``key`` does.
+
     State is PROCESS-LOCAL and resets on restart, like every other in-process
     storm counter in this codebase: the counter exists to catch a live burst,
     not to keep durable statistics. It is also per-instance, so no state bleeds
@@ -94,11 +120,23 @@ class StormCounter:
         time_provider: Callable[[], float] = time.time,
         *,
         count_distinct: bool = False,
+        fire_mode: str = 'rate_limited',
     ) -> None:
+        if fire_mode not in FIRE_MODES:
+            raise ValueError(
+                f'fire_mode={fire_mode!r} is not a StormCounter fire mode; '
+                f'accepted spellings are {", ".join(repr(m) for m in FIRE_MODES)}. '
+                'The mode is structural and fixed by the call site, so an '
+                'unrecognised spelling is a wiring bug: defaulting it would '
+                'silently degrade a latched consumer to per-window rate '
+                'limiting.'
+            )
         self._now = time_provider
         self._count_distinct = count_distinct
+        self._fire_mode = fire_mode
         self._events: deque[tuple[float, str | None, str | None]] = deque()
         self._last_fire_ts: float | None = None
+        self._latched: bool = False
 
     @property
     def count_distinct(self) -> bool:
@@ -112,6 +150,20 @@ class StormCounter:
         no compatibility promise about.
         """
         return self._count_distinct
+
+    @property
+    def fire_mode(self) -> str:
+        """Which FIRE POLICY this counter applies once the threshold is met.
+
+        One of :data:`FIRE_MODES`. Read-only: the mode is structural and fixed
+        at construction (see the class docstring). Exposed for the reason
+        :attr:`count_distinct` is — a consumer whose correctness depends on the
+        policy, such as
+        ``fused_memory/services/memory_metadata_census.py::UnknownKeyStormDetector``
+        and its tests, must be able to pin it through a supported surface
+        rather than coupling to private attributes of another package.
+        """
+        return self._fire_mode
 
     def _prune(self, now: float, window_seconds: float) -> int:
         """Drop events older than the window as of *now*; return how many remain.
@@ -212,13 +264,27 @@ class StormCounter:
         window, or — in ``count_distinct`` mode — the number of distinct
         non-``None`` keys among them.
 
-        Returns ``None`` when the count within the window is below *threshold*,
-        AND when the threshold is met but a previous fire is still inside the
-        window (the rate limit — without it, a runaway emitting hundreds of
-        events would escalate hundreds of times for one incident).
+        Returns ``None`` whenever the count within the window is below
+        *threshold*. Above it, WHEN a fire is reported depends on the
+        constructor's ``fire_mode`` (see the module docstring's FIRE POLICY
+        note); the returned SUMMARY is identical either way.
 
-        Otherwise stamps the rate-limit timestamp and returns a
-        JSON-serializable summary with ``count``, ``threshold``,
+        In the default ``rate_limited`` mode it also returns ``None`` when the
+        threshold is met but a previous fire is still inside the window —
+        without that limit a runaway emitting hundreds of events would escalate
+        hundreds of times for one incident. Otherwise it stamps the rate-limit
+        timestamp and returns the summary, so a condition that stays over the
+        line is re-reported once per window.
+
+        In ``latched`` mode it returns the summary on the call that CROSSES the
+        threshold and ``None`` on every call thereafter, however many windows
+        the writer stays over the line — the crossing is the event, not the
+        state. The latch clears as soon as the count falls back below
+        *threshold*, so a writer that drifts, is fixed, and later drifts again
+        is heard both times. ``_last_fire_ts`` is neither consulted nor stamped
+        in this mode: the latch, not the elapsed window, is what suppresses.
+
+        The summary itself is JSON-serializable with ``count``, ``threshold``,
         ``window_seconds`` and ``labels`` — the sorted DISTINCT non-``None``
         labels seen in the window, so the caller can attribute the burst
         instead of blaming whichever event crossed the threshold.
@@ -242,16 +308,26 @@ class StormCounter:
         if self._count_distinct:
             count = len({k for _, _, k in self._events if k is not None})
         if count < threshold:
+            # Back under the line. In latched mode that is the RE-ARM: the next
+            # crossing is a fresh event and must be heard.
+            self._latched = False
             return None
 
-        # Threshold crossed — apply the per-window rate limit.
-        if (
-            self._last_fire_ts is not None
-            and (effective_now - self._last_fire_ts) < window_seconds
-        ):
-            return None
+        # Threshold crossed — the append / prune / count above is mode-agnostic;
+        # only the decision to REPORT differs.
+        if self._fire_mode == 'latched':
+            if self._latched:
+                return None
+            self._latched = True
+        else:
+            # Default mode: at most one fire per window.
+            if (
+                self._last_fire_ts is not None
+                and (effective_now - self._last_fire_ts) < window_seconds
+            ):
+                return None
+            self._last_fire_ts = effective_now
 
-        self._last_fire_ts = effective_now
         return {
             'count': count,
             'threshold': threshold,
