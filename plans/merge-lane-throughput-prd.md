@@ -407,3 +407,41 @@ decision to make **with data** — in some shape other than the one ruled out.
 
 Revised DAG: **A → B → D1 → D2 → E → F → H**, with **A → G** alongside. No
 RED-TIER conflict anywhere in it.
+
+---
+
+## Corrections (2026-09-04 — cross-PRD coherence check after both decomposes)
+
+Dated corrections; the text above, including the 2026-09-03 ruling on C, is left as
+provenance. Filed batch: A=5050, B=5051, C=5052 (**cancelled**), D1=5053, D2=5054,
+E=5056, F=5057, G=5058, H=5059, plus **C′=5097** (below).
+
+1. **C′ (task 5097) — `verify_host_policy` knob.** Leo asked (2026-09-03) for the
+   remote host to be chosen *first* when free. Measured: `HostAllocator.acquire`
+   prefers local when free (β decision 1 of `plans/concurrent-merge-verify-prd.md`)
+   and only overflows to the laptop, which is why reify's laptop sits 78–88% idle;
+   the runner pool's own δ policy was prefer-remote and the allocator inverted it.
+   No knob existed. C′ adds `verify_host_policy: prefer_local | prefer_remote`
+   (default `prefer_local`, reify unchanged), consulted in `acquire`. D1 sets
+   `prefer_remote` for dark_factory **with `verify_drift_check_every_n_lands: 10`**
+   (not reify's 20), because under prefer-remote nearly every verdict is a remote
+   verdict and the drift check is the standing fidelity guard. D1 depends on C′;
+   γ3 (5026) of the quality batch is serialised behind C′ on
+   `orchestrator/tests/test_verify_runner.py`. Nothing in C′ touches the quality
+   PRD's Appendix A.
+2. **3188 un-gated.** The quality PRD's decision-10 step had gated 3188 (deep-merge
+   telemetry, F's prerequisite) behind that PRD's package move, putting F and H
+   transitively behind the whole quality Phase 1–2. The authoring session removed
+   that edge on 2026-09-03; 3188's prerequisites are done and it is dispatchable.
+3. **The laptop checkout is reify's remote runner.** `leo-laptop:/usr/local/bin/
+   orchestrator` execs `/home/leo/src/dark-factory/.venv/bin/orchestrator`, so
+   task B's refresh of `~/src/dark-factory` on the laptop (from `5f185fdf00`,
+   2026-08-20) is a de-facto deploy of reify's remote verify runner. B runs it only
+   when `pgrep -f verify-merge` on the laptop is empty and records the sha move.
+   The "3 dirty files" in § Background are three *untracked* directories; a reset
+   loses nothing.
+4. **Decision 6 and the κ row are superseded** by the C ruling: no merge-queue
+   branch becomes unreachable; κ keeps `is_flock_contention_failure`.
+5. **`--drain` on the restart leaves (D2, τ)** remains an open operator decision:
+   `restart-all-orchestrators.sh` with no arguments soft-cancels every in-flight
+   task fleet-wide. Not changed here.

@@ -527,3 +527,43 @@ orchestrator/tests/conftest.py
 ```
 `git_ops.py` is measured (lines, cognitive) but not gated by the file-size ceiling
 (decision 9); `advance_main` is gated per function by μ.
+
+---
+
+## Corrections (2026-09-04 — cross-PRD coherence check after both decomposes)
+
+Dated corrections to the text above; the original is left in place as provenance.
+Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024–5033,
+δ=5034, ε=5035, ζ2=5036, η=5037, θ=5038, ι=5039, κ=5040, λ=5041, μ=5042, ν=5043,
+ξ=5044, ο=5045, π=5046, ρ=5047, σ=5048, τ=5049); manifest `d9ce99a8bb`, corrected
+`13ff3d630f`.
+
+1. **κ must NOT delete the `is_flock_contention_failure` branch.** The Cross-PRD
+   row for the throughput PRD said κ would delete it once that PRD's task C made it
+   unreachable. Task C was cancelled by Leo (2026-09-03, task 5052): the laptop-side
+   lock is per project root, so the branch is a *within-project* orphan detector
+   (tasks 2306/2307) and stays live. κ moves it behaviour-preserving with the rest
+   of `_run_post_merge_verify`. Task 5040's details carry the same note.
+2. **The throughput PRD does not depend on κ/λ and runs in parallel** — as the
+   header already says; the follow-up dispatch/speculation-policy PRD is the one
+   that will.
+3. **Counts corrected by the decompose walk** (measured at `4811d62883`): workflow
+   routes on **nine** `reason.startswith` sites over **eight** distinct prefixes,
+   not "ten of seventeen"; the escalation server imports **nine** names (the table
+   said six and then listed nine); there are 18 reason constants (17 public plus
+   the private `_MERGE_CANCEL_RETIRE_REASON`).
+4. **Decision 10 gating as executed:** 120 existing non-terminal tasks gained a
+   dependency on ζ2 (5036) — 110 by source files, 11 by `orchestrator/tests/
+   conftest.py` alone; 4755 was excluded per instruction although it declares
+   conftest.py, so β and 4755 will contend on that file (accepted). **Exemption:**
+   3188 (deep-merge telemetry) was un-gated by the authoring session because the
+   throughput PRD's task F depends on it, which would have put that PRD's canary
+   transitively behind this whole batch; 3188 is ready now and lands before ζ1.
+   **Process gap:** tasks filed *after* decompose are not gated automatically —
+   5064, 5070 and 5092 were gated by hand on 2026-09-04; 5063 (high-priority lane
+   bug) was deliberately left ungated so it lands before ζ1. Until ζ2 lands, a
+   new cluster-touching task needs the same `add_dependency(<id>, 5036)` by hand.
+5. **Main is red fleet-wide at authoring+1 day** (task 5088, commit `731a0bafa9`):
+   α's landing will hit the main-health path until 5088 lands. Not a dependency —
+   the merge queue's main-health probe classifies it — but the first landing of
+   this batch is gated on it in practice.
