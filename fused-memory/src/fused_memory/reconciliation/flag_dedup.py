@@ -3748,6 +3748,286 @@ async def filter_already_tracked_systemic_patterns(
 
 
 # --------------------------------------------------------------------------- #
+# Deterministic cross-project fix-task DISCOVERY (task 4864)
+# --------------------------------------------------------------------------- #
+
+#: Match thresholds for :func:`_discover_foreign_fix_task_citations`.
+#:
+#: Deliberately the SAME values :func:`filter_already_tracked_systemic_patterns`
+#: defaults to (min_key_terms=4, match_coverage=0.75,
+#: min_task_term_precision=0.2), named here so the reuse is a stated contract
+#: rather than a coincidence of two default arguments that could drift apart.
+#:
+#: REUSE RATIONALE (task 4864): these are already the tuned, reviewed numbers
+#: for this exact question — "does a filed task already cover this complaint?"
+#: — including the task-2416 amendment's precision floor, which keeps a
+#: verbose, generic task description from coincidentally sweeping up a narrow
+#: finding's key terms.  Inventing separate, unvalidated constants for the
+#: discovery path would mean two answers to one question.  Discovery is
+#: additionally STRICTER than that filter at the same numbers: its result must
+#: still survive the task-4381 gate's HIT-only, foreign-only, non-cancelled and
+#: done-bounded checks before anything is suppressed, whereas
+#: filter_already_tracked_systemic_patterns drops on text coverage alone.
+_DISCOVERY_MIN_KEY_TERMS: int = 4
+_DISCOVERY_MATCH_COVERAGE: float = 0.75
+_DISCOVERY_MIN_TASK_TERM_PRECISION: float = 0.2
+
+
+async def _discover_foreign_fix_task_citations(
+    taskmaster: Any,
+    known_projects: dict[str, str] | None,
+    project_id: str,
+    candidates: list[dict[str, Any]],
+    *,
+    task_list_cache: dict[str, list[Any] | None] | None = None,
+    get_task_cache: dict[tuple[str, str], Any] | None = None,
+    min_key_terms: int = _DISCOVERY_MIN_KEY_TERMS,
+    match_coverage: float = _DISCOVERY_MATCH_COVERAGE,
+    min_task_term_precision: float = _DISCOVERY_MIN_TASK_TERM_PRECISION,
+) -> dict[int, dict[str, Any]]:
+    """Return ``{candidate index -> synthesized citation}`` for *candidates*.
+
+    THE PRODUCER the task-4381 cross-project fix-task gate has never had
+    (task 4864, design option (b)).  That gate suppresses a carried-forward
+    finding whose ``cited_tasks`` names a live FOREIGN fix task — but nothing
+    ever emitted such a citation, so the gate landed, was enabled, and stayed
+    inert.  Stage 1's context is its own project's task tree, so the model has
+    nothing to cite from; and enriching the marker from Stage 2 (option (a))
+    is defeated outright, because :func:`compute_flag_signature` folds cited
+    task ids into the marker row's own KEY, so an enriched row RELOCATES
+    rather than annotates (task 4712's invariant).
+
+    This helper closes the gap deterministically instead: it matches each
+    candidate's description terms against every FOREIGN project's
+    non-cancelled backlog and synthesises a ``{project_id, task_id, title}``
+    citation — the exact shape ``recon_report.cite_task`` writes — from the
+    winning task.
+
+    **The returned citations are an in-memory GATE INPUT ONLY.**  They must be
+    passed straight to :func:`_resolve_live_cross_project_fix_task` and MUST
+    NEVER be written back onto the flag (``flag['cited_tasks']``) or into the
+    marker payload.  ``compute_flag_signature`` runs BEFORE the gate and reads
+    ``cited_tasks``, so mutating the flag would move the marker to a different
+    row; since the gate is HIT-only, the first enriched cycle would become a
+    MISS, and because discovery matches against a live backlog that changes
+    between cycles the row would relocate perpetually and never accumulate a
+    HIT at all — strictly worse than the inertness this fixes.  This function
+    therefore takes the flags read-only and never mutates them.
+
+    **Reused wholesale**: :func:`_significant_terms` for candidate terms and
+    :func:`_match_already_tracked_candidates` for the matching sweep — the
+    same pure, ``asyncio.to_thread``-safe matcher
+    :func:`filter_already_tracked_systemic_patterns` uses, called off the
+    event loop for the same reason (~0.6s of blocking CPU per project on a
+    real backlog), including its client-side
+    :data:`_ABANDONED_TASK_STATUS_VALUES` skip so a backend that ignores the
+    ``statuses`` kwarg still cannot let a CANCELLED task be discovered and
+    silence a complaint forever.
+
+    **FOREIGN-ONLY**, mirroring :func:`_resolve_live_cross_project_fix_task`
+    rather than :func:`filter_already_tracked_systemic_patterns`: the running
+    *project_id* is never queried at all.  A finding's own subject task lives
+    in its own project and routinely covers the finding's own wording, so a
+    same-project match would make every such flag self-suppress.
+
+    **LAZY.** When *candidates* is empty, or NO candidate clears
+    *min_key_terms*, this returns immediately having issued ZERO ``get_tasks``
+    calls — the cost bound that keeps a cycle with nothing to discover costing
+    exactly what it cost before this landed.
+
+    **Fail-open in every direction** (no citation, never a raise), matching
+    this module's suppress-only-on-positive-confirmation posture: a falsy
+    *taskmaster* / *known_projects*, no resolvable foreign project, a
+    per-project ``get_tasks`` exception, a malformed result, a failed or
+    not-found live-title read, and a missing/blank/non-``str`` live title all
+    yield no citation for the affected candidate.
+
+    The live title is read back with :func:`_safe_get_task` rather than taken
+    from the bulk listing, and a citation is only synthesised when that read
+    positively confirms a titled record.  That is what makes a discovered
+    citation corroborate BY CONSTRUCTION under
+    :func:`_titles_corroborate`, so the discovered path takes the gate's
+    strongly-corroborated (INFO) branch and never its weakly-corroborated
+    (WARNING) one — the WARNING stays a signal about genuinely stale
+    LLM-authored citations.
+
+    Args:
+        taskmaster: Object with async ``get_tasks(project_root, *, statuses)``
+            and ``get_task(task_id, project_root)`` methods.
+        known_projects: The harness ``{project_id: project_root}`` routing map.
+        project_id: The project the current run belongs to — skipped entirely
+            (see FOREIGN-ONLY above).
+        candidates: Flags to find covering foreign tasks for, read-only.  The
+            sole production caller (``dedup_flags``) passes exactly ONE, since
+            candidacy depends on that flag's own per-flag ledger HIT; the
+            batch shape is kept because the reused matcher is batch-shaped and
+            a single ``to_thread`` hop can serve any number of candidates.
+        task_list_cache: OPTIONAL ``project_id -> tasks | None`` memo shared by
+            the caller across every flag in one batch, so N qualifying flags
+            fetch each project's backlog ONCE, not N times.  A failed lookup
+            caches ``None`` and is not retried within the batch.
+        get_task_cache: OPTIONAL ``(str(project_id), str(task_id)) -> get_task
+            result`` memo — the SAME cache ``dedup_flags`` hands
+            :func:`_resolve_live_cross_project_fix_task`.  Sharing it means the
+            live-title read and the gate's own re-verification are one round
+            trip against one record, so the gate cannot see a different
+            snapshot than the one discovery matched.
+        min_key_terms: Minimum distinct key terms a candidate needs before a
+            match is attempted.
+        match_coverage: Minimum fraction of the candidate's key terms a task
+            must cover.
+        min_task_term_precision: Minimum fraction of the matched task's OWN
+            terms that must come from the overlap.
+
+    Returns:
+        ``{index into candidates -> {'project_id', 'task_id', 'title'}}``,
+        empty when nothing was discovered.
+    """
+    if not taskmaster or not known_projects or not candidates:
+        return {}
+
+    candidate_terms: list[set[str]] = [
+        _significant_terms(flag.get('description') or '')
+        if isinstance(flag, dict) else set()
+        for flag in candidates
+    ]
+    if not any(len(terms) >= min_key_terms for terms in candidate_terms):
+        # LAZY cost bound: nothing here has enough signal to match, so skip the
+        # per-project fan-out entirely rather than just the matching sweep.
+        return {}
+
+    lookup_projects = [
+        (cited_project_id, root)
+        for cited_project_id, root in known_projects.items()
+        if root and str(cited_project_id) != str(project_id)  # FOREIGN-ONLY
+    ]
+    if not lookup_projects:
+        return {}
+
+    if task_list_cache is None:
+        task_list_cache = {}
+
+    async def _safe_get_tasks(project_root: str) -> list[Any] | None:
+        """Fetch one project's non-cancelled tasks; None iff the lookup FAILED.
+
+        Same per-project fail-open shape as
+        :func:`filter_already_tracked_systemic_patterns`' closure: one
+        unreachable backend must not blind discovery to every other project,
+        and a malformed-but-successful result normalises to ``[]`` rather than
+        None so it is not miscounted as an error.
+        """
+        try:
+            result = await taskmaster.get_tasks(
+                project_root, statuses=_NON_CANCELLED_TASK_STATUSES,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'reconciliation.cross_project_fix_task_discovery_get_tasks_error '
+                'project_root=%s error=%s',
+                project_root, exc,
+            )
+            return None
+        tasks = result.get('tasks') if isinstance(result, dict) else None
+        return list(tasks) if isinstance(tasks, list) else []
+
+    uncached = [
+        (cited_project_id, root)
+        for cited_project_id, root in lookup_projects
+        if cited_project_id not in task_list_cache
+    ]
+    if uncached:
+        # PLAIN gather — _safe_get_tasks already normalises every failure to
+        # None (tests/test_gather_convention_guard.py).
+        fetched = await asyncio.gather(
+            *(_safe_get_tasks(root) for _cited_project_id, root in uncached)
+        )
+        task_list_cache.update(
+            zip(
+                (cited_project_id for cited_project_id, _root in uncached),
+                fetched,
+                strict=True,
+            )
+        )
+
+    project_ids = [cited_project_id for cited_project_id, _root in lookup_projects]
+    project_task_lists = [task_list_cache[pid] for pid in project_ids]
+    if all(tasks is None for tasks in project_task_lists):
+        # EVERY foreign project errored — fail open to no discovery.
+        return {}
+
+    # Term extraction + the coverage sweep are pure CPU over every fetched
+    # task's title+description; run OFF the event loop exactly as the sibling
+    # filter does.  See _match_already_tracked_candidates for the measurements.
+    matches = await asyncio.to_thread(
+        _match_already_tracked_candidates,
+        project_ids,
+        project_task_lists,
+        candidate_terms,
+        min_key_terms,
+        match_coverage,
+        min_task_term_precision,
+    )
+    # Release the fetched payloads' hold from this frame; the caller's memo
+    # still owns them for the rest of the batch.
+    del project_task_lists
+
+    if not matches:
+        return {}
+
+    if get_task_cache is None:
+        get_task_cache = {}
+    citations: dict[int, dict[str, Any]] = {}
+    for index, match in matches.items():
+        root = known_projects.get(match.project_id)
+        if not root:
+            continue  # unresolvable project -> no citation (fail open)
+        key = (str(match.project_id), str(match.task_id))
+        if key not in get_task_cache:
+            get_task_cache[key] = await _safe_get_task(
+                taskmaster, match.task_id, root,
+            )
+        live = get_task_cache[key]
+        if not confirm_task_present(live):
+            # The bulk listing named a task the per-task read cannot confirm
+            # (deleted between calls, backend error, id the backend rejects).
+            logger.info(
+                'reconciliation.cross_project_fix_task_discovery_unconfirmed '
+                'matched_project_id=%s matched_task_id=%s coverage=%.2f',
+                match.project_id, match.task_id, match.coverage,
+            )
+            continue
+        # confirm_task_present already proved live is a dict.
+        title = live.get('title')  # type: ignore[union-attr]
+        if not isinstance(title, str) or not title.strip():
+            # Fail open rather than synthesise a title-less citation: the live
+            # title is what makes a discovered citation corroborate by
+            # construction, and cite_task's own title-less write is precisely
+            # the degraded shape task 4864 made audible elsewhere.
+            logger.warning(
+                'reconciliation.cross_project_fix_task_discovery_untitled '
+                'matched_project_id=%s matched_task_id=%s live_title=%r — '
+                'declining to synthesise a citation from an untitled record',
+                match.project_id, match.task_id, title,
+            )
+            continue
+        citations[index] = {
+            'project_id': match.project_id,
+            'task_id': match.task_id,
+            'title': title,
+        }
+        logger.info(
+            'reconciliation.cross_project_fix_task_discovered '
+            'matched_project_id=%s matched_task_id=%s coverage=%.2f '
+            'finding_terms=%s',
+            match.project_id, match.task_id, match.coverage,
+            sorted(candidate_terms[index]),
+        )
+    return citations
+
+
+# --------------------------------------------------------------------------- #
 # Blocked-snapshot finding filter for Stage 3 (task-1840)
 # --------------------------------------------------------------------------- #
 
