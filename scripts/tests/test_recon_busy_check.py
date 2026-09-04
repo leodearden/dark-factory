@@ -252,5 +252,7 @@ def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", spy)
     _run_cli("{}")
+    # The 60.0 default is independently pinned by
+    # test_cli_timeout_from_env_unset_returns_default; a bound here would break
+    # the documented RECON_BUSY_CHECK_TEST_TIMEOUT override (tune-down case).
     assert captured["timeout"] == _CLI_TIMEOUT
-    assert captured["timeout"] >= 60
