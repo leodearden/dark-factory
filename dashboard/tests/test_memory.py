@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from unittest.mock import AsyncMock, patch
@@ -231,6 +232,109 @@ class TestMcpToolCall:
             f'Expected all paths to be /mcp, got {captured_paths}'
         )
 
+
+# ── mcp_tool_call evicts a session that hangs or is cancelled ───
+
+
+class _HangingHandler:
+    """Mock handler whose ``tools/call`` never returns (the handshake works).
+
+    An async ``httpx.MockTransport`` handler is awaited by
+    ``handle_async_request``, so awaiting a never-set ``asyncio.Event`` here
+    parks the post exactly as a server that accepts the request and then goes
+    silent would — the shape a per-HTTP-request budget cannot bound.
+    """
+
+    def __init__(self):
+        self._never = asyncio.Event()
+        self.tool_calls = 0
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        rid = body.get('id', 1)
+        if method == 'initialize':
+            return mcp_init_response(rid)
+        if method.startswith('notifications/'):
+            return mcp_notify_response()
+        self.tool_calls += 1
+        await self._never.wait()
+        raise AssertionError('unreachable')  # pragma: no cover
+
+
+class TestMcpToolCallInvalidatesOnHang:
+    """mcp_tool_call is the cache-aware chokepoint every MCP caller passes.
+
+    ``_get_session`` caches one ``McpSession`` per base url and
+    ``invalidate_session`` is the only teardown; ``McpSession.call_tool`` is an
+    instance method with no knowledge of that cache, so it structurally cannot
+    evict itself. A session whose post hangs must therefore be evicted HERE, or
+    it stays wedged in ``_sessions`` and every later poll reuses it — including
+    for callers outside this module (``task_runtime._probe_one`` catches
+    TimeoutError from its own wait_for and never invalidated at all).
+    """
+
+    async def test_cancellation_invalidates_the_cached_session(self):
+        from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
+
+        url = 'http://localhost:8000'
+        handler = _HangingHandler()
+        transport = httpx.MockTransport(handler)
+        _get_session(url)
+        assert url in _sessions
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(
+                    mcp_tool_call(client, url, 'get_status', {}), timeout=0.05,
+                )
+
+        assert handler.tool_calls == 1, 'the hang must be in tools/call'
+        assert url not in _sessions, (
+            'a session cancelled mid-post must be evicted, or every later '
+            'poll reuses the wedged session and hangs identically'
+        )
+
+    async def test_bare_timeout_error_propagates_and_invalidates(self):
+        from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
+
+        url = 'http://localhost:8000'
+        handler = _SessionAwareHandler(error_on_tool=TimeoutError('slow'))
+        transport = httpx.MockTransport(handler)
+        _get_session(url)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(TimeoutError):
+                await mcp_tool_call(client, url, 'get_status', {})
+
+        assert url not in _sessions, (
+            'an escaping builtin TimeoutError must evict the session too'
+        )
+
+    async def test_http_status_error_propagates_WITHOUT_invalidating(self):
+        """Negative control: the guard stays narrow, never `except BaseException`.
+
+        Teardown policy for ordinary transport/soft failures already belongs to
+        the callers (first_success, get_queue_stats, get_wal_status), which
+        invalidate themselves. A blanket handler here would force a cold
+        three-post handshake on every 500 and silently change that policy, so
+        this test fails if the guard is ever broadened.
+        """
+        from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
+
+        url = 'http://localhost:8000'
+        handler = _SessionAwareHandler(error_status=500)
+        transport = httpx.MockTransport(handler)
+        _get_session(url)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await mcp_tool_call(client, url, 'get_status', {})
+
+        assert url in _sessions, (
+            'mcp_tool_call must NOT invalidate on an HTTP status error — that '
+            "remains the caller's decision"
+        )
 
 # ── client_op_id injection (twin of orchestrator McpSession) ────
 
