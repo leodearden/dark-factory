@@ -5900,21 +5900,21 @@ class MemoryService:
         success = True
         error_msg = None
         try:
-            # NO 'uuid' KEY — deliberately (task 3561). graphiti_core's
-            # Graphiti.add_episode does
+            # NO 'uuid' KEY — deliberately (task 3561). graphiti_core
+            # (verified against the installed 0.28.2) does, in
+            # Graphiti.add_episode:
             #     episode = (await EpisodicNode.get_by_uuid(self.driver, uuid)
             #                if uuid is not None
             #                else EpisodicNode(...))
             # so a caller-supplied uuid means "LOAD this EXISTING episode",
             # never "create the new episode under this uuid". Handing it a
             # freshly-minted uuid is therefore unconditionally
-            # NodeNotFoundError — which is exactly what commit 64cb2538fe did
-            # when it added this key. That commit was written against the
-            # older upstream behaviour where a supplied uuid became the new
-            # node's uuid; upstream reversed the semantic in PR 219 (commit
-            # e42d3ae, 2024-12-02), and every add_episode write has failed
-            # since. Let graphiti_core mint the uuid and read the real one
-            # back off result.episode.uuid in _execute_graphiti_write.
+            # NodeNotFoundError — which is exactly what commit 64cb2538fe
+            # ("fix: include uuid in add_episode enqueue payload") did when it
+            # added this key, and every add_episode write failed from then
+            # until task 3561. Let graphiti_core mint the uuid and read the
+            # real one back off result.episode.uuid in
+            # _execute_graphiti_write.
             await self.durable_queue.enqueue(
                 group_id=scope.graphiti_group_id,
                 operation='add_episode',

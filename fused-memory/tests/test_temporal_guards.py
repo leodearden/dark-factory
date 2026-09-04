@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import MockAddEpisodeResult
 
 from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
@@ -68,13 +69,20 @@ class TestTemporalGuardRoundTrip:
     async def test_execute_graphiti_write_registers_planning_episode(
         self, service_with_real_registry
     ):
-        """_execute_graphiti_write with temporal_context='planning' registers the episode UUID."""
+        """_execute_graphiti_write with temporal_context='planning' registers the episode UUID.
+
+        The uuid under test is the one graphiti_core MINTS (result.episode.uuid),
+        not a payload key (task 3561) — the payload never carries a uuid, and
+        when it did the value named no graph node.
+        """
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-planning-001'
         project_id = 'integ-project'
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=ep_uuid))
+        )
 
         payload = {
-            'uuid': ep_uuid,
             'name': 'test-episode',
             'content': 'CostStore extends AgentResult for cost tracking',
             'source': 'text',
@@ -92,13 +100,20 @@ class TestTemporalGuardRoundTrip:
     async def test_execute_graphiti_write_does_not_register_current_episode(
         self, service_with_real_registry
     ):
-        """_execute_graphiti_write without temporal_context does NOT register the episode."""
+        """_execute_graphiti_write without temporal_context does NOT register the episode.
+
+        The minted uuid is supplied on the result (task 3561) so the negative
+        assertion is meaningful: registration would have keyed on exactly this
+        value had temporal_context been set.
+        """
         svc, reg = service_with_real_registry
         ep_uuid = 'integration-ep-current-001'
         project_id = 'integ-project'
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=ep_uuid))
+        )
 
         payload = {
-            'uuid': ep_uuid,
             'name': 'test-episode',
             'content': 'CostStore was implemented in cost_store.py',
             'source': 'text',
@@ -224,12 +239,18 @@ class TestTemporalGuardRoundTrip:
         project_id = 'integ-project'
         scope = Scope(project_id=project_id)
 
+        # The uuid graphiti_core mints for this episode (task 3561). It is the
+        # single identity the whole round trip keys on: registration reads it
+        # off result.episode.uuid, and the edge below is attributed to it.
+        svc.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid=ep_uuid))
+        )
+
         # Step 1: planning write via _execute_graphiti_write. group_id is set
         # from scope.graphiti_group_id (not the raw project_id), mirroring
         # memory_service.add_episode()'s real payload construction so the
         # write and the later search below key off the same canonical value.
         payload = {
-            'uuid': ep_uuid,
             'name': 'prd-episode',
             'content': 'PRD: TaskStore manages task lifecycle',
             'source': 'text',
@@ -288,7 +309,7 @@ class TestBatchPlanAutoTagRoundTrip:
         registers the episode as planned, excludes its edge from default search,
         and surfaces it with include_planned=True.
         """
-        from _fm_helpers import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockEdge
 
         svc, reg = service_with_real_registry
         project_id = 'integ-batch-plan-001'
@@ -385,7 +406,7 @@ class TestProposedResolutionAutoTagRoundTrip:
         temporal_context: registers the episode as planned, excludes its edge
         from default search, and surfaces it with include_planned=True.
         """
-        from _fm_helpers import MockAddEpisodeResult, MockEdge
+        from _fm_helpers import MockEdge
 
         svc, reg = service_with_real_registry
         project_id = 'integ-proposed-resolution-001'
