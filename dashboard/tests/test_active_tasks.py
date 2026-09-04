@@ -32,20 +32,21 @@ def test_minutes_since_handles_z_suffix_and_naive_iso():
     assert 59 <= minutes <= 61
 
 
-def test_minutes_since_returns_none_on_missing_and_zero_on_bad():
-    """A MISSING start time is an honest unknown (None); a bad one keeps 0.
+def test_minutes_since_returns_none_on_missing_and_on_bad():
+    """A MISSING start time and a present-but-unparseable one are both None.
 
     ``None``/``''`` is the per-task artifact-read-failure signal on
     ``TaskRuntimeEntry.started`` (see ``shared/src/shared/task_runtime_state.py``
     — "never a fabricated 0"), so the helper must propagate the unknown rather
     than render it as '0m running'. A present-but-unparseable timestamp is a
-    different failure (upstream data damage, no known producer) and
-    deliberately keeps the existing 0 — out of scope for task 4055, see the
-    plan's design decisions.
+    different failure (upstream data damage, no known producer), but renders
+    identically misleadingly as '0m running' if faked to 0, so it is also
+    surfaced as None rather than fabricated (task 4365; task 4055 scoped its
+    fix to the missing/empty case only and left this branch for follow-up).
     """
     assert _minutes_since(None) is None
     assert _minutes_since('') is None
-    assert _minutes_since('not-a-date') == 0
+    assert _minutes_since('not-a-date') is None
 
 
 def test_minutes_since_uses_provided_now():
