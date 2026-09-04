@@ -1449,17 +1449,28 @@ async def test_rendered_json_carries_the_measurement_and_the_verdict():
     assert [c['name'] for c in payload['candidates']] == list(_mod.CANDIDATE_NAMES)
     assert payload['revalidation_test'] == _mod.REVALIDATION_TEST
 
-    # The candidate band's own keys, in the unit the band counts in. This
-    # corpus recovers nothing, so the lists are empty and the denominators
-    # are what carry the information: two rejected matches were simulated
-    # over two distinct shapes, and neither candidate moved either one.
+    # The candidate band's own keys, in the unit the band counts in. Two
+    # rejected matches over two distinct shapes reached the candidates, and
+    # the denominators are identical across the three rows because all three
+    # are simulated over the SAME corpus — the rows differ only in what they
+    # do with those matches.
     for candidate in payload['candidates']:
-        assert candidate['recovered'] == []
-        assert candidate['over_selected'] == []
         assert candidate['facts_simulated'] == 2
         assert candidate['matches_scanned'] == 2
         assert candidate['already_selected'] == 0
+        assert candidate['over_selected'] == []
         assert 'unchanged_count' not in candidate
+
+    candidates = {c['name']: c for c in payload['candidates']}
+    # 'b' restarts its scan after the date stamp's comma and so recovers the
+    # preamble shape; 'shipped' and 'a' both leave every rejection standing.
+    assert candidates['b']['recovered'] == [
+        {'fact': _PREAMBLE_REJECTION, 'match_start': 18},
+    ]
+    assert len(candidates['b']['unchanged']) == 1
+    for name in ('shipped', 'a'):
+        assert candidates[name]['recovered'] == [], name
+        assert len(candidates[name]['unchanged']) == 2, name
 
 
 async def _candidate_active_report():

@@ -1217,6 +1217,23 @@ def _rejection_payload(rejections: list[Rejection]) -> list[dict[str, Any]]:
     ]
 
 
+def _candidate_match_payload(
+    matches: list[CandidateMatch],
+) -> list[dict[str, Any]]:
+    """Simulated matches, sorted by (fact, offset) so the list never reorders.
+
+    Deliberately the same ordering rule and the same record shape as
+    ``_rejection_payload``: the artifact then has ONE convention for every
+    per-match list it carries, and the renderer band's stated guarantee —
+    every ordering is an explicit sort, so two identical runs diff cleanly —
+    holds for these lists without a second rule to remember.
+    """
+    return [
+        {'fact': m.fact, 'match_start': m.match_start}
+        for m in sorted(matches, key=lambda m: (m.fact, m.match_start))
+    ]
+
+
 def render_json(report: Report) -> str:
     """The citable machine-readable record. Never truncated."""
     payload = {
@@ -1250,12 +1267,20 @@ def render_json(report: Report) -> str:
         'candidates': [
             {
                 'name': candidate.name,
-                # Projected to fact text so this payload keeps the shape it
-                # had before the unit change; the per-match restructure is a
-                # separate change to the artifact schema.
-                'over_selected': sorted(m.fact for m in candidate.over_selected),
-                'recovered': sorted(m.fact for m in candidate.recovered),
-                'unchanged_count': len(candidate.unchanged),
+                # All three lists in ONE unit and ONE record shape. The old
+                # payload emitted the first two as bare fact strings and the
+                # third as a scalar `unchanged_count`, which could not say
+                # WHICH matches were unchanged and counted facts while its
+                # neighbours counted matches.
+                'over_selected': _candidate_match_payload(candidate.over_selected),
+                'recovered': _candidate_match_payload(candidate.recovered),
+                'unchanged': _candidate_match_payload(candidate.unchanged),
+                # The denominators, carried so the band is checkable from the
+                # artifact alone: matches_scanned == already_selected +
+                # recovered + over_selected + unchanged.
+                'matches_scanned': candidate.matches_scanned,
+                'already_selected': candidate.already_selected,
+                'facts_simulated': candidate.facts_simulated,
             }
             for candidate in report.candidates
         ],
@@ -1402,6 +1427,19 @@ def render_markdown(report: Report) -> str:
     if not sampled_any:
         lines += ['_None._', '']
 
+    # UNIT AND DENOMINATOR, called out for the second time in this renderer
+    # and for a stronger reason than the triage table needed. That table
+    # changed the unit against the table above it (per-MATCH, not per-FACT);
+    # this one changes BOTH the unit and the population: its counts are per
+    # rejected MATCH over the DEDUPLICATED distinct fact SHAPES that reached
+    # the guard, not over edges. So it shares a denominator with neither
+    # table above it, and a reader who subtracts gets a number that means
+    # nothing. The denominator is therefore stated in the prose rather than
+    # left to be inferred from the rows.
+    #
+    # `_denominator` is derived here from the first candidate because every
+    # candidate is simulated over the same corpus — the three rows differ in
+    # what they DO with those matches, never in how many they saw.
     lines += [
         '## Candidate tightenings',
         '',
@@ -1410,13 +1448,33 @@ def render_markdown(report: Report) -> str:
         'guard in this run. `over_selected` is disqualifying (the '
         'unrecoverable direction); `recovered` is the benefit.',
         '',
-        '| candidate | over-selections re-opened | preamble shapes recovered |',
-        '| --- | ---: | ---: |',
+    ]
+    if report.candidates:
+        sample = report.candidates[0]
+        rejected_matches = sample.matches_scanned - sample.already_selected
+        lines += [
+            f'**Denominator.** {sample.facts_simulated:,} distinct fact '
+            f'shape(s) were simulated, carrying {sample.matches_scanned:,} '
+            f'regex match(es), of which {sample.already_selected:,} were '
+            f'already selected by the shipped guard and '
+            f'{rejected_matches:,} reached the candidates. Every count below '
+            'is per rejected MATCH over those deduplicated shapes, so it '
+            'shares a denominator with NEITHER table above — not the '
+            'per-FACT edge counts, not the per-MATCH triage over every '
+            'rejection including duplicate shapes. Each row sums: '
+            '`already_selected + recovered + over-selected + unchanged = '
+            'matches scanned`.',
+            '',
+        ]
+    lines += [
+        '| candidate | over-selections re-opened (matches) | '
+        'preamble matches recovered | rejections left unchanged (matches) |',
+        '| --- | ---: | ---: | ---: |',
     ]
     for candidate in report.candidates:
         lines.append(
             f'| `{candidate.name}` | {len(candidate.over_selected):,} | '
-            f'{len(candidate.recovered):,} |'
+            f'{len(candidate.recovered):,} | {len(candidate.unchanged):,} |'
         )
     lines += [
         '',
