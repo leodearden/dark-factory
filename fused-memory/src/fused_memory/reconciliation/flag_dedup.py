@@ -721,9 +721,22 @@ _CITED_TASK_PAYLOAD_KEYS: tuple[str, ...] = ('project_id', 'task_id', 'title')
 #: :func:`_cited_task_corroborated` an unbounded string to normalise and
 #: compare.  200 characters comfortably exceeds every real task title in
 #: this factory (the longest are ~130), so truncation only ever fires on
-#: junk; when it does, the truncated title no longer matches the live
-#: record, corroboration fails OPEN (no suppression) and the near-miss INFO
-#: log in :func:`_resolve_live_cross_project_fix_task` makes it observable.
+#: junk.
+#:
+#: **Truncation parity (task 4864).**  Truncation used to be a silent
+#: matching hazard: the citation was cut to this bound while the live record's
+#: ``title`` was compared at full length, so the gate's own sanitizer could
+#: mutate a perfectly good citation into one that could never corroborate the
+#: task it was copied from.  :func:`_titles_corroborate` now truncates BOTH
+#: sides to this bound before normalising, which makes the sanitizer's
+#: mutation provably lossless for MATCHING at any value of this constant —
+#: the invariant holds however the cap is later tuned, rather than depending
+#: on it exceeding every real title.  The documented consequence is that two
+#: titles differing ONLY past character 200 compare equal; that is the cap's
+#: intended semantics (it is a bound on how much title the gate reads at
+#: all), not a prefix match — a SHORT cited title is still compared in full
+#: against the truncated live title, so a long live title that merely begins
+#: with a short citation does NOT corroborate.
 _MAX_CITED_TASK_STR_CHARS: int = 200
 
 
@@ -741,9 +754,12 @@ def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
     Sanitizing is NOT decorative.  The result is handed to
     :func:`_resolve_live_cross_project_fix_task` (via ``dedup_flags``), which
     compares each entry's ``title`` against a live task record
-    (:func:`_cited_task_corroborated`); an unsanitized LLM-authored value (a
+    (:func:`_titles_corroborate`); an unsanitized LLM-authored value (a
     nested object, a datetime, a mock) could make that comparison raise
-    instead of failing open.  This is now the sanitizer's ONLY job — task
+    instead of failing open.  The truncation this applies is NOT lossy for
+    that comparison: :func:`_titles_corroborate` truncates the live title to
+    the same bound first (task 4864), so a citation this function shortened
+    still corroborates the record it was copied from.  This is now the sanitizer's ONLY job — task
     4712 retired the marker-payload write it used to also protect (the
     payload is never ``json.dumps``-ed with a ``cited_tasks`` key any more;
     see the module docstring's invariant) — but it remains load-bearing for
@@ -2699,6 +2715,47 @@ def confirm_task_present(get_task_result: object) -> bool:
     return any(key in get_task_result for key in _TASK_IDENTITY_KEYS)
 
 
+def _titles_corroborate(cited_title: object, live_title: object) -> bool:
+    """True iff a cited title and a live task title name the SAME task.
+
+    Both sides are truncated to :data:`_MAX_CITED_TASK_STR_CHARS` and then
+    normalised with :func:`_normalize_content_description` (casefold +
+    whitespace-collapse) before comparison.
+
+    **Truncating BOTH sides is the point** (task 4864).  ``_sanitize_cited_tasks``
+    already cut the citation to that bound, but the live record read back from
+    the backend is not cut, so comparing them at different lengths let the
+    gate's own sanitizer mutate a good citation into one that could never
+    match.  Truncating symmetrically makes that mutation lossless for matching
+    at ANY cap value, so the invariant survives future tuning of the constant
+    instead of resting on "200 exceeds every real title".
+
+    This is a symmetric truncated-equality test, NOT a prefix match: a short
+    cited title is compared in full against the truncated live title, so a long
+    live title that merely BEGINS with a short citation does not corroborate.
+    The one documented consequence is that two titles differing only PAST the
+    cap compare equal — that is what a cap on how much title the gate reads
+    means, and it is bounded by the cap rather than open-ended.
+
+    Fails safe (``False``) on a missing, blank or non-``str`` value on either
+    side, matching this module's suppress-only-on-positive-confirmation
+    posture.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(cited_title, str) or not isinstance(live_title, str):
+        return False
+    normalized_cited = _normalize_content_description(
+        cited_title[:_MAX_CITED_TASK_STR_CHARS]
+    )
+    normalized_live = _normalize_content_description(
+        live_title[:_MAX_CITED_TASK_STR_CHARS]
+    )
+    if not normalized_cited or not normalized_live:
+        return False
+    return normalized_cited == normalized_live
+
+
 def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> bool:
     """True iff *get_task_result* positively corroborates the *cited* candidate.
 
@@ -2712,10 +2769,11 @@ def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> 
     occupy the cited id (task-2525 amendment).
 
     This helper additionally requires the resolved record's ``title`` to
-    match the cited candidate's ``title`` — both normalised via
-    :func:`_normalize_content_description` (casefold + whitespace-collapse)
-    to tolerate incidental case/spacing differences — before treating the
-    lookup as positive corroboration of the SAME task the finding cited.
+    match the cited candidate's ``title`` via :func:`_titles_corroborate`
+    (symmetric truncation to :data:`_MAX_CITED_TASK_STR_CHARS`, then casefold
+    + whitespace-collapse, so incidental case/spacing differences and the
+    sanitizer's own truncation are both tolerated) before treating the lookup
+    as positive corroboration of the SAME task the finding cited.
 
     Fails safe (returns False = not corroborated) when:
     - :func:`confirm_task_present` returns False for *get_task_result*.
@@ -2735,15 +2793,10 @@ def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> 
     if not confirm_task_present(get_task_result):
         return False
     # confirm_task_present already proved get_task_result is a dict.
-    result_title = get_task_result.get('title')  # type: ignore[union-attr]
-    cited_title = cited.get('title')
-    if not isinstance(cited_title, str) or not isinstance(result_title, str):
-        return False
-    normalized_cited = _normalize_content_description(cited_title)
-    normalized_result = _normalize_content_description(result_title)
-    if not normalized_cited or not normalized_result:
-        return False
-    return normalized_cited == normalized_result
+    return _titles_corroborate(
+        cited.get('title'),
+        get_task_result.get('title'),  # type: ignore[union-attr]
+    )
 
 
 #: Task statuses that mean the work was ABANDONED rather than merely filed

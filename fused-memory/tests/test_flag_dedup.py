@@ -3796,17 +3796,34 @@ class TestCitedTaskTitleTruncationParity:
         )
         assert result.cited == cited and result.status == 'pending'
 
-    def test_long_title_differing_only_past_the_cap_does_not_corroborate(self):
+    def test_different_long_title_does_not_corroborate(self):
         """Companion: the fix must not degrade into "any long title matches".
 
-        Two 250-char titles sharing their first 200 characters and differing
-        only afterwards.
+        Two 250-char titles differing WITHIN the first
+        ``_MAX_CITED_TASK_STR_CHARS`` characters.
+
+        WEAKENED FROM step-1, deliberately (task 4864 step-2).  This assertion
+        was first written with the two titles differing only PAST character
+        200, and that form is unsatisfiable BY DESIGN once both sides are
+        truncated to the same bound: a cap on how much title the gate reads is
+        precisely a statement that nothing past it is consulted.  Raising or
+        special-casing the cap to rescue it would reintroduce the unbounded
+        string the cap exists to prevent.  What the assertion is actually FOR
+        — "the fix must not degrade into a prefix match that any long title
+        satisfies" — is preserved here and, more sharply, in
+        ``test_short_citation_is_not_satisfied_by_a_long_title_that_starts_with_it``
+        below, which is the case that genuinely separates symmetric truncation
+        from a prefix rule.
         """
-        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+        from fused_memory.reconciliation.flag_dedup import (
+            _MAX_CITED_TASK_STR_CHARS,
+            _cited_fix_task_live,
+        )
 
         cited = self._cited(self.LONG_TITLE)
-        other = self.LONG_TITLE[:200] + ('z' * 50)
-        assert other != self.LONG_TITLE and other[:200] == self.LONG_TITLE[:200]
+        other = 'A completely different long task title ' + ('z' * 211)
+        assert len(other) > _MAX_CITED_TASK_STR_CHARS
+        assert other[:_MAX_CITED_TASK_STR_CHARS] != self.LONG_TITLE[:_MAX_CITED_TASK_STR_CHARS]
         live = {'id': 3839, 'title': other, 'status': 'pending'}
 
         assert _cited_fix_task_live(cited, live) is False, (
