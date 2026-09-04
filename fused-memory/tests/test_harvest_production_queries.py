@@ -184,6 +184,78 @@ def _standard_journal(tmp_path: Path) -> Path:
     return _build_journal(tmp_path / 'journal.db', rows)
 
 
+# ---------------------------------------------------------------------------
+# Read-only connection proxies
+# ---------------------------------------------------------------------------
+# Inert scaffolding: these classes carry NO assertions of their own.  They are
+# an injection seam that lets a test observe HOW `harvest()` consumes its scan
+# cursor, or make ONE specific statement fail while every other statement runs
+# for real against the synthetic journal.
+#
+# `_connect_readonly` is already treated as a public-to-tests seam by
+# `TestReadOnlyAccess`, which calls it directly, so patching it introduces no
+# new coupling.
+
+
+class _CursorProxy:
+    """A real cursor with `fetchall()` forbidden and iteration left intact.
+
+    `fetchone` DELEGATES rather than raising, deliberately: the schema probe
+    in `harvest()` legitimately calls it.  Blocking everything would drag the
+    probe into the streaming contract this exists to pin, so the guard names
+    exactly one property -- the SCAN is streamed -- and nothing more.
+    """
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        raise AssertionError('harvest must stream the scan cursor, not materialize it')
+
+
+class _ConnectionProxy:
+    """A real connection that hands out `_CursorProxy` cursors.
+
+    `fail_on` is an optional predicate over the SQL string; when it matches,
+    `exc` is raised INSTEAD of executing.  That is what lets a test fail
+    exactly one statement -- the `write_ops` scan -- while the schema probe
+    and every PRAGMA still run for real.
+    """
+
+    def __init__(self, con, *, fail_on=None, exc=None):
+        self._con = con
+        self._fail_on = fail_on
+        self._exc = exc
+
+    def execute(self, *args, **kwargs):
+        if self._fail_on is not None and args and self._fail_on(args[0]):
+            raise self._exc
+        return _CursorProxy(self._con.execute(*args, **kwargs))
+
+    def close(self):
+        self._con.close()
+
+
+def _patch_connect(monkeypatch, mod, factory):
+    """Route `mod._connect_readonly` through `factory(real_connection)`.
+
+    monkeypatch restores the real callable on teardown, so the seam is not
+    left patched for the next test in the worker.
+    """
+    real = mod._connect_readonly
+
+    def _connect(db_path, *args, **kwargs):
+        return factory(real(db_path, *args, **kwargs))
+
+    monkeypatch.setattr(mod, '_connect_readonly', _connect)
+
+
 class TestHarvestSelectsOnlySearchOps:
     """Only `operation='search'` rows carrying query text are counted."""
 
