@@ -15,7 +15,9 @@ import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
 
 from dashboard.config import DashboardConfig
+from dashboard.data import mcp_fanout
 from dashboard.data.mcp_fanout import (
+    call_with_deadline,
     describe_exc,
     first_success,
     log_fanout_failure,
@@ -332,6 +334,15 @@ async def get_queue_stats(
     configured URLs, so the aggregate cost scales with N. Callers needing a
     hard bound must still wrap this in ``asyncio.wait_for`` — ``metrics.py``
     does.
+
+    Each URL's attempt additionally carries ``mcp_fanout``'s whole-operation
+    deadline (``_DEFAULT_PER_URL_DEADLINE_SECONDS``, resolved at call time), so
+    a server that accepts the request and then goes silent no longer parks this
+    loop before it reaches the remaining URLs. The two bounds are complementary
+    rather than redundant: the caller's outer ``wait_for`` bounds the N-URL
+    aggregate, while this one stops any single URL from consuming all of it.
+    An expiry is an ordinary per-URL failure here — logged, invalidated, and
+    skipped, exactly like a ``ConnectError``.
     """
     merged_counts: dict[str, int] = {}
     oldest_age: float | None = None
@@ -339,11 +350,14 @@ async def get_queue_stats(
 
     for url in config.fused_memory_urls:
         try:
-            result = await mcp_tool_call(
-                client, url, 'get_queue_stats', {}, timeout=timeout,
+            result = await call_with_deadline(
+                url,
+                lambda u: mcp_tool_call(client, u, 'get_queue_stats', {},
+                                        timeout=timeout),
+                mcp_fanout._DEFAULT_PER_URL_DEADLINE_SECONDS,
             )
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
+                TimeoutError, ValueError) as e:
             # Same transition-only WARNING policy as first_success (task 3871):
             # this loop visits ALL N urls, so a partial outage used to
             # under-report queue counts at DEBUG with no journal trace at all.
@@ -385,16 +399,27 @@ async def get_wal_status(
     bound on this call: like ``get_queue_stats`` this visits ALL N configured
     URLs, so the aggregate cost scales with N. Callers needing a hard bound
     must still wrap this in ``asyncio.wait_for``.
+
+    Each URL's attempt additionally carries ``mcp_fanout``'s whole-operation
+    deadline (``_DEFAULT_PER_URL_DEADLINE_SECONDS``, resolved at call time), so
+    one silent server no longer costs every other server its WAL column. The
+    two bounds are complementary: the caller's outer ``wait_for`` bounds the
+    N-URL aggregate, this one stops any single URL from consuming all of it.
+    An expiry is an ordinary per-URL failure — logged, invalidated, recorded in
+    *errors*, and skipped.
     """
     per_server: dict[str, dict] = {}
     errors: list[str] = []
     for url in config.fused_memory_urls:
         try:
-            result = await mcp_tool_call(
-                client, url, 'get_wal_status', {}, timeout=timeout,
+            result = await call_with_deadline(
+                url,
+                lambda u: mcp_tool_call(client, u, 'get_wal_status', {},
+                                        timeout=timeout),
+                mcp_fanout._DEFAULT_PER_URL_DEADLINE_SECONDS,
             )
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
+                TimeoutError, ValueError) as e:
             # Transition-only WARNING, as above — a per-server WAL column can
             # vanish from the UI badge and, at DEBUG, leave nothing behind.
             log_fanout_failure('get_wal_status', url, e)

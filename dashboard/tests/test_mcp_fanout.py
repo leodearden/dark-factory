@@ -245,6 +245,11 @@ class TestFirstSuccessWholeOperationDeadline:
         async def call(url):
             attempted.append(url)
             await never.wait()
+            # Unreachable: the Event is never set, so this leg only ever ends
+            # by the deadline firing. Present so the closure's inferred return
+            # type is NoReturn and V solves from offline_result, matching
+            # TestFirstSuccessAllFail's raising `call` above.
+            raise AssertionError('unreachable')  # pragma: no cover
 
         result = await asyncio.wait_for(
             first_success(
