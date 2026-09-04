@@ -289,7 +289,7 @@ def _json_type_name(value: Any) -> str | None:
     return None
 
 
-def _quoted_markup_params(recovered: Any) -> list[str]:
+def _quoted_markup_params(recovered: Mapping[str, str]) -> list[str]:
     """The recovered names whose value STILL trips :func:`detect`, sorted.
 
     WHY THIS EXISTS, not just what it does. A faithful REPORT of a markup leak
@@ -320,15 +320,28 @@ def _quoted_markup_params(recovered: Any) -> list[str]:
     unchanged and non-negotiable. This census covers ``fix.recovered`` only.
 
     NAMES ONLY, like ``recovered_params``: a fact must not become a second copy
-    of the caller's payload. Non-``str`` values are skipped because
-    :func:`_coerce_recovered` may have typed them into a list or dict, and a
-    blanket textual scan of a decoded structure would be answering a different
-    question than the one a downstream string consumer asks.
+    of the caller's payload.
 
-    Total for the unrepairable path's ``()``, which has no recovery at all: the
-    answer there is the EMPTY list, present-and-empty for the same reason
-    ``misclose`` is present-and-null — a consumer must never have to tell "none
-    quoted" apart from "that emitter forgot the key".
+    CALLED ON THE PRE-COERCION MAP, and only there. :meth:`_handle_markup`
+    takes this census ABOVE its :func:`_coerce_recovered` line and threads the
+    one answer to all three publication sites. That is why the parameter is
+    typed ``Mapping[str, str]`` rather than ``Any``: by ``Repair.recovered``'s
+    own declaration every value here IS a ``str``, so the ``isinstance(value,
+    str)`` filter below is a type-safety belt on a never-raises path, not a
+    semantic filter that decides anything.
+
+    It USED to be semantic, and that is the defect this shape replaces. Reading
+    the post-coercion map and skipping non-``str`` values correctly observes
+    that a decoded structure answers a different question — and then resolves
+    it by dropping the primary answer, because the parameter the whole
+    mechanism exists for (``evidence: list[dict[str, Any]] | None``) is exactly
+    the one ``_coerce_recovered`` decodes into a ``list``. Measured: the census
+    shipped EMPTY for its entire measured population while every test passed.
+
+    The unrepairable path has no recovery to inspect at all, so it publishes
+    the EMPTY list without calling this function — present-and-empty for the
+    same reason ``misclose`` is present-and-null there: a consumer must never
+    have to tell "none quoted" apart from "that emitter forgot the key".
 
     Related, and deliberately NOT reopened here: this module passes no
     ``schema_params`` at its :func:`detect_for` call site, leaving a cross-field
@@ -337,8 +350,6 @@ def _quoted_markup_params(recovered: Any) -> list[str]:
     (``TestSelfNameCloserIsSeenAtTheBoundary``); task 4502 ruled it an explicit
     non-goal rather than re-litigating a landed decision.
     """
-    if not isinstance(recovered, Mapping):
-        return []
     return sorted(
         name
         for name, value in recovered.items()
@@ -998,12 +1009,43 @@ class MarkupGuardMiddleware(Middleware):
             await self._emit_fact(
                 name, identity, param, pattern,
                 outcome=_OUTCOME_UNREPAIRABLE, misclose=None, recovered=(),
+                # No recovery exists at all, so nothing of the caller's text was
+                # inspected: present-and-empty, the same convention ``misclose``
+                # is present-and-null on this path for.
+                quoting=[],
             )
             storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity, subject)
             await self._refuse_unrepairable(
                 name, identity, subject,
                 param, value, pattern, storm,
             )
+
+        # THE CENSUS IS TAKEN HERE, ABOVE THE COERCION, AND THAT ORDER IS THE
+        # WHOLE POINT (task 4502). ``fix.recovered`` is the VERBATIM map: every
+        # value in it is a slice of what the caller actually sent (invariant
+        # D5), which is exactly the text this census is about. The coerced map
+        # below is a DERIVED, tool-facing view — a decoded ``evidence`` is a
+        # ``list`` and no longer text at all, and a FORWARD_REPAIR drop removes
+        # an entry outright. Reading the census off THAT makes the answer depend
+        # on the invoked tool's type declarations and on the policy tier: the
+        # same caller text was measured named under REJECT_WITH_REPAIR and
+        # unnamed under FORWARD_REPAIR, and reported EMPTY for the whole
+        # measured population (corpus record toolu_01XbCz5NFCA6pCvmseyqFgvy,
+        # whose `evidence` is declared ``list[dict[str, Any]] | None``) while
+        # every test in the suite stayed green.
+        #
+        # DO NOT "TIDY" THIS LINE DOWNWARD past the ``_coerce_recovered`` call.
+        # Doing so re-introduces that defect silently, with nothing failing:
+        # the unit pins that would catch it must drive a NON-string declared
+        # type, and the corpus replay's synthetic tools declare every parameter
+        # ``str | None``. The real-server pin is
+        # ``escalation/tests/test_markup_middleware_registration.py``'s
+        # ``TestTheQuotedMarkupCensusAgainstTheREALSchema``.
+        #
+        # Taken ONCE and threaded to all three publication sites rather than
+        # recomputed at each — same INV-5 reason the coercion has one
+        # application point.
+        quoting = _quoted_markup_params(fix.recovered)
 
         # ONE application point, serving BOTH tiers. The recovered map is typed
         # against the invoked tool's live schema here, before either policy
@@ -1061,6 +1103,7 @@ class MarkupGuardMiddleware(Middleware):
             await self._emit_fact(
                 name, identity, param, pattern,
                 outcome=_OUTCOME_REJECTED, misclose=fix.misclose, recovered=fix.recovered,
+                quoting=quoting,
             )
             # The REPAIRED view, matching the ``identity`` resolved from that
             # same merged map one line above — if the leak ate the caller's own
@@ -1070,11 +1113,12 @@ class MarkupGuardMiddleware(Middleware):
             storm = await self._record_storm(
                 _OUTCOME_REJECTED, identity, self._subject({**arguments, **fix.recovered}),
             )
-            return self._reject(name, arguments, param, fix, storm)
+            return self._reject(name, arguments, param, fix, storm, quoting)
 
         await self._emit_fact(
             name, identity, param, pattern,
             outcome=_OUTCOME_REPAIRED, misclose=fix.misclose, recovered=fix.recovered,
+            quoting=quoting,
         )
         subject = self._subject({**arguments, **fix.recovered})
         storm = await self._record_storm(_OUTCOME_REPAIRED, identity, subject)
@@ -1087,6 +1131,7 @@ class MarkupGuardMiddleware(Middleware):
         return await self._forward(
             context, call_next, arguments, param, fix, storm,
             unrecovered=tuple(sorted(unrecovered)), residue_id=residue_id,
+            quoting=quoting,
         )
 
     # -- the injected channels --------------------------------------------
@@ -1142,6 +1187,7 @@ class MarkupGuardMiddleware(Middleware):
         outcome: str,
         misclose: str | None,
         recovered: Any,
+        quoting: list[str],
     ) -> None:
         """Emit one ``markup_detected`` (INV-2), and never change an outcome.
 
@@ -1187,10 +1233,15 @@ class MarkupGuardMiddleware(Middleware):
             'misclose': misclose,
             'outcome': outcome,
             'recovered_params': sorted(recovered),
-            # Task 4502. A SUBSET of recovered_params, never the absorbing
-            # parameter — see :func:`_quoted_markup_params` for why delivering
-            # these is correct and why it must nonetheless be countable.
-            'quoted_markup_params': _quoted_markup_params(recovered),
+            # Task 4502. Computed ONCE by :meth:`_handle_markup` from the
+            # VERBATIM recovered map and handed in, never recomputed here — see
+            # the census capture there for why that map and not this one, and
+            # :func:`_quoted_markup_params` for why delivering these values is
+            # correct and why it must nonetheless be countable. Never the
+            # absorbing parameter. Not necessarily a subset of
+            # ``recovered_params``: on the FORWARD_REPAIR path an untypable name
+            # is dropped from the delivered map while its text still quoted.
+            'quoted_markup_params': quoting,
             'agent_id': agent_id,
             'project': project,
         }
@@ -1573,7 +1624,7 @@ class MarkupGuardMiddleware(Middleware):
             })
         return residue_id
 
-    def _reject(self, name, arguments, param, fix, storm) -> NoReturn:
+    def _reject(self, name, arguments, param, fix, storm, quoting) -> NoReturn:
         """Write nothing; bounce the caller with the repaired argument map.
 
         RAISES rather than short-circuiting with a middleware-authored
@@ -1621,7 +1672,7 @@ class MarkupGuardMiddleware(Middleware):
             # resubmission, and a recovered value that quotes a literal makes
             # that retry bounce again — naming it is what turns an infinite
             # mechanical retry into an adjudicable report (task 4502).
-            'quoted_markup_params': _quoted_markup_params(fix.recovered),
+            'quoted_markup_params': quoting,
             'repaired_call': repaired_call,
             'hint': _REJECT_HINT,
         }, storm)))
@@ -1629,6 +1680,7 @@ class MarkupGuardMiddleware(Middleware):
     async def _forward(
         self, context, call_next, arguments, param, fix, storm,
         *, unrecovered: tuple[str, ...] = (), residue_id: str | None = None,
+        quoting: list[str],
     ):
         """Repair in place, let the call through, and say so.
 
@@ -1680,7 +1732,7 @@ class MarkupGuardMiddleware(Middleware):
             # below: this one answers "did anything I was handed still carry a
             # literal", and an absent key would read as "no" while actually
             # meaning "this emitter is older than task 4502".
-            'quoted_markup_params': _quoted_markup_params(fix.recovered),
+            'quoted_markup_params': quoting,
             'hint': _FORWARD_HINT,
         }, storm)
         # Omitted when empty, the same convention `storm` follows: a key that is
