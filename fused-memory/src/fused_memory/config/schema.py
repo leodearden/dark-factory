@@ -2155,7 +2155,11 @@ class CuratorConfig(BaseModel):
     # resets it — see task_curator.py::TaskCurator._consecutive_zero_output_timeouts).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
-    # before allowing a half-open probe.
+    # before allowing a half-open probe; a successful LLM call (including a
+    # concurrent batch round-trip) closes the breaker early rather than
+    # waiting out the cooldown — see
+    # task_curator.py::TaskCurator._reset_zero_output_breaker and
+    # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
 
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
