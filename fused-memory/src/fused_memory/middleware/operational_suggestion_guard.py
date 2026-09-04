@@ -138,7 +138,11 @@ _PROVENANCE_STAMP_RE = re.compile(
     # sentence, losing the author's own code-change signal.
     r'^[ \t]*'
     r'\['
+    r'(?:'
     r'[^\]\n]{0,160}\d{4}-\d{2}-\d{2}[^\]\n]{0,160}'  # any DATED annotation stamp
+    r'|'
+    r'stage\s+\d+[^\]\n]{0,160}'  # or an undated "[Stage N ...]" stamp
+    r')'
     r'\]'
     # Not a markdown link: DF task prose routinely opens a line with
     # "[Stage 1 stall detector](fused-memory/.../stage1_stall_detector.py)",
