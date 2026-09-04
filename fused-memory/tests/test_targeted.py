@@ -6724,3 +6724,140 @@ class TestContradictedEscalationFailureContainment:
             a for a in result.get('actions', [])
             if a['type'] == 'verification_contradicted_escalated'
         ], f'Nothing was filed, so no escalated action, got {result.get("actions")}'
+
+
+class TestContradictedEscalationSurvivesAMemoryOutage:
+    """The reverse independence: a broken memory store must not eat the alert.
+
+    `TestContradictedEscalationFailureContainment` above pins one direction —
+    a broken escalation queue must not cost the memory write.  This pins the
+    OTHER direction, and it is the reason the escalation call is ordered
+    BEFORE `_fenced_add_memory` rather than after it.
+
+    Without this test that ordering is unpinned: moving the escalation below
+    the write is a tidy-looking refactor ("escalate only once the record it
+    points at exists") that leaves every other test in this file green while a
+    Mem0/Qdrant outage silently swallows the human alert — `_fenced_add_memory`
+    raises, `_on_task_done`'s broad verify `except` catches it, and the
+    escalation is simply never reached.
+    """
+
+    @staticmethod
+    def _break_memory_write(mock_memory_service, mock_event_buffer, arm: str) -> None:
+        """Make the verification memory write fail on one of its two arms."""
+        if arm == 'direct':
+            mock_memory_service.add_memory.side_effect = RuntimeError('qdrant down')
+        else:
+            # The deferral arm: a full cycle is active, so the write is handed
+            # to the buffer instead — and the buffer is the thing that is down.
+            mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+            mock_event_buffer.defer_write.side_effect = RuntimeError('buffer unwritable')
+
+    @pytest.mark.parametrize('arm', ['direct', 'deferred'])
+    @pytest.mark.asyncio
+    async def test_escalation_still_lands_when_the_memory_write_fails(
+        self, reconciler, journal, mock_memory_service, mock_event_buffer, tmp_path, arm
+    ):
+        from escalation.queue import EscalationQueue
+
+        reconciler.verifier.verify = AsyncMock(return_value=_contradicted_result())
+        self._break_memory_write(mock_memory_service, mock_event_buffer, arm)
+
+        result = await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        # The alert reached its durable home despite the outage.
+        pending = EscalationQueue(tmp_path / 'data' / 'escalations').get_pending()
+        assert len(pending) == 1, (
+            f'A memory outage must not suppress the human alert, got '
+            f'{[e.id for e in pending]}'
+        )
+        assert pending[0].category == 'risk_identified', (
+            f'Got category {pending[0].category!r}'
+        )
+
+        escalated = [
+            a for a in result.get('actions', [])
+            if a['type'] == 'verification_contradicted_escalated'
+        ]
+        assert len(escalated) == 1, (
+            f'Expected the escalated action, got {result.get("actions")}'
+        )
+        assert escalated[0]['escalation_id'] == pending[0].id, (
+            f'The action must carry the filed id {pending[0].id!r}, got {escalated[0]!r}'
+        )
+
+        # The write really DID fail. Without this the test could pass vacuously
+        # against a healthy write and pin nothing about the ordering: it is the
+        # post-verify failure row that proves the raise happened and that the
+        # escalation had to have preceded it.
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        ops = [a['operation'] for a in _verify_rows(await journal.get_run_actions(runs[0].id))]
+        assert 'contradicted' in ops and 'post_verify_error' in ops, (
+            f'Expected the outcome row plus a post-verify write failure, got {ops}'
+        )
+
+
+class TestContradictedEscalationWithoutTheEscalationPackage:
+    """A minimal install with no escalation package must still reconcile.
+
+    `escalation` is an optional workspace package, defensively imported at the
+    top of targeted.py; when it is absent both names are left as None and
+    `_HAS_ESCALATION` is False.  The guard reading those is what keeps a
+    contradicted verdict from crashing such an install — and it is the arm
+    with the least other signal, since the environment that exercises it is
+    precisely the one with no escalation watcher to notice.  A future edit
+    that raised there, or returned a truthy action for an escalation that was
+    never filed, would otherwise reach production uncaught.
+    """
+
+    @pytest.mark.parametrize('absent', ['queue_class', 'model_class', 'flag'])
+    @pytest.mark.asyncio
+    async def test_absent_escalation_package_degrades_gracefully(
+        self, reconciler, journal, mock_memory_service, caplog, tmp_path, absent
+    ):
+        reconciler.verifier.verify = AsyncMock(return_value=_contradicted_result())
+        target = {
+            'queue_class': 'fused_memory.reconciliation.targeted.EscalationQueue',
+            'model_class': 'fused_memory.reconciliation.targeted.Escalation',
+            'flag': 'fused_memory.reconciliation.targeted._HAS_ESCALATION',
+        }[absent]
+        replacement = False if absent == 'flag' else None
+
+        with caplog.at_level(logging.WARNING), patch(target, replacement):
+            result = await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        assert 'task_id' in result, (
+            f'The done transition must still complete, got {result!r}'
+        )
+
+        # Nothing filed — and nothing created either: the guard returns before
+        # the queue is ever constructed, so no data/escalations/ is left behind.
+        assert not (tmp_path / 'data' / 'escalations').exists(), (
+            'Without the escalation package the queue dir must not be created'
+        )
+        assert not [
+            a for a in result.get('actions', [])
+            if a['type'] == 'verification_contradicted_escalated'
+        ], f'Nothing was filed, so no escalated action, got {result.get("actions")}'
+
+        # The finding still reaches its other home.
+        writes = _verdict_writes(mock_memory_service)
+        assert len(writes) == 1, (
+            f'The contradiction memory must still be written, got {writes}'
+        )
+        assert writes[0].kwargs['content'].startswith('Codebase evidence CONTRADICTS'), (
+            f'Got {writes[0].kwargs["content"]!r}'
+        )
+
+        # An absent optional package is a degraded environment, not a failure:
+        # it logs at DEBUG. It must not emit a verify failure row (which would
+        # pollute task 4343's census) nor a WARNING that would page someone.
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        ops = [a['operation'] for a in _verify_rows(await journal.get_run_actions(runs[0].id))]
+        assert ops == ['contradicted'], (
+            f'Expected only the outcome row, got {ops}'
+        )
+        msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any('escalat' in m.lower() for m in msgs), (
+            f'An absent optional package must not log a WARNING, got {msgs}'
+        )
