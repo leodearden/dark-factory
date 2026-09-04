@@ -94,6 +94,7 @@ from fused_memory.server.grouped_read import (
     # produce children that exist but never group, which reads as content
     # loss without being one.
     AMENDMENT_KIND,
+    CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
     SIGHTING_KIND,
     group_memory_document,
@@ -125,6 +126,7 @@ from fused_memory.server.write_triage import (
     CANONICAL_ID_KEY,
     FAIL_OPEN_ESCALATION_ID_KEY,
     OUTCOME_AMENDED,
+    OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
@@ -135,6 +137,15 @@ from fused_memory.server.write_triage import (
     resolve_write_triage_enabled,
     triage_write,
 )
+
+# The middle-band judge, imported HERE and nowhere else. `tools.py` is the
+# single wiring point on purpose: `write_triage_judge` imports `write_triage`
+# for the OUTCOME_* vocabulary, so `write_triage` importing the judge back
+# would close a cycle. Keeping the attachment at the consumer leaves that
+# dependency one-way, and leaves `_stub_judge` as `triage_write`'s default for
+# direct callers and for beta's judge-slot contract tests — which is what keeps
+# those tests meaningful rather than tautological.
+from fused_memory.server.write_triage_judge import judge_write
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
     UNVERIFIED_CLAIM_TAG,
@@ -468,13 +479,14 @@ Conventions:
 - Always include project_id on every call (scopes data isolation).
 - Include agent_id for attribution (e.g. "claude-interactive", "claude-task-7").
 - Prefer add_memory over add_episode for discrete, pre-distilled facts (lower cost: 0-3 vs 5-15 LLM calls).
-- Before writing a procedural_knowledge memory, search first for an existing entry on the same
-  workflow/gotcha and update or skip instead of writing a near-duplicate. add_memory enforces this
-  at write time with two guards: (1) a deterministic topic-cluster guard that soft-blocks a write
-  matching a known-contradictory topic cluster (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected)
-  — do not add another entry; consolidate/update the existing entries or add context to the human gate
-  task named in the hint; and (2) a cosine guard that soft-blocks a write matching an existing entry at
-  high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
+- Before writing a procedural_knowledge or preferences_and_norms memory, search first for an existing
+  entry on the same workflow/gotcha/norm and update or skip instead of writing a near-duplicate.
+  add_memory enforces this at write time with up to two guards: (1) a deterministic topic-cluster
+  guard — covering BOTH categories — that soft-blocks a write matching a known-contradictory topic
+  cluster (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) — do not add another entry;
+  consolidate/update the existing entries or add context to the human gate task named in the hint;
+  and (2) a cosine guard, scoped to procedural_knowledge only, that soft-blocks a write matching an
+  existing entry at high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
   metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
   agents are exempt from both. Both guards apply only while write_triage.enabled is false (the
   shipped default); with it on, an explicit Mem0-primary write is REDIRECTED instead of rejected —
@@ -1433,13 +1445,21 @@ def create_mcp_server(
     _TRIAGED_CATEGORIES = frozenset(c.value for c in MEM0_PRIMARY)
     # outcome -> child `kind` for the ATTACH outcomes. Membership in this
     # map is the definition of "attach outcome": anything absent is stored
-    # standalone. `contested` is deliberately NOT here — leaf gamma's judge
-    # is what produces it, and its child also carries
-    # grouped_read.CONTESTED_METADATA_KEY, so wiring a half-shaped
-    # contested child now would be a second thing for that leaf to unpick.
+    # standalone.
+    #
+    # `contested` maps to AMENDMENT_KIND and NOT to SIGHTING_KIND, and the
+    # difference is content visibility rather than bookkeeping: grouped_read
+    # DIGESTS amendment text into the grouped document, while sightings are
+    # only COUNTED. A contested child filed as a sighting has its correction
+    # suppressed to a tally underneath the very entry it contests — the
+    # esc-5712 five-week-wrong-appendix shape that grouped_read.
+    # is_contested_child exists to prevent. Its child additionally carries
+    # CONTESTED_METADATA_KEY (stamped in the attach below), which is what
+    # distinguishes it from an ordinary amendment for the read side.
     _TRIAGE_ATTACH_KINDS = {
         OUTCOME_RESTATED: SIGHTING_KIND,
         OUTCOME_AMENDED: AMENDMENT_KIND,
+        OUTCOME_CONTESTED: AMENDMENT_KIND,
     }
     # Remediation hint returned alongside conflicting_task_status_framing_write_blocked
     # (task 2276 amendment) so a blocked recon-stage agent can self-correct instead of
@@ -1623,6 +1643,19 @@ def create_mcp_server(
             'observations_and_summaries',
             'entities_and_relations',
             'temporal_facts',
+        }
+    )
+    # Categories the deterministic topic-cluster pre-check covers (task 3430).
+    # ENUMERATED rather than composed from MEM0_PRIMARY the way _TRIAGED_CATEGORIES
+    # is: observations_and_summaries is deliberately excluded here — extending to
+    # it is sibling task 4729's call, with its own false-positive analysis this
+    # task has not done. This frozenset is the one-line widening point for 4729.
+    # Built from `.value` (not string literals) so a category rename cannot
+    # silently break the gate.
+    _TOPIC_GUARD_GATED_CATEGORIES = frozenset(
+        {
+            MemoryCategory.procedural_knowledge.value,
+            MemoryCategory.preferences_and_norms.value,
         }
     )
 
@@ -2999,11 +3032,13 @@ def create_mcp_server(
         """Add a classified memory directly. Skips the extraction pipeline.
         Use when the agent has already identified a specific, discrete memory.
 
-        Before writing a procedural_knowledge memory, search first for an
-        existing entry covering the same workflow/gotcha and update or skip
-        instead of writing a near-duplicate. procedural_knowledge writes are
-        soft-blocked at write time by two guards: (1) a deterministic
-        topic-cluster guard that fires FIRST when the content matches a
+        Before writing a procedural_knowledge or preferences_and_norms memory,
+        search first for an existing entry covering the same workflow/gotcha/
+        norm and update or skip instead of writing a near-duplicate.
+        procedural_knowledge writes are soft-blocked at write time by two
+        guards, the first of which also covers preferences_and_norms (see
+        below): (1) a deterministic topic-cluster guard that fires FIRST when
+        the content matches a
         known-contradictory topic cluster
         (error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) — do NOT
         add another entry; consolidate/update the existing entries for that
@@ -3012,9 +3047,12 @@ def create_mcp_server(
         existing entry at high similarity
         (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either,
         override with metadata={'allow_near_duplicate': True} only when the
-        content is genuinely distinct. Both guards only cover writes with an
-        explicit category='procedural_knowledge' (a category=None write that
-        auto-classifies to procedural_knowledge is not covered), share the
+        content is genuinely distinct. The topic-cluster guard (1) covers
+        writes with an explicit category='procedural_knowledge' OR
+        category='preferences_and_norms'; the cosine near-duplicate guard (2)
+        remains scoped to an explicit category='procedural_knowledge' write
+        only (a category=None write that auto-classifies to
+        procedural_knowledge is covered by neither). Both guards share the
         procedural_knowledge_near_dup_guard_enabled kill-switch, and exempt
         recon-stage-* agents (Stage-1 consolidation writes a merged/canonical
         entry that is expected to closely resemble the duplicates it
@@ -3039,6 +3077,18 @@ def create_mcp_server(
         rediscovery is counted, and the canonical is never edited. Nothing is
         lost and no write is ever blocked — a retrieval or judge failure
         degrades to a plain ``stored``, never to an error.
+
+        A ``contested`` write becomes an AMENDMENT CHILD flagged as contesting
+        its parent. Nothing was blocked and nothing was decided: triage
+        DETECTS that your write contradicts the memory it names, it does not
+        adjudicate which of the two is right. Your full text is stored and
+        readable in the canonical's grouped document (amendment text is
+        digested there; sighting text is only counted), the flag is picked up
+        by the existing gate machinery, and the memory you contradict is left
+        untouched for a human to settle. Getting a ``contested`` ack is not a
+        rejection and needs no action from you — but it is the ack worth
+        reading, because it says the corpus now holds two claims that cannot
+        both be true.
 
         With triage on, ``metadata={'allow_near_duplicate': True}`` is
         reinterpreted rather than retired: it now means FORCE-STORE — store
@@ -3224,6 +3274,15 @@ def create_mcp_server(
                 content=content,
                 project_id=project_id,
                 counter=_triage_fail_open_counter,
+                # Leaf gamma. Until this line the judge slot ran `_stub_judge`,
+                # so every middle-band write acked `stored` no matter what it
+                # said — building `write_triage_judge` changed no observable
+                # behaviour on its own, and this is the one line that makes it
+                # load-bearing. `triage_write` still owns the fail-open
+                # apparatus around it (INV-4): `judge_write` raises on
+                # transport error, timeout and unparseable output, and that
+                # `except` arm counts it and returns `stored`.
+                judge=judge_write,
                 # Both predicates are already derived above, from the metadata
                 # and agent_id this body holds. Passed IN rather than
                 # recomputed inside triage_write: a second derivation is a
@@ -3256,29 +3315,69 @@ def create_mcp_server(
         # `routed == stored` for a topic match, and a real judge may answer
         # otherwise. That assertion is EXPECTED to change with this arm — it
         # pins the retirement of the soft-block, not the outcome `stored`.
+        # Shared exemptions for both dup-guard blocks below (task 3430 review,
+        # reviewer_comprehensive #1 duplication): hoisted to a single source
+        # of truth so a future new exemption (another agent-id carve-out, a
+        # triage-mode tweak) is a one-place edit instead of two conjunct
+        # chains that can silently drift apart. Deliberately EXCLUDES the
+        # category predicate and the resolve_near_dup_guard_enabled() call:
+        # each block below still spells out its own `category in/== ...`
+        # conjunct ahead of the resolver call, so a write in a category
+        # neither block gates still never calls resolve_near_dup_guard_enabled
+        # — identical short-circuit behaviour to before this hoist, and the
+        # cosine block's behaviour for procedural_knowledge stays provably
+        # unchanged (same truth table, same call count, order of the pure
+        # boolean reads is immaterial since none of them has a side effect).
+        dup_guard_base_exempt = (
+            not triage_enabled and not allow_near_duplicate and not is_recon_stage_agent
+        )
         if (
-            not triage_enabled
-            and category == 'procedural_knowledge'
-            and not allow_near_duplicate
-            and not is_recon_stage_agent
+            dup_guard_base_exempt
+            and category in _TOPIC_GUARD_GATED_CATEGORIES
             and resolve_near_dup_guard_enabled(memory_service)
         ):
-            # Deterministic topic-keyed pre-check (task 2845): if the content
-            # matches a known-contradictory topic cluster, soft-block BEFORE the
+            # Deterministic topic-keyed pre-check (task 2845; widened in task
+            # 3430 to also gate preferences_and_norms): if the content matches
+            # a known-contradictory topic cluster, soft-block BEFORE the
             # cosine search. This is strictly cheaper (no embedding round-trip)
             # and catches same-topic paraphrases the cosine guard misses. On no
-            # match (or an empty/unconfigured clusters list) fall through to the
-            # existing cosine path unchanged. Shares the allow_near_duplicate /
-            # recon-stage exemptions and the enabled kill-switch above with the
-            # cosine guard.
+            # match (or an empty/unconfigured clusters list) fall through — to
+            # the cosine path below for procedural_knowledge, or straight
+            # through to the write for any other _TOPIC_GUARD_GATED_CATEGORIES
+            # member. Shares the allow_near_duplicate / recon-stage exemptions
+            # and the enabled kill-switch with the cosine guard below.
+            #
+            # TOPIC-keyed rather than category-keyed: unlike the cosine guard
+            # below, this check is not scoped to a single category — it covers
+            # every category in _TOPIC_GUARD_GATED_CATEGORIES.
             topic_clusters = resolve_topic_guard_clusters(memory_service)
             if topic_clusters:
                 topic_match = find_matching_topic_cluster(content, topic_clusters)
                 if topic_match is not None:
                     matched_cluster, matched_phrases = topic_match
-                    return build_topic_cluster_block(
-                        agent_id, content, matched_cluster, matched_phrases
-                    )
+                    return {
+                        **build_topic_cluster_block(
+                            agent_id, content, matched_cluster, matched_phrases
+                        ),
+                        'category': category,
+                    }
+        # Cosine near-duplicate search — kept procedural_knowledge-only. Unlike
+        # the topic pre-check above (task 3430 widened that one to also cover
+        # preferences_and_norms), this path stays scoped to procedural_knowledge:
+        # the search(categories=['procedural_knowledge'], stores=['mem0'])
+        # round-trip below and find_near_duplicate_memory's category filter are
+        # both procedural-specific, and deciding whether/how to compare a
+        # preferences_and_norms write against procedural (or preferences)
+        # entries is a separate cost/semantics decision this task does not
+        # make. Reuses dup_guard_base_exempt from the block above (the shared
+        # exemptions) and re-spells only its own category predicate, so this
+        # block's behaviour for procedural_knowledge stays provably unchanged
+        # by the split.
+        if (
+            dup_guard_base_exempt
+            and category == 'procedural_knowledge'
+            and resolve_near_dup_guard_enabled(memory_service)
+        ):
             near_dup_threshold = resolve_near_dup_threshold(memory_service)
             try:
                 # NOTE: this is an extra semantic search round-trip (embedding +
@@ -3358,15 +3457,21 @@ def create_mcp_server(
             and attach_kind is None
             and triage_decision.outcome != OUTCOME_STORED
         ):
-            # A verdict this body cannot ACT on. `contested` is the concrete
-            # case: it is a full member of TRIAGE_OUTCOMES, so `triage_write`
-            # accepts it from a judge, but it has no entry in
-            # _TRIAGE_ATTACH_KINDS (deliberately — leaf gamma owns the
-            # contested child, which also carries CONTESTED_METADATA_KEY).
-            # Without this arm the verdict is discarded and the ack quietly
-            # reports `stored`, indistinguishable from "nothing matched" — a
-            # trap laid for leaf gamma's FIRST contested verdict, whose
-            # silence would read as the judge never firing.
+            # A verdict this body cannot ACT on. Without this arm the verdict
+            # is discarded and the ack quietly reports `stored`,
+            # indistinguishable from "nothing matched" — so a consumer waiting
+            # on that outcome waits forever with nothing to grep.
+            #
+            # NOT DEAD CODE, despite now being unreachable for all four
+            # published outcomes: task 3128 wired `contested`, which is the
+            # case this arm was originally laid as a trap for, and wiring it
+            # sprung the trap the right way round. What remains is the guard
+            # for the FIFTH verdict — a future judge whose vocabulary grows
+            # without _TRIAGE_ATTACH_KINDS growing with it. Deleting it as
+            # unreachable restores exactly the silence it was written to
+            # break. tests/server/test_add_memory_write_triage_gate.py::
+            # TestAVerdictWithNoWiredAttachKindIsVisible holds it live against
+            # a stand-in verdict for that reason.
             #
             # Counted as a fail-open for the same reason `triage_write` counts
             # an out-of-vocabulary verdict: the write still lands untriaged
@@ -3383,17 +3488,34 @@ def create_mcp_server(
             _triage_fail_open_counter.record(project=project_id)
         write_meta = cleaned_meta
         if attached_to is not None:
-            # These two keys are ATTACH_OWNED_KEYS, and overwriting them is
-            # safe ONLY because `caller_owns_attach_keys` force-stored every
-            # write that carried either one — so neither can be present here.
-            # Adding a third key to this dict without adding it to
+            # Every key written here is an ATTACH_OWNED_KEY, and overwriting
+            # them is safe ONLY because `caller_owns_attach_keys` force-stored
+            # every write that carried any one of them — so none can be
+            # present here. Adding a key to this dict without adding it to
             # ATTACH_OWNED_KEYS re-opens the loss for that key; the gate suite
-            # pins the two sets against each other for exactly that reason.
+            # pins the two sets against each other for exactly that reason,
+            # unioned across the outcomes because they no longer write the
+            # same keys.
             write_meta = {
                 **(cleaned_meta or {}),
                 PARENT_ID_KEY: attached_to,
                 'kind': attach_kind,
             }
+            if triage_decision is not None and triage_decision.outcome == OUTCOME_CONTESTED:
+                # The one key that distinguishes a contested child from an
+                # ordinary amendment — both are AMENDMENT_KIND, because both
+                # need their text DIGESTED into the grouped document rather
+                # than counted. Composed from grouped_read's constant, never
+                # the 'x_contested' literal: that module owns the read-side
+                # predicate (is_contested_child) which has to recognise what
+                # is stamped here, and two spellings would produce children
+                # flagged in a way nothing reads.
+                #
+                # Triage DETECTS the contradiction; it does not adjudicate it
+                # (D3). The flag is a marker for the existing gate machinery
+                # and a human, and the canonical it contradicts is left
+                # exactly as it was.
+                write_meta[CONTESTED_METADATA_KEY] = True
         try:
             result = await memory_service.add_memory(
                 content=content,
@@ -8190,12 +8312,37 @@ def create_mcp_server(
                 decomposition sessions where you do not want curator
                 deduplication to recombine sibling tasks.  Persists
                 ``human_decomposed=True`` in task metadata.
-            routing_override_reason: When set (non-empty), the path guards are
-                skipped and the task is filed in the submitting project.  The
-                reason is recorded on task metadata and emitted as a WARNING
-                audit log so a deliberate override is greppable.  Use only
-                when sure the task belongs to the submitting project.  If
-                unsure, escalate rather than risking a mis-filed task.
+            routing_override_reason: A TOP-LEVEL parameter of this tool (NOT a
+                ``metadata`` key — putting it in ``metadata`` has no effect).
+                When set to anything non-blank, ALL path-scope guards are
+                skipped and the task is filed in the submitting project.
+
+                This disables the PROSE advisory AND the FILES-certain HARD
+                REJECT — the check task 2206's anti-bypass tests exist to
+                protect.  It is validated only as "non-blank after stripping":
+                there is no allowlist, no format constraint, and no cross-check
+                of the stated reason against the paths actually claimed.
+
+                EVERY use now files a ``scope_violation`` audit escalation
+                (id prefix ``esc-task-path-guard-override``) in the filing
+                project's queue, recording the reason, the claimed project and
+                the paths that WOULD have been flagged — so reaching for this
+                is visible to an operator rather than silent (task 3123).  The
+                reason is also recorded on task metadata and emitted as a
+                WARNING audit log.
+
+                Legitimate use case, deliberately preserved: the
+                self-referential one, where a task ABOUT the path guard
+                necessarily quotes the very tokens the guard matches.  This is
+                not deprecated.
+
+                Cheaper non-bypassing alternative: supply accurate
+                ``metadata.files`` / ``files_to_modify`` / ``modules``.  When
+                those attest work in the filing project, the task-3106
+                attribution gate suppresses the prose advisory on its own, with
+                no bypass and no audit record.  Use only when sure the task
+                belongs to the submitting project; if unsure, escalate rather
+                than risking a mis-filed task.
             task_kind: ``'normal'`` (default) or ``'deterministic'``.
                 Deterministic tasks must have ``before_done`` and/or
                 ``always_escalates=True`` in metadata.  Invariants enforced at

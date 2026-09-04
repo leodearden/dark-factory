@@ -351,9 +351,12 @@ class TestDeadL0FilingIncarnationRule:
         """The classifier may only convert an L0 when it can PROVE the filing
         incarnation is dead. It cannot here, so it pins.
 
-        This is the branch that governs TODAY: until a producer stamps
-        filing_claimant_run_id, every real record carries None — so the
-        widening cannot by itself change any disposition."""
+        Governs every record whose filing identity is unknown: legacy rows
+        written before task 3550, and producers that still do not stamp (see
+        the inventory on ``pins.classify_pins`` — most are moot above link 4,
+        but ``merge_queue._file_main_health_escalation`` reaches THIS branch
+        with a real task_id, which is exactly the residual gap the inventory
+        names)."""
         bucket = _bucket_of(
             _rec(level=0, severity='blocking', filing=filing),
             live_claimant=True,

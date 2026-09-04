@@ -1612,12 +1612,28 @@ class TestB5UnrepairableIsNeverGuessed:
 
     @BOTH_POLICIES
     async def test_the_escalation_locates_the_leak(self, policy):
+        """The pattern is the leak's OWN tag as of task 4696, not the one after it.
+
+        This specimen's ``how`` mis-closes on ``\\x3c/how>`` and only LATER
+        carries an ``\\x3c/invoke>``. While the boundary scan was param-blind it
+        reported the invoke closer — i.e. it blamed whatever happened to follow
+        the leak, which is verbatim the diagnosis failure PRD section 2.2 was
+        written about ("a mis-closed ``description`` could not report its own
+        tag and the write-time guard blamed whatever happened to follow it").
+        Now the earliest-by-text-position rule reaches the self-name closer, so
+        the operator record names where the leak actually STARTS.
+        """
         h, _, _ = await self._refuse(policy)
 
         record = h.escalations[0]
         assert record['tool'] == 'add_reuse_item'
         assert record['field'] == 'how'
-        assert record['matched_pattern'] == INVOKE_CLOSER
+        assert record['matched_pattern'] == _closer('how')
+        assert INVOKE_CLOSER in self._value(), (
+            'the invoke closer must still be PRESENT but LATER — otherwise this '
+            'row stops testing that the earliest tag wins'
+        )
+        assert self._value().index(_closer('how')) < self._value().index(INVOKE_CLOSER)
 
     @BOTH_POLICIES
     async def test_the_refusal_names_the_escalation_and_offers_no_repair(self, policy):
@@ -2251,7 +2267,13 @@ class TestINV2StructuredFacts:
         assert h.facts[0]['pattern'] != h.facts[0]['misclose']
 
     async def test_the_unrepairable_fact_still_names_the_matched_pattern(self):
-        """A refusal that could not say WHAT it saw would be unactionable."""
+        """A refusal that could not say WHAT it saw would be unactionable.
+
+        Names ``\\x3c/how>`` rather than ``\\x3c/invoke>`` as of task 4696 — the
+        leak's own tag, not the literal that happens to follow it. See
+        :meth:`TestB5UnrepairableIsNeverGuessed.test_the_escalation_locates_the_leak`
+        for why that is the point rather than a changed expectation.
+        """
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
         with pytest.raises(ToolError):
@@ -2264,7 +2286,7 @@ class TestINV2StructuredFacts:
                 },
             )
 
-        assert h.facts[0]['pattern'] == INVOKE_CLOSER
+        assert h.facts[0]['pattern'] == _closer('how')
 
     # -- identity: read from the call's own arguments -----------------------
 
@@ -3227,3 +3249,222 @@ class TestB14OrderingDependsOnStrictInputValidationBeingOff:
             'empty list IS the finding, not an incidental assertion'
         )
         assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# Task 4696 — the SELF-NAME closer, the dialect the live boundary cannot see.
+# ---------------------------------------------------------------------------
+
+
+class TestSelfNameCloserIsSeenAtTheBoundary:
+    """The dominant real leak dialect, pinned at the LIVE WRITE BOUNDARY.
+
+    ``_first_markup_argument`` asked the param-free ``detect``, whose fixed
+    six-literal union echoes NONE of the invoked tool's own parameter names.
+    So a value mis-closed with its OWN name-echoing tag — and carrying no
+    invoke closer and no parameter-open token to give it away — matched
+    nothing, the guard returned ``None``, and the corrupt value was forwarded
+    to the tool and written to disk. The guard was never bypassed; it was
+    BLIND, and this class is where that blindness is visible from the outside.
+
+    Measured over ``.worktrees/.task-meta/*/plan.json`` on 2026-08-25: 444
+    corrupted entries, 232 of them visible to the fixed literal set and **212
+    (48%) invisible to it** — of which **212 of 212 are caught by the SELF-NAME
+    closer alone**, with a cross-field residual of ZERO. That is the whole
+    basis for passing only ``param`` here and not the awaited tool schema; see
+    :meth:`TestSelfNameCloserIsSeenAtTheBoundary.
+    test_a_CROSS_FIELD_misclose_is_the_one_accepted_residual` for the residual
+    that measurement leaves behind.
+
+    The two victims below are the two largest real populations: 296
+    ``add_design_decision.rationale`` specimens and 129 ``add_reuse_item.how``
+    ones. Neither tool takes a ``task_id`` — they are called with exactly their
+    declared parameters, as the harness registers them.
+    """
+
+    #: The ONLY envelope signature in this value is the rationale closer: no
+    #: invoke closer, no ``parameter name=`` token. That is what makes it
+    #: invisible today, and it is the shape 296 real specimens have.
+    RATIONALE = 'Both mechanisms partition rather than race.' + _closer('rationale')
+    RATIONALE_CLEAN = 'Both mechanisms partition rather than race.'
+
+    #: The same shape on the second-largest victim.
+    HOW = 'Reuse the declared table directly.' + _closer('how')
+    HOW_CLEAN = 'Reuse the declared table directly.'
+
+    def test_the_specimen_carries_no_OTHER_envelope_signature(self):
+        """Otherwise this class would be re-testing a dialect already caught.
+
+        The whole point is a value whose only tell is its own closer. If a
+        future edit slipped an invoke closer or an opener into the specimen,
+        every assertion below would pass for the wrong reason.
+        """
+        for value in (self.RATIONALE, self.HOW):
+            assert INVOKE_CLOSER not in value
+            assert '\x3cparameter name=' not in value
+            assert detect(value) is None, (
+                'the blanket predicate must still be blind to this specimen — '
+                'that blindness IS the defect under test'
+            )
+
+    async def test_a_self_name_rationale_leak_is_REJECTED(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['outcome'] == 'rejected'
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['field'] == 'rationale'
+        assert payload['misclose'] == _closer('rationale')
+
+    async def test_the_tool_body_never_ran(self):
+        """"REJECT_WITH_REPAIR writes nothing" is what this empty list means."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        assert h.recorder.calls == []
+
+    async def test_the_repaired_call_is_the_COMPLETE_argument_map(self):
+        """So the retry is mechanical: resubmit it verbatim.
+
+        This specimen recovers NOTHING — a bare self-name closer has an empty
+        tail — so ``repaired_call`` is the caller's own map with one value
+        sliced clean. That also makes the recovered-value type coercion a
+        verified no-op here, which is why this class asserts on the trimmed
+        string alone.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['repaired_call'] == {
+            'decision': 'Widen the gate.',
+            'rationale': self.RATIONALE_CLEAN,
+        }
+        assert payload['recovered_params'] == []
+
+    async def test_the_two_pattern_channels_AGREE(self):
+        """``matched_pattern`` and the fact's ``pattern`` are fed differently.
+
+        ``matched_pattern`` comes from ``Repair.pattern``, which falls back to
+        the misclose when no literal is present — so it already reported the
+        self-name closer even while the gate was blind. The fact's ``pattern``
+        is fed DIRECTLY by the boundary scan, so it is the one that goes red
+        today. Asserting both in one place is what pins them together.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        assert _reject_payload(excinfo)['matched_pattern'] == _closer('rationale')
+        assert len(h.facts) == 1
+        assert h.facts[0]['pattern'] == _closer('rationale')
+
+    async def test_the_emitted_fact_locates_and_classifies_the_leak(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_design_decision',
+                {'decision': 'Widen the gate.', 'rationale': self.RATIONALE},
+            )
+
+        assert len(h.facts) == 1
+        fact = h.facts[0]
+        assert set(fact) == FACT_KEYS
+        assert fact['fact'] == 'markup_detected'
+        assert fact['tool'] == 'add_design_decision'
+        assert fact['param'] == 'rationale'
+        assert fact['outcome'] == 'rejected'
+        assert fact['pattern'] == _closer('rationale')
+        assert fact['misclose'] == _closer('rationale')
+
+    async def test_the_same_shape_on_add_reuse_item_how(self):
+        """The paired positive control: 129 real specimens have this shape."""
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item',
+                {'what': 'the declared table', 'how': self.HOW, 'where': 'plan_tools'},
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['field'] == 'how'
+        assert payload['misclose'] == _closer('how')
+        assert payload['repaired_call'] == {
+            'what': 'the declared table',
+            'how': self.HOW_CLEAN,
+            'where': 'plan_tools',
+        }
+        assert h.recorder.calls == []
+
+    async def test_a_CROSS_FIELD_misclose_is_the_one_accepted_residual(self):
+        """THE MEASURED RESIDUAL, pinned so it cannot be rediscovered as a bug.
+
+        ``how`` closed with ``what``'s tag — a closer naming a DIFFERENT
+        parameter of the SAME tool. The boundary deliberately passes only
+        ``param`` and does NOT await the tool's schema to widen detection, so
+        this still forwards. That is a decision with a measured basis, not an
+        oversight: 212 of 212 real invisible specimens are self-name and ZERO
+        are cross-field, while widening here would put an awaited ``get_tool``
+        round-trip on the 99.7% CLEAN path of every tool call on the server.
+
+        The two sites that hold their schema for free — plan-tools' declared
+        repairable-field table and the sweep's ``set(working.keys())`` — do
+        pass it, so nothing is given up where it is cheap. This residual is
+        made countable by the sweep's census rather than left invisible.
+        """
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        cross_field = 'Reuse the declared table directly.' + _closer('what')
+
+        await h.call(
+            'add_reuse_item',
+            {'what': 'the declared table', 'how': cross_field, 'where': 'plan_tools'},
+        )
+
+        assert h.recorder.args == {
+            'tool': 'add_reuse_item',
+            'what': 'the declared table',
+            'how': cross_field,
+            'where': 'plan_tools',
+        }
+        assert h.facts == []
+        assert h.escalations == []
+
+
+def test_this_module_spells_no_raw_envelope_literal():
+    """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
+
+    The mechanical half of the authoring-hazard note in the module docstring,
+    promoted here from ``scripts/tests/test_sweep_toolcall_markup.py`` by task
+    **4696** so every file this containment work touches carries the same
+    guard. Computed at runtime from :func:`chr` so the needle itself is not
+    spelled here either — a test that had to write the literal to check for it
+    would be the very hazard it guards.
+    """
+    needle = chr(60) + '/'
+    source = Path(__file__).read_text(encoding='utf-8')
+    assert needle not in source, (
+        'A raw envelope literal was written into this test file. Spell it with '
+        'the \\x3c escape instead — see this module\'s docstring for why.'
+    )

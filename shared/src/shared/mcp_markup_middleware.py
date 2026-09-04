@@ -122,7 +122,11 @@ from fastmcp.tools.base import ToolResult
 from shared.storm_counter import StormCounter
 from shared.toolcall_markup import (
     MARKUP_OVERRIDE_KEY,
-    detect,
+    # ``detect`` is deliberately NOT imported here any more (task 4696). This
+    # boundary has exactly one scan and it is parameter-aware; importing the
+    # blanket predicate too would leave a loaded gun for a future edit to
+    # re-blind the gate with, and ruff would not complain.
+    detect_for,
     markup_override_requested,
     repair,
     strip_markup_override,
@@ -468,6 +472,24 @@ class MarkupGuardMiddleware(Middleware):
 
     The storm counter is held PER INSTANCE (like ``MarkupStormCounter``), so no
     burst state bleeds between servers, or between tests in one process.
+
+    WHAT THIS GUARD COVERS is NOT a fixed list of literals. As of task **4696**
+    the boundary scan is ``detect_for(value, param)``: the shared enumeration
+    PLUS the closing tag of the argument's own name, which is the dialect the
+    fixed set could never spell and which 212 of 444 measured real corruptions
+    take. One residual is accepted by construction and is documented at
+    :meth:`_first_markup_argument`: a closer naming a DIFFERENT parameter of
+    the same tool still passes, because widening to the tool's schema would
+    put an awaited round-trip on every clean call.
+
+    EXPECTED OPERATIONAL EFFECT, stated so it is not read as a regression:
+    widening the gate converts silent writes into loud
+    ``REJECT_WITH_REPAIR`` bounces carrying ``repaired_call``, so STORM
+    ESCALATIONS BECOME MORE FREQUENT — the counter is per instance at
+    threshold 3 in 3600s, and three leaks inside one agent session is an
+    observed shape. That is INV-4 behaving correctly, and it is not
+    stop-the-line: residue and storm records file under a NON-TASK anchor
+    (PRD D9), so a leaking task is never halted by its own leak.
     """
 
     def __init__(
@@ -515,9 +537,12 @@ class MarkupGuardMiddleware(Middleware):
         Ordered so the overwhelmingly common path is cheapest. The corruption
         rate measured in PRD section 2.3 is 0.26%, and this sits on EVERY tool
         call on the server, so a clean call costs ONE scan per string argument
-        and nothing else: :func:`detect` searches the whole literal set in a
-        single compiled pass (not one pass per literal), and the awaited
-        ``get_tool`` round-trip is deferred behind that gate.
+        and nothing else: ``detect_for`` searches the literal set WIDENED BY
+        THE ARGUMENT'S OWN NAME in a single compiled pass (not one pass per
+        needle), and the awaited ``get_tool`` round-trip is still deferred
+        behind that gate — which is precisely why the scan takes the parameter
+        name, already in hand, and not the schema. See
+        :meth:`_first_markup_argument`.
         """
         name = context.message.name
         arguments = context.message.arguments or {}
@@ -625,10 +650,35 @@ class MarkupGuardMiddleware(Middleware):
         swallowed the rest of the envelope. A second hit downstream of it is
         either the same leak seen twice or a value that repair() will refuse
         anyway.
+
+        PARAMETER-AWARE, and free (task **4696**). The scan asks
+        :func:`~shared.toolcall_markup.detect_for` with the argument's OWN
+        name, so a value mis-closed with its own name-echoing tag is seen — the
+        dominant real dialect, and one the fixed literal set spells no part of.
+        The name is already the loop variable from ``arguments.items()``, so
+        this adds NO awaited schema round-trip to the 99.7% clean path; it
+        costs one frozenset build and an ``lru_cache`` hit on top of the same
+        single compiled pass. Measured over
+        ``.worktrees/.task-meta/*/plan.json`` on 2026-08-25: of 444 corrupted
+        entries, 212 were invisible to the fixed set, and 212 of 212 of those
+        are caught by the SELF-NAME closer alone.
+
+        THE SCHEMA IS DELIBERATELY NOT PASSED, and that leaves ONE ACCEPTED
+        RESIDUAL: a CROSS-FIELD misclose — a closer naming a DIFFERENT
+        parameter of the same tool — still passes here. Widening would require
+        awaiting ``get_tool`` before the gate, i.e. on every clean call, which
+        is exactly what the ordering in :meth:`on_call_tool` exists to avoid;
+        and the same measurement puts the cross-field population at ZERO. The
+        two sites that hold their schema for free — ``plan_tools``' declared
+        repairable-field table and the sweep's ``set(working.keys())`` — DO
+        pass it, so nothing is given up where it is cheap. The residual is
+        pinned by a negative-control test
+        (``TestSelfNameCloserIsSeenAtTheBoundary``) and made countable by the
+        sweep's census, rather than left to be rediscovered as a bug.
         """
         for param, value in arguments.items():
             if isinstance(value, str):
-                pattern = detect(value)
+                pattern = detect_for(value, param)
                 if pattern is not None:
                     return param, value, pattern
         return None

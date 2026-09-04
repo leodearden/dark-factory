@@ -42,6 +42,21 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+# This guard AST-parses every *.py under orchestrator/tests/ -- 535 files at
+# authorship time -- via rglob. MEASURED at 8.25s/call unloaded and serial
+# (-n0) on a 32-core box, the slowest in the family, and CRASHED live rather
+# than hypothetically: branch task/3980 @ d4182e4642, loadavg ~250-336 --
+# "FAILED test_no_new_merge_queue_private_reachback_patches" / "[gw17] node
+# down", session truncated at 44% (esc-3980-1).
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _THIS_FILE = Path(__file__).name
 _TESTS_DIR = Path(__file__).parent
 _SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
@@ -280,6 +295,14 @@ ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('test_merge_queue.py', '_resolve_second_parent'),
     ('test_merge_queue.py', '_reverify_rebased_tree'),
     ('test_merge_queue_concurrent_verify.py', '_maybe_schedule_shadow_compare'),
+    # Task 3186 (deep merge-ahead delta) — the adopted-head shadow-compare
+    # cadence test.  Same genuinely-unavoidable reach-back as the four other
+    # ('_maybe_schedule_shadow_compare') pairs here: the consumer at
+    # merge_queue.py::_finalize_inflight resolves the name through the
+    # merge_queue module global (imported at merge_queue.py:124), so a spy
+    # installed on merge_shadow would sit off the resolution path and the
+    # test's `len(head_calls) == 1` assertion would pass vacuously.
+    ('test_merge_queue_deep_landing.py', '_maybe_schedule_shadow_compare'),
     ('test_merge_queue_equivalence.py', '_check_post_merge_pyright'),
     ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_equivalence'),
     ('test_merge_queue_invariant_integration_gate.py', '_check_post_merge_pyright'),

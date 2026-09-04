@@ -1208,6 +1208,48 @@ class TestRankIndex:
         assert _mod().rank_index([]) == {}
 
 
+class TestRanksAtDepth:
+    """`ranks_at_depth(ranks, k)` — the depth-scoped view of a full-depth index.
+
+    Provably identical to `rank_index(results[:k])`: `rank_index` keeps the
+    FIRST rank, so a hash whose first rank is <= k has that same rank in the
+    truncated list, and one whose first rank is > k does not appear in the
+    truncated list at all. Pinning that identity is what justifies deriving
+    the view instead of re-hashing a truncated copy.
+    """
+
+    def test_matches_rehashing_the_truncated_list_at_every_depth(self):
+        m = _mod()
+        results = _filler(9)
+        ranks = m.rank_index(results)
+
+        for k in (0, 1, 4, len(results), len(results) + 5):
+            assert m.ranks_at_depth(ranks, k) == m.rank_index(results[:k])
+
+    def test_a_repeated_hash_keeps_its_first_rank_across_the_cut(self):
+        """Same content at rank 1 (<= k) and rank 7 (> k): the derived view
+        must map it to its first rank, not drop it because a later
+        occurrence of the same content fell outside the depth."""
+        m = _mod()
+        results = [_R(content='dup', id='D1'), *_filler(5), _R(content='dup', id='D2')]
+        ranks = m.rank_index(results)
+        k = 3
+
+        depth_view = m.ranks_at_depth(ranks, k)
+
+        assert depth_view[m.content_key('dup')] == 1
+        assert depth_view == m.rank_index(results[:k])
+
+    def test_it_does_not_mutate_the_input_mapping(self):
+        m = _mod()
+        ranks = m.rank_index(_filler(5))
+        before = dict(ranks)
+
+        m.ranks_at_depth(ranks, 2)
+
+        assert ranks == before
+
+
 class TestContentKey:
     """`content_key(text)` — whitespace-normalized sha256[:16]."""
 
@@ -1675,15 +1717,21 @@ def _contam_obs(topic, *, foreign=0, untopiced=0, scored=5, degraded=False):
     )
 
 
-def _inversion_obs(topic, *, pairs=2, comparable=None, inversions=0, degraded=False):
+def _inversion_obs(
+    topic, *, pairs=2, comparable=None, inversions=0, degraded=False, k=5, beyond_depth=0,
+):
     m = _mod()
     return m.InversionObservation(
         topic=topic,
         phrasing='q',
+        k=k,
         pairs_registered=pairs,
         # Default: every registered pair came back both-present. Tests that
         # care about the exposure gap set it explicitly.
         pairs_comparable=pairs if comparable is None else comparable,
+        # Default: nothing was trimmed by the scored-depth pin. Tests that
+        # care about the diagnostic set it explicitly.
+        pairs_beyond_scored_depth=beyond_depth,
         inversions=tuple(
             m.InversionRecord(
                 topic=topic, phrasing='q',
@@ -1947,6 +1995,13 @@ class TestBuildSeries:
             _build(observations, counts={'observations_served_by_mem0_at_k5': 99})
 
         assert 'observations_served_by_mem0_at_k5' in str(excinfo.value)
+
+        inversion_observations = m.ProbeObservations(inversions=[_inversion_obs('a', k=5)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _build(inversion_observations, counts={'inversion_observations_at_k5': 99})
+
+        assert 'inversion_observations_at_k5' in str(excinfo.value)
 
     def test_a_non_colliding_caller_key_passes_through(self):
         """The guard must not be a ban on caller-supplied counts."""
@@ -2379,8 +2434,8 @@ def _report_observations():
         claims=[_claim_obs('alpha-topic', 'a claim', recalled=False)],
         contamination=[_contam_obs('alpha-topic', foreign=1, untopiced=3, scored=5)],
         inversions=[m.InversionObservation(
-            topic='alpha-topic', phrasing='tuned',
-            pairs_registered=1, pairs_comparable=1,
+            topic='alpha-topic', phrasing='tuned', k=5,
+            pairs_registered=1, pairs_comparable=1, pairs_beyond_scored_depth=0,
             inversions=(m.InversionRecord(
                 topic='alpha-topic', phrasing='tuned',
                 superseded_hash='dead' * 4, successor_hash='beef' * 4,
@@ -3860,6 +3915,47 @@ class TestStoresServedDisclosure:
         assert counts['degraded_observations_at_k5'] == 1
         assert counts['degraded_observations_at_k10'] == 1
 
+    def test_the_inversion_family_disclosure_counts_ride_in_the_machine_readable_artifact(self):
+        """Prose-only disclosure is invisible to every consumer that reads JSON.
+
+        The two non-degraded observations are the same population
+        `superseded-above-successor`'s exposure (`n`) is summed over, so this
+        row must be comparable to exactly that metric. The degraded one must
+        be walled off into its own key rather than polluting either count —
+        the same discipline `degraded_observations_at_k` holds the phrasing
+        family to.
+
+        `inversion_pairs_beyond_scored_depth_at_k5` is a different kind of
+        row — a trim diagnostic, not an exposure — but is walled off from
+        the degraded observation the same way as the other two.
+        """
+        observations = _mod().ProbeObservations(inversions=[
+            _inversion_obs('a', pairs=3, inversions=1, k=5, beyond_depth=2),
+            _inversion_obs('b', pairs=2, k=5, beyond_depth=1),
+            _inversion_obs('c', pairs=99, k=5, degraded=True, beyond_depth=99),
+        ])
+        counts = _build(observations).corpus.counts
+
+        assert counts['inversion_observations_at_k5'] == 2
+        assert counts['inversion_pairs_registered_at_k5'] == 5
+        assert counts['inversion_pairs_beyond_scored_depth_at_k5'] == 3
+        assert counts['degraded_inversion_observations_at_k5'] == 1
+
+    def test_inversion_observations_at_different_depths_produce_separate_keys(self):
+        """Two coexisting depths must not be merged into one number — the
+        same hazard the serving-store disclosure guards against, restated
+        for the inversion family."""
+        observations = _mod().ProbeObservations(inversions=[
+            _inversion_obs('a', pairs=1, k=5, beyond_depth=1),
+            _inversion_obs('a', pairs=1, k=10, beyond_depth=1),
+        ])
+        counts = _build(observations).corpus.counts
+
+        assert counts['inversion_observations_at_k5'] == 1
+        assert counts['inversion_observations_at_k10'] == 1
+        assert counts['inversion_pairs_beyond_scored_depth_at_k5'] == 1
+        assert counts['inversion_pairs_beyond_scored_depth_at_k10'] == 1
+
     def test_the_probe_band_records_both_exposures_distinctly(self):
         """Registered pairs and comparable pairs are different facts.
 
@@ -4149,6 +4245,7 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {expected}
         assert {o.k for o in observations.claims} == {expected}
+        assert {o.k for o in observations.inversions} == {expected}
 
     def test_a_deep_call_still_scores_at_the_pinned_depth(self):
         """min(), not max(): contamination and claim recall are DEFINED at the
@@ -4158,6 +4255,7 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
         assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
 
     def test_the_default_path_is_unchanged(self):
         m = _mod()
@@ -4165,3 +4263,72 @@ class TestObservationDepthIsHonest:
 
         assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
         assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.inversions} == {m.TRIPWIRE_K}
+
+
+class TestInversionFamilyIsPinnedToScoredDepth:
+    """The inversion/comparable-pair family is scored at ``scored_k``, not the
+    fetch depth — the same comparability contract `contamination` and `claim
+    recall` already hold, verified end-to-end through `probe_topic`."""
+
+    def _observe(self, *, superseded_rank, successor_rank, ks=(10,), total=10):
+        m = _mod()
+        entry = _pair_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        results = _filler(total)
+        results[superseded_rank - 1] = _R(content='old text', id='OLD')
+        results[successor_rank - 1] = _R(content='new text', id='NEW')
+        search = _search_returning({}, default_factory=lambda: _healthy(results))
+
+        import asyncio  # noqa: PLC0415
+
+        asyncio.run(m.probe_topic(search, entry, registry, ks, observations))
+        return observations
+
+    def test_a_pair_visible_only_beyond_the_scored_depth_is_not_comparable(self):
+        """A deeper fetch must not widen the family: both members return only
+        beyond the tripwire depth (ranks 6 and 7 at ks=(10,)); at full fetch
+        depth this pair would be comparable and 6 < 7 would fire an
+        inversion, which is precisely what the scored-depth pin must
+        suppress."""
+        observations = self._observe(superseded_rank=6, successor_rank=7)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 0
+            assert obs.inversions == ()
+            # Both-present at full fetch depth (ranks 6, 7 <= limit=10) but
+            # not both within scored_k=5: the pin's cut is disclosed, not
+            # silently indistinguishable from a corpus with nothing to trim.
+            assert obs.pairs_beyond_scored_depth == 1
+
+    def test_a_pair_inside_the_scored_depth_stays_comparable(self):
+        """The pin narrows only what is genuinely out of scope: a pair fully
+        inside the top 5 (rank 1, 2) is still comparable and still inverts."""
+        observations = self._observe(superseded_rank=1, successor_rank=2)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 1
+            assert len(obs.inversions) == 1
+            # Nothing was trimmed: the pair was already inside scored_k.
+            assert obs.pairs_beyond_scored_depth == 0
+
+    def test_a_straddling_pair_is_not_comparable(self):
+        """One member inside the scored depth (rank 1), one beyond it
+        (rank 6): a pair that cannot both be seen at the scored depth is no
+        exposure, even though both are visible at the full fetch depth."""
+        observations = self._observe(superseded_rank=1, successor_rank=6)
+
+        assert observations.inversions
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 1
+            assert obs.pairs_comparable == 0
+            assert obs.inversions == ()
+            # Both-present at full fetch depth (rank 1 and rank 6 <= limit=10)
+            # but not both within scored_k=5: the straddle is a trim too, not
+            # just a comparable-pairs miss.
+            assert obs.pairs_beyond_scored_depth == 1

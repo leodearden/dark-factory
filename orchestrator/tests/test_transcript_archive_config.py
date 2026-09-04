@@ -28,7 +28,7 @@ class TestTranscriptArchiveDefaults:
         assert ta.enabled is True
         assert ta.root == 'data/orchestrator/agent-transcripts'
         assert ta.retention.max_age_days == 90
-        assert ta.retention.max_task_dirs == 5000
+        assert ta.retention.max_task_dirs == 50000
         # Archival-failure burst detector (task 3619, INV-4). One failed
         # archive is routine — a BURST is the condition worth an operator's
         # attention, so the escalation is thresholded, not per-failure.
@@ -96,4 +96,4 @@ class TestTranscriptArchiveReloadable:
         # The nested edit is live, and the untouched sibling rode along in the
         # whole-submodel swap (retention.max_task_dirs still at its default).
         assert live.transcript_archive.retention.max_age_days == 30
-        assert live.transcript_archive.retention.max_task_dirs == 5000
+        assert live.transcript_archive.retention.max_task_dirs == 50000

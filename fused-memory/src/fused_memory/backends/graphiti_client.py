@@ -237,10 +237,43 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
             else:
                 check_openai_responses_api()
-                llm_client = OpenAIClient(config=llm_config)
+                # max_tokens= is NOT redundant with GraphitiLLMConfig(max_tokens=...)
+                # above, and must not be "simplified" away — the same mechanism
+                # as the generic arm's, one class up the hierarchy:
+                # BaseOpenAIClient.__init__ (openai_base_client.py:51-67), which
+                # OpenAIClient derives from, declares its own
+                # `max_tokens: int = DEFAULT_MAX_TOKENS` (16384 on the 0.28.2
+                # wheel) and unconditionally re-assigns
+                # `self.max_tokens = max_tokens` immediately after
+                # super().__init__(config, cache) had correctly set it from the
+                # config object (client.py:80). _generate_response then sends
+                # `max_tokens or self.max_tokens` (:176,187), so this
+                # constructor kwarg is the ONLY lever that reaches the wire.
+                #
+                # This is a DELIBERATE behaviour change (task 3864): until it
+                # landed, the default arm asked for upstream's 16384 output
+                # tokens regardless of configuration, and now asks for the
+                # configured value (4096 with the shipped config). It restores
+                # agreement rather than inventing a new policy — the anthropic
+                # arm below (which honours a passed config, measured) and mem0
+                # (fused-memory/src/fused_memory/backends/mem0_client.py::Mem0Backend._build_config_dict)
+                # have always read the same cfg.llm.max_tokens knob. And if the
+                # configured value ever proves too small the failure is LOUD,
+                # never silent ('Output length exceeded max tokens <N>' from
+                # openai_base_client.py:191-192, or a truncated body failing
+                # json.loads), retried by graphiti and then dead-lettered
+                # visibly; whereas before, an operator hitting truncation had no
+                # working lever on this arm at all.
+                llm_client = OpenAIClient(config=llm_config, max_tokens=cfg.llm.max_tokens)
+            # max_tokens is named here deliberately (task 3864): it is now
+            # authoritative on BOTH sub-arms, and the default arm's effective
+            # value changed from upstream's 16384 to the configured one without
+            # any other signal to the operator. Log cfg.llm.max_tokens rather
+            # than llm_client.max_tokens — the two are equal, and the config
+            # value is the one an operator can act on.
             logger.info(
                 f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
-                f'({type(llm_client).__name__})'
+                f'({type(llm_client).__name__}, max_tokens={cfg.llm.max_tokens})'
             )
             return llm_client
     elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
@@ -256,7 +289,14 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                     max_tokens=cfg.llm.max_tokens,
                 )
                 llm_client = AnthropicClient(config=llm_config)
-                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
+                # Same addition as the openai arm above, so the observability is
+                # uniform across arms rather than present only where the value
+                # changed. This arm has always honoured the knob (AnthropicClient
+                # .__init__ overrides config.max_tokens only when config is None).
+                logger.info(
+                    f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                    f'(max_tokens={cfg.llm.max_tokens})'
+                )
                 return llm_client
             except ImportError:
                 logger.warning('Anthropic client not available for Graphiti')
@@ -2162,6 +2202,115 @@ class GraphitiBackend:
             seen[edge_uuid] = edge
             edges.append(edge)
         return edges
+
+    @_canonicalize_group_args
+    async def count_foreign_relationships(
+        self, node_uuid: str, *, group_id: str, episode_uuid: str = ''
+    ) -> int:
+        """Count every relationship a DETACH DELETE of *node_uuid* would destroy.
+
+        WHAT IT ANSWERS, contrasted with its neighbour above.
+        :meth:`get_valid_edges_for_node` answers "does this node still carry
+        LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
+        ``invalid_at IS NULL``.  This one answers a different question:
+        "would deleting this node DESTROY ANYTHING?"  It is therefore
+        deliberately UNTYPED and UNFILTERED, because
+        :meth:`delete_entity_node` issues a bare
+        ``MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n`` that removes EVERY
+        relationship — invalidated ``RELATES_TO`` temporal history and
+        Episodic ``MENTIONS`` included.  A guard authorising a destructive
+        operation must test exactly what that operation destroys, and every
+        other count/edge query in this module is typed to ``RELATES_TO``, so
+        none of them can.
+
+        WHY ``MENTIONS`` MATTERS.  An Entity's provenance links from Episodic
+        nodes are real, load-bearing graph content — ``maintenance/
+        cross_graph_move.py`` recreates ``(ep:Episodic)-[e:MENTIONS]->(n:Entity)``
+        links precisely because losing them loses provenance — and they are
+        wholly invisible to every ``RELATES_TO``-typed query in this file.
+
+        WHY THE ``episode_uuid`` EXCLUSION IS NARROW AND OPTIONAL.  It exists so
+        the single caller (``MemoryService._cleanup_emptied_nodes``) can ask "is
+        this node attached to anything OTHER than the write currently in
+        flight?".  graphiti_core's extraction mints a mis-resolved node AND its
+        ``MENTIONS`` link from the same episodic node in the same
+        ``add_episode``, so a strict zero-degree predicate would never fire on
+        the very phantom that cleanup exists to remove.  Excluding only THIS
+        episode's own ``MENTIONS`` is what actually encodes "minted by this very
+        episode": any invalidated ``RELATES_TO``, or any ``MENTIONS`` from a
+        DIFFERENT episode, proves pre-existing history and still counts.
+        It defaults to ``''``, which applies no exclusion at all and makes the
+        primitive strictly conservative — the fail-closed default.
+
+        THE SELF-LOOP NOTE.  An A->A relationship double-matches the undirected
+        pattern and is intentionally NOT deduped, which is the OPPOSITE choice
+        from :meth:`get_valid_edges_for_node`'s uuid-keyed dedup.  The asymmetry
+        is correct because the two values are consumed differently: that one's
+        list is enumerated, while this one is consumed only as ``== 0``.
+        Over-counting can therefore only ever REFUSE a delete, which is the safe
+        direction; under-counting would authorise one.
+
+        READ-ONLY, and must stay so — it runs on ``ro_query``.  A guard that can
+        write is a guard that can cause the damage it exists to prevent.
+
+        THE ONLY ZERO THIS RETURNS IS ONE THE SERVER ACTUALLY SAID.
+        ``count(r)`` is an UNGROUPED aggregate — it carries no grouping key —
+        so against a real server it yields exactly one row whether or not the
+        ``MATCH`` found anything, and a node with no relationships at all comes
+        back as a readable ``0``.  ``int(rows[0][0])`` is therefore the ONLY
+        zero path, and no legitimate call can reach an empty or ``None``
+        ``result_set`` at all.
+
+        Every OTHER response shape RAISES, and the arms are deliberately
+        symmetric: an empty ``result_set``, an absent one, and a row that is
+        present but unreadable are all equally uninterpretable, so none of them
+        may be quietly degraded into the single value that AUTHORISES a
+        deletion.  An earlier revision returned ``0`` for the two empty arms;
+        that was the one fail-OPEN branch in a guard whose entire purpose is to
+        prevent irreversible loss of a real entity's temporal history, and the
+        asymmetry with the raising arm was unmotivated.  Raising costs nothing
+        on every real path, because no real path gets here.  The caller wraps
+        this in a per-candidate ``try``/``except``, so a raise becomes a logged
+        skip — a refusal to delete.
+
+        Args:
+            node_uuid: UUID of the Entity node whose degree to measure.
+            group_id: Project graph to query.
+            episode_uuid: UUID of the episode whose write is in flight, whose
+                own ``MENTIONS`` link is excluded from the count. ``''`` (the
+                default) excludes nothing.
+
+        Returns:
+            The number of relationships of any type and any validity attached
+            to the node, minus this episode's own ``MENTIONS`` link.
+
+        Raises:
+            RuntimeError: if the backend is not initialized, or if the query
+                came back with no readable row — see above; that is a broken
+                response, never a node with no relationships.
+            IndexError/TypeError/ValueError: if the row is present but its
+                first column cannot be read as an int.
+        """
+        graph = self._graph_for(group_id)
+        cypher = 'MATCH (n:Entity {uuid: $uuid})-[r]-(m) '
+        params: dict[str, Any] = {'uuid': node_uuid}
+        if episode_uuid:
+            cypher += "WHERE NOT (type(r) = 'MENTIONS' AND m.uuid = $episode_uuid) "
+            params['episode_uuid'] = episode_uuid
+        cypher += 'RETURN count(r)'
+        result = await graph.ro_query(cypher, params)
+        rows = result.result_set or []
+        if not rows:
+            # NOT a node with no relationships — that comes back as a readable
+            # `0` row. This is a response nobody can interpret, and reading it
+            # as `0` would authorise a DETACH DELETE on the strength of it.
+            raise RuntimeError(
+                'count_foreign_relationships: empty result_set for node '
+                f'{node_uuid!r} in group {group_id!r}; count(r) is an ungrouped '
+                'aggregate and always yields one row, so this is a broken '
+                'response, not a zero-degree node'
+            )
+        return int(rows[0][0])
 
     @_canonicalize_group_args
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:

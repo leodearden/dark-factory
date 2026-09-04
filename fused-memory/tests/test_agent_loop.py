@@ -1426,6 +1426,160 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_explicit_cwd_overrides_config_explore_root(tmp_path):
+    """An explicit `cwd=` wins over config.explore_codebase_root (task 4722, PRD D5).
+
+    The verifier now runs against the TASK's own project root, not the
+    process-global explore root, so AgentLoop must accept a per-instance cwd
+    and hand exactly that to invoke_with_cap_retry.
+
+    The `!=` assertion is not redundant: a regression that silently ignores the
+    parameter and keeps using the global root would still produce a Path, and
+    on an accidental path equality the positive assertion alone could pass.
+    Pinning the inequality against a deliberately DISTINCT global root makes
+    that failure mode loud.
+    """
+    from pathlib import Path
+
+    from shared.cli_invoke import AgentResult
+
+    global_root = tmp_path / 'global'
+    global_root.mkdir()
+    target = tmp_path / 'target'
+    target.mkdir()
+
+    config = _make_cli_config(explore_codebase_root=str(global_root))
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-cwd-explicit',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=make_gate_mock(),
+            cwd=target,
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=[])
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+    assert call_kwargs['cwd'] == target
+    assert call_kwargs['cwd'] != Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_cwd_defaults_to_config_explore_root(tmp_path):
+    """Without an explicit cwd, AgentLoop falls back to config.explore_codebase_root.
+
+    PRD D5's "test compat" clause: `cwd` is optional precisely so this file's
+    ~28 existing construction sites keep working unchanged.  That is the
+    WHOLE blast radius — `AgentLoop(` has exactly ONE call site outside
+    tests, verify.py, and it always passes `cwd`.  The recon stages, the
+    judge harness and cli_stage_runner call `invoke_with_cap_retry` directly
+    and never construct an AgentLoop at all, so nothing in production depends
+    on this fallback and the default is in fact unreachable there.
+
+    This pins the fallback while those test sites still rely on it; a later
+    task can make `cwd` required outright once they pass it explicitly.
+    """
+    from pathlib import Path
+
+    from shared.cli_invoke import AgentResult
+
+    global_root = tmp_path / 'global'
+    global_root.mkdir()
+    config = _make_cli_config(explore_codebase_root=str(global_root))
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-cwd-default',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=make_gate_mock(),
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=[])
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
+async def test_explicit_cwd_survives_forwarding_to_invoke_claude_agent(tmp_path):
+    """The explicit cwd survives the kwargs-forwarding layer down to the CLI call.
+
+    Sibling of test_call_claude_cli_forwards_cwd_to_invoke_claude_agent, but
+    for the per-instance root: `usage_gate=None` takes invoke_with_cap_retry's
+    fast path so the REAL forwarding code runs, and ``autospec=True`` validates
+    every kwarg against the real invoke_claude_agent signature — a dropped or
+    misspelled kwarg raises TypeError here rather than in production.
+    """
+    from pathlib import Path
+
+    from shared.cli_invoke import AgentResult
+
+    global_root = tmp_path / 'global'
+    global_root.mkdir()
+    target = tmp_path / 'target'
+    target.mkdir()
+
+    config = _make_cli_config(explore_codebase_root=str(global_root))
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-cwd-fwd',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        autospec=True,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
+            cwd=target,
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=[])
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['cwd'] == target
+    assert call_kwargs['cwd'] != Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
 async def test_call_claude_cli_scopes_mcp_to_no_servers():
     """_call_claude_cli strict-scopes its run to ZERO MCP servers.
 

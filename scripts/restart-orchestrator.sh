@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Restart orchestrator-dark-factory.service and verify a fresh MainPID.
+# Restart the orchestrator unit (default orchestrator-dark-factory.service)
+# and verify a fresh MainPID.
 #
 # INTENDED CALLER: an operator shell, or a task_kind='deterministic' deploy
 # task's `before_done.script`, invoked OUTSIDE the orchestrator's own
@@ -26,8 +27,29 @@ set -euo pipefail
 # finally (cli.py _make_cancel_handler), bounded by the unit's
 # TimeoutStopSec=90s. A plain `systemctl restart` already triggers that
 # path, so there is nothing extra for --drain to do here.
+#
+# Env knobs (all optional, ${VAR:-default} style):
+#   ORCH_RESTART_UNIT        the unit this script restarts
+#                             (default: orchestrator-dark-factory.service)
+#   RESTART_VERIFY_TIMEOUT   seconds to wait for a fresh MainPID (default: 30)
+#
+# ORCH_RESTART_UNIT, and deliberately NOT `ORCH_UNIT` (task 3950): every
+# installed scripts/orchestrator-*.service sets
+# `Environment=ORCH_UNIT=<its own unit name>`, so reading THAT variable would
+# silently retarget this script at whichever orchestrator's cgroup happened to
+# spawn it -- restarting the wrong unit, in production, with no test able to
+# see it. `SELF_UNIT` is likewise taken, with a different meaning, by
+# restart-all-orchestrators.sh.
 
-SERVICE="orchestrator-dark-factory.service"
+# Test isolation is achieved by SETTING ORCH_RESTART_UNIT to a synthetic
+# `orchestrator-fake*` unit, never by changing this default. The default is
+# pinned against scripts/orchestrator-watchdog.py's WATCHED table and
+# restart-all-orchestrators.sh's SELF_UNIT by
+# tests/scripts/test_orchestrator_watchdog.py::test_restart_orchestrator_unit_default_matches_across_tiers
+# (task 3950) -- that pin is the only remaining coverage of this value, since
+# the two fake-systemctl harnesses now supply their own synthetic names. Read
+# it before changing this line.
+SERVICE="${ORCH_RESTART_UNIT:-orchestrator-dark-factory.service}"
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
 
@@ -71,12 +93,12 @@ while [[ $SECONDS -lt $deadline ]]; do
     # would otherwise make a clean restart look spuriously stale.
     if [[ "$pid" -gt 0 && "$active" == "active" && "$mono" -gt "$baseline_mono" ]]; then
         echo " OK"
-        echo "orchestrator-dark-factory restarted successfully (new MainPID=${pid})."
+        echo "${SERVICE} restarted successfully (new MainPID=${pid})."
         exit 0
     fi
     sleep 1
 done
 
 echo " FAILED"
-echo "ERROR: restart did not take (stale MainPID); orchestrator-dark-factory did not come back within ${VERIFY_TIMEOUT}s" >&2
+echo "ERROR: restart did not take (stale MainPID); ${SERVICE} did not come back within ${VERIFY_TIMEOUT}s" >&2
 exit 1

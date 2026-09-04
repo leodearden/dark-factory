@@ -21,6 +21,10 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.reconciliation.citation_verifier import (
+    STAGE_STAT_PREFIX,
+    verify_cited_memories,
+)
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE_REPORT_SCHEMA,
     recon_config_base_dir,
@@ -213,12 +217,25 @@ class BaseStage:
 
         if start_report_failed:
             completed = datetime.now(UTC)
+            # Stamp the zeroed citation triple even here. This is the ONE path
+            # that returns without reaching the shared assembly below, so it is
+            # the ONE path that would otherwise omit the counters — and a
+            # consumer that took the explicit-zero convention at face value and
+            # indexed report.stats['stageN_citations_verified'] would KeyError
+            # on exactly the degraded run it most wants to account for. Zero is
+            # the honest value: there were no findings, so nothing was verified,
+            # dropped, or errored.
+            _prefix = STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value)
             return StageReport(
                 stage=self.stage_id,
                 started_at=started,
                 completed_at=completed,
                 items_flagged=[],
-                stats={},
+                stats={
+                    f'{_prefix}_phantom_citations_dropped': 0,
+                    f'{_prefix}_citations_verified': 0,
+                    f'{_prefix}_citation_verification_errors': 0,
+                },
                 llm_calls=0,
                 tokens_used=0,
             )
@@ -337,12 +354,94 @@ class BaseStage:
                 )
 
         report_data = stage_result.report
+        _flagged = report_data.get('flagged_items', [])
+        _stats = report_data.get('stats', {})
+
+        # ── Phantom-citation verification (task 2978, hoisted here by 2979) ───
+        # Re-resolve every flagged finding's cited Mem0 memories against the live
+        # store and strip any that no longer exist, so a finding is never
+        # silently backed by an id that never existed (or whose queued
+        # add_memory write later failed).
+        #
+        # Why the BASE class and not each stage's run() override: task 2978 put
+        # this in MemoryConsolidator.run() alone, and Stages 2 and 3 silently
+        # inherited ZERO protection — a per-stage override is exactly the
+        # failure mode task 2979 fixes. Every stage calls super().run() first,
+        # so this is the one placement a new stage cannot skip by forgetting to
+        # add it. Do not move it back into a subclass.
+        #
+        # Placing it HERE — on the shared items_flagged assembly, immediately
+        # before the StageReport is built — also converges BOTH citation paths:
+        # the RRS-assembled report AND the structured-output JSON fallback,
+        # whose flagged_items reach items_flagged without ever passing
+        # recon_report.cite_memory's cite-time existence check. And because it
+        # precedes every subclass's post-processing (including Stage 1's
+        # remediation early-return), full and remediation passes alike are
+        # verified and the citation stats are always present on report.stats.
+        _cite_prefix = STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value)
+        _cite_stats = await verify_cited_memories(
+            _flagged, self.memory, self.project_id, stat_prefix=_cite_prefix,
+        )
+        _stats.update(_cite_stats)
+
+        # Write the outcome back to the AUTHORITATIVE recon_report record
+        # (task 2979). verify_cited_memories above mutated the projection
+        # get_assembled_report built — a fresh dict per finding, carrying a NEW
+        # cited_memories list — so without this the durable row keeps the
+        # phantom and the two stores permanently disagree about the same
+        # finding. Keyed on finding_id, which only the RRS-assembled projection
+        # carries; the structured-output JSON fallback has no RRS record to
+        # correct, so those findings are skipped (their correction lives in the
+        # returned StageReport alone, which is all that exists for them).
+        #
+        # Gated on the pass having actually CHANGED something. With zero drops
+        # and zero verification errors — the overwhelmingly common case —
+        # `kept` is the input list and no marker was appended, so every
+        # correction would be a byte-identical rewrite, and
+        # `apply_citation_verification`'s `_persist_run` re-serialises and
+        # upserts EVERY entry of the run. Only findings carrying a
+        # `citation_failures` marker can have moved (a drop and an error each
+        # append one), so those are the only ones worth sending.
+        _cite_changed = (
+            _cite_stats.get(f'{_cite_prefix}_phantom_citations_dropped', 0)
+            or _cite_stats.get(f'{_cite_prefix}_citation_verification_errors', 0)
+        )
+        if _active_rrs is not None and _cite_changed:
+            _corrections = [
+                {
+                    'finding_id': _item['finding_id'],
+                    'cited_memories': _item.get('cited_memories') or [],
+                    'citation_failures': _item.get('citation_failures') or [],
+                }
+                for _item in _flagged
+                if isinstance(_item, dict)
+                and _item.get('finding_id')
+                and _item.get('citation_failures')
+            ]
+            if _corrections:
+                try:
+                    _active_rrs.apply_citation_verification(run_id, _corrections)
+                except Exception as exc:  # noqa: BLE001
+                    # Degrade to "report is correct, durable record is stale" —
+                    # never to a failed stage. Loud, not silent (the repo's
+                    # loud-over-silent-degradation norm): name the run, stage and
+                    # the findings whose durable citations may now be stale.
+                    logger.warning(
+                        'reconciliation.citation_writeback_failed',
+                        extra={
+                            'run_id': run_id,
+                            'stage': self.stage_id.value,
+                            'finding_ids': [c['finding_id'] for c in _corrections],
+                            'error': repr(exc),
+                        },
+                    )
+
         stage_report = StageReport(
             stage=self.stage_id,
             started_at=started,
             completed_at=completed,
-            items_flagged=report_data.get('flagged_items', []),
-            stats=report_data.get('stats', {}),
+            items_flagged=_flagged,
+            stats=_stats,
             llm_calls=stage_result.llm_calls,
             tokens_used=stage_result.tokens_used,
         )

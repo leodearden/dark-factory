@@ -84,6 +84,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
     _CONSTRUCT_RE,
@@ -106,6 +107,16 @@ from orchestrator.evals.runner import (
 )
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.workflow import TaskWorkflow
+
+# test_b2_factory_single_construction_point reuses test_workflow_factory's
+# _orchestrator_src_root().rglob('*.py') helper (imported above) to scan every
+# *.py under orchestrator/src. Not individually reproduced under load; marked
+# because it is structurally identical to the three members that crashed.
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The non-routable null sentinel EVAL_PROFILE pins fused_memory.url to, and the
 # production endpoint an un-isolated eval run would otherwise write into.

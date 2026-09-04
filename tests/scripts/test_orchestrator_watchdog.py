@@ -51,6 +51,60 @@ def _load_watchdog() -> types.ModuleType:
     return mod
 
 
+def _neutralize_fleet_clock_gates(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stub BOTH of staleness_pass's fleet deploy-clock gates to "not blocking".
+
+    For the many staleness_pass tests that are about something else entirely
+    (enumeration, per-unit probes, delegation, exception isolation) and just
+    need the clock gates out of the way.
+
+    WHY A HELPER RATHER THAN TWO setattr LINES PER TEST: this is the read-side
+    isolation boundary, and it is easy to under-apply. REPO_DIR is a hardcoded
+    "/home/leo/src/dark-factory" literal in the watchdog, NOT derived from
+    __file__, so FLEET_DEPLOY_CLOCK_PATH resolves to the LIVE deploy clock even
+    when the suite runs from a worktree — a test that forgets one of these
+    stubs silently reads real machine state, and (because the resulting failure
+    is a hollow pass or a machine-state-dependent flake rather than a hard
+    error) nothing flags it. Each gate added to the pass has so far meant
+    another sweep across every such test — task 2396 added the min-interval
+    stub, task 4754 the head-start stub — so the list lives in ONE place and
+    the next gate is a one-line edit here.
+
+    Deliberately NOT used by the acceptance tests that must exercise the real
+    file reads — test_staleness_head_start_anchored_on_fleet_min_interval_
+    expiry_real_clock_file, test_staleness_pass_head_start_fails_open_on_
+    unreadable_fleet_clock, test_staleness_head_start_gates_read_separate_
+    clocks, and the boundary-scenario clock-file tests — which point
+    FLEET_DEPLOY_CLOCK_PATH at a tmp file instead and monkeypatch neither
+    gate. Nor by tests that hold a gate OPEN (lambda: True) on purpose.
+    """
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: False)
+
+
+def _neutralize_fm_clock_gates(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stub BOTH of fused_memory_staleness_pass's fm deploy-clock gates.
+
+    fm sibling of _neutralize_fleet_clock_gates — same rationale, against fm's
+    OWN clock (FM_DEPLOY_CLOCK_PATH, likewise resolved off the hardcoded
+    REPO_DIR and therefore live). Kept as a SEPARATE helper rather than one
+    parameterized by tier so no test can neutralize the wrong tier's gates,
+    mirroring the two separate zero-arg gates in the watchdog itself.
+
+    Deliberately NOT used by the fm acceptance tests that must exercise the
+    real file reads (test_fm_staleness_head_start_anchored_on_fm_min_interval_
+    expiry_real_clock_file, test_fm_staleness_pass_head_start_fails_open_on_
+    unreadable_fm_clock, test_staleness_head_start_gates_read_separate_clocks),
+    nor by tests that hold a gate open on purpose.
+    """
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
+
+
 # ---------------------------------------------------------------------------
 # probe_port tests
 # ---------------------------------------------------------------------------
@@ -1602,6 +1656,92 @@ def test_fleet_dir_default_matches_across_tiers() -> None:
     )
 
 
+def test_restart_orchestrator_unit_default_matches_across_tiers() -> None:
+    """restart-orchestrator.sh's target-unit default must not diverge.
+
+    Three mirrors of one unit name that cannot import each other: the
+    watchdog's WATCHED table (Python, and the deployed watchdog's own idea of
+    which unit is the dark-factory orchestrator — already port-pinned against
+    the real escalation configs by test_watched_ports_match_escalation_configs
+    above), restart-orchestrator.sh's SERVICE default (bash, stdlib-free) and
+    restart-all-orchestrators.sh's SELF_UNIT default (bash — the same unit, for
+    the same fleet, never previously pinned against the table).
+
+    WHY THIS EXISTS, and why it is not optional: task 3950 made the restart
+    script's target env-overridable (`ORCH_RESTART_UNIT`) so its two
+    fake-systemctl harnesses could stop putting a REAL unit name in front of
+    whatever `systemctl` resolves to. That retired the only two assertions in
+    the repo that pinned the production default —
+    scripts/tests/test_restart_orchestrator.py::UNIT and
+    scripts/tests/test_deploy_w11_lane_lifecycle.py::UNIT — which now hold
+    synthetic names the fixtures themselves supply. Without this pin the
+    default would be wholly UNPINNED: a future edit could retarget the script
+    at any unit and every test would stay green.
+
+    THE DECISION THIS ENCODES, not merely the mismatch: restart-orchestrator.sh
+    is invoked by operators and by `task_kind='deterministic'` before_done
+    scripts to restart THE dark-factory orchestrator. A drifted default does not
+    fail loudly — it silently restarts the WRONG unit, or none at all, while
+    reporting success against whatever it did restart.
+
+    A CHARACTERIZATION PIN, not a RED test: the production values are already
+    correct and must not change. Isolate a test by SETTING ORCH_RESTART_UNIT to
+    a synthetic `orchestrator-fake*` unit (df_pytest_isolation.synthetic_unit),
+    never by changing this default.
+    """
+    wdog = _load_watchdog()
+
+    # The canonical in-repo source: what the deployed watchdog actually
+    # restarts for the dark-factory escalation port.
+    port_to_unit = {port: unit for port, unit in wdog.WATCHED}
+    assert 8102 in port_to_unit, (
+        "No WATCHED entry for the dark-factory escalation port 8102 -- did the "
+        "table's port change? This pin derives the expected unit name from it."
+    )
+    expected = port_to_unit[8102]
+
+    drift_note = (
+        "\nrestart-orchestrator.sh is invoked by operators and by "
+        "task_kind='deterministic' before_done scripts to restart THE "
+        "dark-factory orchestrator, so a drifted default silently restarts the "
+        "WRONG unit (or none) while reporting success. This pin is the ONLY "
+        "remaining coverage of that default: task 3950 made it overridable and "
+        "thereby retired the two harness literals "
+        "(scripts/tests/test_restart_orchestrator.py::UNIT, "
+        "scripts/tests/test_deploy_w11_lane_lifecycle.py::UNIT) that were "
+        "previously its only pins. Isolate a test by SETTING ORCH_RESTART_UNIT "
+        "to a synthetic orchestrator-fake* unit instead of changing this value."
+    )
+
+    # --- bash mirror 1: restart-orchestrator.sh SERVICE default (task 3950) ---
+    restart_src = (REPO_ROOT / "scripts" / "restart-orchestrator.sh").read_text()
+    match = re.search(r'SERVICE="\$\{ORCH_RESTART_UNIT:-([^}]+)\}"', restart_src)
+    assert match is not None, (
+        "restart-orchestrator.sh SERVICE default pattern not found -- did its "
+        "literal shape change? Update this regex to match. (A pin that silently "
+        "stops finding its target is worse than no pin.)"
+    )
+    assert match.group(1) == expected, (
+        f"restart-orchestrator.sh SERVICE default {match.group(1)!r} has drifted "
+        f"from the watchdog WATCHED table's unit for port 8102 ({expected!r})."
+        + drift_note
+    )
+
+    # --- bash mirror 2: restart-all-orchestrators.sh SELF_UNIT default ---
+    fleet_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
+    self_match = re.search(r'SELF_UNIT="\$\{SELF_UNIT:-([^}]+)\}"', fleet_src)
+    assert self_match is not None, (
+        "restart-all-orchestrators.sh SELF_UNIT default pattern not found -- did "
+        "its literal shape change? Update this regex to match."
+    )
+    assert self_match.group(1) == expected, (
+        f"restart-all-orchestrators.sh SELF_UNIT default {self_match.group(1)!r} "
+        f"has drifted from the watchdog WATCHED table's unit for port 8102 "
+        f"({expected!r}); it names the same unit for the same fleet -- the unit "
+        "the fleet script restarts LAST, as its own." + drift_note
+    )
+
+
 def test_orch_restart_min_interval_secs_malformed_env_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1726,6 +1866,171 @@ def test_within_fleet_deploy_min_interval_false_when_clock_absent(
     assert wdog._within_fleet_deploy_min_interval() is False
 
 
+def test_within_fleet_staleness_head_start_true_shortly_after_window_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """True when the FLEET deploy min-interval window opened <STALENESS_GRACE_SECS ago.
+
+    The corrected anchor (task 4754): the coordinator's head start is measured
+    from the moment this tier's own min-interval window OPENED
+    (last_fleet_deploy + ORCH_RESTART_MIN_INTERVAL_SECS), not from the age of
+    the newest watched commit. Here the window opened 300s ago, well inside
+    the 1800s head start, so the fleet backstop must still hold off.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 300.0)
+
+    assert wdog._within_fleet_staleness_head_start() is True
+
+
+def test_within_fleet_staleness_head_start_false_once_head_start_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False once the fleet window has been open for STALENESS_GRACE_SECS or more.
+
+    The window opened 1801s ago — the polite event-driven coordinator has had
+    its full head start at this boundary, so the backstop is released.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(
+        wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 1800.0 + 1.0
+    )
+
+    assert wdog._within_fleet_staleness_head_start() is False
+
+
+def test_within_fleet_staleness_head_start_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False when the fleet clock is missing/corrupt/unreadable.
+
+    The fail-OPEN direction inherited from _within_min_interval: with no
+    readable clock there is no window-open instant to measure a head start
+    from, so the head start must not apply. Failing the other way would let
+    one unreadable file silence the fleet staleness backstop forever.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: None)
+
+    assert wdog._within_fleet_staleness_head_start() is False
+
+
+def test_within_fleet_staleness_head_start_false_when_both_caps_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False WITHOUT reading the clock when the summed cap is <=0.
+
+    Both ORCH_RESTART_MIN_INTERVAL_SECS and STALENESS_GRACE_SECS at 0 sum to
+    0, which _within_min_interval short-circuits before touching the reader —
+    a disabled head start must not depend on a readable file.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fleet_deploy_epoch",
+        lambda: pytest.fail("must not be consulted when the head start is disabled"),
+    )
+
+    assert wdog._within_fleet_staleness_head_start() is False
+
+
+@pytest.mark.parametrize(
+    ("clock_age", "expected"),
+    [(300.0, True), (1900.0, False)],
+)
+def test_within_fleet_staleness_head_start_holds_grace_when_only_the_cap_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, clock_age: float, expected: bool
+) -> None:
+    """ORCH_RESTART_MIN_INTERVAL_SECS=0 still leaves a STALENESS_GRACE_SECS head start.
+
+    The REALISTIC disabled-cap configuration an operator produces, as distinct
+    from test_within_fleet_staleness_head_start_false_when_both_caps_disabled
+    above (which zeroes BOTH knobs and so only exercises _within_min_interval's
+    <=0 short-circuit).
+
+    With the cap at 0 the summed cap is STALENESS_GRACE_SECS (1800 > 0), so
+    the clock IS read and the head start degenerates to "1800s since the last
+    verified fleet deploy" — measured from the same instant, against a
+    zero-length min-interval window. That is a genuine behaviour CHANGE from
+    before task 4754: ORCH_RESTART_MIN_INTERVAL_SECS=0 used to remove every
+    deploy-clock gate from the staleness backstop, and now removes only the
+    min-interval one. Both the constant's comment and
+    _within_fleet_staleness_head_start's docstring say so; this pins it.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "ORCH_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fleet_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + clock_age)
+
+    assert wdog._within_fleet_staleness_head_start() is expected
+
+
+def test_staleness_head_start_gates_read_separate_clocks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """ACCEPTANCE (task 4754): the two tiers' head-start gates consume SEPARATE
+    clocks — "do not collapse the two clocks".
+
+    Complements test_fleet_deploy_clock_path_matches_across_tiers above, which
+    pins that the two PATHS differ and are both protected; this pins that the
+    two new GATES actually consume those separate paths. A fresh orchestrator
+    fleet redeploy must NOT open or reset fm's head-start window, and vice
+    versa — so each direction writes exactly one tier's clock inside its
+    window and leaves the other tier's absent.
+    """
+    wdog = _load_watchdog()
+    now = 2_000_000_000.0
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+
+    # --- fleet clock written and inside its head start; fm clock absent.
+    fleet_clock = tmp_path / "fleet_only.json"
+    fleet_clock.write_text(
+        json.dumps(
+            {
+                "ts": now - wdog.ORCH_RESTART_MIN_INTERVAL_SECS - 300,
+                "iso": "2026-08-26T00:00:00+00:00",
+            }
+        )
+    )
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(fleet_clock))
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(tmp_path / "no_fm.json"))
+
+    assert wdog._within_fleet_staleness_head_start() is True
+    assert wdog._within_fm_staleness_head_start() is False, (
+        "a fresh orchestrator fleet redeploy must not open fm's head-start window"
+    )
+
+    # --- the exact converse: fm clock written and inside its head start;
+    #     fleet clock absent.
+    fm_clock = tmp_path / "fm_only.json"
+    fm_clock.write_text(
+        json.dumps(
+            {
+                "ts": now - wdog.FM_RESTART_MIN_INTERVAL_SECS - 300,
+                "iso": "2026-08-26T00:00:00+00:00",
+            }
+        )
+    )
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(fm_clock))
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(tmp_path / "no_fleet.json"))
+
+    assert wdog._within_fm_staleness_head_start() is True
+    assert wdog._within_fleet_staleness_head_start() is False, (
+        "a fresh fm redeploy must not open the fleet's head-start window"
+    )
+
+
 # ---------------------------------------------------------------------------
 # staleness_pass core tests
 #
@@ -1759,7 +2064,7 @@ def test_staleness_pass_core(monkeypatch: pytest.MonkeyPatch) -> None:
         unknown_unit: None,  # undeterminable -> must not count as stale
     }
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(
         wdog, "_enumerate_running_units", lambda: [stale_unit, fresh_unit, unknown_unit]
     )
@@ -1815,7 +2120,7 @@ def test_staleness_pass_isolates_per_unit_exception(monkeypatch: pytest.MonkeyPa
             raise RuntimeError("systemctl exploded")
         return commit_epoch - 100  # stale
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [boom_unit, stale_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -1843,11 +2148,11 @@ def test_staleness_pass_noop_when_commit_epoch_none(monkeypatch: pytest.MonkeyPa
         enumerated.append("called")
         return ["orchestrator-x.service"]
 
-    # Neutralize the fleet-deploy clock gate (task 2396 step-11): it is
-    # checked BEFORE commit_epoch, and _read_last_fleet_deploy_epoch reads a
-    # real on-disk file at the default path — this test must exercise the
-    # commit_epoch-None path specifically, not an incidental gate skip.
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    # Both clock gates are checked BEFORE commit_epoch, and this test must
+    # exercise the commit_epoch-None path specifically, not an incidental gate
+    # skip. It pins no fake time.time(), so — see _neutralize_fleet_clock_gates
+    # — the LIVE clock's real age would otherwise decide the outcome.
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: None)
     monkeypatch.setattr(wdog, "_enumerate_running_units", fake_enumerate)
     monkeypatch.setattr(wdog, "restart_unit", lambda _u: pytest.fail("must not restart"))
@@ -1874,7 +2179,7 @@ def test_staleness_pass_skips_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
     disabled_unit = "orchestrator-disabled.service"
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [disabled_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -1905,7 +2210,7 @@ def test_staleness_pass_skips_startup_grace(monkeypatch: pytest.MonkeyPatch) -> 
 
     grace_unit = "orchestrator-grace.service"
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [grace_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 30.0)  # < 120s grace
@@ -1939,7 +2244,7 @@ def test_staleness_pass_none_elapsed_does_not_block_restart(
 
     unit = "orchestrator-unknown-elapsed.service"
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
@@ -1975,9 +2280,7 @@ def test_staleness_pass_commit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
 
     stale_unit = "orchestrator-young-commit.service"
 
-    # Neutralize the fleet-deploy clock gate (task 2396 step-11) — see the
-    # comment in test_staleness_pass_noop_when_commit_epoch_none above.
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: [stale_unit])
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -2008,7 +2311,7 @@ def test_staleness_pass_delegates_exactly_once_for_multiple_stale_units(
 
     stale_units = ["orchestrator-stale-a.service", "orchestrator-stale-b.service"]
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(stale_units))
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -2043,7 +2346,7 @@ def test_staleness_pass_delegates_zero_times_when_all_fresh(
 
     fresh_units = ["orchestrator-fresh-a.service", "orchestrator-fresh-b.service"]
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_enumerate_running_units", lambda: list(fresh_units))
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
@@ -2233,6 +2536,242 @@ def test_staleness_pass_suppresses_skip_log_outside_log_bucket(
     )
 
 
+def test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HEAD-START skip line obeys SKIP_LOG_INTERVAL_SECS too (task 4754).
+
+    Sibling of test_staleness_pass_suppresses_skip_log_outside_log_bucket
+    above, for the second clock gate. The cost being avoided is the same one
+    SKIP_LOG_INTERVAL_SECS exists for: this pass runs every ~60s from a FRESH
+    oneshot process with no cross-tick memory (see the module docstring), so
+    an unthrottled line would write ~30 near-identical entries per 30-minute
+    head start, per tier, burying actionable watchdog output.
+
+    Also pins that the head-start gate returns BEFORE the git subprocess AND
+    before enumeration — both are monkeypatched to pytest.fail.
+
+    The paired positive case (at a bucket boundary the line IS emitted) is
+    already covered by
+    test_staleness_head_start_anchored_on_fleet_min_interval_expiry_real_clock_file,
+    which pins now to a bucket boundary and asserts the skip line is present;
+    it is deliberately not duplicated here.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    # Halfway into the bucket — well outside the logging slot near its start.
+    monkeypatch.setattr(
+        wdog.time,
+        "time",
+        lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_newest_watched_commit_epoch",
+        lambda: pytest.fail("must not be consulted while the head start is running"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_enumerate_running_units",
+        lambda: pytest.fail("must not enumerate while the head start is running"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.staleness_pass()
+
+    assert log_messages == [], (
+        f"Expected no head-start skip line outside the log-rate-limit bucket: "
+        f"{log_messages}"
+    )
+
+
+#: orchestrator-watchdog.timer's OnUnitActiveSec — the staleness passes' tick
+#: cadence, and the resolution at which a throttled skip line can be emitted.
+_WATCHDOG_TICK_SECS = 60
+
+
+def _count_head_start_skip_lines(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pass_fn_name: str,
+    window_start: float,
+    tick_phase: float = 0.0,
+) -> int:
+    """Tick a staleness pass across one WHOLE head start; count skip lines emitted.
+
+    Drives *pass_fn_name* once per _WATCHDOG_TICK_SECS from the first tick at
+    or after *window_start* until the window closes STALENESS_GRACE_SECS later
+    — the full length of a head start — with that tier's head-start gate held
+    True and its min-interval gate held False, i.e. the state the pass is in
+    for every tick of that window. *tick_phase* offsets the tick grid relative
+    to the window (systemd's timer phase is unrelated to when a min-interval
+    window happens to open, so it must not be assumed to be 0). Returns how
+    many journal lines the throttle let through.
+
+    Both gates are stubbed because this exercises the LOG-THROTTLE arithmetic,
+    not the gates: what is under test is whether a window of exactly
+    STALENESS_GRACE_SECS is guaranteed to contain a logging slot at all.
+    """
+    log_messages: list[str] = []
+    tier = "fm" if pass_fn_name.startswith("fused_memory") else "fleet"
+    monkeypatch.setattr(wdog, f"_within_{tier}_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, f"_within_{tier}_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    now = {"t": window_start + tick_phase}
+    monkeypatch.setattr(wdog.time, "time", lambda: now["t"])
+    pass_fn = getattr(wdog, pass_fn_name)
+    while now["t"] < window_start + wdog.STALENESS_GRACE_SECS:
+        pass_fn()
+        now["t"] += _WATCHDOG_TICK_SECS
+    return len(log_messages)
+
+
+def _head_start_skip_line_emitted_at(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, when: float
+) -> bool:
+    """Run staleness_pass for exactly ONE tick at *when*; True iff it logged.
+
+    Single-tick sibling of _count_head_start_skip_lines, used to MEASURE the
+    real width of the logging slot against the code rather than assuming it.
+    """
+    log_messages: list[str] = []
+    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fleet_staleness_head_start", lambda: True)
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+    monkeypatch.setattr(wdog.time, "time", lambda: when)
+    wdog.staleness_pass()
+    return bool(log_messages)
+
+
+def _boundary_late_head_start_window_start(wdog: types.ModuleType) -> float:
+    """A head-start window whose bucket boundary lands 1s before the window closes.
+
+    Returns W with ``(W + STALENESS_GRACE_SECS - 1) % SKIP_LOG_INTERVAL_SECS ==
+    0``: the sole bucket boundary strictly inside the window opens its 120s
+    logging slot 1 second before the window closes, so only ~1s of THAT slot
+    overlaps the head start and no tick on a 60s grid anchored at W can land
+    in it. The naive reading is that the line is then never emitted; see
+    test_staleness_pass_emits_head_start_skip_line_at_least_once_per_head_start
+    for why the complementary 119s at the START of the window makes that false.
+    """
+    base = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    return base - wdog.STALENESS_GRACE_SECS + 1.0
+
+
+def test_staleness_pass_emits_head_start_skip_line_at_least_once_per_head_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The FLEET head-start skip line is emitted at least once per head start.
+
+    REGRESSION PIN (review of task 4754). A head start is exactly
+    STALENESS_GRACE_SECS (1800s) long and SKIP_LOG_INTERVAL_SECS is also
+    1800s, which invites the reading that a window containing exactly ONE
+    bucket boundary can be journal-silent: put that boundary 1s before the
+    window closes (_boundary_late_head_start_window_start) and only ~1s of its
+    120s logging slot lies inside the head start.
+
+    That reading is wrong, and this test is the pin for WHY: when the window
+    length EQUALS the bucket period, a boundary landing d seconds before the
+    close leaves the PREVIOUS bucket's slot covering the first (120-d) seconds
+    of the same window. Measured at this phase: 1s of trailing slot plus 119s
+    of leading slot — the coverage inside the window is always exactly 120s,
+    merely split across its two ends. So the line is emitted exactly twice per
+    head start at the 60s tick cadence, for every combination of window phase
+    and timer phase (test_head_start_skip_log_bucket_covers_every_window_phase
+    below scans them).
+
+    Operationally this is the one ~30-minute period per min-interval window in
+    which the backstop is deliberately silent, so an operator asking "why
+    didn't the backstop fire?" is asking about exactly this window: it must
+    leave evidence in the journal. The paired suppression case — the line must
+    stay THROTTLED, not unthrottled — is
+    test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket
+    above.
+    """
+    wdog = _load_watchdog()
+    window_start = _boundary_late_head_start_window_start(wdog)
+
+    # tick_phase 30 puts the timer grid deliberately out of step with both the
+    # window and the bucket, so a pass here cannot come from a lucky alignment.
+    emitted = _count_head_start_skip_lines(
+        wdog,
+        monkeypatch,
+        pass_fn_name="staleness_pass",
+        window_start=window_start,
+        tick_phase=30.0,
+    )
+
+    assert emitted >= 1, (
+        "the fleet head-start skip line must be emitted at least once during a "
+        f"{wdog.STALENESS_GRACE_SECS}s head start, even when the bucket boundary "
+        "lands 1s before the window closes; got zero — the whole window would be "
+        "silent in the journal"
+    )
+    # ...and still throttled: the window is 30 ticks long at the 60s cadence.
+    assert emitted <= 4, (
+        f"the fleet head-start skip line must stay throttled; {emitted} lines "
+        f"per {wdog.STALENESS_GRACE_SECS}s head start is approaching unthrottled"
+    )
+
+
+def test_head_start_skip_log_bucket_covers_every_window_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARITHMETIC pin: NO (window phase, timer phase) pair yields a silent head start.
+
+    Generalizes the two behavioural tests (fleet above, fm below) from one
+    adversarial phase to the whole phase space, so a later edit to
+    SKIP_LOG_INTERVAL_SECS, STALENESS_GRACE_SECS or the 120s slot that would
+    make some head start journal-silent fails here naming the exact phase,
+    rather than being discovered by an operator finding no evidence of a
+    window in which the backstop deliberately did nothing.
+
+    The guarantee currently rests on THREE relations, any of which a future
+    edit could break: the slot (120s) is at least twice the tick cadence; the
+    bucket period is a whole multiple of that cadence; and the window length
+    is a whole multiple of the bucket period (here exactly one), so the
+    coverage lost off the window's end wraps back onto its start. Both tiers
+    share all three constants, so one pin covers both.
+    """
+    wdog = _load_watchdog()
+    period = wdog.SKIP_LOG_INTERVAL_SECS
+    grace = wdog.STALENESS_GRACE_SECS
+    tick = _WATCHDOG_TICK_SECS
+
+    # MEASURE the slot width off the real pass instead of restating the source
+    # literal, so this scan cannot keep passing against a stale assumption if
+    # that literal is ever changed.
+    slot = 120
+    boundary = period * 1000.0
+    assert _head_start_skip_line_emitted_at(wdog, monkeypatch, boundary + slot - 1), (
+        f"expected the skip line {slot - 1}s into a bucket; the logging slot is "
+        f"narrower than the {slot}s this scan assumes"
+    )
+    assert not _head_start_skip_line_emitted_at(wdog, monkeypatch, boundary + slot), (
+        f"expected no skip line {slot}s into a bucket; the logging slot is wider "
+        f"than the {slot}s this scan assumes"
+    )
+
+    for window_phase in range(period):  # window start, mod the bucket period
+        for tick_phase in range(tick):  # systemd timer grid, mod the cadence
+            first = window_phase + tick_phase
+            logging_ticks = [
+                t
+                for t in range(first, window_phase + grace, tick)
+                if t % period < slot
+            ]
+            assert logging_ticks, (
+                f"a head start opening at phase {window_phase} (mod {period}) with "
+                f"timer phase {tick_phase} would emit the skip line ZERO times "
+                f"across its {grace}s: no tick lands in a logging slot"
+            )
+
+
 def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2250,7 +2789,7 @@ def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
         enumerated.append("called")
         return []
 
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "_enumerate_running_units", fake_enumerate)
@@ -2260,6 +2799,152 @@ def test_staleness_pass_proceeds_when_fleet_deploy_gate_open(
 
     assert enumerated == ["called"], (
         "staleness_pass must still reach enumeration when the fleet-deploy gate is open"
+    )
+
+
+def test_staleness_head_start_anchored_on_fleet_min_interval_expiry_real_clock_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """ACCEPTANCE (task 4754, FLEET tier): the head start is measured from
+    min-interval EXPIRY, not from the newest watched commit — driven through a
+    REAL on-disk fleet-deploy clock file.
+
+    Neither _within_fleet_deploy_min_interval nor
+    _within_fleet_staleness_head_start is monkeypatched here: both gates must
+    evaluate the real _read_last_fleet_deploy_epoch() file read, which is what
+    makes this an anchor test rather than a restatement of a stub. Uses the
+    _fleet_fake_run harness defined below (resolved at call time) exactly as
+    test_boundary1_staleness_inside_window_real_clock_file does.
+
+    The newest watched commit is pinned SIX HOURS old, so the RETAINED
+    commit-age grace is wide open in both halves and only the new anchor can
+    decide the outcome. "now" is pinned to a SKIP_LOG_INTERVAL_SECS bucket
+    boundary so the skip line is guaranteed and cannot flake on the throttle
+    (the same trick test_boundary1_staleness_inside_window_real_clock_file
+    uses); the mid-bucket suppression half lives in
+    test_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket.
+
+    Half (a) is the KNOWN-RED half before this task lands: today the
+    min-interval has expired and the commit is hours old, so every gate is
+    open and the pass delegates a fleet redeploy the instant the 8h window
+    opens — beating the polite event-driven coordinator by poll cadence. Half
+    (b) passes today and is the non-regression half: once the head start has
+    genuinely elapsed the backstop must still act.
+    """
+    wdog = _load_watchdog()
+
+    now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    commit_epoch = int(now) - 6 * 3600  # HOURS old: the commit-age grace is wide open
+    unit = "orchestrator-know-live.service"
+
+    def run_pass_with_clock_age(age_secs: float) -> tuple[list[list[str]], list[str]]:
+        """Drive staleness_pass with the fleet clock stamped *age_secs* ago."""
+        clock_file = tmp_path / f"clock_{int(age_secs)}.json"
+        clock_file.write_text(
+            json.dumps({"ts": now - age_secs, "iso": "2026-08-26T00:00:00+00:00"})
+        )
+        monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+        recorded_calls: list[list[str]] = []
+        log_messages: list[str] = []
+        fake_run = _fleet_fake_run(
+            units=[unit],
+            commit_epoch=commit_epoch,
+            start_epochs={unit: commit_epoch - 100},  # genuinely stale
+            recorded_calls=recorded_calls,
+            log_messages=log_messages,
+        )
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(wdog.time, "time", lambda: now)
+        monkeypatch.setattr(
+            wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW
+        )
+
+        wdog.staleness_pass()
+        return recorded_calls, log_messages
+
+    # --- (a) 300s past min-interval expiry: inside the head start, hold off.
+    inside_calls, inside_logs = run_pass_with_clock_age(
+        wdog.ORCH_RESTART_MIN_INTERVAL_SECS + 300
+    )
+
+    assert not any(c[0] == "systemd-run" for c in inside_calls), (
+        f"must not delegate a fleet redeploy 300s after the min-interval window "
+        f"opened — the coordinator's {wdog.STALENESS_GRACE_SECS}s head start is "
+        f"still running; got {inside_calls}"
+    )
+    assert not any(
+        c[:3] == ["systemctl", "--user", "list-units"] for c in inside_calls
+    ), f"the head-start gate must return before enumeration; got {inside_calls}"
+    _assert_zero_mutating_calls(inside_calls)
+    assert any(
+        "skip" in m and str(wdog.STALENESS_GRACE_SECS) in m for m in inside_logs
+    ), f"Expected a skip log line naming the head start: {inside_logs}"
+
+    # --- (b) head start elapsed: the backstop is released and must act.
+    past_calls, _past_logs = run_pass_with_clock_age(
+        wdog.ORCH_RESTART_MIN_INTERVAL_SECS + wdog.STALENESS_GRACE_SECS + 60
+    )
+
+    delegate_calls = [c for c in past_calls if c[0] == "systemd-run"]
+    assert len(delegate_calls) == 1, (
+        f"once the head start has elapsed the backstop must delegate exactly one "
+        f"fleet redeploy for the stale {unit}; got {delegate_calls}"
+    )
+
+
+@pytest.mark.parametrize("clock_state", ["absent", "corrupt"])
+def test_staleness_pass_head_start_fails_open_on_unreadable_fleet_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, clock_state: str
+) -> None:
+    """ACCEPTANCE (task 4754): a missing/corrupt fleet clock still lets the
+    backstop act — the head start must fail OPEN.
+
+    This is the regression pin for the direction the task names as its main
+    risk. A fail-CLOSED head start plus an unreadable clock would silence the
+    fleet staleness backstop PERMANENTLY and INVISIBLY: with no readable
+    stamp there is no window-open instant, so a gate that answered "still
+    inside the head start" would answer that on every tick forever. That is
+    the exact direction scripts/orchestrator-watchdog.py::_within_min_interval
+    documents itself as failing away from, and routing the new gate through it
+    is what makes this true by construction rather than by re-derivation.
+
+    Drives the WHOLE pass with neither clock gate monkeypatched, so both the
+    min-interval gate and the head-start gate evaluate the real (failing) file
+    read. A later "tighten the gate" edit that inverts either fail direction
+    breaks this test.
+    """
+    wdog = _load_watchdog()
+
+    clock_file = tmp_path / "unreadable.json"
+    if clock_state == "corrupt":
+        clock_file.write_text("{not-json")
+    # "absent": deliberately never created.
+    monkeypatch.setattr(wdog, "FLEET_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    commit_epoch = int(now) - 6 * 3600  # hours old: the commit-age grace is wide open
+    unit = "orchestrator-know-live.service"
+
+    recorded_calls: list[list[str]] = []
+    log_messages: list[str] = []
+    fake_run = _fleet_fake_run(
+        units=[unit],
+        commit_epoch=commit_epoch,
+        start_epochs={unit: commit_epoch - 100},  # genuinely stale
+        recorded_calls=recorded_calls,
+        log_messages=log_messages,
+    )
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
+
+    wdog.staleness_pass()
+
+    delegate_calls = [c for c in recorded_calls if c[0] == "systemd-run"]
+    assert len(delegate_calls) == 1, (
+        f"an {clock_state} fleet clock must not silence the staleness backstop — "
+        f"expected exactly one delegation, got {delegate_calls}"
     )
 
 
@@ -2420,7 +3105,7 @@ def test_staleness_pass_e2e_restarts_stale_unit_then_converges(
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -2479,7 +3164,7 @@ def test_staleness_pass_e2e_commit_grace_suppresses_all_restarts(
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -2515,7 +3200,7 @@ def test_staleness_pass_e2e_fresh_unit_not_restarted(monkeypatch: pytest.MonkeyP
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -2554,7 +3239,7 @@ def test_staleness_pass_e2e_disabled_unit_not_restarted(monkeypatch: pytest.Monk
     )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(wdog, "_within_fleet_deploy_min_interval", lambda: False)
+    _neutralize_fleet_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog.time, "clock_gettime", lambda _clk_id: _E2E_CLOCK_MONOTONIC_NOW)
 
@@ -5741,6 +6426,110 @@ def test_within_fm_deploy_min_interval_false_when_clock_absent(
     assert wdog._within_fm_deploy_min_interval() is False
 
 
+def test_within_fm_staleness_head_start_true_shortly_after_window_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """True when the FM deploy min-interval window opened <STALENESS_GRACE_SECS ago.
+
+    fm sibling of test_within_fleet_staleness_head_start_true_shortly_after_
+    window_opens, pinning fm's OWN cap (FM_RESTART_MIN_INTERVAL_SECS) and fm's
+    OWN reader (_read_last_fm_deploy_epoch) — never the fleet's. The corrected
+    anchor (task 4754) measures the head start from the moment fm's window
+    OPENED (last_fm_deploy + FM_RESTART_MIN_INTERVAL_SECS); here that was 300s
+    ago, well inside the 1800s head start, so the fm backstop holds off.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 300.0)
+
+    assert wdog._within_fm_staleness_head_start() is True
+
+
+def test_within_fm_staleness_head_start_false_once_head_start_elapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False once fm's window has been open for STALENESS_GRACE_SECS or more.
+
+    fm's window opened 1801s ago — the polite event-driven fm coordinator has
+    had its full head start at this boundary, so the fm backstop is released.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(
+        wdog.time, "time", lambda: 1_000_000.0 + 28800.0 + 1800.0 + 1.0
+    )
+
+    assert wdog._within_fm_staleness_head_start() is False
+
+
+def test_within_fm_staleness_head_start_false_when_clock_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False when fm's clock is missing/corrupt/unreadable.
+
+    The fail-OPEN direction inherited from _within_min_interval: with no
+    readable fm clock there is no window-open instant to measure a head start
+    from, so the head start must not apply. Failing the other way would let
+    one unreadable file silence the fm staleness backstop forever.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 28800)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
+
+    assert wdog._within_fm_staleness_head_start() is False
+
+
+def test_within_fm_staleness_head_start_false_when_both_caps_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """False WITHOUT reading fm's clock when the summed cap is <=0.
+
+    Both FM_RESTART_MIN_INTERVAL_SECS and STALENESS_GRACE_SECS at 0 sum to 0,
+    which _within_min_interval short-circuits before touching the reader — a
+    disabled head start must not depend on a readable file.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 0)
+    monkeypatch.setattr(
+        wdog,
+        "_read_last_fm_deploy_epoch",
+        lambda: pytest.fail("must not be consulted when the head start is disabled"),
+    )
+
+    assert wdog._within_fm_staleness_head_start() is False
+
+
+@pytest.mark.parametrize(
+    ("clock_age", "expected"),
+    [(300.0, True), (1900.0, False)],
+)
+def test_within_fm_staleness_head_start_holds_grace_when_only_the_cap_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, clock_age: float, expected: bool
+) -> None:
+    """FM_RESTART_MIN_INTERVAL_SECS=0 still leaves a STALENESS_GRACE_SECS head start.
+
+    fm mirror of
+    test_within_fleet_staleness_head_start_holds_grace_when_only_the_cap_is_disabled
+    — the realistic disabled-cap configuration (only the cap zeroed), as
+    distinct from the both-caps-zeroed short-circuit above. Same behaviour
+    change from before task 4754, against fm's OWN clock: a 0 cap now removes
+    the min-interval gate but not the head-start gate.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "FM_RESTART_MIN_INTERVAL_SECS", 0)
+    monkeypatch.setattr(wdog, "STALENESS_GRACE_SECS", 1800)
+    monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: 1_000_000.0)
+    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + clock_age)
+
+    assert wdog._within_fm_staleness_head_start() is expected
+
+
 def test_cli_stamp_fm_deploy_clock_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
     """_cli(["--stamp-fm-deploy-clock"]) stamps exactly once, returns 0, and runs
     NONE of the liveness/staleness/report paths.
@@ -5942,7 +6731,7 @@ def test_fused_memory_staleness_pass_core_stale_delegates_once(
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100  # older than grace
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -5970,7 +6759,7 @@ def test_fused_memory_staleness_pass_fresh_does_not_delegate(
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -6039,6 +6828,96 @@ def test_fused_memory_staleness_pass_within_min_interval_suppresses_log_outside_
     assert log_messages == [], f"Expected no skip log outside the bucket: {log_messages}"
 
 
+def test_fm_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fm HEAD-START skip line obeys SKIP_LOG_INTERVAL_SECS too (task 4754).
+
+    fm mirror of test_staleness_pass_suppresses_head_start_skip_log_outside_
+    log_bucket. Same cost being avoided: this pass runs every ~60s from a
+    FRESH oneshot process with no cross-tick memory (see the module
+    docstring), so an unthrottled line would write ~30 near-identical entries
+    per 30-minute head start, per tier, burying actionable watchdog output.
+
+    Also pins that the fm head-start gate returns before the git subprocess,
+    before the enabled probe, and before any delegation — all three are
+    monkeypatched to pytest.fail.
+
+    The paired positive case is already covered by
+    test_fm_staleness_head_start_anchored_on_fm_min_interval_expiry_real_clock_file,
+    which pins now to a bucket boundary and asserts the skip line is present;
+    it is deliberately not duplicated here.
+    """
+    wdog = _load_watchdog()
+    log_messages: list[str] = []
+
+    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: True)
+    monkeypatch.setattr(
+        wdog.time,
+        "time",
+        lambda: wdog.SKIP_LOG_INTERVAL_SECS * 1000.0 + wdog.SKIP_LOG_INTERVAL_SECS / 2,
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_newest_fm_watched_commit_epoch",
+        lambda: pytest.fail("must not be consulted while the fm head start is running"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "is_unit_enabled",
+        lambda _u: pytest.fail("must not probe the unit while the fm head start is running"),
+    )
+    monkeypatch.setattr(
+        wdog,
+        "_delegate_fm_restart",
+        lambda: pytest.fail("must not delegate while the fm head start is running"),
+    )
+    monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+    wdog.fused_memory_staleness_pass()
+
+    assert log_messages == [], (
+        f"Expected no fm head-start skip line outside the log-rate-limit bucket: "
+        f"{log_messages}"
+    )
+
+
+def test_fm_staleness_pass_emits_head_start_skip_line_at_least_once_per_head_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The FM head-start skip line is emitted at least once per head start.
+
+    fm mirror of
+    test_staleness_pass_emits_head_start_skip_line_at_least_once_per_head_start
+    — the same property, since both tiers' head starts are exactly
+    STALENESS_GRACE_SECS long and both skip lines share one bucket period. See
+    that test's docstring for the wrap arithmetic and the operator cost, and
+    test_head_start_skip_log_bucket_covers_every_window_phase for the pin over
+    the whole phase space.
+    """
+    wdog = _load_watchdog()
+
+    emitted = _count_head_start_skip_lines(
+        wdog,
+        monkeypatch,
+        pass_fn_name="fused_memory_staleness_pass",
+        window_start=_boundary_late_head_start_window_start(wdog),
+        tick_phase=30.0,
+    )
+
+    assert emitted >= 1, (
+        "the fm head-start skip line must be emitted at least once during a "
+        f"{wdog.STALENESS_GRACE_SECS}s head start, even when the bucket boundary "
+        "lands 1s before the window closes; got zero — the whole window would be "
+        "silent in the journal"
+    )
+    assert emitted <= 4, (
+        f"the fm head-start skip line must stay throttled; {emitted} lines per "
+        f"{wdog.STALENESS_GRACE_SECS}s head start is approaching unthrottled"
+    )
+
+
 def test_fused_memory_staleness_pass_commit_grace_suppresses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6050,7 +6929,7 @@ def test_fused_memory_staleness_pass_commit_grace_suppresses(
     now = 2_000_000_000.0
     commit_epoch = int(now) - 300  # younger than STALENESS_GRACE_SECS=1800
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(
@@ -6073,7 +6952,11 @@ def test_fused_memory_staleness_pass_noop_when_commit_epoch_none(
     enabled/active probe, no delegate)."""
     wdog = _load_watchdog()
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    # Both fm clock gates are checked BEFORE commit_epoch, and this test must
+    # exercise the commit_epoch-None path specifically, not an incidental gate
+    # skip. It pins no fake time.time(), so — see _neutralize_fm_clock_gates —
+    # the LIVE clock's real age would otherwise decide the outcome.
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: None)
     monkeypatch.setattr(
         wdog,
@@ -6099,7 +6982,7 @@ def test_fused_memory_staleness_pass_skips_disabled(monkeypatch: pytest.MonkeyPa
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: False)
@@ -6127,7 +7010,7 @@ def test_fused_memory_staleness_pass_skips_startup_grace(
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -6156,7 +7039,7 @@ def test_fused_memory_staleness_pass_active_none_does_not_delegate(
     now = 2_000_000_000.0
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -6183,7 +7066,7 @@ def test_fused_memory_staleness_pass_isolates_probe_exception(
     def _boom(_u: str) -> bool:
         raise RuntimeError("systemctl exploded")
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", _boom)
@@ -6204,7 +7087,7 @@ def test_fused_memory_staleness_pass_e2e_converges(monkeypatch: pytest.MonkeyPat
     commit_epoch = int(now) - wdog.STALENESS_GRACE_SECS - 100
     active = {"epoch": commit_epoch - 100}  # starts stale
 
-    monkeypatch.setattr(wdog, "_within_fm_deploy_min_interval", lambda: False)
+    _neutralize_fm_clock_gates(wdog, monkeypatch)
     monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
     monkeypatch.setattr(wdog.time, "time", lambda: now)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
@@ -6221,6 +7104,149 @@ def test_fused_memory_staleness_pass_e2e_converges(monkeypatch: pytest.MonkeyPat
     active["epoch"] = commit_epoch + 50
     wdog.fused_memory_staleness_pass()
     assert delegated == [], f"a refreshed unit must self-clear; got {len(delegated)} delegation(s)"
+
+
+def test_fm_staleness_head_start_anchored_on_fm_min_interval_expiry_real_clock_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """ACCEPTANCE (task 4754, FM tier): the fm head start is measured from fm's
+    OWN min-interval EXPIRY, not from the newest fm-watched commit — with the
+    fm clock read left REAL.
+
+    Written in this block's existing alpha style (direct helper monkeypatching)
+    rather than through an argv-dispatching fake-subprocess harness: there is
+    no _fm_fake_run sibling of _fleet_fake_run, and building one is a larger
+    refactor than this task warrants. The one thing deliberately NOT stubbed is
+    the clock: neither _within_fm_deploy_min_interval nor
+    _within_fm_staleness_head_start is monkeypatched, so both gates evaluate a
+    real on-disk FM_DEPLOY_CLOCK_PATH read in tmp_path (never the live path —
+    tests/scripts/test_deploy_clock_isolation.py and df_pytest_isolation.py
+    guard that file). That is what makes this an anchor test rather than a
+    restatement of a stub.
+
+    The newest fm-watched commit is pinned SIX HOURS old, so the RETAINED
+    commit-age grace is wide open in both halves and only the new anchor can
+    decide the outcome. "now" sits on a SKIP_LOG_INTERVAL_SECS bucket boundary
+    so the skip line is guaranteed; the mid-bucket suppression half lives in
+    test_fm_staleness_pass_suppresses_head_start_skip_log_outside_log_bucket.
+
+    All arithmetic uses fm's OWN cap (FM_RESTART_MIN_INTERVAL_SECS), never the
+    fleet's. Half (a) is the KNOWN-RED half before this task lands: today fm's
+    min-interval has expired and the commit is hours old, so the pass delegates
+    an fm redeploy the instant fm's window opens.
+    """
+    wdog = _load_watchdog()
+
+    now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    commit_epoch = int(now) - 6 * 3600  # HOURS old: the commit-age grace is wide open
+
+    def run_pass_with_clock_age(
+        age_secs: float, *, commit_reader_must_not_run: bool
+    ) -> tuple[list[None], list[str]]:
+        """Drive fused_memory_staleness_pass with fm's clock stamped *age_secs* ago."""
+        clock_file = tmp_path / f"fm_clock_{int(age_secs)}.json"
+        clock_file.write_text(
+            json.dumps({"ts": now - age_secs, "iso": "2026-08-26T00:00:00+00:00"})
+        )
+        monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+
+        delegated: list[None] = []
+        log_messages: list[str] = []
+
+        def commit_reader() -> int:
+            if commit_reader_must_not_run:
+                pytest.fail(
+                    "the fm head-start gate must return BEFORE the git subprocess"
+                )
+            return commit_epoch
+
+        monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", commit_reader)
+        monkeypatch.setattr(wdog.time, "time", lambda: now)
+        monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+        monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+        monkeypatch.setattr(
+            wdog, "_unit_active_enter_epoch", lambda _u: commit_epoch - 100
+        )  # genuinely stale
+        monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+        monkeypatch.setattr(wdog, "log", lambda m: log_messages.append(m))
+
+        wdog.fused_memory_staleness_pass()
+        return delegated, log_messages
+
+    # --- (a) 300s past fm's min-interval expiry: inside the head start, hold off.
+    inside_delegated, inside_logs = run_pass_with_clock_age(
+        wdog.FM_RESTART_MIN_INTERVAL_SECS + 300, commit_reader_must_not_run=True
+    )
+
+    assert inside_delegated == [], (
+        f"must not delegate an fm redeploy 300s after fm's min-interval window "
+        f"opened — the fm coordinator's {wdog.STALENESS_GRACE_SECS}s head start "
+        f"is still running; got {inside_delegated}"
+    )
+    assert any(
+        "skip" in m and str(wdog.STALENESS_GRACE_SECS) in m for m in inside_logs
+    ), f"Expected a skip log line naming the fm head start: {inside_logs}"
+
+    # --- (b) head start elapsed: the fm backstop is released and must act.
+    past_delegated, _past_logs = run_pass_with_clock_age(
+        wdog.FM_RESTART_MIN_INTERVAL_SECS + wdog.STALENESS_GRACE_SECS + 60,
+        commit_reader_must_not_run=False,
+    )
+
+    assert len(past_delegated) == 1, (
+        f"once the fm head start has elapsed the backstop must delegate exactly "
+        f"one fm redeploy; got {past_delegated}"
+    )
+
+
+@pytest.mark.parametrize("clock_state", ["absent", "corrupt"])
+def test_fm_staleness_pass_head_start_fails_open_on_unreadable_fm_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, clock_state: str
+) -> None:
+    """ACCEPTANCE (task 4754): a missing/corrupt FM clock still lets the fm
+    backstop act — the fm head start must fail OPEN.
+
+    fm mirror of test_staleness_pass_head_start_fails_open_on_unreadable_fleet_clock,
+    in this block's alpha style. Same failure guarded: a fail-CLOSED head start
+    plus an unreadable fm clock would silence the fm staleness backstop
+    PERMANENTLY and INVISIBLY, because with no readable stamp there is no
+    window-open instant and the gate would answer "still inside the head start"
+    on every tick forever. That is the direction
+    scripts/orchestrator-watchdog.py::_within_min_interval documents itself as
+    failing away from.
+
+    Neither fm clock gate is monkeypatched, so both evaluate the real
+    (failing) file read. A later "tighten the gate" edit that inverts either
+    fail direction breaks this test.
+    """
+    wdog = _load_watchdog()
+
+    clock_file = tmp_path / "unreadable_fm.json"
+    if clock_state == "corrupt":
+        clock_file.write_text("{not-json")
+    # "absent": deliberately never created.
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    now = wdog.SKIP_LOG_INTERVAL_SECS * 1000.0
+    commit_epoch = int(now) - 6 * 3600  # hours old: the commit-age grace is wide open
+    delegated: list[None] = []
+
+    monkeypatch.setattr(wdog, "_newest_fm_watched_commit_epoch", lambda: commit_epoch)
+    monkeypatch.setattr(wdog.time, "time", lambda: now)
+    monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
+    monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: 300.0)
+    monkeypatch.setattr(
+        wdog, "_unit_active_enter_epoch", lambda _u: commit_epoch - 100
+    )  # genuinely stale
+    monkeypatch.setattr(wdog, "_delegate_fm_restart", lambda: delegated.append(None))
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+
+    wdog.fused_memory_staleness_pass()
+
+    assert len(delegated) == 1, (
+        f"an {clock_state} fm clock must not silence the fm staleness backstop — "
+        f"expected exactly one delegation, got {delegated}"
+    )
 
 
 # ---------------------------------------------------------------------------

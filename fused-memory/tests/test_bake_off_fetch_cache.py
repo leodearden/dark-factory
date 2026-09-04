@@ -7,9 +7,10 @@ Dumping its return value and replaying it makes every read-side variant free
 and — the point of this module — makes the metric code unit-testable against
 REAL rankings rather than only hand-built ones.
 
-The script is loaded via importlib so it can be tested without sys.path
-pollution — the loader is copied verbatim from
-``test_bake_off_storage_shape.py:48-73`` and is invoked lazily (via ``_mod()``)
+The script is loaded via ``fused-memory/tests/_fm_helpers.py``
+``::load_script_module`` so it can be tested without sys.path pollution: that
+helper reuses an already-loaded module for the same file instead of
+re-executing it under the same key.  It is invoked lazily (via ``_mod()``)
 rather than bound at import time.
 
 LANE DISCIPLINE — READ BEFORE ADDING A TEST
@@ -34,10 +35,11 @@ in-progress and claims that module.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import types
 from pathlib import Path
 from typing import Any
+
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -83,22 +85,15 @@ def _load_module() -> types.ModuleType:
 
     The module is registered in sys.modules under its bare name so that
     @dataclass and other reflection-based decorators work correctly (they
-    call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
+    call sys.modules.get(cls.__module__)).  That key is SHARED with
+    ``test_bake_off_storage_shape.py`` and with the script-side
+    ``read_transform_selection._load_script``, which is what makes reuse —
+    rather than an unconditional re-exec — the correct behaviour here.
 
-    mod_name = 'bake_off_storage_shape'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    A named seam rather than a direct call at each use site, so the
+    load-once property has something uncached to assert against.
+    """
+    return load_script_module(SCRIPT_PATH, mod_name='bake_off_storage_shape')
 
 
 @functools.cache
@@ -113,6 +108,31 @@ def _mod() -> types.ModuleType:
 import hashlib  # noqa: E402
 
 import pytest  # noqa: E402
+
+
+class TestTheScriptIsLoadedOnceNotReExecuted:
+    """The loader seam must REUSE the script, not re-execute it.
+
+    An unconditional re-exec mints a SECOND module object under the same
+    ``sys.modules`` key, and whichever loader ran last wins.  The concrete
+    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
+    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
+    serves whichever object a test module last registered under
+    ``'bake_off_storage_shape'``.  Three test modules register that key, and
+    ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto --dist
+    loadgroup"``, so collection order is not stable.
+
+    The UNCACHED seam is what this calls: ``_mod()`` is ``functools.cache``d
+    and would pass vacuously.
+    """
+
+    def test_the_script_is_loaded_once_not_re_executed(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_module()
+        second = _load_module()
+        assert first is second
+        assert sys.modules['bake_off_storage_shape'] is first
 
 
 class TestMeasurementAnchor:
@@ -467,6 +487,71 @@ class TestFetchCacheRoundTrip:
         assert 'rec-nope' in str(excinfo.value)
 
 
+def _count_cache_reads(monkeypatch, mod) -> list:
+    """Install a counting proxy over `_read_fetch_cache` and return the log.
+
+    Delegates to the real function — the point is to count decodes of a
+    32k-line JSON document, not to stub the read out and change what the
+    guards see.
+    """
+    real = mod._read_fetch_cache
+    reads: list = []
+
+    def counting(path):
+        reads.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(mod, '_read_fetch_cache', counting)
+    return reads
+
+
+class TestTheCacheDocumentIsReadOnce:
+    """One decode of the cache document, threaded — not re-parsed per guard.
+
+    The committed E2 fixture is a 32k-line JSON document, and the replay path
+    reads it once per consumer that needs a piece of it.
+    """
+
+    def test_load_fetches_accepts_an_already_read_cache_without_re_reading(
+        self, tmp_path, monkeypatch,
+    ):
+        """The threading seam itself, pinned by a fast pure test.
+
+        Without this, only the CLI-level count below would catch a refactor
+        that reverted to re-reading — and that one is slow and indirect.
+        """
+        mod = _mod()
+        records = [_record('rec-1'), _record('rec-2')]
+        path = tmp_path / 'cache.json'
+        mod.dump_fetches(
+            path,
+            {'c_peers': _fetched(
+                {'q1': [(records[0], 0.9)], 'q2': [(records[1], 0.4)]},
+                {'cl1': [(records[0], 0.8)]},
+            )},
+            provenance=_provenance(mod, {'c_peers': records}),
+        )
+
+        from_path = mod.load_fetches(path, {'c_peers': _seeded('c_peers', records)})
+
+        cache = mod.read_fetch_cache(path)
+        reads = _count_cache_reads(monkeypatch, mod)
+        from_cache = mod.load_fetches(cache, {'c_peers': _seeded('c_peers', records)})
+
+        assert reads == []
+        # Equal rankings, so the seam is a pure threading change and not a
+        # different join that merely happens to avoid a read.
+        assert from_cache.keys() == from_path.keys()
+        for kind in ('queries', 'probes'):
+            assert sorted(from_cache['c_peers'][kind]) == \
+                sorted(from_path['c_peers'][kind])
+            for key, hits in from_cache['c_peers'][kind].items():
+                assert [(h.record.record_id, h.relevance_score) for h in hits] == [
+                    (h.record.record_id, h.relevance_score)
+                    for h in from_path['c_peers'][kind][key]
+                ]
+
+
 # ===========================================================================
 # step-3 — the cache must refuse to silently measure a stale corpus
 # ===========================================================================
@@ -615,14 +700,30 @@ class TestFetchCacheProvenance:
 
 
 class TestFetchCacheRefusesAStaleCorpus:
-    """Three named refusals, so an operator can tell them apart WITHOUT
-    reading code: the fixtures moved, the cache is truncated, or the cache is
-    too shallow for the requested depth."""
+    """Four named refusals, so an operator can tell them apart WITHOUT
+    reading code: the fixtures moved, the QUERIES half is truncated, the
+    PROBES half is truncated, or the cache is too shallow for the requested
+    depth.
 
-    def _dump(self, mod, tmp_path, records, *, queries, search_limit=10):
+    The two truncations are separate refusals rather than one because they
+    are separately repairable and separately consequential: a missing query
+    scores an arm over a subset of the query set, a missing probe cluster
+    scores the neighbourhood metrics over a subset of the clusters.  Naming
+    which half is short is the whole reason these are named refusals rather
+    than bare raises.
+    """
+
+    def _dump(self, mod, tmp_path, records, *, queries, probes=None,
+              search_limit=10):
+        """A one-shape cache to truncate.
+
+        *probes* defaults to ``None`` — i.e. an empty probes half — so the
+        refusals that only care about the QUERIES half read exactly as they
+        did before it was a parameter.
+        """
         path = tmp_path / 'cache.json'
         mod.dump_fetches(
-            path, {'c_peers': _fetched(queries, {})},
+            path, {'c_peers': _fetched(queries, probes or {})},
             provenance=_provenance(
                 mod, {'c_peers': records}, search_limit=search_limit,
             ),
@@ -678,7 +779,16 @@ class TestFetchCacheRefusesAStaleCorpus:
                 path, {'c_peers': _seeded('c_peers', records)},
                 expect_query_ids=['q1', 'q2-never-cached'],
             )
-        assert 'q2-never-cached' in str(excinfo.value)
+        message = str(excinfo.value)
+        assert 'q2-never-cached' in message
+        assert 'c_peers' in message
+        # The other half of the class docstring's promise, symmetric with the
+        # probes refusal below.  `_check_kind_coverage` is parameterised by
+        # *kind*, so a mislabelled call site here — passing 'probes' for the
+        # queries block — still raises, and every other assertion in this
+        # suite still passes.  The label is the only thing that tells the two
+        # truncations apart, so it is the thing to assert.
+        assert 'queries' in message
 
     def test_the_full_requested_query_set_loads(self, tmp_path):
         """The converse, so the refusal above is not vacuously always-on."""
@@ -693,6 +803,49 @@ class TestFetchCacheRefusesAStaleCorpus:
             expect_query_ids=['q1', 'q2'],
         )
         assert set(loaded['c_peers']['queries']) == {'q1', 'q2'}
+
+    def test_a_probe_cluster_absent_from_the_cache_is_refused(self, tmp_path):
+        """The PROBES half of the same failure, and the reason it is a NAMED
+        refusal: `measure_arm` indexes `fetched['probes'][cluster_id]` bare,
+        so a truncated probes half that is not refused here surfaces as an
+        unnamed `KeyError` from inside the metric code — naming neither the
+        cache nor how to re-dump it, and escaping the documented
+        FetchCacheError -> exit-3 contract entirely.
+        """
+        mod = _mod()
+        records = [_record('rec-1')]
+        path = self._dump(
+            mod, tmp_path, records,
+            queries={'q1': [(records[0], 0.9)]},
+            probes={'cl1': [(records[0], 0.8)]},
+        )
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(
+                path, {'c_peers': _seeded('c_peers', records)},
+                expect_probe_ids=['cl1', 'cl2-never-cached'],
+            )
+        message = str(excinfo.value)
+        assert 'cl2-never-cached' in message
+        assert 'c_peers' in message
+        # The point of the test: an operator must be able to tell a truncated
+        # PROBES half from a truncated QUERIES half without reading code.
+        assert 'probes' in message
+
+    def test_the_full_requested_probe_set_loads(self, tmp_path):
+        """The converse, so the refusal above is not vacuously always-on."""
+        mod = _mod()
+        records = [_record('rec-1'), _record('rec-2')]
+        path = self._dump(
+            mod, tmp_path, records,
+            queries={'q1': [(records[0], 0.9)]},
+            probes={'cl1': [(records[0], 0.8)], 'cl2': [(records[1], 0.3)]},
+        )
+        loaded = mod.load_fetches(
+            path, {'c_peers': _seeded('c_peers', records)},
+            expect_probe_ids=['cl1', 'cl2'],
+        )
+        assert set(loaded['c_peers']['probes']) == {'cl1', 'cl2'}
 
     def test_a_cache_shallower_than_the_requested_limit_is_refused(self, tmp_path):
         """A limit-5 cache replayed at --limit 10 measures every arm over a
@@ -1118,8 +1271,14 @@ class TestDumpFetchesFlag:
         )) == 0
 
         doc = json.loads(cache.read_text(encoding='utf-8'))
-        assert set(doc['arms']) == set(mod.ARM_SHAPES)
-        assert set(doc['provenance']['corpus_fingerprints']) == set(mod.ARM_SHAPES)
+        # A default run is probe-ON, so the dump covers the three read arms
+        # PLUS one pass per regrowth mode -- each seeded over its own injected
+        # corpus, so each needs its own fingerprint or a replay could silently
+        # serve one mode's fetches for the other.
+        expected = set(mod.ARM_SHAPES) | {
+            mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES}
+        assert set(doc['arms']) == expected
+        assert set(doc['provenance']['corpus_fingerprints']) == expected
         # The live-only values, taken from the run rather than defaulted.
         assert doc['provenance']['embedder_model'] == 'text-embedding-3-small'
         assert doc['provenance']['search_limit'] == mod.DEFAULT_SEARCH_LIMIT
@@ -1167,6 +1326,28 @@ class TestReplayFetchesFlag:
         for key in ('token_estimator', 'guard_threshold', 'embedder_model',
                     'search_limit', 'distractor_slab_size', 'clusters_measured',
                     'queries_measured', 'guard_probes_measured', 'fixtures'):
+            assert replayed['protocol'][key] == live['protocol'][key], key
+
+    def test_the_replayed_regrowth_block_and_its_descriptor_agree_with_live(
+        self, tmp_path, monkeypatch,
+    ):
+        """`_replay_bake_off` claims the block "must come out byte-identical
+        to the live one" — asserted here rather than left as a docstring.
+
+        The DESCRIPTOR travels with it.  The two paths once decided
+        `regrowth_probed` from different values (the live one from the
+        `regrowth` flag, the replay from whether a block was built), so a run
+        whose cluster subset retained no injected topic published `true` live
+        and `false` on a replay of its own cache — a contradiction about
+        probe coverage, which is the ONE thing this descriptor exists to
+        state outright.
+        """
+        mod = _mod()
+        live, replayed, _ = self._dump_then_replay(mod, tmp_path, monkeypatch)
+
+        assert live['regrowth'] is not None
+        assert replayed['regrowth'] == live['regrowth']
+        for key in ('regrowth_probed', 'regrowth_injections_measured'):
             assert replayed['protocol'][key] == live['protocol'][key], key
 
     def test_the_replayed_report_discloses_that_it_was_replayed(
@@ -1238,6 +1419,103 @@ class TestReplayFetchesFlag:
             tmp_path, 'replay', '--replay-fetches', str(cache),
         )) != 0
         assert not (tmp_path / 'replay.json').exists()
+
+    @staticmethod
+    def _delete_probe_cluster(cache, shape_keys) -> str:
+        """Drop one probe cluster from every named arm, and say which.
+
+        Uniformly across *shape_keys* rather than from one arm, so the
+        refusal cannot be attributed to a per-shape fingerprint mismatch —
+        the corpus is untouched, only the cached probes half is short.
+        """
+        doc = json.loads(cache.read_text(encoding='utf-8'))
+        cluster_id = next(iter(doc['arms'][shape_keys[0]]['probes']))
+        for key in shape_keys:
+            del doc['arms'][key]['probes'][cluster_id]
+        cache.write_text(json.dumps(doc), encoding='utf-8')
+        return cluster_id
+
+    def test_a_replay_against_a_cache_missing_a_probe_cluster_exits_three(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """Exactly 3, and NAMED — not merely "something raised".
+
+        `measure_arm` indexes `fetched['probes'][cluster_id]` bare, so an
+        unguarded truncation of the probes half leaves `main` on a `KeyError`
+        raised from inside the metric code: not the documented
+        `FetchCacheError` -> exit-3 contract, and a message naming neither
+        the cache nor how to re-dump it.
+        """
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+
+        cluster_id = self._delete_probe_cluster(cache, list(mod.ARM_SHAPES))
+        capsys.readouterr()
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) == 3
+        message = capsys.readouterr().err
+        assert 'fetch cache error:' in message
+        assert cluster_id in message
+        # And NO artifact was written from the refused run.
+        assert not (tmp_path / 'replay.json').exists()
+
+    def test_a_replay_whose_regrowth_pass_is_missing_a_probe_cluster_exits_three(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """The regrowth pass needs its OWN coverage.
+
+        `measure_regrowth_arms` forwards the same `probes` list into
+        `measure_arm`, so the second `load_fetches` call site has the
+        identical bare-index failure.  Truncating only the regrowth pass keys
+        — leaving every `ARM_SHAPES` block intact — is what makes a fix that
+        wires only the first call site fail here instead of looking complete.
+        """
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+
+        cluster_id = self._delete_probe_cluster(
+            cache, [mod.regrowth_pass_key(mode) for mode in mod.REGROWTH_MODES],
+        )
+        capsys.readouterr()
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) == 3
+        message = capsys.readouterr().err
+        assert 'fetch cache error:' in message
+        assert cluster_id in message
+        assert not (tmp_path / 'replay.json').exists()
+
+    def test_a_replay_reads_the_cache_document_exactly_once(
+        self, tmp_path, monkeypatch,
+    ):
+        """EXACTLY once, not "fewer than before".
+
+        A `<= 2` assertion would still pass a fix that removed only one of
+        the redundant reads, and the point of the item is that the 32k-line
+        document is decoded once and threaded.
+        """
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+
+        # The counter goes in AFTER the live leg: only the REPLAY's parses
+        # are being measured.
+        _install_driver_doubles(monkeypatch)
+        reads = _count_cache_reads(monkeypatch, mod)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) == 0
+        assert len(reads) == 1, reads
 
 
 # ===========================================================================

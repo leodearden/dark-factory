@@ -20,6 +20,12 @@ import subprocess
 import typing
 
 import pytest
+
+# The PRODUCTION substitution, imported by name — tests/scripts/conftest.py puts
+# scripts/ on sys.path for exactly this. See the comment above
+# HARDCODED_SERVICE_REPO_ROOT for why this module renders through the
+# installer's own code rather than replaying the substitution.
+import render_dashboard_unit  # pyright: ignore[reportMissingImports]
 from systemd_unit_invariants import (
     assert_restart_backoff_effective as _assert_restart_backoff_effective,
 )
@@ -91,11 +97,19 @@ HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE = (
 # alternate machine may legitimately differ — the test is not asserting anything
 # about the runtime install environment.
 #
-# Substitution semantics (setup-host.sh lines 325-329):
-#   sed 's|__REPO_ROOT__|$REPO_ROOT|g'   (global, unanchored, literal substitution)
-#   sed 's|__UV_PATH__|$UV_PATH|g'       (global, unanchored, literal substitution)
-# Both sentinels contain no regex metacharacters and no '|', so str.replace is
-# semantically identical to the sed command.
+# Substitution semantics: scripts/render_dashboard_unit.py::render_template,
+# which is the code setup-host.sh section 8 actually runs to install this unit.
+# Both sentinels are replaced globally, unanchored and literally.
+#
+# THE RENDER TEST CALLS THAT FUNCTION rather than replaying the substitution
+# here, and the reason is specific rather than tidiness. Until task 4793 the
+# installer used `sed -e "s|__REPO_ROOT__|$REPO_ROOT|g" ... > "$UNIT_DIR/<unit>"`
+# and this module replayed it as two str.replace calls, justified by a comment
+# arguing the two spellings were semantically identical. That argument was
+# sound and the citation still rotted: "setup-host.sh lines 325-329" now points
+# into the orchestrator unit array, and the sed it named no longer exists at all.
+# A lockstep claim made THROUGH the installer's own function cannot drift from
+# the installer, and needs no line range to stay true.
 HARDCODED_SERVICE_REPO_ROOT = "/home/leo/src/dark-factory"
 HARDCODED_SERVICE_UV_PATH = "/home/leo/.local/bin/uv"
 
@@ -276,9 +290,15 @@ def test_project_root_env_var_is_pinned_in_both_unit_files() -> None:
     anchored rather than a substring match.
 
     The template must carry the __REPO_ROOT__ sentinel, never a hardcoded path,
-    so setup-host.sh's `sed 's|__REPO_ROOT__|$REPO_ROOT|g'` makes the installed
+    so the installer's __REPO_ROOT__ substitution
+    (scripts/render_dashboard_unit.py::render_template) makes the installed
     value track the real checkout — the same treatment
-    DASHBOARD_KNOWN_PROJECT_ROOTS' self entry already gets.
+    DASHBOARD_KNOWN_PROJECT_ROOTS' self entry already gets. NOTE the treatment
+    is only the same for the SUBSTITUTION: DASHBOARD_KNOWN_PROJECT_ROOTS is
+    additionally PRESERVED from the installed unit across a reinstall
+    (render_dashboard_unit.HOST_LOCAL_ENVIRONMENT), and this variable
+    deliberately is not — its value must equal the SAME copy's
+    WorkingDirectory=, which the next test pins.
     """
     for path, expected_line in (
         (TEMPLATE, TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE),
@@ -562,33 +582,50 @@ def test_comment_warns_about_systemd_space_handling() -> None:
 def test_template_renders_to_hardcoded_file() -> None:
     """Rendered template must match the committed hardcoded service file verbatim.
 
-    This is the canonical drift-prevention invariant: applying the same substitutions
-    as setup-host.sh (lines 325-329) to the template must yield the hardcoded file
-    byte-for-byte.
+    This is the canonical drift-prevention invariant, and it is made THROUGH the
+    installer's own renderer: scripts/render_dashboard_unit.py::render_template
+    is the function setup-host.sh section 8 runs to install this unit, so the
+    two repo-side files are held in lockstep by the same code that renders the
+    host-side one. A replayed copy of the substitution would be a third
+    spelling, unguarded, and the citation it needed to justify itself has
+    already rotted once — see the comment above HARDCODED_SERVICE_REPO_ROOT.
 
-    Substitution semantics (mirroring setup-host.sh):
-        sed 's|__REPO_ROOT__|$REPO_ROOT|g'  →  str.replace('__REPO_ROOT__', HARDCODED_SERVICE_REPO_ROOT)
-        sed 's|__UV_PATH__|$UV_PATH|g'      →  str.replace('__UV_PATH__', HARDCODED_SERVICE_UV_PATH)
+    If this test fails, the template and hardcoded file have drifted.  Re-render
+    with::
 
-    Both sentinels contain no regex metacharacters and no '|', so str.replace is
-    semantically identical to the sed command (global, unanchored, literal substitution).
+        python3 scripts/render_dashboard_unit.py --no-preserve \\
+            --template  scripts/dashboard.service.template \\
+            --repo-root /home/leo/src/dark-factory \\
+            --uv-path   /home/leo/.local/bin/uv \\
+            --output    dashboard/dark-factory-dashboard.service
 
-    If this test fails, the template and hardcoded file have drifted.  Re-render by
-    running the sed substitutions in setup-host.sh lines 325-329 and updating
-    dashboard/dark-factory-dashboard.service.
+    (The two literals are HARDCODED_SERVICE_REPO_ROOT / HARDCODED_SERVICE_UV_PATH
+    above — the committed copy is deliberately pinned to this host's paths, not
+    to whatever checkout happens to be running the test.)
+
+    ``--no-preserve`` IS LOAD-BEARING HERE, and its absence was a trap.  That
+    CLI's whole purpose is host-side: it reads --output FIRST as the installed
+    copy and carries its host-local DASHBOARD_KNOWN_PROJECT_ROOTS into the
+    render.  Pointed at the REPO-side artifact, the file being read is the one
+    under regeneration — so the moment the template's default for that variable
+    changes, the preserving form would copy the stale committed value straight
+    back in, leave this test red, and give no hint why.  It is a no-op today
+    only because the two values coincide.  Never pass --no-preserve when
+    rendering an INSTALLED unit; that is the clobber the renderer exists to
+    prevent, and setup-host.sh does not pass it.
     """
-    rendered = (
-        TEMPLATE.read_text(encoding="utf-8")
-        .replace("__REPO_ROOT__", HARDCODED_SERVICE_REPO_ROOT)
-        .replace("__UV_PATH__", HARDCODED_SERVICE_UV_PATH)
+    rendered = render_dashboard_unit.render_template(
+        TEMPLATE.read_text(encoding="utf-8"),
+        repo_root=HARDCODED_SERVICE_REPO_ROOT,
+        uv_path=HARDCODED_SERVICE_UV_PATH,
     )
     hardcoded = HARDCODED.read_text(encoding="utf-8")
     assert rendered == hardcoded, (
         f"Rendered template does not match {HARDCODED}.\n"
         f"Template path: {TEMPLATE}\n"
-        "The files have drifted.  Re-render by running the sed substitutions "
-        "in setup-host.sh lines 325-329 and updating "
-        "dashboard/dark-factory-dashboard.service."
+        "The files have drifted.  Re-render with "
+        "scripts/render_dashboard_unit.py — see this test's docstring for the "
+        "exact invocation."
     )
 
 

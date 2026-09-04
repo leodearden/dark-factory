@@ -15,6 +15,7 @@ from fused_memory.models.scope import Scope
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
+    ReferentRepairStats,
     ReferentStats,
     _is_rate_limit_or_quota_error,
     _serialize_temporal,
@@ -5012,6 +5013,23 @@ class TestNormalizeTaskNodeNames:
 # Tests for _reconcile_episode_identity  (task 2202 / W6-β, step 3)
 # ---------------------------------------------------------------------------
 
+def _episode_result(episode):
+    """An add_episode result carrying *episode* verbatim, however malformed.
+
+    Built here rather than by extending `_fm_helpers.MockAddEpisodeResult`
+    because the shapes under test are precisely the ones a dataclass field
+    cannot express — an attribute that is ABSENT, not merely None.
+    """
+    from types import SimpleNamespace
+    return SimpleNamespace(entity_edges=[], edges=[], nodes=[], episode=episode)
+
+
+def _episode_result_uuid(uuid):
+    """An add_episode result whose episode carries *uuid*, however malformed."""
+    from types import SimpleNamespace
+    return _episode_result(SimpleNamespace(uuid=uuid))
+
+
 class TestReconcileEpisodeIdentity:
     """Unit tests for MemoryService._reconcile_episode_identity — the single
     orchestration point (task 2202 / W6-β) that folds the five post-write
@@ -5041,6 +5059,7 @@ class TestReconcileEpisodeIdentity:
         service._dedup_episode_nodes = AsyncMock(return_value=4)
         service._normalize_task_node_names = AsyncMock(return_value=5)
         service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+        service._repair_episode_referents = AsyncMock(return_value=ReferentRepairStats())
 
         manager = Mock()
         manager.attach_mock(service._dedup_episode_edges, '_dedup_episode_edges')
@@ -5054,6 +5073,7 @@ class TestReconcileEpisodeIdentity:
         manager.attach_mock(service._dedup_episode_nodes, '_dedup_episode_nodes')
         manager.attach_mock(service._normalize_task_node_names, '_normalize_task_node_names')
         manager.attach_mock(service._verify_episode_referents, '_verify_episode_referents')
+        manager.attach_mock(service._repair_episode_referents, '_repair_episode_referents')
 
         stats = await service._reconcile_episode_identity(mock_result, group_id='test')
 
@@ -5080,6 +5100,14 @@ class TestReconcileEpisodeIdentity:
             # _normalize_task_node_names produces, and any repair it enables
             # must describe post-normalization topology).
             '_verify_episode_referents',
+            # Task 3672 (PRD leaf eta) — EIGHTH and LAST, strictly after zeta
+            # because it CONSUMES zeta's findings, and therefore also after
+            # _normalize_task_node_names. Load-bearing in the same direction
+            # zeta's placement is, and more so: eta MINTS nodes and REPOINTS
+            # edges, so anything it creates must describe post-normalization
+            # topology or it would mint exactly the duplicate-name pair
+            # _normalize_task_node_names exists to collapse.
+            '_repair_episode_referents',
         ]
         call_order = [c[0] for c in manager.mock_calls if c[0] in expected_order]
         assert call_order == expected_order, (
@@ -5226,6 +5254,191 @@ class TestReconcileEpisodeIdentity:
 
         with pytest.raises(exc_type):
             await service._reconcile_episode_identity(mock_result, group_id='test')
+
+    # ---- leaf ETA: the repair pass (task 3672) ------------------------------
+
+    @pytest.mark.asyncio
+    async def test_the_repair_pass_is_fed_zetas_own_stats_object(self, service):
+        """The EXACT object, not a reconstruction: eta acts on zeta's findings
+        in-process, inside the same identity-lock critical section, and any
+        copy in between is a second answer that can disagree with the one the
+        write actually used."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+        populated = ReferentStats(edges_scanned=2, endpoints_checked=3)
+        service._verify_episode_referents = AsyncMock(return_value=populated)
+        service._repair_episode_referents = AsyncMock(return_value=ReferentRepairStats())
+
+        await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._repair_episode_referents.assert_awaited_once_with(
+            populated, group_id='test', episode_uuid='',
+        )
+        (args, _kwargs), = service._repair_episode_referents.await_args_list
+        assert args[0] is populated
+
+    @pytest.mark.asyncio
+    async def test_the_repair_pass_is_told_which_episode_is_in_flight(self, service):
+        """eta needs THIS episode's uuid to answer "was this node minted by
+        this very write?" — the question the emptied-node cleanup's guard
+        claims to ask and, until it had this datum, could not.
+
+        `_reconcile_episode_identity` already receives `result` and forwards it
+        verbatim to the other seven sub-passes, so the identifier is present at
+        the call site; the eighth just has to be handed it.
+        """
+        mock_result = _episode_result_uuid('ep-live-1')
+        populated = ReferentStats(edges_scanned=2, endpoints_checked=3)
+        service._verify_episode_referents = AsyncMock(return_value=populated)
+        service._repair_episode_referents = AsyncMock(return_value=ReferentRepairStats())
+
+        await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        service._repair_episode_referents.assert_awaited_once_with(
+            populated, group_id='test', episode_uuid='ep-live-1',
+        )
+        (args, _kwargs), = service._repair_episode_referents.await_args_list
+        assert args[0] is populated, (
+            'the exact-object identity pin must survive the new argument'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'make_result, label',
+        [
+            (lambda: None, 'result is None'),
+            (lambda: object(), 'result has no .episode at all'),
+            (lambda: _episode_result(None), 'episode is None'),
+            (lambda: _episode_result(object()), 'episode has no .uuid'),
+            (lambda: _episode_result_uuid(''), 'uuid is empty'),
+            (lambda: _episode_result_uuid(None), 'uuid is None'),
+            (lambda: _episode_result_uuid(12345), 'uuid is a non-str'),
+            (lambda: _episode_result_uuid(MagicMock()), 'uuid is an auto-mock'),
+        ],
+    )
+    async def test_a_malformed_result_degrades_to_the_fail_closed_empty_uuid(
+        self, service, make_result, label,
+    ):
+        """READING an identifier must never be able to lose the repair.
+
+        This sub-pass runs AFTER the episode write is already durable, and
+        `_run_pass` exists precisely so a sub-pass failure never fails that
+        committed write. The other seven sub-passes already treat `result` as
+        duck-typed, so an AttributeError raised while merely reading
+        `result.episode.uuid` would forfeit the repair for a reason wholly
+        unrelated to repairing.
+
+        `''` does not mean "no exclusion is needed" — it means "we could not
+        establish which episode this is, so exclude nothing and refuse more
+        deletions". The fail-closed direction, matching
+        `ReferentFinding.resolvable` defaulting to False.
+        """
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+        service._repair_episode_referents = AsyncMock(return_value=ReferentRepairStats())
+
+        stats = await service._reconcile_episode_identity(
+            make_result(), group_id='test',
+        )
+
+        (_args, kwargs), = service._repair_episode_referents.await_args_list
+        assert kwargs['episode_uuid'] == '', label
+        assert '_repair_episode_referents' not in stats.errors, (
+            f'{label}: reading the episode uuid must not raise'
+        )
+
+    def test_the_extraction_helper_never_raises(self):
+        """Pinned directly on the helper too, not only through the chain, so a
+        future caller cannot reintroduce the raise by using it elsewhere."""
+        from types import SimpleNamespace
+
+        from fused_memory.services.memory_service import _episode_uuid_of
+
+        class _Exploding:
+            @property
+            def episode(self):
+                raise RuntimeError('boom')
+
+        assert _episode_uuid_of(_Exploding()) == ''
+        assert _episode_uuid_of(None) == ''
+        assert _episode_uuid_of(SimpleNamespace(episode=SimpleNamespace(uuid='ep-1'))) == 'ep-1'
+
+    @pytest.mark.asyncio
+    async def test_the_repair_stats_are_carried_on_the_aggregate(self, service):
+        """INV-2: the structured record of what was repaired must be
+        observable on the return value, not merely logged."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        from fused_memory.services.memory_service import ReferentRepair
+
+        mock_result = MockAddEpisodeResult()
+        repaired = ReferentRepairStats()
+        repaired.repairs.append(ReferentRepair(
+            edge_uuid='e1', which_end='source', outcome='repaired',
+            old_endpoint_uuid='n-3129', new_endpoint_uuid='n-3127',
+            check='set-membership', moved=True,
+        ))
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+        service._repair_episode_referents = AsyncMock(return_value=repaired)
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        assert stats.repair_stats is repaired
+        assert stats.repair_stats.repaired == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failing_repair_pass_degrades_to_a_typed_default(self, service):
+        """The repair pass WRITES, so its failure is the one most likely to be
+        real — and it still must not fail an episode write that has ALREADY
+        committed. Same one guard, same typed-default discipline as zeta."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+        service._dedup_episode_edges = AsyncMock(return_value=1)
+        service._normalize_task_node_names = AsyncMock(return_value=5)
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+        service._repair_episode_referents = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        assert '_repair_episode_referents' in stats.errors
+        assert stats.repair_stats == ReferentRepairStats()
+        assert stats.edges_deduped == 1
+        assert stats.task_names_normalized == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+    async def test_the_repair_pass_never_swallows_cancellation(self, service, exc_type):
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+        service._repair_episode_referents = AsyncMock(side_effect=exc_type('interrupted'))
+
+        with pytest.raises(exc_type):
+            await service._reconcile_episode_identity(mock_result, group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_the_repair_pass_costs_nothing_on_the_clean_path(self, service):
+        """The ~99.8% case: zeta found nothing, so eta must issue ZERO backend
+        calls. This runs inside the per-group identity lock, where every
+        avoidable round-trip is contention every other writer pays for."""
+        from _fm_helpers import MockAddEpisodeResult
+
+        mock_result = MockAddEpisodeResult()
+        service._verify_episode_referents = AsyncMock(return_value=ReferentStats())
+        for name in ('ensure_entity_node', 'reassign_edge', 'refresh_entity_summary',
+                     'get_valid_edges_for_node', 'delete_entity'):
+            setattr(service.graphiti, name, AsyncMock())
+
+        stats = await service._reconcile_episode_identity(mock_result, group_id='test')
+
+        assert stats.repair_stats == ReferentRepairStats()
+        for name in ('ensure_entity_node', 'reassign_edge', 'refresh_entity_summary',
+                     'get_valid_edges_for_node', 'delete_entity'):
+            getattr(service.graphiti, name).assert_not_awaited()
 
     # best-effort per-sub-pass guard
 

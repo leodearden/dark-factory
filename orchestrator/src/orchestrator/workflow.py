@@ -1460,6 +1460,57 @@ class TaskWorkflow:
         self._claimant_heartbeat_task: asyncio.Task | None = None
 
     @property
+    def _filing_claimant_run_id(self) -> str:
+        """This incarnation's identity, stamped on every ``Escalation`` it files.
+
+        Task 3550.  Spec ``docs/task-escalation-state-spec.md`` S6, realised
+        by ``escalation.pins::classify_pins`` Link 4: an L0 is a live handoff
+        ONLY while the incarnation that FILED it lives, and liveness is judged
+        by comparing this value WHOLE against the live claimant.  That live
+        claimant is read from the ``claimant_run_id`` DB column, so this
+        property is also the SINGLE expression composing that column's value
+        — :meth:`_setup_worktree_and_artifacts`'s dispatch stamp routes
+        through it.  Two copies could drift, and a drifted filing identity
+        classifies a genuinely LIVE filer's own L0 as ``dead_l0``, the unsafe
+        direction.  Byte-identical by construction is the only guarantee
+        strong enough for an exact-string rule.
+
+        KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP, a
+        task 3563 follow-up): ``or ''`` means a HARNESS-LESS workflow
+        (``_process_run_id is None`` — tests/evals, see the field comment at
+        its declaration) composes the PARTIAL identity
+        ``'/{session_id}/pid={pid}'``.  That string carries the ``/pid=``
+        marker, so it passes ``escalation.pins._norm_id``'s shape guard and is
+        then compared whole as if it were KNOWN.  The ``plan.lock`` writer
+        deliberately does the OPPOSITE — it omits the key entirely when the
+        run id is unknown, so ``TaskGroundTruth`` resolves a fail-safe
+        ``None`` (see the :meth:`Artifacts.lock_plan` call site and the
+        ``Claimant`` docstring), and ``Harness._filing_claimant_run_id``
+        makes that same choice because it has no DB counterpart to match.
+        Task 3563 landed while deliberately leaving THIS side alone, so the
+        asymmetry is ratified and owned elsewhere.  Normalising it is the
+        follow-up's job; do not "fix" it by changing the plan.lock side to
+        match, and do not change it here — this side must keep matching the
+        DB stamp it composes.
+
+        Both components are read via ``getattr`` because this sits on the
+        ESCALATION-FILING path, which ``object.__new__(TaskWorkflow)`` test
+        fixtures reach while setting only the handful of attributes their
+        methods touch (see ``tests/test_workflow_sandbox_refusal.py``).  This
+        does NOT weaken the byte-identity guarantee above — the dispatch stamp
+        routes through this same property, so the two cannot diverge whatever
+        the attributes hold.  Nor does it widen the hazard: a MISSING
+        attribute and a declared-but-``None`` one are the same statement (the
+        component is unknown), which the ratified ``or ''`` already maps to an
+        empty component.
+        """
+        return compose_claimant_run_id(
+            getattr(self, '_process_run_id', None) or '',
+            getattr(self, 'session_id', None) or '',
+            os.getpid(),
+        )
+
+    @property
     def state(self) -> WorkflowState:
         """Current workflow phase, delegated to :attr:`machine`.
 
@@ -2299,23 +2350,15 @@ class TaskWorkflow:
         # claimant atomically with the dispatch status write, so there is no
         # window where the task is in-progress with no live claimant.
         #
-        # KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP,
-        # a task 3563 follow-up): `or ''` means a HARNESS-LESS workflow
-        # (`_process_run_id is None` — tests/evals, see the field comment at
-        # its declaration) stamps the PARTIAL identity '/{session_id}/pid={pid}'.
-        # That string carries the '/pid=' marker, so it passes
-        # escalation.pins._norm_id's shape guard and is then compared whole
-        # against filing identities as if it were KNOWN. The plan.lock writer
-        # below deliberately does the OPPOSITE — it omits the key entirely when
-        # the run id is unknown, so TaskGroundTruth resolves a fail-safe None
-        # (see the lock_plan call site and the Claimant docstring). Normalising
-        # THIS side is the follow-up's job; do not "fix" it by changing the
-        # plan.lock side to match.
+        # Composed via `_filing_claimant_run_id` (task 3550), which is the ONE
+        # expression producing this workflow's identity — the same value every
+        # Escalation this incarnation files carries. `escalation.pins` Link 4
+        # compares the two WHOLE, so they must not be able to drift; the
+        # property's docstring also carries the `or ''` KNOWN HAZARD note that
+        # used to live here.
         await self.scheduler.set_task_status(
             self.task_id, 'in-progress',
-            claimant_run_id=compose_claimant_run_id(
-                self._process_run_id or '', self.session_id, os.getpid(),
-            ),
+            claimant_run_id=self._filing_claimant_run_id,
             heartbeat_at=datetime.now(UTC).isoformat(),
         )
         self._claimant_heartbeat_task = asyncio.create_task(
@@ -7242,6 +7285,7 @@ class TaskWorkflow:
                 ),
                 suggested_action='manual_intervention',
                 level=2,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(esc)
         except Exception:
@@ -8966,6 +9010,7 @@ class TaskWorkflow:
             suggested_action='verify_wip_reconciliation',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
 
@@ -10004,6 +10049,74 @@ class TaskWorkflow:
 
         return self.artifacts.aggregate_reviews()
 
+    def _salvageable_verdict_payload(
+        self, role: AgentRole, envelope: object,
+    ) -> dict | None:
+        """Return *role*'s verdict payload out of *envelope* iff it is
+        well-formed and self-consistent, else ``None``.
+
+        Single validation seam shared by BOTH of ``_run_reviewer``'s salvage
+        paths — the normal post-invocation gate and the exception guard around
+        the ``_invoke`` await (task 3639) — so the two cannot drift apart.
+
+        PURE — takes the caller's already-read *envelope* (one
+        ``artifacts.read_verdict(role.name)`` result) rather than reading the
+        artifact itself.  The normal gate needs the envelope anyway, to tell
+        "no verdict file at all" from "file present but unusable" in its
+        diagnostic; reading it here too meant two stat+read+``json.loads``
+        round-trips per reviewer against a file that could change between them
+        (reviewer_comprehensive amendment, task 3639).
+
+        A payload is trusted only when every clause holds:
+
+        * the envelope is a dict (``read_verdict`` already returns ``None``
+          for a missing or corrupt file);
+        * its ``'verdict'`` member is itself a dict — an envelope missing the
+          payload key entirely is untrusted (defensive extraction);
+        * that payload's own ``verdict`` is in ``{PASS, ISSUES_FOUND}``;
+        * its ``reviewer`` names THIS role.
+
+        The identity clause is defense-in-depth.  ``_submit_review_verdict``
+        (``mcp/verdict_tools.py:86-95``) already rejects a mismatch at WRITE
+        time because "the artifact filename is authoritative for this role",
+        so only a corrupt, hand-edited or cross-role artifact can reach disk
+        under someone else's name.  It still matters: ``_run_reviewer``'s
+        return is mirrored verbatim into ``reviews/<role>.json`` (``_review``
+        -> ``artifacts.write_review``), and that mirror — despite
+        ``write_review``'s "debugging aid, not load-bearing" docstring
+        (``artifacts.py:851-852``) — is the SOLE input to
+        ``aggregate_reviews()``, which makes the blocking-issue decision.  A
+        cross-role payload returned verbatim would be filed, and its issues
+        counted, under the wrong reviewer's name.
+
+        Deliberately does NOT consider the invocation result.  Whether a run
+        that ended badly may still be salvaged is the CALLER's judgement, and
+        it differs by path: the normal gate excludes ``result.timed_out``, the
+        exception guard excludes ``TimeoutError`` — the same wall-clock-kill
+        exclusion expressed in each path's own vocabulary.
+        """
+        if not isinstance(envelope, dict):
+            return None
+        payload = envelope.get('verdict')
+        if not isinstance(payload, dict):
+            return None
+        if payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}:
+            return None
+        if payload.get('reviewer') != role.name:
+            logger.warning(
+                'Task %s: verdict artifact for %s carries reviewer %r — '
+                'refusing to attribute another role\'s verdict; failing safe',
+                self.task_id, role.name, payload.get('reviewer'),
+                extra={
+                    'event': 'reviewer_verdict_identity_mismatch',
+                    'task_id': str(self.task_id),
+                    'role': role.name,
+                    'payload_reviewer': str(payload.get('reviewer')),
+                },
+            )
+            return None
+        return payload
+
     async def _run_reviewer(
         self, role: AgentRole, diff: str,
         amendment_suggestions: list[dict] | None = None,
@@ -10022,7 +10135,84 @@ class TaskWorkflow:
         # this same worktree (mirrors _resolve_and_resubmit's pre-spawn
         # clear, workflow.py:7073-7075).
         self.artifacts.clear_verdict(role.name)
-        result = await self._invoke(role, prompt, self.worktree)
+        # EXCEPTION-PATH completion of b4fe7171d3's I-FAIL-SAFE narrowing
+        # (task 3639).  That commit removed `not result.success` from the
+        # gate below, but an exception escaping this await bypasses the gate
+        # ENTIRELY — it is raised one line after clear_verdict(), long before
+        # the read_verdict() salvage.  `_review` then treats the exception as
+        # a first-class outcome: its gather(..., return_exceptions=True)
+        # captures it, the retry loop re-enters _run_reviewer whose
+        # clear_verdict() destroys the recoverable verdict PERMANENTLY, and
+        # on exhaustion it synthesizes {'verdict': 'ERROR', 'issues': []}
+        # without ever consulting disk.  That is the esc-5777-7 shape: a good
+        # verdicts/ artifact and an ERROR reviews/ mirror seconds later.
+        # Salvage must therefore run here, BEFORE any respawn.
+        try:
+            result = await self._invoke(role, prompt, self.worktree)
+        except (
+            TimeoutError,
+            AllAccountsCappedException,
+            _SessionBudgetExhausted,
+        ):
+            # Ordered first: all three ARE Exception subclasses and would
+            # otherwise be swallowed below.
+            #
+            # TimeoutError — exception-path analogue of the `result.timed_out`
+            # exclusion in the gate: a wall-clock kill can land mid-write, so
+            # its artifact may reflect a partial pass.
+            #
+            # AllAccountsCappedException / SessionBudgetExhausted — HALT-class
+            # control flow, not reviewer failure (reviewer_comprehensive
+            # amendment, task 3639).  Both carry a `RequeueKind.BLOCK`
+            # disposition in `workflow_types.classify_failure`'s table and are
+            # handled by name in `_drive` (workflow.py:3019, :3031).  Reachable
+            # here with a verdict already on disk: `invoke_with_cap_retry` runs
+            # the reviewer on attempt 1 (the agent calls
+            # submit_review_verdict, so the payload IS written), the run then
+            # hits an account cap, and the retry re-enters
+            # `UsageGate.before_invoke` with the session budget now exhausted.
+            # Salvaging that into a PASS/ISSUES_FOUND return would mask the
+            # halt signal, letting the workflow walk past REVIEW and block at
+            # the NEXT `_invoke` instead — attributing the stop to the wrong
+            # phase.  Re-raising restores the pre-task-3639 handling for these
+            # two exactly (`_review`'s retry then its synthesized ERROR); that
+            # retry's own clear_verdict() does drop the artifact, which is the
+            # accepted cost of not masking a halt — a capped/exhausted account
+            # cannot produce a better verdict on the next attempt anyway.
+            #
+            # Deliberately an explicit tuple rather than
+            # `classify_failure(exc).requeue_kind is BLOCK`: `_DEFAULT_BLOCK`
+            # (workflow_types.py:206-213) is itself BLOCK, so that predicate
+            # would re-raise essentially everything and neuter the salvage.
+            #
+            # asyncio.CancelledError needs no clause of its own: it is a
+            # BaseException in 3.13, so `except Exception` excludes it by
+            # construction and cooperative cancellation keeps propagating,
+            # mirroring _invoke's own preserve-and-re-raise contract.
+            raise
+        except Exception as exc:
+            payload = self._salvageable_verdict_payload(
+                role, self.artifacts.read_verdict(role.name),
+            )
+            if payload is None:
+                # Nothing recoverable — task 3321's no-emit case.  Propagate
+                # so _review's retry + synthesized-ERROR fail-safe is intact.
+                raise
+            logger.warning(
+                'Task %s: reviewer %s invocation raised %s but a well-formed '
+                '%s verdict is on disk — salvaging instead of discarding '
+                '(task 3639)',
+                self.task_id, role.name, type(exc).__name__,
+                payload.get('verdict'),
+                extra={
+                    'event': 'reviewer_verdict_salvaged_from_exception',
+                    'task_id': str(self.task_id),
+                    'role': role.name,
+                    'verdict': str(payload.get('verdict')),
+                    'exc_type': type(exc).__name__,
+                },
+            )
+            return payload
 
         # Read the reviewer's structured verdict instead of the
         # structured_output/json.loads cascade (task 2484 / PRD task δ).
@@ -10050,13 +10240,25 @@ class TaskWorkflow:
         # used despite `not result.success`).  What still fails safe:
         #   - no verdict file / unparseable envelope / malformed payload;
         #   - an inner verdict outside {PASS, ISSUES_FOUND};
+        #   - a payload whose `reviewer` names a DIFFERENT role (task 3639);
         #   - ANY timed-out invocation (`result.timed_out`), whose verdict
         #     may be from a partial, aborted run — precisely the case the
         #     original fail-safe exists for.
         # The `ended_awaiting_background` false positive itself is task
         # 3639's; this only stops it from destroying a verdict we already
         # have.
+        #
+        # Well-formedness AND cross-role self-consistency both live in
+        # `_salvageable_verdict_payload`, so this gate and the exception guard
+        # around the `_invoke` await validate identically (task 3639).
+        # ONE read of `verdicts/<role>.json`, consumed by both the gate and the
+        # diagnostic below (which must tell "no verdict file at all" apart from
+        # "file present but unusable", a distinction `payload is None` alone
+        # cannot make).  The helper is a pure validator over this envelope, so
+        # there is no second round-trip and no window for the two reads to
+        # disagree (reviewer_comprehensive amendment, task 3639).
         envelope = self.artifacts.read_verdict(role.name)
+        payload = self._salvageable_verdict_payload(role, envelope)
         if envelope is None and result.success:
             # Observability (reviewer_comprehensive amendment, task 2484):
             # a missing meta-root would make the verdict-tools server
@@ -10081,10 +10283,8 @@ class TaskWorkflow:
                     'exists) — reviewer did not call submit_review_verdict',
                     self.task_id, role.name, verdicts_dir,
                 )
-        payload = envelope.get('verdict') if isinstance(envelope, dict) else None
         if (
-            not isinstance(payload, dict)
-            or payload.get('verdict') not in {'PASS', 'ISSUES_FOUND'}
+            payload is None
             # A timed-out run stays fail-safe even with a well-formed verdict
             # on disk — it was killed mid-flight, so the verdict may be from
             # a partial pass.  Note `not result.success` is deliberately NOT
@@ -11097,6 +11297,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 suggested_action='main_health_auto_heal_in_flight',
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             if fp:
                 esc.dedupe_fingerprint = fp
@@ -11938,6 +12139,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     workflow_state=self.state.value,
                     level=1,
                     train_state=train_state,  # type: ignore[arg-type]
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 self.escalation_queue.submit(esc)
                 logger.warning(
@@ -12138,6 +12340,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
             train_state=train_state,  # type: ignore[arg-type]
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._submit_halt_owning_escalation(esc)
         logger.info(
@@ -12195,6 +12398,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 train_state=train_state,  # type: ignore[arg-type]
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(esc)
         except Exception:
@@ -12239,6 +12443,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 level=1,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
@@ -12283,6 +12488,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 level=1,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
@@ -12950,7 +13156,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         )
             # RE-CORROBORATE against the config dir we are about to USE.
             #
-            # The harness eligibility guard (_session_resume_eligible) checks a
+            # The harness eligibility guard (_session_resume_reasons) checks a
             # BOOT-TIME snapshot path — the config dir that existed when
             # recovery ran.  self._config_dir is constructed fresh (see
             # _setup_worktree) from whatever lane was acquired AFTERWARDS, and
@@ -13309,6 +13515,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # zero-output wedge (transcript_turns==0/None).
                     'transcript_turns': result.transcript_turns,
                     'timed_out': result.timed_out,
+                    # Same truthful-reporting principle (task 3639): this flag
+                    # is what actually DECIDES the success verdict for a
+                    # downgraded run (subtype stays 'success' while success
+                    # flips False), yet it appeared in 0 of 3,340
+                    # invocation_end rows — so diagnosing the class required a
+                    # manual transcript dig.  Emitted unconditionally, False
+                    # included: present-and-false is what makes the
+                    # false-positive rate computable from runs.db, since a
+                    # True-only key leaves the denominator unknowable.
+                    'ended_awaiting_background': result.ended_awaiting_background,
                 },
             )
 
@@ -14568,6 +14784,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_and_retry',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -14657,6 +14874,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='install_sandbox_backend_or_set_backend_none',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -14974,6 +15192,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_and_retry',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -15009,6 +15228,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_log_corruption',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
 
@@ -15169,6 +15389,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(l1)
             if self.event_store:
@@ -15503,6 +15724,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     suggested_action=suggested_action,
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 if dedupe_fingerprint:
                     # Cross-task N->1 dedup: stamp the fingerprint and route
@@ -15675,9 +15897,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     #     already-merged task.  Escalation.filing_claimant_run_id
                     #     is the field that would make a real
                     #     filed-by-this-incarnation predicate possible, but it
-                    #     is stamped only in tests today, never on a
-                    #     production filing path; stamping it is the
-                    #     principled follow-up.
+                    #     is now stamped on every production filing path
+                    #     (task 3550: TaskWorkflow, Harness, and the
+                    #     escalate_blocker/escalate_info chokepoint).  This
+                    #     sweep's dismissal set is nonetheless STILL
+                    #     deliberately unchanged — narrowing it to a real
+                    #     filed-by-this-incarnation predicate is a behaviour
+                    #     change owned by task 3541, not by the task that
+                    #     merely populated the field.
                     # (iii) Do NOT "fix" the sibling sweep sites by symmetry:
                     #     each of them has an L1 open by construction, so
                     #     dismissing a stray L0 there is deliberate
@@ -15975,6 +16202,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             level=1,
             train_state=train_state,
             root_cause=root_cause,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -16417,6 +16645,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='triage_suggestions',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -16456,6 +16685,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='fix_review_issues',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:

@@ -1631,6 +1631,25 @@ def test_hand_launched_record_keeps_the_durable_session_leader_pid(
 # ---------------------------------------------------------------------------
 
 
+def _launching_record(
+    slug: str,
+    root: Path,
+    *,
+    pid: int = 4193001,
+    start_ts: str | None = None,
+) -> None:
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.LAUNCHING,
+            launcher_pid=pid,
+            role='cockpit',
+            start_ts=start_ts if start_ts is not None else datetime.now(UTC).isoformat(),
+        ),
+        root=root,
+    )
+
+
 def test_refresh_path_does_not_bind_a_still_launching_record(tmp_path: Path) -> None:
     # spawn-claude.sh's `launching` write has not been sighted by its
     # owner's SessionStart yet (delayed, timed out under the 10s hook
@@ -1648,6 +1667,7 @@ def test_refresh_path_does_not_bind_a_still_launching_record(tmp_path: Path) -> 
             project='cockpit',
             prompt='/spawn cockpit',
             launcher_pid=3215100,
+            start_ts=datetime.now(UTC).isoformat(),
         ),
         root=tmp_path,
     )
@@ -1678,12 +1698,7 @@ def test_refresh_path_withholds_a_question_during_the_unbound_launch_window(
     # is the thing awaiting input. Withheld on the same unknowable-provenance
     # grounds as the status and the binding.
     slug = 'session-cockpit-3215103'
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215103
-        ),
-        root=tmp_path,
-    )
+    _launching_record(slug, tmp_path, pid=3215103)
     hook_input = {
         'session_id': 'uuid-nested',
         'cwd': '/home/leo/src/dark-factory',
@@ -2016,8 +2031,26 @@ def test_run_session_start_windowid_env_stamps_wm_display(tmp_path: Path) -> Non
     record = sr.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
+    assert record.display.wm_window_id == '0x03200007'
     assert record.display.wm_title == 'session:dark-factory'
+
+
+def test_run_session_start_decimal_windowid_stamps_canonical_hex_display(tmp_path: Path) -> None:
+    # Real terminal emulators export $WINDOWID as a bare DECIMAL (e.g.
+    # '52428807'), not hex. Capture must canonicalize it to wmctrl -l's
+    # 0x%08x column form ('0x03200007') so string-consumers (the window-gone
+    # reaper, dashboards) and the wm backend agree. 52428807 == 0x03200007
+    # is an exact identity.
+    hook_input = {'session_id': 'sess-d2b', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'WINDOWID': '52428807'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.display is not None
+    assert record.display.kind == 'wm'
+    assert record.display.wm_window_id == '0x03200007'
 
 
 def test_run_session_start_tmux_takes_precedence_over_windowid(tmp_path: Path) -> None:
@@ -2069,7 +2102,7 @@ def test_run_session_start_display_stamping_applies_on_refresh_path(tmp_path: Pa
     assert record.status == sr.Status.RUNNING
     assert record.display is not None
     assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
+    assert record.display.wm_window_id == '0x03200007'
     # wm_title resolves from the persisted record title (hook_display_title's
     # existing precedence), not a freshly-derived role:project fallback.
     assert record.display.wm_title == 'unblock:df#2085 routing-mechanism'
@@ -2138,7 +2171,7 @@ def test_run_session_start_windowid_wins_over_marker_title_resolver_not_called(
     record = sr.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'wm'
-    assert record.display.wm_window_id == '0x3200007'
+    assert record.display.wm_window_id == '0x03200007'
 
 
 def test_run_session_start_tmux_wins_over_marker_title_resolver_not_called(
@@ -3108,19 +3141,6 @@ def _owner_ppid_env(slug: str, ppid: int) -> dict[str, str]:
     return {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_OWNER_PPID': str(ppid)}
 
 
-def _launching_record(slug: str, root: Path, *, pid: int = 4193001) -> None:
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug,
-            status=sr.Status.LAUNCHING,
-            launcher_pid=pid,
-            role='cockpit',
-            start_ts=datetime.now(UTC).isoformat(),
-        ),
-        root=root,
-    )
-
-
 def test_nested_session_start_cannot_capture_an_unbound_launching_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3343,6 +3363,70 @@ def test_withholding_expires_so_a_stuck_record_is_never_blind_forever(
     # The expiry buys VISIBILITY, not ownership: provenance is still
     # unproven, so the record stays unbound and open for its true owner
     # rather than being claimed by whoever broke the deadlock (esc-4193-10).
+    assert record.claude_session_id is None
+
+
+@pytest.mark.parametrize(
+    'start_ts',
+    [
+        pytest.param('', id='missing'),
+        pytest.param('not-a-timestamp', id='unparseable'),
+        pytest.param(
+            (
+                datetime.now(UTC) - timedelta(seconds=sh._LAUNCH_WINDOW_WITHHOLD_MAX_SECS + 60)
+            ).replace(tzinfo=None).isoformat(),
+            id='stale-naive',
+        ),
+    ],
+)
+def test_unreadable_or_stale_start_ts_expires_immediately_instead_of_withholding_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_ts: str,
+) -> None:
+    # start_ts defaults to '' on SessionRecord, and may also arrive corrupt
+    # or simply stale. None of these is evidence the spawn is healthy:
+    # treating any of them as "still within the window" (the old behaviour
+    # for the first two) would let a record withhold FOREVER -- the exact
+    # permanently-blind failure _LAUNCH_WINDOW_WITHHOLD_MAX_SECS exists to
+    # bound (esc-4193-8 item 4-iii). A record with no readable -- or no
+    # in-window -- clock must be treated as expired and become visible
+    # immediately. The third (tz-naive) case also confirms a naive
+    # timestamp is parsed (assumed UTC) rather than rejected as
+    # unparseable; see test_naive_start_ts_inside_the_window_still_withholds
+    # for the discriminating in-window counterpart.
+    slug = 'session-cockpit-4661001'
+    _launching_record(slug, tmp_path, pid=4661001, start_ts=start_ts)
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+
+    sh.run_stop({'session_id': 'uuid-expired', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.IDLE
+    assert record.claude_session_id is None
+
+
+def test_naive_start_ts_inside_the_window_still_withholds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The discriminating case for the tz-naive-assumed-UTC branch. A stale
+    # naive timestamp (above) would also expire under a WRONG assumption --
+    # e.g. local time at a non-negative UTC offset, or a dropped comparison
+    # -- so it cannot tell "assumed UTC" apart from those. Only an in-window
+    # naive timestamp discriminates: under a correct UTC assumption the
+    # record is still within bound and must stay withheld (LAUNCHING).
+    slug = 'session-cockpit-4661004'
+    recent_naive = (datetime.now(UTC) - timedelta(seconds=5)).replace(tzinfo=None).isoformat()
+    _launching_record(slug, tmp_path, pid=4661004, start_ts=recent_naive)
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+
+    sh.run_stop({'session_id': 'uuid-naive-recent', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status is sr.Status.LAUNCHING
     assert record.claude_session_id is None
 
 

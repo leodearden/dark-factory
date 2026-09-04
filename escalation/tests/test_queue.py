@@ -7,8 +7,11 @@ import fcntl
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -28,6 +31,13 @@ from escalation.queue import (
     iter_all_escalation_paths,
 )
 
+#: "argument not supplied", distinct from an explicitly-passed ``None``.
+#: Needed wherever a helper's default must not collide with a MEANINGFUL
+#: ``None`` value — e.g. seeding a record whose ``citation_sha`` is genuinely
+#: absent, which ``citation_sha=None`` would otherwise read as "use the
+#: default sha" (amendment pass, task 4499).
+_UNSET: Any = object()
+
 
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
     esc = Escalation(
@@ -46,6 +56,35 @@ def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', l
 def _submit_escalation(queue: EscalationQueue, esc: Escalation) -> None:
     """Write an escalation directly, bypassing the callback."""
     queue.submit(esc)
+
+
+def _aged_escalation(
+    esc_id: str,
+    *,
+    age_secs: float,
+    task_id: str = '1',
+    level: int = 0,
+    severity: str = 'blocking',
+) -> Escalation:
+    """An escalation explicitly stamped *age_secs* in the past.
+
+    Every age-aware test pins its own timestamps and passes its own explicit
+    threshold, so no assertion here depends on the production default value of
+    ``orphan_l0_timeout_secs`` (task 3172).
+    """
+    esc = _make_escalation(esc_id, task_id=task_id, level=level)
+    esc.severity = severity
+    esc.timestamp = (datetime.now(UTC) - timedelta(seconds=age_secs)).isoformat()
+    return esc
+
+
+_PENDING_SECS_RE = re.compile(r'\[pending_secs=(\d+)\b')
+
+
+def _pending_secs(resolution: str) -> int | None:
+    """Parse the pending-age token out of a dismissal resolution, or None."""
+    m = _PENDING_SECS_RE.search(resolution)
+    return int(m.group(1)) if m else None
 
 
 class TestDismissAllPending:
@@ -69,7 +108,9 @@ class TestDismissAllPending:
         updated = queue.get('esc-1-1')
         assert updated is not None
         assert updated.status == 'dismissed'
-        assert updated.resolution == 'Stale from prior run'
+        # Prefix, not equality: the pending age is always recorded (task 3172).
+        assert updated.resolution is not None
+        assert updated.resolution.startswith('Stale from prior run')
 
     def test_multiple_pending_all_dismissed(self, tmp_path: Path):
         """Multiple pending escalations are all dismissed; count matches."""
@@ -126,7 +167,12 @@ class TestDismissAllPending:
         assert dismissed_esc.resolution == 'User dismissed earlier'  # unchanged
 
     def test_resolution_message_preserved(self, tmp_path: Path):
-        """Resolution message is preserved on dismissed escalations."""
+        """Resolution message is preserved on dismissed escalations.
+
+        The caller's message is now a PREFIX rather than the whole string:
+        per-record pending age is always recorded alongside it (task 3172
+        ASK A), so a swept record carries how long it had been waiting.
+        """
         queue = EscalationQueue(tmp_path / 'queue')
         queue.submit(_make_escalation('esc-1-1'))
 
@@ -135,7 +181,9 @@ class TestDismissAllPending:
 
         esc = queue.get('esc-1-1')
         assert esc is not None
-        assert esc.resolution == msg
+        assert esc.resolution is not None
+        assert esc.resolution.startswith(msg)
+        assert _pending_secs(esc.resolution) is not None
 
     def test_mixed_statuses_only_pending_dismissed(self, tmp_path: Path):
         """With a mix of pending/resolved/dismissed, only pending ones are dismissed."""
@@ -159,6 +207,240 @@ class TestDismissAllPending:
         assert queue.get('esc-3-1').status == 'resolved'  # type: ignore[union-attr]
         assert queue.get('esc-4-1').status == 'dismissed'  # type: ignore[union-attr]
         assert queue.get('esc-4-1').resolution == 'dismissed already'  # type: ignore[union-attr]
+
+
+class TestDismissAllPendingAgeAware:
+    """dismiss_all_pending() records pending age and stamps long strands distinctly.
+
+    The origin incident (task 3172): a restart swept esc-5189-7, pending 20h58m
+    with a workflow parked on it, using the same fixed resolution string and the
+    same 'benign' class as esc-5685-1, pending ~90s.  The two records were
+    indistinguishable afterwards, so a 20h strand read as ordinary restart
+    noise.  These tests pin that they are now distinguishable.
+    """
+
+    STRAND_AGE_SECS = 75480.0  # 20h58m — esc-5189-7
+    FRESH_AGE_SECS = 90.0  # ~90s — esc-5685-1
+    THRESHOLD_SECS = 600.0
+
+    def _seed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(
+            _aged_escalation(
+                'esc-5189-7', age_secs=self.STRAND_AGE_SECS, task_id='5189', severity='blocking'
+            )
+        )
+        queue.submit(
+            _aged_escalation('esc-5685-1', age_secs=self.FRESH_AGE_SECS, task_id='5685')
+        )
+        queue.submit(_aged_escalation('esc-9-1', age_secs=self.STRAND_AGE_SECS, task_id='9', level=1))
+        return queue
+
+    def test_returns_plain_int_count_of_dismissed_l0s(self, tmp_path: Path):
+        """Return type stays a plain int — the L1 is not counted."""
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert type(count) is int
+        assert count == 2
+
+    def test_level_1_escalation_untouched(self, tmp_path: Path):
+        """A 20h-old L1 is still preserved across the age-aware sweep."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        l1 = queue.get('esc-9-1')
+        assert l1 is not None
+        assert l1.status == 'pending'
+        assert l1.resolution_class is None
+
+    def test_strand_and_fresh_record_get_distinguishable_classes(self, tmp_path: Path):
+        """THE user-observable signal: the 20h strand and the 90s artifact differ."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert strand.resolution_class == 'stale-strand'
+        assert fresh.resolution_class == 'benign'
+        assert strand.resolution_class != fresh.resolution_class
+
+    def test_effective_benign_reads_both_stamps_verbatim(self, tmp_path: Path):
+        """The dashboard classifier reads each stamp as stamped, not inferred."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert effective_benign(strand) == ('stale-strand', 'stamped')
+        assert effective_benign(fresh) == ('benign', 'stamped')
+
+    def test_both_resolutions_keep_caller_message_and_record_pending_age(self, tmp_path: Path):
+        """Every dismissed L0 keeps the caller's message and gains its own age."""
+        queue = self._seed(tmp_path)
+        msg = 'Auto-dismissed: orchestrator restarted — stale from prior run'
+
+        queue.dismiss_all_pending(msg, strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        fresh = queue.get('esc-5685-1')
+        assert strand is not None and fresh is not None
+        assert strand.resolution is not None and fresh.resolution is not None
+        assert strand.resolution.startswith(msg)
+        assert fresh.resolution.startswith(msg)
+        assert abs(_pending_secs(strand.resolution) - self.STRAND_AGE_SECS) < 5  # type: ignore[operator]
+        assert abs(_pending_secs(fresh.resolution) - self.FRESH_AGE_SECS) < 5  # type: ignore[operator]
+
+    def test_resolution_records_severity_alongside_age(self, tmp_path: Path):
+        """The durable blocked-ness signal travels with the swept record."""
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        strand = queue.get('esc-5189-7')
+        assert strand is not None
+        assert strand.resolution is not None
+        assert 'severity=blocking' in strand.resolution
+
+
+class TestDismissAllPendingAgeAwareDegrades:
+    """The age-aware sweep degrades honestly — loudly, and never into a false strand.
+
+    Clearing stale L0s at startup must still happen even when a record's
+    timestamp cannot be aged; what must NOT happen is a malformed record being
+    silently promoted to 'stale-strand' by a floor sentinel, or dropped in
+    silence (task 3172).
+    """
+
+    THRESHOLD_SECS = 600.0
+
+    def test_unparseable_timestamp_is_still_dismissed(self, tmp_path: Path):
+        """A garbage timestamp does not stop the record from being swept."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert count == 1
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.status == 'dismissed'
+
+    def test_unparseable_timestamp_is_never_stamped_stale_strand(self, tmp_path: Path):
+        """A malformed record must not read as maximally stale.
+
+        The parse fallback sorts an unparseable record as NEWEST, so a corrupt
+        timestamp can never be mislabelled a 20h strand.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.resolution_class != 'stale-strand'
+        assert swept.resolution_class == 'benign'
+
+    def test_unparseable_timestamp_carries_no_age_token(self, tmp_path: Path):
+        """No age is claimed for a record whose age is unknowable."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        msg = 'Stale from prior run'
+        queue.dismiss_all_pending(msg, strand_age_secs=self.THRESHOLD_SECS)
+
+        swept = queue.get('esc-7-1')
+        assert swept is not None
+        assert swept.resolution is not None
+        assert swept.resolution.startswith(msg)
+        assert _pending_secs(swept.resolution) is None
+
+    def test_unparseable_timestamp_logs_a_warning(self, tmp_path: Path, caplog):
+        """The skip is LOUD — a warning names the offending escalation."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-7-1', task_id='7')
+        esc.timestamp = 'not-a-timestamp'
+        queue.submit(esc)
+
+        with caplog.at_level(logging.WARNING):
+            queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('esc-7-1' in m for m in warnings), warnings
+
+    def test_naive_timestamp_is_treated_as_utc(self, tmp_path: Path):
+        """A tz-naive stamp is read as UTC, not misread as ancient.
+
+        The record is deliberately RECENT: if a naive stamp were mishandled it
+        would age out to something enormous and be mis-stamped a strand.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-8-1', task_id='8')
+        esc.timestamp = (datetime.now(UTC) - timedelta(seconds=90)).replace(tzinfo=None).isoformat()
+        queue.submit(esc)
+
+        count = queue.dismiss_all_pending('Stale from prior run', strand_age_secs=self.THRESHOLD_SECS)
+
+        assert count == 1
+        swept = queue.get('esc-8-1')
+        assert swept is not None
+        assert swept.status == 'dismissed'
+        assert swept.resolution_class == 'benign'
+        assert swept.resolution_class != 'stale-strand'
+        assert abs(_pending_secs(swept.resolution) - 90) < 5  # type: ignore[operator]
+
+    def test_omitted_threshold_preserves_pre_3172_classification(self, tmp_path: Path):
+        """Opt-in default: without strand_age_secs a 20h L0 is still 'benign'.
+
+        A caller that has not been considered cannot be silently reclassified.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-5189-7', age_secs=75480.0, task_id='5189'))
+
+        count = queue.dismiss_all_pending('Stale from prior run')
+
+        assert count == 1
+        swept = queue.get('esc-5189-7')
+        assert swept is not None
+        assert swept.resolution_class == 'benign'
+        assert effective_benign(swept) == ('benign', 'stamped')
+
+    def test_resolve_failure_does_not_abort_the_age_aware_sweep(self, tmp_path: Path):
+        """One raising record cannot cost the others their dismissal or the count."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=75480.0, task_id='1'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=90.0, task_id='3'))
+
+        original_resolve = queue.resolve
+
+        def patched_resolve(esc_id: str, resolution: str, dismiss: bool = False, **kwargs):
+            if esc_id == 'esc-2-1':
+                raise OSError('disk full')
+            return original_resolve(esc_id, resolution, dismiss=dismiss, **kwargs)
+
+        with patch.object(queue, 'resolve', side_effect=patched_resolve):
+            count = queue.dismiss_all_pending(
+                'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS
+            )
+
+        assert count == 2
+        assert queue.get('esc-1-1').resolution_class == 'stale-strand'  # type: ignore[union-attr]
+        assert queue.get('esc-3-1').resolution_class == 'benign'  # type: ignore[union-attr]
+        assert queue.get('esc-2-1').status == 'pending'  # type: ignore[union-attr]
 
 
 class TestDismissAllPendingResilience:
@@ -4202,6 +4484,11 @@ class TestEscalationIdLock:
 # ---------------------------------------------------------------------------
 
 _CHILD_SCRIPT = Path(__file__).parent / '_concurrent_queue_child.py'
+#: A SECOND child-runner, for `note_suppressed_refile`'s cross-process
+#: increment.  It would naturally be a fifth op on `_CHILD_SCRIPT` above; that
+#: file was outside the editable scope of task 4499, so the op lives in its own
+#: file.  Folding it back in is a clean follow-up (see the script's docstring).
+_SUPPRESSED_REFILE_CHILD = Path(__file__).parent / '_suppressed_refile_child.py'
 
 
 class TestAddMembersToL2Concurrency:
@@ -5664,4 +5951,398 @@ class TestAddMembersToL2VariantConcurrency:
         assert set(record.root_cause_variants) == expected, (
             'concurrent folds lost spellings — missing: '
             f'{sorted(expected - set(record.root_cause_variants))}'
+        )
+
+
+class TestFindTerminalByCitation:
+    """EscalationQueue.find_terminal_by_citation() — "was this exact evidence already adjudicated?"
+
+    The complement of ``has_open_l1``, which asks "is a duplicate still OPEN?"
+    and reads PENDING records only.  Once the auto-watcher resolves a
+    ``provenance_unattributed`` L1 the pending guard goes False, and because the
+    reject condition is ABSORBING the very next tick refiles the identical
+    finding — a close-then-refile ping-pong.  This read closes that loop by
+    matching the TERMINAL record carrying the same
+    ``(task_id, category, citation_sha)`` triple (task 4499).
+    """
+
+    CITATION = 'b' * 40
+    CATEGORY = 'provenance_unattributed'
+
+    def _filed(
+        self,
+        queue: EscalationQueue,
+        esc_id: str,
+        *,
+        task_id: str = '1',
+        citation_sha: str | None = _UNSET,
+        category: str | None = None,
+    ) -> Escalation:
+        """Submit a provenance-shaped L1 carrying *citation_sha*.
+
+        *citation_sha* defaults to the ``_UNSET`` sentinel rather than to
+        ``None`` so that ``citation_sha=None`` seeds a record whose identity is
+        genuinely ABSENT — the state a ``no_citation`` reject files.  Defaulting
+        on ``None`` would silently substitute ``CITATION`` there and make the
+        "stored without a citation" cell unreachable (amendment pass).
+        """
+        esc = _make_escalation(esc_id, task_id=task_id, level=1)
+        esc.category = category if category is not None else self.CATEGORY
+        esc.citation_sha = self.CITATION if citation_sha is _UNSET else citation_sha
+        _submit_escalation(queue, esc)
+        return esc
+
+    def _archived_path(self, queue: EscalationQueue, esc_id: str) -> Path:
+        matches = list((queue.queue_dir / 'archive').rglob(f'{esc_id}.json'))
+        assert len(matches) == 1, f'expected exactly one archive copy of {esc_id}; got {matches}'
+        return matches[0]
+
+    def _force_resolved_at(self, queue: EscalationQueue, esc_id: str, stamp: str) -> None:
+        """Rewrite an archived record's resolved_at so ordering is clock-independent."""
+        path = self._archived_path(queue, esc_id)
+        data = json.loads(path.read_text())
+        data['resolved_at'] = stamp
+        path.write_text(json.dumps(data, indent=2))
+
+    def test_resolved_record_matching_the_triple_is_returned(self, tmp_path: Path):
+        """(1) The whole point — a resolved record on this exact evidence is found."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'confirmed benign', resolved_by='escalation-watcher-auto')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a resolved record on this citation must be found'
+        assert found.id == 'esc-1-1', f'wrong record returned: {found.id!r}'
+
+    def test_dismissed_record_is_also_terminal(self, tmp_path: Path):
+        """(2) A dismissal is an equally terminal decision on that exact evidence."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'not a real defect', dismiss=True)
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a DISMISSED record adjudicates the evidence just as a resolved one does'
+        assert found.status == 'dismissed', f'expected dismissed; got {found.status!r}'
+
+    def test_different_citation_sha_does_not_match(self, tmp_path: Path):
+        """(3) Genuine NEW evidence must escape — a different sha is a different finding."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, 'c' * 40) is None
+
+    def test_different_category_does_not_match(self, tmp_path: Path):
+        """(4) A different root cause must escape suppression."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', category='task_failure')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None
+
+    def test_pending_record_is_not_reported(self, tmp_path: Path):
+        """(5) A pending match is has_open_l1's contract, deliberately not this one's."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None, (
+            'a still-pending record must NOT be reported as adjudicated'
+        )
+
+    @pytest.mark.parametrize('falsy', [None, ''])
+    def test_falsy_lookup_key_short_circuits(self, tmp_path: Path, falsy: str | None):
+        """(6a) LOOKUP-KEY half — a no_citation verdict carries no identity to match on.
+
+        The record here deliberately carries a FULL identity (``CITATION``): the
+        point is that the incoming filing has none, so the ``find_dedupe_parent``
+        falsy-key short-circuit answers None before any record is compared.  A
+        no_citation reject can therefore never be suppressed — not even against
+        a resolution on the very same task and category.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, falsy) is None, (
+            f'falsy lookup key {falsy!r} must short-circuit to None, never match'
+        )
+
+    @pytest.mark.parametrize('stored', [None, ''])
+    def test_record_stored_without_a_citation_never_matches_a_real_sha(
+        self, tmp_path: Path, stored: str | None,
+    ):
+        """(6b) STORED-IDENTITY half — the other direction, and the one the short-circuit misses.
+
+        A resolution filed with no evidence identity (the ``no_citation`` arm)
+        must never be returned for a filing that DOES carry a sha: that would be
+        a cross-finding collapse, suppressing real evidence against an
+        adjudication of something else entirely.  Pinned separately from (6a)
+        because it survives the falsy-key short-circuit being moved or removed —
+        the per-record ``esc.citation_sha != citation_sha`` comparison is what
+        has to reject it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', citation_sha=stored)
+        queue.resolve('esc-1-1', 'confirmed benign')
+        seeded = queue.get('esc-1-1')
+        assert seeded is not None and seeded.citation_sha == stored, (
+            'Pre-condition: the record must really be stored WITHOUT an identity'
+        )
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None, (
+            f'a record stored with citation_sha={stored!r} matched a real sha — '
+            'unrelated findings would collapse into one another'
+        )
+
+    def test_no_record_at_all_returns_none(self, tmp_path: Path):
+        """(7) An empty queue answers None rather than raising."""
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        assert queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION) is None
+
+    def test_glob_over_match_on_hyphenated_sibling_task_is_rejected(self, tmp_path: Path):
+        """(8) `esc-{task_id}-*.json` over-matches sibling hyphenated ids.
+
+        The hyphen hazard `_recover_seq_from_disk` documents: the glob for task
+        '1-2' also matches esc-1-2-3-9.json, which belongs to task '1-2-3'.  The
+        record's OWN task_id field is the authoritative filter.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-2-3-9', task_id='1-2-3')
+        queue.resolve('esc-1-2-3-9', 'confirmed benign')
+
+        assert queue.find_terminal_by_citation('1-2', self.CATEGORY, self.CITATION) is None, (
+            "task '1-2-3' record leaked into task '1-2' via the glob over-match"
+        )
+        assert queue.find_terminal_by_citation('1-2-3', self.CATEGORY, self.CITATION) is not None, (
+            'the owning task must still find its own record'
+        )
+
+    def test_newest_terminal_record_wins(self, tmp_path: Path):
+        """(9) Several terminal matches — the newest by resolved_at is returned."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'first adjudication')
+        self._filed(queue, 'esc-1-2')
+        queue.resolve('esc-1-2', 'second adjudication')
+        self._force_resolved_at(queue, 'esc-1-1', '2026-01-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-2', '2026-06-01T00:00:00+00:00')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None
+        assert found.id == 'esc-1-2', (
+            f'expected the NEWEST adjudication esc-1-2; got {found.id!r}'
+        )
+
+    def test_malformed_resolved_at_sorts_oldest_and_never_displaces(self, tmp_path: Path):
+        """A malformed stamp is treated as oldest — it never displaces a well-formed newer match.
+
+        Loud-over-silent: the record is still a legitimate adjudication, so it is
+        never dropped; it simply loses the newest-wins comparison.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1')
+        queue.resolve('esc-1-1', 'well-formed adjudication')
+        self._filed(queue, 'esc-1-2')
+        queue.resolve('esc-1-2', 'adjudication with a broken stamp')
+        self._force_resolved_at(queue, 'esc-1-1', '2026-01-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-2', 'not-a-timestamp')
+
+        found = queue.find_terminal_by_citation('1', self.CATEGORY, self.CITATION)
+
+        assert found is not None, 'a malformed stamp must not drop the record entirely'
+        assert found.id == 'esc-1-1', (
+            f'the malformed-stamp record displaced a well-formed one: {found.id!r}'
+        )
+
+
+class TestNoteSuppressedRefile:
+    """EscalationQueue.note_suppressed_refile() — the INV-4 storm counter (task 4499).
+
+    Bumping ``refiles_suppressed`` on the RESOLUTION makes "this adjudication
+    has absorbed N identical refiles" a durable structured fact rather than
+    log-only (INV-2).  Shares ``patch_resolution_metadata``'s locate-then-patch-
+    in-place shape, so the same no-resurrection contract applies: the archived
+    copy is rewritten where it lives, never lifted back into the queue root.
+    """
+
+    def _resolved(self, queue: EscalationQueue, esc_id: str = 'esc-1-1') -> Escalation:
+        esc = _make_escalation(esc_id, level=1)
+        esc.category = 'provenance_unattributed'
+        esc.citation_sha = 'b' * 40
+        _submit_escalation(queue, esc)
+        resolved = queue.resolve(esc_id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+        assert resolved is not None
+        return resolved
+
+    def test_increments_from_zero_and_returns_the_updated_record(self, tmp_path: Path):
+        """(1) The base case — 0 -> 1, and the updated Escalation comes back."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+
+        result = queue.note_suppressed_refile('esc-1-1')
+
+        assert result is not None, 'note_suppressed_refile must return the updated Escalation'
+        assert result.refiles_suppressed == 1, (
+            f'expected 1 absorbed refile; got {result.refiles_suppressed!r}'
+        )
+
+    def test_is_repeatable_and_accumulates_on_disk(self, tmp_path: Path):
+        """(2) Three calls -> 3, re-read from DISK each time (not from the return value).
+
+        A storm counter that only accumulated in memory would read 1 forever to
+        the next process, which is precisely the storm case.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+
+        for expected in (1, 2, 3):
+            queue.note_suppressed_refile('esc-1-1')
+            reread = queue.get('esc-1-1')
+            assert reread is not None
+            assert reread.refiles_suppressed == expected, (
+                f'on-disk counter should read {expected}; got {reread.refiles_suppressed!r}'
+            )
+
+    def test_patches_in_place_without_resurrecting_into_the_queue_root(self, tmp_path: Path):
+        """(3) The archive copy is bumped where it lives; the root stays clean."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Pre-condition: a resolved record lives in the archive, not the root'
+        )
+
+        queue.note_suppressed_refile('esc-1-1')
+
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'RESURRECTION BUG: the archived record was written back into the queue root'
+        )
+        archived = list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy; got {archived}'
+        assert json.loads(archived[0].read_text())['refiles_suppressed'] == 1
+
+    def test_leaves_the_resolution_untouched(self, tmp_path: Path):
+        """(4) Only the counter moves — the adjudication itself is immutable here."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        before = self._resolved(queue)
+
+        queue.note_suppressed_refile('esc-1-1')
+
+        after = queue.get('esc-1-1')
+        assert after is not None
+        assert after.status == before.status, f'status changed: {after.status!r}'
+        assert after.resolution == before.resolution, f'resolution changed: {after.resolution!r}'
+        assert after.resolved_at == before.resolved_at, f'resolved_at changed: {after.resolved_at!r}'
+        assert after.resolved_by == before.resolved_by, f'resolved_by changed: {after.resolved_by!r}'
+        assert after.citation_sha == before.citation_sha, (
+            f'citation_sha changed: {after.citation_sha!r} — the identity must stay stable'
+        )
+
+    def test_unknown_id_returns_none(self, tmp_path: Path):
+        """(5) A missing record is answered, not raised on."""
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        assert queue.note_suppressed_refile('esc-nope-1') is None
+
+    def test_pending_record_is_not_counted_and_not_written(self, tmp_path: Path):
+        """(6) Terminal-only, mirroring patch_resolution_metadata's guard.
+
+        A pending record has absorbed nothing — its own open-L1 veto is what
+        suppresses the refile, and stamping a counter on it would misattribute
+        the storm.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1', level=1)
+        esc.category = 'provenance_unattributed'
+        _submit_escalation(queue, esc)
+        before = (queue.queue_dir / 'esc-1-1.json').read_text()
+
+        assert queue.note_suppressed_refile('esc-1-1') is None
+
+        assert (queue.queue_dir / 'esc-1-1.json').read_text() == before, (
+            'a pending record must be left byte-identical'
+        )
+
+    @pytest.mark.timeout(60)
+    def test_concurrent_bumps_lose_no_count(self, tmp_path: Path):
+        """(7) TWO OS PROCESSES — the increment runs under the lock, so no bump is lost.
+
+        The one property `escalation_id_lock` exists to provide here, and the
+        only test in this class that can see it: every other test is
+        single-process and sequential, so the lock could be deleted outright (or
+        the read-modify-write hoisted out of the ``with`` block) and they would
+        all still pass.
+
+        This matters because the counter is an INCREMENT, not the last-write-
+        wins field SET that ``patch_resolution_metadata`` performs — two
+        processes that both read N and both write N+1 silently lose one, and a
+        lost bump is invisible in the final value unless the expected total is
+        known exactly.  The under-count would land precisely under the
+        concurrent load that makes a storm likely, which is when the counter is
+        the only signal anyone has.
+
+        Mirrors ``TestAddMembersToL2VariantConcurrency`` above, which pins the
+        analogous lost-update on ``root_cause_variants``.
+
+        The RENDEZVOUS BARRIER is what makes it non-vacuous, and was added only
+        after measuring that its absence made it so: spawn-and-wait alone has
+        the children racing their own interpreter startup rather than the
+        counter, so process A finished all its bumps before B had imported and
+        the test passed with the lock deleted.  Releasing both children from a
+        barrier — after each has paid its startup and parked — is what puts two
+        read-modify-writes on the same record at the same time.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        self._resolved(queue)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        count = 150
+        go = tmp_path / 'go'
+        ready = {tag: tmp_path / f'ready-{tag}' for tag in ('a', 'b')}
+        child_args = [
+            sys.executable, str(_SUPPRESSED_REFILE_CHILD), str(queue_dir), 'esc-1-1',
+            str(count),
+        ]
+        procs = {
+            tag: subprocess.Popen(child_args + [str(ready[tag]), str(go)], env=env)
+            for tag in ('a', 'b')
+        }
+        rc_a = rc_b = None
+        try:
+            deadline = time.monotonic() + 40
+            while not all(p.exists() for p in ready.values()):
+                assert time.monotonic() < deadline, (
+                    'children never reached the barrier: '
+                    f'{ {tag: p.exists() for tag, p in ready.items()} }'
+                )
+                time.sleep(0.005)
+            go.write_text('go')
+
+            rc_a = procs['a'].wait(timeout=50)
+            rc_b = procs['b'].wait(timeout=50)
+        finally:
+            for proc in procs.values():
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.refiles_suppressed == 2 * count, (
+            'concurrent bumps were LOST — the storm counter under-reports under '
+            f'exactly the load that makes a storm likely: expected {2 * count}, '
+            f'got {record.refiles_suppressed}'
+        )
+        assert record.status == 'resolved', (
+            f'the concurrent bumps disturbed the adjudication: {record.status!r}'
         )

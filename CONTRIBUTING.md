@@ -207,7 +207,22 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   more leg the merge gate also runs —
   `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
   `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
-  the full chain.
+  the full chain. Despite its legacy filename that script now carries **two
+  independent mock-spec-discipline rules**, each with its own suppression
+  code (both take the form
+  `# noqa: <code> — <reason>` on the **preceding** non-blank line; the reason
+  is mandatory and an inline trailing comment is deliberately not honored):
+  - `bare-magicmock` — a config-named variable (`config`, `cfg`, `*_config`,
+    `*_cfg`) assigned an unspecced `MagicMock()`. Remedy: the
+    `mock_orch_config` fixture or `MagicMock(spec_set=pydantic_spec(...))`.
+  - `bare-dataclass-double` — an unspecced `MagicMock` shaped like a
+    registered stdlib dataclass (`VerifyResult` today), flagged in **any**
+    syntactic position including `return MagicMock(...)`. Remedy:
+    `_fake_verify_result(...)` or `MagicMock(spec=VerifyResult)`.
+    Eleven files carry pre-existing debt, grandfathered in the script's
+    `_DATACLASS_DOUBLE_DEBT` baseline. That list is **shrink-only** — entries
+    come off as files are migrated and must never be added. A new offending
+    file is covered by default and will fail the gate.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
   of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
   not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
@@ -235,9 +250,13 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   ```bash
   cd fused-memory && uv run pyright   # also: orchestrator, dashboard
   ```
-  `dark-factory-orchestrator.yaml`'s `type_check_command` runs the same
-  three packages via `npx pyright` (needs Node 22+) — either invocation
-  works.
+  `dark-factory-orchestrator.yaml`'s `type_check_command` runs all seven
+  workspace members via `npx pyright` (needs Node 22+) — either invocation
+  works, and both resolve the SAME pyright version: `uv run pyright` resolves
+  the pyright-python wheel `uv.lock` pins, `npx pyright` resolves the repo-root
+  `package.json` pin that `npm ci` installs into `node_modules/`. Run `npm ci`
+  once locally, or a bare `npx pyright` fetches whatever is current instead.
+  `tests/scripts/test_pyright_version_pin.py` holds the two lanes together.
 
 Treat `dark-factory-orchestrator.yaml`'s `test_command` / `lint_command` /
 `type_check_command` as the source of truth if these drift.
@@ -266,9 +285,15 @@ it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
 **pyright up to 3×** (once per touched package under `PYRIGHT_PACKAGES`, or
 across all three if the change touches a shared dependency like `shared` or
-`escalation`). This can comfortably exceed two minutes — give commit
-commands a timeout of at least `300000`ms (or run detached via `setsid` and
-poll) rather than letting a default 2-minute timeout kill it mid-hook.
+`escalation`). That stage is path-filtered since task 2551: a commit
+staging no `.py` files skips pyright entirely and finishes in seconds
+(`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`
+outside every one of those prefixes (e.g. `scripts/`, a root-level
+`conftest.py`) skips it too — silently, with no such line printed. A
+commit that does stage Python under a configured package can comfortably
+exceed two minutes — give those a timeout of at least `300000`ms (or run
+detached via `setsid` and poll) rather than letting a default 2-minute
+timeout kill it mid-hook; the two skip cases above need no bumped timeout.
 Never `--no-verify` this hook to skip pyright/ruff on a code change; the
 two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention

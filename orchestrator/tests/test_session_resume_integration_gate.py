@@ -1418,7 +1418,7 @@ async def test_b4_foreign_acquire_falls_back_no_transcript(harness: Harness):
     assert len(cap.emits) == 1
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
-    assert kwargs['data']['reason'] == 'no_transcript'
+    assert kwargs['data']['reasons'] == ['no_transcript']
 
 
 # ── B4': the lane was reseeded → EXPECTED fallback, no escalation ────────────
@@ -1466,7 +1466,7 @@ async def test_b4b_reseeded_lane_is_expected_fallback_no_escalation(harness: Har
     assert len(cap.emits) == 1
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
-    assert kwargs['data']['reason'] == 'reseeded'
+    assert kwargs['data']['reasons'] == ['reseeded']
     assert harness._escalation_queue.submit.call_count == 0
 
 
@@ -1505,7 +1505,7 @@ async def test_b5_stale_sidecar_falls_back(harness: Harness):
     assert len(cap.emits) == 1
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
-    assert kwargs['data']['reason'] == 'stale'
+    assert kwargs['data']['reasons'] == ['stale']
 
 
 # ── B6: kill switch (session_resume.enabled = false) ─────────────────────────
@@ -1518,8 +1518,8 @@ async def test_b6_kill_switch_fresh_dispatch_no_event(harness: Harness):
 
     ω asserts the LANDED inject-time-only semantics (ω design_decision #3):
     ``_adopt_recovered_session`` has no ``enabled`` gate, so recovery populates
-    ``_recovered_sessions`` regardless; only ``_session_resume_eligible``
-    returns ``(False, 'disabled')`` and ``_run_slot`` degrades without an
+    ``_recovered_sessions`` regardless; only ``_session_resume_reasons``
+    returns ``frozenset({'disabled'})`` and ``_run_slot`` degrades without an
     event or a storm-streak bump. This deliberately does NOT assert the PRD §8
     prose "no adoption at boot" — that would be a RED-doomed false premise
     against merged γ.
@@ -1578,14 +1578,24 @@ async def test_b7_resume_cap_emits_capped(harness: Harness):
     assert [et for et, _ in cap.emits] == [EventType.session_resume_capped]
 
 
-# ── B8: resume-failure fallback storm → one L1, streak not per-event ─────────
+# ── B8: stale dispatches are by-design — telemetry yes, escalation no ────────
 @pytest.mark.asyncio
-async def test_b8_fallback_storm_files_one_l1(harness: Harness):
+async def test_b8_stale_dispatches_emit_but_file_no_l1(harness: Harness):
     """B8 — ``fallback_storm_threshold`` CONSECUTIVE stale dispatches in one
-    boot file exactly ONE level-1 escalation (not one per fallback): the streak
-    is a per-boot RUN counter, and a run this long is the signature of a
-    SYSTEMATIC corroboration break (clock skew / mass reseed), not isolated
-    foreign-acquires.
+    boot now file ZERO level-1 escalations while still emitting one
+    ``session_resume_fallback`` each (task 3728 D4).
+
+    This assertion is INVERTED from the one this row landed with, and the
+    inversion is the task's user-observable signal. A sidecar older than
+    freshness_window_secs is an EXPECTED outcome of the 8h restart cadence, so
+    a run of them was never evidence of systematic breakage — yet it filed an
+    L1 whose detail told the operator to check host clock skew (NTP) first.
+    Every by-design outcome is now excluded from the streak by construction,
+    so the escape can only fire on a reason outside that vocabulary; PRD leaf
+    ε (task 3733) installs the first such feeder.
+
+    Noise suppression of the ESCALATION, never of the telemetry: all three
+    dispatches still emit, so the stale rate stays measurable in runs.db.
 
     The FIRST stale dispatch flows through REAL ``_recover_crashed_tasks`` (so
     this stays a composition, not a hand-populated unit test); the remaining
@@ -1595,14 +1605,25 @@ async def test_b8_fallback_storm_files_one_l1(harness: Harness):
     harness.config.session_resume = SessionResumeConfig(fallback_storm_threshold=3)
     harness._escalation_queue = _storm_queue()
 
-    # 1st stale dispatch — REAL recovery → adopt → stale fallback (streak=1).
+    # 1st stale dispatch — REAL recovery → adopt → stale fallback.
     _setup_warm_lane_session(harness, 'st0', 'uuid-st0', fresh=False)
     await harness._recover_crashed_tasks()
     assert 'st0' in harness._recovered_sessions  # β genuinely adopted it
     cap0 = await _dispatch_capture(harness, 'st0')
     assert cap0.resume_session_id is None
+    # The transcript corroborates, so staleness is the SOLE reason here.
+    # NOTE ``_DispatchCapture.emits`` is CUMULATIVE across dispatches (it reads
+    # the harness's whole emit log), so each dispatch is checked at [-1] and by
+    # the growing length rather than by a whole-list equality.
+    assert len(cap0.emits) == 1
+    et, kwargs = cap0.emits[-1]
+    assert et == EventType.session_resume_fallback
+    assert kwargs['data']['reasons'] == ['stale']
 
-    # 2nd + 3rd stale dispatches — leaner hand-populated recovered state.
+    # 2nd + 3rd stale dispatches — leaner hand-populated recovered state. No
+    # config dir is stashed for these, so they are additionally uncorroborated
+    # — which the composite reasons now REPORT rather than hiding behind the
+    # first match, and both reasons are by-design.
     for i in (1, 2):
         tid = f'st{i}'
         harness._recovered_sessions[tid] = _sidecar(
@@ -1612,12 +1633,15 @@ async def test_b8_fallback_storm_files_one_l1(harness: Harness):
         harness._recovered_plans[tid] = _make_plan(3, 5, tid)
         cap = await _dispatch_capture(harness, tid)
         assert cap.resume_session_id is None
+        assert len(cap.emits) == i + 1
+        et, kwargs = cap.emits[-1]
+        assert et == EventType.session_resume_fallback
+        assert kwargs['data']['reasons'] == ['no_transcript', 'stale']
 
-    # Exactly one L1 filed at the threshold — not one per fallback.
-    assert harness._escalation_queue.submit.call_count == 1
-    esc = harness._escalation_queue.submit.call_args.args[0]
-    assert esc.level == 1
-    assert 'resume' in esc.summary.lower()
+    # Three fallbacks, a streak that never moved, and NO escalation.
+    assert len(_session_resume_emits(harness)) == 3
+    assert harness._session_resume_fallback_streak == 0
+    assert harness._escalation_queue.submit.call_count == 0
 
 
 # ── B9: cold worktree, plan present — β widens the cold path too ─────────────

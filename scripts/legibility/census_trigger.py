@@ -97,8 +97,19 @@ SUCCEEDS, so a test leaning on ambient unreachability flaps with the host's
 listener state (task 3291). Injecting therefore matters MORE now, not less:
 it keeps the pure decision core fully unit-testable and makes "a failing
 get_statuses fails SAFE" testable with a raising fake regardless of what is
-listening. (No MCP client library is available in that env either, so a
-hardcoded MCP client could not be exercised there at all.)
+listening. An MCP client is importable here too, symmetrically with httpx:
+`fastmcp>=3.2` is a direct dependency of `shared` (shared/pyproject.toml,
+task 3689), and fastmcp in turn depends on `mcp`, so `mcp` and
+`mcp.client.streamable_http` both resolve under `uv run --project
+shared` -- a hardcoded MCP client would run here too, and would really
+reach whatever is listening. So, as with httpx, this seam's rationale rests
+on DETERMINISM ALONE -- a pure, unit-testable decision core and a fail-safe
+path exercisable with a raising fake -- regardless of what is installed or
+listening, never on either package being absent. This paragraph has now had
+a package-absence claim rot TWICE: "no httpx" (fixed by task 3376) and "no
+MCP client" (fixed here by task 4110, which rotted on 2026-08-10 when task
+3689 added fastmcp to shared/pyproject.toml). Never re-ground this
+rationale on a package's absence again.
 `default_status_fetcher` provides the best-effort glue implementation, and
 since task 4148 it is the SHARED production factory for all three
 consumers -- the standalone `evaluate` CLI, `census.py`'s `main()`, and the

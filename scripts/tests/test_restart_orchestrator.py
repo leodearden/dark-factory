@@ -4,7 +4,10 @@ against a fake `systemctl` shimmed onto PATH.
 The fake `systemctl` is a small Python script written into a temp `bin/`
 dir (prepended to PATH) at test time; it records every invocation (minus
 the constant `--user` flag) into a JSON state file and answers `show`
-from that same file, so the real script never touches a real systemd.
+from that same file, so the real script never touches a real systemd. The
+fake answers for a SYNTHETIC unit that the fixture itself supplies to the
+script via ORCH_RESTART_UNIT, so no real unit name is ever put in front of
+whatever `systemctl` resolves to.
 """
 from __future__ import annotations
 
@@ -13,25 +16,30 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+# Importable because scripts/tests/conftest.py appends REPO_ROOT to sys.path.
+# Functions only -- importing one of that module's FIXTURES into a test module
+# would bind a module-scoped copy that shadows the conftest's session-scoped one.
+from df_pytest_isolation import assert_synthetic_units, synthetic_unit
+
 SCRIPT = Path(__file__).parent.parent / "restart-orchestrator.sh"
-# A CONTRACT PIN, not a fixture input — deliberately NOT renamed to a synthetic
-# `orchestrator-fake*` name by task 3799, which audited this whole fake-systemctl
-# family. The name flows SCRIPT -> fake -> assertion, not fixture -> script:
-# restart-orchestrator.sh's SERVICE constant HARDCODES the value
-# "orchestrator-dark-factory.service"
-# with no env override, `_make_fake_systemctl` below takes no unit argument at
-# all, and this constant exists so `test_invokes_systemctl_restart_on_correct_unit`
-# can assert the script targeted the right unit. A synthetic name here would make
-# that test fail (the script still calls the real name) while closing nothing.
+# SYNTHETIC (task 3950), replacing the real `orchestrator-dark-factory.service`
+# this used to be. Task 3799 audited this fake-systemctl family and left this
+# harness alone because the name flowed SCRIPT -> fake -> assertion: the
+# script's SERVICE constant hardcoded the real unit, so a synthetic name here
+# would only have made the assertions fail while closing nothing. Task 3950
+# made that constant env-overridable (ORCH_RESTART_UNIT), inverting the flow to
+# FIXTURE -> script -> fake -> assertion, which is what lets `_run_script` hand
+# the PATH-shimmed fake an inert name. The stem names what the fixture stands
+# in for, so every assertion below still reads as being about the dark-factory
+# orchestrator.
 #
-# The residual exposure is real but is NOT closable at this layer: driving the
-# script through a PATH-shimmed fake necessarily puts the real unit name in front
-# of whatever `systemctl` resolves to. Two things bound it — the script is
-# entirely FOREGROUND (no forked poll loop can outlive the test the way task
-# 3798's drain orphans did), and closing it properly means making SERVICE
-# overridable in the production script, which is out of task 3799's scope. Filed
-# as a follow-up; see the escalation on task 3799 before "finishing the job" here.
-UNIT = "orchestrator-dark-factory.service"
+# THE PRODUCTION-DEFAULT CONTRACT THIS CONSTANT USED TO CARRY now lives in
+# tests/scripts/test_orchestrator_watchdog.py::test_restart_orchestrator_unit_default_matches_across_tiers
+# -- go there to find what pins the REAL unit name. Nothing in this file
+# asserts it any more, by design.
+UNIT = synthetic_unit("dark-factory")
 
 FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake `systemctl` for testing restart-orchestrator.sh.
@@ -158,13 +166,47 @@ def _make_fake_systemctl(tmp_path, *, scenario="stale", main_pid=1234):
     return bin_dir, state_path
 
 
-def _run_script(bin_dir, state_path, *extra_args, env=None):
-    """Run restart-orchestrator.sh with the fake systemctl on PATH."""
+def _run_script(bin_dir, state_path, *extra_args, env=None, unit=UNIT):
+    """Run restart-orchestrator.sh with the fake systemctl on PATH.
+
+    THE PATH-SHIMMING SEAM for this harness, and so where the synthetic-unit
+    guard lives (rather than in `_make_fake_systemctl`, as in the other three
+    members of this family): the fake discards the unit token, so the name
+    never reaches the factory -- it reaches the real bash subprocess through
+    ORCH_RESTART_UNIT, set here.
+
+    TWO CHECKS, NOT ONE, because there are two routes to the variable and they
+    guard different properties. The pre-flight check on `unit` runs before the
+    env dict exists, so a rejected keyword call shims nothing and spawns
+    nothing. But `env=` merges LAST (deliberately -- see below), so a caller
+    passing env={"ORCH_RESTART_UNIT": ...} bypasses the keyword entirely; the
+    second check reads the EFFECTIVE value out of `full_env` immediately before
+    the spawn, which is the only place both routes have converged. Checking
+    only the keyword would ship the guard and a documented way around it.
+    """
+    # FIRST, before the env is built or PATH is shimmed, so a rejected call
+    # shims nothing.
+    assert_synthetic_units(
+        [unit], where="scripts/tests/test_restart_orchestrator.py::_run_script"
+    )
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
+    full_env["ORCH_RESTART_UNIT"] = unit
+    # `env=` LAST so a per-test override still wins -- the convention every
+    # spawner in this family follows.
     if env:
         full_env.update(env)
+    # SECOND, on the EFFECTIVE value: `env=` can overwrite ORCH_RESTART_UNIT
+    # after the pre-flight check, and only this one sits between every route
+    # and the subprocess.
+    assert_synthetic_units(
+        [full_env["ORCH_RESTART_UNIT"]],
+        where=(
+            "scripts/tests/test_restart_orchestrator.py::_run_script "
+            "(effective ORCH_RESTART_UNIT, after the env= merge)"
+        ),
+    )
     return subprocess.run(
         ["bash", str(SCRIPT), *extra_args],
         env=full_env,
@@ -183,7 +225,13 @@ def _load_state(state_path):
 # ---------------------------------------------------------------------------
 
 def test_invokes_systemctl_restart_on_correct_unit(tmp_path):
-    """The script must call `systemctl --user restart orchestrator-dark-factory.service`."""
+    """The script must call `systemctl --user restart <its target unit>`.
+
+    That target is now the synthetic `UNIT` the fixture supplied via
+    ORCH_RESTART_UNIT, so this pins the script's restart WIRING, not the
+    production unit name -- for the latter see
+    tests/scripts/test_orchestrator_watchdog.py::test_restart_orchestrator_unit_default_matches_across_tiers.
+    """
     bin_dir, state_path = _make_fake_systemctl(tmp_path)
 
     _run_script(bin_dir, state_path, env={"RESTART_VERIFY_TIMEOUT": "1"})
@@ -192,6 +240,163 @@ def test_invokes_systemctl_restart_on_correct_unit(tmp_path):
     assert ["--user", "restart", UNIT] in state["calls"], (
         f"Expected a `systemctl --user restart {UNIT}` call; "
         f"got calls={state['calls']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fixture-unit-name containment (task 3799, extended to this harness by 3950).
+#
+# The mirrors of this test live in scripts/tests/test_restart_all_orchestrators.py
+# as test_fake_systemctl_rejects_a_real_unit_name and in
+# tests/scripts/test_orchestrator_watchdog.py as
+# test_boundary_fake_systemctl_rejects_a_real_unit_name. Copies rather than a
+# shared test because scripts/tests/ and tests/scripts/ cannot import each
+# other's test modules, so each root must prove its OWN seam validates. What
+# they share is the rule itself -- df_pytest_isolation.assert_synthetic_units.
+# ---------------------------------------------------------------------------
+
+
+def test_run_script_rejects_a_real_unit_name(tmp_path):
+    """`_run_script` must refuse a genuinely installed unit name.
+
+    THE SEAM IS `_run_script` HERE, NOT THE FAKE FACTORY -- a deliberate
+    divergence from the other three harnesses in this family, which check in
+    their `_make_fake_systemctl`. This fake is unit-AGNOSTIC by construction:
+    it parses argv and discards the unit token outright (see the `# unit name
+    or unrecognized flag -- not needed by the fake` branch above), so the name
+    never reaches `_make_fake_systemctl` at all. It reaches the real bash
+    subprocess through ORCH_RESTART_UNIT, which `_run_script` sets -- in the
+    same function that puts the fake's bin_dir on PATH. Checking the factory
+    here would guard a value the factory never sees.
+
+    THE HAZARD, verbatim from the family: the fake shadows `systemctl` only
+    for as long as its tmpdir sits on PATH. A poll loop that outlives the test
+    -- task 3798 measured orphans surviving 27.8 HOURS, well past pytest's
+    tmpdir GC -- resolves /usr/bin/systemctl instead and issues a REAL restart
+    of whatever unit name it was handed. `orchestrator-dark-factory.service`
+    is INSTALLED on this box, so that worst case is a real restart of the live
+    orchestrator. One mitigating bound is specific to THIS script: it is
+    entirely FOREGROUND -- its verify loop runs in the script's own process,
+    with no `&` -- so no poll loop of its own can outlive the test. The guard
+    stands anyway; the bound is a property of today's script, not a contract.
+
+    pytest.raises(pytest.fail.Exception) rather than AssertionError --
+    pytest.fail raises Failed, a BaseException, deliberately so a fixture's
+    own `except Exception` cannot swallow it.
+    """
+    bin_dir, state_path = _make_fake_systemctl(tmp_path)
+
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _run_script(bin_dir, state_path, unit="orchestrator-dark-factory.service")
+    message = str(excinfo.value)
+    assert "orchestrator-dark-factory.service" in message, message
+    assert "_run_script" in message, message
+    # The no-side-effect property the pre-flight placement exists FOR, asserted
+    # rather than merely claimed: were the check ever moved below the spawn,
+    # the message assertions above would still pass while the real bash script
+    # had already run against a real unit name. `_make_fake_systemctl` seeded
+    # `calls` empty, so anything here means a subprocess ran.
+    assert _load_state(state_path)["calls"] == [], (
+        "a rejected call must spawn nothing -- the guard belongs BEFORE the "
+        f"subprocess. got calls={_load_state(state_path)['calls']!r}"
+    )
+
+
+def test_run_script_rejects_a_real_unit_name_via_env(tmp_path):
+    """The `env=` route must be guarded too, not just the `unit=` keyword.
+
+    `_run_script` merges `env=` LAST so a per-test override still wins, and
+    `test_target_unit_is_env_overridable` below relies on exactly that --
+    which makes env={"ORCH_RESTART_UNIT": ...} a SANCTIONED route, not a
+    hypothetical one. It bypasses the `unit` keyword entirely, so the
+    pre-flight check cannot see it; only the effective-value check, read out
+    of `full_env` immediately before the spawn, stands between it and the
+    PATH-shimmed fake. Guarding one route and documenting the other would ship
+    the hazard this whole family exists to close.
+
+    The shim IS built by the time this fires (the caller constructed it), so
+    the property asserted is the spawn-nothing one, not the write-nothing one.
+    """
+    bin_dir, state_path = _make_fake_systemctl(tmp_path)
+
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _run_script(
+            bin_dir,
+            state_path,
+            env={"ORCH_RESTART_UNIT": "orchestrator-dark-factory.service"},
+        )
+    message = str(excinfo.value)
+    assert "orchestrator-dark-factory.service" in message, message
+    assert "_run_script" in message, message
+    # Names the SECOND check specifically, so a reader of the failure knows
+    # which of the two seams fired -- and so this test cannot pass by
+    # accidentally tripping the pre-flight one.
+    assert "effective" in message, message
+    assert _load_state(state_path)["calls"] == [], (
+        "a rejected call must spawn nothing. got "
+        f"calls={_load_state(state_path)['calls']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 3950: the target unit must be env-overridable
+# ---------------------------------------------------------------------------
+
+def test_target_unit_is_env_overridable(tmp_path):
+    """`ORCH_RESTART_UNIT` must RETARGET the script, not merely add a call.
+
+    THE HAZARD, in the terms this fake-systemctl family established: the fake
+    shadows `systemctl` only for as long as its tmpdir sits on PATH. A unit
+    name that outlives that window resolves /usr/bin/systemctl instead and
+    issues a REAL restart of whatever unit the script names --
+    `orchestrator-dark-factory.service` is INSTALLED on this box, so that
+    worst case is a real restart of the live orchestrator. The fixture can
+    only hand the script an inert synthetic name if the script's target is
+    overridable in the first place, which is what this test pins.
+
+    The override must RETARGET: a script that read the variable but still also
+    called the hardcoded default would leave the real unit exposed, so the
+    second assertion is as load-bearing as the first.
+
+    A SECOND, DISTINCT synthetic name -- not the module's `UNIT` -- because
+    `_run_script` now sets ORCH_RESTART_UNIT to `UNIT` by default. Asserting
+    the override with that same value would pass vacuously whether or not the
+    script consults the variable at all. A different name proves both that the
+    variable is genuinely read AND that a per-call `env=` still beats
+    `_run_script`'s own default.
+    """
+    bin_dir, state_path = _make_fake_systemctl(tmp_path, scenario="fresh")
+
+    override = synthetic_unit("dark-factory-override")
+    assert override != UNIT, "the override must differ from the harness default"
+    _run_script(
+        bin_dir,
+        state_path,
+        env={"ORCH_RESTART_UNIT": override, "RESTART_VERIFY_TIMEOUT": "5"},
+    )
+
+    calls = _load_state(state_path)["calls"]
+
+    # THE RETARGET CONTRACT, ASSERTED AS A PROPERTY rather than as "some named
+    # literal is absent". Naming `orchestrator-dark-factory.service` here would
+    # rot silently: if the script's production default were ever retargeted at
+    # a different unit, a check for the old name would keep passing while a
+    # reads-the-var-AND-ALSO-restarts-its-default regression sailed through. It
+    # would also read as a substring test while `x in call` is element equality
+    # over an argv list, so a unit embedded in a compound token would escape.
+    # "the override is the ONLY unit named anywhere" has neither weakness and
+    # is the contract the test's name actually claims.
+    restarts = [call for call in calls if "restart" in call]
+    assert restarts == [["--user", "restart", override]], (
+        f"ORCH_RESTART_UNIT must RETARGET the restart at {override!r} and at "
+        f"nothing else -- exactly one restart call, naming only the override. "
+        f"got restarts={restarts!r} out of calls={calls!r}"
+    )
+    named_units = {tok for call in calls for tok in call if tok.endswith(".service")}
+    assert named_units == {override}, (
+        f"every systemctl call (the verify-loop `show` polls included) must "
+        f"name the override {override!r} and no other unit; got "
+        f"{sorted(named_units)!r} from calls={calls!r}"
     )
 
 

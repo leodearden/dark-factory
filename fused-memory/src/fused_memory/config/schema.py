@@ -232,6 +232,30 @@ class LLMConfig(BaseModel):
     provider: Literal['openai', 'anthropic'] = Field(default='openai')
     model: str = Field(default='gpt-4o-mini')
     temperature: float | None = Field(default=None)
+
+    # Output-token budget per LLM request. Authoritative on EVERY arm that
+    # reads it: graphiti `client_class='openai'`, graphiti
+    # `client_class='openai_generic'`, the graphiti anthropic arm, and mem0's
+    # LLM (backends/mem0_client.py).
+    #
+    # Before task 3864 the default 'openai' arm silently substituted
+    # graphiti-core's DEFAULT_MAX_TOKENS (16384) — the configured value was
+    # accepted and dropped, because BaseOpenAIClient.__init__ re-assigns
+    # self.max_tokens from its own parameter after super().__init__ had read it
+    # off the config object. Only the constructor kwarg reaches the wire, and
+    # backends/graphiti_client.py now passes it (as the generic arm has since
+    # task 3715).
+    #
+    # The default stays 4096 DELIBERATELY. This is a SHARED knob: raising it to
+    # match the old observed behaviour of one arm would silently raise the
+    # anthropic arm and mem0 too, and Anthropic rejects a max_tokens above a
+    # model's output ceiling with a hard 400 (claude-3-opus caps at 4096).
+    #
+    # Exhaustion is LOUD, not silent: graphiti's LLM client raises
+    # `Output length exceeded max tokens <N>` (or a truncated body fails
+    # json.loads), which graphiti retries and the durable queue then
+    # dead-letters visibly. Remedy: raise this value and restart (llm.* is
+    # restart-tier — absent from config/reload.py's RELOADABLE_FIELDS).
     max_tokens: int = Field(default=4096)
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
@@ -799,11 +823,57 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 '-p no:xdist',
             ],
             min_phrase_hits=2,
+            # The previous hint's sole instruction -- amend the canonical
+            # memory in place -- is authz-refused for every orchestrator-
+            # dispatched agent: update_memory's content-amend arm is gated to
+            # recon-stage- / curator- agent_id prefixes
+            # (Mem0UpdateConfig.content_amend_allowed_agent_prefixes), and no
+            # dispatched task/merge agent carries either. That made the block
+            # a dead end for its actual audience. Replaced with the
+            # three-outcome shape ratified 2026-08-25 (task 4738, fix A):
+            # override / skip / escalate, naming only tools this audience
+            # actually holds (search, escalate_*) and never suggesting the
+            # self-rename into curator- that skills/curate-fused-memories
+            # forbids. The structural fix -- stopping a per-cluster hint from
+            # shadowing the guard's escape hatches at all -- is the sibling
+            # fix-B task, deliberately not done here.
+            #
+            # Amendment (reviewer, task 4738): the first cut told the reader
+            # to SEARCH the bare uuid, but `search` is semantic/vector, not
+            # an id lookup -- a bare-uuid query returns noise, not that
+            # record. Reworded to a topic-phrase query with the uuid kept as
+            # a verification target, and escalate named as the fallback when
+            # it still can't be confirmed that way. Outcome (3) now names
+            # escalate_blocker/escalate_info explicitly (previously only the
+            # bare word "escalate"), matching how outcomes (1)/(2) already
+            # name an exact literal to act on.
             hint=(
                 'Known-recurring topic (pytest-xdist -n0 serial-override workaround '
                 'for the hardcoded -n auto addopts in orchestrator/fused-memory '
-                'pyproject.toml). Do NOT add another entry -- update/consolidate '
-                'canonical memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51.'
+                'pyproject.toml). The canonical entry is memory '
+                '8bb3eb15-1133-4e7b-ac1f-5bac10329b51. To check it, run '
+                "search(query='pytest-xdist -n0 serial-override workaround', "
+                'project_id=...) and look for the result whose id matches that '
+                'uuid -- a bare-uuid query will not find it, since search is '
+                'semantic, not an id lookup. If you cannot confirm it that way, '
+                'treat that as case (3) below and escalate rather than guessing. '
+                'Do not try to amend it either way: content amends are '
+                'authz-gated to recon-stage- / curator- agent_ids, so that '
+                'call will refuse you. '
+                '(1) Your content is genuinely DISTINCT from that entry -- '
+                're-send this write with metadata='
+                "{'allow_near_duplicate': True}, which is open to every agent "
+                'and bypasses this block. '
+                '(2) Your content is a DUPLICATE -- SKIP the write. Skipping '
+                'is a sanctioned outcome here, not a failure: consolidating '
+                'this cluster belongs to an interactive curation sitting '
+                'running skills/curate-fused-memories, not to you, and '
+                'renaming yourself into that role to get past this block is '
+                'forbidden by that skill. '
+                '(3) You are unsure, your content CONTRADICTS the canonical '
+                'entry, or you could not confirm it above -- escalate with '
+                'escalate_blocker (or escalate_info if you are merely '
+                'unsure). Do not retry the refused call.'
             ),
         ),
         ProceduralTopicCluster(
@@ -2018,12 +2088,13 @@ class CuratorConfig(BaseModel):
 
     # Zero-output-timeout (ZOT) circuit-breaker watchdog.
     # Root cause: transient Anthropic-backend degradation on the curator's
-    # sonnet+json-schema call shape (task 1550). Each hang burns the full
+    # sonnet+json-schema call shape (task 1743). Each hang burns the full
     # timeout_seconds (180s); the breaker stops every call burning that cost
     # during a sustained outage while preserving the best-effort
     # degrade-to-create contract.
     # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
-    # any success or on a non-ZOT failure).
+    # any success or on a non-ZOT failure — the batch path's missing reset
+    # was fixed in task 4143).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
     # before allowing a half-open probe.
@@ -2226,6 +2297,107 @@ class WriteTriageConfig(BaseModel):
             'read as "no comparable candidate" on every write and route '
             'everything to `stored` with nothing logged. Green-tier '
             'hot-reloadable, read live per write.'
+        ),
+    )
+
+    # --- judge knobs (leaf gamma, task 3128) -------------------------------
+    #
+    # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
+    # they ship with real defaults, and None on the two inheriting leaves means
+    # "follow llm.*", never "uncalibrated". All six are green-tier
+    # hot-reloadable and read LIVE per middle-band write by
+    # server/write_triage_judge.py's resolvers — nothing is captured at import
+    # or construction, which is what makes the registration in
+    # config/reload.py real rather than restart-only in disguise.
+
+    judge_enabled: bool = Field(
+        default=True,
+        description=(
+            "Kill switch for write triage's LLM judge arm — the middle band "
+            'between t_low and t_high. While False that band answers `stored` '
+            'without an LLM call, exactly as leaf beta\'s deliberate stub did, '
+            'and the deterministic bands keep running. Defaults TRUE, unlike '
+            'the `enabled` sibling above, and the asymmetry is deliberate: the '
+            'judge is structurally INERT while write_triage.enabled is false '
+            '(no triage code executes at all), so it costs nothing on the '
+            'shipped config. Default-False would be an operator footgun — at '
+            'the task-3169 flip the operator would turn `enabled` on, silently '
+            'get stub behaviour, and read the resulting all-`stored` ack stream '
+            'as evidence that the corpus is novel. Its real purpose is stopping '
+            'an in-flight JUDGE incident (spend, latency, a bad model) while '
+            'leaving the deterministic bands running, which is a strictly finer '
+            'lever than `enabled` and green-tier for the same reason.'
+        ),
+    )
+    judge_provider: Literal['openai', 'anthropic'] | None = Field(
+        default=None,
+        description=(
+            'Which SDK arm the judge calls. None INHERITS llm.provider, so the '
+            'judge follows whatever model the deployment already trusts for '
+            "add_memory auto-classification rather than needing a second knob "
+            'kept in sync. Pin it only to run the judge on a different provider '
+            'from the rest of the server. An unrecognised value falls back '
+            'rather than raising — this is read on the write path, where '
+            'contract C1 forbids raising.'
+        ),
+    )
+    judge_model: str | None = Field(
+        default=None,
+        description=(
+            'The model the judge calls. None INHERITS llm.model. The PRD\'s '
+            '"haiku-class" is a cost/size class, not a vendor pin: this is a '
+            'single-turn ~2.5k-token classification with a four-word closed '
+            'output, so the smallest capable model is the right one. Whatever '
+            'is resolved here is stamped into the accuracy report\'s provenance '
+            'block by scripts/eval_write_triage_judge.py, so the operator at '
+            'the 3169 flip gate can tell which model produced the numbers.'
+        ),
+    )
+    judge_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description=(
+            'Per-call wall-clock budget for the judge, enforced with '
+            'asyncio.wait_for. NOT optional and not a tuning nicety: no LLM '
+            'call anywhere in fused-memory sets a timeout today and the openai '
+            'SDK default is 600 SECONDS, which on the synchronous add_memory '
+            'write path is a wedge rather than a degradation — the caller waits '
+            'ten minutes for a write contract C1 promises never to block. A '
+            'TimeoutError propagates into triage_write\'s fail-open arm, which '
+            'is exactly C1\'s "judge error/timeout => stored + storm counter" '
+            '(INV-4). Bounded gt=0 because a zero budget would fail every call '
+            'and read as a total judge outage caused by nothing.'
+        ),
+    )
+    judge_candidate_count: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "How many retrieved candidates reach the judge's prompt — PRD C1's "
+            '"top 3-5". Distinct from candidate_k above, which is the '
+            'RETRIEVAL width: triage retrieves k, then the judge is shown the '
+            'best few of them, because prompt tokens are the expensive resource '
+            'and a candidate ranked 15th is not going to be the one the entry '
+            'restates. The band\'s own winner is always included regardless of '
+            'this cap. Bounded ge=1 so a 0 cannot silently empty the slate — '
+            'that would answer `stored` on every middle-band write, reducing '
+            'triage to its below-t_low behaviour with nothing logged.'
+        ),
+    )
+    judge_accuracy_report_path: str | None = Field(
+        default=None,
+        description=(
+            "Path to the JSON accuracy report measuring the judge against leaf "
+            "alpha's curator-labelled calibration fixture — the traceability "
+            'link from the judge shipped here back to the run that measured it, '
+            'exactly as calibration_report_path points at the run that produced '
+            't_high/t_low. Written by scripts/eval_write_triage_judge.py. This '
+            'is what the task-3169 flip gate reads: it is an OPERATOR input, '
+            'not a threshold, and deliberately no accuracy floor is asserted '
+            'anywhere in code or tests (PRD D10 makes the report the arbiter '
+            'and the human the gate). Package-relative, never absolute — an '
+            'absolute per-task-worktree path dangles the moment the branch '
+            'merges. Green-tier hot-reloadable via reload_config.'
         ),
     )
 

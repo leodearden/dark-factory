@@ -1,5 +1,5 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
-const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, HistBar: HB, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = window.DF_CHARTS;
+const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = window.DF_CHARTS;
 const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;

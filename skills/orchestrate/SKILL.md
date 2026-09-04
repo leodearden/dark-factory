@@ -502,16 +502,38 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 2. **Diagnose**: read `.task/plan.json`, check test output, review `git log`
 3. **Fix**: make changes directly in the worktree
 4. **Verify**: run the target project's verify commands (look these up in `$TARGET_CONFIG` — Rust projects use `cargo test`/`cargo clippy`, Python projects use `pytest`/`ruff`/`pyright`, etc. — do not assume Python tooling)
-5. **Merge manually** (if the fix is good):
+5. **Merge manually** (if the fix is good) — capture the merge sha **at the moment of the merge**, never by re-reading `HEAD` later:
    ```bash
    cd "$TARGET_PROJECT"
-   git merge --no-ff task/<task-id>
+   branch=$(git symbolic-ref --quiet --short HEAD); echo "on branch=$branch"
+   [ "$branch" = "main" ] \
+     && git merge --no-ff task/<task-id> \
+     && MERGE_SHA=$(git rev-parse HEAD) \
+     && [ "$(git rev-parse -q --verify "$MERGE_SHA^2")" = "$(git rev-parse task/<task-id>)" ] \
+     && echo "MERGE_SHA=$MERGE_SHA"
    ```
+   The `&&` chain is the point, not style. `$TARGET_PROJECT` is a **machine-operated checkout** — the merge worker, the startup reconciler and git hooks all act on it directly — so `main` can advance between this step and step 6, and a `git rev-parse HEAD` read there can return an *unrelated* task's merge. Chaining short-circuits a **conflicted** merge, so `MERGE_SHA` is never set from a merge that failed — resolve the conflict first and re-run the chain. But two paths exit **0 without creating this task's merge commit**, which is why the chain also checks the merge commit's second parent and opens with the branch guard. (a) **`Already up to date.`** — when the branch tip is already an ancestor of `main`, `git merge --no-ff` exits 0 and creates *no* merge commit at all, so `git rev-parse HEAD` returns whatever is on main's tip, which under a live merge worker can be an unrelated task's merge; the second-parent check rejects that, because `$MERGE_SHA^2` is then some other branch's tip (or absent). (b) **not on `main`** — the merge genuinely SUCCEEDS and `MERGE_SHA` points at a real merge commit of this branch that simply is not on main (measured: `git merge-base --is-ancestor "$MERGE_SHA" main` rc=1); the second-parent check *cannot* catch this, since it is a bona-fide merge of this branch, which is why the branch guard is the **first link of the same `&&` chain** — so a non-`main` HEAD short-circuits the chain and `git merge` never runs. Merging onto the wrong branch is itself the damage, not just a bad capture, so the guard has to *abort*, not merely warn: a standalone `[ ... ] || { echo "NOT ON main - stop"; }` before an unchained `git merge` prints its warning and then merges anyway (reproduced on git 2.43.0), and the chain still prints a `MERGE_SHA=` because the second-parent check passes. The `echo "on branch=$branch"` runs unconditionally so the guard's verdict is visible either way rather than being silent short-circuit. Stamp only a `MERGE_SHA=` the chain actually printed.
 6. **Update task status**:
    ```
-   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"commit": "<merge-commit-sha>"})
+   set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})
    ```
-   Use `{"commit": "<sha>"}` when a merge commit contains the landed work (the normal case — read the SHA from `git log -1 --format=%H` after the merge). Use `{"note": "<one-sentence explanation>"}` for fast-forward merges or when the work was covered by a sibling task and no single commit applies.
+   `kind` is **required** — `_validate_done_provenance` (`fused-memory/src/fused_memory/middleware/task_interceptor.py`) rejects a kind-less blob with `done_provenance.kind is required`, and `DoneProvenance.kind` (`shared/src/shared/task_metadata.py`) has no default. Use `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge you just performed — **the normal case here**, since step 5 merged by hand; use `{"kind": "found_on_main", "commit": "<sha>", "note": "<why>"}` when the work was already on main.
+
+   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the one step 5 captured: `{"kind": "merged", "commit": "$MERGE_SHA"}`. It is attributable because step 5 proved its **second parent is this branch's tip** — that is what makes it a merge commit that brought *this* branch in, not whatever has landed on main since — and it was captured on `main`. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only. If step 5's chain printed no `MERGE_SHA=`, this carve-out does **not** apply: fall through to **If `MERGE_SHA` is not in hand** below, which re-derives from the hand-merge subject, proves containment, and already bans a bare `git rev-parse HEAD`.
+
+   **If `MERGE_SHA` is not in hand** — step 6 reached in a fresh shell, a resumed session, or a merge performed earlier — do **not** substitute `git rev-parse HEAD`. Re-derive by the *hand-merge* subject and prove containment first:
+   ```bash
+   sha=$(git log main --fixed-strings --grep="Merge branch 'task/<task-id>'" --max-count=1 --format=%H)
+   echo "hand-merge sha=$sha"
+   [ -n "$sha" ] && { git merge-base --is-ancestor task/<task-id> "$sha"; echo "containment rc=$?"; }
+   ```
+   `--fixed-strings` against the full quoted subject is substring-safe — the trailing `'` stops `task/1` matching inside `Merge branch 'task/10'`. Stamp `$sha` only when it is **non-empty AND containment rc=0**, which is what proves that merge brought *this* branch in. rc=1 means it did not (a different or earlier merge), rc=128 means one of the two shas did not resolve, and an empty `$sha` means no hand-merge subject is on main: on any of those, stamp nothing here and fall through to the ladder below. **Never stamp a bare `git rev-parse HEAD`** — that is main's current tip, not necessarily your merge, and the server's only backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main, so nothing downstream would catch the substitution.
+
+   **Otherwise** — when the work was already on main and you are deriving rather than recording a merge you performed — derive the sha with the task-scoped ladder, never from main's current HEAD and never from an eyeballed listing: [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the single normative copy (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full. Two adaptations for this call site: run every command in `$TARGET_PROJECT`, not dark-factory, and the shared doc writes the task id as `<TASK_ID>` where this workflow writes `<task-id>` — same value.
+
+   On the ladder's genuine not-landed outcomes — rc=0's **phantom-branch** exit, and, both **outside** the `coalesce-*` arm, rc=1 and rc=128 with an empty marker search — stamp nothing and report, rather than substituting a convenient sha. A citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict: stamp nothing there either, and report it as un-evaluable rather than as not-landed.
+
+   A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<branch tip, or the sibling's landing sha>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
    ```bash
    git worktree remove .worktrees/<task-id>

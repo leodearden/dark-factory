@@ -2041,10 +2041,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # (reviewer finding observability, task 2229 amendment pass round 2)
             # — the key now makes explicit that it tracks the ledger write only.
             'stage1_cycle_summary_ledger_written': 1,
-            # Always present on BOTH the full and remediation paths (task 2978):
-            # verify_cited_memories runs right after super().run() and BEFORE the
-            # remediation early-return, merging these citation-verification
-            # counters into report.stats. All 0 here — no findings were flagged.
+            # Always present on BOTH the full and remediation paths (task 2978,
+            # hoisted by 2979): verify_cited_memories now runs inside
+            # BaseStage.run()'s shared items_flagged assembly — so these counters
+            # are merged into report.stats before any subclass post-processing,
+            # including Stage 1's remediation early-return. All 0 here — no
+            # findings were flagged.
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
@@ -2164,10 +2166,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # (reviewer finding observability, task 2229 amendment pass round 2)
             # — the key now makes explicit that it tracks the ledger write only.
             'stage1_cycle_summary_ledger_written': 1,
-            # Always present on BOTH the full and remediation paths (task 2978):
-            # verify_cited_memories runs right after super().run() and BEFORE the
-            # remediation early-return, merging these citation-verification
-            # counters into report.stats. All 0 here — no findings were flagged.
+            # Always present on BOTH the full and remediation paths (task 2978,
+            # hoisted by 2979): verify_cited_memories now runs inside
+            # BaseStage.run()'s shared items_flagged assembly — so these counters
+            # are merged into report.stats before any subclass post-processing,
+            # including Stage 1's remediation early-return. All 0 here — no
+            # findings were flagged.
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,

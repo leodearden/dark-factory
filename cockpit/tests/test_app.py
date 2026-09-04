@@ -3,9 +3,10 @@
 Textual headless pilot tests (App.run_test / Pilot.pause) drive the few
 integration signals this task requires: the table renders scanned records on
 mount, the poll timer picks up on-disk changes, row selection renders the
-detail pane, and the pure-consumer write discipline holds end-to-end. The
-bulk of the underlying logic (glyph/title/age/order/detail/config) is
-covered by fast deterministic unit tests elsewhere in this package -- see
+detail pane, the pure-consumer write discipline holds end-to-end, and the
+selected-slug restore seam round-trips across a remount. The bulk of the
+underlying logic (glyph/title/age/order/detail/config) is covered by fast
+deterministic unit tests elsewhere in this package -- see
 test_session_table.py / test_detail_pane.py / test_registry_reader.py /
 test_ui_config.py.
 """
@@ -439,6 +440,77 @@ class TestWriteDiscipline:
         assert new_or_modified == {'cockpit-ui.json'}, (
             f'expected only cockpit-ui.json as a new path, got {new_or_modified}'
         )
+
+
+class TestSelectedSlugRestore:
+    @pytest.mark.timeout(10)
+    async def test_selection_round_trips_into_a_fresh_mount(self, tmp_path):
+        """on_mount restores the operator's place via
+        load_ui_config(...).selected_slug -> SessionTable.select_slug --
+        ui_config's whole reason to exist. Both halves were unit-tested;
+        the seam joining them was not. Also note here that the persisted
+        poll_interval is deliberately inert (task 4054 scope)."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import load_ui_config
+
+        # blocked-1 is AWAITING_INPUT, so order_sessions makes IT the
+        # default row-0 cursor -- target-1 can only be highlighted on the
+        # second mount if the restore branch actually ran.
+        blocked = _make_record(session_slug='blocked-1', status=sr.Status.AWAITING_INPUT)
+        target = _make_record(session_slug='target-1', status=sr.Status.RUNNING)
+        for r in (blocked, target):
+            sr.write_record(r, root=tmp_path)
+
+        first = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with first.run_test() as pilot:
+            await pilot.pause()
+            table = first.query_one(SessionTable)
+            assert table.get_row_index('target-1') != 0
+            assert table.highlighted_slug() == 'blocked-1'
+
+            table.move_cursor(row=table.get_row_index('target-1'))
+            await pilot.pause()
+            assert table.highlighted_slug() == 'target-1'
+
+        # the on-disk half of the seam -- localizes a future failure to
+        # save-side vs restore-side
+        assert load_ui_config(tmp_path).selected_slug == 'target-1'
+
+        second = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with second.run_test() as pilot:
+            await pilot.pause()
+            table = second.query_one(SessionTable)
+            assert table.get_row_index('target-1') != 0
+            assert table.highlighted_slug() == 'target-1'
+
+    @pytest.mark.timeout(10)
+    async def test_persisted_slug_that_no_longer_exists_degrades_to_row_zero(self, tmp_path):
+        """A session selected before a restart may well have exited by the
+        next launch; select_slug returns False rather than raising, so the
+        cockpit must still mount and land on row 0. This test is a
+        fail-soft regression guard, NOT a second proof of the restore --
+        it passes with or without the restore branch, by design."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import CockpitUIConfig, save_ui_config
+
+        save_ui_config(CockpitUIConfig(selected_slug='gone-1'), tmp_path)
+        # Two live records, ranked by order_sessions (AWAITING_INPUT above
+        # RUNNING), so "landed on row 0" is actually observable below -- with
+        # only one record, row 0 is the only row and the assertion would pass
+        # no matter where the cursor really landed.
+        live = _make_record(session_slug='live-1', status=sr.Status.AWAITING_INPUT)
+        other = _make_record(session_slug='live-2', status=sr.Status.RUNNING)
+        for r in (live, other):
+            sr.write_record(r, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            assert table.get_row_index('live-2') != 0
+            assert table.highlighted_slug() == 'live-1'
 
 
 class TestDecisionQueueRender:

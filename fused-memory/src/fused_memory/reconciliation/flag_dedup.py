@@ -45,31 +45,59 @@ payload and a self-refreshing 14-day ``expires_at`` TTL — every recurrence
 pushes the expiry back out, so a still-recurring marker never ages out;
 only a finding that stops recurring for 14 days is GC'd.
 
-The payload also carries the finding's ``cited_tasks`` when it has any
-(task 4381, provenance esc-3841-1), sanitized by
-:func:`_sanitize_cited_tasks` down to the three canonical keys
-``{project_id, task_id, title}`` with scalar values only.  This is the
-marker's only PROJECT-QUALIFIED identity — the ledger's ``task_id`` column
-is a bare per-project integer (or comma-join, or ``fp:`` key) — so it is
-what lets a later cycle resolve a fix task that was filed in a DIFFERENT
-known project.  Sanitizing is load-bearing rather than cosmetic: the
-payload is ``json.dumps``-ed inside the best-effort try/except below, so an
-unserialisable LLM-authored value would otherwise be swallowed as a ledger
-WARNING and the marker would silently stop persisting at all.
+The payload never carries the finding's ``cited_tasks`` (task 4712; it did,
+briefly, under task 4381 / esc-3841-1 — see the invariant below for why that
+was retired).  The cross-project fix-task suppression gate (see
+"Suppression") resolves ONLY against the CURRENT cycle's ``cited_tasks``,
+sanitized by :func:`_sanitize_cited_tasks` down to the three canonical keys
+``{project_id, task_id, title}`` with scalar values only.  That sanitizing
+now serves the gate's input validation alone — an unserialisable or
+malformed LLM-authored citation must never reach the resolver — not a
+payload write.
 
-The persisted value is the UNION of the prior row's anchor and the current
-cycle's citations (:func:`_union_cited_tasks`), never the current cycle
-alone.  That distinction is the whole mechanism: persisting only the current
-cycle would ERASE the anchor on the very cycle it did its job — a
-citation-less cycle that suppressed on the prior anchor would rewrite the
-row without it, and the next cycle would resurface the finding — making the
-anchor single-use.  Persisting the union makes it self-carrying across
-arbitrarily many citation-less cycles.  Because the value therefore
-round-trips through this payload every cycle (persisted -> read back ->
-re-merged -> re-persisted), it is projected through
-:func:`_persistable_cited_tasks` before the write: identity-bearing entries
-only, capped at :data:`_MAX_PERSISTED_CITED_TASKS`, so the row is bounded by
-construction rather than growing without limit.
+**Invariant (task 4712):** no INPUT to :func:`compute_flag_signature` may be
+persisted in the marker payload as durable cross-cycle state.
+:func:`compute_flag_signature` folds every ``cited_tasks`` entry's
+``task_id`` into the row's own key (see its "cited_tasks union" section
+below), so a value derived from citations is unconditionally stored in a row
+keyed by itself — reachable only when a LATER cycle happens to present the
+IDENTICAL citation set, in which case that cycle's own citation already
+resolves the gate and the anchor adds nothing.  A prior version of this
+module persisted the UNION of the prior row's anchor and the current cycle's
+citations (``_union_cited_tasks``, now deleted) specifically to survive
+citation-less cycles; measured evidence disproved it —
+``compute_flag_signature({'task_id': 598, 'flag_type': ft, 'cited_tasks':
+[{'project_id': 'dark_factory', 'task_id': '3839'}]})`` returns
+``('3839,598', ft)`` while the citation-less
+``compute_flag_signature({'task_id': 598, 'flag_type': ft})`` returns
+``('598', ft)`` — two different rows for one logical flag, so the anchor was
+unreachable exactly when it would have mattered.  ``task_id``/``flag_type``
+are the only signature inputs the payload may carry, and only because they
+are exact mirrors of the row's own key columns, trivially reproducible by
+any cycle that keys to this row at all.
+``tests/test_flag_dedup.py::TestMarkerPayloadKeyInvariant`` is the
+regression guard: it fails again if a future change re-adds a
+signature-derived field as durable payload state.
+
+**Interaction with the Stage 1 producer gap (task 4712, recorded for that
+sibling task's author):** one option that task considers is having Stage 2
+enrich the Stage 1 marker row with cross-project citations.  That option is
+DEFINITIVELY defeated by the keying property above, not merely blocked:
+citations are folded into the row's KEY, so enriching a row with citations
+RELOCATES it to a different row rather than annotating the one already
+written.
+
+**Residual cost this task does not fix:** a varying citation set still
+mints a distinct marker row per distinct citation set it has recently
+emitted (sprawl), each independently bounded by the ledger's
+self-refreshing 14-day TTL and reaped by ``ReconLedgerStore.gc()`` once it
+stops recurring — elevated row count within a rolling 14-day window, not
+unbounded growth.  The direction that would fix the sprawl itself is
+de-folding ``cited_tasks`` from :func:`compute_flag_signature` and replacing
+task-2432's collision protection (see that function's docstring) with some
+other discriminator; that is a fleet-wide re-key across ~40 call sites and
+was declined here as disproportionate to a feature that has never once
+fired (task 4712, provenance esc-3841-1, 2026-08-24 measurement).
 
 Because the identity excludes run_id, ``ON CONFLICT`` on the full primary
 key guarantees **exactly one row survives** per (task_id, flag_type)
@@ -230,6 +258,7 @@ from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
+from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.utils.async_utils import gather_collect
 
@@ -674,54 +703,59 @@ def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
     return sorted(collected)
 
 
-#: The only ``cited_tasks`` entry keys carried into a ``stage1_flag_marker``
-#: payload (task 4381).  Matches the shape ``server/recon_report.cite_task``
-#: appends — ``{project_id, task_id, title}`` — which is also what
-#: :func:`_cited_task_corroborated` reads.
+#: The only ``cited_tasks`` entry keys :func:`_sanitize_cited_tasks` keeps —
+#: the shape the cross-project fix-task suppression gate resolves against
+#: (task 4381).  No longer a payload key (task 4712 retired the marker's
+#: persisted ``cited_tasks``; see the module docstring's invariant).  Matches
+#: the shape ``server/recon_report.cite_task`` appends — ``{project_id,
+#: task_id, title}`` — which is also what :func:`_cited_task_corroborated`
+#: reads.
 _CITED_TASK_PAYLOAD_KEYS: tuple[str, ...] = ('project_id', 'task_id', 'title')
 
-#: Hard ceiling on the length of any STRING value carried into a
-#: ``stage1_flag_marker`` payload's ``cited_tasks`` (task 4381 amendment).
-#: :data:`_MAX_PERSISTED_CITED_TASKS` bounds the row's ENTRY COUNT; this bounds
-#: its BYTES.  Both are needed because the value round-trips through the
-#: payload every cycle: an LLM emitting a pathologically long ``title`` (a
-#: pasted stack trace, a whole task description) would otherwise produce a
-#: ``payload_json`` that is large from the first cycle and stays large forever
-#: — and the failure would land exactly where sanitisation was introduced to
-#: prevent failure, inside the best-effort try/except where a rejected ledger
-#: write is swallowed as a WARNING and the marker silently stops persisting.
-#: 200 characters comfortably exceeds every real task title in this factory
-#: (the longest are ~130), so truncation only ever fires on junk; when it does,
-#: the truncated title no longer matches the live record, corroboration fails
-#: OPEN (no suppression) and the near-miss INFO log in
-#: :func:`_resolve_live_cross_project_fix_task` makes it observable.
+#: Hard ceiling on the length of any STRING value in a sanitized
+#: ``cited_tasks`` entry (task 4381 amendment).  No longer bounds a persisted
+#: row (task 4712 retired that write); it now bounds only the in-memory
+#: value :func:`_resolve_live_cross_project_fix_task` compares on every
+#: cycle.  An LLM emitting a pathologically long ``title`` (a pasted stack
+#: trace, a whole task description) would otherwise hand
+#: :func:`_cited_task_corroborated` an unbounded string to normalise and
+#: compare.  200 characters comfortably exceeds every real task title in
+#: this factory (the longest are ~130), so truncation only ever fires on
+#: junk; when it does, the truncated title no longer matches the live
+#: record, corroboration fails OPEN (no suppression) and the near-miss INFO
+#: log in :func:`_resolve_live_cross_project_fix_task` makes it observable.
 _MAX_CITED_TASK_STR_CHARS: int = 200
 
 
 def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """Project *flag*'s ``cited_tasks`` down to a payload-safe list, or ``None``.
+    """Project *flag*'s ``cited_tasks`` down to a gate-safe list, or ``None``.
 
     Each surviving entry keeps ONLY the three canonical keys in
     :data:`_CITED_TASK_PAYLOAD_KEYS`, and only when the value is a scalar
     (``str``/``int``/``float``/``bool``) or ``None``.  Entries that are not
     dicts are skipped entirely, and an entry that projects down to nothing is
-    dropped rather than persisted as an empty dict.  Every ``str`` value is
-    additionally truncated to :data:`_MAX_CITED_TASK_STR_CHARS` characters, so
-    the persisted row is bounded in BYTES as well as in entry count (task 4381
-    amendment) — see that constant for why a count-only bound was not enough.
+    dropped rather than kept as an empty dict.  Every ``str`` value is
+    additionally truncated to :data:`_MAX_CITED_TASK_STR_CHARS` characters
+    (task 4381 amendment) — see that constant for why.
 
-    Sanitizing is NOT decorative.  The result is embedded in the payload that
-    ``dedup_flags`` ``json.dumps``-es inside its best-effort try/except, so an
-    unserialisable LLM-authored value (a nested object, a datetime, a mock)
-    would today be swallowed as a ledger WARNING and the marker would silently
-    stop persisting at all — a regression on the module's core cross-cycle
-    dedup guarantee, not merely a lost annotation.  Restricting the value
-    domain to JSON scalars makes that failure mode unreachable by
-    construction.
+    Sanitizing is NOT decorative.  The result is handed to
+    :func:`_resolve_live_cross_project_fix_task` (via ``dedup_flags``), which
+    compares each entry's ``title`` against a live task record
+    (:func:`_cited_task_corroborated`); an unsanitized LLM-authored value (a
+    nested object, a datetime, a mock) could make that comparison raise
+    instead of failing open.  This is now the sanitizer's ONLY job — task
+    4712 retired the marker-payload write it used to also protect (the
+    payload is never ``json.dumps``-ed with a ``cited_tasks`` key any more;
+    see the module docstring's invariant) — but it remains load-bearing for
+    the gate, which runs every cycle a carried-forward flag cites anything.
 
     Returns ``None`` (rather than ``[]``) when ``cited_tasks`` is absent, not
-    a list, empty, or entirely junk, so the caller's ``if cited_tasks:`` gate
-    omits the payload key exactly as it does for ``deduped_against``.
+    a list, empty, or entirely junk.  :func:`_resolve_live_cross_project_fix_task`
+    degrades identically either way today (both fail its
+    ``isinstance(..., list)`` guard or resolve no entries), but the ``None``
+    signal is kept for "no citations at all" vs "an empty list", matching
+    this module's established idiom for optional derived values (e.g.
+    ``deduped_against``).
 
     Input order is preserved.  Pure, sync, no I/O — never raises.
     """
@@ -739,8 +773,8 @@ def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
             value = entry[key]
             if isinstance(value, str) and len(value) > _MAX_CITED_TASK_STR_CHARS:
                 logger.debug(
-                    'flag_dedup: cited_tasks %r truncated from %d to %d chars for'
-                    ' the persisted marker payload',
+                    'flag_dedup: cited_tasks %r truncated from %d to %d chars'
+                    ' for the cross-project fix-task gate',
                     key, len(value), _MAX_CITED_TASK_STR_CHARS,
                 )
                 value = value[:_MAX_CITED_TASK_STR_CHARS]
@@ -750,54 +784,6 @@ def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
             sanitized.append(projected)
     return sanitized or None
 
-
-def _union_cited_tasks(current: Any, prior: Any) -> list[dict[str, Any]]:
-    """Merge a flag's *current* ``cited_tasks`` with the *prior* persisted anchor.
-
-    Both sides are run through the same validation as
-    :func:`_sanitize_cited_tasks` (each is wrapped as a flag-shaped dict), so a
-    malformed value on either side — a bare string, a dict, a list of
-    non-dicts, ``None`` — degrades to "no citations from that side" rather
-    than raising.  This matters most for *prior*, which is free-form JSON read
-    back off a ledger row that may predate this key or have been written by an
-    older/other producer.
-
-    Entries are de-duplicated on the ``(str(project_id), str(task_id))``
-    identity — the same ``"project_id:task_id"`` convention
-    ``server/recon_report`` uses for citation fingerprints — with first-seen
-    order preserved and *current* taking precedence, so a task cited by BOTH
-    sides is looked up exactly once.  An entry lacking either identity field
-    is kept (it is harmless; the resolver skips it) but never collapses with
-    another.
-
-    Pure, sync, no I/O — never raises.
-    """
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for side in (current, prior):
-        for entry in _sanitize_cited_tasks({'cited_tasks': side}) or []:
-            project_id = entry.get('project_id')
-            task_id = entry.get('task_id')
-            if project_id is None or task_id is None:
-                merged.append(entry)
-                continue
-            key = (str(project_id), str(task_id))
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(entry)
-    return merged
-
-
-#: Hard ceiling on the number of ``cited_tasks`` entries carried in a
-#: ``stage1_flag_marker`` payload (task 4381 review fix).  This is a bound on
-#: ledger ROW GROWTH, not a functional limit: realistic ``cited_tasks`` lists
-#: are 1-5 entries, so it never bites in normal operation.  It exists solely
-#: because the persisted anchor round-trips through the payload every cycle
-#: (persisted -> read back as ``prior_cited`` -> re-merged by
-#: :func:`_union_cited_tasks` -> re-persisted), so an LLM emitting fresh
-#: distinct citations every cycle would otherwise grow the row without limit.
-_MAX_PERSISTED_CITED_TASKS: int = 32
 
 #: Payload key carrying the number of CONSECUTIVE cycles a ``stage1_flag_marker``
 #: has been suppressed by a cross-project fix task that is already ``done``
@@ -845,67 +831,6 @@ def _prior_done_suppression_count(prior_payload: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
     return value
-
-
-def _persistable_cited_tasks(entries: Any) -> list[dict[str, Any]] | None:
-    """Project :func:`_union_cited_tasks`' output down to what may be PERSISTED.
-
-    This is the persistence projection of the cross-cycle anchor, applied ONLY
-    to the value written into the ``stage1_flag_marker`` payload — never to the
-    in-memory list handed to :func:`_resolve_live_cross_project_fix_task`.
-
-    Two narrowings, both forced by the fact that the persisted value
-    round-trips back into the union on the very next cycle:
-
-    * **Identity-bearing entries only.**  An entry lacking ``project_id`` or
-      ``task_id`` cannot be de-duplicated — :func:`_union_cited_tasks`
-      deliberately appends such an entry without collapsing it against
-      ``seen`` — so persisting one would add a fresh copy every cycle, forever.
-      It is also dead weight as an anchor: the resolver skips any entry it
-      cannot resolve to a project.  An explicit ``None`` counts as absent; the
-      check is ``is None``, NOT truthiness, so a legitimate ``task_id=0`` or
-      ``project_id=''`` survives.
-    * **Capped at** :data:`_MAX_PERSISTED_CITED_TASKS`.  Truncation keeps the
-      FIRST N: ``_union_cited_tasks`` orders the current cycle's citations
-      ahead of the prior anchor's, so the freshest entries are the retained
-      ones.
-
-    Returns ``None`` (never ``[]``) when nothing is persistable, so the
-    caller's ``if persistable:`` gate omits the payload key exactly as it does
-    for ``deduped_against`` and a citation-less flag keeps the historical
-    six-key payload verbatim.
-
-    *entries* is typed ``Any`` for the same reason :func:`_union_cited_tasks`
-    is: although the only production caller hands it that function's
-    ``list[dict]`` return value, the body validates defensively — a non-list,
-    or a list carrying non-dict members, degrades to "nothing to persist"
-    rather than raising — and that contract is pinned by tests.  A narrower
-    annotation would advertise a guarantee the callers of a sanitizer over
-    LLM-authored data cannot make.
-
-    Input order is preserved and the input is never mutated (a new list is
-    returned).  Pure, sync, no I/O — never raises.
-    """
-    if not isinstance(entries, list) or not entries:
-        return None
-    kept: list[dict[str, Any]] = [
-        entry
-        for entry in entries
-        if isinstance(entry, dict)
-        and entry.get('project_id') is not None
-        and entry.get('task_id') is not None
-    ]
-    if not kept:
-        return None
-    if len(kept) > _MAX_PERSISTED_CITED_TASKS:
-        logger.debug(
-            'flag_dedup: cited_tasks anchor truncated to %d of %d entries'
-            ' for the persisted marker payload',
-            _MAX_PERSISTED_CITED_TASKS,
-            len(kept),
-        )
-        return kept[:_MAX_PERSISTED_CITED_TASKS]
-    return kept
 
 
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
@@ -1006,52 +931,31 @@ async def dedup_flags(
     omit it — they are already resolvable anchors and their payload is
     unchanged.
 
-    Cited-tasks enrichment (task 4381 / esc-3841-1): the flag's
-    ``cited_tasks``, sanitized by :func:`_sanitize_cited_tasks` to the three
-    canonical keys with scalar values only, is threaded into the payload as
-    ``cited_tasks`` — an OPTIONAL key exactly like ``deduped_against``, so a
-    flag with no citations persists the historical six-key payload verbatim.
-    Unlike ``deduped_against`` this is NOT scoped to ``fp:``-keyed markers:
-    the marker's own ``task_id`` is a bare per-project value, so
-    ``cited_tasks`` is the only project-qualified anchor a marker of ANY
-    shape carries.  The value is sanitized precisely so the ``json.dumps``
-    inside the best-effort try/except below can never fail on LLM-authored
-    content and silently skip the marker write.
-
-    What is persisted is the UNION of the prior row's anchor and this cycle's
-    citations (:func:`_union_cited_tasks`), computed ONCE into ``merged_cited``
-    and shared with the suppression gate below, so the gate provably resolves
-    against exactly the set that was just written.  Persisting the current
-    cycle alone would make the anchor single-use — a citation-less cycle that
-    suppressed on it would rewrite the row without it and the next cycle would
-    resurface the finding.  Since the union therefore round-trips through the
-    payload every cycle, it is projected through
-    :func:`_persistable_cited_tasks` (identity-bearing entries only, capped at
-    :data:`_MAX_PERSISTED_CITED_TASKS`) so the row is bounded by construction:
-    an entry lacking ``(project_id, task_id)`` cannot be de-duplicated by the
-    union and would otherwise accumulate one fresh copy per cycle forever.
-
-    Cross-project fix-task suppression (task 4381 / esc-3841-1): this is the
-    SECOND way ``dedup_flags`` can drop a flag, alongside ``filter_suppressed``
-    above.  When the OPTIONAL keyword-only *taskmaster* and *known_projects*
-    are both supplied and the ledger read was a HIT (``persisted_from_run`` is
-    set), the flag's ``cited_tasks`` are passed to
-    :func:`_resolve_live_cross_project_fix_task`; if one of them names a live,
-    non-cancelled task in ANOTHER known project, the flag is dropped instead of
-    re-asserted.  Properties, each load-bearing:
+    Cross-project fix-task suppression (task 4381 / esc-3841-1; cross-cycle
+    anchor retired task 4712): this is the SECOND way ``dedup_flags`` can
+    drop a flag, alongside ``filter_suppressed`` above.  When the OPTIONAL
+    keyword-only *taskmaster* and *known_projects* are both supplied and the
+    ledger read was a HIT (``persisted_from_run`` is set), the flag's
+    CURRENT-CYCLE ``cited_tasks`` — sanitized by :func:`_sanitize_cited_tasks`
+    to the three canonical keys with scalar values only, never persisted to
+    the payload (see the module docstring's invariant) — are passed to
+    :func:`_resolve_live_cross_project_fix_task`; if one of them names a
+    live, non-cancelled task in ANOTHER known project, the flag is dropped
+    instead of re-asserted.  Properties, each load-bearing:
 
     * **HIT-only.** A first-cycle finding is never suppressed — the point is to
       stop re-asserting a complaint that has already been converted into
       tracked work, not to pre-empt the first report of it.
-    * **Two anchors, either sufficient.** The prior row's persisted
-      ``cited_tasks`` is the CROSS-CYCLE anchor; the flag's own is the
-      CURRENT-CYCLE one.  :func:`_union_cited_tasks` merges them (deduped on
-      ``(project_id, task_id)``, current first), so a carried-forward finding
-      stays resolved even on a cycle whose LLM output re-emits no citation at
-      all — which is precisely what the payload enrichment above buys.  The
-      merged value is the same object that was persisted this cycle, so the
-      anchor survives EVERY cycle (suppressing or not) and the property holds
-      for arbitrarily many consecutive citation-less cycles, not just one.
+    * **ONE anchor: the current cycle's citation.** The gate resolves ONLY
+      against the flag's OWN ``cited_tasks`` this cycle — there is no
+      cross-cycle citation anchor in the marker payload (task 4712).  The
+      accepted consequence: a carried-forward finding whose LLM output
+      re-emits NO citation on a given cycle keys to a DIFFERENT row (see
+      :func:`compute_flag_signature`'s cited_tasks union), so that cycle is a
+      MISS and the finding is RE-ASSERTED rather than suppressed.
+      Suppression is reliable exactly when the LLM keeps re-citing the same
+      fix task — the common case for a still-open remediation — which is why
+      this is a genuine, if narrower, mitigation rather than a no-op.
     * **Foreign-project-only.** See
       :func:`_resolve_live_cross_project_fix_task` — a finding's own subject
       task is routinely its own first citation.
@@ -1061,10 +965,10 @@ async def dedup_flags(
     * **The upsert still runs on a suppressed cycle.** The gate's DECISION is
       computed between the ledger read and the ledger write (so the
       done-suppression counter below can ride the same write), but the write
-      itself still happens for a suppressed flag: it keeps its row, refreshes
-      its 14-day TTL, and re-persists the merged ``cited_tasks``.  Skipping the
-      write would let the marker age out and lose the recurrence history the
-      abandoned-fix-task path depends on.
+      itself still happens for a suppressed flag: it keeps its row and
+      refreshes its 14-day TTL.  Skipping the write would let the marker age
+      out and lose the recurrence history the abandoned-fix-task path
+      depends on.
     * **A ``done`` fix task suppresses for a BOUNDED number of cycles** (task
       4381 amendment).  Each consecutive cycle suppressed by an already-``done``
       fix task increments ``cross_project_done_suppressions`` in the payload;
@@ -1239,21 +1143,9 @@ async def dedup_flags(
         ledger = getattr(memory_service, 'recon_ledger', None)
         flag = dict(flag)
         persisted_from_run: str | None = None
-        # The prior row's cited_tasks is the CROSS-CYCLE anchor (task 4381):
-        # it survives a cycle whose LLM output re-emits no citation at all.
-        # Free-form JSON off a ledger row — validated by _union_cited_tasks,
-        # never trusted for shape.
-        prior_cited: Any = None
         # Consecutive cycles this marker has already been suppressed by an
         # already-``done`` cross-project fix task (task 4381 amendment).
         prior_done_suppressions: int = 0
-        # The single merged anchor: computed ONCE and used by BOTH the payload
-        # written below and the suppression gate further down, so the gate
-        # provably resolves against exactly the set that was just persisted.
-        # Initialised to the current-cycle-only union, which is the correct
-        # value for the no-ledger path and for a ledger read that raises
-        # before any prior row is seen.
-        merged_cited: list[dict[str, Any]] = _union_cited_tasks(cited_tasks, None)
 
         payload: dict[str, Any] = {
             'source': 'stage1_flag_marker',
@@ -1286,7 +1178,6 @@ async def dedup_flags(
                 if prior is not None:
                     prior_payload = json.loads(prior.payload_json)
                     persisted_from_run = prior_payload.get('run_id') or 'unknown'
-                    prior_cited = prior_payload.get('cited_tasks')
                     prior_done_suppressions = _prior_done_suppression_count(prior_payload)
                     if persisted_from_run == 'unknown':
                         logger.debug(
@@ -1294,9 +1185,6 @@ async def dedup_flags(
                             tid,
                             ftype,
                         )
-                # Outside the `if prior is not None` branch on purpose: a MISS
-                # must still end up with the current-cycle-only union.
-                merged_cited = _union_cited_tasks(cited_tasks, prior_cited)
                 ledger_read_ok = True
             except Exception as e:
                 logger.warning(
@@ -1324,7 +1212,7 @@ async def dedup_flags(
                 taskmaster,
                 known_projects,
                 project_id,
-                merged_cited,
+                cited_tasks,
                 cache=fix_task_cache,
             )
         if fix_task is not None:
@@ -1358,17 +1246,6 @@ async def dedup_flags(
 
         if ledger is not None and ledger_read_ok:
             try:
-                # The UNION is what gets persisted — not the current cycle
-                # alone.  Persisting only the current cycle would erase the
-                # anchor on the very cycle it did its job, making it
-                # single-use.  Projected through _persistable_cited_tasks
-                # precisely BECAUSE it round-trips through this payload every
-                # cycle and must be bounded by construction.  Assigned only
-                # when non-empty, mirroring the `deduped_against` idiom, so a
-                # citation-less flag persists the six-key literal verbatim.
-                persistable = _persistable_cited_tasks(merged_cited)
-                if persistable:
-                    payload['cited_tasks'] = persistable
                 if done_suppressions:
                     # Same optional-key idiom: a marker never suppressed by a
                     # done fix task keeps the historical payload shape.
@@ -1840,6 +1717,20 @@ def compute_flag_signature(flag: dict[str, Any]) -> tuple[str, str] | None:
     deploy; this is self-healing (the very next cycle writes suppression
     under the new signature), so no marker migration or dual-key lookup is
     required.
+
+    **Payload-persistence hazard (task 4712):** because this union folds every
+    ``cited_tasks`` entry's ``task_id`` into the task component, any value
+    *derived from* ``cited_tasks`` is unconditionally stored in a row keyed by
+    itself, and so can never be persisted as durable CROSS-CYCLE state in that
+    row's own payload — a later cycle presenting a different citation set
+    keys to a *different* row and can never read it back.  Measured:
+    ``compute_flag_signature({'task_id': 598, 'flag_type': ft, 'cited_tasks':
+    [{'project_id': 'dark_factory', 'task_id': '3839'}]})`` returns
+    ``('3839,598', ft)`` while the citation-less ``compute_flag_signature({
+    'task_id': 598, 'flag_type': ft})`` returns ``('598', ft)`` — two
+    different rows for one logical flag.  This is why :func:`dedup_flags` no
+    longer persists ``cited_tasks`` in the marker payload; see the module
+    docstring's invariant for the general rule this instance falls out of.
 
     Returns ``None`` for flags without enough signal to deduplicate — these are
     passed through unchanged by :func:`dedup_flags`.
@@ -4136,5 +4027,253 @@ def filter_contamination_ceiling_findings(
             # do NOT append — flag is dropped
         else:
             kept.append(flag)
+
+    return kept
+
+
+# --------------------------------------------------------------------------- #
+# Style-only authorship guard helpers (task 3138, PRD §9 leaf μ)
+# --------------------------------------------------------------------------- #
+
+#: Flag types asserting that an entry's content was injected, fabricated, or
+#: written by someone outside this deployment.  Several spellings are listed
+#: because the family has no committed schema entry — Stage 1 emits it as
+#: free-form LLM output, so the set is a best-effort census of the plausible
+#: spellings (the ``STALE_METADATA_FLAG_TYPES`` idiom).  An unrecognised
+#: spelling degrades to a visible drift log rather than a silent no-op.
+AUTHORSHIP_SUSPICION_FLAG_TYPES: frozenset[str] = frozenset({
+    'possible_injection',
+    'prompt_injection',
+    'injected_content',
+    'possible_fabrication',
+    'fabricated_content',
+    'foreign_authorship',
+    'suspicious_authorship',
+})
+
+
+def _classify_authorship(agent_id: Any) -> str:
+    """Classify one citation's stored ``agent_id``.
+
+    ``'internal'`` — a recognised house writer (the only value that can clear
+    a flag).  ``'missing'`` — no usable provenance at all (absent key, None,
+    empty, or a non-string).  ``'foreign'`` — a real agent_id that matches no
+    house writer family.  These are kept distinct because they read very
+    differently to an operator: a foreign id is a positive signal, a missing
+    one is a gap.  (A fourth value, ``'unresolved'``, is assigned by the
+    caller when the record could not be read at all — see
+    :func:`filter_style_only_authorship_flags`.)
+    """
+    if is_internal_writer(agent_id):
+        return 'internal'
+    if not isinstance(agent_id, str) or not agent_id:
+        return 'missing'
+    return 'foreign'
+
+
+def _authorship_keep_decision(checked: list[dict[str, Any]]) -> str:
+    """Summarise WHY a candidate flag survived, from its checked citations.
+
+    A positively-foreign author is the most informative outcome, and reads
+    differently depending on whether a house writer sits alongside it
+    (``kept_mixed_authors``) or not (``kept_foreign_author``).  Absent any
+    foreign author, the flag can only have survived because some citation
+    yielded no usable agent_id — absent, empty, or unreadable — which is
+    ``kept_missing_agent_id``.
+    """
+    if not checked:
+        return 'kept_no_resolvable_citations'
+    classifications = {c['classification'] for c in checked}
+    if 'foreign' in classifications:
+        return 'kept_mixed_authors' if 'internal' in classifications else 'kept_foreign_author'
+    # No positively-foreign author, yet the flag survived — so at least one
+    # citation yielded no usable agent_id (absent, empty, or unreadable).
+    return 'kept_missing_agent_id'
+
+
+async def filter_style_only_authorship_flags(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop injection/fabrication flags whose cited entries are house-authored.
+
+    Closes reify esc-5564-1: Stage 1 flagged its OWN earlier consolidator
+    output (agent_id ``recon-stage-memory_consolidator``) as "possibly
+    injected/fabricated" because the imperative writing style looked foreign to
+    it — it never read the stored ``agent_id``.  Writing style is not evidence
+    of authorship; provenance is.
+
+    A flag is a CANDIDATE iff its ``flag_type`` is in
+    :data:`AUTHORSHIP_SUSPICION_FLAG_TYPES`.  For each candidate, every mem0
+    citation in ``cited_memories`` is resolved via
+    ``memory_service.get_memory_by_id(project_id, memory_id)`` — whose
+    ``metadata`` is the raw Qdrant payload and therefore still carries the
+    top-level ``agent_id`` that mem0's ``AsyncMemory`` promotes out of metadata
+    on the search and ``get`` paths — and classified with
+    :func:`~fused_memory.reconciliation.internal_writers.is_internal_writer`.
+
+    **Fail-safe direction**: this filter DROPS a security-shaped signal, so it
+    drops ONLY on positively-confirmed wholly-internal authorship — at least
+    one agent_id resolved AND every resolved one is a recognised house writer.
+    Every other outcome KEEPS the flag: a foreign agent_id, a missing/empty
+    one, a mixed citation set (a partially-internal claim is not cleared), a
+    citation the backend could not resolve (a raised error or a not-found
+    record is ``'unresolved'`` — unknown, never internal — and is never
+    propagated to the caller), and a candidate with no resolvable citations at
+    all (an unattributable claim stays flaggable).  The asymmetry is
+    deliberate — wrongly keeping a flag costs one noisy finding the next cycle
+    clears, while wrongly dropping one silently disables the detection.
+
+    Degrades to an unchanged pass-through when ``memory_service`` or
+    ``project_id`` is falsy.
+
+    Every SURVIVING candidate is annotated with ``authorship_provenance``::
+
+        {'checked': [{'memory_id', 'agent_id', 'classification'}, ...],
+         'decision': 'kept_foreign_author' | 'kept_missing_agent_id'
+                     | 'kept_mixed_authors' | 'kept_no_resolvable_citations'}
+
+    — the structured fact at the decision point (INV-2), so Stage 2 and any
+    operator read the agent_ids this gate actually checked as a field instead
+    of re-deriving them from the description prose.  Non-candidate flags pass
+    through untouched: never looked up, never annotated.
+
+    Args:
+        memory_service: Object with an async ``get_memory_by_id(project_id,
+            memory_id)`` method, typically ``self.memory`` in
+            MemoryConsolidator.
+        project_id: Project scope for the lookup.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        A new list, in input order, with confirmed-house-authored authorship
+        flags removed.  The input LIST is never mutated; surviving candidate
+        dicts gain the ``authorship_provenance`` key described above.
+    """
+    if not memory_service or not project_id:
+        # Degrade to a no-op pass-through — mirrors filter_terminal_metadata_flags
+        # / filter_already_tracked_systemic_patterns.  Provenance is unreadable,
+        # so nothing can be positively confirmed internal.
+        return list(flags)
+
+    candidate_positions: list[int] = [
+        i for i, flag in enumerate(flags)
+        if flag.get('flag_type') in AUTHORSHIP_SUSPICION_FLAG_TYPES
+    ]
+
+    # Detect potential LLM naming drift: flag_type strings that look like this
+    # family but are not in AUTHORSHIP_SUSPICION_FLAG_TYPES.  The family has no
+    # committed schema entry, so an unrecognised spelling would silently make
+    # the gate a no-op; this log makes that observable (the
+    # filter_terminal_metadata_flags drift-log precedent).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if isinstance(ft := flag.get('flag_type'), str)
+        and any(token in ft.lower() for token in ('inject', 'fabricat', 'foreign'))
+        and ft not in AUTHORSHIP_SUSPICION_FLAG_TYPES
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.style_only_authorship_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update AUTHORSHIP_SUSPICION_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(AUTHORSHIP_SUSPICION_FLAG_TYPES),
+        )
+
+    if not candidate_positions:
+        # No candidates at all — skip every lookup, so a normal cycle (in which
+        # this family is rare) does zero I/O.
+        return list(flags)
+
+    async def _classify(flag: dict[str, Any]) -> list[dict[str, Any]]:
+        """Resolve every mem0 citation on *flag* to a provenance record."""
+        checked: list[dict[str, Any]] = []
+        for entry in flag.get('cited_memories') or []:
+            # Skip anything we cannot — or must not — resolve, without a lookup
+            # and without recording a verdict: a non-dict entry (malformed), an
+            # entry with no truthy memory_id, or a non-mem0 citation.
+            # get_memory_by_id is a Mem0/Qdrant point-id read, so resolving a
+            # graphiti edge uuid through it would return not-found for EVERY
+            # graph citation (citation_verifier's guard).  Such an entry
+            # therefore neither clears a flag nor blocks a clearance — a
+            # candidate citing only these ends up with an empty ``checked`` and
+            # is kept as unattributable.
+            if (
+                not isinstance(entry, dict)
+                or entry.get('store') != 'mem0'
+                or not entry.get('memory_id')
+            ):
+                continue
+            memory_id = entry.get('memory_id')
+            try:
+                record = await memory_service.get_memory_by_id(project_id, memory_id)
+            except Exception as exc:
+                # A raised backend error is 'unknown', not 'house-authored'.
+                # Record the uncertainty, KEEP the flag, and never propagate —
+                # a check error must not crash the stage.
+                logger.debug(
+                    'reconciliation.style_only_authorship_lookup_error '
+                    'memory_id=%s error=%s',
+                    memory_id, exc,
+                )
+                checked.append({
+                    'memory_id': memory_id,
+                    'agent_id': None,
+                    'classification': 'unresolved',
+                })
+                continue
+            if not record:
+                # Not found — also unknown, never internal.
+                checked.append({
+                    'memory_id': memory_id,
+                    'agent_id': None,
+                    'classification': 'unresolved',
+                })
+                continue
+            agent_id = (record.get('metadata') or {}).get('agent_id')
+            checked.append({
+                'memory_id': memory_id,
+                'agent_id': agent_id,
+                'classification': _classify_authorship(agent_id),
+            })
+        return checked
+
+    checked_by_pos: dict[int, list[dict[str, Any]]] = dict(
+        zip(
+            candidate_positions,
+            await asyncio.gather(*[_classify(flags[i]) for i in candidate_positions]),
+            strict=True,
+        ),
+    )
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        checked = checked_by_pos.get(i)
+        if checked is None:
+            # Not a candidate — never looked up, never annotated, byte-identical.
+            kept.append(flag)
+            continue
+        if checked and all(c['classification'] == 'internal' for c in checked):
+            logger.info(
+                'reconciliation.style_only_authorship_flag_dropped '
+                'flag_type=%s agent_ids=%s memory_ids=%s',
+                flag.get('flag_type'),
+                [c['agent_id'] for c in checked],
+                [c['memory_id'] for c in checked],
+            )
+            continue  # drop: every cited entry is provably house-authored
+        # Survives. Record the provenance actually read at the decision point
+        # (INV-2), so Stage 2 and any operator read the checked agent_ids as a
+        # field rather than re-deriving them from the description prose.
+        # ``setdefault`` mirrors citation_verifier's ``citation_failures``
+        # idiom: annotate the finding, never rewrite it.
+        flag.setdefault(
+            'authorship_provenance',
+            {'checked': checked, 'decision': _authorship_keep_decision(checked)},
+        )
+        kept.append(flag)
 
     return kept

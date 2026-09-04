@@ -15,7 +15,6 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.reconciliation.citation_verifier import verify_cited_memories
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
 )
@@ -36,6 +35,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_false_absence_flags,
     filter_stale_bulk_get_statuses_flags,
     filter_stale_count_snapshot_corrections,
+    filter_style_only_authorship_flags,
     filter_terminal_metadata_flags,
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
@@ -199,21 +199,13 @@ class MemoryConsolidator(BaseStage):
             resume_session_id=resume_session_id,
         )
 
-        # ── Phantom-citation verification (task 2978) ─────────────────────────
-        # Re-resolve every flagged finding's cited Mem0 memories against the
-        # live store and strip any that no longer exist, so a finding is never
-        # silently backed by an id that never existed (or whose queued
-        # add_memory write later failed).  Placed HERE — right after
-        # super().run() assembles items_flagged (converging BOTH the
-        # RRS-assembled and the structured-output JSON-fallback citation lists,
-        # the latter of which bypasses cite_memory's existence check) and BEFORE
-        # the remediation early-return below — so full AND remediation passes are
-        # both verified and the stage1_* citation stats are always present on
-        # report.stats.
-        _cite_stats = await verify_cited_memories(
-            report.items_flagged or [], self.memory, self.project_id,
-        )
-        report.stats.update(_cite_stats)
+        # Phantom-citation verification (task 2978) used to run here. Task 2979
+        # HOISTED it into BaseStage.run(), which performs it on the shared
+        # items_flagged assembly for all three stages — see the rationale
+        # comment there. The stage1_* citation stats therefore arrive on
+        # report.stats via super().run() above, already present on full AND
+        # remediation passes. Do not re-add a call here: it would double-count
+        # every stage1_* citation stat and double the get_memory_by_id load.
 
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
@@ -448,6 +440,33 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['systemic_pattern_already_tracked_dropped'] = (
                 _before_already_tracked_filter - len(report.items_flagged)
+            )
+            # ── Style-only authorship guard (task 3138): drop ─────────────────────
+            # injection/fabrication flags whose cited entries turn out to have been
+            # written by our OWN agents.  Closes reify esc-5564-1, in which Stage 1
+            # flagged its own earlier consolidator output (agent_id
+            # recon-stage-memory_consolidator) as "possibly injected/fabricated"
+            # purely because the imperative writing style looked foreign — it never
+            # read the stored agent_id.  Provenance comes from
+            # memory.get_memory_by_id, whose metadata is the raw Qdrant payload and
+            # so still carries the top-level agent_id that mem0 promotes out of
+            # metadata on the search/get paths.  Fail-safe: drops only on
+            # positively-confirmed wholly-house authorship; foreign, missing, mixed
+            # or unresolvable provenance all KEEP the flag (and get annotated with
+            # the agent_ids actually checked).  Surfaces the dropped count as
+            # report.stats['style_only_authorship_flags_dropped'].
+            #
+            # Placement before dedup_flags is load-bearing: it is what routes a
+            # dropped flag through the marker-reclaim tail below, so its Stage-2
+            # disposition marker is acknowledged rather than stranded.
+            _before_authorship_filter = len(report.items_flagged)
+            report.items_flagged = await filter_style_only_authorship_flags(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                flags=report.items_flagged,
+            )
+            report.stats['style_only_authorship_flags_dropped'] = (
+                _before_authorship_filter - len(report.items_flagged)
             )
             # Snapshot immediately before dedup_flags, which internally applies the
             # suppression gate (filter_suppressed) as its first step, so suppression
