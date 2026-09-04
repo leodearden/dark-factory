@@ -1,20 +1,593 @@
-"""Repo-level structural fence around the anti-regrowth atomic-write guard.
+"""Repo-level guard: the consolidated atomic-write pattern cannot silently regrow.
 
-Step 3 of task 3388 creates this module with the two BOUNDARY tests only; the
-guard itself (``_SRC_TREES``, ``_ALLOWED_RENAMERS``, ``_find_renamers``,
-``_iter_source_files``, ``TestNoRegrownAtomicWriters``) is relocated here from
-``shared/tests/test_safe_io.py`` in step 4, which also writes this docstring's
-placement rationale and its cross-references to the sibling repo-level sweeps
-already living in this directory.
+WHAT THIS IS.  An AST sweep over SIX first-party source trees — ``shared/src``,
+``orchestrator/src``, ``escalation/src``, ``fused-memory/src``,
+``fused-memory/scripts`` and ``scripts`` — asserting that every
+rename-into-place (the tmp+``os.replace`` shape task 3223 consolidated into
+``shared.safe_io.atomic_write_text``) is a known, individually-reasoned
+survivor rather than a fresh hand-rolled copy.
+
+WHY IT LIVES HERE AND NOT IN A PACKAGE SUITE (task 3388).  It was born in
+``shared/tests/test_safe_io.py``, beside the implementation it protects, and
+that was defensible while it scanned three trees and shared owned the blessed
+writer.  It stopped being defensible once the guard asserted on five packages
+shared does not own: a guard that asserts on five packages cannot live inside a
+sixth package's tests.  The concrete failure it created — not hypothetical, and
+recorded in the allowlist itself — is that
+``orchestrator/src/orchestrator/digest.py::write_digest_entry`` is allowlisted
+AND flagged there as a prime migration candidate, so migrating it turned the
+SHARED suite red, at a site no orchestrator author would think to look.  Moving
+the guard to the repo level puts the failure where the fix is.
+
+THE PLACEMENT IS THE ESTABLISHED PATTERN, not a stray file.  ``tests/scripts/``
+is a registered module config (``tests/scripts/orchestrator.yaml``) and already
+holds this exact class of repo-wide structural sweep:
+
+  * ``test_nonmember_ruff_config.py`` — sweeps every non-member directory for
+    ruff rule-set parity with a live workspace member.
+  * ``test_pytest_workspace_collection.py`` — cross-checks every member's
+    pytest markers.
+  * ``test_module_verify_budgets.py`` — cross-checks every module yaml's
+    verify budget.
+
+Being repo-level is also what makes this module's two HARD assertions correct:
+``assert root.is_dir()`` in ``_iter_source_files`` and the stale-entry assertion
+in ``test_no_unapproved_renamers_in_source_trees``.  At the repo root every
+declared tree is guaranteed present, so neither needs the ``pytest.skip`` /
+warning-downgrade fallback that a package-local guard would have had to adopt.
+Both carry a comment saying so at their site.
+
+COLLECTED TWICE, DELIBERATELY.  ``tests/scripts/orchestrator.yaml`` collects
+this directory, and so does ``scripts/orchestrator.yaml``
+(``pytest tests/scripts/ scripts/tests/``) — so a diff touching ``scripts/``
+runs the guard that scans ``scripts/``.  No yaml edit was needed to register
+this file: all three commands there are directory-wide.
+
+SCOPE LIMIT, stated because a green run here must not be over-read: relocating
+this guard did NOT make ``shared/tests`` standalone-runnable.  Five other
+cross-tree gates still live there; they are enumerated, with measured counts, in
+``test_atomic_write_guard_does_not_scan_sibling_package_trees`` below.
 """
 import ast
 from pathlib import Path
 
-# tests/scripts/<file>.py and shared/tests/<file>.py are both exactly two
-# levels below the repo root, so this constant carries over verbatim from the
-# guard's old home and is shared by the boundary tests below and by the
-# relocated guard (task 3388 step 4).
+# tests/scripts/<file>.py and shared/tests/<file>.py are both exactly two levels
+# below the repo root, so this constant carried over verbatim from the guard's
+# old home.  Shared by the relocated guard and by the boundary tests at the
+# bottom of this module.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+# ---------------------------------------------------------------------------
+# Anti-regrowth guard (task 3223)
+# ---------------------------------------------------------------------------
+#
+# Task 3223 consolidated ten hand-rolled tmp+rename writers into
+# ``atomic_write_text`` above.  Nothing stops the eleventh from being written
+# by hand next month — the pattern is short enough to look harmless, which is
+# exactly how the first ten accumulated (two of them carried a docstring
+# saying they were copied because "there is no atomic writer in shared/ to
+# reuse").  These tests are the fence: a NEW rename-into-place inside the
+# SIX TREES LISTED BELOW fails loudly and points the author at this module.
+#
+# SCOPE LIMIT — the fence is narrower than "the repo", and saying so matters
+# more than the fence looking complete.  Task 3388 widened ``_SRC_TREES`` from
+# three trees to six: ``shared/src``, ``orchestrator/src``, ``escalation/src``,
+# ``fused-memory/src``, ``fused-memory/scripts`` and ``scripts``.
+#
+# THE COUNT, CORRECTED BY MEASUREMENT.  Widening surfaced SEVENTEEN unmigrated
+# hand-rolled writers, not the six this block used to enumerate — and not the
+# six the follow-up ticket that tracked the widening enumerated either.  Both
+# of those counts were arrived at by reading; the detector disagreed with both.
+# So: trust ``_find_renamers`` over any prose count in this file, this sentence
+# included, and re-run it rather than re-trusting the sentence.  A fence sized
+# from stale prose is not a fence, which is the whole reason 3388 existed.
+#
+# STILL NOT SCANNED, stated with COUNTS rather than bare directory names so the
+# claim is falsifiable (measured at main 86db695984): ``cockpit/src`` 2
+# (priority.py::save_priorities, ui_config.py::save_ui_config), filed as a
+# follow-up; ``dashboard/src`` 0; ``sampler/src`` 0; ``skills`` 0; the
+# repo-root ``tests/`` 0.
+#
+# TEST DIRECTORIES.  ``fused-memory/scripts`` and ``scripts`` are scanned
+# WHOLESALE, tests included, rather than through an exclusion mirroring the
+# ``*/src`` convention: a flat operator directory has no ``src/`` boundary to
+# mirror, and the one place a regrown production writer could hide is precisely
+# a directory somebody decided not to look at.  That is free today — the test
+# dirs INSIDE the scanned trees are clean: ``shared/tests`` 0, ``fused-memory/
+# tests`` 0, ``scripts/tests`` 0.  Stated in that scoped form deliberately: the
+# general claim "test trees are clean" is FALSE at this base, because
+# ``orchestrator/tests`` carries 2 renamers and ``escalation/tests`` 1.  Neither
+# sits inside a scanned tree, so neither affects red/green — but they are live
+# evidence that test directories do accumulate this pattern over time, and so
+# that an exclusion would not have stayed harmless.
+
+_SRC_TREES = (
+    'shared/src',
+    'orchestrator/src',
+    'escalation/src',
+    'fused-memory/src',
+    'fused-memory/scripts',
+    'scripts',
+)
+
+# Every (module, function) in the six trees that renames a path into place,
+# with the reason it is not calling atomic_write_text.  Adding an entry is a
+# deliberate act that needs a reason; growing this set silently is the failure
+# mode the guard exists to prevent.
+_ALLOWED_RENAMERS = {
+    ('shared/src/shared/safe_io.py', 'atomic_write_text'):
+        'THE consolidated implementation — the one blessed home for this pattern.',
+    ('shared/src/shared/safe_io.py', 'load_json_or_warn'):
+        'Quarantine rename of a corrupt file (<name>.corrupt); not a write path.',
+    ('orchestrator/src/orchestrator/session_registry.py', '_atomic_write_text'):
+        'DELIBERATE EXCEPTION to task 3223, not an oversight. The module is '
+        'invoked by absolute path from skills/spawn/spawn-claude.sh under an '
+        'interpreter with no venv/install/workspace packages, so its docstring '
+        "declares it stdlib-only; a module-scope `from shared import safe_io` "
+        'made it unimportable there (ModuleNotFoundError) and silently broke '
+        'the spawn hook. Pinned by test_session_registry.py::'
+        'TestStdlibOnlySelfContainment. Do not "finish" this migration.',
+    ('orchestrator/src/orchestrator/session_hooks.py', '_run_install'):
+        'Out of task 3223 enumerated scope; left alone deliberately.',
+    ('orchestrator/src/orchestrator/verify_cancel.py', 'write_pgid_file'):
+        'Out of task 3223 enumerated scope; left alone deliberately.',
+    ('escalation/src/escalation/queue.py', 'EscalationQueue._atomic_write_path'):
+        'Out of task 3223 enumerated scope. This is the helper 3223 was MODELLED '
+        'on (its durable= flag became fsync=); a follow-up may migrate it.',
+    ('escalation/src/escalation/queue.py', 'EscalationQueue._archive_resolved'):
+        'Moves a resolved file into the dated archive dir; not a write path.',
+    ('escalation/src/escalation/sweep.py', '_atomic_move'):
+        'Out of task 3223 enumerated scope; moves an existing file, does not write.',
+    ('orchestrator/src/orchestrator/digest.py', 'write_digest_entry'):
+        'Out of task 3223 enumerated scope. Notable: b3_gate._save_state was '
+        'originally documented as "modelled on digest.py" — this is where one '
+        'of the ten copies came from, so it is a prime candidate for the '
+        'follow-up migration.',
+    ('orchestrator/src/orchestrator/evals/rereview.py', 'atomic_write_json'):
+        'Out of task 3223 enumerated scope; left alone deliberately.',
+    (
+        'orchestrator/src/orchestrator/service_restart.py',
+        'StaleServiceRestartCoordinator._persist_last_fire_wall',
+    ):
+        'Out of task 3223 enumerated scope; left alone deliberately.',
+    ('orchestrator/src/orchestrator/agents/invoke.py', '_invoke_pi'):
+        'Swaps .mcp.json with a backup and back again; renames existing files '
+        'rather than writing new content, so atomic_write_text does not apply.',
+    # --- Sites that landed on main AFTER this task branched. Both were triaged
+    # on their merits when the branch was rebased; neither is "out of scope"
+    # boilerplate, because each has a concrete semantic atomic_write_text
+    # cannot express today. Stated here rather than migrated, because a
+    # migration that quietly dropped one of these is exactly the silent
+    # regression this task exists to avoid.
+    ('shared/src/shared/transcript_archive.py', '_archive_one'):
+        'COPIES an existing file rather than writing new text, so it is the '
+        'same category as escalation sweep._atomic_move / queue._archive_resolved. '
+        'Two specifics rule out atomic_write_text even as a rewrite: (1) the '
+        'payload is a multi-MB agent-session JSONL moved with shutil.copyfile '
+        'on the platform fast-copy path, so peak RSS stays flat regardless of '
+        'transcript size, whereas atomic_write_text takes a str already fully '
+        'in memory; (2) os.utime mirrors the SOURCE mtime onto the staging file '
+        'BEFORE the replace, and atomic_write_text exposes no pre-replace seam '
+        'for that — a now-stamped archive reads to gc_agent_transcripts as a '
+        'reset retention age.',
+    ('shared/src/shared/transcript_archive.py', 'restore_archived_transcript'):
+        'The INVERSE of _archive_one above and in exactly its category: it '
+        'COPIES an existing archived transcript back into a config dir rather '
+        'than writing new text. The same two specifics rule out '
+        'atomic_write_text: (1) the payload is a multi-MB agent-session JSONL '
+        'moved with shutil.copyfile (or streamed through gzip.open + '
+        'copyfileobj for the pre-3618 .jsonl.gz corpus) so peak RSS stays flat, '
+        'whereas atomic_write_text takes a str already fully in memory; '
+        '(2) os.utime mirrors the ARCHIVE mtime onto the staging file BEFORE '
+        'the replace, and atomic_write_text exposes no pre-replace seam for '
+        'that — a now-stamped restore reads to the next archival pass as newer '
+        'than its own archive and is pointlessly re-archived over it. The '
+        'staging+os.replace publish is load-bearing rather than decorative: the '
+        'claude CLI PARSES the transcript rather than stat-ing it (a zero-byte '
+        'file and a preamble-only file both yield `No conversation found with '
+        'session ID`, measured on CLI 2.1.236), so a torn restore would arm '
+        '--resume against a file the CLI then rejects. Added by task 3578.',
+    ('shared/src/shared/transcript_archive.py', '_move_to_archive'):
+        'MOVES an existing transcript rather than writing new text — the '
+        'sibling of _archive_one above, and the same category as escalation '
+        'sweep._atomic_move / queue._archive_resolved. atomic_write_text does '
+        'not merely fit badly here, it has nothing to be handed: there is no '
+        'content string, only an inode to relink. The os.rename IS the '
+        'operation, not a rename-into-place finishing a write, so the '
+        'structural detector that flags it is reading the shape correctly and '
+        'the shape is correct. Added by task 3619, which made archival a '
+        'precondition of config-dir deletion and needed the O(1) metadata move '
+        'to keep that affordable inside a synchronous teardown. Two properties '
+        'the copy path has to work for and this one gets from the rename '
+        'itself: atomicity within a filesystem (no staging sibling, so a '
+        'truncated transcript cannot appear at the canonical path) and mtime '
+        'preservation via the surviving inode (a now-stamped archive would '
+        'reset gc_agent_transcripts retention age and defeat the '
+        'already-current skip). The EXDEV branch delegates to _archive_one '
+        'when the rename is physically impossible, so the cross-device case '
+        'is handled by the entry above rather than by a second writer here.',
+    ('orchestrator/src/orchestrator/mcp/plan_tools.py', '_atomic_write_plan'):
+        'Cannot delegate without losing three semantics atomic_write_text does '
+        'not offer. (1) SYMLINK RESOLUTION: it writes to os.path.realpath(path) '
+        'and refuses a dangling link; atomic_write_text replaces the path as '
+        'given, so an os.replace onto the lane plan.json symlink would swap the '
+        'LINK for a regular file and re-fork the lane/meta-root copies (the '
+        'esc-5205-9 divergence that symlink exists to prevent). (2) PRE-REPLACE '
+        'VERIFICATION: _verify_plan_json re-parses the TEMP file after the '
+        'chmod and before the swap — a deliberately named seam a test injects '
+        'into, at the last reversible checkpoint; atomic_write_text has no '
+        'pre-replace inspection hook, and verifying after the swap is backwards. '
+        '(3) FSYNC ASYMMETRY: it fsyncs the temp file but NOT the parent dir, '
+        'while atomic_write_text does both under fsync=True and neither under '
+        'fsync=False, so no setting reproduces it. It also funnels every '
+        'failure into PlanWriteError naming both the original and resolved '
+        'paths. A follow-up may widen atomic_write_text; it must not be forced '
+        'through the current signature.',
+    # --- Sites surfaced by task 3388's widening of _SRC_TREES to six trees.
+    # Each reason below was written from READING that site, not pattern-matched
+    # from a neighbour: an entry whose reason came from the entry above it is
+    # indistinguishable from a triaged decision and is worse than no entry.
+    # Where an argument already exists above, it is CITED rather than re-argued.
+    ('fused-memory/src/fused_memory/middleware/curator_escalator.py', 'CuratorEscalator._persist_state'):
+        'DETECTOR-NESTING ARTIFACT — this function contains no rename of its '
+        'own. The os.replace lives in the nested ``_write`` closure, which is '
+        'allowlisted separately below; the outer name is reported only because '
+        '_find_renamers uses ast.walk, which descends into nested functions '
+        '(the limitation its docstring states). There is nothing here to '
+        'migrate, and no semantic justification is offered because there is '
+        'none to offer — the entry exists solely to keep the detector honest.',
+    (
+        'fused-memory/src/fused_memory/middleware/curator_escalator.py',
+        'CuratorEscalator._persist_state._write',
+    ):
+        'Out of task 3223 enumerated scope; left alone deliberately. This is '
+        'the real writer, and a migration must preserve two properties '
+        'atomic_write_text does not offer today: a per-writer temp name '
+        '``<state>.{pid}.{id(payload)}.tmp`` (mirroring event_queue.py\'s '
+        'disjoint-path discipline, so two writers can never share a temp path '
+        'even if they bypass _persist_lock), and the asyncio.to_thread offload '
+        'that keeps the blocking I/O off the event loop under burst load.',
+    ('fused-memory/src/fused_memory/reconciliation/backlog_policy.py', 'BacklogPolicy._restore_policy_keys'):
+        'Out of task 3223 enumerated scope; left alone deliberately. Re-merges '
+        'the policy-only keys that closing a halt strips (project_id, '
+        'error_type, backlog, threshold) back onto the persisted record via '
+        'tmp.write_text + tmp.replace. Best-effort by construction — every '
+        'failure is logged and swallowed so a record that IS closed but lost '
+        'its forensic keys is never misreported as un-closed.',
+    ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue._rotate_dead_letter'):
+        'MOVES existing files: cascade-rotates dead_letter.jsonl -> .1 -> .2 '
+        '-> ... There is no content string, only os.replace(src, dst) per '
+        'slot, so this is the same class as escalation sweep._atomic_move / '
+        'queue._archive_resolved and atomic_write_text has nothing to be '
+        'handed.',
+    ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue.replay_dead_letters'):
+        'MOVES an existing file: os.replace snapshots each dead-letter file '
+        'onto a ``.replaying`` sibling as an atomic CLAIM — race-safe against '
+        'concurrent _write_dead_letter appends and self-guarding against '
+        're-replay, since a second call finds nothing left to snapshot. A '
+        'claim, not a write; same class as escalation sweep._atomic_move / '
+        'queue._archive_resolved.',
+    ('fused-memory/src/fused_memory/server/manifest_stamping.py', '_stamp_capability_manifests_impl'):
+        'Out of task 3223 enumerated scope; left alone deliberately. A genuine '
+        'writer: yaml.safe_dump into a uniquely-named '
+        '``<sidecar>.{pid}.{id(raw)}.tmp`` sibling, then os.replace. Its '
+        'surrounding comment already documents the one tradeoff a migration '
+        'must not silently change — a hard kill between write and replace can '
+        'leave a .tmp sibling, which is harmless only because sidecar '
+        'discovery matches the exact derived rel path and never a .tmp suffix.',
+    ('fused-memory/scripts/bake_off_storage_shape.py', '_atomic_write_text'):
+        'Out of task 3223 enumerated scope; left alone deliberately — but note '
+        'what this entry COSTS, because leaving that implicit would hide a '
+        'silenced assertion behind an allowlist line. '
+        'test_atomic_write_text_helpers_only_delegate ``continue``s on '
+        'anything in _ALLOWED_RENAMERS, so this entry also silences the '
+        'delegate check for this name: a NON-delegating helper carrying the '
+        'consolidated name — a full inlined mkstemp + os.replace body — '
+        'survives here on purpose, in a one-off benchmark script. It is the '
+        'single strongest candidate for the next migration, and it is the '
+        'reason 3388 widened to fused-memory/scripts rather than stopping at '
+        'fused-memory/src as its own ticket text proposed.',
+    ('fused-memory/scripts/memory_eval_retrieval_probe.py', 'write_report_text'):
+        'Out of task 3223 enumerated scope; left alone deliberately. Its '
+        'docstring already argues the atomicity (the memory-eval leaves share '
+        'one artifact root that the dashboard reads as plain files, so a '
+        'truncated report beside a valid metrics artifact is the one state to '
+        'exclude) and records that the mechanism is COPIED rather than '
+        'imported because shared\'s own _atomic_write_text is module-private. '
+        'That reason is retired by the PUBLIC safe_io.atomic_write_text, which '
+        'is what makes this a migration candidate rather than an exception.',
+    ('fused-memory/scripts/memory_eval_staleness_sweep.py', 'write_report_text'):
+        'Out of task 3223 enumerated scope; left alone deliberately. The '
+        'sibling of memory_eval_retrieval_probe.write_report_text above — its '
+        'own docstring says the mechanism is copied \'(β does the same)\' — '
+        'same shared artifact root, same mkstemp + os.replace, same candidacy. '
+        'Migrate the two together or the copy-from-a-neighbour habit survives.',
+    ('scripts/consume_redispatch_requests.py', 'archive_request'):
+        'MOVES an existing file: os.replace of an APPLIED request into the '
+        '``consumed/`` subdirectory, to keep an audit trail of what was '
+        'actioned that the snapshot directory cannot provide. Same class as '
+        'escalation sweep._atomic_move / queue._archive_resolved.',
+    ('scripts/dashboard-watchdog.py', 'save_state'):
+        'STDLIB-ONLY STANDALONE ENTRYPOINT — the same constraint already '
+        'recorded above for session_registry._atomic_write_text, so that '
+        'argument is not restated. This is a ``#!/usr/bin/env python3`` '
+        'systemd/cron oneshot; verified by reading its imports (contextlib, '
+        'json, os, subprocess, sys, tempfile, time, urllib) that it pulls in '
+        'nothing outside the stdlib, so a module-scope `from shared import '
+        'safe_io` would need an install or a sys.path graft it does not have. '
+        'This is NOT a blanket \'scripts/ cannot import shared\': '
+        'scripts/legibility/census.py does exactly that, via a '
+        '__file__-relative sys.path insert.',
+    ('scripts/legibility/census.py', 'advance_census_state'):
+        'Out of task 3223 enumerated scope; left alone deliberately. '
+        'mkstemp(prefix=\'.census-state-\') + os.replace. This module is '
+        'census-state.json\'s SOLE writer, so a migration must keep the '
+        'always-present ``last_census_done_count`` key — serialised as JSON '
+        'null when the count could not be observed, never omitted as falsy — '
+        'which is what lets zeta\'s compute_tasks_landed fail safe.',
+    ('scripts/legibility/codebook.py', 'dump'):
+        'Out of task 3223 enumerated scope; left alone deliberately. '
+        'mkstemp(prefix=\'.codebook-\') + os.replace of a canonical '
+        'block-style yaml document written behind a fixed HEADER comment. Sole '
+        'writer of the legibility pipeline\'s canonical registry, and '
+        'byte-stable given byte-stable input so a no-change night commits '
+        'nothing — a migration must not perturb either property.',
+    ('scripts/legibility/trickle_state.py', 'record_run'):
+        'Out of task 3223 enumerated scope; left alone deliberately. '
+        'Same-directory mkstemp + os.replace of the trickle-state document the '
+        'function also returns; ordinary write path with no seam of its own.',
+    ('scripts/migrate_transcript_archive_gunzip.py', 'gunzip_one'):
+        'PRE-REPLACE SEAM, and the same one already recorded above for shared '
+        'transcript_archive._archive_one — cited rather than re-argued. It '
+        'decompresses to a staging sibling, corroborates the read-back, then '
+        'os.utime mirrors the SOURCE mtime onto staging BEFORE the replace, '
+        'because that mtime is the retention age gc_agent_transcripts keys on '
+        'and the source is gone by the end. atomic_write_text exposes no '
+        'pre-replace seam, and the payload is decompressed bytes on disk '
+        'rather than a str already in memory.',
+    ('scripts/orchestrator-watchdog.py', '_atomic_write_json'):
+        'STDLIB-ONLY STANDALONE ENTRYPOINT — as dashboard-watchdog.save_state '
+        'above, and session_registry._atomic_write_text before it. A '
+        '``#!/usr/bin/env python3`` systemd/cron oneshot; verified by reading '
+        'its imports that the only addition beyond dashboard-watchdog\'s set '
+        'is shlex, i.e. still stdlib. Note this IS already a consolidation '
+        '(task 3764 extracted it so the mkdir/mktemp/write/rename dance is '
+        'defined once for every watchdog state file rather than per call '
+        'site), so the duplication here is one deep, not per-writer.',
+    ('scripts/sweep_toolcall_markup.py', 'write_repaired'):
+        'PRE-REPLACE VERIFICATION SEAM — the same seam already recorded above '
+        'for plan_tools._atomic_write_plan, whose ordering this function\'s '
+        'docstring says it follows, so that argument is not restated. Between '
+        'reading and swapping it RE-READS the target and confirms it is still '
+        'the bytes the repair was computed from, as late as possible before '
+        'the os.replace, returning a WriteFailure (REASON_CHANGED_UNDER_US) '
+        'rather than silently reverting somebody else\'s concurrent write. '
+        'atomic_write_text has no pre-replace inspection hook.',
+}
+
+
+def _find_renamers(source: str) -> list[str]:
+    """Return the qualified names of functions in *source* that rename a path.
+
+    Covers all four spellings the repo actually uses, because a scan for any
+    one of them leaves a hole big enough to hide a copy in:
+
+    * ``os.replace(tmp, dest)`` — eight of the ten sites 3223 consolidated.
+    * ``os.rename(tmp, dest)`` — ``escalation.queue._atomic_write_path``.
+    * ``tmp.replace(dest)`` — ``evals.rereview``, ``service_restart``.
+    * ``tmp.rename(dest)`` — ``digest.write_digest_entry``, which is the
+      writer ``b3_gate._save_state`` was documented as modelled on.
+
+    The two ``Path``-method forms are matched by arity: ``Path.replace`` and
+    ``Path.rename`` take exactly one positional argument, while the far more
+    common ``str.replace(old, new)`` takes two, so requiring exactly one
+    positional arg and no keywords separates them without a type-inference
+    pass.
+
+    AST-based rather than a text grep on purpose: six of the migrated modules
+    still *mention* ``os.replace`` in a docstring describing what
+    ``atomic_write_text`` does for them, and a text scan would flag all six as
+    false positives.
+
+    Limitation, stated rather than papered over: this finds the rename, which
+    is the half of the pattern that cannot be omitted.  A copy that factored
+    its rename out into a helper would be attributed to that helper instead.
+    """
+    found: list[str] = []
+
+    def is_rename(sub) -> bool:
+        if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)):
+            return False
+        if sub.func.attr not in ('replace', 'rename'):
+            return False
+        receiver = sub.func.value
+        if isinstance(receiver, ast.Name) and receiver.id == 'os':
+            return True
+        # Path.replace(target) / Path.rename(target): exactly one positional
+        # argument.  str.replace(old, new) takes two and is excluded here.
+        return len(sub.args) == 1 and not sub.keywords
+
+    def visit(node, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, f'{prefix}{child.name}.')
+            elif isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                qualname = f'{prefix}{child.name}'
+                if any(is_rename(sub) for sub in ast.walk(child)):
+                    found.append(qualname)
+                visit(child, f'{qualname}.')
+            else:
+                visit(child, prefix)
+
+    visit(ast.parse(source), '')
+    return found
+
+
+def _iter_source_files():
+    """Yield (repo-relative posix path, source text) for the three src trees."""
+    for tree in _SRC_TREES:
+        root = _REPO_ROOT / tree
+        # HARD assert, kept rather than downgraded to pytest.skip, and that is
+        # only correct BECAUSE this guard is now repo-level (task 3388): at the
+        # repo root every declared tree is guaranteed present, so a missing one
+        # is a real defect rather than a legitimate partial checkout.  The skip
+        # fallback was the price of NOT relocating; having relocated, do not
+        # also pay it.  Paired with
+        # test_every_declared_tree_contributes_scanned_files below, which
+        # catches the case this assert cannot: a tree that IS a directory and
+        # rglobs nothing.
+        assert root.is_dir(), (
+            f'{tree} not found under {_REPO_ROOT} — this guard walks fixed tree '
+            f'names, so a moved/renamed package must update _SRC_TREES rather '
+            f'than let the guard silently scan nothing.'
+        )
+        for py in sorted(root.rglob('*.py')):
+            yield py.relative_to(_REPO_ROOT).as_posix(), py.read_text(encoding='utf-8')
+
+
+class TestNoRegrownAtomicWriters:
+    """The consolidated pattern cannot silently re-duplicate."""
+
+    def test_detector_fires_on_a_regrown_copy(self):
+        """The detector has teeth: it flags a re-inlined tmp+rename block.
+
+        Without this, a detector that silently matched nothing would make
+        every other test in this class pass vacuously.  The sample below is
+        the exact shape task 3223 removed from five call sites.
+        """
+        regrown = (
+            'import json, os\n'
+            'def _save_raw(self, state):\n'
+            '    tmp = self._path.with_suffix(".json.tmp")\n'
+            '    tmp.write_text(json.dumps(state), encoding="utf-8")\n'
+            '    os.replace(str(tmp), str(self._path))\n'
+        )
+        assert _find_renamers(regrown) == ['_save_raw']
+
+        os_rename_variant = (
+            'import os\n'
+            'class S:\n'
+            '    def _write(self, path, text):\n'
+            '        os.rename(tmp, path)\n'
+        )
+        assert _find_renamers(os_rename_variant) == ['S._write']
+
+        # Path-method spellings: the hole that let digest.write_digest_entry,
+        # rereview.atomic_write_json and service_restart sit unseen by an
+        # os.replace-only scan.
+        path_method_variant = (
+            'def _write(path, text):\n'
+            '    tmp = path.with_suffix(".tmp")\n'
+            '    tmp.write_text(text)\n'
+            '    tmp.rename(path)\n'
+        )
+        assert _find_renamers(path_method_variant) == ['_write']
+
+        path_replace_variant = (
+            'def _write(path, text):\n'
+            '    tmp.replace(path)\n'
+        )
+        assert _find_renamers(path_replace_variant) == ['_write']
+
+    def test_detector_ignores_str_replace(self):
+        """``str.replace(old, new)`` is not a rename.
+
+        The Path-method branch keys on arity, so this is the false positive
+        that would fire on half the repo if the arity check regressed.
+        """
+        two_arg = (
+            'def normalise(s):\n'
+            '    return s.replace("-", "_").replace(" ", "")\n'
+        )
+        assert _find_renamers(two_arg) == []
+
+    def test_detector_ignores_docstring_mentions(self):
+        """A docstring describing the pattern is not an implementation of it.
+
+        Six migrated modules still reference ``os.replace`` in prose; flagging
+        those would make the guard unusable and train people to disable it.
+        """
+        prose_only = (
+            'def _save_raw(self, state):\n'
+            '    """Delegates to safe_io.atomic_write_text (tmp + os.replace)."""\n'
+            '    safe_io.atomic_write_text(self._path, state)\n'
+        )
+        assert _find_renamers(prose_only) == []
+
+    def test_no_unapproved_renamers_in_source_trees(self):
+        """Every rename-into-place in the three trees is a known, reasoned survivor."""
+        actual = {
+            (relpath, qualname)
+            for relpath, source in _iter_source_files()
+            for qualname in _find_renamers(source)
+        }
+
+        unapproved = actual - set(_ALLOWED_RENAMERS)
+        assert not unapproved, (
+            'New hand-rolled rename-into-place found:\n  '
+            + '\n  '.join(f'{f}::{q}' for f, q in sorted(unapproved))
+            + '\nUse shared.safe_io.atomic_write_text instead. If this site '
+            'genuinely cannot (it moves an existing file rather than writing '
+            'one, say), add it to _ALLOWED_RENAMERS with the reason.'
+        )
+
+        # HARD assert on stale entries, kept rather than downgraded to a
+        # warning, for the same reason as the is_dir assert above: repo-level,
+        # every tree is present, so a stale entry means the site really is gone
+        # or really stopped renaming.  When someone finally migrates the
+        # allowlisted orchestrator digest.write_digest_entry this fires — and
+        # the fix is the one-line allowlist deletion the message spells out, in
+        # THIS repo-level module, not a red suite in a package that merely
+        # happened to host the guard.
+        stale = set(_ALLOWED_RENAMERS) - actual
+        assert not stale, (
+            'Stale _ALLOWED_RENAMERS entries (site is gone or no longer '
+            f'renames): {sorted(stale)}. Remove them so the allowlist keeps '
+            'describing reality.'
+        )
+
+    def test_atomic_write_text_helpers_only_delegate(self):
+        """The four surviving ``_atomic_write_text`` names must stay one-liners.
+
+        Task 3223 kept these module-level names (test_prompt_artifact.py
+        monkeypatches one at five sites) but emptied their bodies down to a
+        delegation.  Re-inlining a real implementation under the old name is
+        the most likely way the duplication comes back, because the name would
+        still look consolidated from every call site.
+        """
+        offenders = []
+        for relpath, source in _iter_source_files():
+            if relpath == 'shared/src/shared/safe_io.py':
+                continue  # the blessed implementation lives here
+            for node in ast.walk(ast.parse(source)):
+                if (relpath, node.__dict__.get('name')) in _ALLOWED_RENAMERS:
+                    # Same documented exceptions as the sibling guard above.
+                    # session_registry in particular MUST keep an inlined body:
+                    # it is stdlib-only so spawn-claude.sh can run it with no
+                    # venv, and importing shared makes it unimportable there.
+                    continue
+                if (
+                    isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                    and node.name in ('_atomic_write_text', 'atomic_write_text')
+                ):
+                    body = ast.get_source_segment(source, node) or ''
+                    if 'safe_io.atomic_write_text(' not in body:
+                        offenders.append(f'{relpath}::{node.name} does not delegate')
+
+        assert not offenders, (
+            'These helpers stopped delegating to shared.safe_io.atomic_write_text '
+            'and re-inlined their own implementation:\n  ' + '\n  '.join(offenders)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module boundary and anti-vacuity fences (task 3388)
+# ---------------------------------------------------------------------------
+#
+# Two tests ABOUT the guard above rather than about the source trees: one keeps
+# the guard out of the package suite it was relocated from, the other keeps it
+# from reporting green while scanning nothing.
 
 #: The ONE file this module's boundary test pins.  Deliberately a single file
 #: rather than a walk of ``shared/tests/**/*.py`` — see the scope-limit block
@@ -143,11 +716,17 @@ def test_every_declared_tree_contributes_scanned_files():
     """
     scanned = {relpath for relpath, _ in _iter_source_files()}
 
-    assert set(_CONTROL_MODULES) == set(_SRC_TREES), (
+    # Annotated set[str] rather than the bare set() calls: pyright infers
+    # set[Literal['shared/src', ...]] from the _SRC_TREES tuple and then
+    # rejects `-` against set[str] (reportOperatorIssue).
+    declared: set[str] = set(_SRC_TREES)
+    controlled: set[str] = set(_CONTROL_MODULES)
+
+    assert controlled == declared, (
         'Every declared tree needs a named control module, or the anti-vacuity '
         'check degrades to "the tree yielded something" for the unpaired one.\n'
-        f'  declared but uncontrolled: {sorted(set(_SRC_TREES) - set(_CONTROL_MODULES))}\n'
-        f'  controlled but undeclared: {sorted(set(_CONTROL_MODULES) - set(_SRC_TREES))}'
+        f'  declared but uncontrolled: {sorted(declared - controlled)}\n'
+        f'  controlled but undeclared: {sorted(controlled - declared)}'
     )
 
     empty = [tree for tree in _SRC_TREES
