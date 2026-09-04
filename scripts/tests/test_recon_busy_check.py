@@ -126,3 +126,34 @@ def test_cli_non_object_json_is_unreachable():
     result = _run_cli("[1, 2, 3]")
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert result.stdout.splitlines()[0] == "unreachable"
+
+
+# ---------------------------------------------------------------------------
+# _cli_timeout_from_env(): default-resolution branches (unset/blank -> 60.0;
+# a valid override parses through). Loud-rejection branches are in the next
+# section, once the helper exists.
+# ---------------------------------------------------------------------------
+
+def test_cli_timeout_from_env_unset_returns_default(monkeypatch):
+    monkeypatch.delenv("RECON_BUSY_CHECK_TEST_TIMEOUT", raising=False)
+    assert _cli_timeout_from_env() == 60.0
+
+
+def test_cli_timeout_from_env_blank_returns_default(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "")
+    assert _cli_timeout_from_env() == 60.0
+
+
+def test_cli_timeout_from_env_whitespace_only_returns_default(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "   \n\t")
+    assert _cli_timeout_from_env() == 60.0
+
+
+def test_cli_timeout_from_env_integral_override_parses(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "5")
+    assert _cli_timeout_from_env() == 5.0
+
+
+def test_cli_timeout_from_env_fractional_override_parses(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "2.5")
+    assert _cli_timeout_from_env() == 2.5
