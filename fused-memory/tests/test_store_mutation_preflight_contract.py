@@ -79,12 +79,18 @@ def _stub_script_module(*, with_guard: bool = True) -> types.ModuleType:
     class StoreMutationUnavailable(RuntimeError):
         pass
 
-    mod.StoreMutationUnavailable = StoreMutationUnavailable
+    # Populate via __dict__.update: pyright rejects attribute assignment on a
+    # bare ModuleType instance (reportAttributeAccessIssue), but a module
+    # namespace is a plain dict[str, Any], so this is runtime-equivalent and
+    # type-clean -- the same spelling escalation/tests/conftest.py uses for its
+    # module stubs. `monkeypatch.setattr(mod, ...)` still sees these, since
+    # attribute access on a module IS its `__dict__`.
+    mod.__dict__.update(StoreMutationUnavailable=StoreMutationUnavailable)
     if with_guard:
         def _real_guard(*, operation: str) -> None:
             raise AssertionError(f'the real guard ran for {operation!r}')
 
-        mod.assert_store_mutation_allowed = _real_guard
+        mod.__dict__.update(assert_store_mutation_allowed=_real_guard)
     return mod
 
 
