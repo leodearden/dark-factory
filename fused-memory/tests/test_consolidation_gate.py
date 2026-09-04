@@ -1100,9 +1100,11 @@ class TestHandrolledMemberEnumeration:
 
     def test_key_selection_is_deterministic_when_both_are_present(self):
         """Sorted-first, so the warning text is stable across runs."""
-        key, _ = consolidation_gate.handrolled_member_enumeration(
+        hit = consolidation_gate.handrolled_member_enumeration(
             self._meta(memory_ids=[_uuid(1)], related_memory_ids=[_uuid(2)])
         )
+        assert hit is not None
+        key, _ = hit
         assert key == sorted(consolidation_gate.HANDROLLED_MEMBER_KEYS)[0]
 
     def test_an_empty_enumeration_is_not_a_hit(self):

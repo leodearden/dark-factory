@@ -24,6 +24,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -83,7 +84,7 @@ _WELL_FORMED = [_member(_uuid(1), canonical=True), _member(_uuid(2))]
 
 
 def _gate_blob(observed=None, members_override=None):
-    block = {'topic': _TOPIC}
+    block: dict[str, Any] = {'topic': _TOPIC}
     if observed is not None:
         block['provenance'] = {
             'report_run': 'run-abc',
