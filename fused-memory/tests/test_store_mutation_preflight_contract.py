@@ -14,7 +14,8 @@ Two things live here:
    raiser, `fail_closed_records` actually filters. None of these assert on
    docstring prose: `neutralise_fixture` still composes its `__doc__` from the
    shared rationale plus the per-suite note (which is what makes
-   `pytest --fixtures` useful), but that composition has no runtime effect and
+   `pytest --fixtures -v` useful -- the `-v` is required, since pytest hides
+   underscore-prefixed fixtures), but that composition has no runtime effect and
    so is read inline rather than pinned by a test.
 
 2. The whole-tree AST drift guards that keep the extraction from silently
@@ -218,13 +219,37 @@ _LOGGER = 'contract_probe_logger'
 _OTHER_LOGGER = 'contract_probe_other_logger'
 
 # Probe messages are COMPOSED from the exported markers rather than spelled
-# out, so `TestPinnedLiterals` stays the one place in this file that types
-# either marker -- and so a marker rename cannot leave these probes silently
-# testing the wrong string.
-_MARKER_FAIL_CLOSED, _MARKER_REMEDY = FAIL_CLOSED_MARKERS
-_BOTH_MARKERS = f'sweep {_MARKER_FAIL_CLOSED}: route it through the {_MARKER_REMEDY}'
-_ONLY_REMEDY = f'fatal error during sweep: route it through the {_MARKER_REMEDY}'
-_ONLY_FAIL_CLOSED = f'sweep {_MARKER_FAIL_CLOSED}: boom'
+# out, for two reasons. First, `TestNoInlinedFailClosedMarker` below forbids
+# spelling the fail-closed marker as a literal anywhere under `tests/` --
+# INCLUDING this module, since that guard's sweep is exemption-free -- so
+# composing is the only way to build a probe that carries it. Second, a marker
+# rename then cannot leave these probes silently testing the wrong string.
+#
+# Composed by ITERATION, never by unpacking: `a, b = FAIL_CLOSED_MARKERS` would
+# make a third marker an import-time `ValueError`, i.e. a collection error for
+# this whole module, which is the worst available failure mode for what should
+# be a one-line change in the helper. Iterating instead means a third marker
+# widens the positive probe and mints its own exclusion case automatically.
+
+
+def _message_carrying(markers) -> str:
+    """A plausible guard-site ERROR message carrying exactly *markers*."""
+    return f"sweep refused -- {'; '.join(markers)} -- see above"
+
+
+_ALL_MARKERS = _message_carrying(FAIL_CLOSED_MARKERS)
+
+
+def _message_omitting(marker: str) -> str:
+    """The same message with exactly one clause dropped.
+
+    The point of dropping only ONE is that the record still looks like a real
+    diagnosis: the helper's filter must reject it on the strength of the single
+    missing clause, not because the message is obviously junk. This is the
+    generated form of the old hand-written pair (`'... : boom'`, `'fatal error
+    during sweep: ...'`), which covered the same two cases at a fixed arity.
+    """
+    return _message_carrying([m for m in FAIL_CLOSED_MARKERS if m != marker])
 
 
 class TestFailClosedRecords:
@@ -232,37 +257,44 @@ class TestFailClosedRecords:
     diagnosis from every other record in the log.
 
     Each exclusion is asserted independently, so a filter that silently drops
-    one of its four clauses fails a named test rather than passing on the
-    strength of the other three.
+    one of its clauses fails a named test rather than passing on the strength
+    of the others. The per-marker cases are generated from
+    `FAIL_CLOSED_MARKERS`, so that stays true at any arity.
     """
 
     def test_returns_the_matching_record(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.DEBUG):
-            logging.getLogger(_LOGGER).error(_BOTH_MARKERS)
-        assert [r.getMessage() for r in fail_closed_records(caplog, _LOGGER)] == [_BOTH_MARKERS]
+            logging.getLogger(_LOGGER).error(_ALL_MARKERS)
+        assert [r.getMessage() for r in fail_closed_records(caplog, _LOGGER)] == [_ALL_MARKERS]
 
     def test_excludes_another_logger(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.DEBUG):
-            logging.getLogger(_OTHER_LOGGER).error(_BOTH_MARKERS)
+            logging.getLogger(_OTHER_LOGGER).error(_ALL_MARKERS)
         assert fail_closed_records(caplog, _LOGGER) == []
 
     def test_excludes_below_error(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.DEBUG):
-            logging.getLogger(_LOGGER).warning(_BOTH_MARKERS)
+            logging.getLogger(_LOGGER).warning(_ALL_MARKERS)
         assert fail_closed_records(caplog, _LOGGER) == []
 
-    def test_excludes_a_record_missing_the_fail_closed_marker(
-        self, caplog: pytest.LogCaptureFixture
+    @pytest.mark.parametrize('omitted', FAIL_CLOSED_MARKERS)
+    def test_excludes_a_record_missing_any_one_marker(
+        self, omitted: str, caplog: pytest.LogCaptureFixture
     ) -> None:
-        with caplog.at_level(logging.DEBUG):
-            logging.getLogger(_LOGGER).error(_ONLY_REMEDY)
-        assert fail_closed_records(caplog, _LOGGER) == []
+        """Each marker is required INDEPENDENTLY: a record carrying every other
+        clause is still not this guard site's diagnosis.
 
-    def test_excludes_a_record_missing_the_remedy_marker(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+        Parametrised over `FAIL_CLOSED_MARKERS` rather than written out once
+        per marker, so a filter that silently drops a clause fails a case pytest
+        has NAMED for the dropped clause (it ids each case by the marker text),
+        and so a third marker arrives with its own exclusion case generated.
+
+        The marker texts are deliberately not quoted in this docstring: drift
+        guard #3 below sweeps docstrings too, because a docstring IS an
+        `ast.Constant`. (Measured: quoting one here turned that guard red.)
+        """
         with caplog.at_level(logging.DEBUG):
-            logging.getLogger(_LOGGER).error(_ONLY_FAIL_CLOSED)
+            logging.getLogger(_LOGGER).error(_message_omitting(omitted))
         assert fail_closed_records(caplog, _LOGGER) == []
 
     def test_includes_critical(self, caplog: pytest.LogCaptureFixture) -> None:
@@ -274,8 +306,8 @@ class TestFailClosedRecords:
         matches and can never turn a green assertion red.
         """
         with caplog.at_level(logging.DEBUG):
-            logging.getLogger(_LOGGER).critical(_BOTH_MARKERS)
-        assert [r.getMessage() for r in fail_closed_records(caplog, _LOGGER)] == [_BOTH_MARKERS]
+            logging.getLogger(_LOGGER).critical(_ALL_MARKERS)
+        assert [r.getMessage() for r in fail_closed_records(caplog, _LOGGER)] == [_ALL_MARKERS]
 
     def test_filters_a_mixed_log_down_to_the_guard_record(
         self, caplog: pytest.LogCaptureFixture
@@ -284,11 +316,11 @@ class TestFailClosedRecords:
         level, so only the markers can tell the two records apart."""
         with caplog.at_level(logging.DEBUG):
             log = logging.getLogger(_LOGGER)
-            log.info(_BOTH_MARKERS)
+            log.info(_ALL_MARKERS)
             log.error('fatal error during sweep')
-            logging.getLogger(_OTHER_LOGGER).error(_BOTH_MARKERS)
-            log.error(_BOTH_MARKERS)
-        assert [r.getMessage() for r in fail_closed_records(caplog, _LOGGER)] == [_BOTH_MARKERS]
+            logging.getLogger(_OTHER_LOGGER).error(_ALL_MARKERS)
+            log.error(_ALL_MARKERS)
+        assert [r.getMessage() for r in fail_closed_records(caplog, _LOGGER)] == [_ALL_MARKERS]
 
 
 # ---------------------------------------------------------------------------

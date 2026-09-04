@@ -65,10 +65,22 @@ import pytest
 # rather than as a plausible real diagnosis.
 SENTINEL = 'SENTINEL-store-unwritable'
 
-# The two clauses a guard site's own ERROR record must carry: the fail-closed
+# The clauses a guard site's own ERROR record must carry: the fail-closed
 # marker, and the remedy noun that tells the operator where to route the
-# mutation instead. Exported so that adding a third is a one-line change here
-# rather than a sweep across every guarded suite.
+# mutation instead. Exported as a TUPLE that every consumer ITERATES rather
+# than unpacking at a fixed arity, so adding a third clause is a one-line
+# change here rather than a sweep across the 12 guarded suites:
+# `fail_closed_records` below requires `all(...)` of it, and the contract
+# module's probe messages compose themselves from it (the positive probe
+# carries every clause; one exclusion case is generated per clause by
+# omission).
+#
+# ONE deliberate exception, and it is not an oversight: drift guard #3 sweeps
+# `FAIL_CLOSED_MARKERS[0]` ONLY. The fail-closed marker is a distinctive
+# sentence that appears as a string constant nowhere else under `tests/`; the
+# remedy noun is ordinary English and appears in 48 unrelated test modules
+# (measured 2026-09-04), so sweeping it would buy 48 false positives rather
+# than a guard. That guard's own comment carries the same reason.
 FAIL_CLOSED_MARKERS = ('NOT started (fail-closed)', 'MCP server')
 
 _SHARED_NEUTRALISE_RATIONALE = """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
@@ -97,8 +109,12 @@ def neutralise_fixture(mod, *, note):
     rationale above cannot: this suite's seam (which entry point runs the
     preflight, before which phase, and under which originating task) and its
     mock substrate. It is composed into the generated fixture's `__doc__`, so it
-    travels with the object and shows up in `pytest --fixtures` rather than
-    drifting away as a comment. Making it required is the forcing function: a
+    travels with the object and shows up in `pytest --fixtures -v` rather than
+    drifting away as a comment. The `-v` is load-bearing: pytest hides
+    underscore-prefixed fixtures from a bare `--fixtures`, and the suites bind
+    this one as `_neutralise`, so plain `--fixtures` prints the
+    `fixtures defined from _store_mutation_preflight_contract` section header
+    with nothing under it. Making it required is the forcing function: a
     conversion that forgets to carry a suite's per-script rationale forward is a
     `TypeError` at collection time, not a silent prose deletion.
     """
