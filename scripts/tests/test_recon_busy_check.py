@@ -98,13 +98,16 @@ def _cli_timeout_from_env(default: float = 60.0) -> float:
     return value
 
 
-def _run_cli(stdin_text: str) -> subprocess.CompletedProcess:
+_CLI_TIMEOUT = _cli_timeout_from_env()
+
+
+def _run_cli(stdin_text: str, timeout: float = _CLI_TIMEOUT) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["python3", str(SCRIPT)],
         input=stdin_text,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     )
 
 
