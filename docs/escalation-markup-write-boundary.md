@@ -120,7 +120,17 @@ routes to `MarkupGuardMiddleware._forward`, so a filing of this shape today
 The recovered `evidence` still contains the quoted `content` closing tag,
 because that is the caller's own text. The middleware names it in
 `quoted_markup_params`, on the `markup_detected` fact and on both policy
-payloads, so the quoting is countable rather than silent.
+payloads, so the quoting is countable rather than silent. Concretely, measured
+against the real server: a filing of this shape reports
+`recovered_params=['evidence','suggested_action']` with
+`quoted_markup_params=['evidence']`, while the stored `evidence` still lands
+with its declared `list` type.
+
+The census is taken from the **verbatim** recovered map, before the middleware
+types each value against the invoked tool's schema. That is not an
+implementation detail here: `evidence` is decoded to a `list` on its way to the
+tool, so a census read off the delivered map would name nothing at all for
+exactly this shape.
 
 ### Why it USED to fail: the controlled experiment
 

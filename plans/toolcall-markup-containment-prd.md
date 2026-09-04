@@ -600,6 +600,30 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > worse than the `None` it returns today. **Condition (i) is what prevents it**, and
 > it is safe to state categorically because an item's own closing tag inside its own
 > value is a cross-dialect mis-close by definition, never prose about itself.
+>
+> **Follow-on 2026-09-04 (task 4502, same task, later iteration) — the COUNTABILITY
+> half silently no-opped, and every test was green.** The narrowing above shipped
+> correct: the characters land. `quoted_markup_params` did not. It was computed from
+> the **post-coercion** recovered map, while the parameter the carve-out exists for —
+> `escalate_info.evidence`, declared `list[dict[str, Any]] | None` — is decoded to a
+> `list` by `_coerce_recovered` and skipped by the census's `str`-only scan. Measured
+> against the real escalation server with the one record above:
+> `recovered_params=['evidence','suggested_action']` and `quoted_markup_params=[]` —
+> **empty for the entire measured population**. Fixed by taking the census ONCE from
+> the **verbatim** (pre-coercion) map, which is the caller's own text under D5, and
+> threading it to all three publication sites; the same replay now reports
+> `quoted_markup_params=['evidence']`.
+>
+> *Why nothing failed, which is the reusable part.* Every unit pin exercised only
+> **string-typed** parameters, where the pre- and post-coercion values are the same
+> object; and the corpus replay's synthetic tools declare **every** parameter
+> `str | None`, so no test in the suite ever reached `_coerce_recovered`'s decode
+> branch. The anti-vacuity guard (`test_the_carve_out_is_REACHED_by_this_corpus`)
+> passed throughout. **A schema-directed mechanism needs at least one pin driven
+> through a REAL declared type**, and the real-server replay is where it belongs —
+> here, `escalation/tests/test_markup_middleware_registration.py`'s
+> `TestTheQuotedMarkupCensusAgainstTheREALSchema`. The FINDING 2 ruling above is
+> unchanged.
 *Evidence:* each corpus record carries its **expected outcome** (`repaired` with the expected recovered-parameter names, or `unrepairable`), committed alongside the specimens; replay asserts the repairer matches every committed expectation, that replay is byte-identical across two runs, and that D5 holds for every repaired case (`clean_value` is a prefix of the input; every recovered value is a verbatim substring).
 *G6 note — deliberately not a bare threshold.* The reference implementation scores **308 repaired / 26 unrepairable (92.2%)**, and that is the basis for expecting a high rate; but the signal is agreement-with-committed-expectations, not a literal count. A correct implementation that repairs *more* of the 26 ambiguous cases must update the expectation file in the same commit — which is a reviewable improvement, not a RED test. Pinning the literal 308 would make a better repairer look like a regression.
 
