@@ -3,39 +3,24 @@
 Sibling of `test_roles_tool_call_rejection.py` (tasks 4273 + 4578) — same
 shape, same provenance kind: a legibility-census finding about a wasted
 agent turn, turned into a named prompt constant spliced into a
-machine-derived set of roles. This one is census 2026-08-31 §1.1
-(`plans/confusion-census-2026-08-31.md`), codebook entry
-`entry-cand-20260827-23` (founding session
-7dae04c6-f0a5-400d-b199-8932d65a8790): an `Edit` call landed
-`<tool_use_error>Found 3 matches of the string to replace, but replace_all
-is false...`, and the very next turn called a bare `replace_all({})` —
-rejected with `Error: No such tool available: replace_all`, one turn lost.
-The agent read the rejection's remedy clause ("set replace_all to true")
-and bound the bare identifier `replace_all` to the wrong syntactic
-category: a callable tool rather than a parameter on a re-issued `Edit`
-call. The empty argument object is the tell — invoked as a "tool", the
-name carries nothing from the failed edit, so there is nothing for it to
-act on.
-
-The error TEXT is the harness's — `Edit`'s multi-match rejection is a
-Claude Code builtin behaviour, upstream of this repository, and is not
-addressed here at all; no in-repo code path produces or can intercept it.
-What IS in this repo's control, and what this constant targets, is the
-RESPONSE facet: an agent that reads a remedy clause as naming a parameter,
-not a tool, does not need a wasted turn to recover.
+machine-derived set of roles. Provenance (the two-turn `Edit` ->
+`replace_all({})` trace, codebook entry `entry-cand-20260827-23`, founding
+session 7dae04c6-f0a5-400d-b199-8932d65a8790) and the full "what is/isn't
+addressed" and "discrimination, not duplication" rationale are recorded
+once, next to the constant they constrain, in the comment block above
+`orchestrator/src/orchestrator/agents/roles.py::ERROR_REMEDY_HINT_GUIDANCE`
+— not re-derived here. Short version: census 2026-08-31 §1.1
+(`plans/confusion-census-2026-08-31.md`), task 4964.
 
 THIS IS A SEPARATE MODULE, not a fourth bullet added to
-`test_roles_tool_call_rejection.py` the way task 4578 shared that module.
-4578's finding was a THIRD `InputValidationError` shape — the same error
-class as that module's section opener ("`InputValidationError` reports a
-defect in the CALL you just made") — so it composed in as a peer bullet
-under one heading. This finding is a DIFFERENT error class: a well-formed
-`Edit` call that PARSED fine, was accepted, and failed on CONTENT,
-printing a remedy — and the defect is in parsing the remedy, not the
-call. It gets its own `##` section and its own constant,
-`ERROR_REMEDY_HINT_GUIDANCE`, spliced immediately after
-`TOOL_CALL_REJECTION_GUIDANCE` rather than composed into it. See this
-task's design decision of the same name.
+`test_roles_tool_call_rejection.py` the way task 4578 shared that module,
+because (per the roles.py comment block cited above, and this task's
+design decision of the same name) the finding is a DIFFERENT error class:
+a well-formed `Edit` call that parsed fine and failed on CONTENT, printing
+a remedy, rather than one of `InputValidationError`'s
+defect-in-the-call shapes. It gets its own `##` section and its own
+constant, `ERROR_REMEDY_HINT_GUIDANCE`, spliced immediately after
+`TOOL_CALL_REJECTION_GUIDANCE` rather than composed into it.
 
 Its real effect is on model behaviour and is not unit-testable, but
 silent removal during a prompt refactor is a genuine regression — the
@@ -207,9 +192,14 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
     """The new block lands immediately after `TOOL_CALL_REJECTION_GUIDANCE`, always.
 
     Iterates `TOOL_CALL_REJECTION_GUIDANCE`'s own carrier set, not the new
-    block's — a role where the new block is absent is recorded as an
-    offender (`'ABSENT'`) rather than skipped, so this test can never pass
-    vacuously on a role that dropped the splice.
+    block's, so a role that gained an out-of-place copy is still checked.
+    Presence is deliberately NOT this test's job: a role that has dropped
+    the splice entirely already fails
+    `test_carried_by_exactly_the_tool_call_rejection_role_set`'s
+    `missing_new` check (that test's `shared` guard is what keeps such a
+    failure from ever passing vacuously), so it is skipped here rather than
+    re-flagged — the same "one root cause fails one test" discipline
+    `test_guidance_appears_exactly_once_per_role` documents.
 
     Why the new block cannot be placed EARLIER: two pre-existing invariants
     constrain the front of every role prompt. For the 7 roles carrying
@@ -234,7 +224,9 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
         prompt = ROLES[name].system_prompt
         idx = prompt.find(ERROR_REMEDY_HINT_GUIDANCE)
         if idx == -1:
-            offenders[name] = 'ABSENT'
+            # Presence is test_carried_by_exactly_the_tool_call_rejection_role_set's
+            # job (its missing_new check), not this one's — see the
+            # docstring above.
             continue
 
         expected = prompt.find(TOOL_CALL_REJECTION_GUIDANCE) + len(TOOL_CALL_REJECTION_GUIDANCE)
@@ -244,6 +236,7 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
     assert offenders == {}, (
         f'Roles placing ERROR_REMEDY_HINT_GUIDANCE incorrectly: {offenders}. '
         'It must immediately follow TOOL_CALL_REJECTION_GUIDANCE in every '
-        "role that carries the latter — 'ABSENT' means the splice is "
-        'missing entirely for that role.'
+        'role that carries both blocks (a role missing the new block '
+        'entirely is a different, already-covered failure — see '
+        'test_carried_by_exactly_the_tool_call_rejection_role_set).'
     )
