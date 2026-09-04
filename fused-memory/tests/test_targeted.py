@@ -6280,3 +6280,103 @@ async def test_unblock_metadata_stamp_non_dict_response_is_rejected(
         f"Expected the 'unknown' fallback for a non-dict response, "
         f'got: {stamp_skips[0]["detail"]!r}'
     )
+
+
+# ── Task 4723 / PRD D7: verdict-specific verification memory templates ──
+#
+# The defect: `confirmed` and `contradicted` shared ONE completion-framed
+# template, so a verdict meaning "the codebase does NOT support this claim"
+# was written into permanent project memory as though the task had been
+# completed, with the refutation buried in the tail after the colon.  A later
+# semantic search surfaces that record as evidence FOR completion — the
+# retrieval-time reading inverts the finding.  Each verdict now carries its
+# own framing, so the record reads correctly standing alone.
+
+
+def _verdict_writes(mock_memory_service) -> list:
+    """The verification memory writes from a done-transition, and only those.
+
+    `_on_task_done`'s fast-path completion echo is a separate and explicitly
+    ALLOWED write; the metadata key marking a write as verdict-bearing is
+    what separates the two (same filter idiom as the refused-root test above).
+    """
+    return [
+        c for c in mock_memory_service.add_memory.call_args_list
+        if 'verification_verdict' in (c.kwargs.get('metadata') or {})
+    ]
+
+
+class TestVerdictMemoryTemplates:
+    """Each verdict's memory record says what that verdict actually found."""
+
+    @staticmethod
+    def _stub_verifier(reconciler, verdict: VerificationVerdict) -> None:
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=verdict,
+            confidence=0.8,
+            evidence=[{'file_path': 'api.py', 'line_range': '42', 'snippet': 'def handle_event()'}],
+            summary='api.py:42 defines handle_event()',
+            agent_failed=False,
+            failure_token='',
+        ))
+
+    @pytest.mark.asyncio
+    async def test_confirmed_memory_is_framed_as_a_verification(
+        self, reconciler, mock_memory_service, tmp_path
+    ):
+        """A confirmed verdict records that the claim was VERIFIED against code."""
+        self._stub_verifier(reconciler, VerificationVerdict.confirmed)
+
+        await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        writes = _verdict_writes(mock_memory_service)
+        assert len(writes) == 1, (
+            f'Expected exactly one verification memory write, got '
+            f'{[c.kwargs.get("metadata") for c in writes]}'
+        )
+        content = writes[0].kwargs['content']
+        assert content == (
+            "Verified completion of task 'Test' against the codebase: "
+            'api.py:42 defines handle_event()'
+        ), f'Unexpected confirmed content: {content!r}'
+        assert not content.startswith('Completed task'), (
+            f'The retired shared completion framing must be gone, got {content!r}'
+        )
+        assert writes[0].kwargs['metadata'] == {
+            'source': 'targeted_reconciliation',
+            'task_id': '1',
+            'verification_verdict': VerificationVerdict.confirmed,
+        }, f'Metadata must be unchanged, got {writes[0].kwargs["metadata"]!r}'
+
+    @pytest.mark.asyncio
+    async def test_contradicted_memory_is_framed_as_a_contradiction(
+        self, reconciler, mock_memory_service, tmp_path
+    ):
+        """A contradicted verdict must NOT read as a completion record.
+
+        This is the whole point of the split: the sentence a semantic search
+        returns has to carry the refutation in its subject, not as a trailing
+        clause on a completion claim.
+        """
+        self._stub_verifier(reconciler, VerificationVerdict.contradicted)
+
+        await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        writes = _verdict_writes(mock_memory_service)
+        assert len(writes) == 1, (
+            f'Expected exactly one verification memory write, got '
+            f'{[c.kwargs.get("metadata") for c in writes]}'
+        )
+        content = writes[0].kwargs['content']
+        assert content == (
+            "Codebase evidence CONTRADICTS the completion claim of task 'Test': "
+            'api.py:42 defines handle_event()'
+        ), f'Unexpected contradicted content: {content!r}'
+        assert not content.startswith('Completed task'), (
+            f'A contradiction must never be framed as a completion, got {content!r}'
+        )
+        assert writes[0].kwargs['metadata'] == {
+            'source': 'targeted_reconciliation',
+            'task_id': '1',
+            'verification_verdict': VerificationVerdict.contradicted,
+        }, f'Metadata must be unchanged, got {writes[0].kwargs["metadata"]!r}'
