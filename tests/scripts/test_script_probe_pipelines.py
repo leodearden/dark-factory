@@ -350,3 +350,71 @@ def test_import_stops_the_containers_on_a_clean_listing(tmp_path):
 
     combined = result.stdout + result.stderr
     assert _STOPPED in combined, combined
+
+
+# --- import-data.sh section 7: the FalkorDB "wait for healthy" loop ---------
+# Anchor occurs exactly once on a non-comment line and survives the fix. The
+# same anchor shape task 4204 used for setup-host.sh's section-2 wait loop,
+# which this block is a literal copy of. Verified to yield the 11-line block.
+_IMPORT_WAIT_START = 'docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant'
+_IMPORT_WAIT_END = "\ndone\n"
+
+_HEALTHY = "OK FalkorDB healthy"
+_NOT_HEALTHY = "WARN FalkorDB did not become healthy in 30s"
+
+
+def _run_import_wait(tmp_path, exec_body):
+    """Slice import-data.sh's section-7 wait loop and run it against a scripted docker.
+
+    The `up -d` invocation falls to the stub's catch-all and exits 0 silently;
+    only the `redis-cli ping` exec branch is under test. The no-op `sleep` stub
+    is what makes the 30-iteration timeout case instant.
+    """
+    return _run_probe(
+        tmp_path,
+        slice_section(IMPORT_DATA_PATH, _IMPORT_WAIT_START, _IMPORT_WAIT_END),
+        docker_body=_dispatch_stub_body((('*" exec "*', exec_body),)),
+    )
+
+
+def test_import_wait_reports_healthy_when_the_ping_exits_nonzero(tmp_path):
+    """A ping that ANSWERED PONG is healthy, whatever else the producer's status says.
+
+    `docker compose exec` reports on the exec run as a whole; redis-cli having
+    answered is a fact about the OUTPUT. Reading the verdict from the
+    pipeline's status conflates the two and polls a live FalkorDB for thirty
+    seconds before declaring it never came up.
+    """
+    result = _run_import_wait(tmp_path, _match_then_nonzero("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _HEALTHY in combined, combined
+    assert _NOT_HEALTHY not in combined, combined
+
+
+def test_import_wait_reports_healthy_when_the_ping_is_sigpiped(tmp_path):
+    """A producer still writing when grep matches dies of SIGPIPE; PONG was still said."""
+    result = _run_import_wait(tmp_path, _match_then_bulk("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _HEALTHY in combined, combined
+    assert _NOT_HEALTHY not in combined, combined
+
+
+def test_import_wait_times_out_when_the_ping_says_nothing(tmp_path):
+    """No reply is still not-healthy — and the loop must reach that verdict without aborting."""
+    result = _run_import_wait(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_HEALTHY in combined, combined
+    assert _HEALTHY not in combined, combined
+
+
+def test_import_wait_reports_healthy_on_a_clean_ping(tmp_path):
+    """Characterization: the ordinary path answers PONG and exits 0."""
+    result = _run_import_wait(tmp_path, _clean_match("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _HEALTHY in combined, combined
+    assert _NOT_HEALTHY not in combined, combined
