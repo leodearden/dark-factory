@@ -164,7 +164,7 @@ def test_shared_parser_module_importable_and_exposes_the_parser():
     (test_migrate_metadata_modules_to_files.py, test_repair_wiped_metadata_files.py).
     The runtime import is the assertion; these tests passing IS its proof.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     assert callable(systemd_unit_parity.parse_unit_directives)
     assert callable(systemd_unit_parity._join_continuations)
@@ -180,7 +180,7 @@ def test_shared_parser_parses_sections_keys_and_values():
     dropped rather than attributed, and the split taken on the FIRST ``=``
     only so ``Environment=A=1`` yields value ``A=1``.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
@@ -219,7 +219,7 @@ def test_dashboard_checker_consumes_the_lifted_parser():
     apart, which is precisely the failure mode these parity checkers exist to
     catch. Asserting object identity is the only check that fires on that.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     dashboard = _load_dashboard_checker()
 
@@ -242,7 +242,7 @@ def test_find_dropins_is_shared_not_duplicated():
     test in both suites green while the implementations quietly diverged.
     Object identity is the only check that fires on that.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     checker = _load_checker()
     dashboard = _load_dashboard_checker()
@@ -262,7 +262,7 @@ def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
     ``is_file()``). Counting a stray ``override.conf.bak`` would report an
     override that has no effect at all.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     installed_dir = tmp_path / "user"
     installed_dir.mkdir()

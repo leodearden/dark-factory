@@ -75,7 +75,7 @@ def test_environment_map_lives_on_the_shared_module():
     section-8 tmp repo) that makes the import direction load-bearing rather
     than a matter of taste.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     assert callable(systemd_unit_parity.environment_map)
 
@@ -92,7 +92,7 @@ def test_dashboard_checker_consumes_the_lifted_environment_map():
     implementations quietly drift — inside the tooling built to catch exactly
     that. Object identity is the only check that fires on it.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     checker = _load_checker()
 
@@ -105,7 +105,7 @@ def test_dashboard_checker_consumes_the_lifted_environment_map():
 
 
 def _env(text, section="Service"):
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     return systemd_unit_parity.environment_map(
         systemd_unit_parity.parse_unit_directives(text), section
@@ -188,7 +188,7 @@ HARDCODED_SERVICE_UV_PATH = "/home/leo/.local/bin/uv"
 
 
 def _render_template(template_text, **kwargs):
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.render_template(template_text, **kwargs)
 
@@ -308,13 +308,13 @@ NINE_ROOTS = ",".join(
 
 
 def _preserved_values(installed_text, names):
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.preserved_values(installed_text, names)
 
 
 def _apply_preserved(rendered_text, preserved):
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.apply_preserved(rendered_text, preserved)
 
@@ -328,7 +328,7 @@ def _apply_preserved(rendered_text, preserved):
 # word would have satisfied the wrong assertion. The code is the contract; the
 # sentence stays free to change.
 def _skip_codes():
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.SKIP_ABSENT, render_systemd_unit.SKIP_EMPTY
 
@@ -602,13 +602,13 @@ _DASHBOARD = "dashboard"
 
 
 def _units():
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.UNITS
 
 
 def _module():
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit
 
@@ -706,7 +706,7 @@ def test_fused_memory_spec_preserves_the_known_project_roots():
 
 
 def _host_local():
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.HOST_LOCAL_ENVIRONMENT
 
@@ -959,7 +959,7 @@ _NEW_UV = "/opt/uv/bin/uv"
 
 
 def _render_unit(**kwargs):
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.render_unit(
         TEMPLATE_PATH.read_text(encoding="utf-8"), **kwargs
@@ -1147,7 +1147,7 @@ _TAG = "[dashboard_unit_render]"
 
 
 def _main(argv):
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.main(argv)
 
@@ -1418,7 +1418,7 @@ def test_main_removes_its_temp_file_when_the_write_fails(tmp_path, capsys, monke
     give — the whole point of the temp-file-and-rename is that a failure is
     byte-safe, and a message that does not say so invites a panicked recovery.
     """
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     argv, output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
     before = output.read_bytes()

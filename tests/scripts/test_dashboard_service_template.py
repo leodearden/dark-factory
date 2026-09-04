@@ -25,7 +25,7 @@ import pytest
 # scripts/ on sys.path for exactly this. See the comment above
 # HARDCODED_SERVICE_REPO_ROOT for why this module renders through the
 # installer's own code rather than replaying the substitution.
-import render_systemd_unit  # pyright: ignore[reportMissingImports]
+import render_systemd_unit
 from systemd_unit_invariants import (
     assert_restart_backoff_effective as _assert_restart_backoff_effective,
 )
