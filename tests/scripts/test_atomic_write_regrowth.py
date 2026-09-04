@@ -426,7 +426,14 @@ def _find_renamers(source: str) -> list[str]:
 
 
 def _iter_source_files():
-    """Yield (repo-relative posix path, source text) for the three src trees."""
+    """Yield (repo-relative posix path, source text) for every scanned tree.
+
+    "Every scanned tree" means ``_SRC_TREES``, whatever that currently holds —
+    six at the time of writing.  Stated by reference rather than by count: the
+    count in this sentence used to say "the three src trees" and stayed there
+    through the widening to six, which is precisely the stale-prose failure
+    this module exists to prevent (task 3388).
+    """
     for tree in _SRC_TREES:
         root = _REPO_ROOT / tree
         # HARD assert, kept rather than downgraded to pytest.skip, and that is
@@ -517,7 +524,12 @@ class TestNoRegrownAtomicWriters:
         assert _find_renamers(prose_only) == []
 
     def test_no_unapproved_renamers_in_source_trees(self):
-        """Every rename-into-place in the three trees is a known, reasoned survivor."""
+        """Every rename-into-place in the scanned trees is a known, reasoned survivor.
+
+        Scanned trees = ``_SRC_TREES`` (six at the time of writing).  Read the
+        tuple, not this sentence — see _iter_source_files on why no count is
+        written here.
+        """
         actual = {
             (relpath, qualname)
             for relpath, source in _iter_source_files()
@@ -549,13 +561,25 @@ class TestNoRegrownAtomicWriters:
         )
 
     def test_atomic_write_text_helpers_only_delegate(self):
-        """The four surviving ``_atomic_write_text`` names must stay one-liners.
+        """The surviving ``_atomic_write_text`` names must stay one-liners.
 
         Task 3223 kept these module-level names (test_prompt_artifact.py
         monkeypatches one at five sites) but emptied their bodies down to a
         delegation.  Re-inlining a real implementation under the old name is
         the most likely way the duplication comes back, because the name would
         still look consolidated from every call site.
+
+        NO COUNT IS WRITTEN HERE, deliberately — this docstring said "the four
+        surviving names" from before the widening to six trees and was wrong by
+        the time anyone read it (task 3388).  For orientation only, measured at
+        that widening: six such function names existed across ``_SRC_TREES``,
+        of which this test actually checks THREE (shared/src/shared/
+        {memory_eval_limits,memory_eval_metrics,prompt_artifact}.py).  The other
+        three are skipped by construction rather than overlooked —
+        shared/src/shared/safe_io.py::atomic_write_text is the blessed
+        implementation (skipped by path), and session_registry's and
+        bake_off_storage_shape's copies are allowlisted exceptions (skipped by
+        _ALLOWED_RENAMERS).  Re-run the test to learn today's numbers.
         """
         offenders = []
         for relpath, source in _iter_source_files():
