@@ -546,6 +546,42 @@ class TestPinnedTail:
             mod.harvest(db, pin_tail_texts=['a query nobody ever ran'])
 
 
+class TestTheScanIsStreamed:
+    """The `write_ops` scan is consumed row-by-row, never materialized.
+
+    Not a style preference -- a measured cost.  The module docstring frames
+    the journal as multi-gigabyte (measured at 15,422,816,256 bytes) and the
+    committed sidecar records 431,621 search ops, so a `.fetchall()` on the
+    scan is a multi-hundred-MB peak allocation for a stream of `params` JSON
+    blobs that is consumed exactly once, into a Counter.  Nothing downstream
+    ever indexes the list.
+
+    "Consumed streaming, never materialized" has no direct observable in the
+    result value, and a memory-watermark assertion would be flaky under
+    `-n auto --dist loadgroup`.  So the property is pinned behaviourally:
+    forbid `.fetchall()` on the scan cursor while still requiring the harvest
+    to measure correctly.
+    """
+
+    def test_the_search_scan_is_streamed_not_materialized(self, tmp_path, monkeypatch):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        _patch_connect(monkeypatch, mod, _ConnectionProxy)
+
+        # The AssertionError from `_CursorProxy.fetchall` is not a
+        # `sqlite3.Error`, so it propagates rather than being swallowed and
+        # relabelled by the scan's error handler.
+        result = mod.harvest(db, tail_sample=5)
+
+        # Streaming must not cost accuracy: the same hand-computable shares
+        # `_standard_journal` is built for.
+        assert result.total_search_ops == 200
+        assert result.literal_share == 0.60
+        assert result.tail_share == 0.20
+        tail_rows = [r for r in result.rows if r['source'] == 'production_tail']
+        assert len(tail_rows) == 5
+
+
 class TestReadOnlyAccess:
     """The live journal is a 10 GB file a running server is writing to."""
 
