@@ -850,6 +850,71 @@ class TestRepairableFieldTable:
             'itself already claims write a repairable cell'
         )
 
+    def test_a_plan_writing_non_tool_is_never_a_sweep_candidate(self, monkeypatch):
+        """The derivation admits only REAL registered MCP tool impls.
+
+        "Writes plan.json" was never sufficient to mean "is a probeable tool
+        impl": an INTERNAL helper may legitimately call
+        ``artifacts.write_plan`` while returning something that is not a
+        status envelope, and the probe
+        (:func:`_alternate_writer_changed_the_cell`) can only call a real
+        tool impl.
+
+        MEASURED PROVENANCE — this is a reproduced divergence, not a
+        hypothetical. This branch's base is 83107bfe51; main has since
+        advanced via c005fabb00 ("refactor: delete plan-tools' duplicate
+        plan.json writer", task 3957 step-8), which DELETED the module-level
+        ``_atomic_write_plan`` this branch still has and re-routed
+        ``_read_plan_repaired``'s write-back through
+        ``artifacts.write_plan(repaired)``. ``git merge-base --is-ancestor
+        main HEAD`` reports NO, so this branch has diverged and WILL take
+        that change. Reproduced with main's shape monkeypatched onto the live
+        module: the derivation returns 12 names including
+        ``read_plan_repaired``; the probe then calls
+        ``_read_plan_repaired(artifacts)``, which returns the ``(plan,
+        facts)`` tuple, and ``result.get('status')`` raises ``AttributeError:
+        'tuple' object has no attribute 'get'`` — so BOTH
+        ``test_no_plan_writing_tool_is_an_undeclared_alternate`` and
+        ``test_an_undeclared_plan_writer_cannot_escape_the_sweep`` ERROR on
+        rebase/merge.
+
+        So the candidate set is intersected with the server's own REGISTERED
+        tool surface, which is itself derived (:func:`_registered_plan_tool_names`)
+        rather than hand-listed.
+        """
+        registered = _registered_plan_tool_names()
+        assert registered, 'the registered tool surface must not be empty'
+        assert set(_plan_writing_tool_names()) <= registered, (
+            f'the derived candidate set {sorted(_plan_writing_tool_names())!r} '
+            f'admits {sorted(set(_plan_writing_tool_names()) - registered)!r}, '
+            'which the server never registered as a tool — the probe can only '
+            'call a real tool impl'
+        )
+        assert 'read_plan_repaired' not in registered, (
+            "_read_plan_repaired is an internal read-time helper, not a "
+            'registered tool — if it ever becomes one, the probe must learn '
+            'to call it'
+        )
+
+        def _internal_plan_rewriter(artifacts):
+            """Exactly main's post-c005fabb00 ``_read_plan_repaired`` shape."""
+            plan = artifacts.read_plan()
+            artifacts.write_plan(plan)
+            return plan, []
+
+        # The same honest-simulation forgery
+        # `test_an_undeclared_plan_writer_cannot_escape_the_sweep` performs:
+        # without it the derivation's __module__ guard excludes a function
+        # defined in this test module, so the regression cannot be staged.
+        _internal_plan_rewriter.__module__ = plan_tools.__name__
+        monkeypatch.setattr(
+            plan_tools, '_internal_plan_rewriter', _internal_plan_rewriter, raising=False
+        )
+        assert 'internal_plan_rewriter' not in _plan_writing_tool_names(), (
+            'a plan-mutating INTERNAL helper was admitted to the sweep — the '
+            'probe would call it and crash on its non-envelope return value'
+        )
+
     def test_an_undeclared_plan_writer_cannot_escape_the_sweep(self, tmp_path, monkeypatch):
         """Pins the contract of ``_undeclared_alternates`` — the property
         nothing checks today, since the completeness sweep's candidate set
