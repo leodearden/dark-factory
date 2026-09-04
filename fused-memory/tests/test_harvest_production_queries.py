@@ -642,6 +642,62 @@ class TestReadOnlyAccess:
         assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
+class TestTheJournalPathIsRepoRelative:
+    """A published artifact must not name somebody's home directory.
+
+    An absolute checkout path is neither reproducible nor readable by anyone
+    else, and it leaks the worktree the run happened in -- the same rule this
+    change set already states for
+    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`.
+
+    Both tests patch `mod._REPO_ROOT`, a module global `_repo_relative` reads
+    at call time, so the property is pinned without depending on the
+    filesystem layout the suite happens to run under.
+    """
+
+    def test_a_journal_under_the_repo_root_is_recorded_repo_relative(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        # Move it under a `data/` subdir so the relative value has structure.
+        nested = tmp_path / 'data'
+        nested.mkdir()
+        db = db.rename(nested / 'j.db')
+        # Resolve BOTH sides: `_repo_relative` resolves its input, so an
+        # unresolved anchor would spuriously fail behind a symlinked tmpdir.
+        monkeypatch.setattr(mod, '_REPO_ROOT', tmp_path.resolve())
+
+        result = mod.harvest(db, tail_sample=5)
+
+        assert result.journal_path == 'data/j.db'
+        assert not Path(result.journal_path).is_absolute()
+        # The sidecar is what actually gets published, so pin it too.
+        assert result.provenance()['journal_path'] == 'data/j.db'
+
+    def test_a_journal_genuinely_outside_the_repo_root_stays_absolute(
+        self, tmp_path, monkeypatch
+    ):
+        """The fallback is ABSOLUTE, not a bare filename.
+
+        This is the regression guard against over-relativizing: a journal
+        parked outside the tree is genuinely checkout-independent and must
+        stay identifiable.  It distinguishes the census-shaped helper (which
+        this uses) from the bake-off one, whose fallback is `resolved.name`.
+
+        It passes today for the wrong reason -- no relativization exists at
+        all -- and earns its keep from step-8 onward.
+        """
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        monkeypatch.setattr(mod, '_REPO_ROOT', (tmp_path / 'somewhere_else').resolve())
+
+        result = mod.harvest(db, tail_sample=5)
+
+        assert Path(result.journal_path).is_absolute()
+        assert Path(result.journal_path).name == 'journal.db'
+
+
 class TestLoudDegradation:
     """An unreadable journal is a named error, never an empty sample."""
 
