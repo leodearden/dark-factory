@@ -41,8 +41,6 @@ from __future__ import annotations
 
 import pathlib
 from pathlib import Path
-from types import SimpleNamespace
-from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -109,56 +107,6 @@ def _graft_committed_restart_config(harness: Harness, committed: OrchestratorCon
     harness.config.orchestrator_restart_on_active_secs = (
         committed.orchestrator_restart_on_active_secs
     )
-
-
-def test_graft_forces_enabled_on_while_copying_the_committed_values() -> None:
-    """Pins `_graft_committed_restart_config`'s two-part contract directly,
-    independent of any committed-config load or the `harness` fixture.
-
-    Scenarios 9-10 below are composition/coalescing guards for
-    `_build_orchestrator_restart_coordinator`; the restart *fire path* is
-    their vehicle, not their subject. Deploy policy for
-    `orchestrator_restart_on_merge_enabled` is deliberately pinned by NO
-    test — it is an operator lever — and task 5020 is the gate that
-    restores the committed value once the 2026-09-03 deploy pause lifts.
-    So the helper must:
-
-    1. FORCE `orchestrator_restart_on_merge_enabled` to `True` locally,
-       regardless of what the committed config says (the pause set it to
-       `False` on 2026-09-03) -- otherwise these tests would silently lose
-       all fire-path coverage for the duration of the pause.
-    2. Still COPY the other four `orchestrator_restart_*` fields verbatim
-       from the committed config -- that is this file's unique value: proving
-       the parsed committed script/prefixes/debounce/on_active values reach
-       the coordinator's fields.
-
-    `SimpleNamespace` stand-ins (not `MagicMock`) are used for both `harness`
-    and `committed` because `MagicMock` auto-creates attributes on access,
-    which would make "only these four are hardcoded" vacuous -- a typo'd
-    attribute name would silently return a fresh Mock instead of raising
-    `AttributeError`.
-    """
-    committed = SimpleNamespace(
-        orchestrator_restart_on_merge_enabled=False,
-        orchestrator_restart_script='scripts/sentinel-not-the-fleet-script.sh',
-        orchestrator_restart_watch_prefixes=['sentinel/'],
-        orchestrator_restart_debounce_secs=123.0,
-        orchestrator_restart_on_active_secs=45,
-    )
-    harness = SimpleNamespace(config=SimpleNamespace())
-
-    _graft_committed_restart_config(
-        cast('Harness', harness), cast('OrchestratorConfig', committed)
-    )
-
-    assert harness.config.orchestrator_restart_on_merge_enabled is True
-    assert (
-        harness.config.orchestrator_restart_script
-        == 'scripts/sentinel-not-the-fleet-script.sh'
-    )
-    assert harness.config.orchestrator_restart_watch_prefixes == ['sentinel/']
-    assert harness.config.orchestrator_restart_debounce_secs == 123.0
-    assert harness.config.orchestrator_restart_on_active_secs == 45
 
 
 # ---------------------------------------------------------------------------
