@@ -368,6 +368,15 @@ def test_the_shipped_baseline_is_a_precondition_not_a_measurement():
        reassuring pair of zeroes.
     3. The no-op baseline itself, stated as what it is: a CONSEQUENCE of
        (1) and (2), not an independent measurement.
+
+    The baseline is stated in the simulation's own unit, the rejected MATCH:
+    every match this corpus carries is rejected by the shipped guard
+    (``already_selected == 0``) and the shipped guard compared against itself
+    leaves every one of them unchanged. Note the corpus holds more SHAPES
+    than matches — the suppression shapes carry no plural enumeration for the
+    regex to find at all — so ``facts_simulated`` and ``matches_scanned`` are
+    genuinely different numbers here, which is exactly why the band carries
+    both rather than letting a reader assume one from the other.
     """
     assert _CANDIDATE_GUARDS['shipped'] is _enumeration_is_prepositional_complement
 
@@ -379,7 +388,10 @@ def test_the_shipped_baseline_is_a_precondition_not_a_measurement():
 
     assert result.over_selected == []
     assert result.recovered == []
-    assert result.unchanged == _ALL_GUARDED_SHAPES
+    assert result.already_selected == 0, 'every match here reaches the guard'
+    assert len(result.unchanged) == result.matches_scanned
+    assert result.facts_simulated == len(_ALL_GUARDED_SHAPES)
+    assert set(m.fact for m in result.unchanged) <= set(_ALL_GUARDED_SHAPES)
 
 
 def test_candidate_a_re_opens_nothing_but_misses_the_motivating_shape():
@@ -392,10 +404,11 @@ def test_candidate_a_re_opens_nothing_but_misses_the_motivating_shape():
     motivated it buys very little.
     """
     result = simulate_candidate('a', _ALL_GUARDED_SHAPES)
+    recovered_facts = [m.fact for m in result.recovered]
 
     assert result.over_selected == []
-    assert _DATE_STAMP_PREAMBLE not in result.recovered
-    assert set(result.recovered) == set(_PREAMBLE_SHAPES) - {_DATE_STAMP_PREAMBLE}
+    assert _DATE_STAMP_PREAMBLE not in recovered_facts
+    assert set(recovered_facts) == set(_PREAMBLE_SHAPES) - {_DATE_STAMP_PREAMBLE}
 
 
 def test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection():
@@ -410,8 +423,8 @@ def test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection():
     """
     result = simulate_candidate('b', _ALL_GUARDED_SHAPES)
 
-    assert result.recovered == _PREAMBLE_SHAPES
-    assert result.over_selected == [_INTRA_CLAUSE_COMMA]
+    assert [m.fact for m in result.recovered] == _PREAMBLE_SHAPES
+    assert [m.fact for m in result.over_selected] == [_INTRA_CLAUSE_COMMA]
 
 
 @pytest.mark.parametrize('candidate', ['shipped', 'a', 'b'])

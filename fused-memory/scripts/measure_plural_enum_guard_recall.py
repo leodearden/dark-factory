@@ -352,19 +352,64 @@ def extract_plural_ids(fact: str, *, candidate: str = 'shipped') -> set[int]:
 
 
 @dataclass(frozen=True)
+class CandidateMatch:
+    """One simulated match, carried into the report at the offset scored.
+
+    Deliberately the SAME two fields as ``Rejection``, so the report has one
+    record shape and one ``(fact, match_start)`` sort convention for every
+    per-match list it renders. A bare fact string cannot say WHICH of a
+    multi-enumeration fact's matches was scored, which is the distinction the
+    whole per-MATCH unit exists to preserve.
+    """
+
+    fact: str
+    match_start: int
+
+
+@dataclass(frozen=True)
 class CandidateResult:
     """What one candidate tightening would change against a shape corpus.
+
+    EVERY FIELD BELOW IS COUNTED IN ONE UNIT: the regex MATCH. A fact
+    carrying two enumerations contributes 2, not 1, and contributes to two
+    different buckets if its two matches are scored differently.
 
     ``over_selected`` is disqualifying and ``recovered`` is the benefit; the
     two are separated by ``triage_rejection``, so the same newly-admitted
     match is scored as a regression or a recovery on its own linguistic
-    merits rather than on which list the caller passed it in.
+    merits rather than on which list the caller passed it in. ``unchanged``
+    holds the rejected matches the candidate rejects too, and ONLY those —
+    a match the shipped guard already selects is out of the simulation's
+    scope and is counted in ``already_selected`` instead.
+
+    That split is what makes the band arithmetic::
+
+        matches_scanned
+            == already_selected + len(recovered) + len(over_selected)
+               + len(unchanged)
+
+    An earlier spelling mixed three units in these four fields —
+    ``over_selected``/``recovered`` appended per MATCH, ``unchanged``
+    appended per FACT (and including facts that never reached the guard) —
+    so the columns could not be added, subtracted or compared even though
+    the renderers put them in one table.
+
+    ``facts_simulated`` carries the OTHER denominator: how many distinct
+    fact SHAPES were fed in. The dedup that produces those shapes happens in
+    ``run()`` (see ``live_facts``) and is a separate concern from the unit
+    counted here — deduping shapes stops an N-rejection fact being scored N
+    times over, while the per-MATCH unit is what makes its N enumerations
+    individually visible. Both are needed; conflating them is the defect
+    above.
     """
 
     name: str
-    over_selected: list[str] = field(default_factory=list)
-    recovered: list[str] = field(default_factory=list)
-    unchanged: list[str] = field(default_factory=list)
+    over_selected: list[CandidateMatch] = field(default_factory=list)
+    recovered: list[CandidateMatch] = field(default_factory=list)
+    unchanged: list[CandidateMatch] = field(default_factory=list)
+    matches_scanned: int = 0
+    already_selected: int = 0
+    facts_simulated: int = 0
 
 
 def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
@@ -380,33 +425,57 @@ def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
     is strictly weaker on some prefix; a candidate that instead rejects
     something the shipped guard admits shows up as a changed id set in
     ``extract_plural_ids``, which the subject-position positives pin.
+
+    THE UNIT IS THE MATCH, everywhere, and *facts* is expected to be a
+    deduplicated set of distinct fact SHAPES (``run()`` does that dedup; see
+    its ``live_facts``). Every match of every shape is counted exactly once,
+    into exactly one of four places, so::
+
+        matches_scanned
+            == already_selected + len(recovered) + len(over_selected)
+               + len(unchanged)
+
+    holds by construction. ``already_selected`` is the branch the simulation
+    has nothing to say about: the shipped guard admits that match, so no
+    candidate that is merely WEAKER can change it, and folding it into
+    ``unchanged`` would put a fact that never reached the guard beside the
+    rejections the guard actually produced.
     """
-    over_selected: list[str] = []
-    recovered: list[str] = []
-    unchanged: list[str] = []
+    over_selected: list[CandidateMatch] = []
+    recovered: list[CandidateMatch] = []
+    unchanged: list[CandidateMatch] = []
+    matches_scanned = 0
+    already_selected = 0
+    facts_simulated = 0
 
     guard = _CANDIDATE_GUARDS[name]
     for fact in facts:
-        changed = False
+        facts_simulated += 1
         for match in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
+            matches_scanned += 1
             prefix = fact[: match.start()]
+            entry = CandidateMatch(fact=fact, match_start=match.start())
             if not _enumeration_is_prepositional_complement(prefix):
-                continue  # shipped already selects it; nothing to recover
+                # Shipped already selects it; nothing to recover, and out of
+                # this simulation's scope rather than 'unchanged'.
+                already_selected += 1
+                continue
             if guard(prefix):
-                continue  # candidate agrees with the shipped rejection
-            changed = True
+                unchanged.append(entry)  # candidate agrees with the rejection
+                continue
             if triage_rejection(fact, match.start()) == ADVERBIAL_PREAMBLE:
-                recovered.append(fact)
+                recovered.append(entry)
             else:
-                over_selected.append(fact)
-        if not changed:
-            unchanged.append(fact)
+                over_selected.append(entry)
 
     return CandidateResult(
         name=name,
         over_selected=over_selected,
         recovered=recovered,
         unchanged=unchanged,
+        matches_scanned=matches_scanned,
+        already_selected=already_selected,
+        facts_simulated=facts_simulated,
     )
 
 
@@ -1181,8 +1250,11 @@ def render_json(report: Report) -> str:
         'candidates': [
             {
                 'name': candidate.name,
-                'over_selected': sorted(candidate.over_selected),
-                'recovered': sorted(candidate.recovered),
+                # Projected to fact text so this payload keeps the shape it
+                # had before the unit change; the per-match restructure is a
+                # separate change to the artifact schema.
+                'over_selected': sorted(m.fact for m in candidate.over_selected),
+                'recovered': sorted(m.fact for m in candidate.recovered),
                 'unchanged_count': len(candidate.unchanged),
             }
             for candidate in report.candidates
