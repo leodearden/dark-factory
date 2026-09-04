@@ -671,6 +671,53 @@ def test_index_html_cache_buster_not_reverted_below_charts_axis_floor(
     )
 
 
+def test_index_html_cache_buster_not_reverted_below_count_tick_floor(
+    index_html_body: str,
+) -> None:
+    """Every /static/redux/* asset must stay at or past task 4232's own floor.
+
+    Deliberately ADDED alongside the >= 44 floor above rather than replacing it:
+    that number records where task 4059's percent-axis fix landed, and folding
+    the two together would erase which change each floor defends.
+
+    TWO INDEPENDENT REASONS THIS BUMP IS MANDATORY — the number alone teaches
+    nothing, so both are recorded here.
+
+    1. charts.jsx:13-20's own stated rule. Its `const { ... } = window.DF_SPARK_PATH`
+       destructure now reaches for `formatCountTick`, a name a CACHED copy of
+       spark_path.js does not have. That destructure has no `|| {}` fallback,
+       deliberately, so without a new ``?v=`` an already-open dashboard pairs a
+       fresh charts.jsx with a stale spark_path.js, throws at charts.jsx LOAD
+       time, and blanks every chart on every tab — not just the three this fix
+       touches.
+    2. This is a user-visible RENDERING change. A cached charts.jsx/tabs.jsx
+       would keep drawing 1.75 / 3.5 / 5.25 on the memory and merge axes
+       indefinitely — the same rationale as the >= 44 floor above.
+
+    Asserts only THIS module's floor, per the convention
+    test_index_html.py:691-717 sets out: uniformity lives solely in
+    ``test_redux_cache_buster_bumped`` and the strictly-greater-than-merge-base
+    gate in ``test_redux_cache_buster_is_newer_than_merge_base``.  A bare floor
+    is sound without uniformity because the OLDEST asset is the one that would
+    still serve stale code.  Precedents: test_tab_memory_evals.py (>= 43),
+    test_esc_flow_diagram.py (>= 33).
+    """
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
+    )
+    assert min(versions) >= 52, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 52 (the floor the integer-count tick-label fix landed at). '
+        'Below that, an already-open dashboard pairs a cached spark_path.js '
+        'lacking formatCountTick with a charts.jsx that destructures it — which '
+        'throws at load and blanks every chart, not merely the three this fix '
+        'relabels.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Negative control — mirrors test_charts_null_samples.py:304-336.
 # ---------------------------------------------------------------------------
