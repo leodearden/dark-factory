@@ -7,6 +7,7 @@ Network errors are caught at the get_* level and returned as offline dicts.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -245,9 +246,31 @@ async def mcp_tool_call(
     a hard whole-operation bound must still wrap this in
     ``asyncio.wait_for`` — every existing probe caller does, deliberately, and
     the two layers are complementary rather than redundant.
+
+    **A session that hangs is self-evicting** (task 4958). When that enclosing
+    ``wait_for`` fires — or the caller is cancelled for any other reason — the
+    cached ``McpSession`` is invalidated before the exception propagates, so
+    the next call re-initialises instead of reusing a wedged one. This is the
+    cache-aware layer: ``McpSession.call_tool`` is an instance method with no
+    knowledge of ``_sessions``, so it cannot evict itself, while every MCP
+    caller passes through here — which means callers in other modules are
+    covered too, notably ``task_runtime.py::_probe_one``, whose own ``wait_for``
+    cancels this call and which previously did not invalidate at all.
+
+    The guard catches ONLY the two hang-shaped exits (``asyncio.CancelledError``
+    and the builtin ``TimeoutError``) and always re-raises. It deliberately does
+    not catch ``httpx.HTTPStatusError`` / ``ValueError``: teardown policy for
+    those already belongs to the callers (``first_success``,
+    ``get_queue_stats``, ``get_wal_status`` each invalidate themselves), and a
+    blanket handler would force a cold three-post handshake on every 500 while
+    silently changing a policy those callers implement.
     """
     session = _get_session(base_url)
-    return await session.call_tool(client, tool_name, arguments, timeout=timeout)
+    try:
+        return await session.call_tool(client, tool_name, arguments, timeout=timeout)
+    except (asyncio.CancelledError, TimeoutError):
+        invalidate_session(base_url)
+        raise
 
 
 async def _first_success(
