@@ -15,6 +15,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from recon_busy_check import classify
 
 SCRIPT = Path(__file__).parent.parent / "recon_busy_check.py"
@@ -181,3 +182,33 @@ def test_cli_timeout_from_env_integral_override_parses(monkeypatch):
 def test_cli_timeout_from_env_fractional_override_parses(monkeypatch):
     monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "2.5")
     assert _cli_timeout_from_env() == 2.5
+
+
+# ---------------------------------------------------------------------------
+# _cli_timeout_from_env(): loud-rejection branches — a present-but-malformed
+# override must fail loudly, naming both the env var and the offending raw
+# value, rather than silently falling back or misbehaving far from the cause.
+# ---------------------------------------------------------------------------
+
+def test_cli_timeout_from_env_non_numeric_raises(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "abc")
+    with pytest.raises(ValueError) as excinfo:
+        _cli_timeout_from_env()
+    assert "RECON_BUSY_CHECK_TEST_TIMEOUT" in str(excinfo.value)
+    assert "abc" in str(excinfo.value)
+
+
+def test_cli_timeout_from_env_zero_raises(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "0")
+    with pytest.raises(ValueError) as excinfo:
+        _cli_timeout_from_env()
+    assert "RECON_BUSY_CHECK_TEST_TIMEOUT" in str(excinfo.value)
+    assert "0" in str(excinfo.value)
+
+
+def test_cli_timeout_from_env_negative_raises(monkeypatch):
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "-1")
+    with pytest.raises(ValueError) as excinfo:
+        _cli_timeout_from_env()
+    assert "RECON_BUSY_CHECK_TEST_TIMEOUT" in str(excinfo.value)
+    assert "-1" in str(excinfo.value)
