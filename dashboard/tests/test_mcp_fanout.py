@@ -178,6 +178,124 @@ class TestFirstSuccessTimeoutIsAFailure:
             f'the operator must be told the cause was a timeout, got {result["error"]}'
         )
 
+# ── (b3) a HANGING url is bounded by first_success's own deadline ────
+
+
+class TestFirstSuccessWholeOperationDeadline:
+    """A url that never returns must not park the whole fan-out forever.
+
+    ``mcp_tool_call``'s ``timeout`` is a PER-HTTP-REQUEST budget, so it cannot
+    bound the operation: a cold session performs three posts, and httpx's
+    ``read`` timeout bounds each individual socket read rather than the whole
+    body (see the derivation next to
+    ``mcp_fanout._DEFAULT_PER_URL_DEADLINE_SECONDS``). first_success therefore
+    carries its own default-on whole-operation deadline per url, after which
+    the hung url is logged, invalidated and fallen through like any other
+    failure.
+
+    Every test here wraps the call in an OUTER ``asyncio.wait_for(..., 5)``.
+    That guard is mandatory, not decorative: without it a regression that
+    restores the unbounded await is SIGALRM-killed at the suite's 60s
+    pytest-timeout with no traceback, instead of failing fast and legibly.
+    """
+
+    @staticmethod
+    def _hanging_call(hang_url: str, attempted: list[str]):
+        """Build a *call* whose *hang_url* leg awaits a never-set Event."""
+        never = asyncio.Event()
+
+        async def call(url):
+            attempted.append(url)
+            if url == hang_url:
+                await never.wait()
+            return 'ok'
+
+        return call
+
+    async def test_hung_url_is_bounded_invalidated_and_fallen_through(self):
+        from dashboard.data.memory import _get_session, _sessions
+
+        _get_session('http://a')
+        assert 'http://a' in _sessions
+
+        attempted: list[str] = []
+        result = await asyncio.wait_for(
+            first_success(
+                ['http://a', 'http://b'],
+                self._hanging_call('http://a', attempted),
+                log_label='test',
+                offline_result=_offline_result,
+                per_url_timeout=0.05,
+            ),
+            timeout=5,
+        )
+
+        assert result == 'ok', 'the hung url must fall through to the next one'
+        assert attempted == ['http://a', 'http://b'], (
+            f'B must still be attempted after A is cut off, got {attempted}'
+        )
+        assert 'http://a' not in _sessions, (
+            "a hung url's wedged session must be invalidated, not left cached"
+        )
+
+    async def test_collected_error_names_the_deadline_that_fired(self):
+        attempted: list[str] = []
+        never = asyncio.Event()
+
+        async def call(url):
+            attempted.append(url)
+            await never.wait()
+
+        result = await asyncio.wait_for(
+            first_success(
+                ['http://a', 'http://b'], call,
+                log_label='test',
+                offline_result=_offline_result,
+                per_url_timeout=0.1,
+            ),
+            timeout=5,
+        )
+
+        assert result['offline'] is True
+        assert 'TimeoutError' in result['error'], (
+            f'the sentinel must name the exception type, got {result["error"]}'
+        )
+        assert '0.1' in result['error'], (
+            'the sentinel must name the budget that fired so an operator can '
+            'tell our whole-operation backstop from an httpx read timeout, '
+            f'got {result["error"]}'
+        )
+
+    async def test_default_deadline_applies_with_no_argument_at_call_time(
+        self, monkeypatch,
+    ):
+        """The default is read INSIDE first_success, not bound at def time.
+
+        Pins the ``TTLCache.ttl_seconds`` idiom: a monkeypatched module
+        constant must take effect immediately, which is the only thing that
+        makes the default path testable without a real 45s wait.
+        """
+        from dashboard.data import mcp_fanout
+        from dashboard.data.memory import _get_session, _sessions
+
+        monkeypatch.setattr(mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', 0.05)
+        _get_session('http://a')
+
+        attempted: list[str] = []
+        result = await asyncio.wait_for(
+            first_success(
+                ['http://a', 'http://b'],
+                self._hanging_call('http://a', attempted),
+                log_label='test',
+                offline_result=_offline_result,
+            ),
+            timeout=5,
+        )
+
+        assert result == 'ok'
+        assert attempted == ['http://a', 'http://b']
+        assert 'http://a' not in _sessions
+
 # ── (c) all-fail → offline_result(errors) ────────────────────────────
 
 
