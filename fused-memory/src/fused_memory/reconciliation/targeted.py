@@ -21,6 +21,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationRun,
     RunStatus,
     RunType,
+    VerificationVerdict,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -72,6 +73,30 @@ _ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 # _on_task_done's fast path.  Single-sourced so _is_authoritative_resolution
 # and the fast-path write can't drift out of sync (task 1984).
 _ECHO_SOURCE = 'targeted_reconciliation'
+
+# Per-verdict framing for the codebase-verification memory written by
+# _on_task_done (task 4723 / PRD D7).  Both verdicts previously shared ONE
+# completion-framed template, so a `contradicted` verdict — the codebase
+# saying the claim is NOT supported — was recorded in permanent project
+# memory as a completion, with the refutation demoted to a trailing clause
+# after the colon.  Semantic search then returns that record as evidence FOR
+# completion: the retrieval-time reading inverts the finding.  A memory
+# record is read standing alone, months later, by someone without the
+# verdict in hand, so the framing has to carry the verdict itself.
+#
+# This mapping doubles as the branch condition in _on_task_done ("which
+# verdicts write memory" is the same fact as "what each one says", so a
+# tuple plus a separate lookup could drift into either a KeyError or a
+# silently memory-silent verdict).  Keyed by VerificationVerdict members —
+# pydantic already coerces the field, so the key type is guaranteed and
+# pyright can see it.  `inconclusive`'s ABSENCE here IS the rule that it
+# stays memory-silent; there is no finding to record.
+_VERDICT_MEMORY_TEMPLATES: dict[VerificationVerdict, str] = {
+    VerificationVerdict.confirmed:
+        "Verified completion of task '{title}' against the codebase: {summary}",
+    VerificationVerdict.contradicted:
+        "Codebase evidence CONTRADICTS the completion claim of task '{title}': {summary}",
+}
 
 # Cap on the authoritative-memory pre-check query in _on_task_done's hot
 # path (task 1984 review: hot_path_efficiency).  That query runs on EVERY
@@ -760,9 +785,15 @@ class TargetedReconciler:
                         'type': 'verification_agent_failed',
                         'failure_token': verification.failure_token,
                     })
-                elif verification.verdict in ('confirmed', 'contradicted'):
+                elif verification.verdict in _VERDICT_MEMORY_TEMPLATES:
+                    # The mapping IS the branch condition — see its definition
+                    # at the top of this module.  Membership answers "does this
+                    # verdict write a memory", and the same entry answers "what
+                    # does it say", so the two cannot drift apart.
                     written = await self._fenced_add_memory(
-                        content=f"Completed task '{title}': {verification.summary}",
+                        content=_VERDICT_MEMORY_TEMPLATES[verification.verdict].format(
+                            title=title, summary=verification.summary,
+                        ),
                         category='observations_and_summaries',
                         project_id=scope.project_id,
                         metadata={
