@@ -164,6 +164,19 @@ def harness(tmp_path: Path, mock_orch_config):
          patch('orchestrator.harness.BriefingAssembler'):
         h = Harness(mock_orch_config)
 
+    # Task 3539 — pin the observe-before-enforce flag to its PRODUCTION
+    # default.  `mock_orch_config` is a `MagicMock(spec_set=...)`, so every
+    # bool field it is not explicitly given reads back as a truthy child mock;
+    # `convert_to_blocked_enforce` would therefore enforce here while the real
+    # `OrchestratorConfig` ships it False.  Pinning it restores production
+    # semantics, which is what every assertion in this file was written
+    # against: these suites pin the PRE-3539 LEAVE contract for an
+    # escalation-pinned, unclaimed stranded row, and that contract is exactly
+    # what log mode preserves byte-for-byte.  The enforce arm has its own
+    # fixture (`enforce_harness` in test_convert_to_blocked.py), so nothing is
+    # left uncovered by this pin.
+    h.config.convert_to_blocked_enforce = False
+
     # Replace scheduler with async mocks
     h.scheduler = MagicMock()
     # Wire real (non-auto-mock) liveness-accessor behaviour (task 2235:
@@ -4307,12 +4320,20 @@ class TestWithheldTrainMemberHasRecoveryEdge:
 # The report builders are imported from the sibling wiring module rather than
 # re-declared: two copies of "what does a pinned on-main strand look like"
 # would drift, and this suite asserts against the same shapes that one does.
+#
+# Task 3539 re-anchored the HELD shape those builders produce (sanctioned
+# fixture repair, esc-3539-1): a pinned, unclaimed IN_PROGRESS strand now
+# classifies CONVERT_TO_BLOCKED instead of holding silently forever, so the
+# still-held population these `held=` assertions need is `_pinned_hold` —
+# the same facts on a `blocked` task, which is also what 3539 converts the
+# in-progress row INTO.  The summary contract itself is unchanged.
 # ---------------------------------------------------------------------------
 
 from shared.deploy_state import DeployPhase  # noqa: E402
 from test_recovery_emission_wiring import (  # noqa: E402
     _bind_reports,
     _live_claimant,
+    _pinned_hold,
     _ref,
     _report,
 )
@@ -4343,8 +4364,8 @@ class TestReconcileSweepSummaryAlwaysSpeaks:
         three legacy counters are zero and the line is gated away."""
         TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
         _bind_reports(harness, {
-            'T1': _report(escalations=[_ref('esc-1')]),
-            'T2': _report(escalations=[_ref('esc-2')]),
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
+            'T2': _pinned_hold(escalations=[_ref('esc-2')]),
         })
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
@@ -4360,8 +4381,8 @@ class TestReconcileSweepSummaryAlwaysSpeaks:
         event-store query."""
         TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
         _bind_reports(harness, {
-            'T1': _report(escalations=[_ref('esc-1')]),
-            'T2': _report(escalations=[_ref('esc-2')]),
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
+            'T2': _pinned_hold(escalations=[_ref('esc-2')]),
         })
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
@@ -4380,7 +4401,7 @@ class TestReconcileSweepSummaryAlwaysSpeaks:
         line must not merge them into one opaque count."""
         TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
         _bind_reports(harness, {
-            'T1': _report(escalations=[_ref('esc-1')]),
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
             'T2': _report(
                 branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
                 deploy_phase=DeployPhase.FAILED,
@@ -4424,7 +4445,7 @@ class TestReconcileSweepSummaryAlwaysSpeaks:
         APPENDED, never a rewrite of what operators already grep for."""
         TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
         _bind_reports(harness, {
-            'T1': _report(escalations=[_ref('esc-1')]),
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
             'T2': _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None),
         })
         harness._revert_in_progress_if_no_live_claimant = AsyncMock(
@@ -4446,8 +4467,8 @@ class TestReconcileSweepSummaryAlwaysSpeaks:
         busy forever."""
         TestReconcileSweepSummaryAlwaysSpeaks._arm(harness)
         _bind_reports(harness, {
-            'T1': _report(escalations=[_ref('esc-1')]),
-            'T2': _report(escalations=[_ref('esc-2')]),
+            'T1': _pinned_hold(escalations=[_ref('esc-1')]),
+            'T2': _pinned_hold(escalations=[_ref('esc-2')]),
             'T3': _report(branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None),
         })
         harness._revert_in_progress_if_no_live_claimant = AsyncMock(

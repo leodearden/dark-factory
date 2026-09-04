@@ -13,18 +13,25 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _usage_gate_test_helpers import spawn_fault as _spawn_fault
 
 from shared import invocation_outcome
 from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import AuthFailed, auth_failure_reason, classify_invocation
-from shared.usage_gate import AccountState, UsageGate
+from shared.usage_gate import (
+    _SPAWN_FAULT_THRESHOLD,
+    AccountPhase,
+    AccountState,
+    UsageGate,
+)
 
 
 def _make_gate(
@@ -465,6 +472,215 @@ class TestAuthReprobeReReadsEnv:
             await gate._reprobe_account(gate._accounts[0])
 
         assert gate._accounts[0].auth_failed is True
+
+
+@pytest.mark.asyncio
+class TestAuthReprobeSpawnFault:
+    """The auth path must classify a spawn fault exactly as the resume path does.
+
+    Task 4512. `_reprobe_account` had the same blindness `_run_probe` did: on a
+    failed probe it logged "auth re-probe failed - staying auth_failed", a
+    sentence that ASSERTS a probe ran and came back negative. With `claude`
+    unresolvable no probe ran at all, so that line reported evidence about the
+    token that had never been gathered — pointing an operator at credentials
+    when the actual fault was the host.
+
+    Both probe callers share one accounting surface on purpose: an operator
+    debugging a fleet where some accounts are capped and others auth_failed
+    should see ONE infrastructure fault, not two unrelated-looking symptoms.
+    """
+
+    async def test_spawn_fault_does_not_propagate_and_is_recorded(self, caplog):
+        gate = _make_gate(['a'], auth_reprobe_secs=0)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='shared.usage_gate'),
+            patch('shared.usage_gate.load_dotenv'),
+        ):
+            await gate._reprobe_account(acct)
+
+        assert acct.probe_spawn_failures == 1
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'a spawn fault on the auth path must reach ERROR'
+        assert 'claude' in ' '.join(r.getMessage() for r in errors)
+
+    async def test_spawn_fault_does_not_claim_the_probe_ran(self, caplog):
+        """The misleading line must not be emitted — and the honest one must be.
+
+        "auth re-probe failed - staying auth_failed" is a claim about the
+        token. Emitting it when nothing was spawned is what sends an operator
+        to re-issue credentials for a host problem.
+
+        Deliberately a PAIR of assertions (task 4512 review). A negative
+        substring check on log prose is unfalsifiable on its own: merely
+        REWORDING the line in `_reprobe_account` would satisfy it while the
+        behaviour went away. Pairing it with a positive assertion that the
+        ERROR-level spawn-fault record WAS emitted means a rewording turns
+        the pair red rather than silently green — one of the two substrings
+        has to survive.
+        """
+        gate = _make_gate(['a'], auth_reprobe_secs=0)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='shared.usage_gate'),
+            patch('shared.usage_gate.load_dotenv'),
+        ):
+            await gate._reprobe_account(acct)
+
+        assert not [
+            r for r in caplog.records if 'staying auth_failed' in r.getMessage()
+        ]
+        spawn_errors = [
+            r for r in caplog.records
+            if r.levelno >= logging.ERROR and 'INFRASTRUCTURE FAULT' in r.getMessage()
+        ]
+        assert len(spawn_errors) == 1, (
+            'the probe-ran claim is suppressed, but nothing took its place: '
+            'the operator is now told less, not something truer'
+        )
+        assert acct.probe_spawn_failures == 1
+
+    async def test_spawn_fault_is_not_read_as_recovery(self):
+        """No AUTH_FAILED -> AVAILABLE edge, no auth_resumed event.
+
+        An account we could not VERIFY must not be treated as verified. This
+        is the fail-visible direction: staying blocked on an unverifiable
+        account is recoverable; unblocking it burns real invocations against
+        the same broken host.
+        """
+        gate = _make_gate(['a'], auth_reprobe_secs=0)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with (
+            patch('shared.usage_gate.load_dotenv'),
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+        ):
+            await gate._reprobe_account(acct)
+
+        assert acct.phase == AccountPhase.AUTH_FAILED
+        assert 'auth_resumed' not in [c[0][1] for c in mock_fire.call_args_list]
+
+    async def test_auth_reprobe_loops_broad_handler_never_sees_it(self, caplog):
+        """`_auth_reprobe_loop`'s `except Exception` must not be the catcher.
+
+        That handler logs a WARNING "auth re-probe raised" and retries, which
+        would downgrade the one signal saying this is NOT an auth problem back
+        into generic noise. Catching in `_reprobe_account` is what keeps the
+        classification.
+
+        Pinned on STATE and LEVEL, not only on log prose (task 4512 review).
+        `probe_spawn_failures` advancing once per `_reprobe_account` call is
+        positive proof the INNER handler ran to completion on each iteration —
+        the broad handler catching instead would skip `_note_probe_spawn_failure`
+        entirely and leave the count behind. "No WARNING record at all" is the
+        level-based twin of the substring check, and unlike the substring it
+        survives any rewording of the loop's message.
+        """
+        gate = _make_gate(['a'], auth_reprobe_secs=0)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        original_sleep = asyncio.sleep
+        sleeps = 0
+
+        async def capture_sleep(duration: float) -> None:
+            # Clear on the THIRD sleep, not the first: the loop checks
+            # auth_failed immediately after sleeping, so clearing on the first
+            # would return before _reprobe_account ever runs and make this
+            # test vacuously green. Two full iterations (not one) are what
+            # make "once per call" an assertion about the per-call handler
+            # rather than about a single increment.
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps >= 3:
+                acct.auth_failed = False
+            await original_sleep(0)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='shared.usage_gate'),
+            patch('shared.usage_gate.load_dotenv'),
+            patch('asyncio.sleep', side_effect=capture_sleep),
+        ):
+            await asyncio.wait_for(gate._auth_reprobe_loop(acct), timeout=5)
+
+        assert gate._run_probe.await_count == 2
+        assert acct.probe_spawn_failures == 2, (
+            'the inner handler in _reprobe_account must run on every '
+            'iteration; a count short of the call count means the loop-level '
+            "`except Exception` caught one and skipped the fault's accounting"
+        )
+        assert not [
+            r for r in caplog.records if r.levelno == logging.WARNING
+        ], (
+            'a spawn fault on the auth path must never be narrated at '
+            'WARNING — that is the level the broad handler downgrades it to'
+        )
+        assert not [
+            r for r in caplog.records if 'auth re-probe raised' in r.getMessage()
+        ]
+
+    async def test_auth_path_latches_the_same_gate_level_fault(self):
+        gate = _make_gate(['a'], auth_reprobe_secs=0)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        gate._run_probe = AsyncMock(side_effect=_spawn_fault())
+
+        with patch('shared.usage_gate.load_dotenv'):
+            for _ in range(_SPAWN_FAULT_THRESHOLD):
+                await gate._reprobe_account(acct)
+
+        assert gate.probe_infra_fault is not None
+
+    # --- CONTROL: a probe that RAN keeps every existing behaviour --------
+
+    async def test_probe_that_ran_and_failed_still_says_staying_auth_failed(self, caplog):
+        gate = _make_gate(['a'], auth_reprobe_secs=0)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        gate._run_probe = AsyncMock(return_value=False)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='shared.usage_gate'),
+            patch('shared.usage_gate.load_dotenv'),
+        ):
+            await gate._reprobe_account(acct)
+
+        assert [r for r in caplog.records if 'staying auth_failed' in r.getMessage()]
+        assert acct.phase == AccountPhase.AUTH_FAILED
+        assert gate.probe_infra_fault is None
+        assert acct.probe_spawn_failures == 0
+
+    async def test_probe_that_ran_and_succeeded_still_resumes(self):
+        gate = _make_gate(['a'], auth_reprobe_secs=0)
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        acct.auth_failed_at = datetime.now(UTC)
+        gate._cost_store = AsyncMock()
+        gate._run_probe = AsyncMock(return_value=True)
+
+        with (
+            patch('shared.usage_gate.load_dotenv'),
+            patch.object(gate, '_fire_cost_event') as mock_fire,
+        ):
+            await gate._reprobe_account(acct)
+
+        assert acct.auth_failed is False
+        assert 'auth_resumed' in [c[0][1] for c in mock_fire.call_args_list]
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,13 @@
 #
 # The USAGE_ACCOUNTS_FILE mechanism (d33db0c) ensures eval runs get
 # account A in addition to the shared pool.
+#
+# RULING 2026-08-30 (task 4741): account A is reserved for INTERACTIVE use
+# only — it is not an eval account. Evals have no dedicated account and
+# must be robust to sharing the fleet pool's cap/429 events instead of
+# assuming a private reserve. The account-A injection below is the stale
+# behavior the ruling retires; the follow-up task filed from 4741 tracks
+# fixing it, not this comment.
 
 set -uo pipefail
 
@@ -38,9 +45,10 @@ CONCURRENCY=5
 
 echo "[$(date +%H:%M:%S)] === Cloud baseline reruns ==="
 
-# Generate an eval accounts file that includes account A (eval-only).
-# Without this, cloud evals use only the shared pool which may be capped.
-# This mirrors what run_vllm_eval.py's build_eval_env() does.
+# Generate an eval accounts file that includes account A. NOTE: per the
+# 2026-08-30 ruling A is not actually "eval-only" — it's Leo's interactive
+# account, not a private eval reserve (see note above). This mirrors what
+# run_vllm_eval.py's build_eval_env() does, stale premise included.
 EVAL_ACCOUNTS_FILE=$(python3 -c "
 import yaml, tempfile, os
 base = '/home/leo/src/dark-factory/config/usage-accounts.yaml'

@@ -15,9 +15,12 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.reconciliation.citation_verifier import verify_cited_memories
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
+)
+from fused_memory.reconciliation.curator_gate_resolution_sweep import (
+    extract_open_gate_task_ids,
+    sweep_resolved_curator_gates,
 )
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
@@ -32,6 +35,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_false_absence_flags,
     filter_stale_bulk_get_statuses_flags,
     filter_stale_count_snapshot_corrections,
+    filter_style_only_authorship_flags,
     filter_terminal_metadata_flags,
 )
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
@@ -195,21 +199,13 @@ class MemoryConsolidator(BaseStage):
             resume_session_id=resume_session_id,
         )
 
-        # ── Phantom-citation verification (task 2978) ─────────────────────────
-        # Re-resolve every flagged finding's cited Mem0 memories against the
-        # live store and strip any that no longer exist, so a finding is never
-        # silently backed by an id that never existed (or whose queued
-        # add_memory write later failed).  Placed HERE — right after
-        # super().run() assembles items_flagged (converging BOTH the
-        # RRS-assembled and the structured-output JSON-fallback citation lists,
-        # the latter of which bypasses cite_memory's existence check) and BEFORE
-        # the remediation early-return below — so full AND remediation passes are
-        # both verified and the stage1_* citation stats are always present on
-        # report.stats.
-        _cite_stats = await verify_cited_memories(
-            report.items_flagged or [], self.memory, self.project_id,
-        )
-        report.stats.update(_cite_stats)
+        # Phantom-citation verification (task 2978) used to run here. Task 2979
+        # HOISTED it into BaseStage.run(), which performs it on the shared
+        # items_flagged assembly for all three stages — see the rationale
+        # comment there. The stage1_* citation stats therefore arrive on
+        # report.stats via super().run() above, already present on full AND
+        # remediation passes. Do not re-add a call here: it would double-count
+        # every stage1_* citation stat and double the get_memory_by_id load.
 
         report.stats['entity_summary_snapshot_lines_stripped'] = (
             self._entity_summary_snapshot_lines_stripped
@@ -243,9 +239,120 @@ class MemoryConsolidator(BaseStage):
         # distinction explicit instead of implying "no summary at all".
         report.stats['stage1_cycle_summary_ledger_written'] = 0
 
+        # Always present (task 3084, mirroring the two pre-inits above): set
+        # BEFORE the remediation early-return so no key is ever conditionally
+        # absent — Stage 1's whole report.stats blob is serialized verbatim
+        # into Stage 2's prompt by _format_report (task_knowledge_sync.py), so
+        # a consumer should not need a .get(..., 0) fallback.  Overwritten
+        # below on a full (non-remediation) cycle once the sweep actually runs;
+        # stays 0 on remediation passes (which deliberately skip the sweep, see
+        # that block below) and when filtered_task_tree is unset.
+        #
+        # _errors is reported alongside the other two (reviewer finding
+        # "observability", amendment pass) because without it a cycle in which
+        # EVERY gate failed its Qdrant read is byte-identical, in the report and
+        # therefore in Stage 2's prompt, to a cycle in which every gate was
+        # cleanly checked and none was resolved — both read scanned=N,
+        # flags_emitted=0.  The failure would exist only in the process log,
+        # which is exactly the silent-degradation shape the no-silent-fail-soft
+        # invariant targets.  With all three present, the reader can also spot
+        # the sweep's zero-recall signature (scanned > 0, flags_emitted == 0,
+        # errors == 0 — see the sweep module docstring on source-key drift).
+        report.stats['curator_gate_resolution_scanned'] = 0
+        report.stats['curator_gate_resolution_flags_emitted'] = 0
+        report.stats['curator_gate_resolution_errors'] = 0
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
+
+        # ── Resolved human-curator-gate sweep (task 3084) ──────────────────────
+        # Flag open ``operational_mode == 'gate'`` tasks for which the reify
+        # curator has ALREADY written its ruling to Mem0 (an entry stamped
+        # ``metadata.source == 'curator_gate_{task_id}'``).  Detection was an
+        # ad-hoc Stage-3 spot-check that missed ~25% of cases (run ec45eed0:
+        # gates 5561 and 5563 were resolved-but-stale and went undetected).
+        # Stage 1 runs under DISALLOW_TASK_WRITES, so this only FLAGS; Stage 2
+        # (which holds set_task_status) acts.
+        #
+        # Placement, deliberately unlike the three other Stage-1 sweeps below
+        # (degenerate_task_node / stale_status_snapshot / stale_priority_override,
+        # which all run well after the filter chain): those only mutate Graphiti
+        # and return int stats — none of them touch the flag channel.  This one
+        # EMITS flags, so it must sit ABOVE dedup_flags, for two reasons.
+        # (1) Each appended flag then gets a stage1_flag_marker ledger row keyed
+        #     on (task_id, flag_type), giving cross-cycle recurrence tracking and
+        #     honoring explicit suppression records.  Appending below dedup_flags
+        #     would bypass dedup entirely, so an un-actioned gate flag would
+        #     re-emit unmarked every cycle with no recurrence history and no way
+        #     for an operator to suppress it.  (dedup_flags never DROPS on a hit —
+        #     only filter_suppressed drops — so re-emission until Stage 2 closes
+        #     the gate is preserved, which is the desired behaviour.)
+        # (2) It lets the ``if report.items_flagged:`` guard below fire on a cycle
+        #     where the LLM emitted zero flags of its own but the sweep found a
+        #     resolved gate.
+        #
+        # That placement DOES step over verify_cited_memories (above, right after
+        # super().run()), so the cited_memories these flags carry are the one
+        # citation set that citation_verifier.py's end-to-end "a cited memory id
+        # must resolve" invariant never sees, and stage1_citations_verified /
+        # stage1_phantom_citations_dropped deliberately exclude them (reviewer
+        # finding "architecture", amendment pass).  That exemption is sound
+        # BECAUSE of where these ids come from: the verifier exists to catch
+        # LLM-authored ids that were never real and ids whose queued add_memory
+        # write later failed, whereas these ids are read straight off a Qdrant
+        # scroll microseconds earlier in the same cycle — they resolve by
+        # construction, and sweep_resolved_curator_gates additionally refuses to
+        # emit a flag at all unless that scroll returned at least one row (its
+        # count/scroll-divergence guard), so an uncitable gate flag is impossible
+        # by a different route.  Moving the sweep above the verifier is NOT the
+        # cheap fix it looks like: the verifier sits above the remediation
+        # early-return so that both full and remediation passes are covered, and
+        # this sweep must run on full cycles ONLY, so the move would require
+        # duplicating the remediation guard here.
+        #
+        # Best-effort: a whole-sweep failure must never abort the stage or leave
+        # items_flagged partially mutated — it is logged and swallowed, and all
+        # three stats stay at their pre-early-return 0 for this cycle.
+        if self.filtered_task_tree is not None:
+            gate_ids = extract_open_gate_task_ids(self.filtered_task_tree.active_tasks)
+            # Title-enrichment map (reviewer finding "dead-code", amendment
+            # pass).  extract_open_gate_task_ids deliberately returns bare ids,
+            # so without this the sweep can only name a gate by number and
+            # build_gate_resolution_flag's title branch would be unreachable in
+            # production.  Keyed on the same str(id) coercion the selector uses
+            # and restricted to the swept ids; it is load-bearing for the
+            # description ONLY — selection remains the selector's job alone, so
+            # a partial map can never change which gates are swept or flagged.
+            _gate_id_set = set(gate_ids)
+            gate_tasks_by_id = {
+                str(task.get('id')): task
+                for task in self.filtered_task_tree.active_tasks
+                if isinstance(task, dict) and str(task.get('id')) in _gate_id_set
+            }
+            try:
+                gate_sweep = await sweep_resolved_curator_gates(
+                    self.memory, self.project_id, gate_ids,
+                    tasks_by_id=gate_tasks_by_id,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.exception(
+                    'reconciliation.curator_gate_resolution_sweep_failed',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'gate_id_count': len(gate_ids),
+                    },
+                )
+            else:
+                report.items_flagged = (report.items_flagged or []) + gate_sweep['flags']
+                report.stats['curator_gate_resolution_scanned'] = gate_sweep['scanned']
+                report.stats['curator_gate_resolution_flags_emitted'] = len(
+                    gate_sweep['flags'],
+                )
+                report.stats['curator_gate_resolution_errors'] = gate_sweep['errors']
 
         # Always present (task-2029 amendment): downstream consumers that read this
         # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is
@@ -333,6 +440,33 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['systemic_pattern_already_tracked_dropped'] = (
                 _before_already_tracked_filter - len(report.items_flagged)
+            )
+            # ── Style-only authorship guard (task 3138): drop ─────────────────────
+            # injection/fabrication flags whose cited entries turn out to have been
+            # written by our OWN agents.  Closes reify esc-5564-1, in which Stage 1
+            # flagged its own earlier consolidator output (agent_id
+            # recon-stage-memory_consolidator) as "possibly injected/fabricated"
+            # purely because the imperative writing style looked foreign — it never
+            # read the stored agent_id.  Provenance comes from
+            # memory.get_memory_by_id, whose metadata is the raw Qdrant payload and
+            # so still carries the top-level agent_id that mem0 promotes out of
+            # metadata on the search/get paths.  Fail-safe: drops only on
+            # positively-confirmed wholly-house authorship; foreign, missing, mixed
+            # or unresolvable provenance all KEEP the flag (and get annotated with
+            # the agent_ids actually checked).  Surfaces the dropped count as
+            # report.stats['style_only_authorship_flags_dropped'].
+            #
+            # Placement before dedup_flags is load-bearing: it is what routes a
+            # dropped flag through the marker-reclaim tail below, so its Stage-2
+            # disposition marker is acknowledged rather than stranded.
+            _before_authorship_filter = len(report.items_flagged)
+            report.items_flagged = await filter_style_only_authorship_flags(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                flags=report.items_flagged,
+            )
+            report.stats['style_only_authorship_flags_dropped'] = (
+                _before_authorship_filter - len(report.items_flagged)
             )
             # Snapshot immediately before dedup_flags, which internally applies the
             # suppression gate (filter_suppressed) as its first step, so suppression
@@ -1067,11 +1201,16 @@ Review the above data and perform memory consolidation:
         """Focused payload for remediation runs — findings only, no full data."""
         self._entity_summary_snapshot_lines_stripped = 0
         findings = self.remediation_findings or []
+        # Live-Workflow Signals — parity with assemble_payload / _format_assembled_payload
+        # (task 3839, gate 3833). The harness DOES set filtered_task_tree on remediation
+        # passes (_configure_consolidator, harness.py:3949-3953), so this renders for real;
+        # it is not a no-op. Returns '' when nothing is live, keeping the payload tight.
+        live_workflow_section = self._build_live_workflow_section()
         return f"""## Remediation Run — Stage 1: Targeted Memory Fixes
 ## Project: {self.project_id}
 
 ### Actionable Findings to Remediate ({len(findings)})
-{_format_findings(findings)}
+{_format_findings(findings)}{live_workflow_section}
 
 ## Your Task
 This is a focused remediation run. Address ONLY the specific findings listed above:

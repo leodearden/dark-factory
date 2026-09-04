@@ -29,6 +29,16 @@ from pydantic_settings import (
 )
 from shared.task_metadata import KNOWN_ROLE_NAMES
 
+# Strictly one-way (config -> config_census_ignore): the census-ignore grammar
+# and audit are kept OUT of this already-oversized module, and that module
+# depends only on stdlib plus shared/, so there is no cycle.
+from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for the drift test)
+    CENSUS_IGNORE_ENTRY_KEYS,
+    HARD_KINDS,
+    CensusIgnoreSpec,
+    audit_census_ignore_entries,
+    parse_census_ignore_entries,
+)
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 
 logger = logging.getLogger(__name__)
@@ -831,9 +841,14 @@ class SessionResumeConfig(BaseModel):
     reason-carrying ``session_resume_fallback``/``session_resume_capped``
     event; a run of UNEXPLAINED fallbacks above
     ``fallback_storm_threshold``, each chained within ``storm_window_secs``
-    of the previous, files one L1 escalation (INV-4). By-design
-    degradations (``capped``, and ``reseeded`` since task 3256) emit their
-    event but never feed that run.
+    of the previous, files one L1 escalation (INV-4). Since task 3728 EVERY
+    by-design degradation emits its event but never feeds that run —
+    ``harness.py::_BY_DESIGN_SESSION_RESUME_REASONS`` enumerates them
+    (``capped``, ``reseeded``, and now ``stale`` / ``no_transcript``, which
+    were classified genuine while being documented as the anticipated
+    clock/reseed cases). The fallback event reports ALL reasons a session was
+    ineligible, not the first one matched, so a by-design reason co-occurring
+    with a genuine one is visible beside it rather than hiding it.
 
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
@@ -886,7 +901,10 @@ class SessionResumeConfig(BaseModel):
         description=(
             'A recovered sidecar is eligible only if (now - started_at) is '
             'below this many seconds; a staler sidecar degrades to fresh '
-            'dispatch with a session_resume_fallback(reason=stale) event. '
+            'dispatch with a session_resume_fallback event carrying "stale" in '
+            'its data.reasons list — alongside any OTHER reason the same '
+            'session failed, since the reasons are reported as a set rather '
+            'than a first match (task 3728). '
             'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
             'absolute cap plus slack, so a sidecar is rejected only once it '
             'clearly outlives any legitimate in-flight invocation.'
@@ -908,15 +926,26 @@ class SessionResumeConfig(BaseModel):
         ge=1,
         description=(
             'Consecutive UNEXPLAINED session_resume_fallback degradations '
-            'before one L1 escalation is filed (INV-4 storm escape — '
-            'suspected systematic clock skew, or transcripts vanishing while '
-            'their config dir survives). Only reason in {stale, no_transcript} '
-            'counts: reason=reseeded is a by-design lane reseed and is '
-            'excluded, exactly as session_resume_capped is. The run is chained '
-            'within storm_window_secs (and reset to 0 on any eligible resume) '
-            'rather than accumulating unbounded per boot. Must be >= 1. '
-            'Default 5 is above both the resume cap and ordinary collision '
-            'noise, so only systematic corroboration breakage trips it.'
+            'before one L1 escalation is filed (INV-4 storm escape). Only a '
+            'reason OUTSIDE harness.py::_BY_DESIGN_SESSION_RESUME_REASONS '
+            'counts: every by-design outcome — the per-task cap, a lane '
+            'reseed, an out-of-window sidecar, an uncorroborable transcript — '
+            'is excluded by construction, so reaching this threshold means a '
+            'genuinely unexplained failure mode fired repeatedly. A reason '
+            'is genuine BY DEFAULT: a new one feeds this streak unless it is '
+            'added to that constant. The run is chained within '
+            'storm_window_secs (and reset to 0 on any eligible resume) rather '
+            'than accumulating unbounded per boot. Must be >= 1. Default 5 is '
+            'above both the resume cap and ordinary collision noise, so only '
+            'systematic breakage trips it. '
+            'NOT CURRENTLY REACHABLE, by design and only for now: with '
+            "today's reason vocabulary EVERY producible reason is by-design, "
+            'so the streak has no feeder and this threshold cannot fire at '
+            'any value. Tuning it changes nothing until PRD leaf epsilon '
+            '(task 3733) installs the first genuine feeder '
+            '(archive-restore failure); the mechanism is retained unfed so '
+            'that lands on a tested path. Until then, watch the '
+            'session_resume_fallback event rate directly.'
         ),
     )
     storm_window_secs: int = Field(
@@ -935,7 +964,13 @@ class SessionResumeConfig(BaseModel):
             'with a wide margin on both sides. Measured on the monotonic '
             'clock, deliberately: the stale reason is itself PRODUCED by '
             'clock skew, so a wall-clock decay would be corrupted by the very '
-            'failure mode it must detect.'
+            'failure mode it must detect. '
+            'Its ESCALATION-driving role is inert for the same reason '
+            'fallback_storm_threshold is (see above) — nothing feeds the '
+            'streak until task 3733 — but the window is still LIVE as the '
+            'expiry clock: it is evaluated on every dispatch carrying a '
+            'recovered session, so shortening it still changes when a run '
+            'is considered over.'
         ),
     )
 
@@ -1078,10 +1113,22 @@ class RetentionConfig(BaseModel):
         ),
     )
     max_task_dirs: int = Field(
-        default=5000,
+        default=50000,
         description=(
             'Soft cap on the number of per-task archive dirs kept; the GC '
-            'sweep (δ/task 2731) prunes oldest-first beyond this.'
+            'sweep (δ/task 2731) prunes oldest-first beyond this. A DERIVED '
+            'bound, not a chosen number: max_age_days x the archive\'s '
+            'observed peak daily arrival rate x a safety factor, re-derived '
+            'against the live archive every run by '
+            'scripts/tests/test_gc_agent_transcripts.py (see '
+            'gc_agent_transcripts.required_max_task_dirs). Sized so the AGE '
+            'cap is the only policy that binds in normal operation, because '
+            'this axis prunes OLDEST-FIRST — when it binds it truncates the '
+            'max_age_days window from the forensic end while the sweep still '
+            'reports the full window. Such a bind is now LOUD: the sweep '
+            'emits a WARNING and a count_cap block in its JSON report. '
+            'Raised 5,000 -> 50,000 by plans/transcript-preservation-seam-prd.md '
+            'D8 (task 3621).'
         ),
     )
 
@@ -1767,6 +1814,32 @@ class GitConfig(BaseModel):
             'the merge and the notifiee call); correctness lives in the '
             'run-start head snapshot, not the trigger, so a missed trigger '
             'only costs granularity.'
+        ),
+    )
+    merge_park_lock_grace_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        description=(
+            'How long (seconds) advance_main waits for a FOREIGN '
+            '<git-dir>/index.lock in project_root to clear before giving up '
+            'and returning the transient `park_lock_contended` result. A '
+            'concurrent `git commit --only <path>` holds the index lock for '
+            'the ENTIRE pre-commit hook run, and under a held lock '
+            '`git stash create` exits rc=1 with EMPTY stdout AND stderr — so '
+            'advance_main would otherwise return `stash_failed` and halt the '
+            'whole merge queue. The 300s default matches this repo\'s '
+            'documented pre-commit budget (CLAUDE.md instructs '
+            '`timeout: 300000` because the hook runs pyright), so an ordinary '
+            'docs-direct-commit-on-main merely DELAYS a merge instead of '
+            'halting the queue. 0 disables only the WAIT (probe-only '
+            'fail-fast): the lock is still probed and a held lock is still '
+            'classified as `park_lock_contended` — never a silent fail-soft, '
+            'because parking through a foreign process\'s index lock would '
+            'clobber the in-flight commit\'s staged/working state. This knob '
+            'governs the WAIT only: the crashed-leftover verdict that offers '
+            'an operator destructive `rm -f <lock>` recovery keys on '
+            'max(this, merge_gates._STALE_LOCK_FLOOR_S), so lowering it (0 '
+            'included) never widens what counts as a stale lock.'
         ),
     )
     offline_lane_red_advances_before_blocker: int = Field(
@@ -2498,6 +2571,36 @@ class RecoveryEmissionConfig(BaseModel):
             'auto-resolves when its veto stops.'
         ),
     )
+    landing_git_error_rate_per_hour: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            'How many landing-evidence git_error verdicts may be produced in '
+            'a trailing hour before a blocking L1 is filed against the '
+            'landing-detector storm sentinel. STRICT exceedance: this rate '
+            'itself is quiet. git_error is the one landing reason whose '
+            'REPETITION means the DETECTOR is broken (a repo lock, a corrupt '
+            'object, an unresolvable ref) rather than the task being '
+            'unlanded, and a broken detector is silent by construction -- '
+            'every verdict it produces rejects, so it reads exactly like a '
+            'repo with nothing landed in it. The default is well above any '
+            'healthy rate (the recovery sweeps run every 900s, so a healthy '
+            'fleet produces ~0/hour) and well below a storm. Must be >= 1: at '
+            '0 a single transient git failure would page a human.'
+        ),
+    )
+    landing_git_error_escalation_enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to keep tallying landing-evidence verdicts while '
+            'suppressing the blocking L1 the git_error rate gate files. The '
+            'same narrow-kill-switch discipline as '
+            'streak_escalation_enabled: this is the only part of the landing '
+            'storm escape that WRITES to the escalation queue, so an '
+            'operator can silence a noisy alarm without losing the per-reason '
+            'tally that explains it. Disabling suppresses new filings only.'
+        ),
+    )
 
 
 class VerifyRunnerConfig(BaseModel):
@@ -2532,7 +2635,12 @@ class VerifyRunnerConfig(BaseModel):
             'PROJECT checkout where the merge sha is pushed/tested).  When set, '
             'enables the INV-2 contract-currency auto-sync at dispatch '
             '(HEAD-compare vs the dispatcher, then git pull --ff-only + uv sync '
-            'when stale; plans/merge-verdict-integrity-prd.md §1, §3.1).  '
+            '--all-packages when stale, then a probe that the remote '
+            '`orchestrator` CLI still answers; plans/merge-verdict-integrity-prd.md '
+            '§1, §3.1).  The sync is --all-packages because a DF checkout is a uv '
+            'WORKSPACE, in which a bare `uv sync` exits 0 while pruning the '
+            'members\' console scripts — including the very entry point this '
+            'runner invokes over ssh (task 4539).  '
             'Default None keeps auto-sync OFF (opt-in), byte-identical to the '
             'pre-INV-2 behaviour for every not-yet-migrated runner.'
         ),
@@ -2773,25 +2881,87 @@ class ConfigIgnoredKey(NamedTuple):
 
     Ignored keys are excluded from ``.unknown`` and therefore from the census
     signature and the born-at-L2, but are still reported informationally by
-    ``orchestrator check-config`` (at exit 0) so an over-broad glob stays
-    auditable rather than becoming an invisible blind spot.
+    ``orchestrator check-config`` so an over-broad glob stays auditable rather
+    than becoming an invisible blind spot.
+
+    ``note`` is the OPERATOR's justification — the ``reason:`` text of the
+    matching ``config_key_census.ignore`` entry, naming who actually consumes
+    the key (task 3395).  It is ``None`` for a reserved-prefix key (nobody
+    asserted anything about it) and for an un-reasoned bare-string entry, which
+    ``check-config`` then reports as debt.  Do not confuse it with ``reason``
+    above, which is the CLASSIFICATION label.
+
+    ``note`` is deliberately appended LAST and DEFAULTED so every existing
+    two-argument construction and tuple-equality assertion stays valid, and so
+    ``harness.py``'s ``ik._asdict()`` carries it into the hot-reload report
+    with no harness change.
     """
 
     path: str
     reason: str
+    note: str | None = None
 
 
 class ConfigKeyCensus(NamedTuple):
-    """Both views produced by the ONE census walk (INV-5).
+    """The views produced by the ONE census walk (INV-5).
 
     ``unknown`` drives the loud paths (WARNING, born-at-L2, check-config exit
     code); ``ignored`` is informational only.  Because a single walk classifies
     every key into exactly one of the two, the escalation and the lint can never
     disagree about what is suppressed.
+
+    ``unknown``/``ignored`` keep their FAIL-OPEN meaning: both are empty when the
+    file could not be read or parsed at all, because the census cannot detect
+    keys it never saw and its non-CLI consumers must not have to catch.
+    ``parse_error`` is the sentinel that distinguishes the two causes of an empty
+    census — "parsed, nothing unknown" vs "no census was possible".  When it is
+    non-None the two key lists are VACUOUS, not clean, and any consumer that
+    reads emptiness as health is reading a lie.  ``check-config`` is that
+    consumer: it bypasses ``load_config`` deliberately, so it (and anything else
+    that does) MUST fail closed on this field rather than print an affirmative
+    OK for a file it never inspected.
     """
 
     unknown: list[ConfigUnknownKey]
     ignored: list[ConfigIgnoredKey]
+    parse_error: str | None = None
+
+
+class CensusIgnoreEntry(BaseModel):
+    """The REASONED form of a ``config_key_census.ignore`` entry (task 3395).
+
+    An ignore entry is an ASSERTION that some non-OrchestratorConfig consumer
+    reads the key.  In the bare-string form that assertion is unfalsifiable and
+    never re-checked — the failure mode behind reify's
+    ``cpu_governance.DF_AGENT_CPU_GOVERN`` entry, which was added on the
+    expectation that dark-factory eventually WOULD read the key and thereby
+    made the resulting outage permanent and silent.
+
+    ``reason`` names the actual consumer, so the claim can be checked by a
+    reader and audited by ``audit_census_ignore_entries``.
+
+    NOTE the field names here are pinned to
+    ``config_census_ignore.CENSUS_IGNORE_ENTRY_KEYS`` by a drift test: the raw
+    tree parser cannot use this validated model (it must keep working when the
+    config has an unrelated value-level validation error), so the two sites
+    must agree byte-for-byte on the key names.
+    """
+
+    path: str = Field(
+        description='Dotted key path, matched with fnmatch.fnmatchcase (globs allowed).'
+    )
+    reason: str = Field(
+        description=(
+            'Who actually consumes this key, e.g. "read verbatim by '
+            'scripts/cpu-governed-exec.sh". If the consumer has NOT landed yet, '
+            'the reason MUST cite its tracking task in the canonical form #NNNN '
+            '— an uncited "pending" claim has no expiry and cannot be audited. '
+            'A reason naming dark-factory / the orchestrator / OrchestratorConfig '
+            'as the consumer is rejected outright: dark-factory owns the schema, '
+            'so a key it consumed would be a FIELD on the model and would never '
+            'need excusing.'
+        )
+    )
 
 
 class ConfigKeyCensusConfig(BaseModel):
@@ -2803,18 +2973,26 @@ class ConfigKeyCensusConfig(BaseModel):
     trade one born-at-L2 for another.
     """
 
-    ignore: list[str] = Field(
+    ignore: list[str | CensusIgnoreEntry] = Field(
         default_factory=list,
         description=(
             'Dotted paths of project-YAML keys that are deliberately present for '
             'NON-OrchestratorConfig consumers (e.g. keys read by the project\'s own '
             'scripts) and must therefore not be reported as unknown config keys. '
+            'PREFER the reasoned mapping form `{path: <glob>, reason: <who reads '
+            'it>}`: an entry is an assertion about a consumer, and a bare string '
+            'makes that assertion unfalsifiable. A bare string is still accepted '
+            'for back-compat but reports as un-reasoned DEBT in check-config. If '
+            'the consumer has not landed yet, the reason must cite its tracking '
+            'task as `#NNNN` so the entry can be re-checked when that task closes '
+            '— an uncited "pending" reason is a hard finding. '
             'Entries are matched against the dotted key path with '
             'fnmatch.fnmatchcase, so shell-style globs work — NOTE that `*` spans '
             'dots, so `cpu_governance.*` opts out that whole namespace. The '
             'converse fnmatch trap: `<name>.*` does NOT match the bare parent key '
             '`<name>`, so opting out a top-level dict key requires listing it '
-            'exactly. Prefer renaming a new non-orchestrator knob under the '
+            'exactly. Matching is FIRST-match-wins, so source order is '
+            'load-bearing. Prefer renaming a new non-orchestrator knob under the '
             'reserved `x_`/`x-` prefix (auto-excused at any depth, no config '
             'ceremony) and reserve this list for existing key names that other '
             'tooling already greps for.'
@@ -3046,6 +3224,37 @@ class OrchestratorConfig(BaseSettings):
             'unbounded retry on a persistent provider outage.  Process-local; '
             'orchestrator restart resets it.  Cleared alongside the genuine '
             'counter on DONE or cap-exhaust.'
+        ),
+    )
+    transient_requeue_backoff_base_secs: float = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            'First-step cooldown / exponential base for the TRANSIENT requeue '
+            'lane (task 3317, PRD contract C3).  The n-th transient requeue '
+            'arms `min(base * 2**(n-1), transient_requeue_backoff_cap_secs)` '
+            'seconds, jittered with equal jitter `U(cooldown/2, cooldown)`; '
+            '`n` is the task\'s transient requeue count at arming time.  '
+            'Applies ONLY to requeues classified transient by '
+            '`is_transient_api_requeue` (a server-side HTTP 5xx) — a GENUINE '
+            'requeue keeps the flat `requeue_cooldown_secs` above.  Exists to '
+            'stop a provider outage becoming a retry storm: the 2026-07-29 '
+            'incident produced 67 starts in a single half-hour bucket under '
+            'the flat 30s cooldown.'
+        ),
+    )
+    transient_requeue_backoff_cap_secs: float = Field(
+        default=900.0,
+        gt=0.0,
+        description=(
+            'Per-step ceiling for the transient-requeue backoff envelope '
+            '`min(base * 2**(n-1), cap)` (task 3317, PRD contract C3).  With '
+            'the shipped 30/900 defaults the envelope walks 30/60/120/240/480 '
+            'and pins at 900s from n=6 onward, so a long provider outage '
+            'settles into a 7.5-15 min retry cadence (equal jitter '
+            '`U(cooldown/2, cooldown)`) instead of hammering every 30s.  '
+            'Genuine (non-5xx) requeues are unaffected and keep the flat '
+            '`requeue_cooldown_secs`.'
         ),
     )
     snapshot_min_write_interval_secs: float = Field(
@@ -3840,6 +4049,50 @@ class OrchestratorConfig(BaseSettings):
     # (``_on_escalation_resolved``) then performs the actual flip once that L1
     # is resolved.  Self-dedupes via the pending-escalation check.
     stranded_blocked_escalate_enabled: bool = Field(default=True)
+
+    # Task 3539 — observe-before-enforce gate for the CONVERT_TO_BLOCKED
+    # recovery row.  Sited here beside its two nearest neighbours (the sweep's
+    # own kill switch above and the stranded-`blocked` backstop) and flat, like
+    # them: no `defaults.yaml` stanza and no `RELOADABLE_FIELDS` entry, so the
+    # promotion below is a deliberate, deployed decision rather than something
+    # hot-flipped under a running sweep.
+    #
+    # THE PROMOTION PATH, in the order an operator walks it:
+    #   1. OBSERVE.  With the default False, count the log-mode lines
+    #      (`would convert_to_blocked`) against the `recovery_vetoed` stream
+    #      they shadow.  Log mode is byte-identical to pre-3539, so the counts
+    #      are a pure measurement of the population — nothing has moved.
+    #   2. ENFORCE.  Once those counts look right, flip this default to True.
+    #      Conversion is structurally one-shot (every CONVERT row is keyed
+    #      `TaskStatus.IN_PROGRESS`, so a converted row can never match one
+    #      again), so the flip cannot start an oscillation.
+    #   3. SIMPLIFY.  After the flip has soaked, DELETE the log-mode downgrade
+    #      block in `Harness._reconcile_one_stranded` — and this field with it.
+    #      That block carries the canonical explanation of its own removal (one
+    #      deletion; the `downgraded_reason or leave_reason(report)` call sites
+    #      then reduce to their pre-3539 spellings); this is only a pointer to
+    #      it, per the `zero_progress_requeue` / `recovery_emission`
+    #      one-canonical-explanation convention.
+    convert_to_blocked_enforce: bool = Field(
+        default=False,
+        description=(
+            'Enforce the CONVERT_TO_BLOCKED recovery row (task 3539).  False — '
+            'the shipped default — is LOG MODE: the reconcile sweep logs the '
+            'conversion it WOULD perform for each escalation-pinned, '
+            'unclaimed, stranded in-progress task and then falls back '
+            'byte-identically to pre-3539 behaviour (no status write, same '
+            'return value, same `recovery_vetoed` row with reason '
+            '`escalation_pinned`), so an operator can count the population '
+            'from the journal before any row moves.  Flipping it to True is '
+            'the observe-to-enforce promotion: the sweep then writes '
+            "`blocked` — the honest resting status for \"pinned, awaiting a "
+            'human\" — instead of leaving the row churning a dispatchable '
+            '`in-progress` forever (measured: 39 consecutive `recovery_vetoed` '
+            'over 10.5h on task 3717).  Conversion is NOT completion: the '
+            'converted row keeps its pin, and its exit is a human or task '
+            '3541 — never an automatic self-heal.'
+        ),
+    )
 
     # Kill-switch for the verified-green merge-queue-direct remediation
     # (stranding-remediation-scheduler-ergonomics-prd.md leaf α).  When enabled
@@ -4903,7 +5156,7 @@ def _walk_unknown_keys(
     model_cls: type[BaseModel],
     prefix: str,
     shadow_index: dict[str, list[str]],
-    ignore_patterns: tuple[str, ...],
+    ignore_specs: tuple[CensusIgnoreSpec, ...],
     ignored: list[ConfigIgnoredKey],
 ) -> list[ConfigUnknownKey]:
     """Recursively collect keys in ``tree`` with no matching field on ``model_cls``.
@@ -4931,9 +5184,20 @@ def _walk_unknown_keys(
         match = fields_lower.get(key_lower)
         if match is None:
             if key_lower.startswith(_CENSUS_RESERVED_PREFIXES):
-                ignored.append(ConfigIgnoredKey(dotted, 'reserved_prefix'))
-            elif any(fnmatch.fnmatchcase(dotted, pat) for pat in ignore_patterns):
-                ignored.append(ConfigIgnoredKey(dotted, 'allowlist'))
+                ignored.append(ConfigIgnoredKey(dotted, 'reserved_prefix', None))
+            elif (
+                spec := next(
+                    (
+                        s
+                        for s in ignore_specs
+                        if fnmatch.fnmatchcase(dotted, s.pattern)
+                    ),
+                    None,
+                )
+            ) is not None:
+                # FIRST match wins, so a specific entry's justification is never
+                # overwritten by a broader glob listed after it.
+                ignored.append(ConfigIgnoredKey(dotted, 'allowlist', spec.reason))
             else:
                 candidates = [c for c in shadow_index.get(key_lower, []) if c != dotted]
                 hint = ' or '.join(candidates) if candidates else None
@@ -4944,29 +5208,28 @@ def _walk_unknown_keys(
         if sub is not None and isinstance(value, dict):
             unknown.extend(
                 _walk_unknown_keys(
-                    value, sub, dotted + '.', shadow_index, ignore_patterns, ignored
+                    value, sub, dotted + '.', shadow_index, ignore_specs, ignored
                 )
             )
     return unknown
 
 
-def _census_ignore_patterns(tree: dict[Any, Any]) -> tuple[str, ...]:
+def _census_ignore_specs(tree: dict[Any, Any]) -> tuple[CensusIgnoreSpec, ...]:
     """Read ``config_key_census.ignore`` off the RAW project tree, fail-open.
 
     Read from the raw tree rather than a validated OrchestratorConfig so the
     census keeps working when the config has an unrelated value-level validation
     error (the same reason check-config calls the census directly).  A malformed
-    hatch — non-dict block, non-list ``ignore``, non-str entries — degrades to
-    "no allowlist" instead of raising: a broken escape hatch must never take out
-    the census that surfaces real phantom keys.
+    hatch — non-dict block, non-list ``ignore``, non-str/non-mapping entries —
+    degrades to "no allowlist" instead of raising: a broken escape hatch must
+    never take out the census that surfaces real phantom keys.
+
+    Thin adapter over ``parse_census_ignore_entries`` so there is still exactly
+    ONE reader of ``config_key_census.ignore`` off the raw tree; the grammar
+    (bare string vs reasoned ``{path, reason}`` mapping) lives in
+    ``config_census_ignore``.
     """
-    block = tree.get('config_key_census')
-    if not isinstance(block, dict):
-        return ()
-    raw = block.get('ignore')
-    if not isinstance(raw, list):
-        return ()
-    return tuple(entry for entry in raw if isinstance(entry, str))
+    return tuple(parse_census_ignore_entries(tree))
 
 
 def census_config_keys(config_path: Path) -> ConfigKeyCensus:
@@ -4977,23 +5240,48 @@ def census_config_keys(config_path: Path) -> ConfigKeyCensus:
     1) and walks it against ``OrchestratorConfig``'s schema in ONE pass,
     classifying every non-model key as either genuinely ``unknown`` or
     deliberately ``ignored`` (reserved ``x_``/``x-`` prefix, or an operator
-    ``config_key_census.ignore`` entry).  A ``None``/non-dict document or an
-    unreadable/malformed file yields an empty census (fail-open — the census
-    cannot detect keys it cannot parse; load_config surfaces parse errors loudly
-    on its own path).
+    ``config_key_census.ignore`` entry).
+
+    Three-way contract when no census is possible.  The KEY LISTS stay fail-open
+    — an unreadable file (missing, permission-denied, a directory, or bytes that
+    are not valid UTF-8), a malformed document, or a parsed-but-non-mapping
+    document all yield empty ``unknown``/``ignored`` and never raise, because the
+    census cannot detect keys it cannot parse and load_config surfaces parse
+    errors loudly on its own path.  But each of those shapes ALSO sets
+    ``parse_error``, so a consumer that must fail closed (check-config) can tell
+    "nothing unknown" from "nothing parsed".  Only a ``None`` document — an EMPTY
+    or comments-only project YAML, which legitimately means "use all defaults" —
+    is treated as a genuinely clean census with ``parse_error=None``.
     """
     try:
         with open(config_path) as f:
             tree = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError):
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError is a ValueError, NOT an OSError, and it surfaces
+        # lazily from inside safe_load()'s read rather than from open() — so
+        # without it named here a non-UTF-8 file is the one "could not be read
+        # at all" shape that escapes BOTH handlers, propagating out of a
+        # function documented to never raise and giving check-config a
+        # traceback where the structured diagnostic belongs.
+        return ConfigKeyCensus([], [], f'cannot read {config_path}: {e}')
+    except yaml.YAMLError as e:
+        return ConfigKeyCensus([], [], f'invalid YAML in {config_path}: {e}')
+    if tree is None:
+        # An EMPTY (or comments-only) project YAML is legitimate — it means "all
+        # defaults", and pydantic-settings loads it without complaint — so it is
+        # a genuinely clean census, NOT a parse failure.
         return ConfigKeyCensus([], [])
     if not isinstance(tree, dict):
-        return ConfigKeyCensus([], [])
+        return ConfigKeyCensus(
+            [], [],
+            f'top-level YAML document in {config_path} is a '
+            f'{type(tree).__name__}, expected a mapping',
+        )
     shadow_index = _build_shadow_index(OrchestratorConfig)
     ignored: list[ConfigIgnoredKey] = []
     unknown = _walk_unknown_keys(
         tree, OrchestratorConfig, '', shadow_index,
-        _census_ignore_patterns(tree), ignored,
+        _census_ignore_specs(tree), ignored,
     )
     return ConfigKeyCensus(unknown, ignored)
 
@@ -5115,6 +5403,44 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
                 for uk in census
             ),
         )
+
+    # An ignore entry is an ASSERTION about a non-orchestrator consumer that is
+    # otherwise never re-checked (task 3395).  Warn on HARD findings only —
+    # advisory ones (un-reasoned grandfathered entries in particular) would fire
+    # on every startup of an already-green unit, and a warning that always fires
+    # is one operators learn to ignore.
+    #
+    # This ONE call site covers startup AND hot-reload: Harness.reload_config
+    # obtains its `fresh` config from load_config, so no harness.py edit is
+    # needed for the loud path (nor for the reload report — ConfigIgnoredKey's
+    # new `note` rides along via the existing ik._asdict()).  The born-at-L2
+    # deliberately stays keyed on unknown keys ALONE, per the L2-decoupling
+    # decision: an unrelated task-status change must never be able to shift the
+    # census signature or hard-fail startup.
+    try:
+        hard_findings = [
+            f for f in audit_census_ignore_entries(config_path) if f.kind in HARD_KINDS
+        ]
+    except Exception as exc:  # noqa: BLE001
+        # Deliberately broad but ALWAYS logged at WARNING, never a silent
+        # swallow (which is what shared/tests/test_silent_fallthrough_gate.py
+        # ratchets against).  Breadth is the point here: load_config runs on
+        # every startup and every hot-reload, and no defect in an advisory lint
+        # may be allowed to take either down — while the degradation still
+        # announces itself.
+        logger.warning(
+            'Config %s: census-ignore audit failed (%s) — entry findings SKIPPED',
+            config_path, exc,
+        )
+        hard_findings = []
+    if hard_findings:
+        logger.warning(
+            'Config %s has %d config_key_census.ignore entry finding(s) that '
+            'need action: %s',
+            config_path,
+            len(hard_findings),
+            '; '.join(f'{f.kind}: {f.detail}' for f in hard_findings),
+        )
     return config
 
 
@@ -5234,6 +5560,21 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'steward_lifetime_budget',
         # Scheduler tuning
         'fairness.skip_threshold',
+        # Transient-requeue jittered backoff (task 3317 / PRD contract C3,
+        # open question 2 decided GREEN).  Explicit literals, not a
+        # _submodel_leaf_paths group: these are FLAT top-level fields.  No
+        # reload hook is needed — ``Scheduler.release()`` reads
+        # ``self.config.<knob>`` at ARM time and ``apply_reload``/``_set_leaf``
+        # mutates the same object the Scheduler holds, so a retune lands on
+        # the NEXT arming.  ONE CAVEAT, identical to the existing
+        # ``requeue_cooldown_secs`` behaviour: an ALREADY-ARMED absolute
+        # deadline in ``Scheduler._requeue_until`` keeps its old window; the
+        # new values apply from the next arming onward.  Green-tier on
+        # purpose — retuning the backoff mid-outage is precisely when an
+        # operator needs it, and a restart-only tier would make the knob
+        # useless at the moment it matters.
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
         # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
         # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
         # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
@@ -5323,6 +5664,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
+        # advance_main's foreign-index-lock stand-off budget (task 3060) —
+        # a leaf-mutation-only tuning knob re-read per advance (never
+        # captured at startup), so a reload takes effect on the very next
+        # advance and an operator can retune the stand-off live.
+        'git.merge_park_lock_grace_seconds',
         # Generic per-project offline-lane commands + legacy-numeric gate (task
         # 2789, D6 green-tier): the worker re-reads config.git each _run_once,
         # so the command list, per-command priorities, and the legacy-numeric

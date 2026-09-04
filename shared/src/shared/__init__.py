@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         classify_agent_failure,
         count_transcript_turns,
         detect_ended_awaiting_background,
+        detect_resumable_progress,
         ended_awaiting_background_for_session,
         invoke_claude_agent,
         invoke_with_cap_retry,
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
         note_unreadable_transcript,
         read_transcript_records,
         require_non_blank_prompt,
+        resumable_progress_for_session,
         transcript_exists,
     )
     from shared.config_models import AccountConfig, UsageCapConfig
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
         AccountState,
         IllegalTransitionError,
         InvokeSlot,
+        ProbeSpawnError,
         SessionBudgetExhausted,
         UsageGate,
     )
@@ -105,6 +108,7 @@ _SYMBOL_MODULE: dict[str, str] = {
     'classify_agent_failure': 'cli_invoke',
     'count_transcript_turns': 'cli_invoke',
     'detect_ended_awaiting_background': 'cli_invoke',
+    'detect_resumable_progress': 'cli_invoke',
     'ended_awaiting_background_for_session': 'cli_invoke',
     'invoke_claude_agent': 'cli_invoke',
     'invoke_with_cap_retry': 'cli_invoke',
@@ -115,6 +119,7 @@ _SYMBOL_MODULE: dict[str, str] = {
     'note_unreadable_transcript': 'cli_invoke',
     'read_transcript_records': 'cli_invoke',
     'require_non_blank_prompt': 'cli_invoke',
+    'resumable_progress_for_session': 'cli_invoke',
     'transcript_exists': 'cli_invoke',
     # shared.config_models
     'AccountConfig': 'config_models',
@@ -143,6 +148,7 @@ _SYMBOL_MODULE: dict[str, str] = {
     'AccountState': 'usage_gate',
     'IllegalTransitionError': 'usage_gate',
     'InvokeSlot': 'usage_gate',
+    'ProbeSpawnError': 'usage_gate',
     'SessionBudgetExhausted': 'usage_gate',
     'UsageGate': 'usage_gate',
 }
@@ -220,6 +226,7 @@ __all__ = [
     'count_transcript_turns',
     'note_unreadable_transcript',
     'detect_ended_awaiting_background',
+    'detect_resumable_progress',
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -229,6 +236,7 @@ __all__ = [
     'is_zero_output_timeout',
     'read_transcript_records',
     'require_non_blank_prompt',
+    'resumable_progress_for_session',
     'transcript_exists',
     'AccountConfig',
     'UsageCapConfig',
@@ -239,6 +247,7 @@ __all__ = [
     'InvokeSlot',
     'SessionBudgetExhausted',
     'IllegalTransitionError',
+    'ProbeSpawnError',
     'normalize_lock',
     'files_to_modules',
     'modules_conflict',

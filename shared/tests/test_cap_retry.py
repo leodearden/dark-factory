@@ -696,16 +696,54 @@ class TestCapRetryResume:
 # ===================================================================
 
 
-def _write_transcript(base: Path, session_id: str, slug: str = 'myproject') -> Path:
+def _progressed_session_records() -> list[dict]:
+    """Records for a NORMAL session that actually did something.
+
+    A user turn plus an assistant turn carrying a ``tool_use`` block — the shape
+    of any session worth resuming.  This is the DEFAULT fixture content because
+    a transcript's mere existence is no longer the whole resume-eligibility
+    question: the branch also asks whether the transcript records work to
+    continue.  A user-only (or text-only) transcript means "a session that did
+    nothing", which is a DIFFERENT test subject; tests about reachability must
+    not accidentally assert it.
+    """
+    return [
+        {'type': 'user', 'content': 'hi'},
+        {
+            'type': 'assistant',
+            'message': {
+                'role': 'assistant',
+                'content': [
+                    {'type': 'text', 'text': 'reading the file'},
+                    {'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/tmp/x.py'}},
+                ],
+            },
+        },
+    ]
+
+
+def _write_transcript(
+    base: Path,
+    session_id: str,
+    slug: str = 'myproject',
+    records: list[dict] | None = None,
+) -> Path:
     """Materialise ``<base>/projects/<slug>/<session_id>.jsonl``.
 
     Mirrors the fixture idiom in ``test_cli_invoke.py::TestReadTranscriptRecords``
     — the layout ``_resolve_transcript_path`` globs for.
+
+    *records* defaults to a PROGRESSED session (see
+    ``_progressed_session_records``) so callers that only care about the file
+    being REACHABLE get a transcript representing a healthy, resumable session.
+    Pass *records* explicitly to materialise a specific transcript shape.
     """
     slug_dir = base / 'projects' / slug
     slug_dir.mkdir(parents=True, exist_ok=True)
     transcript = slug_dir / f'{session_id}.jsonl'
-    transcript.write_text(json.dumps({'type': 'user', 'content': 'hi'}) + '\n')
+    if records is None:
+        records = _progressed_session_records()
+    transcript.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
     return transcript
 
 
@@ -905,6 +943,221 @@ class TestCapRetryTranscriptReachability:
         second = mock_inv.call_args_list[1]
         assert second.kwargs.get('resume_session_id') == 'sess-42'
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+
+
+# ===================================================================
+# TestCapRetryResumableProgress
+# ===================================================================
+
+
+def _text_only_session_records() -> list[dict]:
+    """The covered shape: one sentence of stated intent, no tool call.
+
+    A TOP-LEVEL session killed by the usage cap before its first tool call.  Its
+    transcript is perfectly REACHABLE — which is why the reachability guard
+    passes it through — but there is nothing in it to continue.  (Census 1.2's
+    own specimen, session 4396db7a, is NOT this shape: it carried an Agent-tool
+    tool_use — see TestCapRetryResumableProgress's docstring.)
+    """
+    return [
+        {'type': 'user', 'content': 'do the task'},
+        {
+            'type': 'assistant',
+            'message': {
+                'role': 'assistant',
+                'content': [
+                    {'type': 'text', 'text': 'I will start by reading the task plan.'},
+                ],
+            },
+        },
+    ]
+
+
+@pytest.mark.asyncio
+class TestCapRetryResumableProgress:
+    """Reachability is necessary but not sufficient: the cap-hit branch must
+    also verify the capped session recorded WORK TO CONTINUE.
+
+    The covered class: a TOP-LEVEL session killed by the usage cap before its
+    first tool call, then resumed with CAP_HIT_RESUME_PROMPT ("continue where
+    you left off") when its only captured output was one sentence of stated
+    intent — a continuity claim the transcript did not support, and a retry
+    spent re-deriving context that never existed.
+
+    PROVENANCE — and its limit.  Legibility census 2026-08-16 §1.2 (session
+    4396db7a) NAMED this failure mode, but its own specimen is NOT covered here
+    and task 4274 does not close finding 1.2.  4396db7a was an Agent-tool
+    SUB-AGENT kill: a sub-agent's turns are written to a sidecar
+    ``<session_id>/subagents/agent-*.jsonl`` under the PARENT's sessionId, so
+    the parent transcript this guard reads necessarily carries the Task/Agent
+    tool_use that spawned it and detect_resumable_progress returns True on it.
+    Census §4 declined to file a task for 1.2 and left the remedy with task
+    **2561**'s runner-side persistence protocol.
+
+    Modelled on TestCapRetryTranscriptReachability, including its strongest
+    habit: every fires-correctly test is paired with an explicit does-NOT-
+    over-fire pin, so this guard cannot silently disable cross-account session
+    resume on the healthy path.
+    """
+
+    async def test_text_only_transcript_falls_back_to_fresh(self, tmp_path):
+        """Reachable transcript, but no work in it -> fresh, not a false resume."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('4274-noprogress', base_dir=tmp_path)
+        _write_transcript(config_dir.path, 'sess-42', records=_text_only_session_records())
+
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        rebuild = AsyncMock(return_value='FRESH REBUILT PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir,
+                prompt='do stuff', rebuild_prompt=rebuild,
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert 'resume_session_id' not in second.kwargs, (
+            'must NOT resume a session whose transcript records no work to continue'
+        )
+        assert second.kwargs.get('prompt') != CAP_HIT_RESUME_PROMPT, (
+            '"continue where you left off" is a false claim when there is no '
+            'left-off point in the transcript'
+        )
+        # A fresh retry replays the REAL task prompt, which is strictly better
+        # than an instruction to continue nothing.
+        rebuild.assert_awaited_once_with(True)
+        assert second.kwargs.get('prompt') == 'FRESH REBUILT PROMPT'
+
+    async def test_text_only_transcript_without_rebuild_uses_original_prompt(self, tmp_path):
+        """No rebuild_prompt hook -> fresh retry replays the ORIGINAL prompt."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('4274-noprogress-norebuild', base_dir=tmp_path)
+        _write_transcript(config_dir.path, 'sess-42', records=_text_only_session_records())
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id='sess-42'), make_result()]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir, prompt='do stuff',
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert 'resume_session_id' not in second.kwargs
+        assert second.kwargs.get('prompt') == 'do stuff'
+
+    async def test_transcript_with_tool_use_still_resumes(self, tmp_path):
+        """Regression pin against OVER-firing: real work on disk -> resume.
+
+        The guard only ever downgrades resume->fresh, and a wrong downgrade
+        DISCARDS REAL AGENT WORK — strictly worse than the confusing prompt it
+        exists to prevent.  A transcript with a tool call must resume exactly
+        as today.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('4274-progress', base_dir=tmp_path)
+        # Default fixture content = a progressed session (user + assistant tool_use).
+        _write_transcript(config_dir.path, 'sess-42')
+
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir,
+                prompt='do stuff', rebuild_prompt=rebuild,
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') == 'sess-42'
+        assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+        rebuild.assert_not_awaited()
+
+    async def test_no_config_dir_resumes_without_checking_progress(self):
+        """Regression pin: config_dir=None -> resume as today, unchecked.
+
+        Without a concrete config dir there is no correct place to glob (the
+        process default ``~/.claude`` would be wrong for any caller under an
+        isolated CLAUDE_CONFIG_DIR), so emptiness cannot be PROVEN, only
+        assumed.  The guard stays scoped to "we have a directory and can prove
+        emptiness" — the same scope the reachability arm already uses.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id='sess-42'), make_result()]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', prompt='do stuff', rebuild_prompt=rebuild,
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') == 'sess-42'
+        assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+        rebuild.assert_not_awaited()
+
+    async def test_log_states_reason_fresh_no_resumable_progress(self, tmp_path, caplog):
+        """The cap-hit line must name this reason distinctly.
+
+        An operator needs to tell 'we dropped a session that had done work'
+        (transcript unreachable) apart from 'the session had done nothing worth
+        keeping' — the two have opposite severities.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('4274-reason-noprogress', base_dir=tmp_path)
+        _write_transcript(config_dir.path, 'sess-42', records=_text_only_session_records())
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id='sess-42'), make_result()]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir, prompt='do stuff',
+            )
+        assert any('no resumable progress' in r.message for r in caplog.records), (
+            'cap-hit log must name the reason it retried fresh, matching the '
+            f'existing resume_or_fresh log contract. Got: {caplog.text!r}'
+        )
+        # And it must NOT be mislabelled as the unreachable case — the
+        # transcript was right there, it just had nothing in it.
+        assert not any('transcript unreachable' in r.message for r in caplog.records), (
+            f'a reachable-but-empty transcript is not "unreachable". Got: {caplog.text!r}'
+        )
 
 
 # ===================================================================

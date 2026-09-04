@@ -120,6 +120,18 @@ review/reports/
 *.tmp.*
 # Same, scoped explicitly to Python source backups:
 *.py.tmp.*
+# pytest marker-probe scratch dirs.  These fixtures mkdtemp INTO the tests
+# dir on purpose (a system-tmp path makes pytest walk from / when locating
+# the config, costing tens of seconds), and clean up with
+# ignore_errors=True, so a killed run leaves one behind.  One rode a
+# `git add -A` WIP commit onto a task branch and broke the
+# `ruff check fused-memory/tests` directory sweep with I001 (task 3581).
+# Generators: fused-memory/tests/test_integration_marker_config.py:85,
+# cockpit/tests/test_smoke_marker_config.py:64.
+# Deliberately unanchored — these land under <pkg>/tests/, not the repo
+# root — for the same reason recorded for .pytest-tmp/ above:
+.integration_marker_probe*/
+.smoke_marker_probe*/
 
 # ── Node / codex CLI install (ad-hoc, not a project dependency) ──────
 node_modules/

@@ -722,6 +722,21 @@ async def run_server():
     # PRD γ §11: fail loudly before harness construction if reconciliation is
     # enabled but the transport cannot host the recon-report MCP server.
     _require_http_transport_for_reconciliation(config)
+
+    # Task 3112: project_id-adapting wrappers over the deterministic metadata
+    # scroll, for the consolidation-gate closure check. The service methods take
+    # project_id first positionally; the interceptor passes it by keyword because
+    # it resolves scope per task. Defined ABOVE the reconciliation branch because
+    # BOTH TaskInterceptor construction sites wire them — defining them inside the
+    # enabled arm left the disabled arm raising NameError at startup.
+    async def _closure_scroll(filters, *, limit, project_id):
+        return await memory_service.get_memories_by_metadata(
+            project_id, filters, limit=limit
+        )
+
+    async def _closure_count(filters, *, project_id):
+        return await memory_service.count_memories_by_metadata(project_id, filters)
+
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -872,6 +887,12 @@ async def run_server():
             targeted.task_interceptor = task_interceptor
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
+        # Task 3112: the consolidation-gate closure scroll. Dormant until
+        # wired, so this is the ONLY thing that arms the close-time refusal.
+        # memory_service is already in scope at both construction sites.
+        task_interceptor.set_consolidation_scroll(
+            _closure_scroll, count=_closure_count
+        )
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
         # ReconciliationHarness is constructed — so the SAME ReconReportState
@@ -949,6 +970,12 @@ async def run_server():
         )
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
+        # Task 3112: the consolidation-gate closure scroll. Dormant until
+        # wired, so this is the ONLY thing that arms the close-time refusal.
+        # memory_service is already in scope at both construction sites.
+        task_interceptor.set_consolidation_scroll(
+            _closure_scroll, count=_closure_count
+        )
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(

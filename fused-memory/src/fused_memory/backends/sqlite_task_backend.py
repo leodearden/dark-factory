@@ -29,7 +29,7 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
 )
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import TERMINAL, TaskStatus
 
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
@@ -2225,20 +2225,29 @@ class SqliteTaskBackend:
         ``None`` clears it to NULL, and the default ``_UNSET`` leaves it
         untouched. Fails safe (WARNING, no write, no error) when the
         claimant columns are absent from a not-yet-migrated connection.
+
+        Terminal-claimant tripwire (task 4674, PRD
+        ``docs/prds/claimant-invariant-detection.md`` D-6/E-3): when a call
+        persists a non-NULL ``claimant_run_id`` onto a row whose status is
+        in ``shared.task_statuses.TERMINAL``, logs one ERROR beginning with
+        the discriminator ``claimant_stamped_on_terminal``. Observation,
+        not refusal — the write still succeeds.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
         async with self._write_lock(project_root), self._txn(project_root) as conn:
             cursor = await conn.execute(
-                'SELECT id FROM tasks WHERE tag = ? AND id = ?',
+                'SELECT id, status FROM tasks WHERE tag = ? AND id = ?',
                 (tag, tid),
             )
-            if (await cursor.fetchone()) is None:
+            row = await cursor.fetchone()
+            if row is None:
                 raise TaskmasterError(
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
+            row_status = row[1]
 
             set_columns: list[str] = []
             set_values: list[Any] = []
@@ -2267,6 +2276,26 @@ class SqliteTaskBackend:
                 f'UPDATE tasks SET {set_clause} WHERE tag = ? AND id = ?',
                 set_values,
             )
+
+            # Emit AFTER the UPDATE, not beside the SELECT above: the two
+            # early returns between them (no-kwargs no-op; claimant-columns-
+            # absent fail-safe) write NOTHING, and E-3 scopes the ERROR to a
+            # call that actually PERSISTS a non-NULL claimant. Emitting
+            # earlier would fire this tripwire for a write that never
+            # happened — do not hoist it back up.
+            #
+            # Gate on NULL-ness, not truthiness: an empty-string claimant is
+            # non-NULL and is an anomalous mint worth observing.
+            stamps_non_null_claimant = (
+                claimant_run_id is not _UNSET and claimant_run_id is not None
+            )
+            if stamps_non_null_claimant and row_status in TERMINAL:
+                logger.error(
+                    'claimant_stamped_on_terminal: set_task_claimant stamped a claimant '
+                    'onto a terminal row — task_id=%s status=%s claimant_run_id=%s '
+                    'tag=%s project_root=%s',
+                    task_id, row_status, claimant_run_id, tag, project_root,
+                )
         return {
             'id': task_id,
             'message': f'Updated claimant fields for task {task_id}',
@@ -3234,7 +3263,20 @@ def _resolve_metadata_mode(
     """Resolve the effective metadata merge mode from the two input signals.
 
     Precedence (high → low):
-    1. ``metadata_mode`` — explicit tri-state wins unconditionally.
+    1. ``metadata_mode`` — explicit tri-state wins, with ONE carve-out:
+       ``metadata_mode='merge'`` alongside ``append=True`` is **rejected**
+       as a contradiction (the task-3581 nested-metadata clobber,
+       2026-08-11). ``append=True`` means exactly one thing — 'additive' —
+       so the pair asks for two incompatible resolutions of the same
+       write, and silently picking 'merge' shallow-overwrote nested keys
+       (a whole ``memory_hints`` blob, authored ``entities``/``queries``
+       and all, replaced by an incoming stub). Like the rule-2 rejection
+       below this is scoped to ``metadata_present`` writes — with no
+       metadata there is nothing to clobber and ``append`` is driving the
+       details-append path instead. The other explicit/append combinations
+       are unchanged: ``('replace', True)`` stays honored (the sanctioned
+       destructive co-signal rule 2 points callers at) and
+       ``('additive', False)`` stays 'additive'.
     2. ``append`` legacy shim — True → 'additive'. A bare ``append=False``
        (no explicit ``metadata_mode``) is **rejected** when
        ``metadata_present`` is True: it used to resolve to a silent
@@ -3249,10 +3291,12 @@ def _resolve_metadata_mode(
        the details-append path in the backend.
     3. Default — 'merge' (shallow last-write-wins) when both are None.
 
-    Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) for an
-    unrecognised ``metadata_mode`` value AND for a bare ``append=False``
-    metadata write (both loud over silent). ``metadata_present`` defaults to
-    True (fail-safe strict) so any future 2-arg caller gets the guard.
+    Raises :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) in three
+    cases, all loud over silent: an unrecognised ``metadata_mode`` value; the
+    contradictory ``metadata_mode='merge'`` + ``append=True`` pair (rule 1);
+    and a bare ``append=False`` metadata write (rule 2). ``metadata_present``
+    defaults to True (fail-safe strict) so any future 2-arg caller gets the
+    guards.
     """
     if metadata_mode is not None:
         if metadata_mode not in _METADATA_MODES:
@@ -3260,6 +3304,35 @@ def _resolve_metadata_mode(
                 'TASKMASTER_TOOL_ERROR',
                 f"Invalid metadata_mode {metadata_mode!r}; "
                 f"must be one of {sorted(_METADATA_MODES)}.",
+            )
+        if metadata_mode == 'merge' and append is True and metadata_present:
+            # Contradiction: 'merge' is shallow last-write-wins while
+            # append=True means 'additive' (recursive union). Silently
+            # honoring 'merge' clobbered nested metadata wholesale — the
+            # task-3581 / DF-3260 memory_hints clobber.
+            #
+            # Scoped to metadata-present writes, exactly like the task-2180
+            # guard below: with no metadata there is nothing to merge, so
+            # metadata_mode is inert and ``append`` means something else
+            # entirely (it independently drives the details/prompt-append
+            # path). A details-only update_task(details=..., append=True)
+            # that happens to also carry metadata_mode='merge' is not
+            # contradictory and must NOT be rejected.
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                "Refusing a contradictory metadata_mode='merge' + append=True "
+                "write: append=True asks for the ADDITIVE union merge while "
+                "metadata_mode='merge' asks for a SHALLOW last-write-wins "
+                "overwrite, and there is no coherent way to do both. Resolving "
+                "it silently to 'merge' overwrote nested keys wholesale — a "
+                "task's whole memory_hints blob (authored entities/queries and "
+                "all) replaced by the incoming stub instead of unioned with it "
+                "(the task-3581 nested-metadata clobber). State intent "
+                "explicitly: pass metadata_mode='additive' (or append=True "
+                "alone) to UNION nested list/dict fields like memory_hints into "
+                "the existing blob, or drop append and keep "
+                "metadata_mode='merge' to CONFIRM a shallow top-level "
+                "last-write-wins overwrite.",
             )
         return metadata_mode
     if append is True:

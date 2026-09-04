@@ -650,8 +650,12 @@ tasks:
   title: Periodic status-agnostic landed reconciler with a writer
   note: 'Takes an out-of-batch dependency on task 4623: D7''s fold as literally specified
     is in-progress-gated and would skip every landed parked task, greening B12 while
-    B11 reds. Also carries an UNRESOLVED conflict with pending task 3539, which targets
-    the same population with the remedy the PRD''s Sketch rejects.'
+    B11 reds. The conflict with pending task 3539 previously recorded here was a MISREADING
+    and is RETRACTED - ruled by Leo 2026-08-24 via gate task 4673 / esc-4673-1, recorded
+    on main in f34b4bce0b as PRD corrections 9-10. The populations are disjoint on status:
+    3539''s rows are all keyed IN_PROGRESS, and this leaf owns pending/merge-deferred,
+    which are filtered out at harness.py:4959-4960 and never reach _RECOVERY. See the
+    boundary-with-task-3539 capability below.'
   capabilities:
   - name: landing-contract-available-upstream
     binding: capability→producer - producer:task-δ upstream (DAG δ→η). The writer
@@ -807,20 +811,42 @@ tasks:
       kind: manual
       reason: '''no blocking call on the loop thread'' is a whole-function property;
         a grep for to_thread cannot prove the absence of a blocking call elsewhere'
-  - name: conflict-with-task-3539-on-the-same-population
-    binding: 'duplicate-owner, UNRESOLVED - task 3539 (pending/high) targets the same
-      landed pending/blocked/merge-deferred population from the same 930-task sweep,
-      but its remedy is adding _RECOVERY rows, which the PRD''s Sketch lists under
-      ''Explicitly not done''. Load-bearing regardless of which task survives: 3539
-      records that after a pin was genuinely lifted, ''within ~15 minutes the row
-      was status=PENDING, not done. Something re-pended it rather than recovering
-      it.'' This leaf''s writer will race that same re-pender and must identify it
-      before writing.'
-    verdict: OPEN
+  - name: boundary-with-task-3539-disjoint-on-status
+    binding: 'RULED 2026-08-24 by Leo (gate task 4673 / esc-4673-1), recorded on main
+      in f34b4bce0b as PRD corrections 9-10. This row was previously authored as a
+      duplicate-owner row awaiting an operator ruling on which of the two tasks survived;
+      that framing was a MISREADING and is RETRACTED (the ruling has been given, and its
+      answer is that the premise was wrong). Both tasks proceed; neither is merged,
+      re-scoped away or cancelled.
+      The populations are disjoint on status: _RECOVERY is read only by classify_recovery
+      (task_ground_truth.py:916), whose only production callers reach it inside
+      _reconcile_one_stranded, which the sweep enters only for _RECONCILE_SWEEP_STATUSES
+      = frozenset({''in-progress'',''blocked''}) (harness.py:238, filtered at :4959-4960).
+      3539''s added rows are all keyed IN_PROGRESS; this leaf owns pending/merge-deferred,
+      which never reach that table; landed blocked is task 4645''s veto narrowing.
+      ASYMMETRY, recorded because it is load-bearing: that proof binds 3539 STRUCTURALLY,
+      but this leaf''s actor is a new BackgroundService living outside both _RECOVERY and
+      _RECONCILE_SWEEP_STATUSES, so on THIS side the boundary is convention, not structure,
+      and nothing currently machine-checks the status filter. Keep the write filter to
+      pending/merge-deferred; if scope drifts across a line, stop and re-raise.
+      Two supporting claims made when this was ruled do NOT survive re-measurement and
+      must not be reused as safety arguments: (1) "done is a terminal absorbing state"
+      is false - shared/task_transitions.py:222 makes done->anything legal on reopen, and
+      _handle_terminal_exit_on_block reopens done->blocked in production; the no-oscillation
+      conclusion holds here only via the interceptor''s separate ancestry gate. (2) the
+      3539->4645 adjacency is NOT a handoff that completes: 3539''s rows fire only on
+      has_open_escalation, so the converted task arrives blocked still pinned, typically
+      category=task_failure (workflow.py:14957), which _only_merge_remediable (harness.py:5299,
+      an all() over frozenset({''stranded_blocked''}) at :5294, widened by 4645 only by
+      {''preexisting_main_break''}) rejects - so 4645''s upgrade never fires and the task
+      rests blocked+pinned until a human or task 3541 closes the record. Corrected in the
+      texts of tasks 4645 and 3539 on 2026-08-24.'
+    verdict: PASS
     delivered_check:
       kind: manual
-      reason: a human must rule on which task survives; the re-pender investigation
-        is this leaf's work either way
+      reason: an ownership boundary ruled by a human; 3539's half is structurally
+        enforced by _RECONCILE_SWEEP_STATUSES, but this leaf's half is a write-filter
+        convention with no automated check today
   - name: reconciler-cadence
     binding: leaf-owned ruling (PRD Open Question 1) - BackgroundService (background_service.py:52)
       is registered 7 times in harness.py; the stranded sweep's registration is at
@@ -832,6 +858,99 @@ tasks:
       kind: manual
       reason: a cadence decision the leaf must make; the config-key check above covers
         whichever shape it picks
+  - name: write-filter-pinned-to-pending-and-merge-deferred
+    binding: 'Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. G4 partition enforcement, added at the 2026-08-24 recheck (PRD correction
+      11d). The ratified partition binds 3539 STRUCTURALLY - _RECOVERY is read only by
+      classify_recovery (task_ground_truth.py:916), reached only inside _reconcile_one_stranded
+      (harness.py:5479, its recovery_for call at :5553), entered only for _RECONCILE_SWEEP_STATUSES
+      = frozenset({''in-progress'',''blocked''}) (harness.py:238, filtered at :4959-4960).
+      This leaf''s actor is a NEW BackgroundService outside both, so its half of the
+      partition was prose only. This check makes it mechanical: a single-line frozenset
+      whose members are drawn ONLY from {pending, merge-deferred}. EXERCISED against
+      fixtures before filing - it matches the two-member set in either order, with or
+      without the ": frozenset[str]" annotation, and FAILS {''pending'',''blocked''},
+      {''in-progress'',''merge-deferred''} and any three-member set. Declare the constant
+      on one line; harness.py:238 is the house model.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '_LANDED_RECONCILE_STATUSES[^=]*=[[:space:]]*frozenset\(\{''(pending|merge-deferred)'', *''(pending|merge-deferred)''\}\)'
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: status-filter-is-consulted-not-merely-declared
+    binding: Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. capability→producer (anti-orphan) - the twin of the check above. A declared-but-unused
+      constant satisfies the membership assertion while the writer filters on something
+      else, which is the declared-only FAIL shape. This pattern is non-vacuous against
+      its twin because the "= frozenset({...})" declaration line cannot contain "in
+      _LANDED_RECONCILE_STATUSES"; only a use site can.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: in _LANDED_RECONCILE_STATUSES
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: writer-routes-through-the-shared-mark-done-capability-gate
+    binding: 'Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. capability→producer (wired), added at the 2026-08-24 recheck (PRD correction
+      11c). _mark_in_progress_done (harness.py:6239) is a THIN WRAPPER over scheduler.mark_done
+      and carries no capability guard of its own; each of its four production callers
+      applies Harness._delivered_checks_block (:6193 -> delivered_checks.gate_mark_done_on_delivered_checks)
+      immediately first - :5763->:5799, :11727->:11731, :11760->:11764, :11788->:11792.
+      delivered_checks.py:249-275 enumerates every attribution-shaped mark_done seam
+      routed through that one decision, and harness.py:6215 states the invariant ("one
+      hot reload disarms all eleven"). Reusing the writer WITHOUT the gate would make
+      this leaf the first unguarded attribution seam in the set.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: _delivered_checks_block already has five call sites in harness.py, so an
+        expect:present grep is vacuous, and git grep cannot scope a pattern to one new
+        function; pinned by a boundary row asserting the done-write is withheld when a
+        declared delivered_check is absent from main
+  - name: escalation-pin-veto-honoured-at-the-done-write
+    binding: 'Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. G7 corroborate-before-acting / safety parity, added at the 2026-08-24 recheck
+      (PRD correction 11c). _already_landed_dispatch_gate refuses its own auto-done when
+      classify_pins(...).vetoes_done_flip is True (harness.py:11578, :11648) - an open
+      record at ANY level (:11536-11543), with info severity the ONLY carve-out (escalation/src/escalation/pins.py:144-147,
+      :35, :237-238). This leaf''s spec carried no such veto and no boundary row for
+      the shape. Measured on ea876cb624: 5 distinct pending tasks hold a pending escalation
+      record (7 records); 3 of the 5 would be vetoed (4194, 4580, 4590 - blocking) and
+      2 would not (4218, 4521 - info-only); no merge-deferred task holds one. So the
+      shape has a live population AND a live negative control. Reuse recovery_emission.pin_buckets
+      (:375-416) rather than a fifth hand-rolled classify_pins call.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: classify_pins is already referenced from harness.py, so an expect:present
+        grep is vacuous; the observable is the pair of boundary rows (blocking record
+        vetoes, info-only record does not)
+  - name: pre-existing-done-writers-over-this-population
+    binding: 'Anchors as of main ea876cb624 (2026-08-24); re-locate at implementation time. capability→producer (authority survey), added at the 2026-08-24 recheck
+      (PRD correction 11b). This leaf is NOT the sole done-writer over pending/merge-deferred.
+      merge_queue.reconcile_landed_row RC-2 (merge_queue.py:6685, kind=merged) reaches
+      exactly pending, because RC-3 at :6616 short-circuits every WORKFLOW_PRESERVE_STATUSES
+      member; it fires only for a task still holding a LandedOutbox row (:6757 calls
+      it "a PURE crash-recovery backstop"). build_train_callback_factory''s redrive_member
+      found_on_main arm (harness.py:1330 - this leaf''s OWN provenance kind) and mark_member_done
+      (:1270) reach merge-deferred, driven from _redrive_coalesce_members (merge_queue.py:14710).
+      metadata.train does NOT separate them from this leaf: it is written at exactly
+      one site, the atomic-train former _maybe_form_train (workflow.py:1954-1956), which
+      is merge_train_former_enabled-gated and OFF BY DEFAULT (:1871-1872); a COALESCE
+      train (merge_queue.py:15104-15123) builds its GroupMergeRequest from the SAME callback
+      factory over solo tasks carrying NO metadata.train, and _redrive_coalesce_members
+      selects members by statuses.get(mid) == merge-deferred (:14774-14778). What separates
+      them is LIVENESS of the GroupMergeRequest - all three fire only while a merge worker
+      holds it in memory, and this leaf''s population is the residue after it is destroyed
+      (harness.py:1261-1262 states the same gap from the other side). Consequence: reuse
+      their attribution rather than re-deriving it, and lose the train-callback race gracefully
+      - mark_member_done also does MergeProvenance.consume and release_lane_for_terminal_task,
+      which a bare mark_done skips.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an authority survey and a reuse constraint; no pattern expresses "did not
+        re-derive an existing primitive"
 - label: θ
   task_id: 4652
   title: 'Integration gate: the landed-recovery boundary suite (B1-B13)'

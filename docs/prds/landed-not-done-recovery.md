@@ -104,6 +104,139 @@ basis.**
    **zero** references to `merge_request`. ζ's behaviour-preservation surface is two tools, and the
    second is unpinned.
 
+9. **The η↔3539 "conflict" was a misreading, and is retracted (ruled by Leo 2026-08-24, gate task
+   4673 / `esc-4673-1`).** The decompose walk recorded leaf η and task 3539 as targeting the same
+   population with incompatible remedies. They do not. `_RECOVERY` is read only by
+   `task_ground_truth.py::classify_recovery`, reached only through
+   `task_ground_truth.py::TaskGroundTruth.recovery_for`, whose sole production caller is
+   `harness.py::Harness._reconcile_one_stranded` — entered only for statuses in
+   `harness.py::_RECONCILE_SWEEP_STATUSES` (`frozenset({'in-progress', 'blocked'})`), filtered
+   upstream by the status loop in `harness.py::Harness._reconcile_stranded_in_progress`.
+   (Line anchors for all of these are measured and SHA-stamped in correction 11.) 3539's rows are **all keyed `IN_PROGRESS`**; η owns `pending` and
+   `merge-deferred`, which never reach that table. §Sketch's objection to "adding rows to
+   `_RECOVERY`" is a claim about rows keyed on *parked* statuses and therefore never reached 3539.
+   3539's own 2026-08-22 amendment says the same thing unprompted: *"the recovery table is a second,
+   independent hole."* **The ratified partition:**
+
+   | Owner | Population | Action |
+   |---|---|---|
+   | **η** (task 4651) | landed `pending` · `merge-deferred` | mark done with attributed provenance |
+   | **β** (task 4645) | landed `blocked` | the existing sweep-side upgrade, veto narrowed |
+   | **3539** | `in-progress` + escalation-pinned | `CONVERT_TO_BLOCKED` rows; plus the `plan_files_not_touched` already-landed carve-out in `merge_gates.py` |
+
+   No two-authorities problem: η's only write is `done`, a **terminal absorbing state**, so it cannot
+   oscillate against 3539's anti-churn work. The one adjacency is a *handoff* — a task 3539 converts
+   `in-progress`→`blocked` lands in the sweep's blocked arm, which is β's territory.
+
+10. **3539's unexplained re-pender is identified.** 3539 records that after a pin lifted on task 3717,
+   *"within ~15 minutes the row was status=PENDING … Something re-pended it"*, and names an
+   unconfirmed reconcile-sweep `REVERT_TO_PENDING` as the candidate. It is the mark-done applier's
+   **own reject arm**: `harness.py::Harness._reconcile_one_stranded` calls
+   `validate_landing_evidence(…, candidate_sha=…)` and, on `not verdict.accepted` with
+   `status == 'in-progress'`, calls `harness.py::Harness._revert_in_progress_if_no_live_claimant`,
+   which flips the task to `pending`. 3717's branch had been re-seeded from main while
+   its work landed 2026-08-08, so the then-byte-identity effect check failed. There is no second path.
+   The loop's **entry** is decayed landing evidence — leaf δ's subject — and the reject's silence at
+   that site is task 4496's.
+
+11. **Recheck 2026-08-24 (five proposed amendments, main `ea876cb624`).**
+
+   > **Code anchors** in this correction verified against main `ea876cb624` (2026-08-24). Main moves
+   > fast — cite-by-symbol elsewhere; re-locate these lines at implementation time. This correction is
+   > deliberately line-anchored because re-measuring the ruling's anchors *is* its subject
+   > (`CONTRIBUTING.md` §"Cite code by symbol" escape hatch). Do not re-anchor it later: freeze it and
+   > move any still-live claim out.
+
+   An adversarial review of the 4673 ruling proposed five amendments; three were applied, two
+   rejected on gates. **The ruling's own
+   line anchors were re-measured and three were stale:** `_reconcile_one_stranded` is defined at
+   `harness.py:5479` and its `recovery_for` call — the only production one — is `:5553` (cited as
+   `:5540`); the status filter is `:4959-4960` (cited as `:4947`); the in-progress revert arm is
+   `:5728-5731` (cited as `:5721-5723`, which is the `logger.warning`). `harness.py:238` is correct as
+   cited. Corrected above. **The structural claim survives in its exact form:** `_RECOVERY` is read
+   only by `classify_recovery` (`task_ground_truth.py:916`), whose only production reach is inside
+   `_reconcile_one_stranded`. Task 4673 is `done`; its ruling text is left as filed (audit record).
+
+   **(b) η is not the sole `done`-writer over its own population — and the discriminator is not
+   `metadata.train`.** Three pre-existing writers already stamp `done` on a task in η's statuses:
+   - `merge_queue.reconcile_landed_row` **RC-2** (`merge_queue.py:6685`, `kind='merged'`). RC-3 at
+     `:6616` short-circuits every `WORKFLOW_PRESERVE_STATUSES` member, so RC-2's reachable population
+     is exactly `pending` (and `in-progress`). It fires only for a task still holding a
+     **LandedOutbox row** — the merge crash window, and `:6757` already calls RC-3 *"a PURE
+     crash-recovery backstop"*.
+   - `build_train_callback_factory`'s `redrive_member` `found_on_main` arm (`harness.py:1330`,
+     `kind='found_on_main'` — η's own provenance kind) and `mark_member_done` (`:1270`), driven from
+     `SpeculativeMergeWorker._redrive_coalesce_members` (`merge_queue.py:14710`).
+
+   **`metadata.train` does not separate those from η.** It is written at exactly one site,
+   `TaskWorkflow._maybe_form_train` (`workflow.py:1954-1956`) — the *atomic-train* former, which is
+   `merge_train_former_enabled`-gated and **off by default** (`:1871-1872`). A **coalesce** train
+   (`merge_queue.py:15104-15123`) builds its `GroupMergeRequest` from the SAME callback factory over
+   ordinary solo tasks that carry **no** `metadata.train`, and `_redrive_coalesce_members` selects its
+   members by `statuses.get(mid) == 'merge-deferred'` (`:14774-14778`), never by train metadata. D5's
+   `metadata.train is None ⇒ recoverable` is right for the **stranded residue** — 2543/2724/2923 are
+   exactly that class — but it does not by itself exclude a *live* coalesce member.
+
+   What separates them is **liveness of the `GroupMergeRequest`**: all three fire only while a merge
+   worker holds that object in memory, and η's population is precisely the residue after it is
+   destroyed. `harness.py:1261-1262` states the same gap from the other side — revert-to-pending is a
+   withheld member's *"ONLY recovery edge (the stranded sweep provably cannot reach a merge-deferred
+   task)"*. Consequences for η: reuse the attribution these sites already perform rather than
+   re-deriving it (`no-lockstep-duplication`); and treat the window between a train advancing main and
+   its callbacks completing as a race the `corroborate-before-acting` re-read must lose gracefully —
+   `mark_member_done` also performs `MergeProvenance.consume` and `release_lane_for_terminal_task`,
+   which a bare `mark_done` skips.
+
+   **Task 4497 is NOT added to the partition and NOT made a prerequisite of η.** It owns one call
+   site — `_redrive_coalesce_members`'s `delivered_checks` wiring and its escalation prose — not a
+   recovery authority for a status, so putting it in the partition table would misstate ownership
+   (G4). It delivers no capability η's signal asserts, and its declared files (`merge_queue.py`,
+   `orchestrator/tests/test_merge_queue_coalesce.py`) do not intersect η's, so a dependency edge would
+   serialise for nothing (G3). Note for whoever works 4497: its *"measured 95.4% `effect_absent`"*
+   figure is pre-3116 and is superseded by correction 1's 60.8% residual, and its anchors
+   (`merge_queue.py:14085/:14091/:14097-14105`) have drifted to `:14805/:14811/:14818-14825`.
+
+   **(c) η's writer must carry two guards its spec did not name.**
+   - `Harness._mark_in_progress_done` (`harness.py:6239`) is a **thin wrapper over
+     `scheduler.mark_done`** and carries no capability guard of its own. Each of its four production
+     callers applies `Harness._delivered_checks_block` (`:6193` →
+     `delivered_checks.gate_mark_done_on_delivered_checks`) immediately first: `:5763`→`:5799`,
+     `:11727`→`:11731`, `:11760`→`:11764`, `:11788`→`:11792`. `delivered_checks.py:249-275` is the
+     enumeration of every attribution-shaped `mark_done` seam routed through that one decision, and
+     `harness.py:6215` states the invariant ("one hot reload disarms all eleven"). η reusing the
+     writer without the gate would be the first unguarded attribution seam in the set.
+   - `_already_landed_dispatch_gate` refuses its own auto-done when
+     `classify_pins(...).vetoes_done_flip` is True (`harness.py:11578`, `:11648`) — an open record at
+     **any** level (`:11536-11543`), with `info` severity the only carve-out
+     (`escalation/src/escalation/pins.py:144-147`, `:35`, `:237-238`). η's spec carried no such veto
+     and no boundary row for the shape. Measured on `ea876cb624`: **5 distinct `pending` tasks hold a
+     pending escalation record (7 records); 3 of the 5 would be vetoed** (4194, 4580, 4590 —
+     `blocking`) and 2 would not (4218, 4521 — `info`-only). No `merge-deferred` task holds one. The
+     shape therefore has both a live population and a live negative control. Reuse
+     `recovery_emission.pin_buckets` (`:375-416`) rather than a fifth hand-rolled `classify_pins`
+     call, and keep the veto predicate explicit at the site.
+
+   Both are constraints on η's own writer, so they are recorded on task 4651 rather than filed as a
+   separate task: such a task would own no mechanism of its own and would contend on `harness.py`.
+
+   **(d) η's status filter is now mechanically pinned.** The partition binds 3539 *structurally*
+   (`_RECONCILE_SWEEP_STATUSES`) but bound η by prose only, because η's actor is a new
+   `BackgroundService` outside `_RECOVERY`. Two `delivered_check`s now express it; they gate both the
+   attribution seam and θ's dependency on η (`docs/task-authoring.md` §3.3):
+   - `_LANDED_RECONCILE_STATUSES[^=]*=[[:space:]]*frozenset\(\{'(pending|merge-deferred)', *'(pending|merge-deferred)'\}\)`
+     — `expect: present` in `harness.py`. **Exercised against fixtures before filing:** it matches the
+     two-member set in either order, with or without the `: frozenset[str]` annotation, and **fails**
+     `{'pending','blocked'}`, `{'in-progress','merge-deferred'}` and any three-member set. It is a
+     membership assertion, not a name grep. Declare the constant on one line — `harness.py:238` is
+     the house model.
+   - `in _LANDED_RECONCILE_STATUSES` — `expect: present` in `harness.py`. Non-vacuous against the
+     first (the `= frozenset({...})` declaration line cannot satisfy it), so the set must be
+     *consulted*, not merely declared.
+
+   **(e) `deferred` gets an explicit non-owner with a measured basis** — see §Out of scope. No
+   follow-up task filed: G1 names no consumer for a mechanism there, the population is empty by
+   construction, and γ already owns and bounds the one artifact that accumulates in that corner.
+
 ## Background
 
 ### The measured defect
@@ -124,8 +257,11 @@ Two corrections are load-bearing for this PRD:
    by `has_open_escalation` being an **element of the lookup key** (`_shape`, `:899`). *Any change
    phrased as "narrow row (f)" is a no-op.*
 2. **There are eight automatic landed-task detectors, not one.** `_RECOVERY` is consulted at exactly
-   one production call site (`harness.py:5540`), and even there two **sweep-side upgrades**
-   (`harness.py:5563-5571`, `:5591-5599`) override its verdict for `blocked` tasks, deliberately
+   one production call site (the `recovery_for` call inside
+   `harness.py::Harness._reconcile_one_stranded`), and even there two **sweep-side upgrades** later in
+   that same method — the on-main `MARK_DONE_WITH_PROVENANCE` clause and the off-main
+   `EXISTS_OFF_MAIN → RE_FILE_ESCALATION` clause, both gated on
+   `Harness._only_merge_remediable` — override its verdict for `blocked` tasks, deliberately
    outside the table ("rather than a change to θ1's reviewed table — design decision, task 2243;
    esc-2243-4/5"). The project has **twice** chosen sweep-side upgrade over table edit.
 
@@ -237,8 +373,8 @@ Five changes, ordered by the option numbers Leo ratified.
   `docs/prds/claimant-invariant-enforcement.md` (*"the set is load-bearing … pinned by
   `test_reconcile_stranded.py:4196` and `test_repend_state_machine.py:681`"*). Option 6 delivers the
   same reach without touching it.
-- *Adding rows to `_RECOVERY`* — inert for `pending`/`merge-deferred` (filtered upstream at
-  `harness.py:4947`), redundant for `blocked` (the caller already upgrades), and would create two
+- *Adding rows to `_RECOVERY`* — inert for `pending`/`merge-deferred` (filtered upstream by
+  `harness.py::_RECONCILE_SWEEP_STATUSES`), redundant for `blocked` (the caller already upgrades), and would create two
   disagreeing authorities for the same shape.
 - *Editing row (f)* — a no-op (see Background).
 
@@ -276,6 +412,12 @@ reached the status via `_handle_superseded` (`workflow.py:1526-1558`), which han
 fleet restart 14 min into the train, and for 2724 by a stale `get_statuses` read 240 ms after
 coalescing. `metadata.train is not None` ⇒ correctly parked, hands off. `is None` ⇒ recoverable.
 Leaf η owns this discriminator; the explicit early-return at `harness.py:5488` stays.
+**Scope corrected at the 2026-08-24 recheck (correction 11b):** `metadata.train` is written at exactly
+one site — the *atomic-train* former `workflow.py::TaskWorkflow._maybe_form_train`, which is
+`merge_train_former_enabled`-gated and off by default. A
+**coalesce** member carries none, so `metadata.train is None` is sound for the stranded residue but is
+NOT what separates η from the live coalesce writers. That separation is the liveness of the
+`GroupMergeRequest`; see correction 11b for the three writers and the race η must lose gracefully.
 
 **D6 — Option 7 emits, never escalates, and never charges the streak alarm.**
 `RecoverySite.already_landed_gate` is **deliberately excluded** from `STREAK_CHARGING_SITES`
@@ -330,7 +472,7 @@ Sequencing internal to the decomposition (§Decomposition plan): δ before ε an
 | task **4497** (coalesce re-drive call site) | sibling | `merge_queue.py:14241` — the eighth landing-detection site | **4497** | pending/med. File-lock contention with γ (same file, ~7,700 lines apart) |
 | task **4500** (capstone: `delivered_checks` required) | consumes | `validate_landing_evidence`'s signature and its seven wired call sites | **4500** | pending/med, deps `[3116, 4496, 4497, 4498]`. δ/ε **must not** change that signature or the call-site count |
 | task **4606** (`_delivered_checks_differential` hardcodes `'main'`) | sibling | `landing_evidence.py` | **4606** | pending/med — same file as δ; sequence, don't co-run |
-| task **3539** (`CONVERT_TO_BLOCKED` recovery backstop) | **conflicts with leaf η** | the landed-`pending`/`blocked`/`merge-deferred` population | **unresolved** | pending/high. Same population, **contradictory remedy** (3539 adds `_RECOVERY` rows, which §Sketch rejects). 3539 also records that after a pin lifted, *"within ~15 minutes the row was status=PENDING, not done — something re-pended it"*. η must absorb that finding; a human must rule on which task survives |
+| task **3539** (`CONVERT_TO_BLOCKED` recovery backstop) | sibling | `in-progress` + escalation-pinned strands; the `plan_files_not_touched` already-landed carve-out | **3539** | pending/high. **Ruled 2026-08-24 (gate 4673): no conflict — disjoint on status** (correction 9). 3539 is `in-progress`-keyed; η owns `pending`/`merge-deferred`; β owns `blocked`. 3539's re-pender question is answered in correction 10 |
 | task **4501** (14-day reject-event survey) | consumes | the reject events 4496 emits | **4501** | pending/med — depends on 4496 landing; another reason not to duplicate it as α |
 
 Reciprocal-ownership: none. **But the G4 walk at decompose found this table originally omitted the
@@ -549,12 +691,12 @@ Labels are intra-batch prereqs. All modules are under `orchestrator/` unless sta
   Hang it beside the stranded sweep as its own `BackgroundService`
   (`orchestrator/background_service.py:52`; registration precedent `harness.py:2088-2100`) with an
   independent `*_interval_secs` and `*_enabled` — zero new machinery (resolves Open question 1).
-  **⚠ Unresolved conflict with task 3539** (pending/high), which targets the same population from the
-  same 930-task sweep but with the remedy §Sketch explicitly rejects (adding `_RECOVERY` rows). A
-  human must rule on which survives. Regardless of that ruling, η **must absorb 3539's field
-  observation**: after a pin was genuinely lifted, *"within ~15 minutes the row was status=PENDING,
-  not done — something re-pended it rather than recovering it."* η's writer will race that same
-  re-pender; identify it before writing.
+  **Boundary with task 3539 — ruled 2026-08-24 (gate 4673), no conflict.** η owns `pending` and
+  `merge-deferred`; β owns landed `blocked`; 3539 owns `in-progress` + escalation-pinned. Disjoint by
+  construction (correction 9). If η's scope drifts across a line, stop and re-raise rather than
+  absorbing a neighbour's territory. 3539's *"something re-pended it"* is **identified** — the
+  mark-done applier's own reject arm inside `Harness._reconcile_one_stranded` (correction 10) — so do not spend
+  effort hunting a second re-pender; the same decayed-evidence reject is why δ is a hard prereq.
   G7 `status-matches-liveness` (D7): use `shared.task_claimant.has_live_claimant`
   (`task_claimant.py:187`) **directly**, never `_resolve_live_claimant` — see correction 7. Alarm
   rather than silently skipping when a claimant's heartbeat is older than the TTL.
@@ -567,6 +709,20 @@ Labels are intra-batch prereqs. All modules are under `orchestrator/` unless sta
   counter. Add a dedicated `RecoverySite` member for this reconciler and **include it in**
   `STREAK_CHARGING_SITES` — it runs at sweep cadence, not per dispatch tick, so it is exactly the site
   class that set exists for, and D6's exclusion names `already_landed_gate` only.
+  **Added at the 2026-08-24 recheck (correction 11 b/c/d) — three constraints, all on η's writer:**
+  (1) η is not the sole `done`-writer over `pending`/`merge-deferred`;
+  `merge_queue.py::reconcile_landed_row`'s RC-2 arm and
+  `harness.py::build_train_callback_factory`'s `redrive_member` / `mark_member_done` closures already
+  are, gated by `GroupMergeRequest` liveness rather than by `metadata.train`. Reuse their attribution;
+  do not re-derive it. (2) `harness.py::Harness._mark_in_progress_done` carries **no** capability
+  guard — call `harness.py::Harness._delivered_checks_block` immediately before it, as all four
+  existing callers do, or η becomes the first unguarded attribution seam in the set
+  `delivered_checks.py::verify_delivered_checks_on_main`'s docstring enumerates. (3) Honour
+  `escalation/src/escalation/pins.py::PinReport.vetoes_done_flip` (`info` carved out) exactly as
+  `harness.py::Harness._already_landed_dispatch_gate` does, via
+  `recovery_emission.py::pin_buckets`; add a boundary row for a landed `pending` task holding a
+  `blocking` record (live specimens: 4194, 4580, 4590) and its `info`-only negative control (4218,
+  4521). The status filter itself is now pinned by two `delivered_check`s — see correction 11d.
   G7 `loop-thread-occupancy-bounded`: both limbs apply. `GitOps` already uses the async runner, but
   `derive_truth`/`_resolve_live_claimant` do sync filesystem and escalation-store I/O per task on the
   loop thread — offload per-task resolution via `asyncio.to_thread`. And the candidate set is
@@ -603,8 +759,19 @@ declared stopgap 3541 supersedes).
 - **Task 3541's `classify_pins` veto collapse.** β is a deliberate one-category stopgap. The general
   collapse stays with 3541 and its five dependencies.
 - **Task 4614** (merge-phase gate discards `already_done.json`) — a different landed-not-done channel.
-- **`deferred` status.** No automatic recovery path reaches it and none is added here; η could cover it
-  but the status is human-set and hands-off by convention.
+- **`deferred` status — explicit non-owner, decided at the 2026-08-24 recheck.** No automatic
+  recovery path reaches it and none is added here. η *could* cover it and deliberately does not.
+  Basis, measured on `ea876cb624`: (1) the orchestrator never **writes** `'deferred'` — every hit
+  under `orchestrator/src/orchestrator/` is a `status == 'deferred'` **read**, in `workflow.py` and
+  `chronic_flake.py`; the
+  status is set by the planner (`submit_task(planning_mode=True)` / `commit_planning`) or an
+  operator, so recovering it automatically would overwrite a human decision. (2) The population is
+  empty by construction: of the 12 live `deferred` tasks (1147, 2035, 2217, 2290, 2324, 2346, 2349,
+  2352, 2423, 3008, 3850, 4021) **none has a task branch at all**, against 771 task branches in the
+  repo — there is no landed `deferred` task to recover. (3) The LandedOutbox row γ retains in this
+  corner is not unowned: γ's `holds-owned-and-bounded` clause surfaces the row's age in the reconcile
+  summary and escalates past a configured 24h, and the human resolving that escalation is the row's
+  exit owner. Revisit if a landed `deferred` task is ever observed.
 - **Retiring `commit_effect_present_in_main` entirely.** Only its landing-detection call sites are in
   scope (D1).
 - **Re-litigating `_RECOVERY` or `_RECONCILE_SWEEP_STATUSES`** — see §Sketch.

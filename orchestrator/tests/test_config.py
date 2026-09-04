@@ -2154,6 +2154,140 @@ class TestParkBackfillConfig:
         )
 
 
+class TestTransientRequeueBackoffConfig:
+    """The two jittered-backoff knobs (task 3317 / PRD contract C3).
+
+    ``envelope(n) = min(cap, base * 2**(n-1))`` with equal jitter
+    ``U(envelope/2, envelope)``, applied ONLY to transient-classified
+    requeues.  Genuine requeues keep the flat ``requeue_cooldown_secs``.
+    """
+
+    def test_backoff_base_default_is_thirty_seconds(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert OrchestratorConfig().transient_requeue_backoff_base_secs == 30.0
+
+    def test_backoff_cap_default_is_fifteen_minutes(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert OrchestratorConfig().transient_requeue_backoff_cap_secs == 900.0
+
+    def test_both_knobs_are_floats(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        assert isinstance(config.transient_requeue_backoff_base_secs, float)
+        assert isinstance(config.transient_requeue_backoff_cap_secs, float)
+
+    @pytest.mark.parametrize('field', [
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
+    ])
+    @pytest.mark.parametrize('bad', [0.0, -1.0])
+    def test_non_positive_values_rejected(self, field, bad, monkeypatch, tmp_path):
+        """A zero/negative cooldown would reinstate the tight-loop pathology.
+
+        This task exists precisely to remove a hot retry loop (2026-07-29
+        provider outage: 67 starts in one half-hour bucket), so a config that
+        could arm a zero-length cooldown must fail loudly at load rather than
+        silently restore it.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(**{field: bad})
+
+    def test_defaults_yaml_carries_both_keys(self, monkeypatch, tmp_path):
+        """The packaged defaults.yaml agrees with the pydantic defaults.
+
+        Loaded through the same entry point the sibling defaults.yaml-parity
+        tests use, so the layering (packaged defaults.yaml -> project yaml ->
+        Field default) is not re-implemented here.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = OrchestratorConfig()
+        defaults = _load_package_defaults()
+        assert 'transient_requeue_backoff_base_secs' in defaults
+        assert 'transient_requeue_backoff_cap_secs' in defaults
+        assert (
+            config.transient_requeue_backoff_base_secs
+            == defaults['transient_requeue_backoff_base_secs']
+            == 30.0
+        )
+        assert (
+            config.transient_requeue_backoff_cap_secs
+            == defaults['transient_requeue_backoff_cap_secs']
+            == 900.0
+        )
+
+    def test_flat_genuine_requeue_cooldown_is_untouched(self, monkeypatch, tmp_path):
+        """The genuine-requeue lane keeps its flat 30s cooldown.
+
+        The backoff is a transient-only carve-out; a genuine requeue must
+        still arm exactly ``requeue_cooldown_secs``.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert OrchestratorConfig().requeue_cooldown_secs == 30.0
+
+    @pytest.mark.parametrize('leaf', [
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
+    ])
+    def test_backoff_leaves_are_green_tier_reloadable(self, leaf):
+        """Both knobs are hot-reloadable (green tier; PRD open question 2).
+
+        Retuning the backoff during a live provider outage is exactly when
+        an operator needs it, so a restart-only tier would make the knob
+        useless at the moment it matters.
+        """
+        assert leaf in RELOADABLE_FIELDS, (
+            f"'{leaf}' must be in RELOADABLE_FIELDS (green-tier hot-reloadable, "
+            'in the # Scheduler tuning slice alongside fairness.skip_threshold)'
+        )
+
+    def test_apply_reload_mutates_backoff_knobs_in_place(self, monkeypatch, tmp_path):
+        """apply_reload applies both leaves to the LIVE config object.
+
+        In-place mutation is what makes the green tier work without a reload
+        hook: ``Scheduler.release()`` reads ``self.config.<knob>`` at ARM
+        time, and the Scheduler holds this same object, so the next arming
+        sees the new value.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            transient_requeue_backoff_base_secs=5.0,
+            transient_requeue_backoff_cap_secs=20.0,
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['applied'] == {
+            'transient_requeue_backoff_base_secs': {'old': 30.0, 'new': 5.0},
+            'transient_requeue_backoff_cap_secs': {'old': 900.0, 'new': 20.0},
+        }
+        assert report['restart_required'] == {}
+        assert live.transient_requeue_backoff_base_secs == 5.0
+        assert live.transient_requeue_backoff_cap_secs == 20.0
+
+    @pytest.mark.parametrize('leaf', [
+        'transient_requeue_backoff_base_secs',
+        'transient_requeue_backoff_cap_secs',
+    ])
+    def test_reloadable_names_resolve_on_a_default_config(self, leaf, monkeypatch, tmp_path):
+        """Typo gate: each RELOADABLE_FIELDS literal must be a real attribute.
+
+        Mirrors ``test_every_path_resolves_on_default_config`` — a misspelled
+        entry would silently no-op inside diff_config/apply_reload.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        assert getattr(OrchestratorConfig(), leaf) > 0.0
+
+
 class TestVerifyInfraRetryConfig:
     """Tests for verify_infra_retry_* config fields (step-5)."""
 
@@ -3677,6 +3811,15 @@ class TestRecoveryEmissionConfig:
         # The narrower kill switch for the only part that WRITES to the
         # escalation queue — separate from `enabled` on purpose.
         assert cfg.recovery_emission.streak_escalation_enabled is True
+        # Task 4647: the landing-detector git_error storm escape hatch shares
+        # this section because it is the same KIND of knob — a recovery-site
+        # detector whose alarm an operator must be able to retune or silence
+        # live.  10/hour is well above any healthy rate (the recovery sweeps
+        # run every 900s) and well below a storm.
+        assert cfg.recovery_emission.landing_git_error_rate_per_hour == 10
+        # Its own narrow kill switch, for the same reason
+        # streak_escalation_enabled has one.
+        assert cfg.recovery_emission.landing_git_error_escalation_enabled is True
 
     def test_veto_streak_threshold_must_be_at_least_one(self):
         """threshold=0 would file an L1 on the very first observed veto."""
@@ -3695,6 +3838,20 @@ class TestRecoveryEmissionConfig:
         with pytest.raises(ValidationError):
             RecoveryEmissionConfig(veto_streak_min_span_secs=-1)
 
+    def test_landing_git_error_rate_must_be_at_least_one(self):
+        """rate=0 would file the storm L1 on the very first git_error.
+
+        One git_error is a transient — a repo lock, a ref that lost a race.
+        The alarm exists for the REPEATED shape, which is the one that means
+        the detector rather than the repo.
+        """
+        from orchestrator.config import RecoveryEmissionConfig
+
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(landing_git_error_rate_per_hour=0)
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(landing_git_error_rate_per_hour=-1)
+
     def test_defaults_yaml_block_matches_the_field_defaults(self):
         """The shipped stanza must not drift from the pydantic defaults.
 
@@ -3712,6 +3869,11 @@ class TestRecoveryEmissionConfig:
         assert block['veto_streak_threshold'] == 3
         assert block['veto_streak_min_span_secs'] == 1500.0
         assert block['streak_escalation_enabled'] is True
+        # Task 4647 — a Field(default=...) with no stanza key is exactly the
+        # silent drift this test exists to catch, so the new leaves are pinned
+        # here alongside the sibling four rather than trusted to pydantic.
+        assert block['landing_git_error_rate_per_hour'] == 10
+        assert block['landing_git_error_escalation_enabled'] is True
 
     def test_leaves_are_green_tier_hot_reloadable(self):
         """Every leaf is in RELOADABLE_FIELDS (whole-submodel-group idiom).
@@ -3728,3 +3890,66 @@ class TestRecoveryEmissionConfig:
                 'register the whole submodel via _submodel_leaf_paths so new '
                 'leaves are covered automatically'
             )
+# ---------------------------------------------------------------------------
+# task 3060: git.merge_park_lock_grace_seconds — the advance_main index-lock
+# stand-off knob
+# ---------------------------------------------------------------------------
+
+
+class TestMergeParkLockGraceSeconds:
+    """`GitConfig.merge_park_lock_grace_seconds` bounds how long
+    `advance_main` waits for a FOREIGN `<git-dir>/index.lock` in project_root
+    to clear before giving up and returning `park_lock_contended`.
+
+    The 300s default matches this repo's documented pre-commit budget
+    (CLAUDE.md instructs `timeout: 300000` because the hook runs pyright), so
+    an ordinary docs-direct-commit-on-main — which holds the index lock for
+    the entire hook run — is waited out rather than halting the merge queue.
+    """
+
+    def test_default_is_300_seconds(self):
+        """Default 300.0s == the documented 5-minute pre-commit budget."""
+        from orchestrator.config import GitConfig
+
+        assert GitConfig().merge_park_lock_grace_seconds == 300.0
+
+    def test_round_trips_override(self):
+        """An explicit override round-trips verbatim."""
+        from orchestrator.config import GitConfig
+
+        assert GitConfig(merge_park_lock_grace_seconds=42.5).merge_park_lock_grace_seconds == 42.5
+
+    def test_zero_is_accepted_as_probe_only_off_switch(self):
+        """0 is VALID (`ge=0`, not `gt=0`): it disables only the WAIT.
+
+        The lock is still probed and a held lock is still classified as
+        `park_lock_contended` — the off-switch can never restore the
+        data-loss risk of parking through a foreign process's index lock,
+        and it must never become a silent fail-soft.
+        """
+        from orchestrator.config import GitConfig
+
+        assert GitConfig(merge_park_lock_grace_seconds=0).merge_park_lock_grace_seconds == 0
+
+    def test_rejects_negative(self):
+        """A negative grace is nonsensical — `ge=0` must reject it."""
+        from orchestrator.config import GitConfig
+
+        with pytest.raises(ValidationError):
+            GitConfig(merge_park_lock_grace_seconds=-1)
+
+    def test_is_green_tier_reloadable(self):
+        """Green-tier: an operator can retune the stand-off live via
+        `mcp__escalation__reload_config`, like its `git.offline_lane_*`
+        leaf neighbours. The value is re-read per advance, not captured at
+        startup, so a leaf mutation takes effect on the very next advance.
+
+        NOTE: `GitConfig` has no whole-submodel `_submodel_leaf_paths` group
+        in RELOADABLE_FIELDS (`git.main_branch` is asserted ABSENT above), so
+        this membership requires an EXPLICIT registration line.
+        """
+        assert 'git.merge_park_lock_grace_seconds' in RELOADABLE_FIELDS, (
+            'git.merge_park_lock_grace_seconds must be a member of '
+            'RELOADABLE_FIELDS (green-tier hot-reloadable, explicitly '
+            'registered beside the git.offline_lane_* leaves)'
+        )

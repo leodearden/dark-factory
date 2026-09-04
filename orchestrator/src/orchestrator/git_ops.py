@@ -104,6 +104,7 @@ AdvanceResult = Literal[
     'stash_failed', 'wip_overlap', 'pop_conflict',
     'unmerged_state', 'pop_conflict_no_advance',
     'rebased_pending_reverify', 'conflict_markers',
+    'park_lock_contended',
 ]
 
 
@@ -203,15 +204,66 @@ def is_wip_safety_commit(subject: str) -> bool:
 MERGE_PARK_REF = 'refs/dark-factory/merge-park'
 
 
+# Poll cadence (seconds) for GitOps._await_index_lock_clear's stand-off on a
+# FOREIGN <git-dir>/index.lock, and how often that wait re-announces itself.
+# Deliberately module constants, not config knobs: the operator-facing budget
+# is the single `git.merge_park_lock_grace_seconds` knob — these only control
+# how finely that budget is sampled and how chatty a long wait is.
+_INDEX_LOCK_POLL_INTERVAL_S = 1.0
+_INDEX_LOCK_WARN_INTERVAL_S = 30.0
+
+# Floor (seconds) an index.lock's PRE-wait age must clear before it may be
+# treated as a crashed-git LEFTOVER rather than a live commit.  This repo's
+# documented pre-commit budget (CLAUDE.md instructs `timeout: 300000` for a
+# commit that stages Python), so a lock older than this outlived the longest
+# legitimate hook run.
+#
+# Single source of truth for two collaborating call sites, deliberately
+# defined HERE because the import direction is merge_gates -> git_ops and
+# never the reverse:
+#   * `GitOps._await_index_lock_clear` short-circuits its stand-off once the
+#     pre-wait age clears max(grace, this) — waiting cannot change a verdict
+#     that is already "leftover", it only costs the SERIALIZED merge worker
+#     the whole grace per queued task.
+#   * `merge_gates._map_advance_failure` (which aliases this as
+#     `_STALE_LOCK_FLOOR_S`) uses the SAME bar to decide whether to offer the
+#     destructive `rm -f <lock>` recovery.
+# They must never drift: a short-circuit at a lower bar than the advice bar
+# would skip the wait and then NOT explain why.
+_INDEX_LOCK_STALE_FLOOR_S = 300.0
+
+
 class MergeParkError(Exception):
     """Base class for failures parking pre-advance WIP on MERGE_PARK_REF.
 
     Raised by :meth:`GitOps._park_wip_on_private_ref` when the ``git stash
     create`` / ``git update-ref`` infra sequence itself fails (not a
-    contention condition — see :class:`MergeParkContentionError` for that).
+    contention condition — see :class:`MergeParkContentionError` and
+    :class:`MergeParkLockContentionError` for those).
     ``advance_main`` catches this and returns the existing
     ``AdvanceResult 'stash_failed'`` code (loud CRITICAL log + permanent
     halt to prevent code loss).
+    """
+
+
+class MergeParkLockContentionError(MergeParkError):
+    """Raised when the park failed because a FOREIGN git process holds
+    project_root's ``<git-dir>/index.lock``.
+
+    Transient, never a queue halt: ``advance_main`` maps this to the
+    ``AdvanceResult 'park_lock_contended'`` code, which is DELIBERATELY
+    absent from ``merge_queue._HALT_ADVANCE_RESULTS``.  The dominant cause is
+    a concurrent ``git commit --only <path>`` in project_root, which holds
+    the index lock for the ENTIRE pre-commit hook run — self-clearing, unlike
+    the shared-hygiene fault that ``'stash_failed'`` reports.
+
+    Classification MUST be by positive lock-FILE detection, never by stderr
+    matching: verified on git 2.43.0, ``git stash create`` under a held
+    ``index.lock`` exits **rc=1 with EMPTY stdout AND EMPTY stderr** (while
+    ``git status --porcelain`` and ``git diff --name-only`` both still
+    succeed with rc=0).  There is simply no stderr text to classify on — which
+    is also why the resulting halt escalation used to read
+    ``rc=1, stdout='', stderr=''``.  See :meth:`GitOps._index_lock_state`.
     """
 
 
@@ -1155,6 +1207,47 @@ _EFFECT_PROBE_TRANSIENT_FAILURES = frozenset({
     'main_sha_unresolved',
 })
 
+#: How long GitOps._lookup_merge_marker may reuse its marker index without
+#: re-resolving main's sha.  The staleness check is one `git rev-parse`, and
+#: `git rev-parse main` was measured at ~29ms on the dark-factory repo — paid
+#: once per CANDIDATE (~721 branch-absent candidates on a scheduler tick) that
+#: is ~21s of pure subprocess, which would eat the entire latency budget this
+#: index exists to reclaim.  A short recheck window collapses that to one or
+#: two calls per tick.
+#:
+#: Reusing a marginally stale index is SAFE IN ONE DIRECTION, which is what
+#: makes this sound rather than merely cheap: git history is append-only here,
+#: so an index built at an older main sha can only LACK markers that landed
+#: since — it can never contain a marker that is not on main.  A missing marker
+#: makes find_merge_marker return None, which is exactly its behaviour on a
+#: genuine miss: the gate declines to auto-done and the task dispatches
+#: normally, and the next tick sees the rebuilt index.  The failure mode is
+#: therefore a one-tick delay in an auto-done that has never once fired in
+#: production, not a false positive that could mark unlanded work complete.
+_MERGE_MARKER_INDEX_RECHECK_SECS = 2.0
+
+
+@functools.lru_cache(maxsize=8)
+def _merge_marker_pattern(main_branch: str) -> re.Pattern[str]:
+    """Compile the regex that recovers a branch name from a merge marker.
+
+    DERIVED FROM ``git_ops.py::_merge_subject`` rather than hand-written, so the
+    marker index and the merge-commit writer can never drift apart — the same
+    single-source-of-truth property that ``find_merge_marker``'s original
+    ``--grep`` spelling had by construction.  A sentinel is substituted for the
+    branch, then split back out, so only ``_merge_subject`` decides the literal
+    format.
+
+    The capture is ``\\S+`` because a git branch name can never contain
+    whitespace, and the pattern is deliberately UNANCHORED to mirror
+    ``git log --fixed-strings --grep=...``, which matches anywhere in the commit
+    message rather than only at the start of the subject.
+    """
+    sentinel = '\x00BRANCH\x00'
+    template = _merge_subject(sentinel, main_branch)
+    prefix, _, suffix = template.partition(sentinel)
+    return re.compile(re.escape(prefix) + r'(\S+)' + re.escape(suffix))
+
 
 @dataclass(frozen=True)
 class CommitEffectProbe:
@@ -1963,10 +2056,35 @@ async def _settled_lane_lock_holder_pids(
     For the two acquire-TIMEOUT sites only (:meth:`GitOps.merge_verify_lease`
     and :meth:`GitOps.reset_persistent_merge_worktree`).  Both used to read the
     kernel lock table exactly ONCE there and feed that snapshot to a predicate
-    and a message; this adds the missing read POLICY on top of the unchanged
-    reader, the way
+    and a message; this adds a read POLICY on top of the reader, the way
     :func:`~orchestrator.verify_cancel.lane_lock_holder_pids` is itself a thin
     policy wrapper over ``lane_lock_holder_pids_strict``.
+
+    TWO LAYERS, NOT A DUPLICATE OF ONE (task 4227 — read this before deleting
+    either).  They answer DIFFERENT questions on DIFFERENT time scales:
+
+    * READER layer (``lane_lock_holder_pids``, MICROSECONDS, never sleeps) —
+      recovers a record the CHUNKED READ dropped.  It reads the table K times
+      back-to-back and returns the union, so it heals a lossy read of a SINGLE
+      instant.  It applies to every consumer of the reader, unconditionally
+      and by construction.
+    * SETTLE layer (THIS helper, 0.5s, sleeps) — asks something no re-read of
+      one instant can answer: did the holder genuinely RELEASE between the
+      acquire timeout and the probe?  That is a question about the passage of
+      TIME, which is why its trigger is emptiness and why it stays after the
+      reader is fixed.
+
+    The reader layer strictly shrinks how often this one is reached — the very
+    first read below is now a K-read union, so a lossy read no longer starts a
+    0.5s poll by itself — and it hardens each of the ~25 iterations that a
+    genuinely empty table still costs.  It cannot REPLACE this layer: deleting
+    this helper as redundant would restore the "an empty read contradicts the
+    timeout that produced it" gap.  Deleting the reader's confirm loop would
+    re-expose both layers' reads AND the two ``holder_pids is None`` branches
+    below, which never had a settle layer — though be accurate about those
+    two: no production call site takes them (both acquire-timeout sites pass
+    *holder_pids* explicitly), so they are a test-reached seam whose tolerance
+    is inherited, not a live production exposure.
 
     WHAT IT ABSORBS.  ``/proc/locks`` is a seq_file the kernel serves one PAGE
     per ``read(2)`` regardless of the caller's buffer (a 13062-byte table took
@@ -2017,12 +2135,22 @@ async def _settled_lane_lock_holder_pids(
     THE BOUND (``_LANE_LOCK_HOLDER_SETTLE_SECS`` / ``..._INTERVAL_SECS``),
     derived from both sides:
 
-    * FLOOR — against the measured 1.54%-per-read loss, 0.5s at 0.02s gives
-      ~25 reads: ~1e-45 under independence, and ~3e-8 even at a deliberately
-      pessimistic 50%-per-read correlated-burst rate.  A re-read either
-      succeeds in microseconds or is structurally broken, so a wider bound
-      only delays a certain answer — the same reasoning that sized the test
-      side's ``_LANE_LOCK_STRICT_READ_SECS``.
+    * FLOOR — 0.5s at 0.02s gives ~25 POLL ITERATIONS, and the bound must
+      survive all of them losing the record.  Stated per ITERATION, because
+      task 4227 changed what one iteration is: each is now a K-read UNION in
+      the reader, so an iteration loses the record with probability p^K rather
+      than the per-READ p.  At the measured p = 1.54% and K = 3 that is ~4e-6
+      per iteration; even at a deliberately pessimistic 50%-per-read
+      correlated-burst rate it is 12.5%.  The old figures (~1e-45 and ~3e-8)
+      applied the per-READ rate directly across those ~25 iterations; they are
+      stale in DETAIL only, and in the SAFE direction — the total-loss
+      probability is now p^(K x 25), strictly smaller than either, so the
+      conclusion that this bound sits amply clear of the floor only gets
+      stronger.  Note the reader's confirm reads are a READ-COUNT bound
+      with no sleep, so they add microseconds and move NO wall-clock figure
+      here.  A re-read either succeeds in microseconds or is structurally
+      broken, so a wider bound only delays a certain answer — the same
+      reasoning that sized the test side's ``_LANE_LOCK_STRICT_READ_SECS``.
     * CEILING — this is what forbids simply copying that 2.0.  Every test that
       drives a contended raise inside a ``with foreign_lane_lock_holder(...)``
       block pays this bound ON TOP of that helper's 34.0s unconditional stack
@@ -2092,6 +2220,20 @@ def _lane_lock_holder_facts(
     rendered clause describes the very holder set the leak predicate evaluated;
     a second independent read could observe a different one and quietly
     misdescribe the decision during exactly the forensics this exists for.
+
+    ``None`` READS HERE, and that read is now CHUNK-TOLERANT (task 4227) — but
+    note WHO takes it.  Both production callers pass *holder_pids* positionally
+    for the reason above (task 3081), so this branch is reached only from
+    TESTS; what the reader fix buys in production is that the snapshot handed
+    in was itself read tolerantly, by :func:`_settled_lane_lock_holder_pids`.
+    The tolerance here is the same property arriving by a different route: a
+    chunked skip would otherwise degrade this clause to "the kernel reports no
+    FLOCK holder" precisely when the lane WAS contended, dropping the holder
+    pid+pgid — the one datum DF 3003/3081 had to reconstruct by hand.  Nothing
+    was rewired to get it; the tolerance lives in the reader every site here
+    binds, so all four consume it BY CONSTRUCTION and per-site divergence is
+    impossible.  That binding is itself pinned by
+    ``test_git_ops_binds_the_fail_safe_wrapper_not_the_strict_core``.
     """
     pids = lane_lock_holder_pids(lock_path) if holder_pids is None else holder_pids
     if not pids:
@@ -2557,6 +2699,21 @@ class GitOps:
         # that changes the answer, so a commit_sha-only key would freeze a
         # stale verdict across it.  See describe_commit_effect_in_main.
         self._effect_probe_memo: dict[tuple[str, str], CommitEffectProbe] = {}
+        # Merge-marker index: {branch: merge_commit_sha} for every marker on
+        # main, built in ONE `git log` pass and reused until main advances.
+        # Replaces a full-history `git log --grep` PER CANDIDATE — measured on
+        # this repo at ~2.0s a miss against 62,942 commits, x ~721 branch-absent
+        # candidates a tick, i.e. the whole ~14min scheduler tick.  One index
+        # build costs ~6.3s and serves every lookup at that main sha.
+        #
+        # Unbounded by design, unlike _effect_probe_memo above: its size is the
+        # number of merge markers in history (~3,000 here), not a function of
+        # how many candidates arrive, and exactly one index is live at a time.
+        # _merge_marker_index_checked_at is a time.monotonic() stamp guarding
+        # the rev-parse staleness check — see _MERGE_MARKER_INDEX_RECHECK_SECS.
+        self._merge_marker_index: dict[str, str] | None = None
+        self._merge_marker_index_sha: str | None = None
+        self._merge_marker_index_checked_at: float | None = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -3170,6 +3327,44 @@ class GitOps:
         different holder sets, leaving the message describing a set the
         predicate never evaluated.  ``None`` reads the table here instead,
         keeping direct callers (and the tests) two-argument.
+
+        EVERY read behind this predicate IS CHUNK-TOLERANT (task 4227), and
+        that is where the production win is — NOT in the ``None`` branch below.
+        ``/proc/locks`` is served one page per ``read(2)`` with each read
+        restarting the walk from a positional index, so a single read can
+        silently DROP our row (measured: 1.54%, 144/9337, under 24 churners).
+        The lane lock is ``LOCK_EX``, so the target inode has at most ONE
+        holder row — losing it surfaces as ``[]``, layer (1) evaluates
+        ``self_pid not in []``, and a genuine self-owned B13 leak reads as
+        ordinary foreign contention.  That read SUCCEEDS, so no strict /
+        errno-keyed variant can see it.  BOTH production callers reach here
+        with *holder_pids* already supplied by
+        :func:`_settled_lane_lock_holder_pids`, so what the reader fix hardens
+        for them is that helper's OWN reads: its first read is now a K-read
+        union (so the 0.5s settle poll is ENTERED less often at all), and each
+        of the ~25 poll iterations behind it is tolerant in turn.
+
+        The ``None`` branch itself is reached only from TESTS today — every
+        production call site passes *holder_pids* explicitly, deliberately, for
+        the snapshot-sharing reason above.  Its coverage in
+        ``test_lane_lock_leak_guard`` is therefore a CONTRACT PIN on a
+        public-ish seam, not a fix for a live outage: it says that a direct
+        two-argument caller gets the same tolerance the settled path gets.
+        That equivalence is free rather than wired, and that is the point — the
+        fix went into the READER every site binds rather than into any site, so
+        all four are tolerant by construction and per-site divergence is
+        impossible.
+
+        WHY THE UNION IS SAFE FOR A LOUD PREDICATE.  The reader returns the
+        union of the pids seen across its K back-to-back reads, which can only
+        ADD an attribution that was TRUE OF THE KERNEL at some instant during
+        the query — a chunked read drops records, it never invents them.  So
+        layer (1) can only gain a true attribution, while layers (2) and (3)
+        are read AFTERWARDS and can only VETO: the same asymmetry task 3783's
+        poll already relies on.  The union's staleness window is microseconds
+        (no sleep) against that poll's 0.5s, so it is strictly less exposed to
+        the in-process-sibling race documented there and needs no new argument
+        of its own.
 
         *ctx* forwards ``operation``/``protected_path`` to the fault so it keeps
         the parent's full payload contract.
@@ -8504,6 +8699,15 @@ class GitOps:
         cannot appear inside ``'Merge task/10 into main'`` because the ``0``
         after ``task/1`` falls where the pattern has a space.
 
+        **Lookup is indexed, not re-scanned.** The search half delegates to
+        :meth:`_lookup_merge_marker`, which builds one branch→sha map per main
+        sha (:meth:`_build_merge_marker_index`) and answers from it.  The
+        per-call ``git log`` this replaces cost ~2.0s against 62,942 commits
+        and ran once per candidate on every scheduler dispatch tick;
+        :meth:`_scan_merge_marker` retains it verbatim as the fallback for when
+        an index cannot be built.  Verdicts are unchanged by construction — the
+        index reads full commit messages, exactly as ``--grep`` does.
+
         Args:
             branch: Full prefixed branch name, e.g. ``'task/123'``.
                     Same convention as ``is_ancestor`` and ``resolve_branch_sha``.
@@ -8518,8 +8722,22 @@ class GitOps:
         if gate_on_existing_ref and await self.resolve_branch_sha(branch) is not None:
             return None
 
-        # Branch is gone — search main for a merge commit with the expected subject.
-        # Pattern derivation shared with merge_to_main — see docstring for substring-safety argument.
+        # Branch is gone — resolve the marker from the shared index, which
+        # falls back to the direct scan whenever it cannot build one.
+        return await self._lookup_merge_marker(branch)
+
+    async def _scan_merge_marker(self, branch: str) -> str | None:
+        """Direct, uncached full-history scan for *branch*'s merge marker.
+
+        The original implementation of :meth:`find_merge_marker`'s search half,
+        preserved verbatim as the authoritative fallback whenever the index in
+        :meth:`_lookup_merge_marker` cannot be built (a git failure, or main
+        refusing to resolve).  Answers must agree exactly — the index is a
+        performance change, never a semantic one — so this is also what the
+        equivalence tests compare against.
+        """
+        # Pattern derivation shared with merge_to_main — see find_merge_marker's
+        # docstring for the substring-safety argument.
         grep_pattern = _merge_subject(branch, self.config.main_branch)
         rc, out, _ = await _run(
             [
@@ -8534,6 +8752,82 @@ class GitOps:
         if rc != 0 or not out:
             return None
         return out
+
+    async def _build_merge_marker_index(self) -> dict[str, str] | None:
+        """Scan main once and map every merged branch to its merge-commit sha.
+
+        Returns ``None`` on a git failure so the caller can fall back to
+        :meth:`_scan_merge_marker` rather than cache an empty index — the same
+        never-memoize-a-subprocess-failure rule as
+        :data:`_EFFECT_PROBE_TRANSIENT_FAILURES`, and for the same reason: a
+        cached empty index would pin a spurious marker-absent verdict for the
+        life of the current HEAD.
+
+        Reads the FULL commit message (``%B``), not just the subject, because
+        ``git log --grep`` matches anywhere in the message.  Measured on this
+        repo: 19 of 62,950 commits carry a marker only in the body, so a
+        subject-only index would silently change 19 verdicts.
+
+        ``git log`` walks newest-first and :meth:`find_merge_marker` passes
+        ``--max-count=1``, so the first match wins — ``setdefault`` reproduces
+        that for a branch merged more than once (measured: ``task/958``,
+        ``task/924`` and ``task/791`` each appear twice).
+        """
+        rc, out, _ = await _run(
+            [
+                'git', 'log', self.config.main_branch,
+                '--format=%H%x1f%B%x00',
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+        pattern = _merge_marker_pattern(self.config.main_branch)
+        index: dict[str, str] = {}
+        for record in out.split('\x00'):
+            sha, sep, message = record.partition('\x1f')
+            sha = sha.strip()
+            if not sep or not sha:
+                continue
+            for match in pattern.finditer(message):
+                index.setdefault(match.group(1), sha)
+        return index
+
+    async def _lookup_merge_marker(self, branch: str) -> str | None:
+        """Resolve *branch*'s merge marker from the per-main-sha index.
+
+        Rebuilds the index when main has advanced, but checks for that at most
+        once per :data:`_MERGE_MARKER_INDEX_RECHECK_SECS` — see that constant
+        for why a briefly stale index is safe (append-only history means it can
+        only miss markers, never invent them) and why the naive
+        rev-parse-per-candidate would cost more than the scan it replaces.
+
+        Falls back to :meth:`_scan_merge_marker` on any failure to resolve main
+        or build the index, so a git hiccup degrades to the previous behaviour
+        instead of failing the lookup.
+        """
+        now = time.monotonic()
+        checked_at = self._merge_marker_index_checked_at
+        recheck_due = (
+            self._merge_marker_index is None
+            or checked_at is None
+            or (now - checked_at) >= _MERGE_MARKER_INDEX_RECHECK_SECS
+        )
+        if recheck_due:
+            main_sha = await self.get_main_sha()
+            self._merge_marker_index_checked_at = now
+            if not main_sha:
+                # No HEAD to key an index on — do not cache, just scan.
+                return await self._scan_merge_marker(branch)
+            if main_sha != self._merge_marker_index_sha or self._merge_marker_index is None:
+                index = await self._build_merge_marker_index()
+                if index is None:
+                    return await self._scan_merge_marker(branch)
+                self._merge_marker_index = index
+                self._merge_marker_index_sha = main_sha
+        if self._merge_marker_index is None:
+            return await self._scan_merge_marker(branch)
+        return self._merge_marker_index.get(branch)
 
     async def find_task_citation_commit(
         self, tid: str, *, pattern_template: str | None = None,
@@ -9222,6 +9516,150 @@ class GitOps:
             cwd=self.project_root,
         )
         return rc == 0
+
+    async def net_diff_is_empty(
+        self, upstream: str, head: str, *, probe: dict[str, Any] | None = None,
+    ) -> bool | None:
+        """Does *head* contribute any NET change relative to its fork from *upstream*?
+
+        Answers the "no-op landing" question (task 4647, PRD
+        landed-not-done-recovery, Open question 2): a branch whose commits are
+        all real work but whose combined effect is nothing — added then
+        removed, or reverted within the branch — produces a genuine merge
+        marker on main while delivering no deliverable.  That is the task-1175
+        shape, and stamping it ``done`` records a task as delivered when
+        nothing shipped.
+
+        The computation is ``merge-base(upstream, head)..head``.  The PRD
+        Contract states the formula as ``merge-base(first_parent, tip)..tip``;
+        that is the SPECIAL CASE ``upstream = first_parent(head)``, which a
+        caller asking about a merge commit's own contribution passes directly.
+        The general ``(upstream, head)`` form is the one implemented because a
+        task branch's no-op question is about the BRANCH's net contribution to
+        main, not about its last commit's.
+
+        **TRI-STATE, deliberately, and never collapsed to a bool.** ``None``
+        means "could not be determined" — an unresolvable ref, an unreadable
+        commit, or two histories with no common ancestor.  A bool return would
+        force every git failure into one of the two answers about the TASK:
+        ``False`` would read as "the branch has real content" and ``True`` as
+        "the task delivered nothing", both of them a broken detector silently
+        re-decided as a fact.  ``branch_work_landed`` maps ``None`` to
+        ``LandingReason.git_error`` for exactly this reason.
+
+        ``git diff --quiet`` is used rather than ``--name-only``: the answer is
+        a yes/no, so no file list — and in a large landing no ~300-path set —
+        is ever materialised.  That also sidesteps the path-quoting hazard
+        :meth:`branch_content_in_main` documents below (it is NOT hardened with
+        ``-z`` / ``core.quotePath=false``, so a non-ASCII path can be
+        misparsed); a predicate that never builds a path list cannot have the
+        bug at all.
+
+        Contrast :meth:`branch_content_in_main` (the byte-identity containment
+        predicate, whose final ``git diff --quiet`` leg asks "are the touched
+        paths identical between branch and main *right now*"): that question
+        DECAYS — any later commit touching those paths flips it — whereas this
+        one asks only about the branch's own two endpoints and is unaffected by
+        anything that happens on main afterwards.
+
+        Args:
+            upstream: The ref the branch forked from (a branch name or a sha).
+            head: The branch tip (or any commit-ish) whose net contribution is
+                in question.
+            probe: Optional out-parameter.  When given, structured facts are
+                written into it for the caller's escalation body —
+                ``net_diff_head_parents`` (the head commit's parent shas, so a
+                reader can see whether the tip is a merge without re-running
+                git) and ``net_diff_merge_base``.  Optional so a caller that
+                only wants the answer need not construct a dict.
+
+        Returns:
+            ``True`` when the net diff is empty, ``False`` when it is not, and
+            ``None`` when it could not be determined.
+        """
+        # Head's parents, via the same inline `rev-list --parents -n 1` idiom
+        # _probe_commit_effect uses (there is no named get_commit_parents
+        # helper).  Its combined rc/empty-output guard is kept verbatim; where
+        # the original maps it to failure='unresolvable_commit', this maps it
+        # to the tri-state None.  This also doubles as head's resolvability
+        # check, so an unresolvable head never reaches merge-base.
+        rc, parents_out, _ = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', head],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not parents_out:
+            return None
+        parents = parents_out.split()[1:]
+        if probe is not None:
+            probe['net_diff_head_parents'] = parents
+
+        rc, merge_base, _ = await _run(
+            ['git', 'merge-base', upstream, head],
+            cwd=self.project_root,
+        )
+        merge_base = merge_base.strip()
+        if rc != 0 or not merge_base:
+            # An unresolvable upstream and two disconnected root histories are
+            # both indeterminate, not "not a no-op".
+            return None
+        if probe is not None:
+            probe['net_diff_merge_base'] = merge_base
+
+        rc, _, _ = await _run(
+            ['git', 'diff', '--quiet', merge_base, head],
+            cwd=self.project_root,
+        )
+        if rc == 0:
+            return True
+        if rc == 1:
+            return False
+        # git reserves rc 0/1 for "no differences" / "differences"; anything
+        # else is an error, and an error is not an answer.
+        return None
+
+    async def landing_merge_for(self, head: str, upstream: str) -> str | None:
+        """The MERGE COMMIT on *upstream* that brought *head* in, or None.
+
+        The oldest merge commit on the ANCESTRY PATH from *head* to
+        *upstream* — i.e. the first merge that has *head* as an ancestor.
+        Exists for one caller: :func:`~orchestrator.landing_evidence.
+        branch_work_landed`'s no-op guard, in the case where *head* is ALREADY
+        an ancestor of *upstream*.
+
+        **Why that case needs a different question.** The no-op guard asks
+        "does this branch contribute any net change relative to where it
+        forked?", and its natural baseline is ``merge-base(upstream, head)``.
+        Once the branch has merged, that formula DEGENERATES: *head* is an
+        ancestor of *upstream*, so the merge base IS *head* and the diff is
+        empty for EVERY landed branch — a landed task would be reported as a
+        no-op landing and re-dispatched forever, which is the precise defect
+        the landed-not-done PRD exists to fix.  Given this merge, the guard can
+        instead ask the PRD Contract's LITERAL form,
+        ``merge-base(first_parent, tip)..tip`` — "did this merge change
+        anything relative to main as it stood immediately before it?" — which
+        is well-defined after the fact and answers the same question.
+
+        ``--ancestry-path`` (not a plain ``--merges`` walk) is what makes the
+        result *this branch's* landing rather than merely the oldest merge in
+        the range: it restricts the walk to commits that are simultaneously
+        descendants of *head* and ancestors of *upstream*, so an unrelated
+        merge that happened to land in the same window is excluded.
+
+        Returns ``None`` when there is no such merge — a fast-forward or
+        rebase landing leaves none — and also on any git failure.  The two are
+        deliberately NOT distinguished here because the sole caller treats
+        both identically (it declines to answer the no-op question rather than
+        guessing), and it re-probes repo health itself before deciding whether
+        a refusal is ``not_landed`` or ``git_error``.
+        """
+        rc, out, _ = await _run(
+            ['git', 'rev-list', '--ancestry-path', '--merges', '--reverse',
+             f'{head}..{upstream}'],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not out.strip():
+            return None
+        return out.split()[0]
 
     async def describe_commit_effect_in_main(
         self, commit_sha: str,
@@ -12174,14 +12612,16 @@ class GitOps:
     async def _interactive_worktree_landed(self, full_branch: str) -> bool:
         """True if a ``Merge {full_branch} into {main_branch}`` marker exists on main.
 
-        Reproduces :func:`find_merge_marker`'s grep core (``git log
-        <main_branch> --fixed-strings --grep=<subject> --max-count=1
-        --format=%H``) but deliberately WITHOUT its branch-existence gate:
-        :meth:`find_merge_marker` returns ``None`` immediately whenever the
-        branch ref still resolves, on the assumption that a live branch means
-        ``is_ancestor`` is the right check — but an ``_iact-*`` branch is
-        *always* still checked out in its own worktree at reap time, so that
-        gate would short-circuit to ``False`` here every single time.
+        Shares :meth:`_lookup_merge_marker` with :meth:`find_merge_marker` —
+        the same marker lookup, and deliberately WITHOUT the branch-existence
+        gate that :meth:`find_merge_marker` applies before delegating to it.
+        That gate returns ``None`` immediately whenever the branch ref still
+        resolves, on the assumption that a live branch means ``is_ancestor`` is
+        the right check — but an ``_iact-*`` branch is *always* still checked
+        out in its own worktree at reap time, so it would short-circuit to
+        ``False`` here every single time.  Calling the ungated lookup directly
+        is what preserves that distinction now that the grep core is no longer
+        duplicated here.
 
         Deliberately NOT ``is_ancestor(HEAD, main)``: a freshly-created
         ``_iact-*`` worktree has zero commits of its own, so its HEAD trivially
@@ -12193,18 +12633,7 @@ class GitOps:
         ``find_task_citation_commit`` for the same is_ancestor pitfall
         elsewhere in this module).
         """
-        grep_pattern = _merge_subject(full_branch, self.config.main_branch)
-        rc, out, _ = await _run(
-            [
-                'git', 'log', self.config.main_branch,
-                '--fixed-strings',
-                f'--grep={grep_pattern}',
-                '--max-count=1',
-                '--format=%H',
-            ],
-            cwd=self.project_root,
-        )
-        return rc == 0 and bool(out.strip())
+        return await self._lookup_merge_marker(full_branch) is not None
 
     async def _worktree_dirty(self, worktree: Path) -> bool:
         """True if *worktree* has uncommitted changes (``git status --porcelain``).
@@ -12541,6 +12970,19 @@ class GitOps:
           existed — a stale or contended ref that is never overwritten
           (:class:`MergeParkContentionError`).  Permanent; halt merge to
           prevent code loss.  See :meth:`GitOps._park_wip_on_private_ref`.
+        * ``'park_lock_contended'`` — a FOREIGN git process holds
+          project_root's ``<git-dir>/index.lock``, so this advance stood off
+          and touched NOTHING (no ref move, no tree write, no park, and the
+          foreign lock left strictly alone).  TRANSIENT and retryable —
+          explicitly CONTRASTED with ``'stash_failed'``: that code reports a
+          shared-hygiene fault needing a human, while this one reports a
+          self-clearing condition whose dominant cause is a concurrent
+          ``git commit --only`` holding the index lock across its pre-commit
+          hook.  Accordingly it is DELIBERATELY absent from
+          ``merge_queue._HALT_ADVANCE_RESULTS`` and maps to a per-task
+          ``MergeOutcome('blocked')``, never a queue halt.  The stand-off
+          budget is ``git.merge_park_lock_grace_seconds`` (default 300s,
+          matching the documented pre-commit budget).
         * ``'pop_conflict_no_advance'`` — CAS ``update-ref`` failed AND the
           subsequent stash pop conflicted.  The merge did NOT land.  WIP is
           preserved on a ``wip/recovery-*`` branch; routes to a human-level
@@ -12774,6 +13216,99 @@ class GitOps:
         if rc == 0 and current_branch.strip() == self.config.main_branch:
             is_on_main = True
 
+            # ── Foreign index-lock stand-off (task 3060) ─────────────────
+            # A concurrent `git commit --only <path>` in project_root holds
+            # <git-dir>/index.lock for the ENTIRE pre-commit hook run (this
+            # repo's hook runs pyright; CLAUDE.md instructs callers to pass
+            # `timeout: 300000`).  Under that lock `git stash create` exits
+            # rc=1 with EMPTY stdout AND stderr (verified, git 2.43.0), so
+            # the park below would fail and return the queue-HALTING
+            # 'stash_failed'.  Never park through a foreign lock:
+            # _park_wip_on_private_ref ends with `read-tree -u --reset HEAD`,
+            # which would clobber the in-flight commit's staged/working
+            # state.  When another process owns the index the only safe
+            # action is to touch nothing and come back later.
+            #
+            # This gate is deliberately placed HERE — keyed on `is_on_main`,
+            # BEFORE the dirty-file snapshot below — not inside the
+            # `if dirty_tracked:` park block, for two reasons:
+            #
+            #  (i) It covers the CLEAN-tree path's post-advance
+            #      `read-tree -u --reset HEAD` sync as well as the park.  That
+            #      sync's failure is only LOGGED while the outcome still
+            #      reports 'advanced', so on a CLEAN tree (where no park is
+            #      attempted at all) a foreign lock would silently land main
+            #      with a stale project_root tree — and the NEXT advance
+            #      would then read the whole old-main→new-main delta as
+            #      "dirty" WIP, cascading into wip_overlap/park damage.
+            #      NOTE this gate is a PROBE, so it narrows but cannot close
+            #      that window: a lock taken AFTER it still reaches the sync.
+            #      The dirty path re-probes mid-park (see the
+            #      `except MergeParkLockContentionError` handler below); the
+            #      sync closes its own residual window with a bounded
+            #      stand-off + retry at the read-tree site itself, because by
+            #      then main has already landed and 'park_lock_contended'
+            #      would be a lie.
+            #  (ii) The dirty-file snapshot is now taken AFTER the lock
+            #      clears, so it can never record the half-written state of
+            #      an in-flight `git commit --only`.  A stale snapshot would
+            #      mis-drive both the wip_overlap check and the park.
+            #
+            # It is deliberately NOT hoisted above the pre-existing
+            # unmerged-state gate: that gate's `git status --porcelain` read
+            # succeeds under a held lock (verified rc=0) and cannot
+            # false-positive from a concurrent `commit --only` (which never
+            # creates unmerged entries), so its precedence is preserved.
+            #
+            # The grace is re-read PER ADVANCE (never captured at startup)
+            # so a green-tier reload of git.merge_park_lock_grace_seconds
+            # takes effect on the very next advance.  On the clean happy
+            # path this costs exactly one stat().
+            grace_s = float(self.config.merge_park_lock_grace_seconds)
+            cleared, waited, initial_age = await self._await_index_lock_clear(
+                timeout_s=grace_s,
+                context=f'advance_main for {branch or merge_sha[:8]}',
+            )
+            if not cleared:
+                lock_path = await self._index_lock_path()
+                _, lock_age = await self._index_lock_state()
+                logger.warning(
+                    'Foreign git index lock still held in project_root after '
+                    '%.1fs — standing off; the merge did NOT land and nothing '
+                    'in project_root was modified. lock=%s age=%.1fs',
+                    waited, lock_path, lock_age,
+                )
+                # Mirrors the _last_overlap_files / _last_stash_dirty_files
+                # side channels so _map_advance_failure can name the lock in
+                # the per-task blocked reason.  'dirty_files' is empty on
+                # this path by construction — the snapshot below has not been
+                # taken yet, so no WIP is known to be at risk — and the mapper
+                # renders its "WIP at risk" clause only when the list is
+                # non-empty (the TOCTOU path below, which DOES know the
+                # files).  The key is kept PRESENT so the mapper needs no
+                # shape branching.  _last_stash_dirty_files is left untouched,
+                # so the stash_failed escalation text is unaffected.
+                #
+                # 'age_seconds' and 'initial_age_seconds' differ BY DESIGN and
+                # are not interchangeable.  The former is re-probed here, so
+                # it necessarily includes the stand-off (initial + waited +
+                # epsilon) — a true, useful fact for the operator-facing
+                # reason, but useless as a staleness signal because it exceeds
+                # the grace for a 2-second-old live commit exactly as it does
+                # for an hour-old crashed leftover.  The latter predates the
+                # wait and is the only one a staleness verdict may key on.
+                # 'grace_seconds' travels alongside so the downstream mapper
+                # stays a pure function of this dict.
+                self._last_park_lock_info = {
+                    'lock_path': str(lock_path),
+                    'age_seconds': lock_age,
+                    'waited_seconds': waited,
+                    'initial_age_seconds': initial_age,
+                    'grace_seconds': grace_s,
+                    'dirty_files': [],
+                }
+                return AdvanceOutcome('park_lock_contended')
+
             # Check for uncommitted changes (staged or unstaged)
             _, porcelain, _ = await _run(
                 ['git', 'status', '--porcelain'],
@@ -12834,6 +13369,41 @@ class GitOps:
                 if dirty_tracked:
                     try:
                         await self._park_wip_on_private_ref(branch or merge_sha[:8])
+                    except MergeParkLockContentionError as e:
+                        # SUBCLASS FIRST — the MergeParkError handler below
+                        # would otherwise swallow this and reinstate the
+                        # queue halt.  A foreign git process grabbed the
+                        # index inside the TOCTOU window between the gate
+                        # above and `git stash create`; transient, so
+                        # dispose of it exactly as the gate does.
+                        lock_path = await self._index_lock_path()
+                        _, lock_age = await self._index_lock_state()
+                        logger.warning(
+                            'Foreign git index lock appeared mid-park — '
+                            'standing off; the merge did NOT land. lock=%s '
+                            'age=%.1fs error=%s',
+                            lock_path, lock_age, e,
+                        )
+                        # A lock that appeared DURING the park is by
+                        # definition live, not a crashed leftover — the gate
+                        # above probed it absent moments ago.  Reporting the
+                        # freshly observed age as 'initial_age_seconds' (no
+                        # stand-off ran, so it is already a pre-wait value)
+                        # therefore yields a NOT-stale verdict downstream,
+                        # which is the correct answer for this shape: no
+                        # destructive `rm -f` advice for a lock we watched
+                        # appear.
+                        self._last_park_lock_info = {
+                            'lock_path': str(lock_path),
+                            'age_seconds': lock_age,
+                            'waited_seconds': 0.0,
+                            'initial_age_seconds': lock_age,
+                            'grace_seconds': float(
+                                self.config.merge_park_lock_grace_seconds,
+                            ),
+                            'dirty_files': sorted(dirty_tracked),
+                        }
+                        return AdvanceOutcome('park_lock_contended')
                     except MergeParkContentionError as e:
                         # The merge worker is serialized, so a resolvable
                         # MERGE_PARK_REF here is either an invariant
@@ -12968,6 +13538,55 @@ class GitOps:
                 ['git', 'read-tree', '-u', '--reset', 'HEAD'],
                 cwd=self.project_root,
             )
+            if sync_rc != 0:
+                # ── Residual TOCTOU window at the sync ───────────────
+                # advance_main's pre-snapshot gate is a PROBE, so a foreign
+                # `git commit --only` can still grab the index between it and
+                # this sync — and on the CLEAN-tree path there is no park,
+                # hence no mid-park re-probe to catch it.  Left alone, that is
+                # exactly the silent failure the gate exists to prevent: main
+                # LANDS while project_root's tree stays stale, and the NEXT
+                # advance reads the whole old-main→new-main delta as "dirty"
+                # WIP, cascading into wip_overlap/park damage.
+                #
+                # Returning 'park_lock_contended' here would be a LIE —
+                # update-ref has already run, main HAS moved.  So the recovery
+                # is to retry IN PLACE: stand off for the same bounded grace,
+                # then re-run the sync.  Re-probed first so a genuine
+                # (lock-free) read-tree fault is not silently delayed by a
+                # pointless retry; `_await_index_lock_clear` also short-
+                # circuits an already-stale lock, so the worst case is one
+                # grace, not an unbounded stall.
+                held, held_age = await self._index_lock_state()
+                if held:
+                    logger.warning(
+                        'read-tree after advancing main failed while a '
+                        'foreign git index lock is held (age=%.1fs) — '
+                        'standing off and retrying the sync rather than '
+                        'leaving project_root stale. error=%s',
+                        held_age, sync_err,
+                    )
+                    cleared, waited, _pre_age = await self._await_index_lock_clear(
+                        timeout_s=float(
+                            self.config.merge_park_lock_grace_seconds,
+                        ),
+                        context=(
+                            'post-advance tree sync for '
+                            f'{branch or merge_sha[:8]}'
+                        ),
+                    )
+                    if cleared:
+                        sync_rc, _, sync_err = await _run(
+                            ['git', 'read-tree', '-u', '--reset', 'HEAD'],
+                            cwd=self.project_root,
+                        )
+                        if sync_rc == 0:
+                            logger.info(
+                                'read-tree retry succeeded after waiting '
+                                '%.1fs for the foreign index lock to clear — '
+                                'project_root is in sync with the new HEAD.',
+                                waited,
+                            )
             if sync_rc != 0:
                 logger.error(
                     'read-tree failed after advancing main — working tree '
@@ -13260,6 +13879,179 @@ class GitOps:
         )
         return 'error'
 
+    async def _index_lock_path(self) -> Path:
+        """Resolve project_root's ``<git-dir>/index.lock`` path, memoised.
+
+        Fast path: when ``<project_root>/.git`` is a real DIRECTORY (the
+        ordinary layout) the answer is ``<project_root>/.git/index.lock``
+        with no subprocess at all — this sits on advance_main's hot path and
+        must not cost a fork on the clean happy path.  Fallback: for the
+        ``.git``-FILE layout (a linked worktree / submodule) ask git itself
+        via ``rev-parse --absolute-git-dir``.
+
+        Memoised on the instance because a repository's git-dir does not move
+        under a live GitOps.
+        """
+        cached = getattr(self, '_index_lock_path_cache', None)
+        if cached is not None:
+            return cached
+
+        dot_git = self.project_root / '.git'
+        if dot_git.is_dir():
+            resolved = dot_git / 'index.lock'
+        else:
+            rc, git_dir, _ = await _run(
+                ['git', 'rev-parse', '--absolute-git-dir'],
+                cwd=self.project_root,
+            )
+            if rc == 0 and git_dir.strip():
+                resolved = Path(git_dir.strip()) / 'index.lock'
+            else:
+                # Last resort: assume the ordinary layout rather than
+                # raising.  A wrong path degrades to "no lock detected",
+                # i.e. exactly today's behaviour — never worse.
+                resolved = dot_git / 'index.lock'
+
+        self._index_lock_path_cache: Path = resolved
+        return resolved
+
+    async def _index_lock_state(self) -> tuple[bool, float]:
+        """Return ``(present, age_seconds)`` for project_root's index lock.
+
+        ``age_seconds`` is derived from the lock file's mtime and is what
+        distinguishes an in-flight pre-commit hook (young) from a crashed-git
+        leftover (older than the configured grace) in the operator-facing
+        reason.  Returns ``(False, 0.0)`` when absent; a ``stat`` race (the
+        lock vanishing between ``exists`` and ``stat``) is treated as absent,
+        which is the truth a moment later anyway.
+        """
+        lock_path = await self._index_lock_path()
+        try:
+            mtime = lock_path.stat().st_mtime
+        except (FileNotFoundError, NotADirectoryError):
+            return (False, 0.0)
+        except OSError:
+            # Unreadable for some other reason — do not invent contention.
+            return (False, 0.0)
+        return (True, max(0.0, time.time() - mtime))
+
+    async def _await_index_lock_clear(
+        self, *, timeout_s: float, context: str,
+    ) -> tuple[bool, float, float]:
+        """Wait (bounded by *timeout_s*) for project_root's index lock to clear.
+
+        Returns ``(cleared, waited_seconds, initial_age_seconds)``.
+
+        ``initial_age_seconds`` is the lock's age measured BEFORE the
+        stand-off begins (0.0 when no lock was held).  It is the ONLY age that
+        distinguishes a crashed-git leftover from a live commit, because any
+        age read after the wait necessarily includes the wait: a lock created
+        2s before a 300s stand-off reports 302s afterwards, exactly like an
+        hour-old leftover reports 3900s.  Callers making a staleness judgement
+        must use this value, never the post-wait age.
+
+        The happy path — no lock — costs exactly one ``stat``: no subprocess,
+        no sleep, no await of anything real, so a clean repo behaves
+        byte-identically to before this gate existed.
+
+        ``timeout_s == 0`` still PROBES (probe-only fail-fast): the off-switch
+        disables the WAIT, never the classification, because parking through a
+        foreign process's index lock would clobber the in-flight commit's
+        staged/working state.  A long stand-off is loud rather than silent —
+        a WARNING naming the lock path, its current age and *context* is
+        emitted at most every ~30s while waiting.
+
+        Uses a MONOTONIC clock for the deadline so a wall-clock adjustment
+        mid-wait cannot extend or truncate the budget.
+
+        An ALREADY-STALE lock (pre-wait age past
+        ``max(timeout_s, _INDEX_LOCK_STALE_FLOOR_S)``) short-circuits the wait
+        entirely — see the inline rationale below.
+        """
+        held, age = await self._index_lock_state()
+        if not held:
+            return (True, 0.0, 0.0)
+
+        # Bind the pre-wait observation to a local the poll loop cannot
+        # clobber — the loop rebinds `age` on every probe, which is exactly
+        # how this (the only staleness-bearing) measurement used to be lost.
+        initial_age = age
+        lock_path = await self._index_lock_path()
+
+        # ── Already-stale short-circuit ──────────────────────────────
+        # Do not burn the grace on a lock downstream has already decided is a
+        # crashed-git leftover.  `merge_gates._map_advance_failure` renders
+        # its `rm -f` recovery advice from exactly this pre-wait age against
+        # exactly this threshold (_INDEX_LOCK_STALE_FLOOR_S, which it aliases
+        # as _STALE_LOCK_FLOOR_S), so once the bar is cleared no amount of
+        # waiting can change the verdict — it only costs the SERIALIZED merge
+        # worker the full grace for EVERY queued task until an operator clears
+        # the file, which is a slow-motion version of the stall this gate
+        # exists to remove.  The returned (False, 0.0, initial_age) drives the
+        # identical downstream verdict and advice, minus the dead wall-clock.
+        #
+        # Strictly `>` and keyed on the PRE-wait age, mirroring the mapper: a
+        # young lock (the ordinary docs-direct-commit-on-main window) always
+        # gets its full stand-off, which is the case the wait is FOR.
+        stale_floor = max(max(0.0, timeout_s), _INDEX_LOCK_STALE_FLOOR_S)
+        if initial_age > stale_floor:
+            logger.warning(
+                'Foreign git index lock in project_root is ALREADY %.0fs old '
+                '(past the %.0fs staleness floor) — skipping the stand-off, a '
+                'crashed-git leftover will not clear by waiting. lock=%s '
+                'context=%s',
+                initial_age, stale_floor, lock_path, context,
+            )
+            return (False, 0.0, initial_age)
+
+        started = time.monotonic()
+        deadline = started + max(0.0, timeout_s)
+        # Cap the poll interval so a sub-second timeout_s still yields at
+        # least one further probe rather than sleeping past its own deadline.
+        interval = min(_INDEX_LOCK_POLL_INTERVAL_S, max(0.0, timeout_s)) or \
+            _INDEX_LOCK_POLL_INTERVAL_S
+        last_warned = started
+
+        logger.warning(
+            'Foreign git index lock held in project_root — standing off for '
+            'up to %.0fs before giving up. lock=%s age=%.1fs context=%s',
+            max(0.0, timeout_s), lock_path, age, context,
+        )
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+            held, age = await self._index_lock_state()
+            waited = time.monotonic() - started
+            if not held:
+                logger.info(
+                    'Foreign git index lock cleared after %.1fs — proceeding '
+                    'with advance. lock=%s context=%s',
+                    waited, lock_path, context,
+                )
+                return (True, waited, initial_age)
+            now = time.monotonic()
+            if now - last_warned >= _INDEX_LOCK_WARN_INTERVAL_S:
+                last_warned = now
+                logger.warning(
+                    'Still waiting on a foreign git index lock in '
+                    'project_root after %.1fs (of %.0fs). lock=%s age=%.1fs '
+                    'context=%s',
+                    waited, max(0.0, timeout_s), lock_path, age, context,
+                )
+
+        # Final probe so a lock that cleared inside the last poll interval
+        # is not misreported as still held at the deadline.
+        held, _age = await self._index_lock_state()
+        waited = time.monotonic() - started
+        if not held:
+            logger.info(
+                'Foreign git index lock cleared after %.1fs — proceeding '
+                'with advance. lock=%s context=%s',
+                waited, lock_path, context,
+            )
+            return (True, waited, initial_age)
+        return (False, waited, initial_age)
+
     async def _park_wip_on_private_ref(self, label: str) -> None:
         """Park uncommitted WIP in project_root onto MERGE_PARK_REF.
 
@@ -13280,6 +14072,26 @@ class GitOps:
         exists — the merge worker is serialized, so a resolvable ref here is
         either an invariant violation or a crash-leftover holding real,
         unrecovered WIP; it is never overwritten.
+        Raises :class:`MergeParkLockContentionError` (a ``MergeParkError``
+        SUBCLASS, so it must be caught FIRST) instead of the generic
+        ``MergeParkError`` when the ``git stash create`` failure happens
+        while a FOREIGN git process holds ``<git-dir>/index.lock`` —
+        transient contention rather than a park infra fault.  That re-probe
+        closes the TOCTOU window advance_main's pre-park gate cannot cover.
+
+        The transient classification is DELIBERATELY confined to the
+        stash-create site, which is the only failure that leaves NOTHING
+        behind: no ref, no tree write.  A ``read-tree`` failure happens
+        AFTER ``update-ref`` has already created MERGE_PARK_REF, so
+        classifying it transient would return a per-task
+        ``'park_lock_contended'`` (no cleanup, no apply) while leaving the
+        ref dangling — and the NEXT advance's single-flight guard would then
+        raise :class:`MergeParkContentionError` and halt the whole queue.
+        That converts a transient race into a guaranteed later halt, so the
+        read-tree site keeps the loud generic ``MergeParkError``
+        (``'stash_failed'``) with the WIP safe on the ref.  It also keeps
+        the ``'park_lock_contended'`` operator message's "NOTHING in
+        project_root was modified" claim (merge_gates) factually true.
         """
         # Single-flight guard: explicit pre-check so a stale/contended ref
         # fails loudly with a clear message rather than via the terser
@@ -13301,6 +14113,20 @@ class GitOps:
         )
         stash_sha = stash_sha.strip()
         if stash_rc != 0 or not stash_sha:
+            # Re-probe the index lock: advance_main's gate cannot cover the
+            # TOCTOU window where a concurrent `git commit --only` grabs the
+            # index right after the probe.  Under a held lock this failure is
+            # rc=1 with EMPTY stdout AND stderr (git 2.43), so the message
+            # interpolated below carries no diagnostic signal at all —
+            # positive lock detection is the only available classifier.
+            lock_held, lock_age = await self._index_lock_state()
+            if lock_held:
+                raise MergeParkLockContentionError(
+                    f'git stash create failed because a foreign git process '
+                    f'holds {await self._index_lock_path()} '
+                    f'(age={lock_age:.1f}s) — transient contention, not a '
+                    f'park infra failure (rc={stash_rc})'
+                )
             raise MergeParkError(
                 f'git stash create failed or produced no commit (rc={stash_rc}, '
                 f'stdout={stash_sha!r}, stderr={stash_err!r})'
@@ -13326,6 +14152,17 @@ class GitOps:
             cwd=self.project_root,
         )
         if reset_rc != 0:
+            # NO lock re-probe here, deliberately — unlike the stash-create
+            # site above, this failure happens AFTER update-ref created
+            # MERGE_PARK_REF.  Raising the transient subclass would make
+            # advance_main return 'park_lock_contended', which neither
+            # deletes the ref nor sets did_park, so nothing ever applies or
+            # cleans it up; the next advance's single-flight guard would
+            # then hit MergeParkContentionError -> 'stash_failed' and halt
+            # the entire queue.  Keeping the loud generic MergeParkError
+            # here trades a same-cycle halt (WIP safe on the ref, one
+            # recovery) for a guaranteed later one, and keeps
+            # 'park_lock_contended' honestly meaning "nothing was modified".
             raise MergeParkError(
                 f'read-tree -u --reset HEAD failed after parking WIP on '
                 f'{MERGE_PARK_REF} (rc={reset_rc}, stderr={reset_err!r}) — '

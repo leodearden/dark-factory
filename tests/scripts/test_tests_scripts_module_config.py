@@ -35,24 +35,17 @@ conftest.py puts every subproject's ``src/`` on sys.path.
 from __future__ import annotations
 
 import pathlib
+from collections.abc import Callable
 
 import pytest
 import yaml
-from orchestrator.config import OrchestratorConfig, _discover_module_configs
+from module_budget_family import min_budget
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.module_charter import derive_modules
 
-from orchestrator import verify, verify_plan
+from orchestrator import verify
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-
-# This worktree's own top-level orchestrator config — the one `_root_config`
-# reads. `dark-factory-orchestrator.yaml` is the canonical, REQUIRED filename
-# for a project's top-level config (it is what the dashboard's escalation-URL
-# discovery keys on); the legacy spellings are a discovery fallback for
-# unmigrated projects, not a choice this repo has. Anchored to REPO_ROOT rather
-# than taken from the ambient ORCH_CONFIG_PATH for the reason that helper's
-# docstring records at length.
-ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 
 MODULE_PREFIX = 'tests/scripts'
 
@@ -61,68 +54,9 @@ MODULE_PREFIX = 'tests/scripts'
 SAMPLE_TOUCHED_FILE = 'tests/scripts/test_spawn_claude.py'
 
 
-def _discovered() -> dict:
-    return _discover_module_configs(REPO_ROOT)
-
-
-def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
-    """Load the repo-root config through the PRODUCTION loader, anchored at ROOT_CONFIG_PATH.
-
-    COPIED (task 3703) from the two sibling guards
-    (``test_scripts_module_config.py`` and ``test_module_verify_budgets.py``),
-    not imported: a test file importing a sibling test file couples two guards
-    that must be able to fail independently, and this anchor is load-bearing
-    enough that it must be visibly present in the file that depends on it.
-
-    THE COST OF THAT, RECORDED RATHER THAN LEFT IMPLICIT (task 3703 amendment
-    pass, reviewer-flagged): this makes THREE verbatim copies of a helper that
-    is pure setup, and the no-cross-import argument — sound for ASSERTIONS —
-    does not reach ``tests/scripts/conftest.py``, which already exists and is
-    pytest's idiomatic home for exactly this. One anchoring implementation as a
-    conftest fixture would leave each guard's assertions just as independent.
-    NOT done here: conftest.py is outside this task's locked module list, so
-    de-triplicating it is filed as a follow-up rather than reached for.
-
-    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene.
-    ``project_root`` is only a model FIELD and selects nothing:
-    ``OrchestratorConfig.settings_customise_sources`` builds its
-    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
-    falling back to a CWD-relative ``config.yaml``. Both ambient states are
-    wrong here, in OPPOSITE directions:
-
-      * UNSET — the state INSIDE VERIFY, because
-        ``verify._target_subprocess_env`` deliberately scrubs the whole
-        ``ORCH_`` prefix (task 2957) — finds no file, so every value collapses
-        to the pydantic DEFAULTS, a config this repo does not declare.
-      * SET, as an operator's shell has it, points at whichever checkout that
-        orchestrator serves — typically the MAIN one, not this worktree. Every
-        assertion would then be about a different checkout's yaml and report
-        GREEN on a worktree that had actually regressed: the exact
-        reports-green-while-checking-something-else failure this file exists
-        to prevent, one env var over.
-
-    Setting the env var IS the production load path (``config.load_config``
-    stamps ``os.environ['ORCH_CONFIG_PATH']`` before constructing), so this
-    stays a read through the real loader, pinned to THIS worktree's committed
-    yaml rather than left to the ambient environment.
-
-    Fails LOUDLY on a missing file rather than silently: ``YamlSettingsSource``
-    SKIPS a non-existent ``config_path`` instead of raising, so a bad path
-    would yield the pydantic DEFAULTS with no error at all.
-    """
-    assert ROOT_CONFIG_PATH.is_file(), (
-        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
-        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
-        'skips a non-existent path rather than raising), and every value read '
-        'from the returned config would be about a config this repo does not '
-        'declare. dark-factory-orchestrator.yaml is the canonical, required '
-        "filename for a project's top-level orchestrator config"
-    )
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
-    return OrchestratorConfig(project_root=REPO_ROOT)
-
-
-def test_tests_scripts_is_a_registered_module_config() -> None:
+def test_tests_scripts_is_a_registered_module_config(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
     """tests/scripts/ must be discovered, and must be REACHABLE by the routing chain.
 
     The five assertions below are one cohesive contract — discovery alone is
@@ -174,7 +108,7 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
     2. Pinning ``== ['tests/scripts']`` would re-encode a falsified constant,
     which is precisely the failure mode task 3350 is repairing elsewhere.
     """
-    discovered = _discovered()
+    discovered = discover_module_configs()
 
     # (1) Discovery registers it at all.
     assert MODULE_PREFIX in discovered, (
@@ -259,42 +193,9 @@ _FLEET_CHAIN_MARKERS = (
 )
 
 
-def _executed_for_touched(files: list[str], cfg: OrchestratorConfig):
-    """Run the PRODUCTION plan->execution bridge and return the single executed config.
-
-    ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
-    renders those PlannedRuns into the exact ModuleConfig ``run_verification``
-    executes. Asserting on THAT is what makes "the tests/scripts segment ran" a
-    structural claim rather than an exit-code claim.
-
-    *cfg* IS A REQUIRED PARAMETER, not a convenience (task 3703, applying the
-    shape commit 6c72a7da5a landed next door in
-    ``test_module_verify_budgets.py``). It must be a config built by
-    ``_root_config``, whose docstring spells out why the ``ORCH_CONFIG_PATH``
-    anchor is load-bearing: an unset anchor collapses every value to the
-    pydantic defaults, SILENTLY. This helper used to construct its own
-    ``OrchestratorConfig(project_root=REPO_ROOT)``, and — unlike the sibling
-    guard, whose single anchoring caller at least left the env var set as a
-    SIDE EFFECT of an earlier assertion — NO caller in this file anchored it at
-    all. So it read whatever ambient ``ORCH_CONFIG_PATH`` the process happened
-    to carry, with no failure signal either way. Taking the config as an
-    argument makes the dependency structural instead of ambient.
-
-    The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
-    and nothing classifies STRUCTURAL, so pyright stays FILE_SCOPED.
-    """
-    mc = _discovered()[MODULE_PREFIX]
-    plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
-    executed = verify._executed_module_configs_from_plan([mc], plan)
-    assert len(executed) == 1, (
-        f'expected exactly one executed module config for {files!r}, got '
-        f'{[e.prefix for e in executed]!r}'
-    )
-    return executed[0]
-
-
 def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
-    monkeypatch: pytest.MonkeyPatch,
+    root_config: OrchestratorConfig,
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
     """The task's acceptance criterion, asserted STRUCTURALLY rather than via rc.
 
@@ -317,7 +218,7 @@ def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
     ``pyright tests/scripts/test_spawn_claude.py`` rc=0). Closing the TEST gap
     must not open a LINT/TYPE one.
     """
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], _root_config(monkeypatch))
+    executed = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_FILE], root_config)
 
     # (a) The tests/scripts segment ACTUALLY RUNS.
     assert executed.test_command is not None, (
@@ -370,9 +271,13 @@ def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
 
 
 def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
-    """``_executed_for_touched`` must not read the ambient ``ORCH_CONFIG_PATH``.
+    """The ``executed_for_touched`` fixture must not read the ambient ``ORCH_CONFIG_PATH``.
 
     Task 3703, reviewer-flagged — the mirror of the repair commit 6c72a7da5a
     landed next door in ``test_module_verify_budgets.py``. This file's helper
@@ -408,12 +313,19 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     poisoned env — they read this module's own yaml and the config they are
     handed, never ``ORCH_CONFIG_PATH``.
 
-    ORDER IS LOAD-BEARING: the anchored config is built FIRST, while the
-    environment is still sane, and the poison applied SECOND. Anchoring
-    afterwards would overwrite the poison and leave this test vacuous.
+    ORDER IS LOAD-BEARING, AND IS NOW STRUCTURAL RATHER THAN A COMMENT (task
+    4320). The anchored config must be built FIRST, while the environment is
+    still sane, and the poison applied SECOND; anchoring afterwards would
+    overwrite the poison and leave this test vacuous. That used to rest on the
+    file-local ``_root_config(monkeypatch)`` call physically preceding the
+    poison in the body, enforceable only by reading. The anchored config now
+    arrives from the directory-wide ``root_config`` fixture, and pytest builds
+    fixtures during SETUP — before this body runs at all — so the ordering can
+    no longer be broken by an edit that moves a line.
     """
-    # (1) The anchored config, built while the environment is still sane.
-    cfg = _root_config(monkeypatch)
+    # (1) The anchored config, built during fixture setup while the environment
+    # is still sane.
+    cfg = root_config
 
     # (2) NOW poison the ambient environment, with a config the PRODUCTION
     # loader REJECTS — see the docstring for why rejected and not merely
@@ -426,7 +338,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
 
     # (3) The helper must not consult that variable. A helper that builds its
     # own config raises pydantic ValidationError here instead of returning.
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], cfg)
+    executed = executed_for_touched(MODULE_PREFIX, [SAMPLE_TOUCHED_FILE], cfg)
 
     assert executed.prefix == MODULE_PREFIX, (
         f'under a poisoned ORCH_CONFIG_PATH the production bridge executed '
@@ -460,45 +372,13 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     # The module budget survives too: the figure must come from THIS module's
     # yaml, which the poisoned env cannot reach, not from whatever the ambient
     # config declares.
-    declared = _discovered()[MODULE_PREFIX].verify_command_timeout_secs
+    declared = discover_module_configs()[MODULE_PREFIX].verify_command_timeout_secs
     assert executed.verify_command_timeout_secs == declared, (
         f'executed verify_command_timeout_secs='
         f'{executed.verify_command_timeout_secs} under a poisoned '
         f'ORCH_CONFIG_PATH, not the {declared} this module declares (task '
         '3703) — the budget is being resolved from the ambient environment'
     )
-
-
-def _min_budget(worst: float) -> int:
-    """~2x the worst measured run, rounded DOWN to the nearest 100s.
-
-    The EXACT expression both sibling guards use for their own floors
-    (``test_scripts_module_config.MIN_MODULE_BUDGET_SECS``, task 3458, and
-    ``test_module_verify_budgets._min_budget``, task 3473), COPIED rather than
-    imported so the three cannot drift in SHAPE while staying free to fail
-    INDEPENDENTLY — a test file importing a sibling test file couples two
-    guards that must be able to fail apart, the convention
-    ``test_module_verify_budgets.py``'s header states. The price of that
-    convention, stated rather than glossed: nothing in THIS file can observe a
-    sibling's copy, so
-    ``test_min_module_budget_is_derived_from_the_measured_worst_run`` pins the
-    SHAPE of the expression below against synthetic cases and claims no more
-    than that.
-
-    DERIVED from the measurement rather than hand-set beside it, because that
-    exact pair has already rotted once undetected — in THIS file: a hand-set
-    300s floor left standing against a 127.0s figure while
-    ``tests/scripts/orchestrator.yaml`` had since recorded a 233.50s worst run
-    of the command this module actually declares (task 3703,
-    reviewer-flagged; both sibling guards had NAMED the staleness in prose,
-    which is precisely what a comment can do and an assertion could not).
-
-    DEGENERATES TO ZERO for cheap suites — ``_min_budget(22.49) == 0``, the
-    sampler case ``test_module_verify_budgets.py`` records — which would make
-    the floor assertion below VACUOUS. Assertion (iii) of the derivation test
-    pins that this suite is not in that regime.
-    """
-    return (int(2 * worst) // 100) * 100
 
 
 # The tests/scripts suite's own measured wall-clock. EVERY recorded run, the
@@ -516,6 +396,34 @@ def _min_budget(worst: float) -> int:
 #                                    on a 32-core host
 #     185.29s wall / 180.47s pytest  task 3703 pre-1 run B, same base, same
 #                                    counts, rc=0; loadavg 61.43 at start
+#     353.63s, 374.40s               esc-4240-1 / esc-4240-3, on the task 4240
+#                                    branch (a tree carrying that task's extra
+#                                    module). Both derive the same 700s floor
+#                                    as the worst below, so nothing here hinges
+#                                    on which of the three is largest
+#     136.37s wall / 132.95s pytest  task 4320 architect sweep run 1, THIS
+#                                    branch at base 5c9d4817fb; rc=0, 1256
+#                                    passed / 2 skipped / 6 deselected;
+#                                    loadavg 263.26 -> 51.45, 32-core host
+#     153.57s wall / 149.97s pytest  architect run 2, same base/counts, rc=0;
+#                                    loadavg 51.45 -> 69.83
+#     283.00s wall / 270.40s pytest  architect run 3, same base/counts, rc=0;
+#                                    loadavg 69.83 -> 119.24
+#     397.47s wall                   architect run 4, same base/counts, rc=0;
+#                                    loadavg 119.24 -> 187.04.  <-- WORST
+#     323.88s wall                   architect run 5, same base/counts, rc=0;
+#                                    loadavg 187.04 -> 130.22
+#     234.34s wall / 230.67s pytest  task 4320 pre-1 run 1, same base; rc=0,
+#                                    1256 passed / 2 skipped / 6 deselected;
+#                                    loadavg 97.08 -> 154.41
+#     215.70s wall / 212.52s pytest  pre-1 run 2, same base/counts, rc=0;
+#                                    loadavg 154.41 -> 103.93
+#     172.19s wall / 167.41s pytest  pre-1 run 3, same base/counts, rc=0;
+#                                    loadavg 103.93 -> 80.03
+#     195.36s wall / 188.50s pytest  pre-1 run 4, same base/counts, rc=0;
+#                                    loadavg 80.03 -> 85.81
+#     148.20s wall / 145.77s pytest  pre-1 run 5, same base/counts, rc=0;
+#                                    loadavg 85.81 -> 103.79
 #
 #   FALLBACK-PATH runs — A DIFFERENT COMMAND, kept for history and LABELLED so
 #   nobody sizes this budget against them again:
@@ -524,23 +432,54 @@ def _min_budget(worst: float) -> int:
 #                                    legs narrowed to this diff, not the
 #                                    command declared here
 #
-# SIZING RULE: the WORST RUN, never the mean and never fresh-only. Both of
-# pre-1's fresh runs came in BELOW 233.50s, so sizing on them would LOWER the
-# floor — the unsafe direction. The spread is this oversubscribed host's LOAD at
-# measurement time, not suite variance: 167.73s and 233.50s are the same command
-# on the same tree.
+# SIZING RULE: the WORST RUN, never the mean and never fresh-only, across the
+# UNION of every VERBATIM run above. Task 4320's own five fresh runs all came in
+# BELOW the 397.47s worst — the freshest of them at 148.20s — so sizing on them
+# would have LOWERED the floor from 700 back to 400 and left the then-declared
+# 600s budget passing. That is the unsafe direction, and recording the
+# inconvenient figure rather than only the convenient one is what makes the rule
+# operative.
 #
-# HONEST CAVEAT, recorded rather than left implicit: 233.50s was measured when
-# this suite collected 369 tests, and it now collects 1072 (measured in pre-1).
-# It is therefore a LOWER BOUND on today's contended worst case, not a current
-# measurement. Do NOT scale it by the test-count ratio — RE-MEASURE under load
-# before ever tightening the budget against it.
-MEASURED_SUITE_WORST_SECS = 233.50
+# CORRECTED IN PLACE (task 4320). This paragraph used to read "HONEST CAVEAT ...
+# 233.50s was measured when this suite collected 369 tests, and it now collects
+# 1072 ... It is therefore a LOWER BOUND on today's contended worst case, not a
+# current measurement." That is no longer true in either half: the suite has
+# been RE-MEASURED under load on this branch (ten fresh VERBATIM runs, listed
+# above, at 1256 passed / 2 skipped / 6 deselected), so this constant is a
+# current measurement rather than a lower bound. Corrected rather than deleted,
+# because the caveat is why the re-measurement happened; corrected rather than
+# left standing, because an authoritative-reading comment a later change has
+# falsified is precisely the defect this file exists to remove.
+#
+# THE SPREAD IS LOAD, AND LOAD DOES NOT PREDICT WALL CLOCK. 136.37s -> 397.47s
+# is a 2.91x band on a BYTE-IDENTICAL command and tree within one session, which
+# is why the worst RUN and not any single fresh one sizes the floor. But the
+# loadavg annotations must not be read as a normalisation knob: the FASTEST run
+# of the architect's sweep started at the HIGHEST load of its five (263.26) and
+# the slowest at 119.24, and in task 4320's own sweep run 3 started at a HIGHER
+# load than run 4 (103.93 vs 80.03) and finished FASTER (172.19s vs 195.36s). A
+# figure annotated "recorded at loadavg N" therefore CANNOT be scaled back to a
+# clean-host number — re-measure instead.
+#
+# PROVENANCE CAVEAT RETIRED (task 4320): the 353.63s / 374.40s figures were
+# recorded on the task 4240 branch and could be argued to be inflated by that
+# task's extra module. 397.47s was measured on a tree WITHOUT it, at ~57 FEWER
+# collected tests, and still exceeds both — so the caveat is settled by
+# construction rather than by subtraction, and no figure here needs discounting.
+MEASURED_SUITE_WORST_SECS = 397.47
 # DERIVED from the measurement above, never hand-set beside it, so the two
-# cannot silently diverge again — see _min_budget's docstring for the rot that
-# motivated this and test_min_module_budget_is_derived_from_the_measured_worst_run
-# for the guard that now makes it a property. 2 * 233.50 -> 467.0 -> 400.
-MIN_MODULE_BUDGET_SECS = _min_budget(MEASURED_SUITE_WORST_SECS)
+# cannot silently diverge again — see module_budget_family.min_budget's docstring
+# for the rot that motivated this and
+# test_min_module_budget_is_derived_from_the_measured_worst_run for the guard
+# that makes it a property here. 2 * 397.47 -> 794.94 -> 700.
+#
+# CORRECTED IN PLACE (task 4320): this used to call a LOCAL `_min_budget` copy
+# defined a few lines above, one of three spellings of a single derivation
+# across this family. The copy is gone and the canonical implementation is
+# imported; the guard's own claim is stronger for it, not weaker, because
+# test_module_verify_budgets.py now checks cross-file that every family member
+# calls that one implementation.
+MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
 
 
 def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
@@ -553,21 +492,36 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     declares — so the yaml's own worst figure was gated by NOTHING, and the two
     sibling guards could only NAME the staleness in their comment blocks
     (``test_scripts_module_config.py``'s ``MIN_MODULE_BUDGET_SECS`` comment and
-    ``test_module_verify_budgets.py``'s ``_min_budget`` docstring both call it
+    ``module_budget_family.min_budget``'s docstring, which inherited it from
+    ``test_module_verify_budgets.py``, both call it
     out verbatim) rather than fail on it. Deriving the floor is what turns that
     from a documented observation into a property.
 
-    SCOPE, NARROWED TO WHAT IS ACTUALLY VERIFIED (task 3703 amendment pass,
-    reviewer-flagged: this docstring previously described (i) as cross-file
-    enforcement, which it is not and cannot be). ``_min_budget`` is a LOCAL
-    copy, per the family's no-cross-import convention, so nothing here can
-    observe a sibling's expression: if ``test_scripts_module_config.py``
-    changed its own inline derivation, every assertion below would still pass.
-    (i) is a purity check on THIS file's copy, (ii) is an edit tripwire on THIS
-    file's pair. Real cross-file enforcement — one guard reading every family
-    member's published pair and checking the derivation holds for all of them —
-    would be a new mechanism rather than an amendment, and is filed as a
-    follow-up instead of being claimed here.
+    SCOPE (task 3703 amendment pass, CORRECTED IN PLACE by task 4320). This
+    paragraph used to read: "``_min_budget`` is a LOCAL copy, per the family's
+    no-cross-import convention, so nothing here can observe a sibling's
+    expression: if ``test_scripts_module_config.py`` changed its own inline
+    derivation, every assertion below would still pass ... Real cross-file
+    enforcement — one guard reading every family member's published pair and
+    checking the derivation holds for all of them — would be a new mechanism
+    rather than an amendment, and is filed as a follow-up instead of being
+    claimed here."
+
+    THAT FOLLOW-UP IS TASK 4320 AND IT LANDED. There is no local copy any more:
+    ``min_budget`` is imported from ``module_budget_family``, the family's one
+    implementation, and ``test_module_verify_budgets.py::
+    test_the_budget_family_derives_every_floor_from_one_canonical_expression``
+    reads EVERY member's published pair and evaluates each floor expression in a
+    namespace holding only that helper and the published worst — and,
+    separately, requires each member to BIND ``min_budget`` by importing it, so
+    that a sibling re-spelling its derivation fails there under a different name
+    (``NameError`` in that namespace) and under the same name (a module-scope
+    shadow) alike. The three assertions below are unchanged in what they claim,
+    and are strictly stronger than they were: (i) pins the SHAPE of the one
+    shared implementation rather than of this file's private copy, and (ii)
+    remains an edit tripwire on THIS file's pair. The no-cross-import convention
+    is untouched — this file imports a NON-TEST helper and takes conftest
+    fixtures, never a sibling guard, and still fails entirely on its own.
 
     Three claims, each falsifiable on its own:
 
@@ -584,15 +538,15 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
         task targets, so it is not reintroduced in the test against it.
 
     (ii) An EDIT TRIPWIRE, not a property: ``MIN_MODULE_BUDGET_SECS`` is
-        DEFINED as ``_min_budget(MEASURED_SUITE_WORST_SECS)`` a few lines above,
+        DEFINED as ``min_budget(MEASURED_SUITE_WORST_SECS)`` a few lines above,
         so this can only fail if a future edit puts a literal back in its place
         — which is precisely the rot described above, and precisely what the
         two sibling guards' comments could name but not catch.
 
-    (iii) The derivation is NON-DEGENERATE for this suite. ``_min_budget``
+    (iii) The derivation is NON-DEGENERATE for this suite. ``min_budget``
         floors to the nearest 100s, so a cheap suite derives a floor of ZERO:
         ``test_module_verify_budgets.py`` documents exactly that case for
-        sampler (``_min_budget(22.49) == 0``), where the corresponding budget
+        sampler (``min_budget(22.49) == 0``), where the corresponding budget
         assertion becomes VACUOUSLY true. At this suite's measured cost it does
         not degenerate, and this pins that — so assertion (b) of
         ``test_tests_scripts_module_carries_its_own_tight_verify_budget`` below
@@ -605,8 +559,8 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     #    50.0 -> 100  does not degenerate at the boundary
     #    49.9 ->   0  degenerates just below it (the regime (iii) rules out)
     for worst, expected in ((100.0, 200), (299.9, 500), (50.0, 100), (49.9, 0)):
-        assert _min_budget(worst) == expected, (
-            f'_min_budget({worst}) == {_min_budget(worst)}, expected {expected} '
+        assert min_budget(worst) == expected, (
+            f'min_budget({worst}) == {min_budget(worst)}, expected {expected} '
             '(task 3703). The family derivation is ~2x the worst measured run '
             'floored to the nearest 100s; a different multiple, or rounding UP '
             "instead of DOWN, changes the SHAPE of this file's floor and must "
@@ -617,10 +571,10 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     # rotted once here (see the docstring). Written derivation-first rather than
     # constant-first only because ruff's SIM300 reads the other order as a Yoda
     # condition; equality is symmetric and the claim is unchanged.
-    assert _min_budget(MEASURED_SUITE_WORST_SECS) == MIN_MODULE_BUDGET_SECS, (
+    assert min_budget(MEASURED_SUITE_WORST_SECS) == MIN_MODULE_BUDGET_SECS, (
         f'MIN_MODULE_BUDGET_SECS = {MIN_MODULE_BUDGET_SECS} but '
-        f'_min_budget(MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS}) = '
-        f'{_min_budget(MEASURED_SUITE_WORST_SECS)} (task 3703) — a literal has '
+        f'min_budget(MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS}) = '
+        f'{min_budget(MEASURED_SUITE_WORST_SECS)} (task 3703) — a literal has '
         'been put back where the derivation was. Raise '
         'MEASURED_SUITE_WORST_SECS from a fresh measurement and let the floor '
         'follow; do not hand-set the floor'
@@ -630,23 +584,25 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
     assert MIN_MODULE_BUDGET_SECS > 0, (
         f'MIN_MODULE_BUDGET_SECS derives to {MIN_MODULE_BUDGET_SECS} from '
         f'MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS} (task 3703). '
-        '_min_budget floors to the nearest 100s, so a worst run under 50s '
+        'min_budget floors to the nearest 100s, so a worst run under 50s '
         'derives a ZERO floor — the degenerate case test_module_verify_budgets.py '
-        'records for sampler (_min_budget(22.49) == 0), where the >= floor '
+        'records for sampler (min_budget(22.49) == 0), where the >= floor '
         'assertion passes for ANY declared budget. This suite measures far above '
         'that, so a zero here means the measurement was lost, not that the suite '
         'got cheap'
     )
 
 
-def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
+def test_tests_scripts_module_carries_its_own_tight_verify_budget(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
     """The module must carry its own budget, tighter than the repo-root ceiling.
 
     This is what makes the fix a real NARROWING rather than a relabelling. Two
     sides are bounded:
 
     - Below (b): at least ``MIN_MODULE_BUDGET_SECS``, which is not a literal
-      but ``_min_budget(MEASURED_SUITE_WORST_SECS)`` — ~2x the worst RECORDED
+      but ``min_budget(MEASURED_SUITE_WORST_SECS)`` — ~2x the worst RECORDED
       run of this module's VERBATIM test_command, floored to the nearest 100s.
       An achievable floor derived from measurement, not a guess, and derived
       rather than transcribed so it cannot fall out of step with the figure it
@@ -673,7 +629,7 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
     rather than restating it, so the assertion cannot drift from the code that
     implements it.
     """
-    mc = _discovered()[MODULE_PREFIX]
+    mc = discover_module_configs()[MODULE_PREFIX]
 
     # (a) Declared at all — otherwise the global ceiling silently applies. The
     # message cites MEASURED_SUITE_WORST_SECS rather than a literal (task 3703
@@ -691,13 +647,13 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
         f'own declared test_command is {MEASURED_SUITE_WORST_SECS}s'
     )
 
-    # (b) Measurement-derived floor — DERIVED by _min_budget from
+    # (b) Measurement-derived floor — DERIVED by min_budget from
     # MEASURED_SUITE_WORST_SECS, not hand-set beside it (task 3703).
     assert mc.verify_command_timeout_secs >= MIN_MODULE_BUDGET_SECS, (
         f'{MODULE_PREFIX} verify_command_timeout_secs='
         f'{mc.verify_command_timeout_secs} is below the '
         f'{MIN_MODULE_BUDGET_SECS}s floor (task 3350). That floor is not a '
-        f'literal: it is _min_budget(MEASURED_SUITE_WORST_SECS='
+        f'literal: it is min_budget(MEASURED_SUITE_WORST_SECS='
         f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED run of this '
         "module's VERBATIM test_command floored to the nearest 100s — see the "
         'provenance block above that constant for every run behind it. A budget '

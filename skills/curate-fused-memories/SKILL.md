@@ -129,7 +129,7 @@ executing anything.
 
 ---
 
-## THE SEQUENCING TRAP: close each gate task BEFORE running its own deletes
+## THE SEQUENCING TRAP: name a survivor on every delete
 
 This is the single most important operational item in the sitting. The
 authoritative statement is task **3625's description** ("SEQUENCING TRAP — READ
@@ -144,11 +144,30 @@ gate task.** Task 3624's broadened `_citation_repoint_gate`
 `error_type=CitationRepointRequired` — **the sitting blocked by its own
 bookkeeping**.
 
-**The fix inverts the normal order: CLOSE each gate task BEFORE running its own
-deletes.** A terminal task drops out of `live_citers`, the self-citations
-evaporate, and the guard then fires on exactly the UUIDs with **genuine
-third-party exposure** — turning it from an obstacle into a precise detector
-that names the victim tasks for you in its refusal payload.
+**HISTORICAL, superseded — do NOT act on this paragraph; read the ordering
+correction immediately below it.** The original fix inverted the normal order:
+CLOSE each gate task BEFORE running its own deletes. A terminal task drops out
+of `live_citers`, the self-citations evaporate, and the guard then fires on
+exactly the UUIDs with **genuine third-party exposure** — turning it from an
+obstacle into a precise detector that names the victim tasks for you in its
+refusal payload.
+
+**⚠️ ORDERING CORRECTION, measured 2026-09-03 — the close-first inversion just
+above is RETIRED. Do the WRITES first.** Two independent things killed it.
+(1) You can no longer hand-close a gate at all: `set_task_status(done)` refuses
+with `done_provenance_required`, and the close now runs through
+`resolve_issue(action='resume')`, which does NOT make the task terminal
+immediately — it flips it to `pending` for DeterministicRunner, which then
+re-runs the closure check. So closing first is both impossible and, were it
+possible, would put the check ahead of the work it checks. (2) The refusal it was
+dodging is avoidable head-on: `_citation_repoint_gate` REPOINTS instead of
+refusing whenever you name a survivor. Pass
+`delete_memory(replacement_memory_id=<canonical>)`, and `consolidate_memories`
+does the same automatically with its own canonical as the target — which is why
+its docstring calls the "you named no survivor" refusal unreachable there.
+Measured on esc-4998-1 with the gate task still live AND still citing the doomed
+id: 4978 tasks scanned, 2 citations repointed, 0 failures, 0 unrepointed. The
+prohibition below is UNAFFECTED and still binding.
 
 **Prohibition:** do **NOT** reach for `metadata={'allow_dangling_citations': True}`
 (task 3624's deliberate escape hatch on `delete_memory`) as routine batch
@@ -322,25 +341,52 @@ For each gate task, in whatever order you like (adjudication is read-only):
 
 For each gate with real work, in this order:
 
-1. **Record the disposition on the gate task** (append to its `details`).
+1. **Run the cluster's writes FIRST** — this used to be step 3; see the ordering
+   correction in the sequencing-trap section for why it moved.
+   `consolidate_memories` if landed (preferred), else hand-sequence —
+   `add_memory` for the short canonical (stamped `topic` + `canonical: true`),
+   `update_memory` `metadata_patch` stamps for each retained peer,
+   `delete_memory` for each genuinely absorbed entry. All writes carry
+   `project_id` and your `curator-<slug>` `agent_id`.
+   **The one shape `consolidate_memories` CANNOT execute** is repairing a topic
+   that already carries TWO canonicals where the good one must survive with its
+   identity. Its `content_amend=False` is load-bearing, so it cannot fold new
+   content into an existing canonical, and it "takes no existing canonical id,
+   so a second call for the same (project, topic) writes a SECOND canonical" —
+   i.e. a THIRD on an already-duplicated topic. Repair that by hand instead:
+   `update_memory` to fold the new content in, THEN
+   `delete_memory(replacement_memory_id=<survivor>)`. Fold BEFORE deleting —
+   `topic_anchor.py::select_canonical_payload` tie-breaks on most-recent
+   `created_at`, so the newer duplicate is what the read path is already serving
+   and may carry content the older one lacks.
+2. **Record the disposition on the gate task** (append to its `details`).
    Safe-append protocol: fetch the current text, compose the full replacement
    locally, resend, then read back and **byte-compare the original prefix** —
    `update_task`'s append semantics resend the whole field, and a transcription
    slip silently loses text.
-2. **Close the gate task**: `set_task_status(id=<gate>, status='done',
-   project_root=...)`. **Omit `done_provenance`** — none of the accepted kinds
-   (`merged`, `found_on_main`, `deterministic-deploy`,
-   `deterministic-deploy-scheduled`) truthfully describes a decision closure,
-   and recording a false one feeds Stage-2 reconciliation a fabricated
-   "shipped via" edge (task 3200's `details` documents this exact gap).
-3. **Now run the cluster's writes**: `consolidate_memories` if landed (preferred),
-   else hand-sequence — `add_memory` for the short canonical (stamped
-   `topic` + `canonical: true`), `update_memory` `metadata_patch` stamps for each
-   retained peer, `delete_memory` for each genuinely absorbed entry. All writes
-   carry `project_id` and your `curator-<slug>` `agent_id`.
-4. **If a delete refuses with `CitationRepointRequired`**: this is the detector
-   working — with the gate task closed, the refusal names a **genuine
-   third-party citer**. Read the named tasks, then either repoint their
+3. **Close the gate by RESOLVING ITS ESCALATION — never by `set_task_status`**:
+   `resolve_issue(escalation_id=<gate esc>, action='resume', ...)`. Measured
+   2026-09-03: `set_task_status(id=<gate>, status='done')` REFUSES with
+   `error=done_provenance_required` (`reconciliation.require_done_provenance` is
+   enabled), and the hint offers only `merged` / `found_on_main` — both false for
+   a decision closure. The kind that DOES fit, `deterministic-gate`, exists
+   precisely so such a close "passes `require_done_provenance` without claiming a
+   deploy happened" (task 2331) and IS in the accepted enum at
+   `shared/src/shared/task_metadata.py` — so hand-passing it would be silently
+   ACCEPTED. That is the trap; don't. `task_interceptor.py` is explicit that it is
+   "Stamped by DeterministicRunner, never supplied by hand." The `resume` releases
+   the gate from its blocked-on-human hold (observed `blocked → pending`) and
+   DeterministicRunner re-dispatches it, re-runs the closure check, and stamps the
+   provenance itself. Expect a lag: dispatch competes with the ordinary backlog,
+   so a released gate can sit at `pending` for a while — that is not a fault and
+   needs no nudge. `resolution_class` must be one of
+   `actionable | benign | moot-terminal-subject | stale-strand`; an executed
+   consolidation is `actionable` (`'executed'` is rejected outright).
+4. **If a delete refuses with `CitationRepointRequired`** even though you named a
+   `replacement_memory_id`: this is the detector working — the refusal names a
+   **genuine citer the repoint could not rewrite** (note the gate task is NOT
+   terminal at this point under the corrected order, so its own self-citation may
+   be among them; that one is repointed, not a victim). Read the named tasks, then either repoint their
    citations to the canonical (respecting the tombstone-ledger rules in
    `citation_verifier.py`) or change disposition to retain-and-tag for that
    member. **Never** answer a refusal loop with
@@ -375,7 +421,7 @@ For each gate with real work, in this order:
 
 - **Per-gate ledger**: gate id → disposition, canonical id, retained-peer count,
   deleted count, any `CitationRepointRequired` hits and how each was repointed.
-  This ledger lives durably in the gate tasks (Phase 3 step 1) and in task
+  This ledger lives durably in the gate tasks (Phase 3 step 2) and in task
   3524's details — the escalation records below summarize it, they are not its
   only home.
 - **Resolve 3625's born-at-L2 escalation** recording the per-gate dispositions
@@ -386,8 +432,9 @@ For each gate with real work, in this order:
   pending with a triage-note addendum instead. When you do close it: draft the
   resolution prose first, then resolve in the very next call — the post-`done`
   revalidation sweep can overwrite a slowly-written resolution (~1 minute race).
-- Flip **3524** to `done` (same no-fabricated-provenance rule as the gates),
-  then `/reflect`.
+- Flip **3524** to `done`. Same correction as the gates: if `set_task_status`
+  refuses with `done_provenance_required`, do NOT invent a provenance kind —
+  resolve its escalation and let DeterministicRunner stamp it. Then `/reflect`.
 
 ---
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -1404,6 +1405,233 @@ class TestZeroOutputBreakerCurate:
             )
         # Breaker should NOT be open after 1 ZOT since reset.
         assert 'zero-output-breaker' not in r_next.justification
+
+
+class TestZeroOutputBreakerBatchReset:
+    """RED (task 4143): a successful MULTI-ITEM batch LLM call must reset the
+    consecutive-ZOT breaker too, not just the single-item curate() path.
+
+    On main, _call_llm_batch has no success-path reset, so in a
+    batch-dominant deployment size-1 bisect ZOTs accumulate across an
+    unbounded number of healthy batch round-trips until they trip the
+    breaker on a demonstrably healthy service.
+    """
+
+    def _zot_result(self) -> AgentResult:
+        return AgentResult(
+            success=False, output='', subtype='error_empty_output',
+            timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+            proc_tree='<pgid tree>', account_name='max-g',
+        )
+
+    def _healthy_batch_result(self, n: int) -> AgentResult:
+        return AgentResult(
+            success=True, output='', cost_usd=0.03,
+            structured_output={'decisions': [
+                {'candidate_index': i, 'action': 'create', 'justification': 'ok'}
+                for i in range(n)
+            ]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_batch_resets_zot_counter(self):
+        """(1) A successful _call_llm_batch call resets the counter directly."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        # Seed one recorded ZOT directly.
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
+        assert curator._consecutive_zero_output_timeouts == 0
+
+    @pytest.mark.asyncio
+    async def test_healthy_batch_between_zots_does_not_open_breaker(self):
+        """(2) Production symptom, end to end: ZOT, healthy batch, ZOT must NOT open
+        the breaker — the healthy batch has to clear what the first ZOT left behind."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        zot = self._zot_result()
+        healthy = self._healthy_batch_result(2)
+        mock_llm = AsyncMock(side_effect=[zot, healthy, zot])
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=mock_llm):
+            # ZOT via curate() (counter → 1).
+            await curator.curate(
+                CandidateTask(title='Alpha'), project_id='p', project_root='/x',
+            )
+            # Healthy batch call — must reset counter to 0.
+            await curator._call_llm_batch(
+                candidates=[CandidateTask(title='Batch1'), CandidateTask(title='Batch2')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+            # ZOT via curate() again (counter → 1, still under threshold=2).
+            await curator.curate(
+                CandidateTask(title='Bravo'), project_id='p', project_root='/x',
+            )
+
+        assert curator._zero_output_breaker_open_until is None
+        assert curator._consecutive_zero_output_timeouts == 1
+        # All three LLM-bound calls actually reached the LLM — nothing was
+        # short-circuited by a wrongly-opened breaker.
+        assert mock_llm.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_healthy_batch_through_curate_batch_prepared_resets_counter(self):
+        """(3) Same reset, proven through the real production entry point
+        (curate_batch_prepared → _call_llm_batch_with_fallback → _call_llm_batch)
+        rather than the private method directly."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        c1 = CandidateTask(title='Prepared candidate Gamma', description='gamma task details')
+        c2 = CandidateTask(title='Prepared candidate Delta', description='delta task details')
+        prepared = [
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+            PreparedCandidate(candidate=c2, pool=[], pool_sizes=empty_sizes, prompt_tokens=20),
+        ]
+
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id='p', project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        # Content, not just length: proves this exercised the healthy parse
+        # path rather than _parse_batch_decisions's batch-item-missing
+        # degradation, which would also produce 2 (degraded) decisions.
+        assert [d.justification for d in decisions] == ['ok', 'ok']
+        assert curator._consecutive_zero_output_timeouts == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_batch_does_not_reset_counter(self):
+        """(4) Placement guard — GREEN before and after the fix. A failed batch
+        must NOT reset the counter, pinning the reset behind the success check
+        (if it were placed above the `if not agent_result.success` guard, the
+        breaker would become unreachable from the batch path)."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        curator._record_zero_output_timeout(time.monotonic())
+        assert curator._consecutive_zero_output_timeouts == 1
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        zot = self._zot_result()
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=zot)), \
+             pytest.raises(CuratorFailureError):
+            await curator._call_llm_batch(
+                candidates=[CandidateTask(title='A'), CandidateTask(title='B')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert curator._consecutive_zero_output_timeouts == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_batch_closes_already_open_breaker(self):
+        """(5) Deliberate semantic widening, pinned per this task's plan design
+        decision 3: a successful `_call_llm_batch` call closes an ALREADY-OPEN
+        breaker/cooldown too, not just the consecutive counter.
+
+        During a real bisect, `_call_llm_batch_with_fallback`'s two halves run
+        concurrently under asyncio.gather. A left half that bisected down to
+        size-1 curate() calls can open the breaker (two ZOTs, threshold=2)
+        while a sibling right-half batch call is still in flight; when that
+        sibling batch succeeds, this reset now cancels the cooldown the left
+        half just opened. Pre-task-4143 the batch path had no reset at all,
+        so it could never close an open breaker either — this is new
+        behaviour introduced by the fix, not a narrowing of pre-existing
+        behaviour. It is accepted rather than restricted to counter-only
+        because a completed LLM round-trip is still proof the backend isn't
+        wedged (see the plan's design-decision rationale)."""
+        config = _make_config()
+        config.curator.zero_output_breaker_threshold = 2
+        config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+        # Simulate a sibling bisect half having already tripped the breaker.
+        now = time.monotonic()
+        curator._record_zero_output_timeout(now)
+        curator._record_zero_output_timeout(now)
+        assert curator._consecutive_zero_output_timeouts == 2
+        assert curator._zero_output_breaker_open_until is not None
+
+        empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        healthy = self._healthy_batch_result(2)
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=healthy)):
+            decisions = await curator._call_llm_batch(
+                candidates=[CandidateTask(title='E'), CandidateTask(title='F')],
+                pools=[[], []],
+                pool_sizes_list=[empty_sizes, empty_sizes],
+                start=0.0,
+                project_id='p',
+                project_root='/x',
+            )
+
+        assert len(decisions) == 2
+        assert curator._consecutive_zero_output_timeouts == 0
+        assert curator._zero_output_breaker_open_until is None
 
 
 class TestCurateHappyPath:

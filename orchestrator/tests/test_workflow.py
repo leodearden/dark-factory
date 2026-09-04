@@ -2122,7 +2122,8 @@ class TestBoundaryTableWorkflow:
 
 # ---------------------------------------------------------------------------
 # TestHandleSoftCancelOutcome — unit tests for the 3-way decision in
-# _handle_soft_cancel: terminal → DONE, cancel_event set → SOFT_CANCELLED,
+# _handle_soft_cancel: terminal → that terminal (DONE / CANCELLED),
+# cancel_event set → SOFT_CANCELLED,
 # cancel cleared (spurious) → REQUEUED.
 # ---------------------------------------------------------------------------
 
@@ -2152,6 +2153,9 @@ class TestHandleSoftCancelOutcome:
 
         scheduler = MagicMock()
         scheduler.get_status = AsyncMock(return_value=status)
+        # Case 3 (spurious wakeup) re-pends the row before its REQUEUED exit
+        # as of task 3538 — a bare MagicMock attribute is not awaitable.
+        scheduler.set_task_status = AsyncMock()
 
         wf = TaskWorkflow(
             assignment=assignment,
@@ -2169,6 +2173,19 @@ class TestHandleSoftCancelOutcome:
         wf._cancel_event.set()  # even with event set, terminal wins
         outcome = await wf._handle_soft_cancel('merge')
         assert outcome == WorkflowOutcome.DONE
+
+    async def test_cancelled_status_returns_cancelled(self, tmp_path: Path):
+        """Scheduler status 'cancelled' → CANCELLED, not DONE (task 3538).
+
+        Case 1 reports the OBSERVED terminal rather than collapsing both
+        terminal statuses onto DONE: _OUTCOME_ALLOWED['done'] == {DONE}, so a
+        DONE exit here fails run()'s SM-2 assertion, and the completed tally
+        (outcome == DONE) counted a cancellation as a completion.
+        """
+        wf = self._make_wf(tmp_path, status='cancelled')
+        wf._cancel_event.set()  # terminal still wins
+        outcome = await wf._handle_soft_cancel('merge')
+        assert outcome == WorkflowOutcome.CANCELLED
 
     async def test_non_terminal_cancel_set_returns_soft_cancelled(self, tmp_path: Path):
         """Scheduler status non-terminal + cancel_event.is_set() → SOFT_CANCELLED."""

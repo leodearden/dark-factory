@@ -10,6 +10,7 @@ import subprocess
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
@@ -30,6 +31,8 @@ from orchestrator.git_ops import (
     CommitEffectProbe,
     GitOps,
     MergeParkContentionError,
+    MergeParkError,
+    MergeParkLockContentionError,
     MergeResult,
     TrainStackResult,
     WorktreeConflictError,
@@ -4218,6 +4221,166 @@ class TestFindMergeMarker:
 
 
 @pytest.mark.asyncio
+class TestMergeMarkerIndex:
+    """The per-main-sha marker index behind GitOps.find_merge_marker.
+
+    The index replaced a full-history ``git log --grep`` that ran once per
+    dispatch candidate (~2.0s x ~721 candidates = the entire ~14min scheduler
+    tick).  It is a PERFORMANCE change only, so the load-bearing property is
+    that :meth:`GitOps._lookup_merge_marker` and the retained direct scan
+    :meth:`GitOps._scan_merge_marker` agree on every input.
+
+    ``TestFindMergeMarker`` above already exercises the indexed path end-to-end
+    through real merges (including substring safety and most-recent-wins for a
+    twice-merged branch); these tests pin the index's own seams.
+    """
+
+    async def test_index_and_direct_scan_agree(self, git_ops: GitOps):
+        """Indexed lookup == direct scan, for both a hit and a miss."""
+        repo = git_ops.project_root
+        marker = _merge_subject('task/agree', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'agree.txt': 'x\n'}, marker)
+
+        assert await git_ops.find_merge_marker('task/agree') == sha
+        assert await git_ops._scan_merge_marker('task/agree') == sha
+
+        assert await git_ops.find_merge_marker('task/absent') is None
+        assert await git_ops._scan_merge_marker('task/absent') is None
+
+    async def test_marker_in_commit_BODY_is_found(self, git_ops: GitOps):
+        """A marker in the body, not the subject, must still be found.
+
+        ``git log --grep`` matches anywhere in the commit message, so the index
+        reads ``%B`` rather than ``%s``.  Measured on dark-factory's own main:
+        19 of 62,950 commits carry a marker only in the body, so a subject-only
+        index would silently change those verdicts.
+        """
+        repo = git_ops.project_root
+        marker = _merge_subject('task/body-only', git_ops.config.main_branch)
+        message = f'chore: record a landing\n\n{marker}\n'
+        sha = await _seed_on_main(repo, {'body.txt': 'x\n'}, message)
+
+        assert await git_ops.find_merge_marker('task/body-only') == sha
+        # Equivalence with the path it replaced.
+        assert await git_ops._scan_merge_marker('task/body-only') == sha
+
+    async def test_non_canonical_subject_stays_invisible(self, git_ops: GitOps):
+        """A hand-written ``Merge task/x: ...`` subject is not a marker.
+
+        dark-factory's main carries 46 such commits against 2,972 canonical
+        ones.  They do not match ``_merge_subject``'s ``into <main>`` shape and
+        are invisible to the grep, so the index must not surface them either.
+        """
+        repo = git_ops.project_root
+        await _seed_on_main(
+            repo, {'nc.txt': 'x\n'}, 'Merge task/noncanon: isolate the thing',
+        )
+
+        assert await git_ops.find_merge_marker('task/noncanon') is None
+        assert await git_ops._scan_merge_marker('task/noncanon') is None
+
+    async def test_index_rebuilds_when_main_advances(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A marker landing after the index was built is found on a later call."""
+        monkeypatch.setattr(
+            'orchestrator.git_ops._MERGE_MARKER_INDEX_RECHECK_SECS', 0.0,
+        )
+        repo = git_ops.project_root
+
+        # Builds an index at a main sha that has no such marker.
+        assert await git_ops.find_merge_marker('task/later') is None
+
+        marker = _merge_subject('task/later', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'later.txt': 'x\n'}, marker)
+
+        assert await git_ops.find_merge_marker('task/later') == sha
+
+    async def test_index_is_not_rebuilt_on_every_lookup(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Repeated lookups reuse one index — the whole point of the change.
+
+        Without this the fix would be a no-op: rebuilding per candidate is
+        strictly worse than the per-candidate grep it replaced.
+        """
+        builds: list[int] = []
+        real = GitOps._build_merge_marker_index
+
+        async def _counting(self: GitOps) -> dict[str, str] | None:
+            builds.append(1)
+            return await real(self)
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _counting)
+
+        for i in range(6):
+            assert await git_ops.find_merge_marker(f'task/miss-{i}') is None
+
+        assert len(builds) == 1, f'expected one index build, got {len(builds)}'
+
+    async def test_falls_back_to_scan_when_index_cannot_be_built(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A failed index build degrades to the direct scan, not to a wrong answer."""
+        repo = git_ops.project_root
+        marker = _merge_subject('task/fallback', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'fb.txt': 'x\n'}, marker)
+
+        async def _no_index(self: GitOps) -> dict[str, str] | None:
+            return None
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _no_index)
+
+        assert await git_ops.find_merge_marker('task/fallback') == sha
+        assert git_ops._merge_marker_index is None
+
+    async def test_transient_build_failure_is_not_cached(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A one-off build failure must not pin a marker-absent verdict.
+
+        Same rule as :data:`_EFFECT_PROBE_TRANSIENT_FAILURES`: caching a
+        subprocess failure would freeze a spurious answer for the life of the
+        current HEAD instead of self-healing on the next call.
+        """
+        monkeypatch.setattr(
+            'orchestrator.git_ops._MERGE_MARKER_INDEX_RECHECK_SECS', 0.0,
+        )
+        repo = git_ops.project_root
+        marker = _merge_subject('task/flaky', git_ops.config.main_branch)
+        sha = await _seed_on_main(repo, {'flaky.txt': 'x\n'}, marker)
+
+        real = GitOps._build_merge_marker_index
+        state = {'fail_next': True}
+
+        async def _flaky(self: GitOps) -> dict[str, str] | None:
+            if state['fail_next']:
+                state['fail_next'] = False
+                return None
+            return await real(self)
+
+        monkeypatch.setattr(GitOps, '_build_merge_marker_index', _flaky)
+
+        # First call: build fails, answered by the direct scan, nothing cached.
+        assert await git_ops.find_merge_marker('task/flaky') == sha
+        assert git_ops._merge_marker_index is None
+        # Second call: build succeeds and is cached — no failure was pinned.
+        assert await git_ops.find_merge_marker('task/flaky') == sha
+        assert git_ops._merge_marker_index is not None
+
+    async def test_pattern_is_derived_from_merge_subject(self, git_ops: GitOps):
+        """The index's regex tracks _merge_subject rather than a hard-coded format."""
+        from orchestrator.git_ops import _merge_marker_pattern
+
+        pattern = _merge_marker_pattern(git_ops.config.main_branch)
+        subject = _merge_subject('task/derived', git_ops.config.main_branch)
+        match = pattern.search(subject)
+
+        assert match is not None
+        assert match.group(1) == 'task/derived'
+
+
+@pytest.mark.asyncio
 class TestBranchContentInMain:
     """Real-git tests for GitOps.branch_content_in_main (task 2313).
 
@@ -6501,7 +6664,7 @@ class TestRunWorktreeMissing:
 
 
 async def _wait_for_child_pid(
-    pid_file: Path, *, timeout: float = 5.0, interval: float = 0.1,
+    pid_file: Path, *, timeout: float = 30.0, interval: float = 0.1,
 ) -> int:
     """Poll for *pid_file* to appear and return its pid.
 
@@ -6514,6 +6677,18 @@ async def _wait_for_child_pid(
     (task 3851). Mirrors the monotonic-deadline + ``timeout``/``interval``
     convention used by ``wait_for_pgid_file`` in
     test_laptop_warm_verify_boundary.py.
+
+    After task 4109, this poll is the sole remaining startup-timing bound in
+    ``TestRunCancellationReapsChild``. ``timeout`` here is a diagnostic
+    CEILING, not a deadline that must be beaten: the loop returns the
+    instant ``pid_file`` exists, so the value is paid only when the child
+    genuinely never starts. It is kept well under the 60s
+    ``timeout``/``timeout_method = "thread"`` cap configured in
+    ``orchestrator/pyproject.toml``, so a genuine never-started child surfaces
+    as this function's own ``pytest.fail`` message below, not a generic
+    thread-method kill. Contrast ``_assert_child_reaped``'s 5.0s, which is
+    deliberately left unwidened — that is an ASSERTION window (prompt
+    reaping is the property under test), not an arrange wait.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -6542,6 +6717,117 @@ async def _assert_child_reaped(
     pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
 
 
+# Cancellation timeout for the wait_for-shaped caller in
+# TestRunCancellationReapsChild. NOT a tuned threshold: the child sleeps 60s
+# AFTER publishing its pid, and _start_hung_child does not return until that
+# pid is on disk, so this value only has to be SHORTER than 60s (a ~1200x
+# margin). It fails safe — a slower box makes the timeout MORE likely to
+# fire, never less. Contrast the single 5.0s deadline this replaced, which
+# had to do both jobs at once and was tuned down to 0/40 misses on one box
+# rather than eliminated (task 4109).
+#
+# One narrow parent-side window is covered probabilistically rather than by
+# construction: the child's pid can land on disk while _run's own coroutine
+# is still inside create_subprocess_exec's pipe/transport setup rather than
+# the try block that owns kill+reap. That window is covered by
+# _wait_for_child_pid's 0.1s poll interval giving the parent time to reach
+# the owning await point before cancellation lands, not eliminated
+# structurally.
+_CANCEL_TIMEOUT = 0.05
+
+
+async def _start_hung_child(
+    pid_file: Path, *, startup_delay: float = 0.0,
+) -> tuple[asyncio.Task[tuple[int, str, str]], int]:
+    """Spawn a child that publishes its pid then sleeps, and confirm it started.
+
+    The single spawn-and-confirm arrange path shared by both tests in
+    ``TestRunCancellationReapsChild``. Returns only once the child has
+    PUBLISHED its pid, so the caller's cancellation is guaranteed to hit a
+    live child and no caller-side timeout has to cover interpreter startup
+    (task 4109). ``startup_delay`` exists so the contract guard can inject a
+    startup slower than any caller timeout.
+    """
+    script = (
+        'import os, time\n'
+        f'time.sleep({startup_delay!r})\n'
+        f"tmp = {str(pid_file)!r} + '.tmp'\n"
+        "open(tmp, 'w').write(str(os.getpid()))\n"
+        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
+        f"os.replace(tmp, {str(pid_file)!r})\n"
+        'time.sleep(60)\n'
+    )
+    task = asyncio.ensure_future(_run(['python3', '-c', script]))
+    try:
+        child_pid = await _wait_for_child_pid(pid_file)
+    except BaseException:
+        # Drive the cancellation to completion rather than just scheduling
+        # it: _wait_for_child_pid's pytest.fail() raises a BaseException, and
+        # if we returned immediately after task.cancel() the event loop would
+        # never get a turn to run _run's own except BaseException: proc.kill()
+        # + await proc.wait() cleanup. Without this await, a genuine
+        # never-started-child diagnostic would itself leak the orphan
+        # sleeping child this test class exists to catch (task 4109).
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+        raise
+    return task, child_pid
+
+
+@pytest.mark.asyncio
+class TestHungChildHelperContract:
+    """Contract for the ``_start_hung_child`` arrange helper.
+
+    Pins that the helper's arrange phase is deadline-independent: it waits
+    for the observable fact of the child's pid landing on disk, however long
+    interpreter startup takes, rather than racing a fixed clock (task 4109).
+    """
+
+    async def test_returns_only_after_pid_published_and_alive(
+        self, tmp_path: Path
+    ) -> None:
+        pid_file = tmp_path / 'child.pid'
+        # 4x _CANCEL_TIMEOUT (0.05s) — the discriminating leg. A helper that
+        # folded the spawn into any sub-second fixed deadline, or that
+        # returned before the pid was published, fails the assertions below
+        # here. This is the slow-interpreter-startup condition the old fixed
+        # 5.0s deadline could only cover probabilistically, applied
+        # deterministically instead of hoped for.
+        task, child_pid = await _start_hung_child(pid_file, startup_delay=0.2)
+
+        try:
+            assert pid_file.read_text().strip() == str(child_pid), (
+                f'pid_file contents {pid_file.read_text().strip()!r} do not '
+                f'match the pid the helper returned ({child_pid!r}) — the '
+                'returned pid must be the one the child actually published, '
+                'not a guess'
+            )
+
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                pytest.fail(
+                    f'child pid {child_pid} is not alive immediately after '
+                    '_start_hung_child returned — any cancellation the '
+                    'caller drives next would race a child that may already '
+                    'be gone'
+                )
+
+            assert not task.done(), (
+                'task is already done right after _start_hung_child '
+                'returned — the _run future must still be pending inside '
+                'await proc.communicate() so cancelling it exercises the '
+                'kill+reap path under test rather than an already-completed '
+                'no-op'
+            )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _assert_child_reaped(child_pid)
+
+
 @pytest.mark.asyncio
 class TestRunCancellationReapsChild:
     """``_run`` kills+reaps the spawned child on cancellation (task 2608).
@@ -6553,52 +6839,32 @@ class TestRunCancellationReapsChild:
     ``_run`` on timeout. Before the fix, the spawned child kept running as
     an orphan with its stdout/stderr pipes open, leaking a process + FDs on
     every scheduler sweep for a persistently-hung script.
+
+    Both tests below arrange through ``_start_hung_child``, which returns
+    only once the child has published its pid, so neither cancellation path
+    depends on interpreter-startup timing (task 4109).
     """
 
     async def test_timeout_kills_and_reaps_hung_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
-        # A child that records its own pid then sleeps far longer than the
-        # wait_for timeout below — simulates a persistently-hung script.
-        # The pid is written to a sibling .tmp file and atomically renamed
-        # into place so `pid_file` only ever appears fully written (task
-        # 3851) — see _wait_for_child_pid.
-        script = (
-            'import os, time, sys\n'
-            f"tmp = {str(pid_file)!r} + '.tmp'\n"
-            "open(tmp, 'w').write(str(os.getpid()))\n"
-            f"os.replace(tmp, {str(pid_file)!r})\n"
-            'time.sleep(60)\n'
-        )
-        # The deadline must outlast the child's interpreter startup, or the
-        # child is cancelled before it ever publishes its pid and the poll
-        # below fails as 'child never started'. Measured on a loaded box:
-        # 1.0s missed the pid in 39/40 trials, 3.0s in 12/40, 5.0s in 0/40.
-        # The child sleeps 60s, so a 5.0s deadline still cancels _run with the
-        # child very much alive — which is what this test is about.
+        task, child_pid = await _start_hung_child(pid_file)
+
+        # The wait_for-shaped caller this test exists to model
+        # (delivered_checks._run_script_check) — but driven against an
+        # ALREADY-STARTED future. The child is confirmed alive before the clock
+        # starts, so _CANCEL_TIMEOUT does not have to cover interpreter startup;
+        # it only has to be shorter than the child's 60s sleep. That removed a
+        # fixed 5.0s from every run and the load-sensitive miss with it (task 4109).
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                _run(['python3', '-c', script]), timeout=5.0
-            )
+            await asyncio.wait_for(task, timeout=_CANCEL_TIMEOUT)
 
-        # Wait for the child to have written its pid (should be near-instant).
-        child_pid = await _wait_for_child_pid(pid_file)
-
-        # The cancelled _run must have killed + reaped the child by now — no
-        # zombie, no orphan still sleeping.
+        # The cancelled _run must have killed + reaped the child — no zombie,
+        # no orphan still sleeping.
         await _assert_child_reaped(child_pid)
 
     async def test_cancelled_error_kills_and_reaps_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
-        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
-        script = (
-            'import os, time\n'
-            f"tmp = {str(pid_file)!r} + '.tmp'\n"
-            "open(tmp, 'w').write(str(os.getpid()))\n"
-            f"os.replace(tmp, {str(pid_file)!r})\n"
-            'time.sleep(60)\n'
-        )
-        task = asyncio.ensure_future(_run(['python3', '-c', script]))
-        child_pid = await _wait_for_child_pid(pid_file)
+        task, child_pid = await _start_hung_child(pid_file)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -13690,3 +13956,888 @@ class TestDisableSharedRepoAutoMaintenance:
         assert gc_val.strip() == '0'
         assert rc_mt == 0
         assert mt_val.strip() == 'false'
+
+
+# ---------------------------------------------------------------------------
+# task 3060: advance_main stands off from a FOREIGN project_root index.lock
+# ---------------------------------------------------------------------------
+
+
+class _MergedNotAdvanced(NamedTuple):
+    """The two already-narrowed fields the stand-off tests need off a merge.
+
+    ``MergeResult.merge_commit``/``merge_worktree`` are declared ``| None``,
+    and pyright does NOT carry a helper's internal ``assert ... is not None``
+    across the return boundary — every caller would see ``str | None`` again.
+    Handing back this pair narrows once, in the helper, instead of making all
+    six call sites re-assert.
+    """
+
+    merge_commit: str
+    merge_worktree: Path
+
+
+@pytest.mark.asyncio
+class TestAdvanceMainIndexLockStandoff:
+    """A concurrent `git commit --only <path>` in project_root holds
+    `.git/index.lock` for the ENTIRE pre-commit hook run (this repo's hook
+    runs pyright; CLAUDE.md instructs callers to pass `timeout: 300000`).
+
+    Verified on git 2.43.0: with the lock held and a dirty tracked file,
+    `git status --porcelain` and `git diff --name-only` both succeed (rc=0)
+    while `git stash create` exits **rc=1 with EMPTY stdout AND stderr** — so
+    advance_main's park detects WIP, fails to stash it, and returns
+    `stash_failed`, which is in `_HALT_ADVANCE_RESULTS` and halts the WHOLE
+    merge queue behind an L1 escalation. That is the recurring 2+/day halt.
+
+    The fix stands off: wait (bounded by
+    `git.merge_park_lock_grace_seconds`) for the foreign lock to clear, and
+    if it is still held at the deadline return the new transient
+    `park_lock_contended` code having touched NOTHING — no ref move, no tree
+    write, no park, and the foreign lock left strictly alone.
+    """
+
+    @staticmethod
+    async def _make_merge(
+        git_ops: GitOps, branch: str, filename: str,
+    ) -> _MergedNotAdvanced:
+        """Create a mergeable commit on *branch* and merge it, returning its
+        (merge_commit, merge_worktree) pair — merged, but not yet advanced."""
+        worktree_info = await git_ops.create_worktree(branch)
+        (worktree_info.path / filename).write_text('x = 1\n')
+        await git_ops.commit(worktree_info.path, f'Add {filename}')
+        merge_result = await git_ops.merge_to_main(worktree_info.path, branch)
+        assert merge_result.success
+        assert merge_result.merge_commit is not None
+        assert merge_result.merge_worktree is not None
+        return _MergedNotAdvanced(
+            merge_result.merge_commit, merge_result.merge_worktree,
+        )
+
+    async def test_held_index_lock_returns_park_lock_contended_not_stash_failed(
+        self, git_ops: GitOps,
+    ):
+        """The headline regression: a held foreign index.lock must produce the
+        transient `park_lock_contended`, NOT the queue-halting `stash_failed`.
+
+        No `_run` mocking — a REAL `.git/index.lock` file is created, exactly
+        what a concurrent `git commit --only` leaves behind, so the real
+        rc=1/empty-stderr `git stash create` failure is what the gate is
+        protecting against.
+        """
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        merge_result = await self._make_merge(
+            git_ops, 'lock-standoff', 'lock_standoff.py',
+        )
+
+        # Dirty a TRACKED file so the park would be armed.
+        dirty = '# dirty tracked edit racing a concurrent commit --only\n'
+        (git_ops.project_root / 'README.md').write_text(dirty)
+
+        # grace=0 == probe-only fail-fast. Direct attribute mutation is safe:
+        # GitConfig declares no model_config, so it is neither frozen nor
+        # validate_assignment.
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a foreign index.lock must be classified as transient contention, '
+            f'never as the queue-halting stash_failed; got {result.result!r}'
+        )
+
+        # (2) main did NOT move — nothing landed.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+        # (3) The dirty edit is untouched: advance_main did NOT run
+        # `read-tree -u --reset`, which would have clobbered the concurrent
+        # commit's staged/working state.
+        assert (git_ops.project_root / 'README.md').read_text() == dirty
+
+    async def test_foreign_lock_file_is_never_deleted(self, git_ops: GitOps):
+        """We stand off; we never break another process's lock.
+
+        Deleting a live `git commit --only`'s index.lock would corrupt the
+        in-flight commit — the whole point of standing off is that when a
+        foreign process owns the index, the only safe action is to touch
+        nothing and come back later.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-untouched', 'lock_untouched.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty\n')
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('sentinel-contents')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+            assert result.result == 'park_lock_contended'
+            assert lock_path.exists(), (
+                'advance_main must never delete a foreign index.lock'
+            )
+            assert lock_path.read_text() == 'sentinel-contents', (
+                'the foreign lock file must be left byte-identical'
+            )
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+    async def test_lock_clearing_during_grace_lets_the_merge_land(
+        self, git_ops: GitOps,
+    ):
+        """The transient case must LAND, not merely be classified.
+
+        Simulates the ordinary docs-direct-commit-on-main: the lock is held
+        when advance_main starts and is released partway through, as the
+        concurrent `git commit --only` finishes its pre-commit hook. Once
+        clear, every downstream step must be byte-identical to today — the
+        park/apply round-trip runs normally and the merge lands.
+
+        Deliberately asserts NO elapsed-wall-clock bound: the contract is
+        "waits until clear, then proceeds", not a latency figure.
+
+        The release is triggered by OBSERVATION COUNT, not by a sleep. A
+        pass-through spy on `_index_lock_state` unlinks the REAL lock file
+        after the gate has observed it held twice, so the waiter is proven
+        to have looped at least once and the test cannot flake on how long
+        advance_main's preamble happens to take. Everything the spy reports
+        is the real on-disk state; only the moment of the (real) unlink is
+        made deterministic.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-clears', 'lock_clears.py',
+        )
+
+        wip = '# WIP that must survive the stand-off\n'
+        (git_ops.project_root / 'README.md').write_text(wip)
+
+        git_ops.config.merge_park_lock_grace_seconds = 5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+
+        original_state = git_ops._index_lock_state
+        observations: list[bool] = []
+
+        async def spy_index_lock_state():
+            present, age = await original_state()
+            observations.append(present)
+            # Release on the 2nd held observation: the waiter has polled at
+            # least once, so this genuinely exercises the wait loop.
+            if present and sum(observations) >= 2:
+                with contextlib.suppress(FileNotFoundError):
+                    lock_path.unlink()
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=spy_index_lock_state,
+            ):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert sum(observations) >= 2, (
+            'the gate must have observed the lock HELD and then polled again '
+            f'— observations: {observations!r}'
+        )
+
+        # (1) It landed.
+        assert result.result == 'advanced', (
+            'once the foreign lock clears, the advance must proceed exactly '
+            f'as it does today; got {result.result!r}'
+        )
+
+        # (2) main moved to the merge commit.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_after.strip() == merge_result.merge_commit
+
+        # (3) The park/apply round-trip ran normally — WIP is back.
+        assert (git_ops.project_root / 'README.md').read_text() == wip
+
+        # (4) The park ref was cleaned up.
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, f'expected {MERGE_PARK_REF} to be absent after advance'
+
+    async def test_clean_tree_race_is_gated_too(self, git_ops: GitOps):
+        """The stand-off must key on `is_on_main`, NOT on `dirty_tracked`.
+
+        With a CLEAN project_root tree the code skips the park entirely,
+        advances the ref, and then syncs the working tree with
+        `git read-tree -u --reset HEAD`. That sync's failure is only LOGGED
+        while the outcome still reports 'advanced' — so under a foreign lock
+        main LANDS with a stale project_root tree, and the NEXT advance then
+        reads the whole old-main→new-main delta as "dirty" WIP, cascading
+        into wip_overlap/park damage.
+
+        A gate placed inside `if dirty_tracked:` would leave that hole wide
+        open, because no park is attempted on this path at all.
+        """
+        _, main_before, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+
+        merge_result = await self._make_merge(
+            git_ops, 'clean-tree-race', 'clean_tree_race.py',
+        )
+
+        # Deliberately leave project_root free of TRACKED modifications, so
+        # advance_main's `dirty_tracked` set is empty and no park is ever
+        # attempted. (An untracked-only `?? .worktrees/` entry is expected
+        # here and deliberately does NOT arm the park — untracked entries
+        # survive read-tree without conflict.)
+        _, unstaged, _ = await _run(
+            ['git', 'diff', '--name-only'], cwd=git_ops.project_root,
+        )
+        _, staged, _ = await _run(
+            ['git', 'diff', '--name-only', '--cached'], cwd=git_ops.project_root,
+        )
+        assert unstaged.strip() == '' and staged.strip() == '', (
+            'this test requires NO tracked modifications in project_root; got '
+            f'unstaged={unstaged!r} staged={staged!r}'
+        )
+
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a foreign index lock must gate the CLEAN-tree path too — the '
+            'post-advance read-tree sync writes project_root just as the '
+            f'park does; got {result.result!r}'
+        )
+
+        # main must NOT have moved: landing it here is precisely the silent
+        # stale-tree failure described above.
+        _, main_after, _ = await _run(
+            ['git', 'rev-parse', 'main'], cwd=git_ops.project_root,
+        )
+        assert main_before.strip() == main_after.strip()
+
+    async def test_lock_appearing_after_the_gate_is_still_transient(
+        self, git_ops: GitOps,
+    ):
+        """TOCTOU: a lock that appears BETWEEN the gate and `git stash create`
+        must still be classified as transient, not halt the queue.
+
+        The gate is a probe, so the window it cannot cover is the one where a
+        concurrent `git commit --only` starts right after the probe. The park
+        itself must therefore re-probe on failure and raise
+        MergeParkLockContentionError rather than the generic MergeParkError.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-toctou', 'lock_toctou.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty during toctou\n')
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                # The concurrent `git commit --only` grabs the index right
+                # after the gate probed it clear. Reproduce git 2.43's real
+                # signature: rc=1 with EMPTY stdout AND stderr.
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with patch('orchestrator.git_ops._run', side_effect=mock_run):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended', (
+            'a lock appearing inside the TOCTOU window must still be '
+            f'transient, never a queue halt; got {result.result!r}'
+        )
+
+    async def test_park_raises_lock_contention_error_when_lock_present(
+        self, git_ops: GitOps,
+    ):
+        """_park_wip_on_private_ref itself raises the subclass, so the
+        classification lives at the source rather than being re-derived by
+        every caller."""
+        (git_ops.project_root / 'README.md').write_text('# dirty for park\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                pytest.raises(MergeParkLockContentionError),
+            ):
+                await git_ops._park_wip_on_private_ref('lbl')
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+
+        # It must remain a MergeParkError subclass so any existing
+        # `except MergeParkError` handler still catches it.
+        assert issubclass(MergeParkLockContentionError, MergeParkError)
+
+    async def test_read_tree_failure_under_a_lock_is_NOT_transient(
+        self, git_ops: GitOps,
+    ):
+        """A read-tree failure must halt loudly even with a lock present.
+
+        read-tree runs AFTER `update-ref` has already created
+        MERGE_PARK_REF.  Classifying it as transient lock contention would
+        return a per-task 'park_lock_contended' that neither deletes the ref
+        nor applies it, leaving MERGE_PARK_REF dangling — and the NEXT
+        advance's single-flight guard would raise MergeParkContentionError
+        -> 'stash_failed', halting the WHOLE queue.  That converts a
+        transient race into a guaranteed later halt, so this site keeps the
+        generic MergeParkError (WIP safe on the ref, recovered this cycle).
+        """
+        (git_ops.project_root / 'README.md').write_text('# dirty for read-tree\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'read-tree', '-u']:
+                # A foreign `git commit --only` grabs the index between the
+                # successful update-ref and the tree clean.
+                lock_path.write_text('')
+                return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                pytest.raises(MergeParkError) as excinfo,
+            ):
+                await git_ops._park_wip_on_private_ref('lbl')
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+
+        assert not isinstance(excinfo.value, MergeParkLockContentionError), (
+            'the post-update-ref read-tree failure must NOT be classified as '
+            'transient lock contention — that leaves MERGE_PARK_REF dangling '
+            f'and halts the queue on the NEXT advance; got {excinfo.value!r}'
+        )
+
+        # The WIP really is preserved on the ref, which is what justifies
+        # halting loudly here rather than pretending nothing happened.
+        rc, sha, _ = await _run(
+            ['git', 'rev-parse', '--verify', '--quiet', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0 and sha.strip(), (
+            'MERGE_PARK_REF must still hold the parked WIP after a read-tree '
+            'failure, so the halt is recoverable'
+        )
+        await _run(
+            ['git', 'update-ref', '-d', MERGE_PARK_REF],
+            cwd=git_ops.project_root,
+        )
+
+    async def test_stash_failure_without_a_lock_still_halts(self, git_ops: GitOps):
+        """NON-REGRESSION: a genuine park failure with NO index.lock present
+        keeps its existing loud queue-halt semantics.
+
+        The fix must narrow `stash_failed` to exactly the shared-hygiene
+        fault it was meant to report — not weaken it.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'stash-fail-nolock', 'stash_fail_nolock.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty tracked edit\n')
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        assert not lock_path.exists(), 'this test requires NO index.lock present'
+
+        original_run = _run
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'stash', 'create']:
+                return (1, '', 'fatal: cannot stash changes')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        with patch('orchestrator.git_ops._run', side_effect=mock_run):
+            result = await git_ops.advance_main(merge_result.merge_commit)
+
+        await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'stash_failed', (
+            'a park failure with no lock present must keep halting the queue; '
+            f'got {result.result!r}'
+        )
+        assert git_ops._last_stash_dirty_files == ['README.md'], (
+            'the stash_failed escalation must still name the dirty tracked '
+            f'file(s); got {getattr(git_ops, "_last_stash_dirty_files", "<unset>")!r}'
+        )
+
+    async def test_side_channel_carries_the_age_seen_BEFORE_the_standoff(
+        self, git_ops: GitOps,
+    ):
+        """The side channel must report the age observed at the FIRST probe.
+
+        `_await_index_lock_clear` probes the lock once before waiting — the
+        only observation that predates the stand-off — and today DISCARDS it,
+        so the gate re-probes afterwards and reports
+        `age_seconds == initial_age + waited + epsilon`.  With grace=300 a
+        live `git commit --only` that started 2s before the advance reports
+        302s, and an hour-old crashed-git leftover reports 3900s: both exceed
+        `waited`, so a downstream staleness test keyed on the post-wait age
+        cannot discriminate them at all.  Only an age measured BEFORE the wait
+        carries the information.
+
+        LIVE-COMMIT SHAPE: a lock created moments ago, whose holder simply
+        outlives the grace.  Its reported age must exclude the stand-off.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-initial-age', 'lock_initial_age.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty for initial age\n')
+
+        # A short-but-real grace so the stand-off genuinely runs and the two
+        # probes are separated by a measurable interval.
+        git_ops.config.merge_park_lock_grace_seconds = 1.5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')  # freshly created => initial age ~0
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+
+        info = git_ops._last_park_lock_info
+        assert 'initial_age_seconds' in info, (
+            'the pre-wait observation must reach the side channel; got keys '
+            f'{sorted(info)!r}'
+        )
+        # Deliberately NOT an absolute bound on `initial_age_seconds`.  The
+        # first probe sits behind advance_main's whole preamble (merge-base,
+        # rev-parse, unmerged-state and symbolic-ref subprocesses), so on a
+        # loaded box — 16 xdist workers — a lock created "moments ago" can
+        # legitimately read >1s old at that probe.  Bounding it by a constant
+        # measures the preamble, not the behaviour, and flakes.
+        #
+        # The load-independent fact: `age_seconds` and `initial_age_seconds`
+        # come from the SAME `time.time() - mtime` expression over the SAME
+        # (never rewritten) mtime, so their difference is exactly the interval
+        # between the two probes — and the entire stand-off lies inside it.
+        # The bug this pins (re-probing AFTER the wait and calling the result
+        # "initial") collapses that difference to ~0, whatever the load.  The
+        # epsilon absorbs time.time()/time.monotonic() source skew only.
+        assert (
+            info['age_seconds'] - info['initial_age_seconds']
+            >= info['waited_seconds'] - 0.05
+        ), (
+            'the first-probe age must predate the stand-off, so the post-wait '
+            're-probe must be older by at least the wait; got '
+            f'initial={info["initial_age_seconds"]!r} '
+            f'age={info["age_seconds"]!r} '
+            f'waited={info["waited_seconds"]!r}'
+        )
+        assert info['grace_seconds'] == 1.5, (
+            'the grace actually applied must travel in the side channel so '
+            'the mapper stays a pure function of it; got '
+            f'{info.get("grace_seconds", "<unset>")!r}'
+        )
+
+    async def test_side_channel_reports_a_crashed_leftover_as_old(
+        self, git_ops: GitOps,
+    ):
+        """CRASHED-LEFTOVER SHAPE: a lock already ancient at the first probe.
+
+        This is the ONLY shape for which destructive `rm -f` recovery advice
+        is defensible, so the side channel must make it distinguishable from
+        the live-commit shape above.  grace=0 (probe-only fail-fast) keeps the
+        test from sleeping.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'lock-stale-age', 'lock_stale_age.py',
+        )
+        (git_ops.project_root / 'README.md').write_text('# dirty for stale age\n')
+
+        git_ops.config.merge_park_lock_grace_seconds = 0
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        backdated = time.time() - 1000
+        os.utime(lock_path, (backdated, backdated))
+        try:
+            result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        assert result.result == 'park_lock_contended'
+
+        info = git_ops._last_park_lock_info
+        assert info['initial_age_seconds'] >= 900, (
+            'a backdated lock must be reported as OLD at the first probe; got '
+            f'{info.get("initial_age_seconds", "<unset>")!r}'
+        )
+        assert info['grace_seconds'] == 0, (
+            'grace=0 must travel through as-is — the fail-fast off-switch is '
+            'still a real, comparable grace downstream; got '
+            f'{info.get("grace_seconds", "<unset>")!r}'
+        )
+
+    async def test_post_advance_sync_failure_under_a_lock_is_retried(
+        self, git_ops: GitOps,
+    ):
+        """The RESIDUAL TOCTOU window at the post-advance tree sync.
+
+        The pre-snapshot gate is a PROBE, so a foreign `git commit --only`
+        can still grab the index between it and the post-advance
+        `read-tree -u --reset HEAD` — and on the CLEAN-tree path there is no
+        park, hence no mid-park re-probe to catch it.  Left alone that is the
+        exact silent failure the gate exists to prevent: the sync's failure is
+        only LOGGED while the outcome still reports 'advanced', so main lands
+        with a stale project_root tree and the NEXT advance reads the whole
+        old-main->new-main delta as "dirty" WIP.
+
+        Returning 'park_lock_contended' here would be a LIE (update-ref has
+        already run), so the contract is a bounded stand-off and a RETRY of
+        the sync in place.
+        """
+        merge_result = await self._make_merge(
+            git_ops, 'sync-retry', 'sync_retry.py',
+        )
+        synced_file = git_ops.project_root / 'sync_retry.py'
+        assert not synced_file.exists(), (
+            'the merge commit is not in project_root\'s tree until the '
+            'post-advance sync runs — that is what this test measures'
+        )
+
+        git_ops.config.merge_park_lock_grace_seconds = 5
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        original_run = _run
+        read_tree_calls: list[int] = []
+
+        async def mock_run(cmd, cwd=None, **kwargs):
+            if cmd[:3] == ['git', 'read-tree', '-u'] and cwd == git_ops.project_root:
+                read_tree_calls.append(1)
+                if len(read_tree_calls) == 1:
+                    # A foreign `git commit --only` grabbed the index in the
+                    # window the gate cannot cover. git 2.43's real signature:
+                    # rc=1 with EMPTY stdout AND stderr.
+                    lock_path.write_text('')
+                    return (1, '', '')
+            return await original_run(cmd, cwd=cwd, **kwargs)
+
+        original_state = git_ops._index_lock_state
+        held_observations: list[bool] = []
+
+        async def spy_index_lock_state():
+            present, age = await original_state()
+            held_observations.append(present)
+            # Release once the stand-off has actually observed it held, so the
+            # retry is reached without the test depending on wall-clock.
+            if present:
+                with contextlib.suppress(FileNotFoundError):
+                    lock_path.unlink()
+            return (present, age)
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=mock_run),
+                patch.object(
+                    git_ops, '_index_lock_state',
+                    side_effect=spy_index_lock_state,
+                ),
+            ):
+                result = await git_ops.advance_main(merge_result.merge_commit)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            await git_ops.cleanup_merge_worktree(merge_result.merge_worktree)
+
+        # (1) main landed — this site must NOT claim transient contention.
+        assert result.result == 'advanced', (
+            'update-ref already ran, so the outcome must stay \'advanced\'; '
+            f'got {result.result!r}'
+        )
+
+        # (2) The sync was RETRIED, not merely logged and abandoned.
+        assert len(read_tree_calls) >= 2, (
+            'a read-tree failure with a foreign lock held must be retried '
+            f'after standing off; got {len(read_tree_calls)} call(s)'
+        )
+        assert any(held_observations), (
+            'the retry path must have observed the foreign lock held; got '
+            f'{held_observations!r}'
+        )
+
+        # (3) The tree really is in sync with the new HEAD — the whole point.
+        assert synced_file.exists(), (
+            'project_root\'s working tree must match the advanced HEAD, or '
+            'the NEXT advance reads the delta as dirty WIP'
+        )
+
+    async def test_already_stale_lock_skips_the_standoff(self, git_ops: GitOps):
+        """A crashed-git leftover must not cost the queue the whole grace.
+
+        `_map_advance_failure` declares staleness on the PRE-wait age against
+        `max(grace, _INDEX_LOCK_STALE_FLOOR_S)`.  Once that bar is cleared no
+        amount of waiting can change the verdict, so waiting only burns the
+        full grace in the SERIALIZED merge worker for EVERY queued task until
+        an operator clears the file — a slow-motion version of the stall this
+        gate exists to remove.
+
+        Asserted by PROBE COUNT, not elapsed time: a short-circuit takes the
+        single pre-wait probe and nothing more.
+        """
+        from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        backdated = time.time() - (_INDEX_LOCK_STALE_FLOOR_S + 1000)
+        os.utime(lock_path, (backdated, backdated))
+
+        original_state = git_ops._index_lock_state
+        probes: list[bool] = []
+
+        async def counting_state():
+            present, age = await original_state()
+            probes.append(present)
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=counting_state,
+            ):
+                cleared, waited, initial_age = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=60.0, context='stale-shortcircuit',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        assert cleared is False
+        assert waited == 0.0, (
+            'an already-stale lock must not be waited on at all; got '
+            f'waited={waited!r}'
+        )
+        assert initial_age > _INDEX_LOCK_STALE_FLOOR_S
+        assert len(probes) == 1, (
+            'the short-circuit must take exactly the pre-wait probe — more '
+            f'probes mean the poll loop ran anyway; got {probes!r}'
+        )
+
+    async def test_a_young_lock_is_still_waited_on(self, git_ops: GitOps):
+        """The stale short-circuit must not over-fire.
+
+        The ordinary docs-direct-commit-on-main window is a YOUNG lock, and
+        that is precisely the case the stand-off exists for — it must still
+        get its full budget.  Contrast the test above.
+        """
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')  # fresh => far below the staleness floor
+
+        original_state = git_ops._index_lock_state
+        probes: list[bool] = []
+
+        async def counting_state():
+            present, age = await original_state()
+            probes.append(present)
+            return (present, age)
+
+        try:
+            with patch.object(
+                git_ops, '_index_lock_state', side_effect=counting_state,
+            ):
+                cleared, _waited, _initial = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=1.5, context='young-lock',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        assert cleared is False
+        assert len(probes) >= 2, (
+            'a young lock must be POLLED, not short-circuited — the whole '
+            f'point of the stand-off; got {probes!r}'
+        )
+
+    async def test_index_lock_path_resolves_a_dot_git_FILE_layout(
+        self, git_ops: GitOps,
+    ):
+        """`_index_lock_path`'s fallback branch — the only one that forks.
+
+        A linked worktree (and a submodule) has a `.git` FILE, not a
+        directory, so the `<project_root>/.git/index.lock` fast path is wrong
+        there: the real lock lives in the LINKED git-dir
+        (`<main-git-dir>/worktrees/<name>/index.lock`).  A wrong answer here
+        degrades silently to "no lock detected", i.e. straight back to the
+        halting behaviour this task removes — so the branch that resolves it
+        via `rev-parse --absolute-git-dir` needs its own pin.
+        """
+        worktree_info = await git_ops.create_worktree('dot-git-file-layout')
+        wt_path = worktree_info.path
+        try:
+            assert (wt_path / '.git').is_file(), (
+                'this test requires the .git-FILE layout a linked worktree '
+                'produces; got a directory'
+            )
+
+            linked = GitOps(git_ops.config, wt_path)
+            resolved = await linked._index_lock_path()
+
+            # (1) The fast path was NOT taken — that is the bug being pinned.
+            assert resolved != wt_path / '.git' / 'index.lock', (
+                'a .git FILE is not a directory to hang index.lock off; got '
+                f'{resolved}'
+            )
+            # (2) It is the linked git-dir git itself reports.
+            _, abs_git_dir, _ = await _run(
+                ['git', 'rev-parse', '--absolute-git-dir'], cwd=wt_path,
+            )
+            assert resolved == Path(abs_git_dir.strip()) / 'index.lock'
+            assert 'worktrees' in resolved.parts, (
+                f'expected a linked-worktree git-dir; got {resolved}'
+            )
+            assert resolved.parent.is_dir()
+
+            # (3) End-to-end: a lock written THERE is actually detected.
+            assert await linked._index_lock_state() == (False, 0.0)
+            resolved.write_text('')
+            try:
+                present, age = await linked._index_lock_state()
+                assert present is True, (
+                    'a lock in the linked git-dir must be detected, or the '
+                    'stand-off silently degrades to today\'s halt'
+                )
+                assert age >= 0.0
+            finally:
+                resolved.unlink()
+
+            # (4) Memoised — the git-dir cannot move under a live GitOps.
+            assert await linked._index_lock_path() == resolved
+        finally:
+            await git_ops.cleanup_worktree(wt_path, 'dot-git-file-layout')
+
+    async def test_standoff_deadline_is_monotonic_and_re_announces(
+        self, git_ops: GitOps, caplog,
+    ):
+        """The stand-off's budget is monotonic, and a long wait is LOUD.
+
+        Two behaviours with no wall-clock cost, pinned with a fake clock:
+
+        (a) The deadline keys on `time.monotonic()`, so a wall-clock
+            adjustment mid-wait can neither extend nor truncate the budget.
+            The fake wall clock below jumps an HOUR BACKWARD on every poll;
+            a `time.time()`-keyed deadline would never expire.
+        (b) A wait that outlives `_INDEX_LOCK_WARN_INTERVAL_S` re-announces
+            itself, so a stand-off is never a silent stall.
+        """
+        from orchestrator.git_ops import (
+            _INDEX_LOCK_POLL_INTERVAL_S,
+            _INDEX_LOCK_WARN_INTERVAL_S,
+        )
+
+        lock_path = git_ops.project_root / '.git' / 'index.lock'
+        lock_path.write_text('')
+        # Warm the git-dir memo BEFORE the clock is faked, so the wait itself
+        # touches nothing but `stat` and the (faked) clock.
+        await git_ops._index_lock_path()
+
+        budget = 3 * _INDEX_LOCK_WARN_INTERVAL_S
+
+        class _FakeClock:
+            """Monotonic under our control; wall clock deliberately hostile."""
+
+            def __init__(self) -> None:
+                self.mono = 1_000.0
+                self.wall = time.time()
+
+            def monotonic(self) -> float:
+                return self.mono
+
+            def time(self) -> float:
+                return self.wall
+
+        clock = _FakeClock()
+
+        async def fake_sleep(secs):
+            clock.mono += max(0.0, secs)
+            clock.wall -= 3600.0  # hostile wall-clock adjustment
+
+        class _FakeAsyncio:
+            def __init__(self, sleep) -> None:
+                self.sleep = sleep
+
+        try:
+            with (
+                caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+                patch('orchestrator.git_ops.time', clock),
+                patch('orchestrator.git_ops.asyncio', _FakeAsyncio(fake_sleep)),
+            ):
+                cleared, waited, _initial = (
+                    await git_ops._await_index_lock_clear(
+                        timeout_s=budget, context='fake-clock',
+                    )
+                )
+        finally:
+            lock_path.unlink()
+
+        # (a) It gave up at its own monotonic deadline, despite the wall clock
+        # running backwards by an hour per poll.
+        assert cleared is False
+        assert waited == pytest.approx(budget, abs=_INDEX_LOCK_POLL_INTERVAL_S), (
+            'the budget must be measured on the MONOTONIC clock; got '
+            f'waited={waited!r} for a {budget}s budget'
+        )
+
+        # (b) The wait re-announced itself rather than stalling silently.
+        still_waiting = [
+            r for r in caplog.records if 'Still waiting' in r.message
+        ]
+        assert len(still_waiting) >= 2, (
+            'a wait spanning several warn intervals must re-announce itself; '
+            f'got {[r.message for r in caplog.records]!r}'
+        )

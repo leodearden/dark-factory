@@ -222,23 +222,6 @@ _ALLOWED_RENAMERS = {
         'already-current skip). The EXDEV branch delegates to _archive_one '
         'when the rename is physically impossible, so the cross-device case '
         'is handled by the entry above rather than by a second writer here.',
-    ('orchestrator/src/orchestrator/mcp/plan_tools.py', '_atomic_write_plan'):
-        'Cannot delegate without losing three semantics atomic_write_text does '
-        'not offer. (1) SYMLINK RESOLUTION: it writes to os.path.realpath(path) '
-        'and refuses a dangling link; atomic_write_text replaces the path as '
-        'given, so an os.replace onto the lane plan.json symlink would swap the '
-        'LINK for a regular file and re-fork the lane/meta-root copies (the '
-        'esc-5205-9 divergence that symlink exists to prevent). (2) PRE-REPLACE '
-        'VERIFICATION: _verify_plan_json re-parses the TEMP file after the '
-        'chmod and before the swap — a deliberately named seam a test injects '
-        'into, at the last reversible checkpoint; atomic_write_text has no '
-        'pre-replace inspection hook, and verifying after the swap is backwards. '
-        '(3) FSYNC ASYMMETRY: it fsyncs the temp file but NOT the parent dir, '
-        'while atomic_write_text does both under fsync=True and neither under '
-        'fsync=False, so no setting reproduces it. It also funnels every '
-        'failure into PlanWriteError naming both the original and resolved '
-        'paths. A follow-up may widen atomic_write_text; it must not be forced '
-        'through the current signature.',
     # --- Sites surfaced by task 3388's widening of _SRC_TREES to six trees.
     # Each reason below was written from READING that site, not pattern-matched
     # from a neighbour: an entry whose reason came from the entry above it is
@@ -375,14 +358,76 @@ _ALLOWED_RENAMERS = {
         'defined once for every watchdog state file rather than per call '
         'site), so the duplication here is one deep, not per-writer.',
     ('scripts/sweep_toolcall_markup.py', 'write_repaired'):
-        'PRE-REPLACE VERIFICATION SEAM — the same seam already recorded above '
-        'for plan_tools._atomic_write_plan, whose ordering this function\'s '
-        'docstring says it follows, so that argument is not restated. Between '
-        'reading and swapping it RE-READS the target and confirms it is still '
+        'PRE-REPLACE VERIFICATION SEAM. This entry USED to cite '
+        'plan_tools._atomic_write_plan for that argument instead of making it. '
+        'Task 3957 step-8 deleted that writer — its plan.json duty consolidated '
+        'into orchestrator.artifacts.TaskArtifacts._write_json, which DELEGATES '
+        'to atomic_write_text and is therefore correctly absent from this '
+        'allowlist — and this function\'s docstring now names _write_json as '
+        'the ordering it follows. So the argument is STATED here rather than '
+        'cited: between reading and swapping it RE-READS the target and '
+        'confirms it is still '
         'the bytes the repair was computed from, as late as possible before '
         'the os.replace, returning a WriteFailure (REASON_CHANGED_UNDER_US) '
         'rather than silently reverting somebody else\'s concurrent write. '
         'atomic_write_text has no pre-replace inspection hook.',
+    # --- Sites that landed on main WHILE task 3388 was in flight, surfaced by
+    # merging main back in.  Same policy as the "landed on main AFTER this task
+    # branched" block above: each was triaged by READING it, none is "out of
+    # scope" boilerplate, and none was migrated here — a source migration
+    # folded into a merge resolution is an unreviewed change arriving on the
+    # one path nobody diffs, which is the opposite of what this guard is for.
+    ('scripts/render_dashboard_unit.py', 'main'):
+        'STDLIB-ONLY STANDALONE ENTRYPOINT — the class of dashboard-watchdog.'
+        'save_state and orchestrator-watchdog._atomic_write_json above, and of '
+        'session_registry._atomic_write_text before them, but under a HARDER '
+        'constraint than any of them: setup-host.sh invokes it as bare '
+        '``python3 <abs path>`` (never ``uv run``) while BOOTSTRAPPING the '
+        'host, so at that moment there is no venv and no workspace install for '
+        '``from shared import safe_io`` to resolve against. Verified by '
+        'reading its imports rather than assumed: stdlib only, plus the '
+        'sibling script systemd_unit_parity put on sys.path by hand. Its own '
+        'docstring argues the atomicity — a render that fails part-way must '
+        'leave this host\'s existing unit BYTE-UNCHANGED, because "stale but '
+        'working" is recoverable and "no unit at all" is not. Note the '
+        'destination-mode carry across the replace is NOT the barrier: '
+        'atomic_write_text takes mode=. Importability is the whole barrier, so '
+        'if bootstrap ever gains the workspace this becomes a migration '
+        'candidate rather than an exception.',
+    ('scripts/census_tagger_debris.py', '_atomic_write_text'):
+        'Out of task 3223 enumerated scope — but note what this entry COSTS, '
+        'in the same shape as bake_off_storage_shape._atomic_write_text above '
+        'and for the same reason, because leaving it implicit would hide a '
+        'second silenced assertion behind an allowlist line. This helper '
+        'carries the CONSOLIDATED NAME over a fully inlined mkstemp + '
+        'os.replace body, and test_atomic_write_text_helpers_only_delegate '
+        '``continue``s on anything listed here, so this entry also silences '
+        'the delegate check for this name — the SECOND such purchase against a '
+        'check that only ever examined three names. It is not an independent '
+        'reinvention either: its docstring says outright that it "Mirrors '
+        'fused-memory/scripts/bake_off_storage_shape.py::_atomic_write_text", '
+        'i.e. it is the copy-from-a-neighbour habit the memory_eval entries '
+        'above flag, one generation on and now out of fused-memory/scripts '
+        'into scripts/. Migrate it WITH bake_off, not separately, or the habit '
+        'survives the migration that was supposed to end it.',
+    ('scripts/tests/test_restart_all_orchestrators.py', '_write_heartbeat'):
+        'TEST FIXTURE, and the FIRST test-file entry in this allowlist: '
+        '``scripts/tests`` sits inside the ``scripts`` scan root, so 3388\'s '
+        'widening made the guard reach test scaffolding as well as writers. '
+        'This is not a regrown artifact writer — it SIMULATES AN EXTERNAL '
+        'PRODUCER, deliberately mirroring the mktemp + ``mv -f`` idiom of the '
+        'shell function under test (restart-all-orchestrators.sh::'
+        'stamp_fleet_deploy_clock) so the fixture publishes the heartbeat the '
+        'way production does. The atomicity is load-bearing to the test rather '
+        'than decorative: _heartbeat_timeline calls this from a '
+        'threading.Timer WHILE the spawned script polls the same file, and '
+        'drain_check._read_heartbeat turns the ValueError from a partially '
+        'written file into "absent" — a verdict no timeline scheduled, i.e. a '
+        'flake. Stated plainly: there is NO semantic here beyond '
+        'atomic_write_text\'s reach, so this is a migration candidate, held '
+        'back only because whether the fixture should keep mirroring the shell '
+        'idiom is a test-design call for that follow-up and not for a merge '
+        'resolution.',
 }
 
 
@@ -807,12 +852,17 @@ class TestNoRegrownAtomicWriters:
         shared/src/shared/safe_io.py::atomic_write_text is the blessed
         implementation (skipped by path), and session_registry's and
         bake_off_storage_shape's copies are allowlisted exceptions (skipped by
-        _ALLOWED_RENAMERS).  Re-run the test to learn today's numbers.
+        _ALLOWED_RENAMERS).  Merging main back in then added a SEVENTH name and
+        a THIRD such exception, scripts/census_tagger_debris.py::
+        _atomic_write_text — a site that arrived while this task was in flight,
+        so the checked-to-skipped ratio moved the wrong way again without this
+        test changing.  Re-run the test to learn today's numbers.
 
         THAT NARROWNESS IS THE REASON FOR THE FENCE BELOW.  Three of six is
         already thin, the widening to six trees added zero delegate coverage,
-        and one allowlist entry (bake_off) deliberately removed one — so the
-        trend is downward and every future entry costs another name.  The
+        and two allowlist entries (bake_off, then census_tagger_debris on the
+        merge) each deliberately removed one — so the trend is downward,
+        observed twice, and every future entry costs another name.  The
         docstring above USED to be the only thing recording that; it is now
         asserted, against a named control, so the drift reports itself.
         """

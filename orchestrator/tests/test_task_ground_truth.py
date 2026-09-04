@@ -61,6 +61,8 @@ class TestRecoveryAction:
         assert RecoveryAction.MARK_DONE_WITH_PROVENANCE == 'mark_done_with_provenance'
         assert RecoveryAction.REVERT_TO_PENDING == 'revert_to_pending'
         assert RecoveryAction.RE_FILE_ESCALATION == 're_file_escalation'
+        # Task 3539 — see test_convert_to_blocked.py for its table contract.
+        assert RecoveryAction.CONVERT_TO_BLOCKED == 'convert_to_blocked'
         assert RecoveryAction.LEAVE == 'leave'
 
 
@@ -289,14 +291,19 @@ class TestClassifyRecovery:
         )
         assert classify_recovery(report) == RecoveryAction.LEAVE
 
-    def test_f_on_main_open_l1_vetoes_auto_flip(self) -> None:
+    def test_f_on_main_open_l1_converts_to_blocked(self) -> None:
+        # Task 3539: row (f) used to map to LEAVE, so the sweep held
+        # SILENTLY and the row churned `in-progress` forever.  It now names
+        # the honest resting status.  The surviving guarantee — the veto
+        # proper — is that it is still NOT a mark-done.
         report = self._report(
             branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-f'),
             open_escalations=[EscalationRef(id='esc-1-1', level=1)],
         )
-        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+        assert classify_recovery(report) != RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
-    def test_f2_on_main_open_l2_also_vetoes_auto_flip(self) -> None:
+    def test_f2_on_main_open_l2_also_converts_to_blocked(self) -> None:
         # The veto is "any open escalation, any level" — not L1-only.
         # Before review finding #1's fix, `_shape` checked `level == 1`
         # only, so an open L2 (the actual human-facing tier — see
@@ -306,7 +313,8 @@ class TestClassifyRecovery:
             branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-f2'),
             open_escalations=[EscalationRef(id='esc-1-2', level=2)],
         )
-        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+        assert classify_recovery(report) != RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
     def test_g_blocked_no_claimant_gone_no_marker_no_open_escalation_refiles(self) -> None:
         report = self._report(db_status='blocked', branch_state=BranchState(BranchStateKind.GONE_NO_MARKER))
@@ -1991,15 +1999,22 @@ class TestLeaveReason:
         )
         assert leave_reason(report) == LeaveReason.live_claimant
 
-    def test_recovery_row_f_is_escalation_pinned(self):
+    def test_a_pinned_leave_is_escalation_pinned(self):
         """Boundary #9's classification half.
 
-        IN_PROGRESS + no claimant + ON_MAIN + an open record: the MARK_DONE
-        that row (a) would otherwise take is VETOED by the record.
+        RE-ANCHORED by task 3539.  This used to key on row (f) —
+        IN_PROGRESS + no claimant + ON_MAIN + an open record — but that shape
+        now classifies CONVERT_TO_BLOCKED, so ``leave_reason`` correctly
+        returns None for it (the contract: never mislabel an ACTION as a
+        hold; see test_convert_to_blocked.py).  The ``escalation_pinned``
+        PRECEDENCE link is what this test exists to cover, so it is re-keyed
+        onto a shape that still classifies LEAVE while carrying an open
+        record: BLOCKED + no claimant + ON_MAIN + pinned, which is exactly
+        the post-conversion resting state.
         """
         from orchestrator.task_ground_truth import LeaveReason, leave_reason
 
-        report = _leave_report()
+        report = _leave_report(db_status='blocked')
         assert classify_recovery(report) == RecoveryAction.LEAVE
         assert leave_reason(report) == LeaveReason.escalation_pinned
 

@@ -20,12 +20,14 @@ class TestTopLevelImports:
             AllAccountsCappedException,
             CostStore,
             IllegalTransitionError,
+            ProbeSpawnError,
             SessionBudgetExhausted,
             UsageCapConfig,
             UsageGate,
             classify_agent_failure,
             connect_daemon,
             count_transcript_turns,
+            detect_resumable_progress,
             extract_agent_verdict,
             files_to_modules,
             invoke_claude_agent,
@@ -38,6 +40,7 @@ class TestTopLevelImports:
             normalize_lock,
             read_transcript_records,
             require_non_blank_prompt,
+            resumable_progress_for_session,
         )
 
         assert AgentResult is not None
@@ -54,11 +57,18 @@ class TestTopLevelImports:
         assert require_non_blank_prompt is not None
         assert count_transcript_turns is not None
         assert read_transcript_records is not None
+        # task 4274: cap-hit resume eligibility asks TWO questions — can I reach
+        # the transcript, and does it record work to continue?  The second
+        # predicate and its session wrapper are consumed from the blessed
+        # top-level surface, so pin the lazy re-export, not just the submodule.
+        assert detect_resumable_progress is not None
+        assert resumable_progress_for_session is not None
         assert UsageGate is not None
         assert AccountState is not None
         assert AccountPhase is not None
         assert SessionBudgetExhausted is not None
         assert IllegalTransitionError is not None
+        assert ProbeSpawnError is not None
         assert AccountConfig is not None
         assert UsageCapConfig is not None
         assert CostStore is not None
@@ -93,6 +103,7 @@ class TestModuleLevelAll:
             'classify_agent_failure',
             'count_transcript_turns',
             'detect_ended_awaiting_background',
+            'detect_resumable_progress',
             'ended_awaiting_background_for_session',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
@@ -103,6 +114,7 @@ class TestModuleLevelAll:
             'note_unreadable_transcript',
             'read_transcript_records',
             'require_non_blank_prompt',
+            'resumable_progress_for_session',
             'transcript_exists',
         }
 
@@ -117,6 +129,7 @@ class TestModuleLevelAll:
             'InvokeSlot',
             'SessionBudgetExhausted',
             'IllegalTransitionError',
+            'ProbeSpawnError',
         }
 
     def test_config_models_all(self):
@@ -247,6 +260,56 @@ class TestInitAllCompleteness:
             assert private == [], (
                 f'{name}.__all__ must not contain private symbols: {private}'
             )
+
+
+class TestProbeSpawnErrorContract:
+    """Pin the shape of `ProbeSpawnError`, not just its presence in `__all__`.
+
+    Task 4512. The exception exists to carry ONE distinction the old `return
+    False` could not: "the cap-resume probe could not be spawned at all" (a
+    host fault) versus "the probe ran and the account is still capped". Two
+    properties of the class are load-bearing for that distinction, and neither
+    is implied by the name appearing in `__all__`:
+
+      - it must NOT be an `OSError` subclass. `_run_probe` classifies a spawn
+        fault by catching `OSError` around `create_subprocess_exec`; if
+        `ProbeSpawnError` were itself an `OSError`, any `except OSError` arm
+        downstream (including a future one) could silently reabsorb it and
+        restore exactly the swallow this task removes;
+      - it must carry the failing binary and the originating `OSError` as
+        attributes AND render both in `str(exc)`, because the operator-facing
+        signal ("which binary, and why") has to survive both a structured
+        handler reading `.binary`/`.cause` and a bare `logger.error('%s', exc)`.
+    """
+
+    def test_probe_spawn_error_is_a_plain_exception_not_an_oserror(self):
+        from shared.usage_gate import ProbeSpawnError
+
+        assert issubclass(ProbeSpawnError, Exception)
+        assert not issubclass(ProbeSpawnError, OSError), (
+            'ProbeSpawnError must NOT derive from OSError: an `except OSError` '
+            'arm anywhere downstream would reabsorb it and re-hide the '
+            'infrastructure fault as an ordinary probe failure.'
+        )
+
+    def test_probe_spawn_error_exposes_binary_and_cause(self):
+        from shared.usage_gate import ProbeSpawnError
+
+        cause = FileNotFoundError(2, 'No such file or directory', 'claude')
+        exc = ProbeSpawnError('claude', cause)
+
+        assert exc.binary == 'claude'
+        assert exc.cause is cause
+        assert isinstance(exc.cause, OSError)
+
+    def test_probe_spawn_error_message_names_binary_and_cause(self):
+        from shared.usage_gate import ProbeSpawnError
+
+        cause = FileNotFoundError(2, 'No such file or directory', 'claude')
+        rendered = str(ProbeSpawnError('claude', cause))
+
+        assert 'claude' in rendered, rendered
+        assert 'No such file or directory' in rendered, rendered
 
 
 class TestPEP561:

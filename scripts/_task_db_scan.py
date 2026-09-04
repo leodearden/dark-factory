@@ -13,7 +13,8 @@ importable-by-sibling-scripts only. It hosts three tiers:
 
 * **Tier 1, discovery** (``_DEFAULT_PROJECT_ROOTS``, :func:`tasks_db_path`,
   :func:`resolve_project_roots`, :func:`discover_project_roots`,
-  :func:`discover_db_paths`) — adopted by ALL FOUR sweep scripts.
+  :func:`discover_db_paths`) — adopted by ALL FOUR sweep scripts, plus
+  ``census_tagger_debris.py`` (task 4525).
 * **Tier 2, leak-scanner CLI plumbing** (:func:`sweep_databases`,
   :func:`run_scan_cli`, :func:`add_db_discovery_args`,
   :data:`NO_DB_RESOLVED_MESSAGE`, :func:`format_json`, :func:`truncate`,
@@ -24,7 +25,18 @@ importable-by-sibling-scripts only. It hosts three tiers:
   :func:`sweep_project_roots`, the ``AUDIT_EXIT_*`` codes,
   :data:`NO_PROJECT_ROOT_RESOLVED_MESSAGE`, :func:`format_kv_line`,
   :func:`format_coverage_block`) — adopted by ``audit_wiped_metadata_files.py``
-  and ``audit_combine_gate_marker_loss.py`` (task 3616).
+  and ``audit_combine_gate_marker_loss.py`` (task 3616), and PARTIALLY by
+  ``census_tagger_debris.py`` (task 4525), which takes :func:`sweep_project_roots`
+  and the ``AUDIT_EXIT_*`` numbering but deliberately NOT :func:`run_audit_cli`.
+  Its reason is the SAME exit-1 semantic collision recorded at :66-72 for the
+  repair script, arriving from the other direction: :data:`AUDIT_EXIT_FINDINGS`
+  means "the read-only sweep found something dirty", but the census ALWAYS finds
+  records (507 measured across the six corpora when it landed), so routing
+  through :func:`run_audit_cli` would make its mandated user-observable signal —
+  "re-running the script reproduces the counts (exit 0)" — structurally
+  unreachable. It reuses 1 for a different meaning ("the committed artifact is
+  stale") while keeping 0/2/3 in numeric lockstep, enforced by a test in
+  ``tests/scripts/test_census_tagger_debris.py`` that imports these constants.
 
 Both audit scripts deliberately keep their own ``format_report`` /
 ``format_json`` / ``_build_parser``. What remains genuinely per-script, and

@@ -109,6 +109,27 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
   const m = metric;
   const trend = m.trend || { labels: [], values: [] };
   const Chart = ME_CHART_BY_TAG[chartForKind(m.kind)] || null;
+  // `gaps` counts the runs this metric has NO USABLE SAMPLE for, which is two
+  // kinds of thing at once, and every sentence below has to be true of both:
+  //
+  //   * the run produced nothing — a `null`/`undefined` slot. The common case,
+  //     and a legitimate shape: a metric INTRODUCED MID-WINDOW has no sample
+  //     for the runs that predate it (memory_evals.py).
+  //   * the run produced something unplottable — NaN/±Infinity, a numeric
+  //     string, any non-number. The producer reads the value straight out of
+  //     the run payload (memory_evals.py `by_id.get(...).get('value')`), so a
+  //     malformed payload arrives here as a value that cannot be a point.
+  //
+  // Hence "no USABLE sample" everywhere, never "no sample": the second kind DID
+  // emit something, and reporting it as a run that emitted nothing would
+  // silently reclassify a malformed payload as missing data — the class of fact
+  // the seriesMismatch state below exists to NAME rather than absorb.
+  //
+  // The two are deliberately counted TOGETHER rather than disclosed separately.
+  // They are identically undrawable, the gate needs one number to subtract, and
+  // this cell can act on neither: the honest minimum is a sentence that is true
+  // of both. If the malformed kind ever needs naming in its own right it is a
+  // state of its own, alongside the mismatch arm — not a reword of this count.
   const gaps = trendGaps(trend.values);
   // An EMPTY series is not a drawable series: both Sparkline and StepSpark
   // return null for a zero-length array, so without this count a metric with
@@ -130,10 +151,33 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
   // the other array, and the gap message would print "1 of 0 runs".  It gets
   // its own named state rather than a silently-picked winner.
   const seriesMismatch = labels.length !== points;
-  // A series with a hole cannot be drawn honestly by charts.jsx (see
-  // trendGaps).  Equality, not an ordering comparison: nothing here re-derives
-  // anything from a threshold.
-  const plottable = Chart && gaps === 0 && points > 0 && !seriesMismatch;
+  // A holed series IS drawn (task 3490).  charts.jsx delegates its scale and
+  // path math to spark_path.js, which excludes non-finite samples from the
+  // extrema, keeps index-based x positions so the axis does not shift under a
+  // hole, and emits separate M-started subpaths so the line is genuinely
+  // DISCONTINUOUS across one.  A hole therefore reads as a hole rather than as
+  // a measured plunge to the chart floor, and the gap count is disclosed
+  // alongside the drawing.
+  //
+  // What is still NOT drawable is a series in which NOTHING was measured: the
+  // path builders return an empty line, Sparkline/StepSpark return null, and
+  // the cell would render a blank 26px box.  So the gate counts the samples
+  // the primitive will ACTUALLY draw and requires at least one.  `points > 0`
+  // is not restated: gaps <= points always, so `plotted > 0` implies it, and
+  // the no-runs state keeps its own arm below.
+  //
+  // `plotted` only means what its name says because trendGaps counts exactly
+  // what spark_path.js's isPlottable rejects (memory_evals_fmt.js; the
+  // agreement is pinned executably in dashboard/tests/js/memory_evals_fmt.test.mjs).
+  //
+  // NO THRESHOLD, still: `> 0` is a count-of-nothing check in the same family
+  // as the `points === 0` arm below — not a fraction, a proportion or a
+  // tunable.  Suppressing on some SHARE of holes was considered and rejected:
+  // it would be a locally-invented threshold, and this file consumes the
+  // server's judgments rather than re-deriving them.  Do not "improve" this
+  // into a ratio.
+  const plotted = points - gaps;
+  const plottable = Chart && plotted > 0 && !seriesMismatch;
   const span = labels.length
     ? `${labels[0]} → ${labels[labels.length - 1]}`
     : 'no runs';
@@ -187,30 +231,53 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
       <td className="num">{dash(m.denominator)}</td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{dash(m.direction)}</td>
       <td style={{ width: 160 }}>
-        {/* FOUR DISTINCTLY worded suppression states, all reusing the
-            "no chart, value only" shape chartForKind already establishes.
-            They assert different things and must not be collapsed:
+        {/* FIVE structurally distinct trend states. The four that draw no
+            chart are DISTINCTLY worded, all reusing the "no chart, value only"
+            shape chartForKind already establishes. They assert different
+            things and must not be collapsed:
 
+              * drawn chart — INCLUDING a holed series. Since task 3436 the
+                primitive breaks the line at every hole instead of coercing it
+                to a floor value, so missing data is no longer a reason to
+                withhold the shape; the gap count is disclosed beside it
+                (task 3490).
               * unknown kind — a RENDERING gap; the payload passes the value
                 through verbatim and files an `unknown_kind` issue for it.
               * length disagreement — a MALFORMED payload: labels and values are
                 parallel arrays, so nothing else this cell could say about the
                 series would be trustworthy. Named, never silently reconciled
                 by picking one length over the other.
-              * holed series — normal, fully-explained MISSING DATA: some runs
-                produced no sample, and the count says how many.
-              * no runs — the metric simply has NOT BEEN MEASURED yet. Folding
-                this into the gap message would print "0 of 0 runs produced no
-                sample", a nonsense sentence that reads as a bug.
+              * no runs — the metric simply has NOT BEEN MEASURED yet.
+              * not one usable sample — the metric HAS run, but no run came
+                back with a value the primitive can plot, so there is nothing
+                to draw a point from. Kept separate from "no runs" because they
+                are different facts about the metric: collapsing them would
+                tell an operator that a measured-but-unplottable metric had
+                never run. Folding either into the other's wording would also
+                print a nonsense sentence like "none of the 0 runs produced a
+                usable sample", which reads as a bug — the very outcome these
+                states exist to prevent.
 
             `!Chart` stays first: an unrenderable kind is the more actionable
-            fact than an empty or malformed series.  In every case the row still
-            shows value, current_value, n, denominator, direction and the
-            verdict badge — the operator loses a 160px sparkline, never the
-            signal. */}
+            fact than an empty or malformed series.  In every suppressed case
+            the row still shows value, current_value, n, denominator, direction
+            and the verdict badge — the operator loses a 160px sparkline, never
+            the signal. */}
         {plottable
           ? (
-            <div style={{ height: 26 }} title={span} data-testid="memory-eval-trend-chart">
+            /* The title accounts for the BREAKS in the drawn line, where they
+               appear. `span` (the labels-derived first→last range) is what it
+               says on its own; a holed series adds how many of those runs
+               produced no USABLE sample, so the discontinuities are explained
+               on hover rather than left to read as a rendering fault. "Usable"
+               because the count covers both hole kinds — see the `gaps`
+               declaration above. Both counts come from the same two locals
+               every other disclosure here reads. */
+            <div
+              style={{ height: 26 }}
+              title={gaps ? `${span} · ${gaps} of ${points} runs produced no usable sample` : span}
+              data-testid="memory-eval-trend-chart"
+            >
               {/* values passed through verbatim — never filtered or compacted */}
               <Chart values={trend.values} color={MEC.accent} />
             </div>
@@ -245,21 +312,41 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
                     no runs yet — nothing to chart
                   </span>
                 )
-                : (
-                  <span
-                    className="mono"
-                    style={{ fontSize: 10, color: 'var(--fg-3)' }}
-                    data-testid="memory-eval-trend-gaps"
-                  >
-                    no chart — {gaps} of {labels.length} runs produced no sample
-                  </span>
-                )}
+                // Stated explicitly rather than left as the chain's `else`. An
+                // unconditional final arm would print "none of the N runs
+                // produced a sample" for ANY future reason `plottable` turns
+                // false — a confident false statement about the data, which is
+                // worse than the blank box these states exist to prevent. The
+                // `null` terminator below is unreachable by construction:
+                // reaching it needs Chart && plotted > 0 && !seriesMismatch,
+                // which is exactly what `plottable` already says.
+                : plotted === 0
+                  ? (
+                    <span
+                      className="mono"
+                      style={{ fontSize: 10, color: 'var(--fg-3)' }}
+                      data-testid="memory-eval-trend-all-gaps"
+                    >
+                      no chart — none of the {points} runs produced a usable sample
+                    </span>
+                  )
+                  : null}
         {/* Footer count reads `points`, the SAME local the states above are
             derived from — never the labels array's own length, which would
-            contradict the no-runs state whenever the two arrays disagree. */}
+            contradict the no-runs state whenever the two arrays disagree.
+
+            The footer states COUNTS, not verdicts about the chart. The states
+            above are what say whether anything was drawn, so no clause here
+            may claim a chart was withheld: it would render directly beneath a
+            sparkline that had in fact been drawn. Still conditional, so a
+            clean series prints no dangling separator.
+
+            "unusable", not "missing": the count also covers runs that emitted
+            a value the chart cannot plot, and calling those missing would state
+            something untrue about them (see the `gaps` declaration above). */}
         <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
           {points} pts
-          {gaps ? ` · ${gaps} gap(s) — no chart drawn` : ''}
+          {gaps ? ` · ${gaps} unusable` : ''}
         </div>
       </td>
     </tr>

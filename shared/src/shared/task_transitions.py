@@ -287,12 +287,29 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     # merge-deferred) — an intentional steward terminal decision the
     # orchestrator must not overwrite. 'done' is excluded: that status is
     # handled by a dedicated branch that returns WorkflowOutcome.DONE, never
-    # BLOCKED. IN_PROGRESS is also included: the merge-halt escalation-wait
-    # paths (_handle_wip_recovery_no_advance / _handle_unmerged_state) submit
-    # an L1 and return BLOCKED directly (no _mark_blocked call) without ever
-    # rewriting task status, so the row stays at whatever it was mid-merge —
-    # the same "preserves in-progress" shape already noted below for
-    # 'escalated'.
+    # BLOCKED. IN_PROGRESS is also included, for the BLOCKED paths that
+    # deliberately PRESERVE the mid-flight row rather than parking it:
+    #   - spec §5's steward terminal-decision preserve carve-out — the steward
+    #     already adjudicated the row (e.g. 'deferred'), and _mark_blocked
+    #     returns BLOCKED without rewriting it;
+    #   - the merge-gating bail's documented in-progress-preserving shape (the
+    #     same shape already noted below for 'escalated').
+    # NOT the merge-halt trio: as of task 3537 _handle_stash_failed /
+    # _handle_unmerged_state / _handle_wip_recovery_no_advance all route their
+    # BLOCKED exit through _mark_blocked and DO write the row (spec §7.9 /
+    # §8-E3, INV-6) — that justification is retired, not the member.
+    # The frozenset is deliberately NOT narrowed here: removing IN_PROGRESS is
+    # divergence E10's scope, and doing it in isolation would turn every
+    # still-legitimate preserve path above into a hard AssertionError from
+    # run()'s SM-2 check.
+    # INFRA_HOLD is the infra-hold PARK ROW: _mark_blocked(block_status=
+    # 'infra-hold') writes the first-class infra-hold status (PRD C7/D3) and
+    # then returns BLOCKED, so 'infra-hold' is a legitimate BLOCKED exit row —
+    # exactly like BLOCKED, just on the status the harness HOLD guard and
+    # RESUME cascade key on (is_infra_held).  Omitting it made SM-2 raise
+    # AssertionError out of run() on a row the writer had deliberately parked;
+    # task 3537 added the same block_status pass-through to the merge-phase
+    # park write, which would have widened that trap to a second path.
     'blocked': frozenset(
         {
             TaskStatus.BLOCKED,
@@ -300,14 +317,20 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
             TaskStatus.DEFERRED,
             TaskStatus.MERGE_DEFERRED,
             TaskStatus.IN_PROGRESS,
+            TaskStatus.INFRA_HOLD,
         }
     ),
     # Self-repend / deferred-to-stranded-sweep window / requeue-cap
     # exhausted -> blocked.
     'requeued': frozenset({TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED}),
     # Dominant _mark_blocked + open L1 / merge-gating bail preserves
-    # in-progress.
-    'escalated': frozenset({TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS}),
+    # in-progress.  INFRA_HOLD for the same reason as in 'blocked' above: the
+    # infra-hold park row is written by _mark_blocked's ENTRY gate, BEFORE the
+    # branch that picks BLOCKED vs ESCALATED, so the same row can reach either
+    # exit and the two keys must agree about it.
+    'escalated': frozenset(
+        {TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS, TaskStatus.INFRA_HOLD}
+    ),
     'cancelled': frozenset({TaskStatus.CANCELLED}),
     'merge-deferred': frozenset({TaskStatus.MERGE_DEFERRED}),
     # preserved / release_workflow park->blocked / stranded-sweep->pending.

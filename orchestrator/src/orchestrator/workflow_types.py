@@ -254,7 +254,11 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         return _disposition_table_cache
 
     from shared.cli_invoke import AllAccountsCappedException
-    from shared.usage_gate import IllegalTransitionError, SessionBudgetExhausted
+    from shared.usage_gate import (
+        IllegalTransitionError,
+        ProbeSpawnError,
+        SessionBudgetExhausted,
+    )
 
     from orchestrator.git_ops import (
         BranchResetError,
@@ -546,6 +550,30 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='lane_lock_self_owned_leak',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # BD-2-completeness-only row (task 4512) — same category as
+        # MergeParkError/EphemeralWorktreeError below. ProbeSpawnError is
+        # raised at exactly one site (UsageGate._run_probe, when
+        # create_subprocess_exec fails to spawn the CLI binary) and is caught
+        # by BOTH of that method's callers inside shared/usage_gate.py
+        # (_account_resume_probe_loop and _reprobe_account), so it never
+        # reaches _drive()'s ladder or classify_failure(). The row exists so
+        # _lookup_disposition(ProbeSpawnError) is non-None for BD-2's
+        # completeness check; ProbeSpawnError derives directly from Exception
+        # (deliberately NOT OSError — see its docstring), so no ancestor row
+        # is inherited via MRO.
+        #
+        # Values mirror IllegalTransitionError below: a host fault (missing or
+        # non-executable binary, broken self-update symlink, unresolvable
+        # PATH) that no amount of waiting or requeueing can fix, so BLOCK +
+        # escalate_to_human rather than REQUEUE.
+        ProbeSpawnError: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Usage-gate probe binary could not be spawned',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         IllegalTransitionError: BlockDisposition(
