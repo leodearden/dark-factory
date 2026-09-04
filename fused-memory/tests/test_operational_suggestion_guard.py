@@ -304,3 +304,122 @@ class TestOperationalSuggestionWarningPayload:
         hint = result['operational_suggestion_warning']['hint']
         assert 'deterministic' in hint
         assert 'execution_class' in hint
+
+
+class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
+    """Machine-injected provenance stamps must not arm the code-change
+    suppression (task 4569, ported from task 4532).
+
+    The backstory, observed stamp corpus, monotonicity invariant and
+    directional-safety rule live in ONE place — routing_intent_guard.py's
+    "Provenance-stamp carve-out" module-docstring section. Each test below
+    names only the specific behaviour it pins.
+    """
+
+    def test_stage2_doc_drift_stamp_no_longer_suppresses_marker_finding(self):
+        """The verbatim reify-5117 shape: authored operational phrasing
+        followed by a machine-injected Stage-2 doc-drift stamp whose only
+        code-change signal is the bare word "FIX" inside the stamp ->
+        finding is still produced. The stamp must not arm
+        _CODE_CHANGE_SIGNALS_RE."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Restart the fused-memory service and confirm it is back up.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding 4e06f01a-cacb-4688-9670-ff6d6ce41baf): the '
+                '`dependencies` array carries 32 entries, but this prose '
+                'previously itemized only 31.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'restart' in finding.markers
+        assert 'confirm' in finding.markers
+        assert finding.fields == ('description',)
+
+    def test_authored_signal_after_the_stamp_paragraph_still_suppresses(self):
+        """CONTAINMENT: the stamp strip stops at the blank line ending the
+        stamp's own paragraph, so an AUTHORED "fix" in a LATER paragraph
+        still suppresses."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Restart the service.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding x): re-derived the count.'
+                '\n\nAlso fix the retry helper while you are in here.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'Authored trailing "fix" must still suppress, got: {finding!r}'
+
+    def test_authored_signal_before_the_stamp_still_suppresses(self):
+        """CONTAINMENT (leading side): an authored code-change signal in a
+        paragraph BEFORE the stamp is untouched by the strip and still
+        suppresses."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Fix the ingestion pipeline.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] note.'
+                '\n\nRestart the service.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'Authored leading "Fix" must still suppress, got: {finding!r}'
+
+    def test_markdown_link_at_line_start_is_not_a_provenance_stamp(self):
+        """PRECISION: DF's own task prose routinely opens a line with a
+        markdown link naming a recon stage. Treating it as a stamp would
+        strip a whole AUTHORED paragraph and manufacture a finding."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                '[Stage 1 stall detector]'
+                '(fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py)'
+                ' needs a fix; restart the worker after.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'A markdown link is not a stamp, got: {finding!r}'
+
+    def test_inline_dated_bracket_is_not_a_provenance_stamp(self):
+        """PRECISION: a mid-sentence dated bracket is authored prose, not an
+        appended annotation block, so it must not swallow the rest of the
+        sentence."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Spanning 2026-04-09 to 2026-08-06 [re-verified 2026-08-06]. '
+                'Restart the service after the fix lands.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'An inline dated bracket is not a stamp, got: {finding!r}'
+
+    def test_line_anchored_bracket_without_date_or_stage_is_not_a_stamp(self):
+        """Keeps the widening honest: an ordinary bracketed lead-in naming
+        neither a stage nor a date is AUTHORED prose, so its "crash" still
+        suppresses."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                '[design note] the crash reproduces under load.'
+                '\n\nRestart the worker.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'A bare bracketed lead-in is not a stamp, got: {finding!r}'
