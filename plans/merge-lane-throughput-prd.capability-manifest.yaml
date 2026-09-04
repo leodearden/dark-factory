@@ -404,3 +404,45 @@ tasks:
       kind: manual
       reason: absence of a threshold is a review property
   task_id: 5059
+- label: Cprime
+  title: 'merge-lane throughput: verify_host_policy knob — prefer the remote verify host when it is free'
+  capabilities:
+  - name: host-allocator-prefer-local-is-the-current-policy
+    binding: capability→producer (wired) — verify_runner.py::HostAllocator.acquire tries acquire_local
+      first, then acquire_remote (β decision 1, plans/concurrent-merge-verify-prd.md); VerifyRunnerPool's
+      δ policy is prefer-remote and the allocator inverts it. Measured 2026-09-03; no config knob exists
+      (grep prefer_local|prefer_remote|verify_host_policy over config.py + verify_runner.py returned nothing).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate on main, not this task's deliverable
+  - name: verify-host-policy-config-field
+    binding: capability→producer — built by C′ (task 5097) as an OrchestratorConfig field with default
+      prefer_local so reify's behaviour is byte-identical; consumed by task D1 (5053), which sets prefer_remote
+      for dark_factory.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify_host_policy
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: host-allocator-consults-the-policy
+    binding: capability→producer — built by C′; HostAllocator.acquire reads the policy and tries the remote
+      lease first under prefer_remote, falling back to local when the remote is busy, quarantined or PARKED.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: prefer_remote
+      paths:
+      - orchestrator/src/orchestrator/verify_runner.py
+      expect: present
+  - name: no-appendix-a-file-touched
+    binding: G4 — files are verify_runner.py, config.py, test_verify_runner.py, concurrent-merge-verify-prd.md;
+      none is in plans/merge-lane-quality-prd.md Appendix A. γ3 (5026) is serialised behind C′ on test_verify_runner.py
+      by a real dependency edge.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dependency-graph property, checked at filing
+  task_id: 5097
