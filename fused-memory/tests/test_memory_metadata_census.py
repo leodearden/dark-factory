@@ -270,6 +270,96 @@ class TestUnknownKeyStormDetector:
         assert detector._time_fn is time.monotonic
 
 
+class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
+    """INV-5: the per-writer window IS ``shared.storm_counter.StormCounter``.
+
+    PROVENANCE, which is what makes this a re-copy rather than a body that
+    merely predates the shared class. Task 3088 extracted the
+    append-prune-count-fire body into one home on 2026-07-30 (a41ff0ac02,
+    since promoted to ``shared`` by task 3689) explicitly "so a fourth consumer
+    reuses rather than re-copies it". This module arrived ONE DAY LATER, on
+    2026-07-31 (7d509f0dd7), carrying its own deque, its own
+    ``cutoff``/``popleft`` loop and its own count-versus-threshold compare —
+    the copy the extraction had just been made to prevent. Task 4519 closes
+    that gap.
+
+    Structural rather than behavioural on purpose, exactly as task 3259's
+    ``test_harness.py::test_all_three_storm_counters_are_the_shared_storm_counter``
+    argues: a hand-rolled deque reproduces every behaviour asserted in the
+    sibling class above and is still another copy, which is the thing INV-5
+    forbids. The behavioural halves stay where they are.
+    """
+
+    def _detector(self, clock, *, threshold=5, window_seconds=300):
+        from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
+
+        return UnknownKeyStormDetector(
+            threshold=threshold, window_seconds=window_seconds, time_fn=clock
+        )
+
+    def test_each_writer_window_is_a_shared_storm_counter(self):
+        from shared.storm_counter import StormCounter
+
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=5)
+        detector.record('p', 'a', ['k'])
+
+        assert isinstance(detector._warns[('p', 'a')], StormCounter)
+
+    def test_the_counters_are_latched_not_rate_limited(self):
+        """The detector's contract is the CROSSING, not the standing state.
+
+        A rate-limited counter would re-answer once per window, buying the
+        filer an open-escalation ``queue.get_by_task`` read per memory write
+        for a condition already filed — the behaviour
+        :meth:`UnknownKeyStormDetector.record`'s docstring rules out.
+        """
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=5)
+        detector.record('p', 'a', ['k'])
+
+        assert detector._warns[('p', 'a')].fire_mode == 'latched'
+
+    def test_the_counters_threshold_on_raw_events_not_distinct_keys(self):
+        """Not decoration: distinct-key mode here would never fire at all.
+
+        The commonest drift shape is ONE writer repeating ONE unknown key, and
+        a ``count_distinct`` counter would score that as 1 forever. The sibling
+        ``test_fires_exactly_on_the_crossing_call`` records ``['k']`` five
+        times and expects a fire, so the mode is load-bearing.
+        """
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=5)
+        detector.record('p', 'a', ['k'])
+
+        assert detector._warns[('p', 'a')].count_distinct is False
+
+    def test_a_writer_over_the_line_for_multiple_windows_still_fires_once(self):
+        """The latch-vs-rate-limit discriminator, at the census level.
+
+        A CHARACTERIZATION gate: it passes against the pre-migration
+        hand-rolled body too, and is authored here precisely because the
+        sibling ``test_does_not_re_fire_after_crossing`` never advances the
+        clock — so a counter that re-fired once per window would satisfy it and
+        the migration could adopt the wrong fire policy undetected. Here the
+        writer stays over the line across more than a full window: a
+        rate-limited counter fires again at t=400 (398s since its fire, past
+        the 300s window, with three events still in the sliding window), a
+        latched one does not.
+        """
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=3, window_seconds=300)
+
+        crossing = [detector.record('p', 'a', ['k']) for _ in range(3)]
+        assert crossing == [False, False, True]
+
+        for offset in (100, 200, 300, 400):
+            clock.now = 1000.0 + offset
+            assert detector.record('p', 'a', ['k']) is False, (
+                f'the crossing is the event, not the state (t={offset})'
+            )
+
+
 class TestFileUnknownKeyStormEscalation:
     """Direct port of ``middleware/candidate_key_escalation.py``.
 
