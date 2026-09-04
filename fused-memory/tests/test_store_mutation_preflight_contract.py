@@ -329,6 +329,25 @@ class TestFailClosedRecords:
 
 TESTS_DIR = pathlib.Path(__file__).parent
 
+# Real-time budget for the three whole-tree sweeps below, opting up from the
+# project default of 60s (`fused-memory/pyproject.toml`).
+#
+# REQUIRED, not defensive. That default runs under `timeout_method = "thread"`,
+# whose handler ends in `os._exit(1)` -- so a test that overruns it does not
+# fail, it KILLS ITS ENTIRE xdist WORKER, and a worker lost near end-of-suite
+# leaves the controller waiting forever for a completion signal that never
+# arrives. pyproject spells this out and states the rule: "Tests with a
+# real-time budget approaching 60s MUST set @pytest.mark.timeout(N) to opt up
+# -- otherwise a single slow run takes down the whole suite."
+#
+# These three qualify since the sweep went recursive: each parses/walks 328
+# modules (~1.46M AST nodes), measured at 20-49s per sweep on a machine at load
+# average 290. That is 82% of the default cap, i.e. inside its noise band --
+# and the failure it would cause is a whole-suite deadlock, not a red test.
+# Sized at 5x the observed worst case: this is a backstop against a genuine
+# hang, NOT a performance assertion, so it must not trip on load alone.
+_SWEEP_TIMEOUT = 300
+
 # The name every one of the 14 suites gave its hand-rolled autouse fixture
 # before the extraction. After it, the name exists nowhere in `tests/`: suites
 # call `neutralise_fixture(...)` and bind the result to `_neutralise`.
@@ -461,6 +480,7 @@ class TestNoHandRolledNeutraliseFixture:
     docstring that merely names the old fixture cannot trip it.
     """
 
+    @pytest.mark.timeout(_SWEEP_TIMEOUT)
     def test_no_test_module_defines_its_own_neutralise_fixture(self) -> None:
         offenders: list[str] = []
         for path in _test_modules():
@@ -509,6 +529,7 @@ class TestNoHandRolledDenyRaiser:
     so the assertion sites that name the exception are untouched.
     """
 
+    @pytest.mark.timeout(_SWEEP_TIMEOUT)
     def test_no_test_module_raises_store_mutation_unavailable(self) -> None:
         offenders: list[str] = []
         for path in _test_modules():
@@ -572,6 +593,7 @@ class TestNoInlinedFailClosedMarker:
     and are correctly outside this sweep.
     """
 
+    @pytest.mark.timeout(_SWEEP_TIMEOUT)
     def test_no_test_module_spells_the_fail_closed_marker(self) -> None:
         offenders: list[str] = []
         for path in _test_modules():
