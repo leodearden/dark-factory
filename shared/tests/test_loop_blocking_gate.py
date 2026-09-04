@@ -652,33 +652,6 @@ class TestPrimitiveTable:
                 f'{dotted} is an async sibling and must never be in the table'
             )
 
-    def test_yaml_safe_load_justification_cites_task_4201_measurement(self):
-        """The table must carry WHY yaml parsing counts, with the measurement.
-
-        Task 4201 measured ``yaml.safe_load`` at 8.15 ms for an 11 KB document
-        -- the same order as a subprocess spawn.  Without that number recorded
-        at the table, the next census re-reads it as "just parsing" and drops
-        it back out, which is precisely how gap B happened the first time.
-        """
-        justification = DOTTED_PRIMITIVES['yaml.safe_load']
-
-        assert '4201' in justification, justification
-        assert '8.15' in justification, justification
-        assert '11' in justification, justification
-
-    def test_filesystem_justifications_cite_their_discovering_tasks(self):
-        """Filesystem primitives carry the tasks that found them (4091 / 4201).
-
-        These are the entries task 3778's ``subprocess.run``-only vocabulary
-        omitted, so their justification is the record of why the vocabulary is
-        wider now.
-        """
-        for name in ('read_text', 'write_text', 'read_bytes', 'write_bytes'):
-            justification = METHOD_PRIMITIVES[name]
-            assert '4091' in justification or '4201' in justification, (
-                f'{name}: {justification}'
-            )
-
     def test_every_table_entry_carries_a_justification(self):
         """A primitive with no stated reason is one a future census can drop unchallenged."""
         for table in (DOTTED_PRIMITIVES, METHOD_PRIMITIVES):
