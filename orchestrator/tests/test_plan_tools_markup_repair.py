@@ -445,7 +445,7 @@ def _observed_plan_keys(root) -> dict[str | None, set[str]]:
 
 def _alternate_writer_changed_the_cell(
     root, collection: str | None, field: str, tool_name: str
-) -> tuple[bool, dict[str, object] | None]:
+) -> tuple[bool, Mapping[str, object] | None]:
     """(changed, refusal) for calling *tool_name* on a plan seeded through the
     real writers, addressed at the (*collection*, *field*) cell.
 
