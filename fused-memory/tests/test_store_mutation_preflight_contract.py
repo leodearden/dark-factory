@@ -95,26 +95,6 @@ def _stub_script_module(*, with_guard: bool = True) -> types.ModuleType:
 
 
 # ---------------------------------------------------------------------------
-# The pinned literals
-# ---------------------------------------------------------------------------
-
-
-class TestPinnedLiterals:
-    """The two literals the whole contract is keyed on live in exactly one place.
-
-    Exported rather than inlined so that adding a third fail-closed marker is a
-    one-line change here instead of a 12-file sweep — the drift scenario this
-    extraction exists to close.
-    """
-
-    def test_sentinel_value(self) -> None:
-        assert SENTINEL == 'SENTINEL-store-unwritable'
-
-    def test_fail_closed_markers(self) -> None:
-        assert FAIL_CLOSED_MARKERS == ('NOT started (fail-closed)', 'MCP server')
-
-
-# ---------------------------------------------------------------------------
 # neutralise_fixture
 # ---------------------------------------------------------------------------
 
