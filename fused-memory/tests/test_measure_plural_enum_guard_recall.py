@@ -1449,6 +1449,112 @@ async def test_rendered_json_carries_the_measurement_and_the_verdict():
     assert [c['name'] for c in payload['candidates']] == list(_mod.CANDIDATE_NAMES)
     assert payload['revalidation_test'] == _mod.REVALIDATION_TEST
 
+    # The candidate band's own keys, in the unit the band counts in. This
+    # corpus recovers nothing, so the lists are empty and the denominators
+    # are what carry the information: two rejected matches were simulated
+    # over two distinct shapes, and neither candidate moved either one.
+    for candidate in payload['candidates']:
+        assert candidate['recovered'] == []
+        assert candidate['over_selected'] == []
+        assert candidate['facts_simulated'] == 2
+        assert candidate['matches_scanned'] == 2
+        assert candidate['already_selected'] == 0
+        assert 'unchanged_count' not in candidate
+
+
+async def _candidate_active_report():
+    """A report whose candidate band is NONZERO in three of its four terms.
+
+    ``_fixed_report()``'s corpus recovers nothing, so it cannot tell a
+    correctly-rendered candidate band from one that renders empty lists
+    correctly. This corpus does: two rejected matches in one fact that
+    candidate 'b' recovers, plus an intra-clause-comma shape it re-opens.
+    """
+    source = _FakeEdgeSource({
+        'alpha': ([_TWO_REJECTIONS_IN_ONE_FACT, _INTRA_CLAUSE_COMMA], True),
+    })
+    return await run(
+        _args(project_id=['alpha'], measured_at=_FIXED_TIMESTAMP),
+        edge_source=source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_candidate_band_declares_its_unit_and_denominator():
+    """Both artifacts must render the candidate band in ONE stated unit.
+
+    The committed artifact used to render three units side by side with none
+    of them labelled: ``over_selected``/``recovered`` as lists of fact
+    strings (per MATCH, with the text repeated for a multi-enumeration
+    fact), ``unchanged`` as a bare COUNT under the name ``unchanged_count``
+    (per FACT), in a markdown table sitting directly below a per-FACT table
+    of edges. A reader could not say what any column counted, and could
+    subtract one table from the other and get a number that means nothing.
+
+    So: one record shape for every per-match list, the scalar
+    ``unchanged_count`` gone (it could not say WHICH matches were
+    unchanged), and the denominator STATED next to the table rather than
+    left to be inferred from the rows above it.
+    """
+    report = await _candidate_active_report()
+    payload = json.loads(render_json(report))
+
+    by_name = {c['name']: c for c in payload['candidates']}
+    assert set(by_name) == set(_mod.CANDIDATE_NAMES)
+
+    for name, candidate in by_name.items():
+        for key in ('over_selected', 'recovered', 'unchanged'):
+            entries = candidate[key]
+            assert isinstance(entries, list), f'{name}.{key}'
+            for entry in entries:
+                assert set(entry) == {'fact', 'match_start'}, f'{name}.{key}'
+                assert isinstance(entry['fact'], str)
+                assert isinstance(entry['match_start'], int)
+            # The same explicit-sort guarantee the rejection lists carry.
+            assert entries == sorted(
+                entries, key=lambda e: (e['fact'], e['match_start']),
+            ), f'{name}.{key} is not explicitly sorted'
+
+        assert isinstance(candidate['matches_scanned'], int), name
+        assert isinstance(candidate['already_selected'], int), name
+        assert isinstance(candidate['facts_simulated'], int), name
+        assert candidate['matches_scanned'] == (
+            candidate['already_selected']
+            + len(candidate['recovered'])
+            + len(candidate['over_selected'])
+            + len(candidate['unchanged'])
+        ), name
+
+        # The per-FACT scalar is GONE, so nothing downstream can keep reading
+        # a per-fact number under a per-match heading.
+        assert 'unchanged_count' not in candidate, name
+
+    # The corpus really does exercise every term, so the assertions above are
+    # not passing over three empty lists.
+    assert len(by_name['b']['recovered']) == 2
+    assert len(by_name['b']['over_selected']) == 1
+    assert len(by_name['shipped']['unchanged']) == 3
+    assert by_name['shipped']['facts_simulated'] == 2
+    assert by_name['shipped']['matches_scanned'] == 3
+
+    markdown = render_markdown(report)
+    section = markdown[markdown.index('## Candidate tightenings'):]
+
+    # The column headers name the UNIT.
+    header = next(
+        line for line in section.splitlines() if line.startswith('| candidate |')
+    )
+    assert 'matches' in header, header
+    assert 'shapes recovered' not in header, (
+        'the recovered column counts matches, not shapes'
+    )
+
+    # ...and the denominator is stated, not left to be inferred from the
+    # per-FACT table above.
+    assert '2 distinct fact shape' in section
+    assert '3 regex match' in section
+    assert 'per rejected MATCH' in section
+
 
 @pytest.mark.asyncio
 async def test_rendered_markdown_opens_with_provenance_and_regenerate_command():
