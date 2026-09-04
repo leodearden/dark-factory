@@ -24,6 +24,7 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.citation_verifier import (
     STAGE_STAT_PREFIX,
+    scan_prose_citations,
     verify_cited_memories,
 )
 from fused_memory.reconciliation.cli_stage_runner import (
@@ -218,14 +219,17 @@ class BaseStage:
 
         if start_report_failed:
             completed = datetime.now(UTC)
-            # Stamp the zeroed citation triple even here. This is the ONE path
-            # that returns without reaching the shared assembly below, so it is
-            # the ONE path that would otherwise omit the counters — and a
-            # consumer that took the explicit-zero convention at face value and
-            # indexed report.stats['stageN_citations_verified'] would KeyError
-            # on exactly the degraded run it most wants to account for. Zero is
-            # the honest value: there were no findings, so nothing was verified,
-            # dropped, or errored.
+            # Stamp the zeroed citation triple — and the four zeroed PROSE
+            # counters (task 4818) — even here. This is the ONE path that
+            # returns without reaching the shared assembly below, so it is the
+            # ONE path that would otherwise omit the counters — and a consumer
+            # that took the explicit-zero convention at face value and indexed
+            # report.stats['stageN_citations_verified'] would KeyError on
+            # exactly the degraded run it most wants to account for. That
+            # rationale applies verbatim to the prose keys, which is why they
+            # are stamped here rather than only on the assembly path. Zero is
+            # the honest value throughout: there were no findings, so nothing
+            # was verified, dropped, errored, or scanned.
             _prefix = STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value)
             return StageReport(
                 stage=self.stage_id,
@@ -236,6 +240,10 @@ class BaseStage:
                     f'{_prefix}_phantom_citations_dropped': 0,
                     f'{_prefix}_citations_verified': 0,
                     f'{_prefix}_citation_verification_errors': 0,
+                    f'{_prefix}_prose_citations_verified': 0,
+                    f'{_prefix}_prose_citations_tombstoned': 0,
+                    f'{_prefix}_prose_phantom_citations': 0,
+                    f'{_prefix}_prose_citation_verification_errors': 0,
                 },
                 llm_calls=0,
                 tokens_used=0,
@@ -385,6 +393,26 @@ class BaseStage:
         )
         _stats.update(_cite_stats)
 
+        # The PROSE half of the same invariant (task 4818), at the SAME
+        # placement and for every reason the comment above already gives: it is
+        # the one placement a new stage cannot skip by forgetting to add it, it
+        # converges BOTH the RRS-assembled report and the structured-output JSON
+        # fallback, and it precedes every subclass's post-processing including
+        # Stage 1's remediation early-return. It takes the same `_cite_prefix`,
+        # so Stages 1-3 all get it from the one STAGE_STAT_PREFIX resolution.
+        #
+        # It runs AFTER the structured pass on purpose. A phantom just dropped
+        # from `cited_memories` that is STILL named in the finding's prose is a
+        # real, separate fact worth reporting — the structured drop removes the
+        # machine-readable claim, but the human-readable one survives into the
+        # journal and will be chased by a reader. The two counters are therefore
+        # not double-counting the same claim.
+        _prose_stats = await scan_prose_citations(
+            _flagged, self.memory, self.project_id,
+            stat_prefix=_cite_prefix, run_id=run_id,
+        )
+        _stats.update(_prose_stats)
+
         # Write the outcome back to the AUTHORITATIVE recon_report record
         # (task 2979). verify_cited_memories above mutated the projection
         # get_assembled_report built — a fresh dict per finding, carrying a NEW
@@ -403,6 +431,13 @@ class BaseStage:
         # upserts EVERY entry of the run. Only findings carrying a
         # `citation_failures` marker can have moved (a drop and an error each
         # append one), so those are the only ones worth sending.
+        #
+        # Deliberately NOT widened to the prose scan (task 4818). That pass is
+        # WARN-ONLY: it appends no `citation_failures` marker and mutates no
+        # finding, so there is literally nothing for `apply_citation_verification`
+        # to write back, and no way for a prose warning to make the in-memory
+        # report and the durable SQLite row disagree. Widening the gate would
+        # only trigger byte-identical rewrites of every entry in the run.
         _cite_changed = (
             _cite_stats.get(f'{_cite_prefix}_phantom_citations_dropped', 0)
             or _cite_stats.get(f'{_cite_prefix}_citation_verification_errors', 0)
