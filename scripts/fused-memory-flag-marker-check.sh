@@ -66,6 +66,21 @@
 # containing undated markers fails forever -- verify the census first or set
 # the ceiling accordingly. Historical narrative for the retired 2902 watch:
 # plans/reify-flag-marker-backlog-rca-2026-07-22.md §6a.
+#
+# Task 4591 -- `uv` is resolved to an ABSOLUTE path below rather than trusted
+# to be on PATH, mirroring task 2917's fix to the sibling nightly-drain
+# wrapper (fused-memory-flag-marker-sweep.sh): that wrapper died `exec: uv:
+# not found` / status=127 on its systemd unit's Persistent=true boot
+# catch-up run, which fires before the login session pushes the user PATH
+# into the systemd user manager. This wrapper is not currently wired to any
+# systemd unit or before_done predicate (the watch gate is retired, see
+# above), so the defect here is LATENT -- but whoever re-wires it inherits
+# the identical failure mode unless it is fixed now. UV_BIN overrides the
+# resolution outright (the test seam); otherwise `command -v uv` wins, then
+# the measured real location, then /usr/local/bin. An unresolvable `uv` is
+# reported LOUDLY (an ERROR: line naming uv, the PATH searched, and the
+# boot-catch-up cause) rather than left as a bare shell 127 that says
+# nothing about why.
 set -euo pipefail
 
 REPO="${REPO:-/home/leo/src/dark-factory}"
@@ -78,7 +93,41 @@ export CONFIG_PATH="${CONFIG_PATH:-$FM/config/config.yaml}"
 export PROJECT_ROOT="${PROJECT_ROOT:-$REPO}"
 export FALKORDB_URI="${FALKORDB_URI:-redis://localhost:6379}"
 
-# shellcheck disable=SC2206
-CHECK_CMD=(${FLAG_MARKER_SWEEP_CMD:-uv run --frozen --project "$FM" python})
+resolve_uv_bin() {
+  # Order: explicit override, then PATH, then the two known install roots.
+  if [ -n "${UV_BIN:-}" ] && [ -x "${UV_BIN}" ]; then
+    printf '%s' "${UV_BIN}"
+    return 0
+  fi
+  local from_path
+  if from_path="$(command -v uv 2>/dev/null)" && [ -x "$from_path" ]; then
+    printf '%s' "$from_path"
+    return 0
+  fi
+  local candidate
+  for candidate in "$HOME/.local/bin/uv" /usr/local/bin/uv; do
+    if [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ -n "${FLAG_MARKER_SWEEP_CMD:-}" ]; then
+  # The documented test seam: an unquoted expansion so a multi-word prefix
+  # word-splits into the array.
+  # shellcheck disable=SC2206
+  CHECK_CMD=(${FLAG_MARKER_SWEEP_CMD})
+else
+  if ! UV_RESOLVED="$(resolve_uv_bin)"; then
+    echo "fused-memory-flag-marker-check.sh: ERROR: cannot resolve \`uv\` -- not at \$UV_BIN (${UV_BIN:-unset}), not on PATH (${PATH}), and not at \$HOME/.local/bin/uv or /usr/local/bin/uv. This is the \`exec: uv: not found\` / status=127 boot-catch-up failure task 2917 observed on the sibling sweep wrapper. Install uv, or set UV_BIN to its absolute path." >&2
+    exit 127
+  fi
+  # Built literally (not via a \${X:-...} default inside an unquoted array
+  # expansion) so "$FM" survives verbatim even when the repo path contains
+  # spaces.
+  CHECK_CMD=("$UV_RESOLVED" run --frozen --project "$FM" python)
+fi
 
 exec "${CHECK_CMD[@]}" "$FM/scripts/sweep_orphan_flag_markers.py" --check "$@"
