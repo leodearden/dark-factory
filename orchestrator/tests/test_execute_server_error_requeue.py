@@ -32,6 +32,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.cli_invoke import classify_agent_failure
 from test_liveness_boundary_gate import _make_workflow, _stub_iteration_helpers
 
 from orchestrator.agents.invoke import AgentResult
@@ -238,6 +239,73 @@ class TestExecuteIterationsRow2Row3Regression:
         assert outcome == WorkflowOutcome.BLOCKED
         assert mock_invoke.await_count == 2
         assert 'consecutive_zero_output=2' in wf._zero_output_hang_info['detail']  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# _execute_iterations — defensive invariant: the marker is composed into the
+# reason unconditionally, even when classify_agent_failure's precedence
+# ladder hands back a marker-less summary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestExecuteIterationsMarkerAlwaysComposed:
+    """The task's own mandate: return REQUEUED "... with the marker in the
+    reason AND the structured field set" — UNCONDITIONALLY, not only when
+    ``classify_agent_failure``'s precedence ladder happens to lead with it.
+
+    This is a DEFENSIVE invariant, not a bug fix: no shape below is
+    production-reachable today. ``classify_agent_failure`` rule 3 (the
+    marker producer) fires only under three negative guards —
+    ``not is_timed_out_with_progress(result)``, ``result.subtype !=
+    'error_max_turns'``, ``not isinstance(outcome, ModelNotFound)`` — each
+    of which requires a flag combination a pre-first-token 5xx kill does
+    not produce. This test trips one of those guards
+    (``subtype='error_max_turns'``) alongside a genuine zero-output 5xx, so
+    rule 3 DEFERS and the next rule, ``if result.timed_out:``, claims it:
+    ``cls.summary`` becomes ``'agent timed out after 1200000ms with no
+    transcript turns (wedge — no progress made)'`` — carrying NO marker at
+    all — even though the workflow's OWN entry guard (``is_server_error_status``,
+    a different predicate owned by a different module, ``orchestrator/``
+    rather than ``shared/``) still classifies this exact result as a 5xx
+    requeue. A reason that misdescribes a provider-outage requeue as a
+    "wedge" is actively misleading to an operator, so the marker must be
+    composed in regardless of what the classifier's precedence hands back.
+    """
+
+    async def test_reason_carries_marker_even_when_classifier_summary_does_not(
+        self, tmp_path,
+    ) -> None:
+        result = _zero_output_result(api_error_status=529, subtype='error_max_turns')
+
+        # Premise check: fail LOUDLY (not vacuously) if α's precedence ever
+        # changes and this shape stops exercising the divergence this test
+        # exists to guard.
+        cls = classify_agent_failure(result)
+        assert 'agent API error: HTTP 529' not in cls.summary, (
+            "classify_agent_failure's rule 3 no longer defers for "
+            "subtype='error_max_turns' — this shape no longer exercises the "
+            'marker/no-marker divergence; re-derive a shape that does.'
+        )
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        _stub_iteration_helpers(wf, result)
+        wf.scheduler.set_task_status = AsyncMock()  # type: ignore[method-assign]
+        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        report = wf._terminal_report
+        assert report is not None
+        assert 'agent API error: HTTP 529' in report.reason, (
+            f'marker missing from reason: {report.reason!r}'
+        )
+        assert report.api_error_status == 529
+        # The marker-only legacy fallback (scheduler.py's _API_ERROR_REASON_RE)
+        # must reach the same verdict a field-first reader would — i.e. a
+        # consumer reading only the prose still classifies this transient.
+        assert is_transient_api_requeue(report.reason, api_error_status=None) is True
 
 
 # ---------------------------------------------------------------------------
