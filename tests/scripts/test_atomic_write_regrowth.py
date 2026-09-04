@@ -591,6 +591,19 @@ def _iter_source_files():
     yield from _walk_trees(_SRC_TREES)
 
 
+#: The one helper ``test_atomic_write_text_helpers_only_delegate`` must always
+#: still be looking at.  Same role as ``_CONTROL_MODULES`` further down, for the
+#: same reason: that test's skip condition is membership in
+#: ``_ALLOWED_RENAMERS``, so every future allowlist entry silences one more
+#: name, and a bare "did we find any?" check degrades one entry at a time until
+#: it is checking nothing.  prompt_artifact is the strongest available control —
+#: it is the helper ``test_prompt_artifact.py`` monkeypatches at five sites, so
+#: it is load-bearing for another suite and cannot quietly disappear.  If it
+#: genuinely moves, REPOINT this at another delegating helper rather than
+#: deleting the assertion, which would restore the vacuity it exists to prevent.
+_DELEGATE_CONTROL = 'shared/src/shared/prompt_artifact.py::_atomic_write_text'
+
+
 class TestNoRegrownAtomicWriters:
     """The consolidated pattern cannot silently re-duplicate."""
 
@@ -764,8 +777,16 @@ class TestNoRegrownAtomicWriters:
         implementation (skipped by path), and session_registry's and
         bake_off_storage_shape's copies are allowlisted exceptions (skipped by
         _ALLOWED_RENAMERS).  Re-run the test to learn today's numbers.
+
+        THAT NARROWNESS IS THE REASON FOR THE FENCE BELOW.  Three of six is
+        already thin, the widening to six trees added zero delegate coverage,
+        and one allowlist entry (bake_off) deliberately removed one — so the
+        trend is downward and every future entry costs another name.  The
+        docstring above USED to be the only thing recording that; it is now
+        asserted, against a named control, so the drift reports itself.
         """
         offenders = []
+        checked = []
         for module in _scan_source_trees():
             if module.relpath == 'shared/src/shared/safe_io.py':
                 continue  # the blessed implementation lives here
@@ -776,8 +797,29 @@ class TestNoRegrownAtomicWriters:
                     # it is stdlib-only so spawn-claude.sh can run it with no
                     # venv, and importing shared makes it unimportable there.
                     continue
+                checked.append(f'{module.relpath}::{name}')
                 if not delegates:
                     offenders.append(f'{module.relpath}::{name} does not delegate')
+
+        # ANTI-VACUITY, in the same shape as `assert pointers` in the pointer
+        # sweep below and `_CONTROL_MODULES` in the tree check.  This test was
+        # the only one in the module without such a fence, and it is the one
+        # that most needs it: its skip condition is membership in
+        # _ALLOWED_RENAMERS, so every entry added there silences one more name,
+        # silently and by design.  Without this it could iterate all 509
+        # scanned files, collect nothing, and report green forever.
+        assert checked, (
+            'The delegate check examined no helpers. Real ones exist '
+            f'({_DELEGATE_CONTROL}), so an empty result means the walk or the '
+            'name filter regressed, not that the repo got clean.'
+        )
+        assert _DELEGATE_CONTROL in checked, (
+            f'{_DELEGATE_CONTROL} is no longer being checked. Either it moved '
+            '(repoint _DELEGATE_CONTROL at another delegating helper) or it '
+            'was added to _ALLOWED_RENAMERS, which SILENCES this test for that '
+            f'name — an allowlist entry buys off both guards at once. Checked: '
+            f'{sorted(checked)}'
+        )
 
         assert not offenders, (
             'These helpers stopped delegating to shared.safe_io.atomic_write_text '
