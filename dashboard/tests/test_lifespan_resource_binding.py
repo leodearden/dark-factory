@@ -22,7 +22,8 @@ The contract asserted here has two halves, and the asymmetry is deliberate:
 * **Handles bind to arguments.** ``pool`` and ``http_client`` are passed into
   ``_metrics_loop`` by the lifespan that created them and are never re-read
   from ``app.state``.  ``lifespan`` likewise binds ``config`` to a local for
-  its own startup reads, closing the interleave window across
+  its own startup reads — both store paths and the burndown loop's config
+  argument — closing the interleave window across
   ``await burndown_store.open()``.
 * **Config binds to ``app.state``.** ``_run_once`` re-reads
   ``app.state.config`` every cycle **on purpose**: ~25 tests swap
@@ -39,11 +40,17 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from dashboard.app import _BurndownStore, _metrics_loop, _MetricsStore
+from dashboard.app import (
+    _build_http_limits,
+    _BurndownStore,
+    _metrics_loop,
+    _MetricsStore,
+)
 from dashboard.config import DashboardConfig
 
 
@@ -56,8 +63,7 @@ async def _noop_burndown_loop(*args: object, **kwargs: object) -> None:
     return None
 
 
-@pytest.mark.asyncio
-async def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
+def test_nested_lifespans_each_get_their_own_pool_and_client() -> None:
     """A lifespan's metrics loop gets the DbPool/AsyncClient THAT lifespan built.
 
     Nests two ``TestClient(app)`` contexts over the shared global ``app`` — the
@@ -168,37 +174,70 @@ async def _noop_metrics_loop(*args: object, **kwargs: object) -> None:
     return None
 
 
-@pytest.mark.asyncio
-async def test_lifespan_binds_burndown_loop_to_the_config_it_built() -> None:
-    """The burndown loop gets the config ITS OWN lifespan built, not a later swap.
+def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> None:
+    """Every startup read binds to the config THIS lifespan built, not a later swap.
 
-    ``lifespan`` assigns ``app.state.config`` at the top of startup but reads it
-    back for ``burndown_path``, ``_burndown_loop`` and ``metrics_path`` only
-    afterwards -- with ``await burndown_store.open()`` in between.  That await is
-    a real suspension point, so a concurrently starting lifespan can install its
-    own config before the reads happen, and this lifespan then wires its loops to
-    a config it never built.
+    ``lifespan`` assigns ``app.state.config`` at the top of startup and then
+    consumes it three more times: ``burndown_path``, ``_burndown_loop``\'s
+    config argument, and ``metrics_path``.  ``await burndown_store.open()``
+    sits between the first and the last two, and that await is a real
+    suspension point -- so a concurrently starting lifespan can install its own
+    config there and this one would wire its store paths and loops to a config
+    it never built.
 
-    The interleave is simulated deterministically by swapping ``app.state.config``
-    from inside ``_BurndownStore.open`` -- exactly the window a second lifespan
-    would occupy.
+    The interleave is simulated deterministically by swapping
+    ``app.state.config`` from inside the lifespan itself.  The swap is
+    installed at the EARLIEST reachable hook -- ``_build_http_limits``, the
+    first call after ``app.state.config`` is assigned -- rather than only
+    inside ``_BurndownStore.open``.  Two reasons:
+
+    * ``burndown_path`` is read BEFORE the first await, so a swap confined to
+      the ``open()`` window cannot reach it and an ``app.state`` re-read there
+      would go unpunished.  Installing the swap earlier pins the whole
+      invariant ("startup never re-reads ``app.state.config`` after building
+      its own") rather than only the window that happens to be reachable
+      today -- which would silently stop being enough the moment an ``await``
+      is introduced earlier in startup.
+    * It subsumes the genuine ``open()`` window: ``captured['across_await']``
+      below asserts the foreign config is still installed there, so the two
+      post-await reads are exposed to it exactly as a real interleave would.
+
+    The interleaving config points at a DIFFERENT project_root, so every
+    derived path (``burndown_db``, ``metrics_db``) differs in VALUE and not
+    merely in object identity -- without that the two store-path assertions
+    would hold under a swap and prove nothing.
+
+    Not pinned here: ``_build_http_limits``\'s own argument, because that call
+    IS the hook (its argument is evaluated before the swap runs).  It derives
+    a connection-pool bound and touches no path or handle, so a stale read
+    there is inert.
     """
     from dashboard.app import app
 
+    real_build_http_limits = _build_http_limits
     real_open = _BurndownStore.open
     captured: dict[str, Any] = {}
 
-    async def _swapping_open(self: _BurndownStore) -> None:
+    # A DIVERGENT project_root -- burndown_db/metrics_db derive from it, so the
+    # swapped config's paths differ in value from the lifespan's own.  Under
+    # tmp_path, so a regression that actually opens these writes nothing
+    # outside pytest's temp tree.
+    swapped = DashboardConfig(project_root=tmp_path / 'interleaved-root')
+
+    def _swapping_limits(config: DashboardConfig) -> httpx.Limits:
+        # Stand in for an interleaving lifespan, at the earliest point after
+        # this lifespan installed its own config on app.state.
+        captured['original'] = app.state.config
+        app.state.config = swapped
+        return real_build_http_limits(config)
+
+    async def _recording_open(self: _BurndownStore) -> None:
         # Real open first: the lifespan must still get a usable store.
         await real_open(self)
-        # Now stand in for an interleaving lifespan reaching this window.
-        original = app.state.config
-        captured['original'] = original
-        # Same project_root, so every derived path stays valid and the lifespan
-        # completes -- only the config OBJECT identity differs.
-        swapped = DashboardConfig(project_root=original.project_root)
-        app.state.config = swapped
-        captured['swapped'] = swapped
+        # The genuine interleave window.  Recorded (not swapped again) to prove
+        # the foreign config is installed across it, so the reads that follow
+        # would pick it up if they went through app.state.
+        captured['across_await'] = app.state.config
 
     recorded: list[Any] = []
 
@@ -212,12 +251,15 @@ async def test_lifespan_binds_burndown_loop_to_the_config_it_built() -> None:
     config_before = getattr(app.state, 'config', None)
     try:
         with (
-            patch.object(_BurndownStore, 'open', _swapping_open),
+            patch('dashboard.app._build_http_limits', new=_swapping_limits),
+            patch.object(_BurndownStore, 'open', _recording_open),
             patch('dashboard.app._burndown_loop', new=_recording_burndown_loop),
             patch('dashboard.app._metrics_loop', new=_noop_metrics_loop),
             TestClient(app),
         ):
-            pass
+            # Read inside the lifespan: these are what startup actually built.
+            burndown_db_path = app.state.burndown_store.db_path
+            metrics_db_path = app.state.metrics_db_path
     finally:
         # Do not leak a hand-built config into sibling tests; every lifespan
         # rebuilds it from_env anyway, so this only restores the idle state.
@@ -225,20 +267,48 @@ async def test_lifespan_binds_burndown_loop_to_the_config_it_built() -> None:
             app.state.config = config_before
 
     assert 'original' in captured, (
-        'task 3771: _BurndownStore.open was never called -- the simulated interleave '
+        'task 3771: _build_http_limits was never called -- the simulated interleave '
         'never ran, so this test proves nothing'
     )
-    assert captured['original'] is not captured['swapped'], (
+    original = captured['original']
+    assert original is not swapped, (
         'task 3771: the simulated interleave must install a DISTINCT config object'
     )
+    # Precondition for the two path assertions below: the roots really diverge,
+    # so "came from the lifespan\'s own config" is observable by VALUE.
+    assert original.burndown_db != swapped.burndown_db, (
+        'task 3771: the interleaving config must derive DIFFERENT store paths, '
+        'or the store-path assertions below hold under a swap and prove nothing'
+    )
+    assert original.metrics_db != swapped.metrics_db, (
+        'task 3771: the interleaving config must derive DIFFERENT store paths, '
+        'or the store-path assertions below hold under a swap and prove nothing'
+    )
+    assert captured.get('across_await') is swapped, (
+        'task 3771: the foreign config must still be installed on app.state across '
+        'await burndown_store.open() -- otherwise the post-await reads were never '
+        'actually exposed to an interleave and the assertions below are vacuous'
+    )
+
     assert len(recorded) == 1, (
         f'task 3771: expected exactly one _burndown_loop start per lifespan, '
         f'got {len(recorded)}'
     )
-    assert recorded[0] is captured['original'], (
+    assert recorded[0] is original, (
         'task 3771 INTERLEAVE: _burndown_loop received a config installed on app.state '
         'AFTER its own lifespan built one -- lifespan must bind config to a local before '
         'the first await, not re-read app.state.config across it'
+    )
+    assert burndown_db_path == original.burndown_db, (
+        f'task 3771 INTERLEAVE: the burndown store opened {burndown_db_path}, derived '
+        f'from a config this lifespan did not build (expected {original.burndown_db}). '
+        f'burndown_path must come from the lifespan-local config.'
+    )
+    assert metrics_db_path == original.metrics_db, (
+        f'task 3771 INTERLEAVE: the metrics store opened {metrics_db_path}, derived '
+        f'from a config this lifespan did not build (expected {original.metrics_db}). '
+        f'metrics_path must come from the lifespan-local config -- it is read AFTER '
+        f'await burndown_store.open(), squarely inside the interleave window.'
     )
 
 
