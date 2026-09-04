@@ -1829,6 +1829,277 @@ class TestTTLCacheBoundedBypassInheritance:
             )
 
 
+
+class TestTTLCacheBoundsLiveBypassesPerKey:
+    """A wedged key must never accumulate live refreshes without bound.
+
+    Second reviewer finding (task 4789): bounding INHERITANCE made the
+    supersession loop create a NEW bypass task roughly once per
+    bound-window and never cancel the abandoned one, so during a TRUE
+    wedge in-flight refreshes for that key grow forever (~1 per 15s,
+    ~4/min). Each parked refresh pins a connection on the process-wide
+    ``httpx.AsyncClient``, whose pool is at least 100 connections
+    (``app._build_http_limits``, ``_HTTP_MIN_CONNECTIONS``), so after
+    ~25 minutes the SHARED pool saturates and every unrelated endpoint
+    family starts raising ``httpx.PoolTimeout`` -- converting the
+    incident's per-key outage (3 of 14 endpoints dead, 11 healthy for the
+    full 19.8h) into a whole-dashboard one.
+
+    ``TestTTLCacheBoundedBypassInheritance::test_bypass_concurrency_stays_bounded_while_callers_pile_up``
+    does not catch this: it asserts the RATE
+    (``calls['n'] <= 2 + elapsed / bound``) over a single 0.2s window, and
+    a rate bound holds forever while the TOTAL still diverges. These tests
+    assert the TOTAL, over many bound-windows.
+
+    Every method monkeypatches ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` to a small
+    value and uses the REAL clock. They deliberately create tasks that
+    never complete, so teardown cancels everything outstanding.
+    """
+
+    @staticmethod
+    async def _cancel_all(*tasks):
+        live = [t for t in tasks if t is not None]
+        for t in live:
+            t.cancel()
+        if live:
+            await asyncio.gather(*live, return_exceptions=True)
+
+    async def test_total_live_refreshes_stay_under_the_cap_across_many_windows(
+        self, monkeypatch
+    ):
+        """The reviewer's explicitly requested regression test.
+
+        Drives many bound-windows' worth of timed-out callers against a
+        refresh that NEVER returns, and asserts the total number of started
+        refreshes stays at or under ``_MAX_LIVE_BYPASSES_PER_KEY``. On the
+        pre-fix code this grows by one per window without limit.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        # Pinned explicitly, and asserted against the LITERAL below rather
+        # than against the constant: an assertion phrased as
+        # `calls['n'] <= fanout_mod._MAX_LIVE_BYPASSES_PER_KEY` is vacuous
+        # -- MEASURED, it passes against an effectively-uncapped build
+        # because both sides move together, which is exactly the pre-fix
+        # code this test exists to fail against.
+        monkeypatch.setattr(fanout_mod, '_MAX_LIVE_BYPASSES_PER_KEY', 3)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        calls = {'n': 0}
+        wedged = asyncio.Event()  # never set -- a genuinely unresolved future
+
+        async def _refresh():
+            calls['n'] += 1
+            await wedged.wait()
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        # Hold the key's lock directly so every caller below times out
+        # acquiring it, the same idiom the sibling bypass tests use.
+        lock = cache._locks.setdefault('k', asyncio.Lock())
+        await lock.acquire()
+
+        waiters = []
+        try:
+            # ~15 bound-windows, with fresh callers arriving throughout --
+            # far more than enough for the pre-fix one-per-window growth to
+            # blow past the cap.
+            start = time.monotonic()
+            while time.monotonic() - start < 0.30:
+                waiters.append(
+                    asyncio.create_task(cache.get_or_refresh('k', _refresh))
+                )
+                await asyncio.sleep(0.01)
+            elapsed = time.monotonic() - start
+            windows = elapsed / fanout_mod._LOCK_ACQUIRE_TIMEOUT_SECONDS
+
+            assert windows >= 5, (
+                f'precondition: the run must cover several bound-windows to '
+                f'distinguish a TOTAL bound from a RATE bound, got {windows:.1f}'
+            )
+            assert calls['n'] <= 3, (
+                'a wedged key must never start more than 3 live refreshes '
+                f"however long the wedge lasts, got {calls['n']} over "
+                f'{windows:.1f} bound-windows -- each one pins a connection '
+                'on the shared httpx pool'
+            )
+            live = [t for t in cache._live_bypasses.get('k', []) if not t.done()]
+            assert len(live) <= 3, (
+                f'the live roster itself must respect the cap, got {len(live)}'
+            )
+        finally:
+            lock.release()
+            await self._cancel_all(*waiters, *cache._live_bypasses.get('k', []))
+
+    async def test_the_cap_is_per_key_so_a_wedge_cannot_starve_other_keys(
+        self, monkeypatch
+    ):
+        """Acceptance #2: unaffected keys stay unaffected.
+
+        The cap is the resource-isolation mechanism, so it must not itself
+        become a cross-key coupling: a healthy key must still refresh
+        normally while a different key sits pinned at its cap.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        wedged = asyncio.Event()  # never set
+
+        async def _wedging_refresh():
+            await wedged.wait()
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        async def _healthy_refresh():
+            return 'healthy'
+
+        wedged_lock = cache._locks.setdefault('wedged', asyncio.Lock())
+        await wedged_lock.acquire()
+
+        waiters = []
+        try:
+            start = time.monotonic()
+            while time.monotonic() - start < 0.20:
+                waiters.append(
+                    asyncio.create_task(
+                        cache.get_or_refresh('wedged', _wedging_refresh)
+                    )
+                )
+                await asyncio.sleep(0.01)
+
+            assert cache._live_bypasses.get('wedged'), (
+                'precondition: the wedged key must have live bypasses pinned'
+            )
+
+            got = await asyncio.wait_for(
+                cache.get_or_refresh('healthy', _healthy_refresh), timeout=5.0
+            )
+            assert got == 'healthy'
+            assert cache.get_fresh('healthy') == 'healthy'
+            assert 'healthy' not in cache._live_bypasses, (
+                'a key that never timed out must never appear in the live '
+                'bypass roster at all'
+            )
+        finally:
+            wedged_lock.release()
+            await self._cancel_all(*waiters, *cache._live_bypasses.get('wedged', []))
+
+    async def test_declining_to_re_arm_at_the_cap_is_logged(self, monkeypatch, caplog):
+        """A silent cap would hide the next occurrence.
+
+        Same reasoning as the bypass and re-arm records: the 19.8h incident
+        ran unnoticed because nothing on the wedged path logged. Reaching
+        the cap is a distinct, operator-relevant state -- the key is now
+        deliberately NOT getting fresh attempts -- so it gets its own
+        worded record, throttled through the same per-key streak counter.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        wedged = asyncio.Event()  # never set
+
+        async def _refresh():
+            await wedged.wait()
+            raise AssertionError('unreachable: the wedged event is never set')
+
+        lock = cache._locks.setdefault('k', asyncio.Lock())
+        await lock.acquire()
+
+        waiters = []
+        try:
+            with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+                start = time.monotonic()
+                while time.monotonic() - start < 0.30:
+                    waiters.append(
+                        asyncio.create_task(cache.get_or_refresh('k', _refresh))
+                    )
+                    await asyncio.sleep(0.01)
+
+            records = [
+                r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout'
+            ]
+            # Matched on a phrase from the cap record ITSELF, not the bare
+            # word 'cap': _note_lock_bypass interpolates
+            # ``refresh.__qualname__`` into every record, and this method's
+            # own name contains 'cap', so the looser matcher passed against
+            # an uncapped build (MEASURED) -- a vacuous assertion.
+            cap_records = [
+                r for r in records
+                if 'live bypass refreshes' in r.getMessage()
+                or 'live-bypass cap' in r.getMessage()
+            ]
+            assert cap_records, (
+                'declining to re-arm at the live-bypass cap must leave its '
+                f'own trace, got: {[r.getMessage() for r in records]}'
+            )
+        finally:
+            lock.release()
+            await self._cancel_all(*waiters, *cache._live_bypasses.get('k', []))
+
+    async def test_a_finished_bypass_frees_a_cap_slot(self, monkeypatch):
+        """The cap counts LIVE work, not lifetime attempts.
+
+        A transiently slow key that recovers must not stay permanently
+        capped: once its refreshes complete they stop holding connections,
+        so they must stop counting. Pinned because the obvious wrong
+        implementation -- a monotonic per-key counter -- passes every
+        wedge test above and permanently wedges a key that recovered.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        monkeypatch.setattr(fanout_mod, '_MAX_LIVE_BYPASSES_PER_KEY', 3)
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        calls = {'n': 0}
+        release = asyncio.Event()
+
+        async def _refresh():
+            calls['n'] += 1
+            await release.wait()
+            return f"value-{calls['n']}"
+
+        lock = cache._locks.setdefault('k', asyncio.Lock())
+        await lock.acquire()
+
+        waiters = []
+        try:
+            start = time.monotonic()
+            while time.monotonic() - start < 0.20:
+                waiters.append(
+                    asyncio.create_task(cache.get_or_refresh('k', _refresh))
+                )
+                await asyncio.sleep(0.01)
+
+            assert calls['n'] <= 3
+
+            # Let every in-flight bypass finish, then confirm the roster
+            # drains and a later caller can still get a fresh refresh.
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(*waiters, return_exceptions=True), timeout=5.0
+            )
+            waiters = []
+            await asyncio.sleep(0)  # let done-callbacks run
+            assert not cache._live_bypasses.get('k'), (
+                'completed bypasses must be reclaimed from the live roster, '
+                f'got {cache._live_bypasses.get("k")}'
+            )
+
+            before = calls['n']
+            cache.clear()
+            cache._locks.setdefault('k', asyncio.Lock())
+            later = await asyncio.wait_for(
+                cache.get_or_refresh('k', _refresh), timeout=5.0
+            )
+            assert later.startswith('value-')
+            assert calls['n'] == before + 1, (
+                'a key whose bypasses all finished must not stay capped'
+            )
+        finally:
+            lock.release()
+            await self._cancel_all(*waiters)
+
+
 class TestTTLCacheEvictsDeadBypassEntries:
     """A DEAD bypass entry must actually be reclaimed, not merely harmless.
 
