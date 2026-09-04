@@ -2342,6 +2342,63 @@ def _truncate_clean(text: str, limit: int) -> str:
     return head.rstrip() + '…'
 
 
+# Bounds on the evidence pointers carried by the contradicted-verdict L1
+# escalation (task 4723).  Small on purpose: the escalation is a one-screen
+# alert a human triages, not a copy of the finding.
+_ESCALATION_EVIDENCE_PATH_LIMIT = 5      # at most N pointers in the detail
+_ESCALATION_EVIDENCE_PATH_MAXLEN = 200   # per-path char cap
+
+
+def _evidence_paths(
+    evidence: object,
+    *,
+    limit: int = _ESCALATION_EVIDENCE_PATH_LIMIT,
+    maxlen: int = _ESCALATION_EVIDENCE_PATH_MAXLEN,
+) -> list[str]:
+    """Bounded, deduped, sanitized ``file_path`` pointers from verifier evidence.
+
+    Feeds the contradicted-verdict L1 escalation's detail, which carries
+    POINTERS, not copies (INV-9).  The finding itself already has two homes —
+    the verification memory for the task and the ``verify|codebase|contradicted``
+    audit row for the run — so duplicating the verifier's summary or its
+    evidence snippets into the escalation would fork the record and let the
+    copy drift from the original.  What the triager needs is *where to look*.
+
+    Every read is defensive rather than trusting: ``evidence`` is agent-supplied
+    and ``verify.py``'s ``verification_complete`` tool schema does not mark
+    ``file_path`` required, so entries that are not dicts, that lack the key, or
+    whose value is not a non-blank ``str`` are SKIPPED rather than raising.  A
+    malformed entry costs its own pointer and nothing else — a garbled evidence
+    list must never be what suppresses a human alert.
+
+    De-duplication is on the truncated value and preserves first-seen order, so
+    a verdict citing one file at three line ranges yields one pointer.
+    """
+    if not isinstance(evidence, list):
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for entry in evidence:
+        if len(paths) >= limit:
+            break
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get('file_path')
+        if not isinstance(raw, str):
+            continue
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # _truncate_clean (task 2080) rather than a raw slice: a naive cut
+        # garbles a dense path mid-segment the same way it garbled a CSV note.
+        path = _truncate_clean(stripped, maxlen)
+        if path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths
+
+
 def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) -> str | None:
     """Format ``done_provenance`` into a landed-outcome completion echo, or None.
 
