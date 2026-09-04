@@ -35,12 +35,16 @@ from pathlib import Path
 import pytest
 from architecture_doc_transitions import (
     DOC_PATH,
+    diff_transition_edges,
     extract_lifecycle_mermaid,
     parse_state_diagram_edges,
     read_architecture_doc,
+    table_transition_edges,
 )
 
+from shared import task_transitions
 from shared.task_statuses import TaskStatus
+from shared.task_transitions import TRANSITIONS, ActorClass
 
 # shared/tests/test_architecture_doc_transition_parity.py -> parents[0]=shared/tests,
 # parents[1]=shared, parents[2]=repo root. Same idiom as
@@ -240,3 +244,69 @@ class TestParseStateDiagramEdges:
             isinstance(frm, TaskStatus) and isinstance(to, TaskStatus) for frm, to in edges
         )
         assert (TaskStatus.PENDING, TaskStatus.IN_PROGRESS) in edges
+
+
+class TestTableTransitionEdges:
+    """``table_transition_edges()`` — the table side of the parity check."""
+
+    def test_returns_union_over_all_actors(self):
+        # Recomputed from the imported TRANSITIONS rather than pinning a
+        # literal count, so this test does not itself become stale the next
+        # time an edge is added to the table.
+        expected = frozenset().union(*TRANSITIONS.values())
+        assert table_transition_edges() == expected
+
+    def test_every_element_is_a_taskstatus_pair(self):
+        edges = table_transition_edges()
+        assert edges
+        assert all(
+            isinstance(frm, TaskStatus) and isinstance(to, TaskStatus) for frm, to in edges
+        )
+
+    def test_reads_transitions_lazily_not_at_import_time(self, monkeypatch):
+        # LOAD-BEARING, not incidental: this is what makes the step-9
+        # mutation proofs mean anything. An import-time snapshot
+        # (`from shared.task_transitions import TRANSITIONS` bound at module
+        # scope, or an lru_cache) would survive this monkeypatch untouched
+        # and keep returning the real ~37-edge union — silently making every
+        # later mutation test vacuous.
+        mutated = {ActorClass.HUMAN: frozenset({(TaskStatus.PENDING, TaskStatus.REVIEW)})}
+        monkeypatch.setattr(task_transitions, 'TRANSITIONS', mutated)
+        assert table_transition_edges() == frozenset({(TaskStatus.PENDING, TaskStatus.REVIEW)})
+
+
+class TestDiffTransitionEdges:
+    """``diff_transition_edges(doc, table)`` — the set-difference comparator.
+
+    Every case asserts the ORIENTATION explicitly via the named fields
+    (``.missing_from_doc`` / ``.extra_in_doc``), not just set equality of
+    the pair — a comparator that silently swapped the two halves would
+    otherwise pass an equality-only check.
+    """
+
+    def test_identical_inputs_yield_empty_diff(self):
+        edges = frozenset({(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)})
+        diff = diff_transition_edges(edges, edges)
+        assert diff.missing_from_doc == frozenset()
+        assert diff.extra_in_doc == frozenset()
+
+    def test_table_only_edge_is_missing_from_doc(self):
+        doc_edges: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset()
+        table_edges = frozenset({(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)})
+        diff = diff_transition_edges(doc_edges, table_edges)
+        assert diff.missing_from_doc == frozenset({(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)})
+        assert diff.extra_in_doc == frozenset()
+
+    def test_doc_only_edge_is_extra_in_doc(self):
+        doc_edges = frozenset({(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)})
+        table_edges: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset()
+        diff = diff_transition_edges(doc_edges, table_edges)
+        assert diff.extra_in_doc == frozenset({(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)})
+        assert diff.missing_from_doc == frozenset()
+
+    def test_both_sided_divergence_reports_each_edge_on_exactly_one_side(self):
+        doc_edges = frozenset({(TaskStatus.PENDING, TaskStatus.REVIEW)})
+        table_edges = frozenset({(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)})
+        diff = diff_transition_edges(doc_edges, table_edges)
+        assert diff.missing_from_doc == frozenset({(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)})
+        assert diff.extra_in_doc == frozenset({(TaskStatus.PENDING, TaskStatus.REVIEW)})
