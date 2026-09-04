@@ -452,6 +452,10 @@ class TestNoInlinedFailClosedMarker:
     what lets the surviving per-suite rationale keep discussing the contract in
     words.
 
+    The sweep is exemption-free: it covers every `test_*.py` in this directory
+    INCLUDING this module, so there is no blind spot in which the guard could
+    tolerate the very literal it forbids everywhere else.
+
     The scripts under `scripts/` do contain the literal, since they EMIT it,
     and are correctly outside this sweep.
     """
@@ -459,12 +463,6 @@ class TestNoInlinedFailClosedMarker:
     def test_no_test_module_spells_the_fail_closed_marker(self) -> None:
         offenders: list[str] = []
         for path in _test_modules():
-            if path.name == pathlib.Path(__file__).name:
-                # The helper HOME's own test module. `TestPinnedLiterals` must
-                # spell both markers to pin them; every other reference in this
-                # file is composed from `FAIL_CLOSED_MARKERS`, so this exemption
-                # covers exactly the one deliberate pin and nothing else.
-                continue
             tree = parse_python_module(path)
             for node in ast.walk(tree):
                 if (
