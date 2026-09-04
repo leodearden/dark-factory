@@ -85,6 +85,12 @@ class FakeGraphitiClient:
         # Edges the next add_episode call should attribute to the episode it
         # mints — lets a test simulate extraction provenance without a real LLM.
         self.next_edges: list[Any] = []
+        # Edges retained per group, so ``search`` returns what ``add_episode``
+        # actually attributed (step-09). Keeping them keyed by group is what
+        # makes the group-scoping identity — registration writes
+        # ``payload['group_id']``, the filter reads ``scope.graphiti_group_id``
+        # — an assertion rather than an assumption.
+        self.edges_by_group: dict[str, list[Any]] = {}
 
     async def add_episode(
         self,
@@ -136,7 +142,29 @@ class FakeGraphitiClient:
         for edge in edges:
             # Attribute extracted edges to the uuid that actually exists.
             edge.episodes = [minted]
+        self.edges_by_group.setdefault(group_id, []).extend(edges)
         return self._results_for(node, edges=edges)
+
+    async def search(
+        self,
+        *,
+        query: str = '',
+        group_ids: list[str] | None = None,
+        num_results: int = 10,
+        **kwargs: Any,
+    ) -> list[Any]:
+        """Return the edges ``add_episode`` attributed, scoped by group.
+
+        Stateful for the same reason ``add_episode`` is: the point of step-09
+        is that the uuid the registry holds and the uuid on the edge's
+        ``episodes`` provenance are the SAME minted uuid.  A canned
+        ``AsyncMock(return_value=[MockEdge(episodes=['whatever'])])`` would let
+        the test assert that identity into existence instead of observing it.
+        """
+        out: list[Any] = []
+        for gid in group_ids or list(self.edges_by_group):
+            out.extend(self.edges_by_group.get(gid, []))
+        return out[:num_results]
 
     @staticmethod
     def _results_for(episode: SimpleNamespace, *, edges: list[Any]) -> SimpleNamespace:
@@ -170,6 +198,13 @@ def _backend_with_fake(mock_config) -> tuple[GraphitiBackend, FakeGraphitiClient
     fake = FakeGraphitiClient()
     backend.client = fake  # type: ignore[assignment]
     backend._client_for = MagicMock(return_value=fake)  # type: ignore[method-assign]
+    # GraphitiBackend.search resolves a per-group driver CLONE off the real
+    # FalkorDB driver before delegating to the client, and there is no real
+    # driver here. The clone is only ever forwarded to client.search(driver=...),
+    # which the fake ignores — so stubbing it keeps the real backend (its
+    # @_canonicalize_group_args entry, group_ids plumbing and read timeout) in
+    # the path while making the read seam reachable without a live graph.
+    backend._driver_for = MagicMock(return_value=None)  # type: ignore[method-assign]
     # Real _identity_lock_for already works on a real backend; this additionally
     # no-ops _resolve_or_create_entity so the post-write reconcile sweeps cannot
     # reach a (nonexistent) FalkorDB driver.
@@ -637,3 +672,152 @@ class TestEpisodeIdIsACorrelationId:
             f'({minted_uuid!r}); otherwise the mapping is unrecoverable. '
             f'Records seen: {[r.getMessage() for r in caplog.records]}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-09: acceptance criterion 2 with teeth — the planning episode is actually
+# FILTERED OUT of default search, not merely registered
+# ---------------------------------------------------------------------------
+
+
+async def _execute_planning_round_trip(
+    svc, fake, *, content: str, edge_fact: str, temporal_context: str | None
+) -> tuple[str, Any]:
+    """Enqueue + execute one episode carrying one extracted edge.
+
+    Returns ``(minted_uuid, edge)``.  The edge is attributed by the fake to the
+    uuid graphiti_core actually minted, exactly as upstream attributes real
+    extraction provenance.
+    """
+    from _fm_helpers import MockEdge
+
+    edge = MockEdge(fact=edge_fact, uuid='edge-under-test')
+    fake.next_edges = [edge]
+
+    await svc.add_episode(
+        content=content, project_id='p', temporal_context=temporal_context
+    )
+    await svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
+
+    assert len(fake.episodes) == 1
+    return next(iter(fake.episodes)), edge
+
+
+async def _graphiti_only_search(svc, query: str, **kwargs: Any) -> list[Any]:
+    """``svc.search`` restricted to the seam under test.
+
+    ``stores=['graphiti']`` takes ``ReadRouter.route``'s override branch, so no
+    classification (and no LLM) runs, and ``_search_mem0`` is never scheduled.
+    ``anchor_topics=False`` skips the topic-anchoring pin, whose Qdrant
+    round-trip is unrelated to planned-episode filtering.
+    """
+    return await svc.search(
+        query, project_id='p', stores=['graphiti'], anchor_topics=False, **kwargs
+    )
+
+
+class TestPlanningEpisodeIsFilteredFromSearch:
+    """Acceptance 2, end to end: registered under the uuid the FILTER reads.
+
+    The three tests in :class:`TestPlanningRegistrationKeysOnTheRealUuid` prove
+    ``is_planned(minted_uuid)``.  That is necessary but not sufficient: before
+    this task, registration stored a uuid naming no graph node, so
+    ``_search_graphiti`` compared ``get_planned_uuids(...)`` against edge
+    episode provenance and never matched — the criterion passed as a
+    registration fact while failing as a *filtering* fact, silently, which is
+    exactly the shape the task description calls out.  These tests close that
+    gap by asserting the registry key and the edge's provenance are literally
+    the same string, and then that the filter acts on it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_planning_edge_is_excluded_from_default_search(
+        self, svc_fake_registry
+    ):
+        svc, fake, reg = svc_fake_registry
+
+        minted_uuid, edge = await _execute_planning_round_trip(
+            svc, fake,
+            content='We plan to modularize the merge queue',
+            edge_fact='PRD: MergeQueue is decomposed into a planner and a worker',
+            temporal_context='planning',
+        )
+
+        # THE IDENTITY, asserted directly — this is the whole fix. Registration
+        # keys on result.episode.uuid and provenance carries the same minted
+        # uuid, so the set-membership test in _search_graphiti can match.
+        assert edge.episodes == [minted_uuid]
+        assert await reg.get_planned_uuids('p') == {minted_uuid}, (
+            'The registry must hold exactly the minted uuid, under the group the '
+            'filter reads (scope.graphiti_group_id). Registration writes '
+            "payload['group_id']; if those two ever diverge the filter silently "
+            'sees an empty planned set.'
+        )
+
+        results = await _graphiti_only_search(svc, 'merge queue')
+
+        assert results == [], (
+            'A planning episode’s edge must not appear in default search '
+            f'results. Got {[r.content for r in results]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_planning_edge_surfaces_and_is_marked_with_include_planned(
+        self, svc_fake_registry
+    ):
+        svc, fake, _reg = svc_fake_registry
+
+        minted_uuid, _edge = await _execute_planning_round_trip(
+            svc, fake,
+            content='We plan to modularize the merge queue',
+            edge_fact='PRD: MergeQueue is decomposed into a planner and a worker',
+            temporal_context='planning',
+        )
+
+        results = await _graphiti_only_search(
+            svc, 'merge queue', include_planned=True
+        )
+
+        assert len(results) == 1, (
+            'include_planned=True must surface the planning edge that the '
+            f'default search excludes. Got {results!r}'
+        )
+        assert results[0].metadata.get('planned') is True, (
+            "A surfaced planning edge must be marked metadata['planned'] = True "
+            'so the caller can tell aspiration from fact; got '
+            f'{results[0].metadata!r}'
+        )
+        assert results[0].provenance == [minted_uuid], (
+            'The surfaced edge must carry the minted uuid as its provenance — '
+            'that is the identity the filter matched on.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_planning_edge_is_not_excluded(self, svc_fake_registry):
+        """The filter must be narrow: only planning episodes are withheld.
+
+        Without this, a fix that registered EVERY episode would pass both tests
+        above while making default search return nothing at all.
+        """
+        svc, fake, reg = svc_fake_registry
+
+        minted_uuid, edge = await _execute_planning_round_trip(
+            svc, fake,
+            content='The merge queue was modularized in commit abc123',
+            edge_fact='MergeQueue was decomposed into a planner and a worker',
+            temporal_context=None,
+        )
+
+        assert edge.episodes == [minted_uuid]
+        assert await reg.get_planned_uuids('p') == set(), (
+            'A non-planning episode must never be registered as planned.'
+        )
+
+        results = await _graphiti_only_search(svc, 'merge queue')
+
+        assert len(results) == 1, (
+            'A factual episode’s edge must survive the default filter; got '
+            f'{results!r}'
+        )
+        assert results[0].metadata.get('planned') is not True
+        assert results[0].provenance == [minted_uuid]
