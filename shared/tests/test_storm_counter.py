@@ -639,6 +639,164 @@ class TestDistinctKeyOffByDefault:
         }
 
 
+class TestLatchedFireMode:
+    """``fire_mode='latched'`` — fire once on the CROSSING, not once per window.
+
+    The default ``rate_limited`` mode answers "this burst is still going" once
+    per window, which is right for a counter whose consumer logs or escalates
+    a standing condition. It is NOT right for
+    ``fused_memory/services/memory_metadata_census.py::UnknownKeyStormDetector``,
+    which sits on the live memory-write path: its filer does an
+    open-escalation ``queue.get_by_task`` read per invocation, so re-answering
+    once per window would buy a queue read for a condition already filed. Its
+    docstring states the contract as "the crossing is the event — not the
+    state", and it re-arms only once the window drains back below the
+    threshold, so a writer that drifts, is fixed, and later drifts again is
+    heard both times.
+
+    The two policies are genuinely different, not two spellings of one thing —
+    see ``test_latched_does_not_re_fire_across_a_full_window``, which drives
+    one trace through both modes and gets different answers.
+    """
+
+    def test_fire_mode_defaults_to_rate_limited(self, counter):
+        """Every pre-existing consumer keeps the mode it was written against."""
+        assert counter.fire_mode == 'rate_limited'
+        assert StormCounter().fire_mode == 'rate_limited'
+
+    def test_fire_mode_is_readable_back(self):
+        """Exposed for the reason ``count_distinct`` is (task 3259's amendment).
+
+        A consumer whose correctness depends on the policy must be able to pin
+        it through a supported surface instead of reaching into another
+        package's private attributes.
+        """
+        assert StormCounter(fire_mode='latched').fire_mode == 'latched'
+
+    def test_an_unknown_fire_mode_raises(self):
+        """A mode mismatch is a deterministic wiring bug in the call site.
+
+        Defaulting a misspelled mode to ``rate_limited`` would silently degrade
+        a latched consumer to per-window re-firing — invisible in the return
+        value, the summary and the logs alike, exactly like the ``key``-on-a-
+        default-mode-counter case this class's sibling covers (INV
+        no-silent-fail-soft).
+        """
+        with pytest.raises(ValueError) as excinfo:
+            StormCounter(fire_mode='latch')
+
+        message = str(excinfo.value)
+        assert 'latch' in message, 'the offending value must be named'
+        assert 'rate_limited' in message and 'latched' in message, (
+            'both accepted spellings must be named, so the fix is in the error'
+        )
+
+    def test_latched_fires_exactly_on_the_crossing_call(self, clock):
+        """The return SHAPE is mode-independent; only the fire policy differs."""
+        counter = StormCounter(time_provider=clock, fire_mode='latched')
+
+        results = [
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+            for _ in range(3)
+        ]
+
+        assert [r is None for r in results] == [True, True, False]
+        assert results[-1] == {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 300.0,
+            'labels': ['p'],
+        }
+
+    def test_latched_does_not_re_fire_across_a_full_window(self, clock):
+        """THE DISCRIMINATOR between the latch and the per-window rate limit.
+
+        A writer that stays continuously over the line fires ONCE under the
+        latch and once PER WINDOW under the rate limit. The identical trace is
+        driven through both modes here so the difference is executable rather
+        than asserted in prose: at t=400 the default counter's last fire is
+        398s old (>= the 300s window) while its sliding window still holds
+        three events, so it fires again — and the latched one, never having
+        dropped below the threshold, stays silent.
+
+        Without this trace a per-window rate limit would pass the census's own
+        ``test_does_not_re_fire_after_crossing``, which never advances the
+        clock.
+        """
+        latched = StormCounter(time_provider=clock, fire_mode='latched')
+        rate_limited = StormCounter(time_provider=clock)
+
+        def drive(offset):
+            clock.now = 1000.0 + offset
+            return (
+                latched.record(threshold=3, window_seconds=300.0, label='p'),
+                rate_limited.record(threshold=3, window_seconds=300.0, label='p'),
+            )
+
+        assert [r is not None for r in drive(0)] == [False, False]
+        assert [r is not None for r in drive(1)] == [False, False]
+        assert [r is not None for r in drive(2)] == [True, True], 'both cross here'
+
+        for offset in (100, 200, 300):
+            assert [r is not None for r in drive(offset)] == [False, False], (
+                f'still inside the rate limit at t={offset}'
+            )
+
+        latched_at_400, rate_limited_at_400 = drive(400)
+        assert rate_limited_at_400 is not None, (
+            'the rate limit re-arms a full window after its fire'
+        )
+        assert latched_at_400 is None, (
+            'the latch reports the crossing, not the standing state'
+        )
+
+    def test_latched_re_arms_once_the_window_drains_below_the_threshold(self, clock):
+        """Drift, fix, drift again — heard both times."""
+        counter = StormCounter(time_provider=clock, fire_mode='latched')
+
+        first = [
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+            for _ in range(3)
+        ]
+        assert [r is not None for r in first] == [False, False, True]
+
+        clock.advance(301.0)
+        second = [
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+            for _ in range(3)
+        ]
+
+        assert [r is not None for r in second] == [False, False, True]
+
+    def test_latched_and_count_distinct_are_orthogonal(self, clock):
+        """Two independent dimensions, not one mode enum.
+
+        ``count_distinct`` decides WHAT is counted; ``fire_mode`` decides WHEN
+        the count is reported. A consumer may need either, both or neither.
+        """
+        counter = StormCounter(
+            time_provider=clock, count_distinct=True, fire_mode='latched'
+        )
+
+        for _ in range(5):
+            assert counter.record(
+                threshold=3, window_seconds=300.0, label='p', key='same'
+            ) is None, 'one repeated key is one distinct key, however many events'
+
+        assert counter.record(
+            threshold=3, window_seconds=300.0, label='p', key='second'
+        ) is None
+        summary = counter.record(
+            threshold=3, window_seconds=300.0, label='p', key='third'
+        )
+
+        assert summary is not None, 'the third DISTINCT key crosses'
+        assert summary['count'] == 3, 'distinct keys, not the 7 raw events'
+        assert counter.record(
+            threshold=3, window_seconds=300.0, label='p', key='fourth'
+        ) is None, 'and the latch still suppresses the follow-up'
+
+
 class TestPruneReturnsRawCountInDistinctMode:
     """``prune()`` keeps reporting REMAINING EVENTS, never distinct keys.
 
