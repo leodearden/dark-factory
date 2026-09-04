@@ -768,25 +768,29 @@ TOOL_CALL_REJECTION_GUIDANCE = _TOOL_CALL_REJECTION_KNOWN_SHAPES + MISSING_REQUI
 # allowlists, and
 # test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
 # asserts any fully-qualified MCP tool a prompt names is in THAT role's
-# allowed_tools; `Edit`, `Read` and `ToolSearch` are all builtins and do not
+# allowed_tools; `Edit` and `ToolSearch` are both builtins and do not
 # match that regex. No literal `{`/`}` braces -- role prompts reach this
 # only by plain `+` concatenation. No sighting COUNT in the prose -- the
 # codebook accrues a new sighting every census cycle, and a number baked
 # into a role prompt goes stale silently.
 ERROR_REMEDY_HINT_GUIDANCE = """
-## A tool error's remedy hint names a parameter, not a new tool
+## A tool error's remedy hint may name a parameter — check your tool list first
 
 When a tool result rejects your call and its remedy clause names a bare
-identifier ("set X to true", "pass Y"), that identifier is a PARAMETER of
+identifier ("set X to true", "pass Y"), the discriminator is whether that
+identifier is in your own tool list. If it is NOT, it is a PARAMETER of
 the tool that just errored — not a tool you can call. Re-issue THAT SAME
 tool call with the parameter set, carrying over every argument from the
 failed call; the remedy names the one field to change, not a standalone
-action.
+action. If it IS in your tool list — e.g. a deferred tool's rejection
+naming `ToolSearch` — call it for real: that is a genuine "call this tool
+first," already covered by the section above, not this one.
 
-Catalogued sighting: `Edit` failed with "Found 3 matches of the string to
-replace, but replace_all is false", and the next turn called a bare
-`replace_all` with an empty argument object — rejected with "No such tool
-available: replace_all", one turn lost. The empty argument object is the
+Catalogued sighting of the parameter case: `Edit` failed with "Found 3
+matches of the string to replace, but replace_all is false", and the next
+turn called a bare `replace_all` with an empty argument object — rejected
+with "No such tool available: replace_all", one turn lost. `replace_all`
+never appears in any tool list; the empty argument object is the other
 tell: read as a tool, the name carries nothing from the failed edit, so
 there is nothing for it to act on.
 
@@ -795,11 +799,6 @@ INTENT: re-issue `Edit` with `replace_all: true` only if you really do
 mean every occurrence; otherwise lengthen `old_string` until it matches
 uniquely. The hint reports why the edit was refused; it is not a claim
 that replacing all of them is what you wanted.
-
-A short pointer, not a repeat: before calling a tool name you have not
-seen in your own tool list, check the list. "No such tool available"
-spans several distinct causes, and the deferred-tool case — which needs
-`ToolSearch` first — is already covered by the section above.
 """
 
 
