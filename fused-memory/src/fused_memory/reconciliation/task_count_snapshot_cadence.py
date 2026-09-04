@@ -42,9 +42,12 @@ task-count snapshot is NEVER persisted as a Graphiti ``temporal_facts``
 edge, for ANY project, so the absence of such an edge is never evidence of
 a failed or rejected write. The former un-namespaced spellings were dumped
 verbatim into Stage 3's payload and the judge prompt, where both read them
-as Graphiti persistence claims and filed a false discrepancy. See
-:data:`LEGACY_SNAPSHOT_WRITTEN_STAT_KEY` for the read-only back-compat
-alias.
+as Graphiti persistence claims and filed a false discrepancy.
+
+A read-only alias for the pre-rename spelling was retired in task 3488, once
+measurement confirmed no journal row inside the harness's lookback window
+could still change the computed miss streak. A pre-rename row now reads as
+unknown, which STOPS the streak — the fail-safe direction.
 
 This module has zero imports from ``stages/`` or ``harness`` — it is pure and
 side-effect-free so both can import from it without a dependency cycle.

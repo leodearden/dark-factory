@@ -4356,12 +4356,12 @@ class ReconciliationHarness:
         (``task_count_snapshot_mem0_written``, already computed by
         ``TaskKnowledgeSync.run()``'s post-flight check); only a CONFIRMED
         current miss (``False`` — not a fresh write and not an
-        inconclusive/unknown check) is eligible to escalate.  Journal rows
-        persisted before the task-3045 rename carry the old
-        ``task_count_snapshot_written`` spelling and are still honored, via
-        ``extract_snapshot_written``'s legacy-key fallback — without it the
-        streak below would stop dead at the first pre-rename row.  The prior
-        consecutive-miss streak is recomputed each call from
+        inconclusive/unknown check) is eligible to escalate.  A read-only
+        alias for the pre-task-3045 stat spelling was retired in task 3488,
+        once measurement confirmed no journal row inside the lookback window
+        below could still change the computed streak; a pre-rename row now
+        reads as unknown, which stops the streak rather than extending it.
+        The prior consecutive-miss streak is recomputed each call from
         ``journal.get_recent_runs`` — mirroring ``_finding_persistence_count``'s
         journal-recompute pattern — rather than a stored counter, so it
         naturally resets on any successful write and survives a harness
