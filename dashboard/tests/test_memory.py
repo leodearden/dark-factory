@@ -897,6 +897,111 @@ class TestAggregatingLoopsLogFailuresAtWarning:
         )
 
 
+# ── one hung url must not starve the hand-rolled per-URL loops ──
+
+
+class _PortHangingHandler:
+    """Handshake+respond normally, except *hang_port*'s ``tools/call``, which parks.
+
+    ``fail_port`` in :class:`_SessionAwareHandler` models a server that is
+    DOWN; this models one that is UP and silent — the shape a per-HTTP-request
+    budget cannot bound, and the one that used to park an aggregating loop
+    before it ever reached the remaining urls.
+    """
+
+    def __init__(self, tool_response: dict, *, hang_port: int):
+        self.tool_response = tool_response
+        self.hang_port = hang_port
+        self._never = asyncio.Event()
+        self.ports_seen: set[int] = set()
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        port = request.url.port
+        assert port is not None, f'Request to {request.url} has no port'
+        self.ports_seen.add(port)
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        rid = body.get('id', 1)
+        if method == 'initialize':
+            return mcp_init_response(rid)
+        if method.startswith('notifications/'):
+            return mcp_notify_response()
+        if port == self.hang_port:
+            await self._never.wait()
+            raise AssertionError('unreachable')  # pragma: no cover
+        return mcp_tool_response(self.tool_response, rid)
+
+
+class TestHandRolledLoopsBoundEachUrl:
+    """get_queue_stats / get_wal_status visit ALL N urls, in a plain for-loop.
+
+    Neither goes through ``first_success``, so neither inherited its
+    whole-operation deadline: a url that accepted the request and then went
+    silent parked the loop forever, and the remaining urls were never visited —
+    the aggregate simply never returned. Each url now gets the same
+    ``call_with_deadline`` bound, after which the hung url is logged,
+    invalidated and skipped.
+
+    The outer ``asyncio.wait_for(..., 5)`` is mandatory: without it a
+    regression is SIGALRM-killed at the suite's 60s pytest-timeout with no
+    traceback instead of failing fast.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _short_deadline(self, monkeypatch):
+        from dashboard.data import mcp_fanout
+
+        monkeypatch.setattr(mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', 0.05)
+
+    async def test_get_queue_stats_skips_the_hung_url_and_aggregates_the_rest(
+        self, two_url_config,
+    ):
+        from dashboard.data.memory import _get_session, _sessions, get_queue_stats
+
+        hung = 'http://localhost:9000'
+        _get_session(hung)
+        handler = _PortHangingHandler(_QUEUE_STATS_PAYLOAD, hang_port=9000)
+        transport = httpx.MockTransport(handler)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await asyncio.wait_for(
+                get_queue_stats(client, two_url_config), timeout=5,
+            )
+
+        assert 'offline' not in result, (
+            f'the healthy server must still aggregate, got {result}'
+        )
+        assert result['counts']['pending'] == 3, (
+            f"port 9001's contribution must be present, got {result}"
+        )
+        assert 9001 in handler.ports_seen, 'the loop must reach the second url'
+        assert hung not in _sessions, "the hung url's session must be evicted"
+
+    async def test_get_wal_status_skips_the_hung_url_and_reports_the_rest(
+        self, two_url_config,
+    ):
+        from dashboard.data.memory import _get_session, _sessions, get_wal_status
+
+        hung = 'http://localhost:9000'
+        _get_session(hung)
+        stores = {'graphiti': {'busy': 0}}
+        handler = _PortHangingHandler({'stores': stores}, hang_port=9000)
+        transport = httpx.MockTransport(handler)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await asyncio.wait_for(
+                get_wal_status(client, two_url_config), timeout=5,
+            )
+
+        assert 'offline' not in result, (
+            f'the healthy server must still report, got {result}'
+        )
+        assert result['stores'] == {'http://localhost:9001': stores}, (
+            f"only port 9001's per-url entry is expected, got {result}"
+        )
+        assert 9001 in handler.ports_seen, 'the loop must reach the second url'
+        assert hung not in _sessions, "the hung url's session must be evicted"
+
 # ── Malformed responses ─────────────────────────────────────────
 
 
