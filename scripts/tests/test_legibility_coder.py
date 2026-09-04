@@ -659,6 +659,7 @@ def test_code_digest_exit_zero_cap_reason_names_the_marker():
         invoke=fake_invoke,
     )
     assert result.capped is True
+    assert result.reason is not None, "a capped digest must still record WHY"
     assert "weekly limit" in result.reason.lower(), (
         f"the reason must quote WHICH signal fired -- 'deferred: weekly "
         f"limit' and 'deferred' are different messages to the operator "
