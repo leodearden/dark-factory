@@ -1743,6 +1743,13 @@ class TargetedReconciler:
                 task_id,
             )
             return None
+        # Rebound to locals because pyright's narrowing above does NOT reach
+        # into the nested `_file` scope below: a module-level global could be
+        # reassigned between closure capture and call, so reading
+        # `Escalation`/`EscalationQueue` there re-widens to `... | None` and
+        # trips reportOptionalCall.  These locals are never reassigned, so the
+        # narrowed types survive into the closure.
+        esc_cls, queue_cls = Escalation, EscalationQueue
 
         # One line, and a free-text title must not be what breaks that
         # contract — hence both the newline scrub and the bounded truncate.
@@ -1778,8 +1785,8 @@ class TargetedReconciler:
             # contradicted branch would create data/escalations/ in every
             # target project as a side effect of an unrelated done
             # transition — the trap _escalation_pin_index_for documents.
-            queue = EscalationQueue(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
-            esc = Escalation(
+            queue = queue_cls(Path(project_root) / _ESCALATION_QUEUE_DIRNAME)
+            esc = esc_cls(
                 id=queue.make_id(task_id),
                 task_id=task_id,
                 agent_role='reconciler',
