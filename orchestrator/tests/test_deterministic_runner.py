@@ -5464,6 +5464,88 @@ class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
 
 
 # ---------------------------------------------------------------------------
+# Task 4048 (recovered task-2240 review suggestion, part 2): the deploy-path
+# write in _file_milestone_gate_and_block — both the step-2 stamp-only skip
+# arm and the legal-edge full advance — must be best-effort, mirroring
+# _file_infra_issue_and_block's try/except around its own advance. A
+# transient failure (e.g. a severed fused-memory connection) must not
+# propagate out of run() as a raw exception (the "run() always returns
+# BLOCKED, never a raw exception" contract, deterministic_runner.py::
+# DeterministicRunner._file_infra_issue_and_block docstring).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileMilestoneGateAdvanceIsBestEffort:
+    """A transient failure inside the deploy-path write (either arm of the
+    step-2 fork) must not propagate out of _file_milestone_gate_and_block —
+    the milestone_gate escalation filed above is already durable regardless."""
+
+    async def test_transient_advance_failure_on_legal_edge_does_not_propagate(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Legal RAN->ESCALATED edge: the full _advance_deploy_phase arm is
+        taken and its update_task fails."""
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase='ran')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        scheduler.update_task = AsyncMock(side_effect=RuntimeError('connection severed'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.deterministic_runner'):
+            outcome = await runner._file_milestone_gate_and_block(
+                '4048', task, task['metadata'],
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+        warned = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'deploy_state phase-escalated advance failed' in warned
+
+    @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
+    async def test_transient_stamp_failure_on_skip_path_does_not_propagate(
+        self, tmp_path: Path, seeded_phase: str,
+    ) -> None:
+        """Already-at-target phase: the step-2 stamp-only fallback arm is
+        taken and its update_task fails."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase=seeded_phase)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        scheduler.update_task = AsyncMock(side_effect=RuntimeError('connection severed'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+
+
+# ---------------------------------------------------------------------------
 # Step-5: B7b — verify-fail: stale/missing PID or non-fresh timestamp
 # (RED until step-6 implements the verify-fail path)
 # ---------------------------------------------------------------------------
