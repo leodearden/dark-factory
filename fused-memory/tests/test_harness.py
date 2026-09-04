@@ -5501,6 +5501,153 @@ async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_ca
     )
 
 
+@pytest.mark.asyncio
+async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 4431: _run_remediation_pass's finally (harness.py:5459) must
+    shield update_run_stage_reports (harness.py:5479) against a second
+    cancellation — the undocumented structural mirror of run_full_cycle's
+    finally, already covered above by
+    test_run_full_cycle_finally_persists_stage_reports_despite_a_second_cancellation.
+
+    Unlike run_full_cycle, _run_remediation_pass has NO `except
+    asyncio.CancelledError:` handler — only `except AllAccountsCappedException`
+    and `except Exception`, neither of which catches CancelledError (not an
+    Exception subclass since Python 3.8). So a cancelled stage here
+    propagates straight to the finally with no `_error` breadcrumb stamped.
+    What must survive the second cancellation instead is whatever real
+    stage_reports entries were already recorded before the cancelled stage:
+    this test lets Stage 1 (memory_consolidator) complete normally, then
+    cancels Stage 2 (task_knowledge_sync) mid-flight, and checks Stage 1's
+    report is not lost from the persisted run.
+
+    Same injection rig as the run_full_cycle test above: the second
+    cancellation is delivered from inside a `journal.update_run_stage_reports`
+    stub, one-shot-guarded, cancelling the driving task and yielding once
+    before delegating to the real implementation.
+
+    Expected to FAIL on the tree produced by step 2 (which shielded only
+    run_full_cycle) — that failure is the evidence this mirror is genuinely
+    unfixed, per harness.py:5473-5474's claim that update_run_stage_reports
+    is "placed strictly before ... so the persisted copy captures whatever
+    markers either arm stamped."
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    _mock_stage_run(harness.stages[0])
+
+    # Event set by slow_stage_run when it starts — ensures the first cancel
+    # fires inside the stage loop (Stage 2), after Stage 1 has recorded its
+    # real report into run.stage_reports.
+    stage_entered = asyncio.Event()
+
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[1],
+    ):
+        stage_entered.set()
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[1].run = slow_stage_run
+    _mock_stage_run(harness.stages[2])
+
+    # Capture the outer task reference so the mock can cancel it from within.
+    outer_task_ref: list = [None]
+    original_update = journal.update_run_stage_reports
+    first_call = [True]
+
+    async def self_cancelling_update(run_id, stage_reports):
+        if first_call[0]:
+            first_call[0] = False
+            # Simulate a second external cancellation arriving while the
+            # finally's persistence write is in flight.
+            outer_task_ref[0].cancel()
+            # Without asyncio.shield: this await runs in the outer task's own
+            # context, so the pending cancel fires here — CancelledError
+            # aborts the write before it ever reaches original_update.
+            # With asyncio.shield: this coroutine runs inside shield's own
+            # inner Task, unreached by the outer cancel, so sleep(0)
+            # completes and the write below proceeds.
+            await asyncio.sleep(0)
+        return await original_update(run_id, stage_reports)
+
+    journal.update_run_stage_reports = self_cancelling_update
+
+    outer_task = asyncio.create_task(
+        harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        ),
+    )
+    outer_task_ref[0] = outer_task
+
+    # Race the event against outer_task to avoid an infinite hang if the
+    # remediation pass fails before slow_stage_run (Stage 2) is invoked.
+    done, _ = await asyncio.wait(
+        [asyncio.ensure_future(stage_entered.wait()), outer_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if outer_task in done and not stage_entered.is_set():
+        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
+        pytest.fail(f'outer_task completed before slow_stage_run was invoked: {exc}')
+
+    # First cancellation: triggers CancelledError in slow_stage_run (Stage 2),
+    # which propagates uncaught (no except asyncio.CancelledError handler on
+    # this driver) straight to the finally, whose update_run_stage_reports
+    # call delivers the SECOND cancellation via self_cancelling_update.
+    outer_task.cancel()
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await outer_task
+
+    journal.update_run_stage_reports = original_update
+
+    assert not first_call[0], (
+        'self_cancelling_update never ran — this test no longer exercises '
+        "_run_remediation_pass's finally update_run_stage_reports call, so "
+        'it would pass vacuously regardless of whether the shield fix is present'
+    )
+
+    async def _stage_reports_persisted():
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        return recent[0] if recent and recent[0].stage_reports else None
+
+    persisted = await _poll_until(_stage_reports_persisted)
+    assert persisted is not None, (
+        'no remediation run with non-empty stage_reports was persisted for '
+        'test-project within the poll window — the finally never completed '
+        'its write'
+    )
+
+    assert persisted.run_type == 'remediation', (
+        'expected the persisted run to be the remediation pass, got '
+        f'run_type={persisted.run_type!r}'
+    )
+    assert 'memory_consolidator' in persisted.stage_reports, (
+        "_run_remediation_pass's finally must shield update_run_stage_reports "
+        '(harness.py:5479) so a second cancellation cannot discard the Stage 1 '
+        'report already recorded in run.stage_reports before this finally ran '
+        "— harness.py:5473-5474's claim that the call is \"placed strictly "
+        'before update_run_stage_reports so the persisted copy captures '
+        'whatever markers either arm stamped" is hollow while this write '
+        'stays unshielded'
+    )
+
+
 # ── Tests for _select_tier ────────────────────────────────────────────────────
 
 
