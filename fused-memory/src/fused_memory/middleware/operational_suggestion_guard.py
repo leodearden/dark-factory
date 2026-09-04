@@ -30,7 +30,8 @@ recon-stage-specific either.
   :func:`fused_memory.middleware.lock_charter_guard.extract_files`) — a
   declared code deliverable means this is not a files-less operational ask.
 - A code-change signal (``fix``/``bug``/``crash``/``implement``) is present
-  anywhere across title/description/details — mirrors
+  anywhere across title/description/details, scanned on STAMP-STRIPPED text
+  (see "Provenance-stamp carve-out" below) — mirrors
   ``operational_ask_registry._CODE_CHANGE_TITLE_SIGNALS``'s word set,
   defined locally here rather than imported across the module boundary
   (this codebase's established convention — see ``routing_intent_guard``,
@@ -54,6 +55,32 @@ recon-stage-specific either.
   collision patterns above, not every possible false positive; the
   ``operational_task_suggestion.flagged`` census WARNING rate remains the
   rollout signal to watch for anything it misses.
+
+## Provenance-stamp carve-out (task 4569, ported from task 4532)
+
+DF's own agents append machine-written provenance stamps to live task text
+(``[Stage 2 task-knowledge sync <date>] DOC-DRIFT FIX ...`` and siblings).
+Such a stamp's own wording used to arm the code-change suppression above and
+silently disarm THIS lint for that task — the operational ask was never
+flagged, even though nothing the filing author wrote suppressed it. The
+suppression scan therefore runs on text with those stamps stripped
+(:func:`_strip_provenance_stamps`).
+
+What a stamp IS, the observed corpus behind the recognizer's branches, and
+the directional-safety rule for widening it are written out ONCE, in
+``routing_intent_guard``'s module-docstring section of the same name — the
+canonical writeup for both guards. Do not restate it here; what is local to
+this module is only:
+
+- MONOTONICITY: the strip feeds the code-change SUPPRESSION scan only. The
+  marker loop below reads the RAW ``fields`` values, so the carve-out can
+  only turn ``None`` into a finding — never a finding into ``None``. A
+  marker living INSIDE a stamp consequently still fires, which is the same
+  (monotone) direction.
+- BLAST RADIUS: this guard is WARN-ONLY — there is no enforce/reject path
+  here at all — so the cost of an over-strip is a possible rise in the
+  ``operational_task_suggestion.flagged`` census WARNING rate, not a hard
+  reject of an honest submission.
 
 This module is declaration-only and WARN-ONLY: it never coerces
 ``task_kind`` or ``execution_class`` and never rejects a submission — see
@@ -93,6 +120,45 @@ _EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(
 # the defense against a genuine code task whose prose merely mentions
 # operational terminology in passing (e.g. "Fix the restart-loop bug").
 _CODE_CHANGE_SIGNALS_RE = re.compile(r'\b(?:fix|bug|crash|implement)\w*\b', re.IGNORECASE)
+
+# Recognizer for a machine-injected provenance stamp. Ported verbatim from
+# routing_intent_guard._PROVENANCE_STAMP_RE (task 4532) -- deliberately kept
+# byte-identical, private name included, so the parallel is greppable and a
+# future reader diffing the two guards sees intended equivalence rather than
+# accidental divergence. WHAT a stamp is, the observed corpus behind its
+# branches and the directional-safety rule for widening it live in ONE place:
+# routing_intent_guard.py's module-docstring "Provenance-stamp carve-out"
+# section. Only the constraints local to this pattern are noted here, each at
+# the sub-pattern it governs -- they exist to keep the recognizer NARROW,
+# since over-stripping is the one direction that can manufacture a finding
+# out of authored prose.
+_PROVENANCE_STAMP_RE = re.compile(
+    # An appended annotation block starts its own line. Without this anchor an
+    # inline "... [re-verified 2026-08-06] ..." swallows the rest of the
+    # sentence, losing the author's own code-change signal.
+    r'^[ \t]*'
+    r'\['
+    r'[^\]\n]{0,160}\d{4}-\d{2}-\d{2}[^\]\n]{0,160}'  # any DATED annotation stamp
+    r'\]'
+    # Not a markdown link: DF task prose routinely opens a line with
+    # "[Stage 1 stall detector](fused-memory/.../stage1_stall_detector.py)",
+    # and treating that as a stamp strips a whole AUTHORED paragraph.
+    r'(?!\()'
+    # ... through the end of THIS paragraph only. Without the bound, an
+    # authored "fix" in a paragraph AFTER the stamp is stripped too, quietly
+    # widening the carve-out. The terminator is line-ending agnostic:
+    # matching only "\n[ \t]*\n" would miss a CRLF blank line ("\r\n\r\n",
+    # which "[ \t]*" cannot span), so a stamp in pasted Windows/browser text
+    # would strip to the END OF THE FIELD.
+    r'(?:(?!\r?\n[ \t\r]*\r?\n).)*',
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+
+
+def _strip_provenance_stamps(text: str) -> str:
+    """Return *text* with machine-injected provenance-stamp spans removed."""
+    return _PROVENANCE_STAMP_RE.sub(' ', text)
+
 
 # (compiled regex, marker label) -- each anchored to a whole word so a
 # marker does not spuriously fire on a substring occurrence inside an
@@ -199,7 +265,12 @@ def operational_suggestion_finding(
         'details': details or '',
     }
 
-    combined = ' '.join(fields.values())
+    # Suppression scan only: strip machine-injected provenance stamps first,
+    # per field, so an appended annotation's own wording cannot arm the
+    # code-change signal (task 4569, ported from task 4532). The marker loop
+    # below deliberately scans the RAW `fields` values -- see the module
+    # docstring's monotonicity invariant.
+    combined = ' '.join(_strip_provenance_stamps(v) for v in fields.values())
     if _CODE_CHANGE_SIGNALS_RE.search(combined):
         return None
 
