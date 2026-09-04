@@ -223,3 +223,24 @@ def test_cli_timeout_from_env_negative_raises(monkeypatch):
         _cli_timeout_from_env()
     assert "RECON_BUSY_CHECK_TEST_TIMEOUT" in str(excinfo.value)
     assert "-1" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# _run_cli() wiring: the resolved budget must actually reach subprocess.run
+# — this is the regression this task exists to fix. Behavioural (spy on
+# subprocess.run) rather than inspect.signature-based, so it survives a
+# refactor that moves resolution out of the default argument, and it spawns
+# no interpreter.
+# ---------------------------------------------------------------------------
+
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="idle\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("{}")
+    assert captured["timeout"] == _CLI_TIMEOUT
+    assert captured["timeout"] >= 60
