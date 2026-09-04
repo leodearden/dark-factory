@@ -2122,6 +2122,18 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            # The PROSE half of the same invariant (task 4818), merged from the
+            # same shared assembly immediately after the structured triple above
+            # and carrying the same stageN_ prefix from STAGE_STAT_PREFIX. It is
+            # WARN-ONLY: it never drops a citation and never mutates a finding,
+            # so its whole observable output is these four counters plus a log
+            # line. All four are reported rather than just the phantom count,
+            # because a bare prose_phantom_citations: 0 cannot distinguish "we
+            # scanned and everything is clean" from "nothing was scannable".
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
             # Always present (task 3084), set before the remediation early-return
             # beside the task-2312/2229 pre-inits above. All three stay 0 here:
             # this stage's filtered_task_tree is unset, so the
@@ -2317,6 +2329,18 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            # The PROSE half of the same invariant (task 4818), merged from the
+            # same shared assembly immediately after the structured triple above
+            # and carrying the same stageN_ prefix from STAGE_STAT_PREFIX. It is
+            # WARN-ONLY: it never drops a citation and never mutates a finding,
+            # so its whole observable output is these four counters plus a log
+            # line. All four are reported rather than just the phantom count,
+            # because a bare prose_phantom_citations: 0 cannot distinguish "we
+            # scanned and everything is clean" from "nothing was scannable".
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
             # Always present (task 3084), set before the remediation early-return
             # beside the task-2312/2229 pre-inits above. All three stay 0 here:
             # this stage's filtered_task_tree is unset, so the
