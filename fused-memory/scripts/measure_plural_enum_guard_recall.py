@@ -40,6 +40,23 @@ shapes at all' (nothing to measure) from 'the corpus contains them and the
 guard is eating them' (a real recall cost). Without it a headline zero is
 uninterpretable.
 
+``near_miss`` is the REPORTABLE number derived from it:
+``lexical_precondition - regex_matched``, i.e. facts that carried the shape
+and did NOT match in full. That is what the artifacts label 'near-miss',
+because the raw precondition count CONTAINS the full matches and labelling
+it so invites a reader to subtract two columns of which one is a subset of
+the other. The subtraction is exact rather than approximate:
+PLURAL_ENUM_SNAPSHOT_RE's pattern literally begins
+``\\btasks\\b\\s*#?\\s*(?P<ids>\\d++``, so ``_LEXICAL_PRECONDITION_RE`` is a
+literal PREFIX of it and ``regex_matched <= lexical_precondition`` is an
+identity, not an observed coincidence — a prefix cannot fail where the whole
+pattern succeeded. Both patterns are editable, so the identity is pinned
+mechanically over the shared pinned corpora by
+``tests/test_measure_plural_enum_guard_recall.py::
+test_the_lexical_precondition_is_a_superset_of_the_full_regex``; without
+that gate a drifting pattern could drive ``near_miss`` negative and the
+report would render a nonsense column with nothing failing.
+
 Regenerate:
 
     cd fused-memory && uv run python scripts/measure_plural_enum_guard_recall.py
@@ -116,6 +133,27 @@ class ScanResult:
     guard_rejected: int = 0
     selected: int = 0
     rejections: list[Rejection] = field(default_factory=list)
+
+    @property
+    def near_miss(self) -> int:
+        """Facts carrying the shape that did NOT match the full regex.
+
+        DERIVED, deliberately: not a counted field and not a ``_sum_scans``
+        term. A separately-accumulated counter can drift from the two numbers
+        it is supposed to be the difference of, while this one cannot — and
+        because ``_sum_scans`` already sums both inputs, the totals row's
+        near-miss count is automatically consistent with every project row's
+        without a third accumulation to keep in step.
+
+        Non-negative by an identity, not by luck:
+        ``_LEXICAL_PRECONDITION_RE`` is a literal prefix of
+        PLURAL_ENUM_SNAPSHOT_RE, so every fact counted in ``regex_matched``
+        was already counted in ``lexical_precondition``. The mechanical guard
+        on that claim is
+        ``test_the_lexical_precondition_is_a_superset_of_the_full_regex``,
+        parametrized over the shared pinned corpora.
+        """
+        return self.lexical_precondition - self.regex_matched
 
 
 def scan_corpus(facts: Iterable[str]) -> ScanResult:
@@ -1198,7 +1236,10 @@ def _sorted_projects(report: Report) -> list[ProjectReport]:
 def _scan_payload(scan: ScanResult) -> dict[str, Any]:
     return {
         'facts_scanned': scan.facts_scanned,
+        # Both, and both named accurately: the raw counter under its own
+        # name, and the derived number the near-miss column reports.
         'lexical_precondition': scan.lexical_precondition,
+        'near_miss': scan.near_miss,
         'regex_matched': scan.regex_matched,
         'guard_rejected': scan.guard_rejected,
         'selected': scan.selected,
@@ -1333,14 +1374,14 @@ def render_markdown(report: Report) -> str:
         scan = project.scan
         lines.append(
             f'| `{project.project_id}` | {project.valid_edges:,} | '
-            f'{scan.lexical_precondition:,} | {scan.regex_matched:,} | '
+            f'{scan.near_miss:,} | {scan.regex_matched:,} | '
             f'{scan.guard_rejected:,} | {scan.selected:,} | '
             f'{"yes" if project.complete else "**NO**"} |'
         )
     totals = report.totals
     lines += [
         f'| **(all)** | **{report.total_valid_edges:,}** | '
-        f'**{totals.lexical_precondition:,}** | **{totals.regex_matched:,}** | '
+        f'**{totals.near_miss:,}** | **{totals.regex_matched:,}** | '
         f'**{totals.guard_rejected:,}** | **{totals.selected:,}** | '
         f'**{"yes" if report.complete else "NO"}** |',
         '',
@@ -1359,6 +1400,16 @@ def render_markdown(report: Report) -> str:
         'The near-miss column is what makes a zero interpretable: it separates '
         '"the corpus holds no plural-task shapes at all" from "it holds them '
         'and the guard is eating them".',
+        '',
+        f'It is a PARTITION, not an overlapping count. The '
+        f'{totals.lexical_precondition:,} fact(s) carrying the `tasks <n>` '
+        f'shape split into the {totals.regex_matched:,} that also matched the '
+        f'full regex (the `regex matches` column) and the '
+        f'{totals.near_miss:,} that did not (the near-miss column). The two '
+        f'are disjoint and sum to the shape count, so the columns can be '
+        f'added; the near-miss column deliberately does NOT report the raw '
+        f'shape count, which contains the regex matches and cannot be '
+        f'subtracted from them.',
         '',
         '## Rejection triage',
         '',
