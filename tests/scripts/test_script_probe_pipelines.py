@@ -418,3 +418,75 @@ def test_import_wait_reports_healthy_on_a_clean_ping(tmp_path):
     combined = result.stdout + result.stderr
     assert _HEALTHY in combined, combined
     assert _NOT_HEALTHY not in combined, combined
+
+
+# --- import-data.sh section 8: the FalkorDB health check --------------------
+# `end_after` is required so the slice runs THROUGH the `else` arm to the
+# block's own closing `fi` rather than stopping short at the `if`'s. Both
+# anchors occur exactly once, on non-comment lines, and survive the fix.
+# Verified to yield the 9-line block.
+_IMPORT_HEALTH_START = 'info "Health checks"'
+_IMPORT_HEALTH_END = "\nfi\n"
+_IMPORT_HEALTH_END_AFTER = 'warn "FalkorDB: not responding"'
+
+# Matched on the PREFIX: the same stub answers the DBSIZE call inside the
+# success arm, so the parenthesised count is whatever the scenario happened to
+# print and is irrelevant to the verdict under test.
+_PONG_OK = "OK FalkorDB: PONG"
+_NOT_RESPONDING = "WARN FalkorDB: not responding"
+
+
+def _run_import_health(tmp_path, exec_body):
+    """Slice import-data.sh's section-8 health check and run it against a scripted docker."""
+    return _run_probe(
+        tmp_path,
+        slice_section(
+            IMPORT_DATA_PATH,
+            _IMPORT_HEALTH_START,
+            _IMPORT_HEALTH_END,
+            end_after=_IMPORT_HEALTH_END_AFTER,
+        ),
+        docker_body=_dispatch_stub_body((('*" exec "*', exec_body),)),
+    )
+
+
+def test_import_health_reports_pong_when_the_ping_exits_nonzero(tmp_path):
+    """A FalkorDB that answered PONG is responding, whatever the exec's own status was.
+
+    This is the LAST thing the import prints about FalkorDB, so a misread here
+    is the operator's closing signal: a successful import reported as a
+    database that never came back.
+    """
+    result = _run_import_health(tmp_path, _match_then_nonzero("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PONG_OK in combined, combined
+    assert _NOT_RESPONDING not in combined, combined
+
+
+def test_import_health_reports_pong_when_the_ping_is_sigpiped(tmp_path):
+    """A producer still writing when grep matches dies of SIGPIPE; PONG was still said."""
+    result = _run_import_health(tmp_path, _match_then_bulk("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PONG_OK in combined, combined
+    assert _NOT_RESPONDING not in combined, combined
+
+
+def test_import_health_reports_not_responding_when_the_ping_says_nothing(tmp_path):
+    """No reply is genuinely not responding — reached WITHOUT aborting the import."""
+    result = _run_import_health(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_RESPONDING in combined, combined
+    assert _PONG_OK not in combined, combined
+
+
+def test_import_health_reports_pong_on_a_clean_ping(tmp_path):
+    """Characterization: the ordinary path answers PONG and exits 0."""
+    result = _run_import_health(tmp_path, _clean_match("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PONG_OK in combined, combined
+    assert _NOT_RESPONDING not in combined, combined
