@@ -681,12 +681,26 @@ class TestLatchedFireMode:
         value, the summary and the logs alike, exactly like the ``key``-on-a-
         default-mode-counter case this class's sibling covers (INV
         no-silent-fail-soft).
+
+        The pyright suppression is the POINT, not a workaround: ``fire_mode``
+        is a ``Literal`` (:data:`shared.storm_counter.FireMode`), so a typed
+        caller is caught statically and this runtime backstop only has to cover
+        the untyped ones (a dict-splatted kwarg, a plain-script import). Same
+        shape as ``test_startup_completion_probe.py::
+        test_an_unknown_kind_is_rejected_loudly``.
         """
         with pytest.raises(ValueError) as excinfo:
-            StormCounter(fire_mode='latch')
+            StormCounter(fire_mode='latch')  # pyright: ignore[reportArgumentType]
 
         message = str(excinfo.value)
-        assert 'latch' in message, 'the offending value must be named'
+        # The closing quote is load-bearing. A bare ``'latch' in message`` is
+        # VACUOUS: the accepted spelling ``'latched'`` — which the next
+        # assertion requires the message to list — contains ``latch`` as a
+        # substring, so the check would stay green even if the message never
+        # interpolated the offending value at all, which is the exact
+        # regression it claims to guard. ``"'latch'"`` cannot occur inside
+        # ``'latched'``.
+        assert "fire_mode='latch'" in message, 'the offending value must be named'
         assert 'rate_limited' in message and 'latched' in message, (
             'both accepted spellings must be named, so the fix is in the error'
         )

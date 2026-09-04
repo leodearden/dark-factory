@@ -50,12 +50,23 @@ from __future__ import annotations
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal, get_args
 
-#: The accepted ``fire_mode`` spellings, public so a consumer can name the
-#: policy against the constant rather than re-typing the literal. See the
-#: module docstring's FIRE POLICY note for what each one means.
-FIRE_MODES: tuple[str, ...] = ('rate_limited', 'latched')
+#: The accepted ``fire_mode`` spellings as a TYPE. The mode is structural and
+#: fixed by the call site (see the class docstring), which is exactly the case
+#: a ``Literal`` closes statically: a misspelling is then caught by pyright —
+#: which this repo gates on in pre-commit — instead of surfacing only as a
+#: runtime ``ValueError`` the first time that call site constructs a counter.
+#: ``count_distinct`` gets this property for free by being a ``bool``; a bare
+#: ``str`` would be the one spelling of this mode that throws it away.
+FireMode = Literal['rate_limited', 'latched']
+
+#: The accepted ``fire_mode`` spellings as a VALUE, public so a consumer can
+#: name the policy against the constant rather than re-typing the literal.
+#: DERIVED from :data:`FireMode` rather than written out a second time, so the
+#: type and the constant cannot drift apart. See the module docstring's FIRE
+#: POLICY note for what each one means.
+FIRE_MODES: tuple[FireMode, ...] = get_args(FireMode)
 
 
 class StormCounter:
@@ -106,6 +117,13 @@ class StormCounter:
     likewise readable back off :attr:`fire_mode`, and an unrecognised spelling
     raises at construction for the same reason a mismatched ``key`` does.
 
+    Being structural is also why it is annotated :data:`FireMode` (a
+    ``Literal``) rather than ``str``: a call site that names the mode as a
+    literal — which is every call site, the mode not being a config leaf — has
+    its typo caught by pyright instead of by the constructor on first
+    construction. The ``ValueError`` stays as the backstop for the untyped
+    callers a ``Literal`` cannot reach.
+
     State is PROCESS-LOCAL and resets on restart, like every other in-process
     storm counter in this codebase: the counter exists to catch a live burst,
     not to keep durable statistics. It is also per-instance, so no state bleeds
@@ -120,8 +138,11 @@ class StormCounter:
         time_provider: Callable[[], float] = time.time,
         *,
         count_distinct: bool = False,
-        fire_mode: str = 'rate_limited',
+        fire_mode: FireMode = 'rate_limited',
     ) -> None:
+        # Kept despite the :data:`FireMode` annotation, which only closes the
+        # TYPED call sites: a mode arriving as a dynamically-computed string (a
+        # dict-splatted kwarg, a plain-script import) is still checked here.
         if fire_mode not in FIRE_MODES:
             raise ValueError(
                 f'fire_mode={fire_mode!r} is not a StormCounter fire mode; '
@@ -133,7 +154,10 @@ class StormCounter:
             )
         self._now = time_provider
         self._count_distinct = count_distinct
-        self._fire_mode = fire_mode
+        # Annotated, not inferred: pyright widens a literal to its base type
+        # when inferring a mutable attribute, which would make this ``str`` and
+        # silently drop the guarantee :data:`FireMode` exists to give.
+        self._fire_mode: FireMode = fire_mode
         self._events: deque[tuple[float, str | None, str | None]] = deque()
         self._last_fire_ts: float | None = None
         self._latched: bool = False
@@ -152,7 +176,7 @@ class StormCounter:
         return self._count_distinct
 
     @property
-    def fire_mode(self) -> str:
+    def fire_mode(self) -> FireMode:
         """Which FIRE POLICY this counter applies once the threshold is met.
 
         One of :data:`FIRE_MODES`. Read-only: the mode is structural and fixed
