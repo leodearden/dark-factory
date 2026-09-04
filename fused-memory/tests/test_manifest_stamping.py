@@ -296,22 +296,23 @@ async def test_round_trip_preserves_task_level_note_and_open_verdict(tmp_path):
     }
 
     reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
-    task_entry = reloaded['tasks'][0]
-    assert task_entry['label'] == 'gamma'
-    assert task_entry['task_id'] == 401
 
-    # The task-level `note:` survives the safe_dump write-back verbatim —
-    # the claim ManifestTask's docstring rests on.
-    assert task_entry['note'] == (
-        'SPLIT 2026-08-19. The original gamma row was one task across four '
-        'servers; this leaf carries fused-memory.'
-    )
+    # Whole-document equality against the fixture (task_id patched from
+    # null to the stamped value) is both shorter and strictly stronger than
+    # spot-checking individual leaves: it also covers doc-level keys (prd,
+    # schema_version), the task's title, and the grep row's full
+    # delivered_check body, none of which a narrower per-field check would
+    # re-read after the rewrite.
+    expected = yaml.safe_load(_NOTE_AND_OPEN_VERDICT_SIDECAR_YAML)
+    expected['tasks'][0]['task_id'] = 401
+    assert reloaded == expected
 
-    # The `verdict: OPEN` capability row is unchanged by the rewrite.
-    caps_by_name = {c['name']: c for c in task_entry['capabilities']}
-    assert caps_by_name['open_check']['verdict'] == 'OPEN'
-    assert 'delivered_check' not in caps_by_name['open_check']
-    assert caps_by_name['grep_check']['verdict'] == 'PASS'
+    # Named check for the specific claim this test exists to verify: the
+    # task-level `note:` survives the safe_dump write-back verbatim.
+    # Subsumed by the whole-document equality above; kept as documentation
+    # of intent, derived from the parsed fixture rather than retyped so it
+    # can't silently desync from it.
+    assert reloaded['tasks'][0]['note'] == expected['tasks'][0]['note']
 
     # An OPEN row has no delivered_check, so only the sibling grep check
     # copies into metadata.delivered_checks — mirrors
