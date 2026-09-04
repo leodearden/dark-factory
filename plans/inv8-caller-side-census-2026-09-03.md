@@ -26,6 +26,9 @@ A failure names every site whose disposition is missing (`unblessed`) or whose
 blessing outlived the site (`stale_keys`).
 
 Measured at HEAD `6696f1ce0c`: **167 files scanned, 60 findings.**
+Re-measured over the same 167 files after task 4484's review-amendment
+pass: **62 findings** — one withdrawn as a scanner false positive (§4a),
+three added by widening the vocabulary to `shutil.rmtree` (§4a).
 
 ---
 
@@ -90,7 +93,7 @@ landed. Do not re-open this line of enquiry.
 ## 4. The caller-side result
 
 60 findings across 167 files in `fused-memory/src`, collapsing to ~14 root
-causes. Severity triage, by kind:
+causes (62 after the amendment pass — see §4a). Severity triage, by kind:
 
 **Unbounded fan-out (worst).** `reconciliation/harness.py::ReconciliationHarness._escalate`
 — 9 async callers. The sync `_escalate` reaches `_finding_recently_resolved`,
@@ -128,7 +131,7 @@ so one fix closes 24 rows.
 
 **Startup-only — legitimately accepted, not a defect.**
 `server/main.py::run_server` calls `build_known_projects_map`
-(`yaml.safe_load`) before the server binds, so there is no concurrent work to
+(`open` of each project manifest, then `yaml.safe_load`) before the server binds, so there is no concurrent work to
 stall and no request latency to affect. This is the sole `accepted` row, and
 it states what makes the cost acceptable rather than merely that the call
 exists. Severity triage is part of the deliverable precisely so the ledger is
@@ -136,6 +139,50 @@ not 60 undifferentiated defects.
 
 **Already owned.** 6 rows are `filed`: 2 to task 4201 and 4 to task 3778's
 named live-workflow propagation set. This audit files nothing for those.
+
+## 4a. What the review-amendment pass changed
+
+Two of the five reviewer findings moved the numbers above. Recorded here
+because the §6 ticket table and the ledger both changed with them.
+
+**One row withdrawn as a scanner false positive.** The delivered scanner
+indexed `def`s at any nesting depth and resolved bare names against that
+index, ignoring Python scoping. So `services/completion_claim_gate.py`'s
+`_verify_task(claim, probe)` — where `probe` is a PARAMETER — resolved to the
+unrelated nested `make_commit_probe.probe`, which shells out to `git
+cat-file`, and the sweep reported
+`server/tools.py::create_mcp_server._completion_claim_gate -> verify_claims`
+as reaching `subprocess.run`. It does not: `verify_claims` is sync by design
+and its three probes are pre-resolved dict lookups awaited by the caller.
+Resolution now honours visibility (module-level defs plus the call's own
+enclosing scopes; a name shadowed by a parameter or a local binding resolves
+to nothing), the row is deleted, and the genuine neighbour
+`_claim_commit_presence -> make_commit_probe` is unaffected. The §6 ticket
+`tkt_0RT7RHBAS4A3VH976CE1CJMGK8` names both handlers and therefore overstates
+by one site.
+
+**Three rows added by a wider vocabulary.** `shutil.rmtree` was not in the
+table; adding it found `harness.py::{_recover_one_run, run_full_cycle,
+_run_remediation_pass}`, all three calling `cli_stage_runner.py::gc_run_config_dir`
+inline, which recursively deletes a run's per-run agent config dir on the loop
+thread. This is Gap B exactly — a primitive that was never enumerated is
+invisible however carefully the census is run — found by the guard rather than
+by a fourth batch. Also added at **zero** new rows: the builtin `open`,
+`json.load`/`json.dump`, `os.listdir`, `os.walk`, `subprocess.call`,
+`os.popen`, `urllib.request.urlopen`.
+
+**Deliberately still absent.** The directory-walk and metadata methods, with
+the measured counts that decided it: `mkdir` +18, `exists` +15, `open` as a
+method +7, `unlink` +5, `stat` +4, `iterdir` +4, `glob` +2. ~55 rows, each
+needing a hand-written disposition or the ledger becomes a page of "existing"
+waivers. Filed as its own triage task rather than smuggled into an amendment
+pass.
+
+**The network limb is nominal, and now says so.** No sync HTTP client is
+imported anywhere under `fused-memory/src` (no `requests`, no `httpx`, no
+`urllib.request` — only `urllib.parse`, which is string work). Both network
+entries exist so the first sync client to land is a finding; neither enforces
+anything today.
 
 ## 5. Headline finding: four same-shape sites in one file, two of them unfiled
 
@@ -180,7 +227,10 @@ with its task id is the follow-up work when the tickets resolve.
 
 Eleven root causes, all 53 `to_file` rows.  The `scope.resolve_main_checkout`
 cold miss is one ticket covering two clusters (the 22 MCP handlers and the 2
-reconciliation callers) because one fix closes both.
+reconciliation callers) because one fix closes both.  The amendment pass
+added two more tickets (§4a): the `harness.py` rmtree cluster it found, and
+the method-vocabulary triage it declined to do inline.  The last carries 0
+rows on purpose — it is work on the gate, not a blessing for a site.
 
 | root cause | rows | ticket |
 |---|---|---|
@@ -195,6 +245,8 @@ reconciliation callers) because one fix closes both.
 | `memory_consolidator.py::_assemble_remediation_payload` | 1 | `tkt_0RT7RK22JXVDXBHRXR2PVHKQ21` |
 | `targeted.py::_sweep_cancelled_descendants` → `is_orchestrator_live_for` | 1 | `tkt_0RT7RKWJG17W03JRC947R8FZZN` |
 | `verify.py::CodebaseVerifier.verify.read_file` — LLM-driven call count | 1 | `tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ` |
+| `harness.py` — `gc_run_config_dir` rmtree on the loop thread (amendment pass) | 3 | `tkt_0RT88VW7RRECTHNCVTJXD6M5RJ` |
+| gate vocabulary — triage the ~55 directory-walk/metadata method sites (amendment pass) | 0 | `tkt_0RT88WDRDHSY547N0TA1DPKZ4Z` |
 
 Two were filed at `medium` rather than `low`.  The `server/tools.py`
 claim-verification pair, because it is the direct counter-example to task
@@ -222,3 +274,30 @@ The triad mirrors `silent_fallthrough_{scan,allowlist}` +
 section is explicit that "a slug violated repeatedly across census batches is
 an enforcement gap: file a guard task"; INV-8 had been missed across three
 batches (3778 → 4091 → 4201) before task 4484 was filed.
+
+### A `filed` row's owning task must delete it, in its own change
+
+This is a cross-package coupling, and it is the one thing about this gate that
+can surprise someone who never touched it.
+
+`dark-factory-orchestrator.yaml`'s `test_command` begins with
+`cd shared && uv run pytest tests/`, so `shared/tests` is the **first** verify
+segment for **every** task in this repo. `TestRatchet::test_no_stale_blessings`
+fails on a blessing whose site no longer exists — deliberately, because that
+is what stops the baseline becoming a comfortable lie. The consequence: the
+moment a task lands a fix for a blessed site **without deleting its row**,
+verify goes red for every subsequent task until somebody edits
+`shared/tests/loop_blocking_allowlist.py`.
+
+Six rows are `filed` against in-flight tasks 4201 and 3778, and neither task's
+author is otherwise editing `shared/tests`. So, as a rule:
+
+> **Deleting the ledger row is part of the fix, not follow-up work.** If you
+> offload a site (or otherwise remove it), delete its
+> `(relpath, qualname, content_hash, disposition, justification)` entry from
+> `AUDITED_SITES` in the same commit. The failure message names the exact rows
+> to remove, and the fix is always a deletion — never a re-bless.
+
+The assertion stays fatal. A warning would buy nothing: a ratchet that can be
+ignored is a ratchet nobody updates, and the stale row would then outlive the
+defect it described.

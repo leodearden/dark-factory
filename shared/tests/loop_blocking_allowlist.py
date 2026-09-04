@@ -61,6 +61,17 @@ this a nuisance ratchet reviewers learn to re-bless unread.  The hash is
 invariant under reindentation and edits above the site, and changes only when
 the call itself changes.
 
+DELETING A ROW IS PART OF THE FIX THAT REMOVES ITS SITE.  ``shared/tests`` is
+the FIRST segment of this repo's ``test_command``
+(``cd shared && uv run pytest tests/``), and
+``test_loop_blocking_gate.py::TestRatchet::test_no_stale_blessings`` fails on a
+blessing whose site is gone -- so a landed fix that leaves its row behind reds
+verify for every subsequent task in the repo until someone edits THIS file.
+Six rows are ``filed`` against in-flight tasks 4201 and 3778, whose authors are
+not otherwise editing ``shared/tests``; that coupling is written out in
+``plans/inv8-caller-side-census-2026-09-03.md`` section 7.  The fix is always a
+deletion, never a re-bless.
+
 MULTISET, not set.  ``reconcile_against_allowlist`` compares with
 ``Counter`` subtraction, so a function with two byte-identical blocking calls
 needs two rows.  This is load-bearing for THIS gate specifically: set

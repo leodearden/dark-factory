@@ -1184,7 +1184,13 @@ class TestRatchet:
 
         assert stale == [], (
             'blessed sites that no longer exist -- delete these rows from '
-            f'loop_blocking_allowlist.AUDITED_SITES: {stale}'
+            f'loop_blocking_allowlist.AUDITED_SITES: {stale}\n\n'
+            'If you just landed a fix for one of these, THE DELETION IS PART '
+            'OF THAT FIX: shared/tests is the first segment of this repo\'s '
+            'test_command, so a stale row reds verify for every subsequent '
+            'task until the row goes. Delete, never re-bless -- a blessing for '
+            'a site that no longer exists cannot describe anything. See '
+            'plans/inv8-caller-side-census-2026-09-03.md section 7.'
         )
 
     def test_ratchet_is_a_multiset_not_a_set(self):
