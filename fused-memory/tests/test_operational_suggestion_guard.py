@@ -459,3 +459,160 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
         )
         assert finding is not None, f'Stamp must not suppress, got None for: {stamp_block!r}'
         assert 'restart' in finding.markers
+
+    def test_crlf_stamp_is_still_stripped(self):
+        """The CRLF bound must not be bought by losing recognition: a
+        CRLF-separated stamp is still stripped, so the reported defect stays
+        fixed under both line-ending conventions."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Restart the fused-memory service and confirm it is back up.'
+                '\r\n\r\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding x): re-derived the count.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None, 'CRLF-separated stamp must still be stripped'
+        assert 'restart' in finding.markers
+
+    def test_crlf_authored_signal_after_the_stamp_paragraph_still_suppresses(self):
+        """CONTAINMENT, CRLF variant of the LF case above: the paragraph
+        terminator must recognize a CRLF blank line too. A bound written
+        only against an LF blank line ran straight past it to the END OF THE
+        FIELD, stripping the authored trailing "fix" and manufacturing a
+        finding — the over-strip direction 4532's review caught. CRLF
+        reaches task text via paste from a Windows or browser client."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Restart the service.'
+                '\r\n\r\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding x): re-derived the count.'
+                '\r\nAnd a second stamp line.'
+                '\r\n\r\nAlso fix the retry helper while you are in here.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'CRLF trailing "fix" must still suppress, got: {finding!r}'
+
+    def test_stamp_at_the_start_of_the_title_field_is_stripped(self):
+        """The line anchor is a MULTILINE ``^``, which also matches at
+        position 0 — so a stamp opening the TITLE (the field the sibling
+        operational_ask_registry scopes its signals to) is recognized, not
+        just one appearing after a newline."""
+        finding = operational_suggestion_finding(
+            title=(
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX: '
+                're-derived the dependency count.'
+            ),
+            description='Restart the fused-memory service and confirm it is back up.',
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'restart' in finding.markers
+
+    def test_every_stamp_in_a_field_is_stripped_not_just_the_first(self):
+        """Two stamps in one field, each carrying its OWN code-change signal
+        ("bug" in the first, "FIX" in the second): a finding proves BOTH were
+        stripped, since either survivor alone would re-suppress. Live task
+        descriptions accumulate annotations over a task's lifetime."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Restart the fused-memory service.'
+                '\n\n[RECON CORRECTION 2026-08-08] the prior prose was a bug.'
+                '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding z): re-derived the count.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'restart' in finding.markers
+
+    def test_stamp_in_details_is_stripped_per_field(self):
+        """The strip is applied to EVERY field, and PER FIELD: the marker
+        lives in the description while the disarming stamp is appended to
+        details. Stripping the already-joined string instead would let a
+        stamp's paragraph bound run across a field boundary."""
+        finding = operational_suggestion_finding(
+            title='Restart the ingestion worker',
+            description='Restart the ingestion worker after the nightly window.',
+            details=(
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding abc): re-derived the dependency count.'
+            ),
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'restart' in finding.markers
+
+    def test_marker_inside_a_stamp_still_produces_a_finding(self):
+        """MONOTONICITY lock: the marker scan reads RAW field text, so a
+        marker that lives INSIDE a stamp still fires. The strip is
+        asymmetric by design -- it never removes a finding that fires
+        today."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description='Re-derived the dependency count from the task graph.',
+            details=(
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX: '
+                'restart the ingestion worker to pick it up.'
+            ),
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None
+        assert 'restart' in finding.markers
+        assert 'details' in finding.fields
+
+    def test_list_item_stamp_is_not_stripped(self):
+        """UNDER-STRIP BOUNDARY, pinned deliberately: the opener allows only
+        leading spaces/tabs, so a stamp bulleted into a list ("- [Stage 2
+        ...]") is NOT recognized and its signal still suppresses. This is the
+        SAFE direction (it degrades to pre-4569 behaviour), and pinning it
+        makes any future widening of the opener's leading-whitespace class a
+        visible, deliberate choice rather than a silent behaviour change."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Restart the service.'
+                '\n\n- [Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX: '
+                're-derived the count.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is None, f'A bulleted stamp is not recognized, got: {finding!r}'
+
+    def test_line_continuing_a_stamp_is_stripped_with_it(self):
+        """KNOWN COST of the paragraph bound, pinned so it stays visible:
+        observed stamps have multi-line bodies, so a line separated from the
+        stamp by only a SINGLE newline is stripped with it and its
+        code-change signal is lost. Accepted because every observed annotator
+        appends its stamp as its own blank-line-separated paragraph; a
+        line-bounded strip would instead drop the multi-line stamp bodies
+        this guard must handle."""
+        finding = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Restart the worker.'
+                '\n\n[RECON CORRECTION 2026-08-08] corrected.'
+                '\nAlso fix the retry helper while here.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert finding is not None, 'Single-newline continuation is stripped with the stamp'
+        assert 'restart' in finding.markers
