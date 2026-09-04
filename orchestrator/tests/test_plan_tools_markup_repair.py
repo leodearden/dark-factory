@@ -26,7 +26,10 @@ module's OWN BYTES at import, so a future editor cannot quietly reintroduce one
 from __future__ import annotations
 
 import ast
+import asyncio
 import copy
+import errno
+import functools
 import inspect
 import json
 import logging
@@ -294,7 +297,29 @@ _PLAN_MUTATING_ARTIFACT_METHODS = frozenset({
     'mark_step_committed',
 })
 
-def _plan_writing_tool_names() -> tuple[str, ...]:
+
+@functools.lru_cache(maxsize=1)
+def _registered_plan_tool_names() -> frozenset[str]:
+    """The tool names plan-tools' server actually REGISTERS, read from the server.
+
+    Derived, never restated: builds a real server over a throwaway artifacts
+    root and asks it what it registered. Measured against the live tree — 16
+    names, the 11 plan writers plus the 5 ``report_*``.
+
+    Cached because :func:`_undeclared_alternates` re-derives the candidate set
+    once per row, which would otherwise pay one server build per row for an
+    answer that cannot change within a process.
+
+    ``asyncio.run`` is safe here: ``list_tools`` is a coroutine function
+    (fastmcp 3.2.2) and this file has no ``async def`` test, so no loop is
+    ever already running — ``asyncio_mode = "auto"`` governs async test
+    functions only.
+    """
+    server = plan_tools.create_server(TaskArtifacts(Path(tempfile.mkdtemp())))
+    return frozenset(tool.name for tool in asyncio.run(server.list_tools()))
+
+
+def _plan_writing_tool_names(registered: frozenset[str] | None = None) -> tuple[str, ...]:
     """Derive the plan-writer candidate set from plan_tools' LIVE module surface.
 
     A plan_tools entry point is a plan writer iff (a) it is a module-level
@@ -302,9 +327,25 @@ def _plan_writing_tool_names() -> tuple[str, ...]:
     its namespace; (b) its name starts with ``_``, the private-impl-behind-an-
     MCP-tool convention this file already keys on via
     ``getattr(plan_tools, '_' + tool_name)`` (see :func:`_alternate_writer_changed_the_cell`);
-    (c) its first parameter is ``artifacts``; and (d) its OWN BODY calls one of
-    :data:`_PLAN_MUTATING_ARTIFACT_METHODS`. Returns the surviving names with
-    the leading ``_`` stripped, sorted, as a tuple.
+    (c) its first parameter is ``artifacts``; (d) its OWN BODY calls one of
+    :data:`_PLAN_MUTATING_ARTIFACT_METHODS`; and (e) its ``_``-stripped name is
+    one the server actually REGISTERED as a tool (*registered*, defaulting to
+    :func:`_registered_plan_tool_names`). Returns the surviving names with the
+    leading ``_`` stripped, sorted, as a tuple.
+
+    Guard (e) exists because "writes plan.json" was never sufficient to mean
+    "is a probeable tool impl". An INTERNAL helper may legitimately call
+    ``artifacts.write_plan`` while returning something that is not a status
+    envelope — ``_read_plan_repaired`` does exactly that on main, post-task-3957
+    (commit c005fabb00), returning the bare ``(plan, facts)`` tuple. Without (e)
+    the probe calls it and dies on ``result.get('status')`` with
+    ``AttributeError: 'tuple' object has no attribute 'get'``. Deriving the
+    registered surface from the server rather than hand-listing it keeps this
+    guard from becoming the very kind of unchecked list this helper replaced.
+
+    *registered* is a parameter, not a hardcoded call, so a test can stage a
+    writer that a real registration would have made probeable
+    (``test_an_undeclared_plan_writer_cannot_escape_the_sweep``).
 
     Reads each survivor's source via ``inspect.getsource`` off the LIVE module
     OBJECT, never by parsing plan_tools.py as a file. This is required, not
@@ -316,11 +357,15 @@ def _plan_writing_tool_names() -> tuple[str, ...]:
     Detects a write with an ``ast.Call``/``ast.Attribute`` walk over each
     survivor's own body, never a substring scan of the source text. A text
     scan would be actively WRONG here: this module's own comments and
-    docstrings mention ``write_plan`` in prose repeatedly — including this
-    very docstring — so a substring match would misclassify a non-writer such
-    as ``_read_plan_repaired`` (which only ever calls ``artifacts.read_plan``
-    and the module-level ``_atomic_write_plan``, and merely discusses
-    ``write_plan`` in prose) as a writer.
+    docstrings mention these method names in prose repeatedly — including this
+    very docstring. Measured on plan_tools, ``_repair_one_field`` discusses
+    ``write_plan`` and ``create_server`` discusses ``mark_step_committed``,
+    neither calling the method it names; a substring match would classify both
+    as writers. Other guards happen to exclude those two as well, which is
+    exactly the point — the AST walk is what makes the classification CORRECT
+    rather than accidentally correct, and it is the guard that survives a
+    future helper that is artifacts-first, ``_``-prefixed, and merely
+    discusses a write.
 
     The ``report_*`` family (``report_blocking_dependency``,
     ``report_task_already_done``, ``report_ready_to_merge``,
@@ -336,6 +381,8 @@ def _plan_writing_tool_names() -> tuple[str, ...]:
     ``evidence``, ...) for a guaranteed no-op — the fragility the module's
     design decisions rejected a full entry-point sweep over.
     """
+    if registered is None:
+        registered = _registered_plan_tool_names()
     names = []
     for name, obj in vars(plan_tools).items():
         if not inspect.isfunction(obj):
@@ -353,7 +400,7 @@ def _plan_writing_tool_names() -> tuple[str, ...]:
             for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
-        if called & _PLAN_MUTATING_ARTIFACT_METHODS:
+        if called & _PLAN_MUTATING_ARTIFACT_METHODS and name[1:] in registered:
             names.append(name[1:])
     return tuple(sorted(names))
 
@@ -506,7 +553,9 @@ def _alternate_writer_changed_the_cell(
     return still_exists and after != before, refusal
 
 
-def _undeclared_alternates(tmp_path, monkeypatch) -> set[tuple[str, str | None, str]]:
+def _undeclared_alternates(
+    tmp_path, monkeypatch, registered: frozenset[str] | None = None
+) -> set[tuple[str, str | None, str]]:
     """Every (tool, collection, field) triple OBSERVED writing a cell while
     declared neither as that row's schema owner nor in its ``also_written_by``.
 
@@ -530,12 +579,16 @@ def _undeclared_alternates(tmp_path, monkeypatch) -> set[tuple[str, str | None, 
     :func:`_alternate_writer_changed_the_cell`) rather than being silently
     skipped — a skip would reopen exactly the completeness hole this sweep
     exists to close.
+
+    *registered* is forwarded to :func:`_plan_writing_tool_names` unchanged;
+    see its docstring for why the candidate set is intersected with the
+    server's own registered tool surface.
     """
     monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
     undeclared: set[tuple[str, str | None, str]] = set()
     for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
         owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
-        for tool_name in _plan_writing_tool_names():
+        for tool_name in _plan_writing_tool_names(registered):
             if tool_name == owner:
                 continue  # already reported as `tool`, not an "alternate"
             root = tmp_path / f'{record.collection}-{record.field}-{tool_name}'
@@ -941,7 +994,17 @@ class TestRepairableFieldTable:
         _probe_writer.__module__ = plan_tools.__name__
         monkeypatch.setattr(plan_tools, '_probe_writer', _probe_writer, raising=False)
 
-        undeclared = _undeclared_alternates(tmp_path / 'completeness', monkeypatch)
+        # The second half of that same honest simulation: a new plan writer
+        # only reaches the sweep once its tool is REGISTERED, so staging the
+        # regression means staging the registration too. Exactly parallel to
+        # the ``__module__`` forgery above — without it the derivation's
+        # registered-surface guard filters the synthetic writers straight back
+        # out and the property under test cannot be exercised at all.
+        staged = _registered_plan_tool_names() | {'probe_writer', 'probe_flavoured'}
+
+        undeclared = _undeclared_alternates(
+            tmp_path / 'completeness', monkeypatch, registered=staged
+        )
         assert ('probe_writer', 'steps', 'description') in undeclared
 
         def _probe_flavoured(artifacts, description, flavour):
@@ -954,7 +1017,9 @@ class TestRepairableFieldTable:
         monkeypatch.setattr(plan_tools, '_probe_flavoured', _probe_flavoured, raising=False)
 
         with pytest.raises(AssertionError) as exc_info:
-            _undeclared_alternates(tmp_path / 'unknown-param', monkeypatch)
+            _undeclared_alternates(
+                tmp_path / 'unknown-param', monkeypatch, registered=staged
+            )
         message = str(exc_info.value)
         assert 'probe_flavoured' in message
         assert 'flavour' in message
