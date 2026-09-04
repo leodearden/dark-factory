@@ -210,17 +210,17 @@ class TestStewardSweepUp:
 #
 #  1. It is the MARKER. `test_review_checkpoint_site_uses_helper` below asserts
 #     this value appears in the built prompt, which is what proves
-#     `ReviewCheckpoint._build_prompt` interpolates project_root at all
-#     (review_checkpoint.py:413/422/483). Sandboxing the value under tmp_path
-#     would not break the assertion — it is re-anchored onto this constant — but
-#     the marker's whole job is to be a recognisable value that could only have
-#     come from here, and a per-run tmp_path is a worse marker than a fixed one.
+#     `review_checkpoint.py::ReviewCheckpoint._build_prompt` interpolates
+#     project_root at all. Sandboxing the value under tmp_path would not break
+#     the assertion — it is re-anchored onto this constant — but the marker's
+#     whole job is to be a recognisable value that could only have come from
+#     here, and a per-run tmp_path is a worse marker than a fixed one.
 #  2. `_make_review_checkpoint` builds a REAL `ReviewCheckpoint` — precisely the
-#     class whose `_run_review` raises ValueError on any project_root containing
-#     '/tmp/pytest' (review_checkpoint.py:148-155), ahead of every seam these
-#     tests patch. So this is the same family as `_REVIEW_PROJECT_ROOT` in
-#     test_out_of_band_routing.py and must stay outside pytest paths regardless
-#     of ground 1.
+#     class whose `review_checkpoint.py::ReviewCheckpoint._run_review` raises
+#     ValueError on any project_root containing '/tmp/pytest', ahead of every
+#     seam these tests patch. So this is the same family as
+#     `_REVIEW_PROJECT_ROOT` in test_out_of_band_routing.py and must stay
+#     outside pytest paths regardless of ground 1.
 #
 # Named rather than left inline so the marker role is explicit, and so the name
 # and the assertion cannot drift apart — the assertion below reads

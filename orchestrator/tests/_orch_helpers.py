@@ -1365,21 +1365,26 @@ THE THREE MEASUREMENTS (task 4389, on this branch):
 2. NOTHING HAS EVER WRITTEN THROUGH THEM.  ``/tmp/non-existent-for-test``,
    ``/tmp/non-existent`` and ``/tmp/pr`` were all ABSENT from the machine's
    ``/tmp`` despite a long history of suite runs.  Four ``config.project_root``
-   reads in workflow.py can ``mkdir(parents=True)`` (:8488 and :13387 transcript
-   archive, :9458 verify archive, :9568 chronic-flake ledger); their absence on
-   disk is direct evidence those paths are never reached under these mocks.
-   There is no file leak to fix — and that claim is not left to age, it is
-   TRIPWIRED by ``TestMockWorkflowProjectRootContract`` in
-   test_steward_scaffolding_guards.py, which asserts this path does not exist.
+   reads can ``mkdir(parents=True)``:
+   ``workflow.py::TaskWorkflow._archive_then_cleanup_config_dir`` and
+   ``workflow.py::TaskWorkflow._invoke`` (transcript archive),
+   ``workflow.py::TaskWorkflow._run_scoped_verification_with_infra_retry``
+   (verify archive), and ``workflow.py::TaskWorkflow._maybe_file_chronic_flakes``
+   (chronic-flake ledger).  Their absence on disk is direct evidence those paths
+   are never reached under these mocks.  There is no file leak to fix — and that
+   claim is not left to age, it is TRIPWIRED by
+   ``TestMockWorkflowProjectRootContract`` in test_steward_scaffolding_guards.py,
+   which asserts this path does not exist.
 3. ``ReviewCheckpoint`` IS NOT ON THIS PATH.  Its ``/tmp/pytest`` guard is the
-   first statement of ``_run_review`` only (review_checkpoint.py:148-155), and
-   workflow.py:273 states explicitly that ``ReviewCheckpoint`` is not on the
-   ``TaskWorkflow`` path — which is why measurement 1's pytest-shaped path was
-   harmless.
+   first statement of ``review_checkpoint.py::ReviewCheckpoint._run_review``
+   only, and the comment on ``workflow.py::_ESCALATION_CAPABLE_ROLES`` states
+   explicitly that ``ReviewCheckpoint`` runs in its own dispatcher rather than
+   through ``TaskWorkflow._invoke`` — which is why measurement 1's pytest-shaped
+   path was harmless.
 
 FOR A NEW FACTORY, PREFER THE SANDBOXED SHAPE.  This constant is the adjudicated
 resting place for the EXISTING population, not the pattern to copy.
-``test_workflow_already_done.py:35-57`` is the in-tree shape to follow: a
+``test_workflow_already_done.py::_make`` is the in-tree shape to follow: a
 ``_make(*, project_root: Path, ...)`` keyword parameter with each call site
 passing ``tmp_path / 'proj'``.  A new factory that takes that argument keeps its
 writes inside pytest's retention sweep by construction and needs no adjudication
