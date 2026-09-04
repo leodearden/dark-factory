@@ -124,7 +124,7 @@ def test_orchestrator_restart_watch_prefixes_all_exist() -> None:
 
     This enforces a project convention that is deliberately STRICTER than
     that runtime semantics (see the WATCH-PREFIX CONVENTION note above
-    ``orchestrator_restart_watch_prefixes`` in orchestrator/config.yaml):
+    ``orchestrator_restart_watch_prefixes`` in dark-factory-orchestrator.yaml):
     every configured entry must be a full, existing path. The runtime
     matcher would also accept a bare string prefix of a real path that is
     not itself on disk (e.g. a partial-filename prefix meant to match
@@ -197,10 +197,10 @@ def test_binding_guard_bites_on_a_typod_key_and_on_a_renamed_field(
     typod_cfg["orchestrator_restart_on_merge_enabled_typo"] = typod_cfg.pop(
         "orchestrator_restart_on_merge_enabled"
     )
-    with pytest.raises(AssertionError, match="orchestrator_restart_on_merge_enabled"):
+    with pytest.raises(AssertionError, match="is not a key in the committed"):
         _assert_key_binds(typod_cfg, root_config, "orchestrator_restart_on_merge_enabled")
 
     cfg = _load_df_config()
     renamed_config = SimpleNamespace()
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="has no field named"):
         _assert_key_binds(cfg, renamed_config, "orchestrator_restart_on_merge_enabled")
