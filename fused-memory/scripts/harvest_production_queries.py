@@ -122,6 +122,16 @@ BRIEFING_SEARCH_LIMIT = 5
 UNSPECIFIED_LIMIT = 'unspecified'
 
 DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
+
+#: sqlite's busy timeout for the journal connection, in SECONDS.
+#: sqlite3's implicit default is 5.0; this raises it because the journal
+#: is a live multi-gigabyte file a running fused-memory server is
+#: appending to, so a writer holding a lock is the expected case, not an
+#: exceptional one.  A read that waits is strictly better than a read
+#: that refuses -- and, before this, `database is locked` was reported
+#: as a missing table (see the scan in `harvest`).
+JOURNAL_CONNECT_TIMEOUT = 30.0
+
 DEFAULT_TAIL_SAMPLE = 40
 DEFAULT_SEED = 4004
 
@@ -273,12 +283,19 @@ def _connect_readonly(db_path: Path | str) -> sqlite3.Connection:
     ``mode=ro`` refuses at the VFS layer; ``PRAGMA query_only`` refuses at
     the statement layer. Both are set because this points at a live
     multi-gigabyte journal the fused-memory server is writing to.
+
+    ``JOURNAL_CONNECT_TIMEOUT`` governs the third axis: not WHETHER a write
+    is possible but how long a read WAITS for a concurrent writer before
+    giving up. Against a journal being actively appended to, lock contention
+    is the expected case, so a read that waits beats a read that refuses.
     """
     path = Path(db_path)
     if not path.exists():
         raise JournalUnavailableError(f'write journal not found: {path}')
     try:
-        con = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+        con = sqlite3.connect(
+            f'file:{path}?mode=ro', uri=True, timeout=JOURNAL_CONNECT_TIMEOUT
+        )
     except sqlite3.Error as exc: # pragma: no cover - OS-level failure
         raise JournalUnavailableError(f'cannot open {path} read-only: {exc}') from exc
     con.execute('PRAGMA query_only=ON')
