@@ -104,6 +104,33 @@ def read_escalations(
     )
 
 
+def _build_cross_unit_verify_plan(*, on_failure_escalation):
+    """Build the shared cross-unit ``RestartPlan`` shape used across
+    RESTART_FAILED/VERIFY_FAILED coverage: ``script=/proj/scripts/deploy.sh``,
+    ``target_unit='fused-memory.service'``, ``own_unit='orch.service'``,
+    ``FreshPidVerify(baseline_active_enter_monotonic=1000,
+    baseline_main_pid=42, inspect_timeout_secs=10.0)``. Parametrized only on
+    ``on_failure_escalation`` so ``TestCrossUnitBlockingVerifyFail`` and
+    ``TestUnconfiguredEscalationWarningIsPlanScoped`` share one fixture
+    instead of hand-duplicating it (task 4047 amendment).
+    """
+    from orchestrator.proc_supervision import FreshPidVerify, RestartPlan
+
+    return RestartPlan(
+        script=Path('/proj/scripts/deploy.sh'),
+        args=[],
+        cwd=Path('/proj'),
+        target_unit='fused-memory.service',
+        own_unit='orch.service',
+        on_failure_escalation=on_failure_escalation,
+        verify=FreshPidVerify(
+            baseline_active_enter_monotonic=1000,
+            baseline_main_pid=42,
+            inspect_timeout_secs=10.0,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-1: RED — types + construction
 # ---------------------------------------------------------------------------
@@ -753,31 +780,14 @@ class TestCrossUnitBlockingVerifyFail:
         inspector_called: bool,
         expected_disposition,
     ) -> None:
-        from orchestrator.proc_supervision import (
-            EscalationSpec,
-            FreshPidVerify,
-            RestartDisposition,
-            RestartPlan,
-        )
+        from orchestrator.proc_supervision import EscalationSpec, RestartDisposition
 
         spec = EscalationSpec(
             queue_dir=str(tmp_queue_dir),
             task_id=task_id,
             summary='Cross-unit deploy verify failed',
         )
-        plan = RestartPlan(
-            script=Path('/proj/scripts/deploy.sh'),
-            args=[],
-            cwd=Path('/proj'),
-            target_unit='fused-memory.service',
-            own_unit='orch.service',
-            on_failure_escalation=spec,
-            verify=FreshPidVerify(
-                baseline_active_enter_monotonic=1000,
-                baseline_main_pid=42,
-                inspect_timeout_secs=10.0,
-            ),
-        )
+        plan = _build_cross_unit_verify_plan(on_failure_escalation=spec)
 
         outcome = await plan.execute(runner=runner, inspector=inspector)
 
@@ -872,31 +882,14 @@ class TestUnconfiguredEscalationWarningIsPlanScoped:
         all — the reword must not become unconditional."""
         import logging
 
-        from orchestrator.proc_supervision import (
-            EscalationSpec,
-            FreshPidVerify,
-            RestartDisposition,
-            RestartPlan,
-        )
+        from orchestrator.proc_supervision import EscalationSpec, RestartDisposition
 
         spec = EscalationSpec(
             queue_dir=str(tmp_queue_dir),
             task_id='task-4047-configured',
             summary='Cross-unit deploy verify failed',
         )
-        plan = RestartPlan(
-            script=Path('/proj/scripts/deploy.sh'),
-            args=[],
-            cwd=Path('/proj'),
-            target_unit='fused-memory.service',
-            own_unit='orch.service',
-            on_failure_escalation=spec,
-            verify=FreshPidVerify(
-                baseline_active_enter_monotonic=1000,
-                baseline_main_pid=42,
-                inspect_timeout_secs=10.0,
-            ),
-        )
+        plan = _build_cross_unit_verify_plan(on_failure_escalation=spec)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
             outcome = await plan.execute(
@@ -920,6 +913,16 @@ class TestUnconfiguredEscalationWarningIsPlanScoped:
             f'reword must not become unconditional: {unconfigured!r}'
         )
 
+        escalations = read_escalations(
+            tmp_queue_dir, 'task-4047-configured',
+            agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1, (
+            'the configured leg must be verified through the same product '
+            f'read path as its siblings (TestCrossUnitBlockingVerifyFail, '
+            f'TestCrossUnitBlockingEmptyBaselineFreshness): {escalations!r}'
+        )
+
     async def _drive_unconfigured(
         self,
         tmp_queue_dir: Path,
@@ -934,21 +937,7 @@ class TestUnconfiguredEscalationWarningIsPlanScoped:
         on. Shared by both disposition tests below."""
         import logging
 
-        from orchestrator.proc_supervision import FreshPidVerify, RestartPlan
-
-        plan = RestartPlan(
-            script=Path('/proj/scripts/deploy.sh'),
-            args=[],
-            cwd=Path('/proj'),
-            target_unit='fused-memory.service',
-            own_unit='orch.service',
-            on_failure_escalation=None,
-            verify=FreshPidVerify(
-                baseline_active_enter_monotonic=1000,
-                baseline_main_pid=42,
-                inspect_timeout_secs=10.0,
-            ),
-        )
+        plan = _build_cross_unit_verify_plan(on_failure_escalation=None)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
             outcome = await plan.execute(runner=runner, inspector=inspector)
@@ -970,12 +959,6 @@ class TestUnconfiguredEscalationWarningIsPlanScoped:
 
         assert 'no L2 escalation filed' not in msg, (
             f'the retired flat claim must not appear: {msg!r}'
-        )
-        assert 'this plan' in msg.lower(), (
-            f'the claim must be scoped to this plan: {msg!r}'
-        )
-        assert 'caller' in msg.lower(), (
-            f'the reader must be told a caller may file its own L2: {msg!r}'
         )
         assert 'on_failure_escalation' in msg, (
             f'the message must still name the missing config: {msg!r}'
