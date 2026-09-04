@@ -109,6 +109,13 @@ GAMMA_1 = 'toolu_01Q1FPhhjWsxGhTEQRfvMaLa'
 #: 4502 moved.
 UNREPAIRABLE = 'toolu_012YjuXbKZAMwNAo9WR4Pvjx'
 
+#: The leak REPORT: its recovered ``evidence`` quotes, verbatim in prose, the
+#: content closer that the write-time tripwire matched. Task 4502 narrowed B5
+#: so this repairs rather than refusing, which is why it is also the single
+#: record that task moved repaired-ward. Same underlying leaked call as the two
+#: ``esc-3514`` specimens in ``escalation/tests/fixtures/markup_specimens/``.
+QUOTING = 'toolu_01XbCz5NFCA6pCvmseyqFgvy'
+
 #: The category the middleware stamps on a residue record
 #: (``mcp_markup_middleware._ESCALATION_CATEGORY``) and the machine-readable
 #: owner that will exit the hold unprompted (``_ESCALATION_OWNER``, INV-7).
@@ -246,6 +253,104 @@ class TestLiveEscalateInfoLandsRepaired:
         assert warning['outcome'] == 'repaired'
         assert warning['field'] == 'detail'
         assert warning['recovered_params'] == ['evidence', 'suggested_action']
+
+
+class TestTheQuotedMarkupCensusAgainstTheREALSchema:
+    """Task **4502**: ``quoted_markup_params`` for a REAL declared type.
+
+    THE ONE HOME FOR THIS PIN. The census exists for the leak REPORT — a
+    faithful account of a markup leak necessarily quotes the pattern that
+    tripped, so a recovered value legitimately carries a literal and the
+    guard publishes which parameters those are. On this server the parameter
+    that carries such a report is ``evidence``, declared
+    ``list[dict[str, Any]] | None`` (``escalation/src/escalation/server.py``,
+    ``escalate_info``), which pydantic emits as ``anyOf: [array, null]``.
+
+    That declared type is precisely why the pin cannot live anywhere else:
+
+    * every unit-level pin in ``shared/tests/test_mcp_markup_middleware.py``
+      whose recovered value quotes is ``str``-typed, where the middleware's
+      pre- and post-coercion views of the recovered map are the same object;
+
+    * the corpus replay in ``shared/tests/test_mcp_markup_middleware_corpus.py``
+      declares EVERY parameter of its synthetic tools ``str | None`` (stated in
+      ``_synthetic_tool``'s own docstring), so no specimen there ever reaches
+      ``_coerce_recovered``'s decode branch either.
+
+    So a census that read the DELIVERED map — where ``evidence`` is a decoded
+    ``list`` rather than text — would satisfy every one of those tests and
+    still report ``[]`` here, for the sole measured population the carve-out
+    was written about. Only a run against the real server's real schema
+    distinguishes the two.
+
+    Both halves are asserted together on purpose: the census must be right
+    WHILE the declared-type delivery stays right. A guard that simply stopped
+    coercing would satisfy a ``str``-only census and then die inside pydantic
+    with ``Input should be a valid list`` — the failure
+    ``_coerce_recovered`` exists to prevent.
+    """
+
+    async def _call(self, tmp_path: Path):
+        """Drive the QUOTING specimen exactly as the corpus replay does.
+
+        ``replay_args`` is defined further down with the replay itself; it
+        rebuilds the argument map the specimen really arrived with, damage
+        included, which is what makes the outcome comparable.
+        """
+        record = specimen(QUOTING)
+        assert record['expected_outcome'] == 'repaired'
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            result = await client.call_tool('escalate_info', replay_args(record))
+        assert result.meta is not None
+        return queue, result, result.meta['markup_repair']
+
+    @pytest.mark.asyncio
+    async def test_the_census_names_the_list_typed_parameter(self, tmp_path: Path):
+        """THE row. ``evidence`` quotes a content closer, so it is NAMED.
+
+        ``suggested_action`` is recovered from the same call and is clean, so
+        this cannot pass by echoing ``recovered_params``.
+        """
+        _, _, warning = await self._call(tmp_path)
+
+        assert warning['recovered_params'] == ['evidence', 'suggested_action']
+        assert warning['quoted_markup_params'] == ['evidence']
+
+    @pytest.mark.asyncio
+    async def test_the_declared_type_delivery_still_holds(self, tmp_path: Path):
+        """And the coercion that hides it from a naive census still runs."""
+        queue, result, _ = await self._call(tmp_path)
+
+        esc = queue.get(result.data['id'])
+        assert esc is not None
+        assert isinstance(esc.evidence, list), (
+            f'evidence stored as {type(esc.evidence).__name__}, not a list'
+        )
+        assert esc.evidence, 'evidence stored EMPTY: the payload was lost'
+        assert all(isinstance(entry, dict) for entry in esc.evidence)
+
+    @pytest.mark.asyncio
+    async def test_the_named_value_really_does_still_trip_detect(self, tmp_path: Path):
+        """The claim is TRUE of the stored record, not merely asserted.
+
+        Without this, a census that named ``evidence`` for the wrong reason —
+        or named it unconditionally — would pass the row above.
+        """
+        queue, result, _ = await self._call(tmp_path)
+
+        esc = queue.get(result.data['id'])
+        assert esc is not None
+        quoted = [
+            entry for entry in esc.evidence or []
+            if any(
+                isinstance(v, str) and detect(v) is not None for v in entry.values()
+            )
+        ]
+        assert quoted, 'no stored evidence entry carries the quoted literal'
+        # ...while the ABSORBING parameter stays envelope-free (contract C1).
+        assert detect(esc.detail) is None
+        assert detect(esc.suggested_action) is None
 
 
 # ---------------------------------------------------------------------------
