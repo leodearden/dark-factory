@@ -4527,7 +4527,28 @@ class TaskWorkflow:
         over the requeue intent and is returned verbatim.
         """
         cls = classify_agent_failure(result)
-        reason = f'Execution failed: {cls.summary}'
+        # Compose the `agent API error: HTTP <status>` marker into the reason
+        # UNCONDITIONALLY rather than trusting cls.summary to lead with it.
+        # This method's entry guard is `is_server_error_status` (mandated by
+        # this task's sidecar delivered_check), while the SUMMARY comes from
+        # `classify_agent_failure`, whose precedence ladder is owned by
+        # shared/cli_invoke.py. That ladder's rule 3 (the marker producer)
+        # carries three negative guards (`is_timed_out_with_progress`,
+        # `subtype == 'error_max_turns'`, `ModelNotFound`) plus two rules
+        # ABOVE it (`OK`, `ended_awaiting_background`) — so the two
+        # predicates are not the same test and can in principle disagree, in
+        # which case cls.summary would describe this requeue as a "wedge"
+        # while this guard classified it as a provider outage. No such
+        # divergence is production-reachable today (each guard needs a flag
+        # combination a pre-first-token 5xx kill does not produce) — this is
+        # a DEFENSIVE invariant, not a live bug fix. Its authority is this
+        # task's own contract ("the marker in the reason"): the marker is
+        # what the legacy fallback in scheduler.is_transient_api_requeue, and
+        # every operator-facing block-reason reader, keys on. The structured
+        # api_error_status field routes correctly either way (INV-1).
+        marker = f'agent API error: HTTP {result.api_error_status}'
+        summary = cls.summary if marker in cls.summary else f'{marker} — {cls.summary}'
+        reason = f'Execution failed: {summary}'
         detail = (
             f'iteration={self.metrics.execute_iterations} '
             f'api_error_status={result.api_error_status} '
