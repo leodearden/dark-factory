@@ -390,8 +390,19 @@ async def scan_prose_citations(
       (a deliberate reap is provenance, not a fabrication — benign, no warning);
     - absent with NO tombstone -> ``<stat_prefix>_prose_phantom_citations``,
       the FABRICATED branch, and the only one that logs a WARNING;
-    - the point read raised -> ``<stat_prefix>_prose_citation_verification_errors``
-      (a backend error is "unknown", not "absent" — inconclusive, no warning).
+    - the point read raised, OR the tombstone probe was unavailable/raised ->
+      ``<stat_prefix>_prose_citation_verification_errors`` (a backend error is
+      "unknown", not "absent" — inconclusive, and warned as inconclusive rather
+      than as fabrication).
+
+    That last branch swallows a broken tombstone probe DELIBERATELY, and is the
+    opposite of ``server/tools.py::get_memory_by_id``, which degrades a failed
+    probe to "no tombstone". There the probe can only ADD information to an
+    answer that is already correct; here it is the ONLY discriminator between
+    the benign and fabricated branches, so degrading it would manufacture a
+    false phantom out of every deliberately-reaped memory. Making that collapse
+    unreachable even through a wiring failure is what makes the guarantee hold
+    in production rather than only in the tests.
 
     **Why WARN-ONLY, and why it never mutates a finding.** The structured half
     (:func:`verify_cited_memories`) can safely DROP a phantom because
@@ -443,7 +454,42 @@ async def scan_prose_citations(
 
     resolve = _make_memory_resolver(memory_service, project_id)
 
+    # Resolve the tombstone reader ONCE, defensively. A service without the
+    # method is a WIRING failure, not a data condition, and it must not be able
+    # to collapse the four-way split into a two-way one — see the asymmetry
+    # comment on the miss branch below.
+    tombstone_reader = getattr(memory_service, 'get_mem0_deletion_tombstone', None)
+
+    # Per-call memo of the tombstone probe, alongside the resolver's own memo,
+    # so a missing id named by N findings costs ONE tombstone read as well as
+    # ONE point read. Keeping BOTH memoised is what makes the per-finding
+    # counters and warnings independent of lookup count.
+    # Values: ('tombstoned', None) | ('absent', None) | ('inconclusive', <reason>).
+    tombstone_cache: dict[Any, tuple[str, str | None]] = {}
+
+    async def _probe_tombstone(memory_id: Any) -> tuple[str, str | None]:
+        cached = tombstone_cache.get(memory_id)
+        if cached is not None:
+            return cached
+        if tombstone_reader is None:
+            outcome: tuple[str, str | None] = ('inconclusive', 'reader_unavailable')
+        else:
+            try:
+                tombstone = await tombstone_reader(project_id, memory_id)
+            except Exception as exc:  # noqa: BLE001
+                outcome = ('inconclusive', type(exc).__name__)
+            else:
+                outcome = ('tombstoned', None) if tombstone else ('absent', None)
+        tombstone_cache[memory_id] = outcome
+        return outcome
+
     for finding in findings:
+        # Skip a malformed entry rather than raising mid-scan, matching
+        # ``repoint_task_citations``' ``if not isinstance(task, dict): continue``.
+        # ``find_prose_uuids`` is already total, so this is belt-and-braces for
+        # the ``finding.get('finding_id')`` read on the warn branch below.
+        if not isinstance(finding, dict):
+            continue
         for memory_id, fields in find_prose_uuids(finding).items():
             outcome, _error_type = await resolve(memory_id)
             if outcome == 'error':
@@ -461,15 +507,43 @@ async def scan_prose_citations(
             # the probe runs ONLY here — guarded to the miss branch exactly as
             # ``server/tools.py::get_memory_by_id`` guards it, where it "never
             # runs on the hit branch".
-            tombstone = await memory_service.get_mem0_deletion_tombstone(
-                project_id, memory_id,
-            )
-            if tombstone:
+            _finding_id = finding.get('finding_id')
+            probe, probe_reason = await _probe_tombstone(memory_id)
+            if probe == 'tombstoned':
                 stats[tombstoned_key] += 1
+                continue
+            if probe == 'inconclusive':
+                # DELIBERATE ASYMMETRY with ``server/tools.py::get_memory_by_id``,
+                # whose belt-and-braces handler degrades a failed probe to "no
+                # tombstone". THERE the probe can only ADD information to an
+                # answer that is already correct, so degrading loses detail but
+                # tells no untruth ("a tombstone failure must never turn a
+                # correct found:False into an {'error'}"). HERE the tombstone is
+                # the ONLY thing separating a benign deliberate deletion from a
+                # fabrication, so the same degradation would manufacture a false
+                # phantom out of every GC'd memory — the exact two-way collapse
+                # getting this split right is the whole point of avoiding. So it
+                # degrades to INCONCLUSIVE instead, and does so loudly rather
+                # than silently, per the repo's loud-over-silent norm.
+                stats[errors_key] += 1
+                log.warning(
+                    'reconciliation.prose_citation_tombstone_inconclusive: could not '
+                    'determine whether memory_id=%s named in finding=%s field(s)=%s was '
+                    'deliberately deleted (reason=%s, run_id=%s); counted INCONCLUSIVE, '
+                    'NOT reported as fabricated',
+                    memory_id, _finding_id, ','.join(fields), probe_reason, run_id,
+                    extra={
+                        'run_id': run_id,
+                        'stat_prefix': stat_prefix,
+                        'finding_id': _finding_id,
+                        'fields': list(fields),
+                        'memory_id': memory_id,
+                        'reason': probe_reason,
+                    },
+                )
                 continue
 
             stats[phantom_key] += 1
-            _finding_id = finding.get('finding_id') if isinstance(finding, dict) else None
             log.warning(
                 'reconciliation.prose_phantom_citation: memory_id=%s named in '
                 'finding=%s field(s)=%s resolves to nothing and has no deletion '
