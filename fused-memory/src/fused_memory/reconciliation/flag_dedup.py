@@ -151,7 +151,25 @@ its ``cited_tasks`` are resolved via
 DIFFERENT known project drops the flag rather than re-asserting it.  The
 gate is HIT-only (a first-cycle finding is never suppressed),
 foreign-project-only, and fail-open in every direction — omitting either
-kwarg restores the pre-4381 behaviour exactly.  Note this gate reaches only
+kwarg restores the pre-4381 behaviour exactly.
+
+**Titles are COSMETIC for this gate (task 4864).**  A citation's ``title``
+is a snapshot ``server/recon_report.cite_task`` takes at cite time and never
+refreshes (first-cited title wins; it stores ``''`` outright for a record
+whose title it could not resolve), so requiring title equality let an
+ordinary retitle — or the producer's own empty-title write — silently
+disable suppression.  ``_cited_fix_task_live`` therefore admits on live
+PRESENCE plus a non-abandoned status, and reports title agreement as a
+strength signal: a weakly-corroborated suppression logs
+``reconciliation.cross_project_fix_task_title_uncorroborated`` at WARNING,
+a strong one only at INFO.  The protection this gives up is replaced by
+gate-time re-verification (a LIVE ``get_task`` per citation on EVERY cycle)
+plus the gate's four bounds — HIT-only, foreign-only, non-cancelled, and
+done-bounded to ``_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES`` — so a wrong
+suppression here EXPIRES.  ``_cited_task_corroborated`` is deliberately
+NOT relaxed: ``filter_false_phantom_task_creation_flags`` has no such
+expiry, so a wrong drop there would be permanent, and it keeps requiring
+title equality.  Note this gate reaches only
 the Stage 1 STRUCTURED-REPORT channel (``report.items_flagged``); Stage 2
 independently re-surfaces flags from Mem0 via
 ``task_knowledge_sync._query_stage2_flags``, where no code filter here can
@@ -2856,16 +2874,36 @@ async def _safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> An
 def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool:
     """True iff *cited* names a FILED, non-cancelled task confirmed by *get_task_result*.
 
-    Layers the ruled status policy on top of :func:`_cited_task_corroborated`,
-    giving three guarantees:
+    Layers the ruled status policy on :func:`confirm_task_present`, giving
+    three guarantees:
 
-    1. **Presence + title corroboration** is inherited wholesale from
-       :func:`_cited_task_corroborated`.  This matters more here than in the
-       phantom guard: a ``cited_tasks`` entry is not always the product of
-       ``recon_report.cite_task`` (which validates existence at cite time) —
-       the structured-output JSON-fallback citation path bypasses that check
-       entirely — so a hallucinated or stale entry must never be able to
-       suppress a real recurring complaint on a bare id match.
+    1. **Presence, and presence only** — the citation's ``title`` is NOT part
+       of this test (task 4864).  This is the deliberate SPLIT from
+       :func:`_cited_task_corroborated`, which keeps requiring title equality
+       for the phantom guard.  ``recon_report.cite_task`` snapshots a title at
+       cite time and never refreshes it ("first-cited title wins"; it even
+       stores ``''`` for a record whose title it could not resolve), so title
+       equality is defeated by an ordinary retitle and by the producer's own
+       empty-title write — a cosmetic field silently vetoing the gate.
+
+       What replaces it is not nothing.  The concern a title check answered —
+       a hallucinated or stale citation suppressing a real complaint on a bare
+       id match — is met here by GATE-TIME RE-VERIFICATION plus four bounds
+       the phantom guard does not have:
+       :func:`_resolve_live_cross_project_fix_task` issues a LIVE ``get_task``
+       for every citation on EVERY cycle, and a suppression additionally
+       requires the flag to be carried-forward (HIT-only), the citation to be
+       FOREIGN, the task to be non-abandoned, and — when it is ``done`` —
+       to be within :data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES`.  A wrong
+       suppression here therefore expires; a wrong drop in the phantom guard
+       would not, which is exactly why that one stays strict.
+
+       Title agreement is still computed, as a STRENGTH signal rather than a
+       gate: :func:`_resolve_live_cross_project_fix_task` logs a
+       strongly-corroborated suppression at INFO and a weakly-corroborated one
+       at WARNING (via :func:`_titles_corroborate`), so the weaker decision is
+       distinguishable in a log instead of indistinguishable from the stronger
+       one.
     2. **The status policy is "filed and not abandoned"** (Leo's ruling,
        2026-08-17, task 4381 / esc-3841-1).  Any status outside
        :data:`_ABANDONED_TASK_STATUS_VALUES` counts, INCLUDING ``pending`` and
@@ -2889,18 +2927,25 @@ def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool
 
     Args:
         cited: One ``cited_tasks`` entry ``{'project_id', 'task_id', 'title'}``.
+            No field of it is read as of task 4864 — the parameter is kept so
+            this stays call-site-interchangeable with
+            :func:`_cited_task_corroborated` (the strict sibling), which makes
+            the SPLIT between the two guards a one-symbol difference at the
+            call site rather than a shape difference, and keeps the citation
+            available to any future admission rule that is not cosmetic.
+
         get_task_result: The raw (or normalised-exception) value returned by
             ``taskmaster.get_task()`` for *cited*.
 
     Returns:
-        True only when the record is positively present, its title matches the
-        citation, and its status is a non-cancelled string.
+        True only when the record is positively present and its status is a
+        non-cancelled string.
 
     Pure, sync, no I/O.
     """
-    if not _cited_task_corroborated(cited, get_task_result):
+    if not confirm_task_present(get_task_result):
         return False
-    # _cited_task_corroborated already proved get_task_result is a dict.
+    # confirm_task_present already proved get_task_result is a dict.
     status = get_task_result.get('status')  # type: ignore[union-attr]
     return isinstance(status, str) and status not in _ABANDONED_TASK_STATUS_VALUES
 
@@ -2915,10 +2960,20 @@ class _LiveFixTask(NamedTuple):
     but-unfinished one suppresses for as long as it stays that way.  Resolution
     lives here; the policy lives in ``dedup_flags``, which owns the marker
     counter the bound is measured against.
+
+    *title_corroborated* records whether the citation's title agreed with the
+    live record's.  Since task 4864 that is a STRENGTH signal only — it does
+    not affect whether this value is returned at all.
     """
 
     cited: dict[str, Any]
     status: str
+    #: Whether the citation's ``title`` agreed with the live record's
+    #: (:func:`_titles_corroborate`).  A STRENGTH signal, never an admission
+    #: test (task 4864) — the resolver already logged the ``False`` case at
+    #: WARNING; this field carries the same fact to a caller that wants to
+    #: reason about it without re-reading the log.
+    title_corroborated: bool = False
 
 
 async def _resolve_live_cross_project_fix_task(
@@ -2956,14 +3011,20 @@ async def _resolve_live_cross_project_fix_task(
     suppress-only-on-positive-confirmation posture: a falsy *taskmaster* or
     *known_projects*, a non-list *cited_tasks*, an entry missing
     ``project_id``/``task_id``, a ``project_id`` absent from *known_projects*,
-    a lookup exception, a not-found result, a title mismatch, and a cancelled
-    task all resolve to ``None`` (no suppression).
+    a lookup exception, a not-found result, an inconclusive status and a
+    cancelled task all resolve to ``None`` (no suppression).  A title mismatch
+    is NOT on that list any more (task 4864) — see
+    :func:`_cited_fix_task_live` guarantee 1.
 
     A near-miss — a cited task that is positively PRESENT but not live per
-    :func:`_cited_fix_task_live` (renamed fix task, title-less LLM-authored
-    citation, cancelled task) — is logged at INFO before returning ``None``,
-    so a non-suppression that *nearly* fired is observable rather than
-    silent.
+    :func:`_cited_fix_task_live` (a cancelled task, or one whose status is
+    absent/non-``str`` and therefore inconclusive) — is logged at INFO before
+    returning ``None``, so a non-suppression that *nearly* fired is observable
+    rather than silent.  A renamed or title-less citation is NO LONGER a near
+    miss (task 4864): it resolves, and says so at WARNING via
+    ``reconciliation.cross_project_fix_task_title_uncorroborated``, so the two
+    weaker outcomes stay distinguishable from each other and from a
+    strongly-corroborated suppression, which logs only at INFO.
 
     Args:
         taskmaster: Object with an async ``get_task(task_id, project_root)``.
@@ -2983,7 +3044,8 @@ async def _resolve_live_cross_project_fix_task(
 
     Returns:
         A :class:`_LiveFixTask` naming the first cited entry for which
-        :func:`_cited_fix_task_live` is True and its live status, or ``None``.
+        :func:`_cited_fix_task_live` is True, its live status, and whether its
+        title corroborated; or ``None``.
     """
     if not taskmaster or not known_projects or not isinstance(cited_tasks, list):
         return None
@@ -3035,7 +3097,30 @@ async def _resolve_live_cross_project_fix_task(
     for cited, key, _cited_task_id, _root in resolvable:
         result = cache[key]
         if _cited_fix_task_live(cited, result):
-            return _LiveFixTask(cited=cited, status=str(result.get('status')))
+            live_title = result.get('title')
+            title_corroborated = _titles_corroborate(cited.get('title'), live_title)
+            if not title_corroborated:
+                # Titles are cosmetic for THIS gate (task 4864), so a missing,
+                # empty or stale title no longer vetoes the resolution — but a
+                # suppression resting on presence alone is a weaker decision
+                # than one an exact title also corroborates, and must not be
+                # indistinguishable from it in a log.
+                logger.warning(
+                    'reconciliation.cross_project_fix_task_title_uncorroborated '
+                    'cited_project_id=%s cited_task_id=%s cited_title=%r '
+                    'live_title=%r — suppressing on live presence + status '
+                    'alone; cite_task never refreshes a title, so this is '
+                    'expected for a renamed or title-less citation',
+                    cited.get('project_id'),
+                    cited.get('task_id'),
+                    cited.get('title'),
+                    live_title,
+                )
+            return _LiveFixTask(
+                cited=cited,
+                status=str(result.get('status')),
+                title_corroborated=title_corroborated,
+            )
         if confirm_task_present(result):
             near_misses.append(cited)
 

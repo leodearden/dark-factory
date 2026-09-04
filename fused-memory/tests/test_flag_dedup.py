@@ -3793,14 +3793,19 @@ class TestCitedTaskTitleTruncationParity:
     """A citation the gate's OWN sanitizer truncated must still corroborate.
 
     ``_sanitize_cited_tasks`` truncates every string value to
-    ``_MAX_CITED_TASK_STR_CHARS`` (200), but the live record's ``title`` is
-    compared UNTRUNCATED — so the gate mutates a perfectly good citation into
-    one that can never match its own live task.  Every real title in this
-    factory is well under the cap, so this is not about ordinary titles: it is
-    about the sanitizer's mutation being lossless for MATCHING at whatever the
-    cap happens to be, which is what makes the cap safe to tune later.
+    ``_MAX_CITED_TASK_STR_CHARS`` (200), but the live record's ``title`` used
+    to be compared UNTRUNCATED — so the gate mutated a perfectly good citation
+    into one that could never match its own live task.  Every real title in
+    this factory is well under the cap, so this is not about ordinary titles:
+    it is about the sanitizer's mutation being lossless for MATCHING at
+    whatever the cap happens to be, which is what makes the cap safe to tune
+    later.
 
-    RED until step-2 truncates BOTH sides before normalising.
+    Two live consumers of that comparison, both covered here: the STRICT
+    phantom guard ``_cited_task_corroborated``, where a title still ADMITS and
+    a truncation-induced miss causes an unexpiring wrong drop; and the
+    fix-task gate's STRENGTH signal, where it decides INFO versus WARNING
+    (task 4864 step-4 — the fix-task gate itself no longer admits on title).
     """
 
     PROJECT = 'know_live'
@@ -3834,19 +3839,36 @@ class TestCitedTaskTitleTruncationParity:
 
     def test_truncated_citation_still_corroborates_untruncated_live_title(self):
         """THE DEFECT: the sanitizer's own mutation must not break matching."""
-        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+        from fused_memory.reconciliation.flag_dedup import (
+            _cited_task_corroborated,
+            _titles_corroborate,
+        )
 
         cited = self._cited(self.LONG_TITLE)
         live = {'id': 3839, 'title': self.LONG_TITLE, 'status': 'pending'}
 
-        assert _cited_fix_task_live(cited, live) is True, (
+        assert _titles_corroborate(cited['title'], live['title']) is True, (
             'a citation truncated by the gate\'s OWN sanitizer must still '
             f'corroborate the live record it was copied from; got {cited!r}'
         )
+        # And through the STRICT guard, where title equality is still binding
+        # and this defect could still cause a wrong, unexpiring drop.
+        assert _cited_task_corroborated(cited, live) is True, (
+            f'the strict phantom guard must not be defeated by truncation; got {cited!r}'
+        )
 
     @pytest.mark.asyncio
-    async def test_resolver_returns_live_fix_task_for_truncated_citation(self):
-        """Same defect at the resolver seam dedup_flags actually calls."""
+    async def test_resolver_reports_a_truncated_citation_as_strongly_corroborated(
+        self, caplog
+    ):
+        """Same defect at the resolver seam ``dedup_flags`` actually calls.
+
+        Since task 4864 the fix-task gate no longer ADMITS on title, so what
+        truncation can still corrupt here is the STRENGTH signal: a citation
+        the sanitizer shortened would be reported as weakly corroborated and
+        logged at WARNING, turning a routine long title into a permanent false
+        alarm that drowns the real ones.
+        """
         from fused_memory.reconciliation.flag_dedup import (
             _LiveFixTask,
             _resolve_live_cross_project_fix_task,
@@ -3858,14 +3880,22 @@ class TestCitedTaskTitleTruncationParity:
             return_value={'id': 3839, 'title': self.LONG_TITLE, 'status': 'pending'}
         )
 
-        result = await _resolve_live_cross_project_fix_task(
-            taskmaster, self.KNOWN, self.PROJECT, [cited]
-        )
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await _resolve_live_cross_project_fix_task(
+                taskmaster, self.KNOWN, self.PROJECT, [cited]
+            )
 
         assert isinstance(result, _LiveFixTask), (
             f'the truncated citation must resolve to a live fix task; got {result!r}'
         )
         assert result.cited == cited and result.status == 'pending'
+        assert result.title_corroborated is True, (
+            f'a title the sanitizer truncated must still count as STRONG; got {result!r}'
+        )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            'truncation must not raise a false uncorroborated-title alarm; got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
 
     def test_different_long_title_does_not_corroborate(self):
         """Companion: the fix must not degrade into "any long title matches".
@@ -3888,17 +3918,16 @@ class TestCitedTaskTitleTruncationParity:
         """
         from fused_memory.reconciliation.flag_dedup import (
             _MAX_CITED_TASK_STR_CHARS,
-            _cited_fix_task_live,
+            _titles_corroborate,
         )
 
         cited = self._cited(self.LONG_TITLE)
         other = 'A completely different long task title ' + ('z' * 211)
         assert len(other) > _MAX_CITED_TASK_STR_CHARS
         assert other[:_MAX_CITED_TASK_STR_CHARS] != self.LONG_TITLE[:_MAX_CITED_TASK_STR_CHARS]
-        live = {'id': 3839, 'title': other, 'status': 'pending'}
 
-        assert _cited_fix_task_live(cited, live) is False, (
-            f'two genuinely different long titles must not corroborate; got {live!r}'
+        assert _titles_corroborate(cited['title'], other) is False, (
+            f'two genuinely different long titles must not corroborate; got {other!r}'
         )
 
     def test_short_citation_is_not_satisfied_by_a_long_title_that_starts_with_it(self):
@@ -3910,14 +3939,14 @@ class TestCitedTaskTitleTruncationParity:
         that distinguishes the two candidate fixes, so it is kept regardless of
         how the past-the-cap case above resolves.
         """
-        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+        from fused_memory.reconciliation.flag_dedup import _titles_corroborate
 
         cited = self._cited('Fix the gate')
         assert cited['title'] == 'Fix the gate', 'a short title must not be truncated'
-        live = {'id': 3839, 'title': 'Fix the gate ' + ('y' * 300), 'status': 'pending'}
+        live_title = 'Fix the gate ' + ('y' * 300)
 
-        assert _cited_fix_task_live(cited, live) is False, (
-            f'a long live title must not be corroborated by a short prefix; got {live!r}'
+        assert _titles_corroborate(cited['title'], live_title) is False, (
+            f'a long live title must not be corroborated by a short prefix; got {live_title!r}'
         )
 
 # ---------------------------------------------------------------------------
@@ -5092,7 +5121,12 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         other_cite = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
 
         async def _get_task(task_id, project_root):
-            return {'id': int(task_id), 'title': 'Nope', 'status': 'pending'}
+            # CANCELLED so the batch resolves nothing and the lookup COUNT
+            # stays the subject of this test.  It used to lean on a
+            # non-matching title ('Nope') for that, which stopped disqualifying
+            # anything once titles became cosmetic (task 4864); an abandoned
+            # status is the disqualifier that is actually load-bearing.
+            return {'id': int(task_id), 'title': 'Nope', 'status': 'cancelled'}
 
         # prior cites {3839}; current cites {3839, 3833} — one shared, one new.
         flag = self._make_flag([self.FIX_CITE, other_cite])
@@ -5112,7 +5146,9 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
             known_projects=self.KNOWN,
         )
 
-        assert len(result) == 1, f'titles do not corroborate, so nothing is suppressed; got {result!r}'
+        assert len(result) == 1, (
+            f'every citation is cancelled, so nothing is suppressed; got {result!r}'
+        )
         assert taskmaster.get_task.call_count == 2, (
             'the union must be de-duplicated on (project_id, task_id) — the shared '
             f'citation must not be looked up twice; got {taskmaster.get_task.call_count}'
