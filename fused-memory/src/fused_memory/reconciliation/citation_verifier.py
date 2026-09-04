@@ -1,9 +1,11 @@
-"""Citation integrity for Stage-1 reconciliation (tasks 2978, 3108).
+"""Citation integrity for Stage-1 reconciliation (tasks 2978, 3108, 4818).
 
 This module owns one invariant for the run in flight: **a cited memory id must
-resolve.** It covers both halves of that invariant *within the current run*, so
-there is one owner rather than two mechanisms that can drift. The closed-run
-half lives next door — see "Where this module stops" below.
+resolve.** It covers all three halves of that invariant *within the current
+run* — structured recon-report citations, task-metadata citations, and (task
+4818) the free-text PROSE citations that neither of those reaches — so there is
+one owner rather than several mechanisms that can drift. The closed-run half
+lives next door — see "Where this module stops" below.
 
 Half 1 — recon-report citations (task 2978, hoisted in 2979).
 ``verify_cited_memories`` walks each finding's ``cited_memories`` list and
@@ -26,11 +28,50 @@ ride back on the ``delete_memory`` response under ``citation_repoint`` and
 deliberately carry NO ``stage1_`` prefix — they are tool-response stats, not
 stage-report stats.
 
-**Where this module stops** (task 3065). Both halves above act on state that is
-still in flight: ``verify_cited_memories`` drops phantom citations from the
-CURRENT run's in-progress report, and the repoint helpers rewrite live task
-metadata at the moment of deletion. Neither can reach a finding whose owning run
-already completed — that run's recon-report state is TTL-evicted (300s) and its
+Half 3 — PROSE citations (task 4818), and the one half that only WARNS.
+Halves 1 and 2 act on STRUCTURED citations: a finding's ``cited_memories``
+list, or a task's metadata pointers. A finding's ``description`` and
+``suggested_action`` are free text, and until 4818 a fabricated memory UUID
+embedded *there* was resolved by nothing — the hoist 2979 performed widened the
+structured guard to Stages 2 and 3, it did not widen it to prose. That gap was
+real and had already cost: a fabricated id escaped recon Stage-2 run
+``ab330f59`` into gate task 4423's description and needed a hand-written
+hygiene note so a reader would not chase it.
+
+``scan_prose_citations`` closes it. It scans exactly the two fields named by
+``PROSE_CITATION_FIELDS``, locating candidates with ``_PROSE_UUID_RE`` and
+confirming each through the ONE shape gate ``is_full_uuid``, then splits every
+distinct id FOUR ways onto ``<stageN>_prose_*`` counters — resolves ->
+``_prose_citations_verified``; absent WITH a deletion tombstone ->
+``_prose_citations_tombstoned``; absent with NO tombstone ->
+``_prose_phantom_citations``, the FABRICATED branch and the only one that logs
+a warning; the point read or the tombstone probe faulting ->
+``_prose_citation_verification_errors``. The tombstone branch is what carries
+4818's near-miss specimen pair (fabricated and real ids differing only
+mid-string) and the requirement that a warning fire only on the fabricated
+branch of the three-way contract: a two-way found/not-found test would report
+every deliberately-tombstoned memory as a phantom. It runs from
+``BaseStage.run()`` on the same ``STAGE_STAT_PREFIX`` machinery as Half 1, so
+all three stages get it.
+
+**It is WARN-ONLY, and that is load-bearing rather than merely cautious.** It
+drops nothing, mutates no finding, and appends no ``citation_failures`` marker.
+The reason is a false-positive class no regex can close: recon prose
+legitimately names run_ids (4818's own charter cites Stage-2 run ``ab330f59``),
+Graphiti edge and entity uuids, episode uuids, session ids and task uuids —
+none of them Mem0 point ids, and every one of them answered ``None`` by
+``get_memory_by_id``, which is Mem0/Qdrant-only. Half 1 can safely DROP a
+phantom because ``cited_memories`` entries are by construction meant to be Mem0
+ids; prose carries no such guarantee. So a false positive here costs one log
+line and one counter, never a dropped claim and never a durable marker that
+would make a legitimate finding read as unbacked in the journal.
+
+**Where this module stops** (task 3065). All three halves above act on state
+that is still in flight: ``verify_cited_memories`` drops phantom citations from
+the CURRENT run's in-progress report, ``scan_prose_citations`` warns about that
+same in-progress report's free text, and the repoint helpers rewrite live task
+metadata at the moment of deletion. None of them can reach a finding whose
+owning run already completed — that run's recon-report state is TTL-evicted (300s) and its
 shadow rows are GC'd at quiescence, so within minutes the only surviving copy is
 the journal's durable ``runs.stage_reports`` blob.
 
@@ -41,21 +82,6 @@ once the run is closed, ``citation_repair.repair_memory_citation`` is the only
 thing that can reach the finding, and it rewrites the journal blob. It reuses
 this module's lookup primitive and its three-way found/absent/raised verdict on
 purpose, so the two owners cannot disagree about what a backend timeout means.
-
-**Where this module also stops: PROSE** (task 4818). Everything above acts on
-STRUCTURED citations — a finding's ``cited_memories`` list, or a task's metadata
-pointers. A finding's ``description`` and ``suggested_action`` are free text, and
-a fabricated memory UUID embedded *there* is resolved by nothing: the hoist task
-2979 performed widens the structured guard to Stages 2 and 3, it does not widen
-it to prose. That gap is real and has already cost — a fabricated id escaped
-recon Stage-2 run ``ab330f59`` into gate task 4423's description and needed a
-hand-written hygiene note so a reader would not chase it. Task 2979's charter
-asked for the prose scan as items 4 and 5; they were split out to task 4818
-rather than dropped, and 4818 carries the near-miss specimen pair (the fabricated
-and real ids differ only mid-string) plus the requirement that a warning fire
-only on the FABRICATED branch of ``get_memory_by_id``'s three-way contract — a
-two-way found/not-found test would report every deliberately-tombstoned memory as
-a phantom.
 
 **A tombstone is provenance, never a live pointer.** This is the one rationale
 the rest of the module refers back to rather than restating.
