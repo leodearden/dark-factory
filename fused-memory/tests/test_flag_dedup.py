@@ -5439,6 +5439,312 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
 
 
 # ---------------------------------------------------------------------------
+# task 4864 step-9 — RED: dedup_flags consumes the discovery producer WITHOUT
+# perturbing the marker identity
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsCrossProjectDiscovery:
+    """``dedup_flags`` suppresses a carried-forward finding whose covering fix
+    task was DISCOVERED, not cited (task 4864, workstream 1).
+
+    Everything the task-4381 gate does stays exactly as ruled — this only
+    supplies the citation the gate could never get.  The anti-relocation
+    assertion below is the load-bearing one: ``cited_tasks`` is a
+    ``compute_flag_signature`` INPUT read at the TOP of the per-flag loop, so
+    a discovered citation that reached the flag dict would move the marker to
+    a different row.  Since the gate is HIT-only, the first enriched cycle
+    would become a MISS; and because discovery matches a live backlog that
+    changes between cycles, the row would relocate perpetually and never
+    accumulate a HIT at all — strictly worse than today's inertness, and a
+    direct violation of task 4712's ``TestMarkerPayloadKeyInvariant``.
+
+    RED until step-10 wires discovery into dedup_flags.
+    """
+
+    PROJECT = 'know_live'
+    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    KNOWN = {'know_live': '/kl', 'dark_factory': '/df'}
+    #: The signature a citation-less flag keys to — the identity that must
+    #: SURVIVE a discovery-driven suppression untouched.
+    CITATION_FREE_TID = '598'
+    #: What the row would relocate to if a discovered citation ever reached
+    #: the flag dict before compute_flag_signature read it.
+    RELOCATED_TID = '3839,598'
+
+    @classmethod
+    def _flag(cls, task_id: int = 598, description: str | None = None,
+              cited_tasks: list[dict] | None = None) -> dict:
+        """A carried-forward finding with NO citations of its own.
+
+        Description text is shared with TestDiscoverForeignFixTaskCitations so
+        the two classes' fixtures cannot drift apart.
+        """
+        flag = {
+            'task_id': task_id,
+            'flag_type': cls.FLAG_TYPE,
+            'description': (
+                TestDiscoverForeignFixTaskCitations.DESCRIPTION
+                if description is None else description
+            ),
+        }
+        if cited_tasks is not None:
+            flag['cited_tasks'] = cited_tasks
+        return flag
+
+    @staticmethod
+    def _taskmaster(*args, **kwargs):
+        """The discovery fake: get_tasks fan-out + get_task title/live read."""
+        return TestDiscoverForeignFixTaskCitations._taskmaster(*args, **kwargs)
+
+    @classmethod
+    def _covering(cls, **kwargs) -> dict:
+        return TestDiscoverForeignFixTaskCitations._covering_task(**kwargs)
+
+    @staticmethod
+    def _roots(taskmaster) -> list[str]:
+        return [call.args[0] for call in taskmaster.get_tasks.call_args_list]
+
+    # ---- (i) the headline --------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_hit_flag_with_no_citations_is_suppressed_by_discovery(
+        self, ledger_memory_service
+    ):
+        """(i) HEADLINE: a carried-forward finding that cites NOTHING is
+        suppressed because a live foreign fix task covering it was DISCOVERED
+        — the case the gate could never reach before."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._flag()
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster({'/df': [self._covering()]}),
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert result == [], (
+            'a carried-forward complaint already covered by a filed foreign '
+            f'task must be suppressed even with no citation; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1, (
+            f'the suppression must be counted for the cycle report; got {stats!r}'
+        )
+
+    # ---- (ii) THE ANTI-RELOCATION ASSERTION --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_discovery_does_not_relocate_the_marker(self, ledger_memory_service):
+        """(ii) THE LOAD-BEARING ASSERTION: a discovery-driven suppression
+        leaves the marker identity byte-identical to a citation-less cycle.
+
+        Three ways the discovered citation could leak into the signature are
+        pinned at once: the surviving row's task_id, the absence of the
+        relocated row, and the flag dict itself.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        flag = self._flag()
+        assert compute_flag_signature(flag) == (
+            self.CITATION_FREE_TID, self.FLAG_TYPE,
+        ), 'fixture must key to the citation-less signature'
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster({'/df': [self._covering()]}),
+            known_projects=self.KNOWN,
+        )
+        assert result == [], 'precondition: the flag must have been suppressed'
+
+        ledger = ledger_memory_service.recon_ledger
+        row = await _get_marker(
+            ledger, self.PROJECT, self.CITATION_FREE_TID, self.FLAG_TYPE,
+        )
+        assert row is not None, (
+            'the marker must still key to the CITATION-LESS signature '
+            f'{self.CITATION_FREE_TID!r} after a discovery-driven suppression'
+        )
+        assert row.task_id == self.CITATION_FREE_TID
+
+        relocated = await _get_marker(
+            ledger, self.PROJECT, self.RELOCATED_TID, self.FLAG_TYPE,
+        )
+        assert relocated is None, (
+            'a discovered citation must never reach compute_flag_signature: a '
+            f'row at {self.RELOCATED_TID!r} means the marker RELOCATED, which '
+            'would make every enriched cycle a MISS under a HIT-only gate'
+        )
+
+        payload = json.loads(row.payload_json)
+        assert 'cited_tasks' not in payload, (
+            'cited_tasks is a compute_flag_signature INPUT and must never be '
+            f'persisted (task 4712 invariant); got {payload!r}'
+        )
+
+        assert 'cited_tasks' not in flag, (
+            'the discovered citation is an in-memory gate input ONLY — the '
+            f'caller-owned flag dict must not be enriched; got {flag!r}'
+        )
+
+    # ---- (iii) HIT-only policy is inherited --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_first_cycle_miss_is_never_suppressed_by_discovery(
+        self, ledger_memory_service
+    ):
+        """(iii) The HIT-only bound is the gate's, not the citation path's:
+        discovery must not let a FIRST-cycle finding be suppressed, which is
+        exactly the bound filter_already_tracked_systemic_patterns lacks."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[self._flag()],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, (
+            f'a first-cycle finding must never be suppressed; got {result!r}'
+        )
+        assert 'persisted_from_run' not in result[0]
+        taskmaster.get_tasks.assert_not_called()
+
+    # ---- (iv) discovery is the FALLBACK, not the primary --------------------
+
+    @pytest.mark.asyncio
+    async def test_own_citation_resolving_skips_discovery_entirely(
+        self, ledger_memory_service
+    ):
+        """(iv) When the flag's OWN citations already name a live foreign fix
+        task, discovery must not run at all — it is the fallback for findings
+        that cite nothing usable, not a second sweep on every cycle."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        cite = {
+            'project_id': 'dark_factory',
+            'task_id': '3839',
+            'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
+        }
+        flag = self._flag(cited_tasks=[cite])
+        sig = compute_flag_signature(flag)
+        assert sig is not None
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, sig[0], sig[1],
+            run_id='r1',
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], 'the cited live fix task must still suppress'
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a flag whose own citation resolved must issue no discovery '
+            f'fan-out; got {taskmaster.get_tasks.call_args_list!r}'
+        )
+
+    # ---- (v) the lazy-cost guarantee, end to end ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_no_qualifying_flag_issues_zero_get_tasks_calls(
+        self, ledger_memory_service
+    ):
+        """(v) THE COST BOUND, measured through dedup_flags: a cycle whose
+        carried-forward flags have too little signal to match issues ZERO
+        get_tasks calls, so today's per-cycle cost is preserved exactly."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        thin = self._flag(description='No fix task has been filed.')
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[thin],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, f'a thin finding must survive; got {result!r}'
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a cycle with no qualifying flag must issue no get_tasks call at '
+            f'all; got {taskmaster.get_tasks.call_count}'
+        )
+
+    # ---- (vi) the batch memo -----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_task_lists_are_fetched_once_per_batch(self, ledger_memory_service):
+        """(vi) Two qualifying flags share ONE per-project fetch.  Without the
+        dedup_flags-scoped memo, a family of carried-forward findings would
+        re-pull every foreign project's whole backlog per flag."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        ledger = ledger_memory_service.recon_ledger
+        flags = [self._flag(task_id=598), self._flag(task_id=599)]
+        for tid in ('598', '599'):
+            await _seed_marker(ledger, self.PROJECT, tid, self.FLAG_TYPE, run_id='r1')
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=flags,
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert result == [], f'both findings must be suppressed; got {result!r}'
+        assert stats.get('cross_project_fix_task_suppressed') == 2
+        assert self._roots(taskmaster) == ['/df'], (
+            'each foreign project must be fetched ONCE per dedup_flags call, '
+            f'not once per qualifying flag; got {self._roots(taskmaster)!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task-1656 step-3 — RED: dedup_flags write-guard integration tests
 # ---------------------------------------------------------------------------
 
