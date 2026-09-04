@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import NamedTuple
 
+from shared import task_transitions
 from shared.task_statuses import TaskStatus
 
 # shared/tests/architecture_doc_transitions.py -> parents[0]=shared/tests,
@@ -221,3 +223,62 @@ def parse_state_diagram_edges(body: str) -> frozenset[tuple[TaskStatus, TaskStat
             continue
         edges.add((_resolve_node(frm_id), _resolve_node(to_id)))
     return frozenset(edges)
+
+
+# ---------------------------------------------------------------------------
+# Table side + comparator
+# ---------------------------------------------------------------------------
+
+
+def table_transition_edges() -> frozenset[tuple[TaskStatus, TaskStatus]]:
+    """Return the union of every actor's edge set in ``TRANSITIONS``.
+
+    Reads ``task_transitions.TRANSITIONS`` as a module ATTRIBUTE, inside
+    this function body, so the read happens at CALL time. This is
+    deliberate and load-bearing, not an incidental style choice: do NOT
+    change this to ``from shared.task_transitions import TRANSITIONS`` at
+    module scope, and do NOT cache the result in a module-level constant or
+    ``functools.lru_cache``. Either change would bind the real table once
+    and keep returning it forever, silently defeating
+    ``monkeypatch.setattr(task_transitions, 'TRANSITIONS', ...)`` — which is
+    exactly what the mutation / failure-direction proofs in
+    ``test_architecture_doc_transition_parity.py`` depend on observing. A
+    test pins this behaviour directly:
+    ``TestTableTransitionEdges::test_reads_transitions_lazily_not_at_import_time``.
+
+    The diagram carries no actor annotation, so the UNION over every
+    actor's set (not any single actor's) is the only well-defined
+    comparison target — see design decision in the task-4535 plan.
+    """
+    edges: set[tuple[TaskStatus, TaskStatus]] = set()
+    for pairs in task_transitions.TRANSITIONS.values():
+        edges.update(pairs)
+    return frozenset(edges)
+
+
+class ParityDiff(NamedTuple):
+    """The two-directional result of comparing doc edges against table edges.
+
+    Named fields (rather than a bare 2-tuple) so a caller cannot silently
+    transpose the two halves the way positional unpacking would let it.
+    """
+
+    missing_from_doc: frozenset[tuple[TaskStatus, TaskStatus]]
+    extra_in_doc: frozenset[tuple[TaskStatus, TaskStatus]]
+
+
+def diff_transition_edges(
+    doc_edges: frozenset[tuple[TaskStatus, TaskStatus]],
+    table_edges: frozenset[tuple[TaskStatus, TaskStatus]],
+) -> ParityDiff:
+    """Compare the diagram's edges against the table's edges.
+
+    Returns a :class:`ParityDiff` with ``missing_from_doc`` (edges the
+    table has but the diagram doesn't draw) and ``extra_in_doc`` (edges the
+    diagram draws but the table doesn't have) — plain set differences, in
+    that order.
+    """
+    return ParityDiff(
+        missing_from_doc=frozenset(table_edges - doc_edges),
+        extra_in_doc=frozenset(doc_edges - table_edges),
+    )
