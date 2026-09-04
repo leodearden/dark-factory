@@ -83,6 +83,24 @@ async def _wait_for_buffer_size(
     )
 
 
+async def _wait_for_drained(queue, expected: int, *, timeout: float = 10.0) -> dict:
+    """Poll until the drainer has committed ``expected`` events and the queue is empty.
+
+    Gates on the queue's OWN accounting rather than on buffer rows because
+    ``_events_committed += 1`` and the ``finally: task_done()`` that follows it are
+    separated by no await point (event_queue.py::_commit_with_retry / _drain_loop) —
+    so observing ``events_committed == expected`` guarantees ``queue.join()`` is already
+    satisfied, and a subsequent ``close()`` never consults ``shutdown_flush_seconds``.
+    Thin wrapper over ``_wait_for``; see its docstring for the load-tolerance rationale.
+    """
+    return await _wait_for(
+        queue.stats,
+        lambda s: s['events_committed'] >= expected and s['queue_depth'] == 0,
+        timeout=timeout,
+        description=f'drainer committing {expected} event(s) and emptying the queue',
+    )
+
+
 def _make_event(
     project_id: str = 'test-project',
     event_type: EventType = EventType.task_created,
@@ -396,6 +414,7 @@ async def test_graceful_shutdown_is_independent_of_flush_window(tmp_path, real_b
     await q.start()
     for _ in range(50):
         q.enqueue(_make_event())
+    await _wait_for_drained(q, 50)
     await q.close()
     # All events landed; no dead-letter residue.
     stats = await real_buffer.get_buffer_stats('test-project')
