@@ -180,18 +180,15 @@ def test_cli_non_object_json_is_unreachable():
 # section, once the helper exists.
 # ---------------------------------------------------------------------------
 
-def test_cli_timeout_from_env_unset_returns_default(monkeypatch):
-    monkeypatch.delenv("RECON_BUSY_CHECK_TEST_TIMEOUT", raising=False)
-    assert _cli_timeout_from_env() == 60.0
-
-
-def test_cli_timeout_from_env_blank_returns_default(monkeypatch):
-    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "")
-    assert _cli_timeout_from_env() == 60.0
-
-
-def test_cli_timeout_from_env_whitespace_only_returns_default(monkeypatch):
-    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "   \n\t")
+@pytest.mark.parametrize("raw", [None, "", "   \n\t"])
+def test_cli_timeout_from_env_unset_or_blank_returns_default(raw, monkeypatch):
+    # None stands for "unset" and needs delenv rather than setenv; folded
+    # into one parametrization with blank/whitespace-only since all three
+    # exercise the same `if not raw` branch and assert the same outcome.
+    if raw is None:
+        monkeypatch.delenv("RECON_BUSY_CHECK_TEST_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", raw)
     assert _cli_timeout_from_env() == 60.0
 
 
@@ -211,28 +208,20 @@ def test_cli_timeout_from_env_fractional_override_parses(monkeypatch):
 # value, rather than silently falling back or misbehaving far from the cause.
 # ---------------------------------------------------------------------------
 
-def test_cli_timeout_from_env_non_numeric_raises(monkeypatch):
-    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "abc")
+@pytest.mark.parametrize("raw", ["abc", "0", "-1"])
+def test_cli_timeout_from_env_malformed_or_non_positive_raises(raw, monkeypatch):
+    # "abc" hits the except-ValueError branch; "0"/"-1" hit the `value <= 0`
+    # branch. Folded into one parametrization since both branches produce
+    # the same externally-observable contract this test actually pins: a
+    # ValueError naming the env var and the offending raw value.
+    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", raw)
     with pytest.raises(ValueError) as excinfo:
         _cli_timeout_from_env()
     assert "RECON_BUSY_CHECK_TEST_TIMEOUT" in str(excinfo.value)
-    assert "abc" in str(excinfo.value)
-
-
-def test_cli_timeout_from_env_zero_raises(monkeypatch):
-    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "0")
-    with pytest.raises(ValueError) as excinfo:
-        _cli_timeout_from_env()
-    assert "RECON_BUSY_CHECK_TEST_TIMEOUT" in str(excinfo.value)
-    assert "0" in str(excinfo.value)
-
-
-def test_cli_timeout_from_env_negative_raises(monkeypatch):
-    monkeypatch.setenv("RECON_BUSY_CHECK_TEST_TIMEOUT", "-1")
-    with pytest.raises(ValueError) as excinfo:
-        _cli_timeout_from_env()
-    assert "RECON_BUSY_CHECK_TEST_TIMEOUT" in str(excinfo.value)
-    assert "-1" in str(excinfo.value)
+    # repr(), not a bare substring: "0" or "-1" as plain substrings could be
+    # satisfied incidentally by unrelated text (e.g. a mention of the 60.0
+    # default), so this pins the actual interpolated value unambiguously.
+    assert repr(raw) in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +242,12 @@ def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
     monkeypatch.setattr(subprocess, "run", spy)
     _run_cli("{}")
     # The 60.0 default is independently pinned by
-    # test_cli_timeout_from_env_unset_returns_default; a bound here would break
-    # the documented RECON_BUSY_CHECK_TEST_TIMEOUT override (tune-down case).
+    # test_cli_timeout_from_env_unset_or_blank_returns_default; a bound here
+    # would break the documented RECON_BUSY_CHECK_TEST_TIMEOUT override
+    # (tune-down case).
     assert captured["timeout"] == _CLI_TIMEOUT
+
+    # An explicit override must also reach subprocess.run — otherwise
+    # _run_cli's timeout parameter is dead surface no caller ever exercises.
+    _run_cli("{}", timeout=3)
+    assert captured["timeout"] == 3
