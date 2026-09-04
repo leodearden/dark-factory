@@ -230,8 +230,24 @@ else
     # now fails closed on BaseException, and this second lock means the gate
     # never again depends on the probe alone getting that right: a report that
     # does not CLAIM a pass is not one.
-    if [ "$probe_rc" -eq 0 ] && printf '%s' "$probe_out" | grep -qF "$PROBE_PASS_MARKER"; then
-      if printf '%s' "$probe_out" | grep -qF "$PROBE_PENDING_MARKER"; then
+    # HERE-STRING, NOT A PIPE, and this is load-bearing under the `set -uo
+    # pipefail` at the top of this script. `printf ... | grep -q` races: grep
+    # exits the instant it matches, so printf can be killed by SIGPIPE and
+    # exit 141, and pipefail then makes the whole pipeline non-zero WITH THE
+    # MARKER PRESENT. Measured
+    # on this host: 16 spurious failures in 3000 iterations of this exact
+    # pipeline (~0.5%/call; a reviewer measured ~1.6% on a busier run), and the
+    # hermetic suite below failed 3 of 8 full runs from it alone. Both harms are
+    # silent-ish and opposite: a flake here reports item 1 UNVERIFIABLE against a
+    # judge that demonstrably passes (re-blocking 3169 on a correct fix -- the
+    # exact false-FAIL class this gate was rewritten to remove), and a flake on
+    # the PENDING check drops the name-assisted-pass channel entirely, printing
+    # an ordinary clean `PASS item 1` and silently withdrawing the eyeball
+    # confirmation on a run that authorises a production flip. A here-string has
+    # no writer process to signal, so there is no race to lose: 0 failures in
+    # 3000 iterations of both spellings. Do not "tidy" these back into pipes.
+    if [ "$probe_rc" -eq 0 ] && grep -qF "$PROBE_PASS_MARKER" <<<"$probe_out"; then
+      if grep -qF "$PROBE_PENDING_MARKER" <<<"$probe_out"; then
         item1_pending=1
         note "PASS  item 1  (NEEDS CONFIRMATION) the judge path binds a verdict to a"
         note "              determinate candidate -- but the probe accepted it partly on a"
@@ -277,7 +293,10 @@ fi
 # --- item 2: the committed accuracy artifact must be reproducible -------------
 if read_ref_file "$EVAL"; then
   eval_src="$REF_CONTENT"
-  if printf '%s' "$eval_src" | grep -q 'dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)'; then
+  # Here-string, not a pipe -- same pipefail/SIGPIPE race as item 1 above, and
+  # here it fails the OTHER way: a spurious non-zero takes the else branch and
+  # prints `PASS item 2` for an eval script that still iterates the frozenset.
+  if grep -q 'dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)' <<<"$eval_src"; then
     note "FAIL  item 2  $EVAL still iterates the TRIAGE_OUTCOMES frozenset directly"
     note "              Column/key order is PYTHONHASHSEED-dependent, so the committed"
     note "              JSON and markdown churn between identical runs. Measured"
@@ -296,7 +315,8 @@ if read_ref_file "$EVAL"; then
   fi
 
   # --- item 4: --report-path must not destroy its own JSON --------------------
-  if printf '%s' "$eval_src" | grep -q "report_path\.with_suffix('\.md')"; then
+  # Here-string, not a pipe -- see item 2. A flake here spuriously PASSES too.
+  if grep -q "report_path\.with_suffix('\.md')" <<<"$eval_src"; then
     note "FAIL  item 4  $EVAL still derives the markdown sibling via with_suffix('.md')"
     note "              '--report-path foo.md' writes the JSON and then OVERWRITES it"
     note "              with the markdown, losing the JSON silently; 'foo.tar.gz' writes"

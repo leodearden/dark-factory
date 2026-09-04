@@ -1932,3 +1932,132 @@ class TestReportSurvivesTruncation:
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
         assert 'FAILING ITEMS: none' in tail, tail
+
+
+def _gate_marker(name: str) -> str:
+    """The gate's own literal value for a marker variable.
+
+    Read from the script rather than duplicated here, for the same reason
+    ``test_the_gates_pass_marker_matches_the_probes_own_wording`` does it: a
+    reworded marker must not quietly make these tests assert nothing.
+    """
+    prefix = f'{name}='
+    for line in _GATE_SCRIPT.read_text().splitlines():
+        if line.startswith(prefix):
+            return line.split('=', 1)[1].strip().strip("'\"")
+    raise AssertionError(f'the gate no longer defines {name}')
+
+
+# Large enough that a writer feeding `grep -q` through a PIPE is certain to be
+# killed by SIGPIPE before it finishes: grep exits at the match, and ~1 MB
+# still has to go down the pipe behind it. Measured on this host with the
+# pre-fix spelling: 60 spurious failures in 60 iterations (deterministic),
+# against 0 in 60 for the here-string. That determinism is the whole point --
+# the same bug at the probe's own natural report size flakes at well under 2%
+# per call, so a "run it 50 times and hope" test would miss it about half the
+# time and then itself become the suite's flake.
+_PROBE_FILLER_BYTES = 960_000
+
+
+def _write_marker_first_probe_stub(path: Path, *, markers: list[str]) -> Path:
+    """A stand-in probe: emit the markers FIRST, then a large report, exit 0.
+
+    The ORDER is the mechanism under test. A marker at the end of the report
+    lets the writer finish before grep can exit, so it would never expose the
+    race no matter how large the report is.
+    """
+    body = '\n'.join(markers)
+    path.write_text(
+        '#!/bin/sh\n'
+        f"printf '%s\\n' {shlex.quote(body)}\n"
+        f"yes 'filler line, report body continues' | head -c {_PROBE_FILLER_BYTES}\n"
+        'exit 0\n'
+    )
+    path.chmod(0o755)
+    return path
+
+
+class TestVerdictReadingIsNotRaceProne:
+    """Reading the probe's verdict must not depend on process scheduling.
+
+    Reviewer cycle-6 finding (correctness), measured and reproduced. The two
+    item-1 verdict checks used to be ``printf '%s' "$probe_out" | grep -qF``
+    under the script's ``set -uo pipefail``. ``grep -q`` exits at the first
+    match, so the printf on the left of the pipe can be killed by SIGPIPE and
+    exit 141 -- and pipefail then makes the whole pipeline non-zero even though
+    the marker is PRESENT. Two opposite harms, both bad:
+
+    * the PASS check flakes -> the gate reports item 1 UNVERIFIABLE and exits 1
+      against a judge that demonstrably passes, re-blocking task 3169 on a
+      correct fix. That is exactly the false-FAIL class task 4810 exists to
+      remove, reintroduced one layer up.
+    * the PENDING check flakes -> a name-assisted pass loses its
+      PASS-NEEDS-CONFIRMATION detection, the tail confirmation block is never
+      emitted, and the eyeball demand is silently dropped on a run that
+      authorises a production ``write_triage.enabled`` flip. INVISIBLE: the
+      gate still exits 0.
+
+    These tests drive the gate through a stub probe, so they pin the SHELL's
+    reading of the verdict and stay indifferent to how the real probe decides
+    one.
+    """
+
+    def test_a_pass_marker_ahead_of_a_large_report_is_never_lost(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        stub = _write_marker_first_probe_stub(
+            tmp_path / 'marker-first-probe',
+            markers=[_gate_marker('PROBE_PASS_MARKER') + ' (option (b)).'],
+        )
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name,
+            ref=_FIXTURE_REF,
+            probe_py=str(stub),
+        )
+        assert proc.returncode == 0, (
+            'the gate lost a PASS marker its own report quotes back:\n'
+            f'{proc.stdout[:4000]}\n{proc.stderr[:2000]}'
+        )
+        assert 'PASS  item 1' in proc.stdout, proc.stdout[:4000]
+        assert 'exited 0 without reporting a PASS' not in proc.stdout, proc.stdout[:4000]
+
+    def test_a_pending_marker_ahead_of_a_large_report_is_never_lost(self, tmp_path):
+        """The silent half: item 1 still PASSES, so only this assertion catches it."""
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        stub = _write_marker_first_probe_stub(
+            tmp_path / 'pending-marker-first-probe',
+            markers=[
+                _gate_marker('PROBE_PASS_MARKER') + ' (option (b)).',
+                'WARN  ' + _gate_marker('PROBE_PENDING_MARKER') + ' accepted on a name.',
+            ],
+        )
+        proc = _run_gate(
+            repo / 'scripts' / _GATE_SCRIPT.name,
+            ref=_FIXTURE_REF,
+            probe_py=str(stub),
+        )
+        assert proc.returncode == 0, f'{proc.stdout[:4000]}\n{proc.stderr[:2000]}'
+        assert 'NEEDS CONFIRMATION' in proc.stdout, (
+            'a name-assisted pass was reported as an ordinary clean pass, so the '
+            'eyeball confirmation was silently dropped:\n' + proc.stdout[:4000]
+        )
+
+    def test_repeated_runs_against_a_passing_judge_all_agree(self, tmp_path):
+        """The reviewer's own requested shape, kept as a cheap backstop.
+
+        Weaker than the two above -- at the real probe's report size the race
+        fires well under 2% of calls, so this would miss a reintroduced pipe
+        roughly half the time on its own. It is here because it exercises the
+        REAL probe end to end, so it also catches a non-determinism the stub
+        cannot reach (one in the probe itself). Build the fixture repo once and
+        re-run only the gate.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        gate = repo / 'scripts' / _GATE_SCRIPT.name
+        verdicts = []
+        for _ in range(30):
+            proc = _run_gate(gate, ref=_FIXTURE_REF)
+            verdicts.append((proc.returncode, 'PASS  item 1' in proc.stdout))
+        assert set(verdicts) == {(0, True)}, (
+            f'the gate did not agree with itself across 30 identical runs: '
+            f'{sorted(set(verdicts))}'
+        )
