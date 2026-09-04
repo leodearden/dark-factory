@@ -38,10 +38,12 @@ Design
 * ``SyntaxError`` in one module contributes nothing and never raises, so a
   mid-edit file cannot turn the whole-tree gate red.
 * Callee names resolve through the calling module's ``from X import Y``
-  bindings and its own ``def``s.  **An unresolvable name is silence, never a
-  finding.**  A false RED in a whole-tree gate is worse than a miss: it blocks
-  every merge until someone blesses a non-defect, which trains reviewers to
-  bless rows unread and destroys the gate's value.
+  bindings and the ``def``s actually VISIBLE at the call -- module-level defs
+  plus the call's own enclosing function scopes.  A name a parameter or a local
+  assignment shadows resolves to nothing.  **An unresolvable name is silence,
+  never a finding.**  A false RED in a whole-tree gate is worse than a miss: it
+  blocks every merge until someone blesses a non-defect, which trains reviewers
+  to bless rows unread and destroys the gate's value.
 * Findings key on ``(relpath, qualname, content_hash)`` -- never ``lineno``,
   which drifts on every unrelated edit above the site.  The key shape and its
   helpers are reused verbatim from ``silent_fallthrough_scan``.
@@ -207,10 +209,24 @@ METHOD_PRIMITIVES: dict[str, str] = {
 # The non-blocking siblings.  Never a finding, whatever else matches.
 _NON_BLOCKING_PREFIXES = ('asyncio.', 'anyio.')
 
-# The offload hops.  ``asyncio.to_thread(fn, ...)`` exempts arg 0;
-# ``<loop>.run_in_executor(executor, fn, ...)`` exempts arg 1.
-_OFFLOAD_CALLABLE_ARG: dict[str, int] = {
-    'to_thread': 0,
+# The offload hops, matched by RESOLVED dotted path (after `import X as Y` and
+# `from X import Y` substitution).  ``asyncio.to_thread(fn, ...)`` and
+# ``anyio.to_thread.run_sync(fn, ...)`` both exempt arg 0.
+#
+# Matching these by bare attribute name would be the one place in this scanner
+# where a name collision produces a MISS rather than the documented silence:
+# any `helper.to_thread(load_registry, p)` would exempt `load_registry` from
+# the sweep on a whole-tree gate.  Hence the receiver is checked.
+_OFFLOAD_DOTTED_ARG: dict[str, int] = {
+    'asyncio.to_thread': 0,
+    'anyio.to_thread.run_sync': 0,
+}
+
+# ``<loop>.run_in_executor(executor, fn, ...)`` exempts arg 1.  The receiver is
+# an arbitrary event-loop object, so this one cannot be pinned to a dotted
+# path -- but it IS pinned to the attribute shape: a bare `run_in_executor(...)`
+# name never counts.
+_OFFLOAD_ATTR_ARG: dict[str, int] = {
     'run_in_executor': 1,
 }
 
@@ -233,9 +249,16 @@ class _ModuleCtx:
         self.name = module_name_for(relpath)
         self.parent_map = _build_parent_map(tree)
 
-        # Bare name -> the function def(s) carrying it, at ANY nesting depth.
-        # Ambiguity (two defs sharing a name in one module) resolves to
-        # silence: see _lookup_def.
+        # Bare name -> the MODULE-LEVEL function def(s) carrying it.  Class
+        # methods and nested defs are deliberately absent: a bare ``foo(...)``
+        # can never name them from outside their scope, and indexing them here
+        # would resolve a call to a def that is not in the caller's scope at
+        # all -- a false finding on a merge-blocking gate.  Nested defs are
+        # reachable through the caller's own enclosing-function chain instead
+        # (see :meth:`lookup_visible_def`), which is where a closure like
+        # ``server/tools.py::create_mcp_server._normalize_project_root``
+        # genuinely IS visible.  Ambiguity (two defs sharing a name in one
+        # scope) resolves to silence: see :meth:`lookup_def`.
         self.defs_by_name: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
         # Class name -> {method name -> def}, for `self.foo(...)` resolution.
         self.methods_by_class: dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = {}
@@ -243,14 +266,19 @@ class _ModuleCtx:
         self.bindings: dict[str, tuple[str, str]] = {}
         # Local alias -> real module dotted name, from `import X as Y`.
         self.module_aliases: dict[str, str] = {}
+        # Per-scope caches, keyed by id() of the scope node.
+        self._defs_in_scope: dict[int, dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]] = {}
+        self._rebinds_in_scope: dict[int, frozenset[str]] = {}
 
         self._index()
 
     def _index(self) -> None:
+        self.defs_by_name = {
+            name: list(defs)
+            for name, defs in _defs_bound_in_scope(self.tree).items()
+        }
         for node in ast.walk(self.tree):
-            if isinstance(node, _FUNC_TYPES):
-                self.defs_by_name.setdefault(node.name, []).append(node)
-            elif isinstance(node, ast.ClassDef):
+            if isinstance(node, ast.ClassDef):
                 methods = {
                     child.name: child
                     for child in node.body
@@ -293,14 +321,135 @@ class _ModuleCtx:
         return None
 
     def lookup_def(self, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-        """Return the unique def named *name* in this module, else ``None``.
+        """Return the unique MODULE-LEVEL def named *name*, else ``None``.
 
         Ambiguity is silence: two defs sharing a bare name (an overload in a
         branch, a test double) make the call unresolvable, and an unresolvable
-        call is never a finding.
+        call is never a finding.  This is also the shape ``from X import Y``
+        needs: ``Y`` is by construction a module-level name in ``X``.
         """
         candidates = self.defs_by_name.get(name, [])
         return candidates[0] if len(candidates) == 1 else None
+
+    def enclosing_function_scopes(self, node: ast.AST):
+        """Yield the function scopes enclosing *node*, innermost first."""
+        current = self.parent_map.get(id(node))
+        while current is not None:
+            if isinstance(current, _FUNC_TYPES):
+                yield current
+            current = self.parent_map.get(id(current))
+
+    def name_is_rebound(self, name: str, node: ast.AST) -> bool:
+        """Is *name* bound to a non-``def`` in any function scope around *node*?
+
+        A parameter, a local assignment, a ``with ... as`` or a ``for`` target
+        shadows both this module's own defs and its ``from X import Y``
+        bindings, so a call through that name reaches whatever the local
+        binding holds -- which this scanner cannot know.  Silence, therefore,
+        never a finding: ``async def h(load, p): return load(p)`` must not
+        resolve to a module-level ``def load`` the parameter hides.
+        """
+        for scope in self.enclosing_function_scopes(node):
+            if name in self._rebinds_for(scope):
+                return True
+        return False
+
+    def lookup_visible_def(
+        self, name: str, node: ast.AST
+    ) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        """Return the def a bare *name* names AT *node*, honouring scope.
+
+        Nearest enclosing function scope first (closures -- the
+        ``create_mcp_server._normalize_project_root`` shape), then module
+        level.  A shadowed or ambiguous name is ``None``.
+        """
+        if self.name_is_rebound(name, node):
+            return None
+        for scope in self.enclosing_function_scopes(node):
+            candidates = self._defs_for(scope).get(name, [])
+            if candidates:
+                return candidates[0] if len(candidates) == 1 else None
+        return self.lookup_def(name)
+
+    def _defs_for(
+        self, scope: ast.AST
+    ) -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
+        cached = self._defs_in_scope.get(id(scope))
+        if cached is None:
+            cached = _defs_bound_in_scope(scope)
+            self._defs_in_scope[id(scope)] = cached
+        return cached
+
+    def _rebinds_for(self, scope: ast.AST) -> frozenset[str]:
+        cached = self._rebinds_in_scope.get(id(scope))
+        if cached is None:
+            cached = _names_rebound_in_scope(scope)
+            self._rebinds_in_scope[id(scope)] = cached
+        return cached
+
+
+def _defs_bound_in_scope(
+    scope: ast.AST,
+) -> dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """``def``s bound directly in *scope*'s own namespace, not in a nested one.
+
+    ``scope`` is a ``Module`` or a function node.  Descent stops at every
+    ``def`` / ``async def`` / ``class`` / ``lambda``: a def nested one level
+    down binds a name in ITS body's namespace, not here, so a bare call in
+    this scope cannot reach it.  Defs inside ``if`` / ``try`` / ``with``
+    blocks DO bind here and are collected.
+    """
+    out: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+
+    def _walk(current: ast.AST) -> None:
+        for child in ast.iter_child_nodes(current):
+            if isinstance(child, _FUNC_TYPES):
+                out.setdefault(child.name, []).append(child)
+                continue  # its body is a deeper namespace
+            if isinstance(child, (ast.ClassDef, ast.Lambda)):
+                continue
+            _walk(child)
+
+    _walk(scope)
+    return out
+
+
+def _names_rebound_in_scope(scope: ast.AST) -> frozenset[str]:
+    """Names *scope* binds to something OTHER than a ``def``.
+
+    Parameters plus every ``Store``-context ``Name``: assignment (including
+    unpacking and the walrus), ``for`` targets, ``with ... as``, ``except ...
+    as``.  ``def``s are excluded on purpose -- they are what
+    :func:`_defs_bound_in_scope` resolves, and treating one as a shadow would
+    silence every legitimate closure call.
+
+    Attribute and subscript targets (``self.x = ...``, ``d[k] = ...``) bind no
+    bare name and are therefore not collected: only the ``Name`` node's own
+    ``ctx`` decides.
+    """
+    names: set[str] = set()
+
+    args = getattr(scope, 'args', None)
+    if isinstance(args, ast.arguments):
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            names.add(arg.arg)
+        if args.vararg is not None:
+            names.add(args.vararg.arg)
+        if args.kwarg is not None:
+            names.add(args.kwarg.arg)
+
+    def _walk(current: ast.AST) -> None:
+        for child in ast.iter_child_nodes(current):
+            if isinstance(child, _SCOPE_BOUNDARIES):
+                continue  # a nested scope binds its own names
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                names.add(child.id)
+            elif isinstance(child, ast.ExceptHandler) and child.name:
+                names.add(child.name)
+            _walk(child)
+
+    _walk(scope)
+    return frozenset(names)
 
 
 def module_name_for(relpath: str) -> str:
@@ -366,7 +515,52 @@ def _shallow_nodes(node: ast.AST, skip: frozenset[int] = frozenset()) -> list[as
     return out
 
 
-def _offloaded_callable_ids(func_node: ast.AST) -> frozenset[int]:
+def _resolve_head(path: str, ctx: _ModuleCtx) -> str:
+    """Substitute a dotted path's head through this module's import bindings.
+
+    ``import asyncio as aio`` makes ``aio.to_thread`` -> ``asyncio.to_thread``;
+    ``from anyio import to_thread`` makes ``to_thread.run_sync`` ->
+    ``anyio.to_thread.run_sync``.  An unknown head is returned unchanged.
+    """
+    head, _, rest = path.partition('.')
+    if head in ctx.module_aliases:
+        resolved_head = ctx.module_aliases[head]
+    elif head in ctx.bindings:
+        source_module, source_name = ctx.bindings[head]
+        resolved_head = f'{source_module}.{source_name}'
+    else:
+        resolved_head = head
+    return f'{resolved_head}.{rest}' if rest else resolved_head
+
+
+def _offload_callable_index(call: ast.Call, ctx: _ModuleCtx) -> int | None:
+    """Argument index this offload hop moves onto a worker thread, or ``None``.
+
+    The receiver is checked, not just the attribute name (see
+    :data:`_OFFLOAD_DOTTED_ARG`): ``asyncio.to_thread`` / a ``from asyncio
+    import to_thread`` binding / ``anyio.to_thread.run_sync`` count, and an
+    unrelated ``helper.to_thread(...)`` does not.
+    """
+    func = call.func
+
+    if isinstance(func, ast.Name):
+        bound = ctx.bindings.get(func.id)
+        if bound is None:
+            return None
+        return _OFFLOAD_DOTTED_ARG.get(f'{bound[0]}.{bound[1]}')
+
+    if isinstance(func, ast.Attribute):
+        path = dotted_path(func)
+        if path is not None:
+            index = _OFFLOAD_DOTTED_ARG.get(_resolve_head(path, ctx))
+            if index is not None:
+                return index
+        return _OFFLOAD_ATTR_ARG.get(func.attr)
+
+    return None
+
+
+def _offloaded_callable_ids(func_node: ast.AST, ctx: _ModuleCtx) -> frozenset[int]:
     """Ids of the callable arguments handed to an offload hop inside *func_node*.
 
     ``asyncio.to_thread(load_registry, p)`` and
@@ -379,12 +573,7 @@ def _offloaded_callable_ids(func_node: ast.AST) -> frozenset[int]:
     for node in ast.walk(func_node):
         if not isinstance(node, ast.Call):
             continue
-        name = None
-        if isinstance(node.func, ast.Attribute):
-            name = node.func.attr
-        elif isinstance(node.func, ast.Name):
-            name = node.func.id
-        index = _OFFLOAD_CALLABLE_ARG.get(name or '')
+        index = _offload_callable_index(node, ctx)
         if index is None or len(node.args) <= index:
             continue
         for descendant in ast.walk(node.args[index]):
@@ -410,6 +599,10 @@ def _primitive_for_call(call: ast.Call, ctx: _ModuleCtx) -> str | None:
     func = call.func
 
     if isinstance(func, ast.Name):
+        if ctx.name_is_rebound(func.id, call):
+            # A local binding holds this name, so the module's import bindings
+            # do not describe what it calls.
+            return None
         bound = ctx.bindings.get(func.id)
         if bound is not None:
             candidate = f'{bound[0]}.{bound[1]}'
@@ -453,14 +646,20 @@ def _resolve_callee(
     """Resolve a call to the ``def`` it invokes, or ``None`` if unknowable.
 
     Resolution is deliberately narrow (see the module docstring's "Deliberate
-    limits"): a bare ``Name`` via import bindings or this module's own defs, and
-    ``self.attr`` / ``cls.attr`` via the enclosing class's methods.  Anything
-    else -- an arbitrary ``obj.method()``, a call through a variable -- is
+    limits"): a bare ``Name`` via import bindings or a def actually VISIBLE at
+    the call (this module's module-level defs, plus the call's own enclosing
+    function scopes), and ``self.attr`` / ``cls.attr`` via the enclosing
+    class's methods.  Anything else -- an arbitrary ``obj.method()``, a call
+    through a variable, a name a parameter or local assignment shadows -- is
     silence.
     """
     func = call.func
 
     if isinstance(func, ast.Name):
+        if ctx.name_is_rebound(func.id, call):
+            # A parameter or local binding holds this name; whatever it calls
+            # is not something the module's own defs or imports can tell us.
+            return None
         bound = ctx.bindings.get(func.id)
         if bound is not None:
             target_ctx = modules.get(bound[0])
@@ -468,7 +667,7 @@ def _resolve_callee(
                 return None
             target = target_ctx.lookup_def(bound[1])
             return (target_ctx, target) if target is not None else None
-        own = ctx.lookup_def(func.id)
+        own = ctx.lookup_visible_def(func.id, call)
         return (ctx, own) if own is not None else None
 
     if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
@@ -503,7 +702,7 @@ def _reaches_blocking(
         return None  # cycle: this arm adds nothing, do not recurse
 
     inner_seen = seen | {key}
-    skip = _offloaded_callable_ids(func_node)
+    skip = _offloaded_callable_ids(func_node, ctx)
     result: str | None = None
 
     for node in _shallow_nodes(func_node, skip):
@@ -569,7 +768,7 @@ def find_loop_blocking_sites(sources: dict[str, str]) -> list[LoopBlockingSite]:
         for func_node in ast.walk(ctx.tree):
             if not isinstance(func_node, ast.AsyncFunctionDef):
                 continue
-            skip = _offloaded_callable_ids(func_node)
+            skip = _offloaded_callable_ids(func_node, ctx)
             for node in _shallow_nodes(func_node, skip):
                 if not isinstance(node, ast.Call):
                     continue

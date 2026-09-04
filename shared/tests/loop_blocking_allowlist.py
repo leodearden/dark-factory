@@ -699,30 +699,24 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'create_mcp_server._claim_commit_presence',
         '4d52656d51f0',
         'to_file',
-        'ROOT CAUSE (one defect, 2 rows): the claim-verification MCP '
-        'handlers _claim_commit_presence and _completion_claim_gate call '
-        'recon_claim_verification_guard\'s make_commit_probe / verify_claims '
-        'INLINE on the loop thread, each reaching subprocess.run(git). Task '
-        '3778\'s census asserted this module was "already offloaded at its '
-        'call sites" -- true of the callers it looked at, false of these. '
-        'This pair IS the counter-example that made task 4484 necessary. '
-        'Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7RHBAS4A3VH976CE1CJMGK8.',
-    ),
-    (
-        'fused-memory/src/fused_memory/server/tools.py',
-        'create_mcp_server._completion_claim_gate',
-        '01e23bf817cf',
-        'to_file',
-        'ROOT CAUSE (one defect, 2 rows): the claim-verification MCP '
-        'handlers _claim_commit_presence and _completion_claim_gate call '
-        'recon_claim_verification_guard\'s make_commit_probe / verify_claims '
-        'INLINE on the loop thread, each reaching subprocess.run(git). Task '
-        '3778\'s census asserted this module was "already offloaded at its '
-        'call sites" -- true of the callers it looked at, false of these. '
-        'This pair IS the counter-example that made task 4484 necessary. '
-        'Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7RHBAS4A3VH976CE1CJMGK8.',
+        'ROOT CAUSE (one defect, 1 row): the claim-verification MCP handler '
+        '_claim_commit_presence calls completion_claim_gate\'s '
+        'make_commit_probe INLINE on the loop thread, reaching '
+        'subprocess.run(git cat-file). Task 3778\'s census asserted this '
+        'module was "already offloaded at its call sites" -- true of the '
+        'callers it looked at, false of this one, which is the '
+        'counter-example that made task 4484 necessary. Follow-up filed by '
+        'task 4484 step-9.'
+        ' Ticket: tkt_0RT7RHBAS4A3VH976CE1CJMGK8. WITHDRAWN SIBLING: this '
+        'cluster was originally 2 rows. The second '
+        '(create_mcp_server._completion_claim_gate -> verify_claims, hash '
+        '01e23bf817cf) was a SCANNER false positive, deleted in task 4484\'s '
+        'amendment pass: the pre-amendment resolver indexed defs at any '
+        'nesting depth, so _verify_task\'s "probe" PARAMETER resolved to the '
+        'unrelated nested make_commit_probe.probe. verify_claims is sync by '
+        'design and its probes are pre-resolved dict lookups; it reaches no '
+        'primitive. The ticket above names both handlers and overstates by '
+        'one site.',
     ),
     (
         'fused-memory/src/fused_memory/server/tools.py',

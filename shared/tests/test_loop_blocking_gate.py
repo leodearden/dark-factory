@@ -190,6 +190,78 @@ class TestCallerSideEnumeration:
 
         assert find_loop_blocking_sites(sources) == []
 
+    def test_to_thread_on_an_unrelated_receiver_is_not_an_offload_hop(self):
+        """``helper.to_thread(...)`` is NOT ``asyncio.to_thread(...)``.
+
+        The offload match is the one place in this scanner where a name
+        collision costs a MISS instead of the documented silence: matching on
+        the attribute name alone lets any object with a ``to_thread`` method
+        exempt its first argument from a merge-blocking whole-tree sweep.  The
+        receiver is therefore resolved to ``asyncio.to_thread`` /
+        ``anyio.to_thread.run_sync`` before the exemption applies.
+
+        The fixture puts the CALL inside the offload argument because that is
+        the only shape where the exemption is observable: a recognised hop
+        skips the whole argument subtree (that is what makes
+        ``to_thread(load_registry, path)`` clean), so a bare name there is
+        never a finding either way.
+        """
+        def _sources(receiver: str) -> dict[str, str]:
+            return {
+                'pkg/mod.py': _module(
+                    'import asyncio',
+                    _HELPER_DEF,
+                    f"""
+                    async def b(helper, path):
+                        return {receiver}.to_thread(load_registry(path))
+                    """,
+                )
+            }
+
+        unrelated = find_loop_blocking_sites(_sources('helper'))
+        real = find_loop_blocking_sites(_sources('asyncio'))
+
+        assert [(f.qualname, f.callee) for f in unrelated] == [('b', 'load_registry')], (
+            "an unrelated receiver's .to_thread() must not exempt its argument "
+            f'from the sweep, got {unrelated}'
+        )
+        assert real == [], (
+            'the real asyncio.to_thread hop must still exempt its argument, '
+            f'got {real}'
+        )
+
+    def test_aliased_and_from_imported_to_thread_are_offload_hops(self):
+        """Every spelling of the real hop still offloads: alias and ``from`` import.
+
+        Constraining the match to a RESOLVED dotted path (the test above) must
+        not cost the legitimate spellings ``import asyncio as aio`` and ``from
+        asyncio import to_thread``, or a correctly-fixed site turns red.  Same
+        call-inside-the-argument fixture, for the same reason.
+        """
+        aliased = {
+            'pkg/mod.py': _module(
+                'import asyncio as aio',
+                _HELPER_DEF,
+                """
+                async def a(path):
+                    return await aio.to_thread(load_registry(path))
+                """,
+            )
+        }
+        from_imported = {
+            'pkg/mod.py': _module(
+                'from asyncio import to_thread',
+                _HELPER_DEF,
+                """
+                async def a(path):
+                    return await to_thread(load_registry(path))
+                """,
+            )
+        }
+
+        assert find_loop_blocking_sites(aliased) == []
+        assert find_loop_blocking_sites(from_imported) == []
+
     def test_awaited_async_callee_that_offloads_is_not_a_finding(self):
         """An ``await``ed coroutine that itself hops is clean at both levels.
 
@@ -261,6 +333,141 @@ class TestCallerSideEnumeration:
         }
 
         assert find_loop_blocking_sites(sources) == []
+
+    def test_a_parameter_shadowing_a_helper_name_is_silence(self):
+        """A callee that is a PARAMETER cannot be the module's def of that name.
+
+        ``async def b(load_registry, path)`` calls whatever the caller passed
+        in; the module-level ``def load_registry`` is not reachable through
+        that name at all.  Resolving it anyway is a false RED, and the whole
+        point of a merge-blocking gate is that it never manufactures one.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                _HELPER_DEF,
+                """
+                async def b(load_registry, path):
+                    return load_registry(path)
+                """,
+            )
+        }
+
+        assert find_loop_blocking_sites(sources) == []
+
+    def test_a_local_rebinding_of_a_helper_name_is_silence(self):
+        """A local assignment shadows the module def for the rest of the scope."""
+        sources = {
+            'pkg/mod.py': _module(
+                _HELPER_DEF,
+                """
+                async def b(path):
+                    load_registry = lambda p: 1
+
+                    return load_registry(path)
+                """,
+            )
+        }
+
+        assert find_loop_blocking_sites(sources) == []
+
+    def test_a_class_method_is_not_reachable_as_a_bare_name(self):
+        """``Loader.load`` is not what a bare ``load(...)`` elsewhere calls.
+
+        Indexing class methods under their bare names would resolve any
+        same-named parameter or local call to a method that is not in scope --
+        the shape of a false RED, reported by review against the delivered
+        scanner.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                """
+                class Loader:
+                    def load(self, path):
+                        return path.read_text()
+                """,
+                """
+                async def b(load, path):
+                    return load(path)
+                """,
+            )
+        }
+
+        assert find_loop_blocking_sites(sources) == []
+
+    def test_a_nested_def_is_not_visible_from_a_sibling_scope(self):
+        """THE LIVE FALSE POSITIVE (task 4484 amendment pass).
+
+        ``make_probe`` closes over a nested ``probe`` that shells out;
+        ``verify`` takes a ``probe`` PARAMETER and calls it.  The two names are
+        unrelated -- ``verify`` cannot see inside ``make_probe`` -- but a scanner
+        that indexes defs at any nesting depth resolves one to the other and
+        reports ``verify``'s callers as reaching ``subprocess.run``.
+
+        This is not hypothetical.  The delivered scanner produced exactly this
+        row against the live tree
+        (``server/tools.py::create_mcp_server._completion_claim_gate ->
+        verify_claims``, via ``services/completion_claim_gate.py``'s
+        ``make_commit_probe.probe`` and ``_verify_task``'s ``probe``
+        parameter), and it was blessed in the ledger as a real defect.  The
+        genuine site next door -- ``_claim_commit_presence ->
+        make_commit_probe`` -- is unaffected and still reported.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                'import subprocess',
+                """
+                def make_probe(root):
+                    def probe(sha):
+                        return subprocess.run(['git', 'cat-file', '-e', sha])
+
+                    return probe
+                """,
+                """
+                def verify(claim, probe):
+                    return probe(claim)
+                """,
+                """
+                async def handler(claim):
+                    return verify(claim, lambda ref: None)
+                """,
+            )
+        }
+
+        assert find_loop_blocking_sites(sources) == [], (
+            'a nested def must not resolve a same-named parameter in an '
+            'unrelated scope'
+        )
+
+    def test_an_enclosing_scope_helper_still_resolves(self):
+        """A closure IS visible to the coroutines defined beside it.
+
+        The counterpart to the test above, and the live shape the ledger's
+        largest cluster is made of: ``server/tools.py::create_mcp_server``
+        defines a nested ``_normalize_project_root`` and 22 nested MCP handlers
+        call it.  Restricting resolution to module level alone would silence
+        all 22 -- correctness here is scope visibility, not nesting depth.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                _HELPER_DEF,
+                """
+                def create_server():
+                    def _normalize(path):
+                        return load_registry(path)
+
+                    async def handler(path):
+                        return _normalize(path)
+
+                    return handler
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert [(f.qualname, f.callee) for f in findings] == [
+            ('create_server.handler', '_normalize')
+        ], f'the enclosing-scope closure must still resolve, got {findings}'
 
     def test_cross_module_import_binding_resolves(self):
         """``from X import Y`` then an inline ``Y(...)`` -- the real task_curator shape.
