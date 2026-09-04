@@ -4848,7 +4848,7 @@ class TestVerificationFailureAudit:
         ],
     )
     async def test_every_verification_outcome_records_a_row(
-        self, reconciler, journal, caplog, verdict, expected_operation
+        self, reconciler, journal, caplog, tmp_path, verdict, expected_operation
     ):
         """Every verify invocation records exactly one row — including healthy ones.
 
@@ -4871,7 +4871,13 @@ class TestVerificationFailureAudit:
         ))
 
         with caplog.at_level(logging.WARNING):
-            result = await _run_done_transition(reconciler)
+            # tmp_path, not the shared '/tmp/test' default (task 4723): the
+            # `contradicted` parametrization now files an L1 escalation, and
+            # EscalationQueue.__init__ mkdirs — against the shared default
+            # that is cross-developer FS pollution and a race under the
+            # suite's `-n auto --dist loadgroup` xdist config. What this test
+            # pins is unchanged.
+            result = await _run_done_transition(reconciler, project_root=str(tmp_path))
 
         runs = await journal.get_recent_runs('test-project', limit=1)
         actions = await journal.get_run_actions(runs[0].id)
