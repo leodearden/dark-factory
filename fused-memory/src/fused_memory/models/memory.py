@@ -52,7 +52,30 @@ class MemoryResult(BaseModel):
 class AddEpisodeResponse(BaseModel):
     """Response from add_episode."""
 
-    episode_id: str | None = None
+    # A CORRELATION id for the queued write — explicitly NOT a Graphiti episode
+    # uuid (task 3561). add_episode returns synchronously at ENQUEUE time, so no
+    # node exists yet; the real uuid is minted by graphiti_core when the queued
+    # write executes, and _execute_graphiti_write logs the two together.
+    #
+    # The 'corr_' prefix is the runtime enforcement of that: a caller who copies
+    # this value into delete_episode fails self-describingly rather than getting
+    # a silent no-op against a nonexistent node, which is what happened while
+    # this field returned a bare uuid4.
+    #
+    # The field NAME stays `episode_id`: it is part of the published MCP
+    # response schema and of the write-journal `result_summary` shape
+    # (services/journal.py), so renaming it is a breaking change. The
+    # description below is a Field(...) rather than a comment so the demotion
+    # travels with the MCP schema instead of living only in source.
+    episode_id: str | None = Field(
+        default=None,
+        description=(
+            'Correlation id for the queued write (prefixed "corr_"), NOT a '
+            'Graphiti episode uuid. The episode node does not exist until the '
+            'queued write executes, so this value is not resolvable via '
+            'delete_episode or any other uuid-keyed operation.'
+        ),
+    )
     status: EpisodeStatus
     message: str = ''
 

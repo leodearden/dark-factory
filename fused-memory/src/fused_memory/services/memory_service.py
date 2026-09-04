@@ -5615,6 +5615,19 @@ class MemoryService:
         # getattr-chained rather than attribute access because a None result
         # must not crash this path — see
         # test_execute_graphiti_write_none_result_no_crash.
+        # The ONLY record tying the id returned at enqueue time to the node the
+        # write actually created (task 3561). AddEpisodeResponse.episode_id is
+        # a correlation id minted before the node exists, so without this line
+        # the mapping is unrecoverable — nothing else in the system records it.
+        # Tasks 3583/3584 key off this.
+        real_uuid = getattr(getattr(result, 'episode', None), 'uuid', None)
+        logger.info(
+            'add_episode write executed: correlation_id=%r -> episode_uuid=%r '
+            '(group_id=%r, causation_id=%r)',
+            payload.get('correlation_id'), real_uuid,
+            payload.get('group_id'), causation_id,
+        )
+
         # INVARIANT (task 3561): every path below is either a register or a
         # loud warning — never an implicit fallthrough. A planning episode is
         # only ever OBSERVABLE via search results, so a missed registration
@@ -5624,7 +5637,7 @@ class MemoryService:
         # `if/elif`-with-no-else this replaced was a defect in its own right,
         # and why the miss must be diagnosable from logs alone.
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
-            episode_uuid = getattr(getattr(result, 'episode', None), 'uuid', None)
+            episode_uuid = real_uuid
             group_id = payload.get('group_id')
             if episode_uuid and group_id:
                 await self.planned_episode_registry.register(episode_uuid, group_id)
@@ -5906,7 +5919,17 @@ class MemoryService:
         it.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
-        episode_id = str(uuid_mod.uuid4())
+        # task 3561: this id is minted HERE, at enqueue time, before the queued
+        # write executes and therefore before any Graphiti node exists. It is a
+        # CORRELATION id for the queued write, never an episode uuid — the
+        # 'corr_' prefix enforces that at runtime rather than leaving it to a
+        # docstring, so a caller who copies it into e.g. delete_episode fails
+        # self-describingly instead of getting a silent no-op against a
+        # nonexistent node. The real uuid is minted by graphiti_core and read
+        # back off result.episode.uuid in _execute_graphiti_write, which logs
+        # the two together so the mapping is recoverable.
+        correlation_uuid = str(uuid_mod.uuid4())
+        episode_id = f'corr_{correlation_uuid}'
         write_op_id = str(uuid_mod.uuid4())
 
         # Parse source type name for storage
@@ -5959,8 +5982,14 @@ class MemoryService:
                 group_id=scope.graphiti_group_id,
                 operation='add_episode',
                 payload={
-                    'name': f'episode_{episode_id[:8]}',
+                    # Off the RAW uuid4, deliberately — NOT off the prefixed
+                    # episode_id, so the correlation prefix never leaks into
+                    # episode names stored in the graph (task 3561).
+                    'name': f'episode_{correlation_uuid[:8]}',
                     'content': content,
+                    # A non-'uuid' key, so it can never be forwarded to
+                    # graphiti_core as a load instruction.
+                    'correlation_id': episode_id,
                     'source': source_name,
                     'group_id': scope.graphiti_group_id,
                     'source_description': source_description,
@@ -6011,7 +6040,12 @@ class MemoryService:
         return AddEpisodeResponse(
             episode_id=episode_id,
             status=EpisodeStatus.queued,
-            message=f'Episode queued for processing in project {project_id}',
+            message=(
+                f'Episode queued for processing in project {project_id}. '
+                f'episode_id is a correlation id for the queued write, not a '
+                f'Graphiti episode uuid — the node does not exist until the '
+                f'write executes.'
+            ),
         )
 
     # ------------------------------------------------------------------
