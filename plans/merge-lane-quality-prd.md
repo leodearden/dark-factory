@@ -567,3 +567,8 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    α's landing will hit the main-health path until 5088 lands. Not a dependency —
    the merge queue's main-health probe classifies it — but the first landing of
    this batch is gated on it in practice.
+6. **τ (5049) passes `--drain`** (Leo, 2026-09-04): `before_done.args = ["--drain"]`,
+   `timeout_secs` 900 → 5400 (seven units × up to 600s force-fire + verify grace).
+   The drain gate defers a unit whose merge-idle heartbeat says mid-merge, then
+   forces; a stale/absent heartbeat gets a short grace and proceeds. It protects
+   in-flight merges only; in-flight task agents are still soft-cancelled.

@@ -445,3 +445,11 @@ E=5056, F=5057, G=5058, H=5059, plus **C′=5097** (below).
 5. **`--drain` on the restart leaves (D2, τ)** remains an open operator decision:
    `restart-all-orchestrators.sh` with no arguments soft-cancels every in-flight
    task fleet-wide. Not changed here.
+6. **D2 (5054) passes `--drain`** (Leo, 2026-09-04; closes item 5 above):
+   `before_done.args = ["--drain"]`, `timeout_secs` 900 → 5400 (seven units × up to
+   600s force-fire + verify grace). Protects in-flight merges; task agents are
+   still soft-cancelled by the restart.
+7. **Policy PRD authoring is task 5098**, a `decision`-class human gate that fires
+   once G (5058) and E (5056) have landed, carrying the full brief (reports to
+   read, standing rulings, the two code facts, candidate levers). Chosen over
+   authoring now because the PRD's evidence base does not exist yet.
