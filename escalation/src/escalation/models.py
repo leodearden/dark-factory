@@ -57,6 +57,17 @@ Over-fold evidence (default-empty; task 3998):
               log-scrape.
   SOLE WRITER: `queue.add_members_to_l2` (also the sole trimmer).
 
+Dedupe-provenance bound (default-0; task 4885):
+  dedupe_children_truncated:
+              count of oldest NON-HEAD child ids shed to the
+              `queue._MAX_DEDUPE_CHILDREN` cap.  The TRUE provenance total is
+              `len(dedupe_children) + dedupe_children_truncated`, so the loss
+              stays assertable from the record rather than only by log-scrape.
+              `dedupe_count` is the load-bearing RECURRENCE SIGNAL and is NOT
+              capped — `dedupe_children` is provenance only, and the cap
+              deliberately separates the two.
+  SOLE WRITER: `queue.attach_dedupe_child` (also the sole trimmer).
+
 Filing-identity field (default-None; task 3533, populated by task 3550):
   filing_claimant_run_id:
               the FILING incarnation's claimant id in
@@ -305,6 +316,30 @@ class Escalation:
     dedupe_count: int = 0  # number of duplicate submissions folded into this parent
     dedupe_children: list[str] = field(default_factory=list)  # ids of folded duplicates
     dedupe_fingerprint: str | None = None  # content fingerprint for A7a/A7b recon dedup
+    # Count of oldest NON-HEAD child ids shed to the `queue._MAX_DEDUPE_CHILDREN`
+    # cap.  The TRUE provenance total is `len(dedupe_children) +
+    # dedupe_children_truncated`, so the loss stays assertable FROM THE RECORD
+    # and is never log-only (INV-8), exactly as for amendments_truncated and
+    # root_cause_variants_truncated below.
+    #
+    # `dedupe_count` is NOT affected by the cap and must never be: it is the
+    # load-bearing recurrence signal (a recon-watcher drain sorts the
+    # longest-rotting gates by it, and `sweep._pick_richer` ranks on it), while
+    # `dedupe_children` is provenance only.  The cap separates the two on
+    # purpose — the SIGNAL is uncapped, the PROVENANCE is bounded.
+    #
+    # Retention is HEAD-PRESERVING rather than the pure oldest-shed used above:
+    # unlike `amendments`, this list has no external anchor for the fold's
+    # origin, so the first `queue._MAX_DEDUPE_CHILDREN_HEAD` ids are kept and
+    # the oldest NON-head ones are shed.
+    #
+    # SOLE WRITER / sole trimmer: `queue.attach_dedupe_child`.  Zero migration by
+    # the same from_dict __dataclass_fields__ filter as every field below:
+    # legacy JSON without the key deserialises to 0, to_dict's asdict()
+    # serialises it for free, and queue.submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage need NO change (they are
+    # field-agnostic passthroughs or RMW-on-hydrated-record).
+    dedupe_children_truncated: int = 0
     # L2 cluster fields — empty defaults keep L0/L1 escalations bit-identical on disk.
     # Old JSON files (pre-L2) deserialise correctly via from_dict's __dataclass_fields__
     # filter: absent keys map to the dataclass defaults without any migration required.

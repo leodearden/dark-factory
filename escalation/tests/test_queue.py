@@ -641,6 +641,82 @@ class TestGetWithDuplicateArchiveCandidates:
         )
 
 
+class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
+    """get_by_task must find a record whose FILENAME does not encode its task_id.
+
+    WHY THIS EXISTS — do not "optimise" it away.  ``make_id``'s argument is an
+    id-NAMESPACE key, not a task_id: it names the durable counter ``esc-{key}.seq``
+    and the id stem ``esc-{key}-{n}``, and nothing more.  Five production sites
+    diverge deliberately — ``curator_escalator.py`` x3 (``make_id('curator')``
+    with ``task_id='task-curator'``) and ``ticket_janitor.py`` x2
+    (``make_id('ticket-janitor')``, same task_id) — so ``'task-curator'`` alone
+    carries three stem families in the live corpus (``esc-curator-*`` 31,
+    ``esc-ticket-janitor-*`` 6, ``esc-task-curator-*`` 13).
+
+    The false identity "for every record file, ``stem.startswith(
+    f'esc-{record.task_id}-')``" is therefore FALSE (42 of 2,972 corpus records
+    violate it), and believing it cost TWO design cycles: task 3999's 2026-08-11
+    amendment and ``plans/resume-charter-loss-remediation-prd.md``, both
+    withdrawn 2026-08-20 under ruling esc-3999-2.  ``get_by_task`` is correct
+    precisely BECAUSE it globs the unscoped ``esc-*.json`` and filters on the
+    STORED ``task_id`` FIELD.
+
+    THE BOUNDARY THIS TEST DRAWS: it forbids scoping ``get_by_task``'s glob to
+    ``f'esc-{task_id}-*.json'``.  That change was already rejected on its own
+    merits in esc-3999-2 — a measured 15x on a path costing 20-90 CPU-seconds/day
+    over a corpus the 30-day pruner already bounds, weighed against a
+    silent-record-loss failure mode and the erosion of contract D11
+    (``index_drift_detector.py``, task 3709, which put an opaque dedup key in the
+    task_id slot precisely BECAUSE get_by_task filters on the stored field).
+
+    This test is GREEN on arrival — it characterises existing correct behaviour —
+    so its honest RED is a MUTATION check: swap both globs to the scoped form and
+    it must go red.  That check was run and recorded in this commit.
+    """
+
+    def _esc(self, esc_id: str, task_id: str) -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='curator',
+            severity='info',
+            category='cleanup_needed',
+            summary='curator surfaced a ticket',
+        )
+
+    def test_pending_divergent_stem_is_found_by_stored_task_id(self, tmp_path: Path):
+        """Both live stem families for one task_id come back from get_by_task."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        # The divergent specimen: stem says 'curator', the record says 'task-curator'.
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+        # The SAME task_id under the other live stem family, for contrast.
+        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+
+        results = queue.get_by_task('task-curator')
+
+        assert {e.id for e in results} == {'esc-curator-1', 'esc-task-curator-1'}, (
+            'get_by_task filters on the STORED task_id field, not on the '
+            f'filename: got {sorted(e.id for e in results)}'
+        )
+
+    def test_archived_divergent_stem_is_still_found(self, tmp_path: Path):
+        """The archive tier must not lose the divergent record either."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+        queue.resolve('esc-curator-1', 'handled')
+
+        # It has moved out of the queue root and into archive/YYYY-MM-DD/.
+        assert not (queue.queue_dir / 'esc-curator-1.json').exists()
+
+        results = queue.get_by_task('task-curator')
+
+        assert 'esc-curator-1' in {e.id for e in results}, (
+            'an ARCHIVED divergent-stem record must still be found by its stored '
+            f'task_id: got {sorted(e.id for e in results)}'
+        )
+
+
 class TestGetByTaskAcrossArchive:
     """get_by_task() two-tier scan: hot path skips archive; broad path includes it."""
 
@@ -2744,6 +2820,252 @@ class TestAttachDedupeChild:
         assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
 
 
+class TestAttachDedupeChildGrowthBound:
+    """dedupe_children is BOUNDED, and the bound is loud.
+
+    Why a bound is needed: ``DedupeConfig.for_gate_backlog()`` sets
+    ``infra_dedupe_window_secs=float('inf')`` by design (a 300h-old gate MUST
+    still fold), so nothing ever ages a gate-backlog parent out — it gains one
+    child id per Stage-1 cycle for as long as a human has not decided, and that
+    whole record is read and parsed by ``get_pending()`` on every subsequent
+    dedupe scan.
+
+    Retention is HEAD-PRESERVING (first ``_MAX_DEDUPE_CHILDREN_HEAD`` + most
+    recent), not the pure oldest-shed used for ``amendments``: this list has no
+    external anchor for the fold's ORIGIN, so shedding purely oldest-first would
+    erase where the parent came from and leave only-recent ids — the least useful
+    provenance possible on a record whose whole problem is that it is old.
+
+    Every expected value below is DERIVED from the module constants, never
+    transcribed as a literal: a hand-copied literal encodes the constant's VALUE
+    instead of its NAME and silently drifts when the cap is retuned (test_server's
+    ``_COMPACT_KEYS`` comment records that this drift already happened once here).
+    """
+
+    #: How far past the cap these tests push.  Small on purpose — the shed is
+    #: per-attach in steady state, so K attaches past the cap shed exactly K.
+    K = 5
+
+    #: How far OVER the cap a record is seeded straight onto disk (bypassing
+    #: attach_dedupe_child) in the bulk-shed case.  Must be > 1: that is the
+    #: whole point — it forces `shed > 1`, the multi-element `del` slice that
+    #: the steady-state cases can never reach.
+    OVER_CAP_SEED = 30
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '1', severity: str = 'blocking') -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity=severity,
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+
+    def _attach_n(self, queue: EscalationQueue, parent_id: str, n: int) -> list[str]:
+        """Attach *n* children with predictable ids; returns the attach ORDER."""
+        order = [f'esc-child-{i}' for i in range(n)]
+        for child_id in order:
+            queue.attach_dedupe_child(parent_id, child_id)
+        return order
+
+    def test_at_the_cap_nothing_is_shed(self, tmp_path: Path):
+        """(a) Exactly at the cap: every id is still present, in order, nothing counted.
+
+        Named for what it ASSERTS (``_MAX_DEDUPE_CHILDREN`` attaches — the
+        boundary itself), not for the strictly-below case it does not exercise:
+        the cap fires on ``>``, so the last non-shedding attach IS the one at
+        the cap, and that is the edge worth pinning.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        order = self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert len(from_disk.dedupe_children) == _MAX_DEDUPE_CHILDREN
+        assert from_disk.dedupe_children == order, 'At the cap nothing may be shed or reordered'
+        assert from_disk.dedupe_children_truncated == 0
+
+    def test_past_the_cap_sheds_the_oldest_non_head_ids_and_counts_them(self, tmp_path: Path):
+        """(b) Past the cap: the list is bounded, the HEAD and the TAIL both survive,
+        and exactly the oldest NON-head ids are shed and counted."""
+        from escalation.queue import _MAX_DEDUPE_CHILDREN, _MAX_DEDUPE_CHILDREN_HEAD
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        order = self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN + self.K)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        kept = from_disk.dedupe_children
+
+        assert len(kept) == _MAX_DEDUPE_CHILDREN, (
+            f'dedupe_children must be BOUNDED at _MAX_DEDUPE_CHILDREN='
+            f'{_MAX_DEDUPE_CHILDREN}, got {len(kept)}'
+        )
+        assert from_disk.dedupe_children_truncated == self.K
+
+        # Head retention — the ids that ESTABLISHED the fold survive.
+        assert kept[:_MAX_DEDUPE_CHILDREN_HEAD] == order[:_MAX_DEDUPE_CHILDREN_HEAD], (
+            'The first _MAX_DEDUPE_CHILDREN_HEAD ids must be retained: on a '
+            "weeks-old parent they are the only record of the fold's origin"
+        )
+        # Tail retention — current activity survives.
+        tail_len = _MAX_DEDUPE_CHILDREN - _MAX_DEDUPE_CHILDREN_HEAD
+        assert kept[_MAX_DEDUPE_CHILDREN_HEAD:] == order[-tail_len:], (
+            'The most recent ids must be retained'
+        )
+
+        # Exactly the oldest NON-head ids were shed.
+        shed = order[_MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + self.K]
+        assert set(shed).isdisjoint(kept), f'Expected {shed} to have been shed, found some kept'
+
+        # The true-provenance-total identity: the loss is assertable FROM THE
+        # RECORD, never log-only (INV-8).
+        assert len(kept) + from_disk.dedupe_children_truncated == _MAX_DEDUPE_CHILDREN + self.K
+
+    def test_an_over_cap_record_seeded_on_disk_sheds_the_whole_excess_in_one_fold(
+        self, tmp_path: Path,
+    ):
+        """(b2) A record that arrives ALREADY over the cap sheds the entire
+        excess on its first fold — `shed > 1`, the multi-element `del` slice.
+
+        The steady-state cases above can only ever produce ``shed == 1``,
+        because they grow the list one attach at a time.  That branch is NOT
+        the only reachable one: ``attach_dedupe_child`` is not the sole writer
+        of ``dedupe_children``.  `fused-memory/scripts/backfill_recon_escalations.py`
+        assigns ``canonical.dedupe_children = list(collapse.child_ids)``
+        wholesale and persists it with ``queue.submit()``, which writes the
+        record verbatim and enforces no cap — so an arbitrarily long list can
+        legitimately exist on disk, and the FIRST subsequent fold must shed
+        ``len - cap + 1`` ids in one `del`, crediting every one of them to
+        ``dedupe_children_truncated``.
+
+        Seeded through ``submit`` rather than ``_rewrite`` precisely because
+        ``submit`` is the production path that creates this shape.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN, _MAX_DEDUPE_CHILDREN_HEAD
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        seeded_total = _MAX_DEDUPE_CHILDREN + self.OVER_CAP_SEED
+        seeded = [f'esc-seed-{i}' for i in range(seeded_total)]
+
+        esc = self._make_infra_esc('esc-1-1')
+        esc.dedupe_children = list(seeded)
+        esc.dedupe_count = seeded_total
+        queue.submit(esc)
+
+        # Precondition: submit really does persist an over-cap list untouched.
+        pre = queue.get('esc-1-1')
+        assert pre is not None
+        assert len(pre.dedupe_children) == seeded_total, (
+            'submit must write dedupe_children verbatim — if it ever starts '
+            'capping, this test is no longer exercising the bulk-shed path'
+        )
+        assert pre.dedupe_children_truncated == 0
+
+        queue.attach_dedupe_child('esc-1-1', 'esc-late-1')
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        kept = from_disk.dedupe_children
+
+        # One fold, many ids shed: the excess plus the id just appended.
+        expected_shed = self.OVER_CAP_SEED + 1
+        assert expected_shed > 1, 'OVER_CAP_SEED must force the multi-element del slice'
+        assert len(kept) == _MAX_DEDUPE_CHILDREN
+        assert from_disk.dedupe_children_truncated == expected_shed, (
+            f'A single fold on an over-cap record must credit ALL {expected_shed} '
+            f'dropped ids, got {from_disk.dedupe_children_truncated}'
+        )
+
+        # Head retention survives a bulk shed exactly as it does a single one.
+        assert kept[:_MAX_DEDUPE_CHILDREN_HEAD] == seeded[:_MAX_DEDUPE_CHILDREN_HEAD]
+
+        # Tail: the most recent ids, ending with the id just attached.
+        tail_len = _MAX_DEDUPE_CHILDREN - _MAX_DEDUPE_CHILDREN_HEAD
+        expected_tail = (seeded + ['esc-late-1'])[-tail_len:]
+        assert kept[_MAX_DEDUPE_CHILDREN_HEAD:] == expected_tail
+        assert kept[-1] == 'esc-late-1', 'the id just folded in must survive'
+
+        # Exactly the oldest NON-head ids were shed — contiguously, in one slice.
+        shed = seeded[_MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + expected_shed]
+        assert len(shed) == expected_shed
+        assert set(shed).isdisjoint(kept)
+
+        # The true-provenance-total identity holds across a bulk shed too.
+        assert len(kept) + from_disk.dedupe_children_truncated == seeded_total + 1
+        # And the recurrence signal is untouched by a bulk shed.
+        assert from_disk.dedupe_count == seeded_total + 1
+
+    def test_the_cap_never_touches_dedupe_count_or_severity(self, tmp_path: Path):
+        """(c) The cap bounds PROVENANCE only.
+
+        dedupe_count is the load-bearing recurrence signal (task 3522) — a
+        recon-watcher drain sorts the longest-rotting gates by it and
+        sweep._pick_richer ranks on it — so it must keep climbing past the cap.
+        Severity promotion is likewise unaffected, and is never demoted.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1', severity='info'))
+
+        total = _MAX_DEDUPE_CHILDREN + self.K
+        self._attach_n(queue, 'esc-1-1', total)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert from_disk.dedupe_count == total, (
+            f'dedupe_count is the recurrence SIGNAL and is never capped: expected '
+            f'{total}, got {from_disk.dedupe_count}'
+        )
+        assert from_disk.severity == 'info', 'info children must not promote an info parent'
+
+        # A promotion AFTER the cap is crossed still takes effect.
+        promoted = queue.attach_dedupe_child('esc-1-1', 'esc-late-1', child_severity='blocking')
+        assert promoted is not None
+        assert promoted.severity == 'blocking', (
+            'max_severity promotion must still work once the list is at the cap'
+        )
+        assert promoted.dedupe_count == total + 1
+
+    def test_shedding_logs_a_warning_naming_the_running_total(self, tmp_path: Path, caplog):
+        """(d) The loss is LOUD: a WARNING names the parent and the running total.
+
+        no-silent-fail-soft — a bound that drops ids quietly is exactly the
+        silent degradation this repo forbids.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        # Fill to the cap OUTSIDE the caplog window, so only shed warnings land.
+        self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.attach_dedupe_child('esc-1-1', 'esc-over-1')
+
+        shed_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno >= logging.WARNING
+            and 'esc-1-1' in r.getMessage()
+            and 'truncated=1' in r.getMessage()
+        ]
+        assert shed_records, (
+            'Expected a WARNING from escalation.queue naming the parent id and the '
+            f'running dedupe_children_truncated total, got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+
 class TestFindPendingL2ByRootCause:
     """EscalationQueue.find_pending_l2_by_root_cause() locates a pending L2 by root_cause string."""
 
@@ -3940,8 +4262,10 @@ class TestStampTriage:
 
 class TestUpdatedAtStamp:
     """updated_at is a last-substantive-change marker: bumped by add_members_to_l2's real
-    append path, left untouched by its no-op path, and never touched by stamp_triage
-    (an annotation must not masquerade as a content change)."""
+    append path, left untouched by its no-op path, never touched by stamp_triage
+    (an annotation must not masquerade as a content change), and bumped by
+    attach_dedupe_child (a fold IS a content change — recurrence count up, possible
+    severity promotion)."""
 
     def _make_l2(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
         esc = Escalation(
@@ -3992,6 +4316,86 @@ class TestUpdatedAtStamp:
         assert result.updated_at is None, (
             f'Expected updated_at to stay None after stamp_triage, got {result.updated_at!r}'
         )
+
+    def _make_pending_parent(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
+        """Seed a PENDING dedupe parent.
+
+        attach_dedupe_child loads from the queue ROOT only and returns None for
+        archived parents, so this record must stay pending — hence a plain
+        submit and no resolve.  Seeded at ``info`` so the fold below also
+        exercises the max_severity promotion that makes the staleness bump
+        load-bearing.
+        """
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_attach_dedupe_child_sets_updated_at_on_a_triaged_parent(self, tmp_path: Path):
+        """(d) A dedupe fold IS a substantive change, so it must bump updated_at.
+
+        The contract this defends: a triaged pending parent that then folds in
+        duplicates gains recurrence count (``dedupe_count``) and can be promoted
+        info->blocking by ``max_severity``, yet used to read ``updated_at is
+        None``.  An L1/L2 rotation applying the "updated_at is not None and is
+        newer than triaged_at" re-verify rule (the triage quad in models.py;
+        skills/escalation-watcher/SKILL.md) would therefore trust the now-stale
+        triage note and skip re-assessing a record that has materially changed.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_pending_parent(queue)
+        assert parent.updated_at is None
+        assert parent.triaged_at is None
+
+        stamped = queue.stamp_triage(
+            parent.id,
+            triaged_by='escalation-watcher-auto',
+            triage_note='verified predicate + probe',
+        )
+        assert stamped is not None
+
+        # Re-pin the existing stamp_triage contract as THIS test's precondition:
+        # an annotation stamps triaged_at and leaves updated_at alone, so the
+        # bump asserted below can only have come from the fold.
+        after_triage = queue.get(parent.id)
+        assert after_triage is not None
+        assert after_triage.triaged_at is not None
+        assert after_triage.updated_at is None, (
+            'Precondition: stamp_triage must not bump updated_at, got '
+            f'{after_triage.updated_at!r}'
+        )
+
+        result = queue.attach_dedupe_child(parent.id, 'esc-2-1', child_severity='blocking')
+
+        assert result is not None
+        assert result.updated_at is not None, (
+            'Expected attach_dedupe_child to stamp updated_at: a fold raises '
+            'dedupe_count and can promote severity, so a parent reading '
+            'updated_at=None after folding makes an L1/L2 rotation trust a '
+            'stale triage note and skip re-assessing it'
+        )
+        assert result.triaged_at is not None
+        assert result.updated_at > result.triaged_at, (
+            "The watcher's stamp-then-skip protocol keys off STRICTLY newer, so "
+            f'updated_at ({result.updated_at!r}) must exceed triaged_at '
+            f'({result.triaged_at!r})'
+        )
+
+        # The same two properties must hold on the PERSISTED record, not only on
+        # the returned object.
+        from_disk = queue.get(parent.id)
+        assert from_disk is not None
+        assert from_disk.updated_at is not None, (
+            'Expected the bump to be durable, not only on the returned object'
+        )
+        assert from_disk.triaged_at is not None
+        assert from_disk.updated_at > from_disk.triaged_at
 
 
 class TestResolveCascade:
@@ -4780,6 +5184,97 @@ class TestConcurrentResolveExactlyOneArchive:
 # Step-7: Deterministic spy test proving submit/submit_resolved/resolve adopt lock (RED)
 # ---------------------------------------------------------------------------
 
+class TestSubmitLogsIdTaskIdDivergence:
+    """submit() makes an id/task_id divergence OBSERVABLE — and never rejects it.
+
+    ``make_id``'s argument is an id-NAMESPACE key, not a task_id, so a record's
+    filename stem need not encode its stored ``task_id``.  Five production sites
+    diverge deliberately (curator_escalator.py x3 via ``make_id('curator')``
+    with ``task_id='task-curator'``; ticket_janitor.py x2 via
+    ``make_id('ticket-janitor')``).  Believing the false identity
+    ``stem.startswith(f'esc-{record.task_id}-')`` has already cost two design
+    cycles (task 3999's 2026-08-11 amendment and
+    plans/resume-charter-loss-remediation-prd.md, both withdrawn 2026-08-20 as
+    ruling esc-3999-2), so the divergence is logged where it is CREATED rather
+    than being rediscovered by the next failed design.
+    """
+
+    #: The stable fragment of the guard's message.  Asserting on this plus the
+    #: two interpolated values, rather than on the full sentence, keeps the
+    #: tests from pinning prose.
+    MARKER = 'does not encode its task_id'
+
+    def _esc(self, esc_id: str, task_id: str) -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='curator',
+            severity='info',
+            category='cleanup_needed',
+            summary='curator surfaced a ticket',
+        )
+
+    def test_divergent_stem_is_logged_with_both_values(self, tmp_path: Path, caplog):
+        """(a) The LIVE specimen is logged, showing BOTH halves of the divergence.
+
+        A reader who hits this line must be able to see the divergence itself,
+        not be told one half of it — so the id and the task_id are both on it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.submit(self._esc('esc-curator-1', 'task-curator'))
+
+        matching = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno >= logging.INFO
+            and 'esc-curator-1' in r.getMessage()
+            and 'task-curator' in r.getMessage()
+            and self.MARKER in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            'Expected exactly one escalation.queue record naming both the id and '
+            f'the task_id; got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_conforming_stem_logs_no_divergence_line(self, tmp_path: Path, caplog):
+        """(b) Silent on the conforming majority — 97 of 102 construction sites.
+
+        A guard that fired on every submit would be noise nobody reads.  Filters
+        on the marker rather than counting records, since submit already emits an
+        unconditional 'Escalation submitted: ...' INFO of its own.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.submit(self._esc('esc-42-1', '42'))
+
+        divergence = [r for r in caplog.records if self.MARKER in r.getMessage()]
+        assert not divergence, (
+            'A conforming id must not log a divergence line; got: '
+            f'{[r.getMessage() for r in divergence]}'
+        )
+
+    def test_divergent_submit_is_still_written_and_retrievable(self, tmp_path: Path):
+        """(c) OBSERVABILITY ONLY — the guard must never reject and never raise.
+
+        The five divergent production sites are legitimate by design.  Turning
+        this into enforcement would break them, which is why the record must
+        still land and still be findable BY ITS STORED task_id.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+
+        assert queue.get('esc-curator-1') is not None, (
+            'the divergent record must still be written'
+        )
+        assert 'esc-curator-1' in {e.id for e in queue.get_by_task('task-curator')}, (
+            'the divergent record must still be retrievable by its STORED task_id'
+        )
+
+
 class TestSubmitResolveAdoptLock:
     """Spy test: submit, submit_resolved, and resolve must call escalation_id_lock with correct id."""
 
@@ -4863,6 +5358,158 @@ class TestSubmitResolveAdoptLock:
         assert any(eid == 'esc-3-1' for _, eid in acquired), (
             f'Expected lock acquisition for esc-3-1; got {acquired}'
         )
+
+
+class TestPatchResolutionMetadataLock:
+    """patch_resolution_metadata must serialize its read-modify-write per id.
+
+    It is the LONE mutator in this module that did not take
+    ``escalation_id_lock`` — submit, resolve, park, submit_resolved,
+    add_members_to_l2, stamp_triage, attach_dedupe_child and
+    note_suppressed_refile all do.  Its read-modify-write is on the FULL record,
+    so an unlocked interleave with any of them drops the loser's change
+    wholesale: not just the two patched fields, but every field the loser's
+    in-memory copy carried.
+    """
+
+    def _resolved(self, queue: EscalationQueue, esc_id: str = 'esc-1-1') -> Escalation:
+        """Seed an ARCHIVED, resolved record.
+
+        patch_resolution_metadata returns None for anything still pending, so a
+        pending record would make these tests vacuous.
+        """
+        esc = _make_escalation(esc_id, level=1)
+        esc.category = 'provenance_unattributed'
+        esc.citation_sha = 'b' * 40
+        _submit_escalation(queue, esc)
+        resolved = queue.resolve(esc_id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+        assert resolved is not None
+        return resolved
+
+    def test_patch_resolution_metadata_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(a) The cheap direct assertion: a lock is acquired for the right id.
+
+        Paired with (b) on purpose — on its own this would pass even if the lock
+        wrapped nothing at all.
+        """
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)  # seed WITHOUT the spy
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.patch_resolution_metadata(
+                'esc-1-1', resolved_by='steward-patch', resolution_turns=5,
+            )
+
+        assert any(eid == 'esc-1-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-1-1; got {acquired}'
+        )
+
+    @pytest.mark.timeout(30)
+    def test_patch_holds_the_lock_across_its_whole_read_modify_write(self, tmp_path: Path, monkeypatch):
+        """(b) The SEMANTIC test — the lock must span read..write, not just exist.
+
+        Deliberately NOT the probabilistic two-process shape used by
+        TestAttachDedupeChildConcurrency, for a reason specific to this method:
+        both fields it patches are idempotent last-write-wins SETs, so a
+        patch-vs-patch race produces the correct final value either way and a
+        lost update is INVISIBLE.  The defect is observable only against a
+        mutator whose loss shows, so this races the patch against
+        note_suppressed_refile's ``refiles_suppressed`` INCREMENT.
+
+        Timing is then made deterministic by interposing on the instance's
+        _atomic_write_path, which launches the child BETWEEN the patch's read
+        and its write:
+
+        - WITHOUT the lock: the child finds the sidecar free, bumps 0->1 and
+          writes; the patch's real write then lands its stale in-memory copy and
+          the increment is LOST.  refiles_suppressed reads 0 EVERY time.
+        - WITH the lock: the child BLOCKS on the flock, the 3s wait times out,
+          the patch completes and releases, and the child then bumps on top of
+          the patched record.  refiles_suppressed reads 1 and resolved_by reads
+          'steward-patch' EVERY time.
+
+        The ~3s wait is paid only on the green path.  This shape is what
+        _suppressed_refile_child.py's own docstring records as the fix for a
+        MEASURED failure mode: two processes that never actually overlap make a
+        concurrency test pass even with the lock deleted.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        self._resolved(queue)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        # Pre-create the go-file: the child is barrier-aware, and here we want it
+        # to run IMMEDIATELY on launch rather than park.  The ready-file path is
+        # required by its CLI but nothing waits on it.
+        go = tmp_path / 'go'
+        go.write_text('go')
+        ready = tmp_path / 'ready-child'
+
+        real_write = queue._atomic_write_path
+        launched: list[subprocess.Popen] = []
+
+        def interposing_write(path: Path, json_text: str, *, durable: bool = False) -> None:
+            # Fire once, on the patch's own write — between its read and its write.
+            if not launched:
+                proc = subprocess.Popen(
+                    [
+                        sys.executable, str(_SUPPRESSED_REFILE_CHILD), str(queue_dir),
+                        'esc-1-1', '1', str(ready), str(go),
+                    ],
+                    env=env,
+                )
+                launched.append(proc)
+                # Returns fast when the sidecar is FREE (the unlocked bug);
+                # times out when the patch is correctly holding it.  Either way
+                # the real write below runs — the timeout IS the green path.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=3)
+            real_write(path, json_text, durable=durable)
+
+        monkeypatch.setattr(queue, '_atomic_write_path', interposing_write)
+
+        try:
+            queue.patch_resolution_metadata('esc-1-1', resolved_by='steward-patch')
+            assert launched, 'the interposing write never fired — the test is vacuous'
+            rc = launched[0].wait(timeout=15)
+        finally:
+            for proc in launched:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc == 0, f'child exited rc={rc} (rc=3 means the barrier wedged)'
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.refiles_suppressed == 1, (
+            'the concurrent locked INCREMENT was clobbered by the unlocked patch: '
+            f'expected refiles_suppressed=1, got {record.refiles_suppressed}'
+        )
+        assert record.resolved_by == 'steward-patch', (
+            f"the patch's own write was lost: resolved_by={record.resolved_by!r}"
+        )
+
+        # No resurrection: the record stays where it lives, in exactly one place.
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'patching an archived record must not resurrect it into the queue root'
+        )
+        archived = list(queue.queue_dir.glob('archive/*/esc-1-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy, found {archived}'
 
 
 class TestArchiveListingMemoisation:

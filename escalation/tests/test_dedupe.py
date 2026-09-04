@@ -117,7 +117,8 @@ class TestSummaryDedupeKey:
 
 
 class TestEscalationDedupeFields:
-    """Escalation dataclass gains dedupe_count and dedupe_children fields."""
+    """Escalation dataclass gains dedupe_count, dedupe_children and
+    dedupe_children_truncated fields."""
 
     def _make_min_escalation(self):
         from escalation.models import Escalation
@@ -169,6 +170,45 @@ class TestEscalationDedupeFields:
         assert esc_b.dedupe_children == [], (
             'dedupe_children must use default_factory, not a shared class-level list'
         )
+
+    # --- dedupe_children_truncated: the growth bound's durable loss counter ---
+
+    def test_dedupe_children_truncated_defaults_to_zero(self):
+        """A new Escalation has shed nothing, so the counter starts at 0."""
+        esc = self._make_min_escalation()
+        assert esc.dedupe_children_truncated == 0
+
+    def test_dedupe_children_truncated_round_trips_via_json(self):
+        """The counter survives to_json / from_json.
+
+        Without this the loss would be log-only: the TRUE provenance total is
+        ``len(dedupe_children) + dedupe_children_truncated``, so a counter that
+        did not persist would make the shed unassertable from the record
+        (INV-8 / no-silent-fail-soft).
+        """
+        from escalation.models import Escalation
+        esc = self._make_min_escalation()
+        esc.dedupe_children_truncated = 7
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.dedupe_children_truncated == 7
+
+    def test_from_dict_without_truncated_key_uses_default(self):
+        """Legacy on-disk JSON without the key loads with 0 — zero migration.
+
+        Same contract as every field added since: ``from_dict`` filters on
+        ``__dataclass_fields__``, so an absent key simply takes its default.
+        """
+        from escalation.models import Escalation
+        old_dict = {
+            'id': 'esc-1-1',
+            'task_id': '1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'infra_issue',
+            'summary': 'connection lost',
+        }
+        esc = Escalation.from_dict(old_dict)
+        assert esc.dedupe_children_truncated == 0
 
 
 class TestFindDedupeParent:
