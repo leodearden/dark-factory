@@ -861,18 +861,61 @@ class TestNoRegrownAtomicWriters:
 #: in test_atomic_write_guard_does_not_scan_sibling_package_trees.
 _GUARDED_FILE = 'shared/tests/test_safe_io.py'
 
-#: Scan roots that name a package ``shared`` does not own.  Matched as exact
-#: STRING LITERALS via ast, never as substrings of prose: a comment or
-#: docstring in the guarded file may legitimately discuss another package (the
-#: relocated guard's own scope block does), and only a scan root — a literal
-#: fed to a directory walk — can make shared's suite depend on that package.
-_SIBLING_SCAN_ROOTS = (
-    'orchestrator/src',
-    'escalation/src',
-    'fused-memory/src',
-    'fused-memory/scripts',
+#: Directory names of the packages ``shared`` does not own.  The boundary test
+#: below flags any BARE PATH LITERAL rooted in one of these.
+#:
+#: WHY NOT EXACT MEMBERSHIP, which is what this used to be.  The predicate was
+#: ``node.value in _SIBLING_SCAN_ROOTS`` against the five exact strings
+#: ``orchestrator/src``, ``escalation/src``, ``fused-memory/src``,
+#: ``fused-memory/scripts``, ``scripts`` — so a re-added cross-tree sweep only
+#: had to SPELL ITS ROOT DIFFERENTLY to walk past the fence.  Both
+#: ``'orchestrator/src/orchestrator'`` (a deeper literal) and
+#: ``_REPO_ROOT / 'orchestrator/src' / 'orchestrator'`` (a longer join) are
+#: exactly the coupling this fence exists to prevent, and both were green.
+#: Keying on the leading SEGMENT instead of the whole string closes every
+#: spelling that still writes the path down.
+#:
+#: PROSE SAFETY is what exact matching bought, and widening must not lose it: a
+#: comment or docstring in the guarded file may legitimately DISCUSS another
+#: package — the relocated guard's own scope block does, at length.  So
+#: :func:`_is_sibling_path_literal` additionally requires the constant to be a
+#: bare path with no whitespace anywhere in it.  A prose mention is a sentence;
+#: a scan root is a path.  MEASURED: zero constants in the guarded file match
+#: today, prose and all.
+#:
+#: ``tests`` is deliberately ABSENT from this set.  The repo-root ``tests/`` is
+#: not a package, and a literal naming this guard's own home
+#: (``tests/scripts/test_atomic_write_regrowth.py``) is a POINTER — the thing
+#: ``test_allowlist_pointers_resolve_to_the_guard_module`` exists to keep
+#: resolvable.  Flagging it here would put the module's two guards in direct
+#: contradiction.
+_SIBLING_PACKAGE_DIRS = frozenset({
+    'orchestrator',
+    'escalation',
+    'fused-memory',
+    'cockpit',
+    'dashboard',
+    'sampler',
     'scripts',
-)
+})
+
+
+def _is_sibling_path_literal(value: str) -> bool:
+    """True if *value* is a bare path rooted in a package ``shared`` does not own.
+
+    RESIDUAL HOLE, stated rather than left for the next reader to find.  A root
+    assembled at RUNTIME from individually-innocent segments still evades this:
+    ``os.path.join('orchestrator', 'src')``, ``_REPO_ROOT / 'orchestrator' /
+    'src'``, or ``_REPO_ROOT.parent``.  Closing that needs dataflow, not a
+    constant sweep, and a lone ``'orchestrator'`` cannot be flagged on its own
+    without firing on every ordinary use of the word.  The hole is narrower
+    than what preceded it — an author now has to deliberately NOT write the
+    path down — and the re-add this fence is really for is a copy-paste of an
+    existing cross-tree gate, which has no cheap spelling left.
+    """
+    if '/' not in value or any(ch.isspace() for ch in value):
+        return False
+    return value.split('/', 1)[0] in _SIBLING_PACKAGE_DIRS
 
 #: One real, long-lived module per declared tree.  ``_SRC_TREES`` yielding
 #: *something* is not enough — a tree that rglobs only a stray ``__init__.py``
@@ -900,14 +943,26 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
     Relocating the guard to this repo-level directory (step 4) is what removes
     that coupling, and this test is what keeps it removed.
 
-    SCOPE LIMIT — READ THIS BEFORE TRUSTING A GREEN RUN.  This test pins ONE
-    file, not ``shared/tests`` as a whole.  It does NOT establish that shared's
+    SCOPE LIMIT — READ THIS BEFORE TRUSTING A GREEN RUN.  Two limits, and the
+    second used to go unstated.
+
+    (a) WITHIN the pinned file, the check is a CONSTANT sweep.  It used to be
+    exact string equality against five scan roots, which a re-add evaded just
+    by spelling its root differently — ``'orchestrator/src/orchestrator'``
+    would have passed.  :func:`_is_sibling_path_literal` now keys on the
+    leading path segment, which closes every spelling that writes the path
+    down; a root assembled at runtime from innocent segments still evades it,
+    and that residual is documented at the predicate rather than left implicit.
+
+    (b) This test pins ONE file, not ``shared/tests`` as a whole.  It does NOT establish that shared's
     suite is standalone-runnable against a lone ``dark-factory-shared``
     checkout, and after task 3388 that suite is **not** standalone-runnable.
     The five OTHER cross-tree gates below live in ``shared/tests`` and are
     deliberately NOT covered here; each carries its own comment arguing for its
     cross-tree reach, so narrowing them is a design question this task did not
-    settle rather than an oversight it missed:
+    settle rather than an oversight it missed.  (Each would trip the broadened
+    predicate on its own literals — which is the point: they are real cross-tree
+    gates, just not ones this fence is scoped to move.)
 
       * ``silent_fallthrough_scan.py`` — ``_SCOPE_ROOTS`` (7 roots:
         orchestrator/src, fused-memory/src, dashboard/src, escalation/src,
@@ -955,19 +1010,52 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
         for node in ast.walk(ast.parse(target.read_text(encoding='utf-8')))
         if isinstance(node, ast.Constant)
         and isinstance(node.value, str)
-        and node.value in _SIBLING_SCAN_ROOTS
+        and _is_sibling_path_literal(node.value)
     ]
 
     assert not offenders, (
-        f'{_GUARDED_FILE} declares a scan root in a package shared does not own:\n  '
+        f'{_GUARDED_FILE} names a bare path in a package shared does not own:\n  '
         + '\n  '.join(offenders)
         + '\nA guard that walks sibling package trees cannot live inside one '
         'package\'s suite: a refactor in that sibling (migrating the allowlisted '
         'orchestrator digest.write_digest_entry, say) turns SHARED red, at a site '
         'no orchestrator author would think to look. Move the cross-tree guard to '
         'a repo-level suite — tests/scripts/test_atomic_write_regrowth.py is where '
-        'the atomic-write one lives — rather than widening this exception.'
+        'the atomic-write one lives — rather than widening this exception. If the '
+        'literal is genuinely PROSE rather than a scan root, write it as prose: '
+        'the predicate only flags a bare path with no whitespace in it.'
     )
+
+
+def test_sibling_path_literal_predicate_resists_respelling():
+    """The boundary predicate is not evadable by re-spelling the same root.
+
+    The four rows below are the spellings a real re-add would plausibly use,
+    and every one of them was GREEN under the exact-membership predicate this
+    replaced.  The negative rows are the prose-safety property that exact
+    matching bought and which the widening had to preserve — note the second
+    one, which STARTS with a sibling path and is still prose: that is the case
+    the no-whitespace rule exists for, and the reason this is not a `startswith`
+    check.
+    """
+    for value in (
+        'orchestrator/src',                 # the original exact form
+        'orchestrator/src/orchestrator',    # a deeper literal
+        'fused-memory/scripts',
+        'cockpit/src',
+    ):
+        assert _is_sibling_path_literal(value), value
+
+    for value in (
+        'shared/src',                       # shared owns this one
+        'shared/tests/test_safe_io.py',
+        'orchestrator/src is walked by the relocated guard, not by this one',
+        'tests/scripts/test_atomic_write_regrowth.py',  # a pointer, not a root
+        'orchestrator',                     # lone segment: the documented hole
+        'safe_io.atomic_write_text(',
+        '',
+    ):
+        assert not _is_sibling_path_literal(value), value
 
 
 def test_every_declared_tree_contributes_scanned_files():
