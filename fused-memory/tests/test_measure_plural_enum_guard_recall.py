@@ -41,6 +41,11 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _enumeration_is_prepositional_complement,
 )
 
+# The SHIPPED pagination engine, imported for the same reason the guard above
+# is: the probe delegates to it, and identity checks against the real objects
+# are the only way to catch the probe quietly growing a private copy back.
+from fused_memory.backends import graphiti_client
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'measure_plural_enum_guard_recall.py'
 )
@@ -502,6 +507,76 @@ def test_subject_position_positives_extract_unchanged_under_both_candidates(
 # ---------------------------------------------------------------------------
 # Edge enumeration must survive FalkorDB's server-wide result-set cap
 # ---------------------------------------------------------------------------
+
+def test_the_enumerator_delegates_to_the_shipped_paginator():
+    """The probe must not own a second copy of the pagination machinery.
+
+    It used to: its own census helper, its own page loop, its own structural
+    guard, and its own spellings of 5000 / 10000 / 1000. Two copies of a
+    fail-closed page loop is two places to fix a paging defect and one place
+    to forget, and duplicated CONSTANTS are worse still — the probe's
+    RESULTSET_SIZE is an assumption about server configuration, so a
+    re-measurement that corrected graphiti_client's copy would leave the
+    probe reasoning from the old number while still reporting `complete`.
+
+    Asserted by IDENTITY against the real objects rather than by equal
+    values, because equal values are exactly what a re-spelled copy has.
+    """
+    assert _mod._paged_ro_query is graphiti_client._paged_ro_query
+    assert _mod.DEFAULT_PAGE_SIZE is graphiti_client._DEFAULT_READ_PAGE_SIZE
+    assert _mod.RESULTSET_SIZE is graphiti_client._RESULTSET_SIZE
+    assert _mod.MAX_ENUM_PAGES is graphiti_client._MAX_READ_PAGES
+
+    # The public names are RETAINED — argparse help strings and these tests
+    # use them — so this is a rebinding, not a rename.
+    assert _mod.DEFAULT_PAGE_SIZE == 5000
+    assert _mod.RESULTSET_SIZE == 10000
+    assert _mod.MAX_ENUM_PAGES == 1000
+
+    # ...and the probe's own duplicate is GONE rather than merely unused.
+    assert not hasattr(_mod, '_census_count'), (
+        'the probe still defines its own census helper'
+    )
+
+
+def test_the_probe_and_production_read_the_same_population():
+    """A drifting MATCH/WHERE must fail HERE, not become a silent zero.
+
+    The probe and ``enumerate_all_valid_edges`` are supposed to measure the
+    same corpus. Nothing enforced that: two independently-spelled Cypher
+    strings could drift apart — production narrowing its WHERE, say — and the
+    probe would keep measuring the OLD population while reporting
+    `complete: true` over it. That is the same argument the script's import
+    block already makes about the regex and the guard, applied to the
+    population definition, so it gets the same treatment: share the object,
+    and check the identity mechanically.
+
+    What is deliberately NOT shared is the PROJECTION. The probe returns
+    ``DISTINCT e.uuid, e.fact`` — half the rows of production's four-column
+    per-endpoint projection, and directly comparable to the post-dedup
+    ``len(facts)`` its completeness rule is stated in.
+    """
+    match = graphiti_client._ALL_VALID_EDGES_MATCH
+    assert _mod._EDGE_PAGE_CYPHER.startswith(match), _mod._EDGE_PAGE_CYPHER
+    assert _mod._EDGE_COUNT_CYPHER.startswith(match), _mod._EDGE_COUNT_CYPHER
+
+    # The placeholders _render_page_bounds requires, left literal.
+    assert '{skip}' in _mod._EDGE_PAGE_CYPHER
+    assert '{limit}' in _mod._EDGE_PAGE_CYPHER
+
+    # The probe's own projection and its own single-row census, retained.
+    assert 'RETURN DISTINCT e.uuid, e.fact' in _mod._EDGE_PAGE_CYPHER
+    assert 'ORDER BY e.uuid' in _mod._EDGE_PAGE_CYPHER
+    assert _mod._EDGE_PAGE_CYPHER.index('ORDER BY') < _mod._EDGE_PAGE_CYPHER.index(
+        'SKIP'
+    )
+    assert 'count(DISTINCT e.uuid)' in _mod._EDGE_COUNT_CYPHER
+    assert 'SKIP' not in _mod._EDGE_COUNT_CYPHER
+    assert _mod._EDGE_PAGE_CYPHER != graphiti_client._ALL_VALID_EDGES_PAGE_TEMPLATE, (
+        "the probe keeps its own projection; adopting production's four-column "
+        'one would double the rows and break the len(facts) comparison'
+    )
+
 
 _PAGE_SIZE = 4
 
