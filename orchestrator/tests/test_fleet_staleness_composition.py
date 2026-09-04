@@ -92,8 +92,8 @@ def _graft_committed_restart_config(harness: Harness, committed: OrchestratorCon
     contract: it was flipped ``true -> false`` on 2026-09-03 by the fleet
     deploy pause. Grafting it here (as the other four fields are grafted)
     would silently delete all three guards' fire-path coverage for the whole
-    duration of the pause. Deploy policy is pinned by
-    ``tests/scripts/test_orchestrator_restart_config_drift.py``, not here.
+    duration of the pause. Deploy policy for this flag is deliberately
+    pinned by NO test — it is an operator lever.
 
     Task 5020 is the gate that restores the committed value once the pause
     lifts; once it does, this override is a no-op.
@@ -118,10 +118,10 @@ def test_graft_forces_enabled_on_while_copying_the_committed_values() -> None:
     Scenarios 9-10 below are composition/coalescing guards for
     `_build_orchestrator_restart_coordinator`; the restart *fire path* is
     their vehicle, not their subject. Deploy policy for
-    `orchestrator_restart_on_merge_enabled` is pinned by
-    `tests/scripts/test_orchestrator_restart_config_drift.py`, not here, and
-    task 5020 is the gate that restores the committed value once the
-    2026-09-03 deploy pause lifts. So the helper must:
+    `orchestrator_restart_on_merge_enabled` is deliberately pinned by NO
+    test — it is an operator lever — and task 5020 is the gate that
+    restores the committed value once the 2026-09-03 deploy pause lifts.
+    So the helper must:
 
     1. FORCE `orchestrator_restart_on_merge_enabled` to `True` locally,
        regardless of what the committed config says (the pause set it to
