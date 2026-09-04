@@ -36,6 +36,7 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation import task_count_snapshot_cadence
 from fused_memory.reconciliation.stages import (
     task_knowledge_sync as task_knowledge_sync_module,
 )
@@ -45,10 +46,8 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _verify_task_count_snapshot_written,
     _write_task_count_snapshot,
 )
-from fused_memory.reconciliation import task_count_snapshot_cadence
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
-    LEGACY_SNAPSHOT_WRITTEN_STAT_KEY,
     SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
     SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
     SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
@@ -152,9 +151,6 @@ class TestConstants:
     def test_pruned_stat_key_value(self):
         assert SNAPSHOT_PRUNED_STAT_KEY == 'task_count_snapshot_mem0_pruned'
 
-    def test_legacy_written_stat_key_value(self):
-        assert LEGACY_SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
-
     def test_prune_enumeration_ok_stat_key_value(self):
         assert SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 'task_count_snapshot_prune_enumeration_ok'
 
@@ -224,47 +220,6 @@ class TestExtractSnapshotWritten:
 
     def test_none_report_is_none(self):
         assert extract_snapshot_written(None) is None
-
-    # --- legacy-key back-compat (task 3045) ---------------------------------
-    #
-    # harness._maybe_escalate_stale_task_count_snapshot recomputes its
-    # consecutive-miss streak from journal.get_recent_runs -- i.e. from
-    # stage_reports blobs persisted by cycles that ran BEFORE the rename.
-    # Without a fallback every such row reads as None,
-    # compute_snapshot_miss_streak stops at the first one, and the
-    # recon_stale_task_count_snapshot escalation goes silently dead instead
-    # of loudly wrong.
-
-    def test_legacy_key_1_is_true_on_stage_report(self):
-        report = _stage_report({LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1})
-        assert extract_snapshot_written(report) is True
-
-    def test_legacy_key_0_is_false_on_stage_report(self):
-        report = _stage_report({LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0})
-        assert extract_snapshot_written(report) is False
-
-    def test_legacy_key_1_is_true_on_raw_dict(self):
-        report = {'stats': {LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1}}
-        assert extract_snapshot_written(report) is True
-
-    def test_legacy_key_0_is_false_on_raw_dict(self):
-        report = {'stats': {LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0}}
-        assert extract_snapshot_written(report) is False
-
-    def test_new_key_wins_over_legacy_when_both_present_new_0(self):
-        """Precedence is deterministic: the new key wins, both directions."""
-        report = _stage_report({
-            SNAPSHOT_WRITTEN_STAT_KEY: 0,
-            LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1,
-        })
-        assert extract_snapshot_written(report) is False
-
-    def test_new_key_wins_over_legacy_when_both_present_new_1(self):
-        report = _stage_report({
-            SNAPSHOT_WRITTEN_STAT_KEY: 1,
-            LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0,
-        })
-        assert extract_snapshot_written(report) is True
 
     def test_neither_key_present_is_still_none(self):
         report = _stage_report({'some_unrelated_stat': 1})
