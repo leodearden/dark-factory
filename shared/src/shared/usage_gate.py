@@ -1248,10 +1248,11 @@ class UsageGate:
         full interval — both of them precisely the failures this helper
         exists to fix. So the clock is cleared on the way out of an abandoned
         park too, guarded by ``_park_waiters`` so a cancelled waiter cannot
-        reset a park its siblings are still inside. The staleness check in
-        the loop is the backstop for the residue no local handler can see: a
+        reset a park its siblings are still inside. The staleness check at
+        ENTRY is the backstop for the residue no local handler can see: a
         cancellation that lands at one of the caller's OTHER awaits, between
-        two re-entries of this helper.
+        two re-entries of this helper. Entry is also the only place it
+        belongs — see the comment on the check itself.
 
         ``default=str`` on the dump is load-bearing, not decoration: it
         mirrors ``cli_invoke._check_cap_wait``, where a non-serialisable
@@ -1264,22 +1265,35 @@ class UsageGate:
         """
         self._park_waiters += 1
         try:
+            if (
+                self._park_last_logged_at is not None
+                and time.monotonic() - self._park_last_logged_at
+                > 2 * _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
+            ):
+                # Stale clock. A LIVE park logs every interval, so a gap of
+                # more than two means the park that set these timestamps was
+                # abandoned somewhere the handler below cannot see — a
+                # cancellation at one of the caller's other awaits, between two
+                # re-entries of this helper. Reset rather than inherit:
+                # inheriting reports an elapsed_s measured from a park that is
+                # already over.
+                #
+                # CHECKED ONCE, AT ENTRY, NOT ON EVERY ITERATION. Stale
+                # timestamps can only ever be INHERITED, so entry is the only
+                # moment the check can detect anything: once the loop below is
+                # running, this coroutine is itself the proof that the park is
+                # live. Re-checking per iteration added no detection power and
+                # cost correctness — it compares a wall-clock gap against a
+                # margin of two intervals, which one slow iteration can exceed
+                # whenever the interval is small (tests shrink it to
+                # milliseconds), resetting a LIVE park's clock and sending
+                # elapsed_s backwards mid-park. Measured: under a loaded
+                # 8-worker xdist run at a 0.02s interval, a single >0.04s
+                # scheduling hiccup dropped elapsed_s from 0.2 back to 0.0.
+                self._park_started_at = None
+                self._park_last_logged_at = None
             while not self._open.is_set():
                 now = time.monotonic()
-                if (
-                    self._park_last_logged_at is not None
-                    and now - self._park_last_logged_at
-                    > 2 * _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
-                ):
-                    # Stale clock. A LIVE park logs every interval, so a gap
-                    # of more than two means the park that set these
-                    # timestamps was abandoned somewhere the handler below
-                    # cannot see — a cancellation at one of the caller's other
-                    # awaits, between two re-entries of this helper. Reset
-                    # rather than inherit: inheriting reports an elapsed_s
-                    # measured from a park that is already over.
-                    self._park_started_at = None
-                    self._park_last_logged_at = None
                 if self._park_started_at is None:
                     self._park_started_at = now
                 if (

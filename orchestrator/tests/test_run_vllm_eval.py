@@ -1745,6 +1745,16 @@ class TestPreflightBaseline:
         monkeypatch.setattr(launcher, "PROJECT_ROOT", repo)
         # See test_strict_policy_aborts_before_pod for why this env var is set.
         monkeypatch.setenv("RUNPOD_API_KEY", "rpa_test_fake_key")
+        # Unlike the strict case, warn PROCEEDS — so this test runs on past
+        # preflight into `build_eval_env`, which rosters
+        # `PROJECT_ROOT/config/usage-accounts.yaml` and aborts when that
+        # roster resolves no credential (task 4945). PROJECT_ROOT is redirected
+        # to a bare tmp repo above, so the roster and its token have to be
+        # seeded here; without them the run dies on the account precondition
+        # before it can demonstrate anything about the warn policy.
+        (repo / "config").mkdir()
+        (repo / "config" / "usage-accounts.yaml").write_text(_SHARED_POOL_YAML)
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "SENTINEL-POOL-B")
 
         fake_client = _patch_pod_infra(monkeypatch)
         _patch_subprocess_run_success(monkeypatch, results)
