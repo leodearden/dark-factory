@@ -171,6 +171,59 @@ _MAX_LIVE_BYPASSES_PER_KEY = 3
 # idiom :class:`TTLCache` documents for ``ttl_seconds``.
 _DEFAULT_PER_URL_DEADLINE_SECONDS = 45.0
 
+# ── why a per-HTTP-request budget cannot bound the operation ────────
+#
+# Recording the measurement (httpx 0.28.1 / httpcore 1.0.9) so a future reader
+# does not re-derive it and conclude the deadline above is redundant with
+# ``mcp_tool_call``'s ``timeout``. It is not — that budget is per REQUEST, and
+# even one request is not fully bounded by it:
+#
+# 1. ``read`` bounds each individual socket read, NOT the whole response body.
+#    ``httpcore._async.http11::HTTP11Connection._receive_response_headers`` and
+#    ``::_receive_response_body`` each resolve ``timeouts.get('read', None)``
+#    once and then call ``_receive_event(timeout=timeout)`` inside a
+#    ``while True`` loop; ``::_receive_event`` in turn hands that same value to
+#    every individual ``self._network_stream.read(...)``. So the budget is
+#    re-armed per socket read, and a peer emitting one byte just inside each
+#    read window keeps the request alive indefinitely with the budget never
+#    firing. This is not exotic on this transport:
+#    ``memory.MCP_HEADERS`` sends ``Accept: application/json,
+#    text/event-stream`` and ``client.post`` reads the FULL body, so an SSE
+#    response the server never closes parks ``resp.text`` forever under a
+#    per-request budget that is behaving exactly as documented.
+# 2. ``httpcore._async.connection::AsyncHTTPConnection.handle_async_request``
+#    acquires ``self._request_lock`` (an ``anyio.Lock``) with NO timeout; only
+#    the ``_connect`` inside it is budgeted.
+#
+# Layered on top of that, a COLD session performs three posts (see
+# :func:`memory.mcp_tool_call`), each with its own budget. Hence the
+# whole-operation deadline above, applied per URL.
+#
+# ── why there is deliberately NO per-endpoint pool cap ──────────────
+#
+# Investigated under task 4958 and rejected. The pool-pinning risk is a
+# CONSEQUENCE of the unbounded hang, not an independent defect: with every leg
+# now bounded, a wedged endpoint pins at most (concurrent pollers) connections
+# for at most the deadline, after which ``asyncio.wait_for`` cancels the
+# request and httpcore's ``except BaseException`` in
+# ``httpcore._async.connection_pool::AsyncConnectionPool.handle_async_request``
+# removes the pool request and closes the connection. That sits well inside
+# ``app::_build_http_limits``' ``max(100, 4 * 3 * endpoints)`` ceiling.
+# Conversely a per-endpoint semaphore would add a NEW queueing layer whose
+# acquisition is itself unbounded — reintroducing this exact bug class one
+# level down — and would require editing ``app.py`` for no measured benefit.
+#
+# ── why the deadline is default-on ──────────────────────────────────
+#
+# Most live :func:`first_success` call sites carry no enclosing deadline of
+# their own — measured under task 4958: ``app::api_curator_cancel`` (the
+# ``cancel_ticket`` proxy), ``app::_scheduler_proxy``, the three ``tasks``
+# sites, and ``scheduler``'s. Only ``metrics`` wraps its own inner call, and it
+# had to hand-convert ``TimeoutError`` into ``ValueError`` to do so. Those
+# unwrapped sites are precisely the ones that could park forever, and they are
+# outside this module — so an opt-in parameter would have left the hole open
+# for exactly the population it exists to protect.
+
 
 class PreformattedFanoutError(ValueError):
     """A fan-out failure whose message is ALREADY a rendered ``'Type: message'``.
