@@ -20,6 +20,7 @@ runtime coordinator stays dark.
 """
 
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -137,3 +138,30 @@ def test_orchestrator_restart_config_round_trips_through_config_model(
         "OrchestratorConfig.orchestrator_restart_min_interval_secs did not "
         "resolve to its 8h default — check for a field rename/typo in config.py"
     )
+
+
+def test_binding_guard_bites_on_a_typod_key_and_on_a_renamed_field(
+    root_config: OrchestratorConfig,
+) -> None:
+    """``_assert_key_binds`` must still fail on the two drift modes it exists for.
+
+    Under the 2026-09-03 deploy pause (task 5088) the committed raw value
+    (``false``) equals ``OrchestratorConfig.orchestrator_restart_on_merge_
+    enabled``'s own field default (``Field(default=False)``), so the
+    ``parsed == raw`` term ALONE cannot distinguish "bound correctly" from
+    "silently dropped by ``extra='ignore'``" while the pause holds. The two
+    presence terms — the key exists in the committed YAML, and the field
+    exists on the parsed config — are what actually carry the guard during
+    the pause, and this test is what proves they are still there.
+    """
+    typod_cfg = _load_df_config()
+    typod_cfg["orchestrator_restart_on_merge_enabled_typo"] = typod_cfg.pop(
+        "orchestrator_restart_on_merge_enabled"
+    )
+    with pytest.raises(AssertionError, match="orchestrator_restart_on_merge_enabled"):
+        _assert_key_binds(typod_cfg, root_config, "orchestrator_restart_on_merge_enabled")
+
+    cfg = _load_df_config()
+    renamed_config = SimpleNamespace()
+    with pytest.raises(AssertionError):
+        _assert_key_binds(cfg, renamed_config, "orchestrator_restart_on_merge_enabled")
