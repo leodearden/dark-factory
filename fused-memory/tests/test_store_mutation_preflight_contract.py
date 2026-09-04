@@ -332,28 +332,130 @@ TESTS_DIR = pathlib.Path(__file__).parent
 # The name every one of the 14 suites gave its hand-rolled autouse fixture
 # before the extraction. After it, the name exists nowhere in `tests/`: suites
 # call `neutralise_fixture(...)` and bind the result to `_neutralise`.
+#
+# Kept as a NAMED tripwire, but it is no longer the whole guard: a name-only
+# check is permanently green against the only thing it can see, since the one
+# spelling it knows now appears nowhere. A contributor hand-rolling the fixture
+# would almost certainly call it something else (`_neutralise_preflight`,
+# `_no_preflight`), and the name check would wave it through. So the guard also
+# keys on the SHAPE — see `_neutralising_autouse_fixture` below.
 _HAND_ROLLED_FIXTURE_NAME = '_neutralise_store_mutation_preflight'
 
 
+def _is_autouse_fixture(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether *node* is decorated `@pytest.fixture(autouse=True)`."""
+    for decorator in node.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        # Match the callee node directly rather than `ast.unparse`-ing it:
+        # this runs on every decorator of every function in the tree, and
+        # unparse is the expensive spelling. Covers `@pytest.fixture(...)`
+        # (Attribute) and a bare `@fixture(...)` (Name).
+        callee = decorator.func
+        if isinstance(callee, ast.Attribute):
+            callee_name = callee.attr
+        elif isinstance(callee, ast.Name):
+            callee_name = callee.id
+        else:
+            continue
+        if callee_name != 'fixture':
+            continue
+        for keyword in decorator.keywords:
+            if (
+                keyword.arg == 'autouse'
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+            ):
+                return True
+    return False
+
+
+def _neutralises_the_guard(stmt: ast.stmt) -> bool:
+    """Whether *stmt* is a `monkeypatch.setattr(<mod>,
+    'assert_store_mutation_allowed', ...)` call."""
+    if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+        return False
+    call = stmt.value
+    if not (isinstance(call.func, ast.Attribute) and call.func.attr == 'setattr'):
+        return False
+    return any(
+        isinstance(arg, ast.Constant) and arg.value == 'assert_store_mutation_allowed'
+        for arg in call.args
+    )
+
+
+def _neutralising_autouse_fixture(node: ast.AST) -> bool:
+    """Whether *node* is a hand-rolled neutralising fixture under ANY name.
+
+    The shape, not the name: an autouse fixture that rebinds
+    `assert_store_mutation_allowed`. Both halves are load-bearing.
+
+    AUTOUSE is what keeps this off the ~70 legitimate per-scenario
+    `monkeypatch.setattr(..., 'assert_store_mutation_allowed', ...)` sites that
+    guard #2's docstring enumerates — the `calls.append(kw)` recorders, the
+    `order.append('preflight')` sequencers, and in particular the pass-through
+    `lambda **_kw: None` re-rigs inside "unchanged when the preflight passes"
+    tests, which are byte-identical to the fixture's own body. Those live in
+    test bodies, never in an autouse fixture, and they must NOT be shared.
+    Rebinding THE GUARD is what distinguishes it from the other 29 autouse
+    fixtures in this tree.
+
+    Verified false-positive-free when written (2026-09-04): 30 autouse fixtures
+    across `tests/`, 0 of which rebind the guard, because every suite that
+    needs one now calls `neutralise_fixture`.
+    """
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    if not _is_autouse_fixture(node):
+        return False
+    return any(_neutralises_the_guard(stmt) for stmt in node.body)
+
+
 def _test_modules() -> list[pathlib.Path]:
-    """Every collected test module in this directory, in a stable order.
+    """Every collected test module in this TREE, in a stable order.
+
+    RECURSIVE (`rglob`), not top-level. The guarded suites all happen to live
+    at the top level today, but `tests/reconciliation/`, `tests/server/` and
+    `tests/middleware/` hold collected test modules too, and a guarded suite
+    added under one of them would otherwise be free to reintroduce exactly the
+    second source of truth these guards exist to forbid — silently, since
+    nothing else would notice. The guards are cheap insurance only if their
+    scope matches pytest's.
 
     Deliberately globs `test_*.py` and NOT `*.py`: the helper home
     `_store_mutation_preflight_contract.py` is underscore-prefixed (so pytest
     does not collect it) and is therefore already excluded. Do not "fix" this
     glob to `*.py` — that would sweep the helper itself and make every guard
     below unsatisfiable.
+
+    Cost: 328 modules and ~1.46M AST nodes, against 257 modules / ~1.25M nodes
+    top-level. Wall clock is dominated by the parse and swings widely with
+    machine load (6-23s measured for the identical work on 2026-09-04), so no
+    figure is pinned here. What is structural: the parse is paid ONCE per
+    session, not once per guard — `parse_python_module` is `functools.cache`d on
+    the path, so the three guards below share it, and each then pays only its
+    own `ast.walk` (~2-5s).
     """
-    return sorted(TESTS_DIR.glob('test_*.py'))
+    return sorted(
+        path
+        for path in TESTS_DIR.rglob('test_*.py')
+        if '__pycache__' not in path.parts
+    )
 
 
 class TestNoHandRolledNeutraliseFixture:
-    """Whole-tree AST drift guard: no test module may define its own
-    `_neutralise_store_mutation_preflight`.
+    """Whole-tree AST drift guard: no test module may hand-roll the
+    neutralising fixture — under the historical name, or under any other.
 
     Extraction alone is a one-time dedupe — the moment someone copies an older
     suite as a template, the two-sources-of-truth problem this helper exists to
     close comes straight back. This is what makes the collapse durable.
+
+    Catches TWO shapes, because the name alone catches nothing: a definition of
+    `_neutralise_store_mutation_preflight` (the pre-extraction spelling, now
+    absent everywhere — a tripwire for a literal revert), and an autouse fixture
+    under ANY name whose body rebinds `assert_store_mutation_allowed`, which is
+    what a rename would actually look like. The second is the one with teeth.
 
     Asserts over PARSED source (`_ast_guard.parse_python_module`), so prose in a
     docstring that merely names the old fixture cannot trip it.
@@ -364,15 +466,17 @@ class TestNoHandRolledNeutraliseFixture:
         for path in _test_modules():
             tree = parse_python_module(path)
             for node in ast.walk(tree):
-                if (
-                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name == _HAND_ROLLED_FIXTURE_NAME
-                ):
-                    offenders.append(f'{path.name}:{node.lineno}:{node.name}')
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name == _HAND_ROLLED_FIXTURE_NAME:
+                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}:{node.name} (name)')
+                elif _neutralising_autouse_fixture(node):
+                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}:{node.name} (shape)')
 
         assert not offenders, (
-            f'{len(offenders)} hand-rolled `{_HAND_ROLLED_FIXTURE_NAME}` '
-            'definition(s) found. Route each through '
+            f'{len(offenders)} hand-rolled neutralising fixture(s) found — an '
+            'autouse fixture rebinding `assert_store_mutation_allowed`, or a '
+            f'definition of `{_HAND_ROLLED_FIXTURE_NAME}`. Route each through '
             '`_store_mutation_preflight_contract.neutralise_fixture(_mod, '
             "note='<this suite's seam and mock substrate>')` instead:\n  "
             + '\n  '.join(offenders)
@@ -415,7 +519,7 @@ class TestNoHandRolledDenyRaiser:
                     and node.exc is not None
                     and 'StoreMutationUnavailable' in ast.unparse(node.exc)
                 ):
-                    offenders.append(f'{path.name}:{node.lineno}')
+                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}')
 
         assert not offenders, (
             f'{len(offenders)} hand-rolled `StoreMutationUnavailable` raiser(s) '
@@ -432,10 +536,20 @@ class TestNoHandRolledDenyRaiser:
 
 # Guarding the marker LITERAL rather than a `_fail_closed_records` function
 # name is the stronger check: it also catches a re-divergence that inlines the
-# filter into a test body, or renames the helper. Once green,
-# `FAIL_CLOSED_MARKERS` is the only place either marker is spelled anywhere in
-# `tests/`, so adding a third is a one-line change instead of a 12-file sweep --
-# which is precisely the drift this extraction exists to close.
+# filter into a test body, or renames the helper.
+#
+# Guards the FAIL-CLOSED marker only -- `FAIL_CLOSED_MARKERS[0]`, not the whole
+# tuple -- and that is deliberate, not an arity oversight. Measured 2026-09-04
+# across all 328 test modules: the fail-closed marker appears as an
+# `ast.Constant` in 0 of them, while the remedy noun (`FAIL_CLOSED_MARKERS[1]`)
+# appears in 48, because it is ordinary English that unrelated suites have
+# every right to mention. Sweeping the whole tuple would buy 48 false positives
+# and an allowlist, which is self-defeating for a drift guard -- the same
+# reasoning guard #2 gives for keying on the `raise` shape rather than setattr.
+#
+# The narrower sweep is still sufficient for the property that matters: the two
+# markers travel together in one tuple, and a suite inlining the diagnosis has
+# to spell the distinctive half in order to match a real record.
 _GUARDED_MARKER = FAIL_CLOSED_MARKERS[0]
 
 
@@ -449,9 +563,10 @@ class TestNoInlinedFailClosedMarker:
     what lets the surviving per-suite rationale keep discussing the contract in
     words.
 
-    The sweep is exemption-free: it covers every `test_*.py` in this directory
-    INCLUDING this module, so there is no blind spot in which the guard could
-    tolerate the very literal it forbids everywhere else.
+    The sweep is exemption-free: it covers every `test_*.py` in the whole
+    `tests/` tree, subdirectories and this module included, so there is no blind
+    spot in which the guard could tolerate the very literal it forbids
+    everywhere else.
 
     The scripts under `scripts/` do contain the literal, since they EMIT it,
     and are correctly outside this sweep.
@@ -467,12 +582,12 @@ class TestNoInlinedFailClosedMarker:
                     and isinstance(node.value, str)
                     and _GUARDED_MARKER in node.value
                 ):
-                    offenders.append(f'{path.name}:{node.lineno}')
+                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}')
 
         assert not offenders, (
             f'{len(offenders)} inlined `{_GUARDED_MARKER}` literal(s) found. '
             'Filter the guard record through '
             '`_store_mutation_preflight_contract.fail_closed_records(caplog, '
-            "'<the script's logger name>')` instead, so both markers are "
-            'spelled once:\n  ' + '\n  '.join(offenders)
+            "'<the script's logger name>')` instead, so the fail-closed "
+            'marker is spelled once:\n  ' + '\n  '.join(offenders)
         )
