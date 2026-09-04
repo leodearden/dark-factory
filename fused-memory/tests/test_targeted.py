@@ -4636,6 +4636,24 @@ def _verify_rows(actions: list[dict]) -> list[dict]:
     ]
 
 
+def _verdict_writes(mock_memory_service) -> list:
+    """The verification memory writes from a done-transition, and only those.
+
+    `_on_task_done`'s fast-path completion echo is a separate and explicitly
+    ALLOWED write; the metadata key marking a write as verdict-bearing is what
+    separates the two.
+
+    Defined once, here beside the other shared done-transition helpers, and
+    used by both the task-4343 audit-row tests below and the task-4723
+    verdict-template / escalation tests further down: two copies of "which
+    writes are verdict-bearing" could drift if that marking key ever changes.
+    """
+    return [
+        c for c in mock_memory_service.add_memory.call_args_list
+        if 'verification_verdict' in (c.kwargs.get('metadata') or {})
+    ]
+
+
 async def _run_done_transition(
     reconciler, task_id: str = '1', project_root: str = '/tmp/test',
 ) -> dict:
@@ -5024,10 +5042,7 @@ class TestVerificationFailureAudit:
         # No verdict-bearing memory write.  The fast-path completion echo still
         # fires and is explicitly allowed, so the filter is on the metadata
         # that marks a write as carrying a verification verdict.
-        verdict_writes = [
-            c for c in mock_memory_service.add_memory.call_args_list
-            if 'verification_verdict' in (c.kwargs.get('metadata') or {})
-        ]
+        verdict_writes = _verdict_writes(mock_memory_service)
         assert not verdict_writes, (
             f'A refused root must not write a verification memory, got '
             f'{[c.kwargs.get("metadata") for c in verdict_writes]}'
@@ -6297,19 +6312,9 @@ async def test_unblock_metadata_stamp_non_dict_response_is_rejected(
 # semantic search surfaces that record as evidence FOR completion — the
 # retrieval-time reading inverts the finding.  Each verdict now carries its
 # own framing, so the record reads correctly standing alone.
-
-
-def _verdict_writes(mock_memory_service) -> list:
-    """The verification memory writes from a done-transition, and only those.
-
-    `_on_task_done`'s fast-path completion echo is a separate and explicitly
-    ALLOWED write; the metadata key marking a write as verdict-bearing is
-    what separates the two (same filter idiom as the refused-root test above).
-    """
-    return [
-        c for c in mock_memory_service.add_memory.call_args_list
-        if 'verification_verdict' in (c.kwargs.get('metadata') or {})
-    ]
+#
+# These tests select the verification write with the shared `_verdict_writes`
+# helper defined beside `_run_done_transition` above.
 
 
 class TestVerdictMemoryTemplates:
@@ -6549,11 +6554,18 @@ class TestContradictedEscalation:
         assert '\n' not in esc.summary, (
             f'summary is the one-line field; got {esc.summary!r}'
         )
-        assert '1' in esc.summary, f'The summary must name the task; got {esc.summary!r}'
+        # The surrounding phrase, not the bare id: the task id under test is
+        # the single character '1', which occurs incidentally in run ids,
+        # levels and paths — so a bare `'1' in ...` stays green even if the id
+        # stops being interpolated at all, which is the regression to catch.
+        assert 'task 1:' in esc.summary, (
+            f'The summary must name the task; got {esc.summary!r}'
+        )
 
         runs = await journal.get_recent_runs('test-project', limit=1)
         run_id = runs[0].id
-        for needle in ('1', run_id, 'contradicted', '0.87', 'src/api.py', 'src/other.py'):
+        for needle in ('Task 1 ', run_id, 'contradicted', '0.87',
+                       'src/api.py', 'src/other.py'):
             assert needle in esc.detail, (
                 f'Expected {needle!r} in the escalation detail, got:\n{esc.detail}'
             )

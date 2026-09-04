@@ -1730,6 +1730,24 @@ class TargetedReconciler:
         - NO task-status mutation anywhere (INV-3, esc-3105-3).  Nothing
           auto-closes or auto-reopens on an LLM verdict; this is an alert
           for a human, not an action.
+        - NO `is_orchestrator_live_for` gate, deliberately UNLIKE the
+          `_sweep_escalate_l1` call site in `_sweep_cancelled_descendants`,
+          which files an L1 only when the target project's orchestrator
+          holds a live lock.  That gate is a CHOICE BETWEEN TWO DURABLE
+          ACTIONS — escalate when a watcher can see it, else
+          `_sweep_block_orphan`, which records the same finding in-band as a
+          status transition — so nothing is lost on either arm.  Here there
+          is no second arm to fall back to, because the bullet above forbids
+          the status mutation that would be it: gating on liveness would
+          simply DISCARD a contradiction whenever the target project's
+          orchestrator happened to be down.  Liveness is a point-in-time
+          read of a lock file, while the escalation queue is a durable
+          on-disk queue precisely so a watcher that starts later still
+          drains it.  Accepted cost, stated so it is a recorded decision and
+          not an omission: a project that never runs a watcher accumulates
+          pending L1 JSON files (one per contradicted re-done task, since
+          there is no dedup).  Bounded by the same volume gate as above, and
+          preferred over silently dropping the finding.
 
         Returns the action dict for `result['actions']`, or None when the
         escalation package is unavailable.
@@ -1761,9 +1779,13 @@ class TargetedReconciler:
         # POINTERS ONLY (INV-9): no verifier summary, no evidence snippets.
         # The finding already has two homes; this says where they are so the
         # escalation can never drift from the record it describes.
+        # `:.2f` rather than the default float repr: `confidence` is an
+        # unconstrained [0,1] float parsed out of agent JSON, so a value like
+        # 0.8500000000000001 would render verbatim into the one-screen alert a
+        # human reads.  Two decimals is all the precision a triage decision uses.
         detail_lines = [
             f'Task {task_id} was marked done, but codebase verification returned '
-            f'verdict=contradicted (confidence {confidence}).',
+            f'verdict=contradicted (confidence {confidence:.2f}).',
             f'Reconciliation run: {run_id}',
         ]
         paths = _evidence_paths(evidence)
