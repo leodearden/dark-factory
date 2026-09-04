@@ -123,6 +123,9 @@ UNSPECIFIED_LIMIT = 'unspecified'
 
 DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
 
+#: Repo root, derived from this file: scripts/ -> fused-memory/ -> root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
 #: sqlite's busy timeout for the journal connection, in SECONDS.
 #: sqlite3's implicit default is 5.0; this raises it because the journal
 #: is a live multi-gigabyte file a running fused-memory server is
@@ -386,6 +389,33 @@ def _share(count: int, total: int) -> float | None:
     return round(count / total, 6)
 
 
+def _repo_relative(path: Path | str) -> str:
+    """`data/reconciliation/write_journal.db`, not somebody's home dir.
+
+    An artifact naming an absolute checkout is neither reproducible nor
+    readable by anyone else, and it leaks the worktree the run happened
+    in -- the same rule this change set states for `fixture_digests`
+    (`fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`).
+
+    Paths outside the repo are returned RESOLVED-ABSOLUTE, not shortened
+    to a bare filename: they are genuinely checkout-independent, and a
+    journal parked outside the tree must stay identifiable.
+
+    `_REPO_ROOT` is derived from this file's location, so it differs
+    between the main checkout and every `.worktrees/<id>` lane -- the
+    caveat `census_memory_metadata.py::_repo_relative` already records.
+    The live journal sits under the main checkout's gitignored `/data/`,
+    so a harvest run from a worktree correctly falls through to the
+    absolute branch; the committed sidecar's relative value is what a
+    MAIN-checkout run emits.
+    """
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(_REPO_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
 def _query_id(text: str, source: str) -> str:
     """A stable, content-derived id, so a re-harvest keeps its row ids."""
     import hashlib  # noqa: PLC0415
@@ -611,7 +641,7 @@ def harvest(
         tail_share=_share(tail_total, total),
         literal_share=_share(literal_total, total),
         family_share=_share(literal_total + family_total, total),
-        journal_path=str(db_path),
+        journal_path=_repo_relative(db_path),
         tail_sample=tail_sample,
         tail_top=tail_top,
         seed=seed,
