@@ -80,6 +80,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
@@ -189,6 +190,56 @@ def find_prose_uuids(finding: Any) -> dict[str, list[str]]:
     return found
 
 
+def _make_memory_resolver(
+    memory_service: Any,
+    project_id: str,
+) -> Callable[[Any], Awaitable[tuple[str, str | None]]]:
+    """Build a per-call memoised three-way resolver for a Mem0 point id.
+
+    Returns an async callable answering ``('found', None) | ('missing', None) |
+    ('error', '<ExcTypeName>')`` for a ``memory_id``, resolved through
+    ``memory_service.get_memory_by_id(project_id, memory_id)`` — the
+    no-silent-fail raw Qdrant point read.
+
+    **Why a shared factory rather than a closure per caller.**
+    ``citation_repair.py``'s header already states it reuses this module's
+    found/``None``/raised branching "so the two halves cannot disagree about
+    what a backend timeout means"; a THIRD in-module copy — one inside
+    ``verify_cited_memories`` and one inside ``scan_prose_citations`` — would
+    reintroduce exactly that drift, in the one place where the two halves are
+    most expected to agree.
+
+    Each distinct id is resolved AT MOST ONCE per call: an id cited by N
+    findings costs one point read, not N. ``get_memory_by_id`` is a network
+    round trip on the stage's critical path and task 2979 put the structured
+    pass on ALL THREE stages, so the repeat-citation case is three times as
+    common as it was.
+
+    The memo is scoped to the CALL, never module-level: a longer-lived cache
+    would reintroduce exactly the stale-read TOCTOU these passes exist to
+    close. Caching the ``'error'`` outcome too is deliberate — a backend that
+    just failed for this id will almost certainly fail again within the same
+    assembly, and re-raising it per citation only hammers a sick store while
+    producing the identical marker.
+    """
+    resolution_cache: dict[Any, tuple[str, str | None]] = {}
+
+    async def _resolve(memory_id: Any) -> tuple[str, str | None]:
+        cached = resolution_cache.get(memory_id)
+        if cached is not None:
+            return cached
+        try:
+            record = await memory_service.get_memory_by_id(project_id, memory_id)
+        except Exception as exc:  # noqa: BLE001
+            outcome: tuple[str, str | None] = ('error', type(exc).__name__)
+        else:
+            outcome = ('found', None) if record else ('missing', None)
+        resolution_cache[memory_id] = outcome
+        return outcome
+
+    return _resolve
+
+
 async def verify_cited_memories(
     findings: list[dict[str, Any]],
     memory_service: Any,
@@ -259,33 +310,7 @@ async def verify_cited_memories(
     errors_key = f'{stat_prefix}_citation_verification_errors'
     stats = {dropped_key: 0, verified_key: 0, errors_key: 0}
 
-    # Per-call memo of each mem0 id's resolution OUTCOME, so an id cited by N
-    # findings costs ONE Qdrant point read instead of N. get_memory_by_id is a
-    # network round trip on the stage's critical path, and task 2979 put this
-    # pass on ALL THREE stages, so the repeat-citation case is now three times
-    # as common as it was.  Values: ('found', None) | ('missing', None) |
-    # ('error', '<ExcTypeName>').
-    #
-    # Scoped to the CALL, never module-level: a longer-lived cache would
-    # reintroduce exactly the stale-read TOCTOU this pass exists to close.
-    # Caching the 'error' outcome too is deliberate — a backend that just
-    # failed for this id will almost certainly fail again within the same
-    # assembly, and re-raising it per citation only hammers a sick store while
-    # producing the identical marker.
-    resolution_cache: dict[Any, tuple[str, str | None]] = {}
-
-    async def _resolve(memory_id: Any) -> tuple[str, str | None]:
-        cached = resolution_cache.get(memory_id)
-        if cached is not None:
-            return cached
-        try:
-            record = await memory_service.get_memory_by_id(project_id, memory_id)
-        except Exception as exc:  # noqa: BLE001
-            outcome: tuple[str, str | None] = ('error', type(exc).__name__)
-        else:
-            outcome = ('found', None) if record else ('missing', None)
-        resolution_cache[memory_id] = outcome
-        return outcome
+    _resolve = _make_memory_resolver(memory_service, project_id)
 
     for finding in findings:
         cited = finding.get('cited_memories') or []
@@ -343,6 +368,123 @@ async def verify_cited_memories(
                 stats[dropped_key] += 1
         finding['cited_memories'] = kept
     return stats
+
+
+async def scan_prose_citations(
+    findings: list[dict[str, Any]],
+    memory_service: Any,
+    project_id: str,
+    *,
+    stat_prefix: str = 'stage1',
+    run_id: str | None = None,
+    log: logging.Logger | None = None,
+) -> dict[str, int]:
+    """WARN-ONLY prose half of the citation invariant (task 4818).
+
+    Scans each finding's free text (``PROSE_CITATION_FIELDS``) for
+    UUID-shaped substrings via :func:`find_prose_uuids` and resolves each
+    DISTINCT id, splitting the outcome FOUR ways:
+
+    - resolves -> ``<stat_prefix>_prose_citations_verified``;
+    - absent WITH a deletion tombstone -> ``<stat_prefix>_prose_citations_tombstoned``
+      (a deliberate reap is provenance, not a fabrication — benign, no warning);
+    - absent with NO tombstone -> ``<stat_prefix>_prose_phantom_citations``,
+      the FABRICATED branch, and the only one that logs a WARNING;
+    - the point read raised -> ``<stat_prefix>_prose_citation_verification_errors``
+      (a backend error is "unknown", not "absent" — inconclusive, no warning).
+
+    **Why WARN-ONLY, and why it never mutates a finding.** The structured half
+    (:func:`verify_cited_memories`) can safely DROP a phantom because
+    ``cited_memories`` is a machine-readable claim whose entries are, by
+    construction, meant to be Mem0 point ids. Prose is not. A recon finding's
+    description legitimately names run_ids, Graphiti edge and entity uuids,
+    episode uuids, session ids and task uuids — none of them Mem0 point ids,
+    and every one of them answered ``None`` by ``get_memory_by_id``, which is
+    Mem0/Qdrant-only. That false-positive class is unbounded and NO regex can
+    close it, which is what makes warn-only mandatory rather than merely
+    cautious: a false positive here costs one log line and one counter, never
+    a dropped claim and never a durable ``citation_failures`` marker that
+    would make a legitimate finding read as unbacked in the journal.
+    ``citation_failures`` (task 2979) and ``citation_repairs`` (task 3065) are
+    both left untouched, so the two halves stay separate.
+
+    Counters count DISTINCT ``(finding, memory_id)`` pairs, never occurrences:
+    a phantom named three times in one description is ONE phantom and ONE
+    warning. They count CLAIMS, not lookups — the same distinction
+    :func:`verify_cited_memories`' docstring already draws — so a memoised
+    resolution increments exactly as a fresh one does.
+
+    All FOUR keys are ALWAYS present, on every path, so a caller merging them
+    into ``report.stats`` never needs a ``.get(..., 0)`` fallback (the
+    convention inherited verbatim from :func:`verify_cited_memories`' triple).
+    A bare ``prose_phantom_citations: 0`` would be ambiguous between "we
+    scanned and everything is clean" and "nothing was scannable"; reporting
+    all four makes the zero self-explaining, and they sum to the number of
+    distinct pairs scanned, so no separate denominator key is needed.
+
+    ``stat_prefix`` is caller-supplied for the same reason the structured pass
+    takes one: ``BaseStage.run()`` runs this for EVERY stage and merges the
+    result into that stage's flat stats block, where an unprefixed name would
+    collide across stages — pass ``STAGE_STAT_PREFIX[stage_id]``.
+
+    Never raises: a malformed ``findings`` entry is skipped, and every backend
+    fault is folded into the inconclusive counter.
+    """
+    log = log or logger
+
+    # Bind the four prefixed key names once, mirroring verify_cited_memories'
+    # dropped_key/verified_key/errors_key style, so the increment sites below
+    # stay as readable as the hard-coded literals they replace.
+    verified_key = f'{stat_prefix}_prose_citations_verified'
+    tombstoned_key = f'{stat_prefix}_prose_citations_tombstoned'
+    phantom_key = f'{stat_prefix}_prose_phantom_citations'
+    errors_key = f'{stat_prefix}_prose_citation_verification_errors'
+    stats = {verified_key: 0, tombstoned_key: 0, phantom_key: 0, errors_key: 0}
+
+    resolve = _make_memory_resolver(memory_service, project_id)
+
+    for finding in findings:
+        for memory_id, fields in find_prose_uuids(finding).items():
+            outcome, _error_type = await resolve(memory_id)
+            if outcome == 'error':
+                # "Unknown", not "absent". Reporting this as a fabrication
+                # would be a silent-fail in the loud direction: it asserts
+                # something the read never established.
+                stats[errors_key] += 1
+                continue
+            if outcome == 'found':
+                stats[verified_key] += 1
+                continue
+
+            # MISS. The tombstone is the sole discriminator between a
+            # deliberate reap (benign) and a fabrication (worth warning), so
+            # the probe runs ONLY here — guarded to the miss branch exactly as
+            # ``server/tools.py::get_memory_by_id`` guards it, where it "never
+            # runs on the hit branch".
+            tombstone = await memory_service.get_mem0_deletion_tombstone(
+                project_id, memory_id,
+            )
+            if tombstone:
+                stats[tombstoned_key] += 1
+                continue
+
+            stats[phantom_key] += 1
+            _finding_id = finding.get('finding_id') if isinstance(finding, dict) else None
+            log.warning(
+                'reconciliation.prose_phantom_citation: memory_id=%s named in '
+                'finding=%s field(s)=%s resolves to nothing and has no deletion '
+                'tombstone (run_id=%s); the citation is left UNTOUCHED (warn-only)',
+                memory_id, _finding_id, ','.join(fields), run_id,
+                extra={
+                    'run_id': run_id,
+                    'stat_prefix': stat_prefix,
+                    'finding_id': _finding_id,
+                    'fields': list(fields),
+                    'memory_id': memory_id,
+                },
+            )
+    return stats
+
 
 
 # --------------------------------------------------------------------------- #
