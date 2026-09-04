@@ -45,6 +45,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _verify_task_count_snapshot_written,
     _write_task_count_snapshot,
 )
+from fused_memory.reconciliation import task_count_snapshot_cadence
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
     LEGACY_SNAPSHOT_WRITTEN_STAT_KEY,
@@ -166,6 +167,20 @@ class TestConstants:
     def test_escalation_category_value(self):
         assert ESCALATION_CATEGORY == 'recon_stale_task_count_snapshot'
 
+    def test_legacy_written_stat_key_is_retired(self):
+        """API-surface contract: the pre-rename alias must stay GONE — task 3488.
+
+        Asserts a runtime module export, not docstring prose. Deliberately
+        reads the MODULE rather than importing the name: importing a name in
+        order to assert its absence is self-defeating.
+
+        This is what stops a future edit from quietly resurrecting the
+        read-only back-compat alias that task 3045 introduced and task 3488
+        retired, once measurement confirmed no in-window journal row could
+        still change the computed miss streak.
+        """
+        assert not hasattr(task_count_snapshot_cadence, 'LEGACY_SNAPSHOT_WRITTEN_STAT_KEY')
+
 
 # ---------------------------------------------------------------------------
 # extract_snapshot_written
@@ -253,6 +268,40 @@ class TestExtractSnapshotWritten:
 
     def test_neither_key_present_is_still_none(self):
         report = _stage_report({'some_unrelated_stat': 1})
+        assert extract_snapshot_written(report) is None
+
+    # --- pre-rename spelling is retired, not honored (task 3488) ------------
+    #
+    # Task 3045's read-only legacy alias was deleted once measurement showed
+    # no in-window journal row could still change the computed miss streak:
+    # all 24 in-window full+completed pre-rename rows carried value 1, and
+    # compute_snapshot_miss_streak breaks on anything that is not False, so
+    # True (fallback present) and None (fallback gone) are indistinguishable
+    # to it. Value 0 is the only value the fallback could have changed, and
+    # none was in-window.
+    #
+    # The absent-vs-legitimate-zero distinction that the deleted `in stats`
+    # membership test used to protect is guarded by the EXISTING
+    # test_stats_0_is_false_on_stage_report / test_missing_key_is_none_on_stage_report
+    # above -- those two are load-bearing for the `.get(...)` collapse and
+    # must not be removed: collapsing 0 (confirmed miss) into None (unknown)
+    # would be a real fail-quiet regression, since unknown STOPS the streak.
+    #
+    # Raw literals below, not a constant: the constant is gone, and the
+    # literal is what real journal blobs contain.
+
+    def test_pre_rename_key_0_is_unknown_on_stage_report(self):
+        """The important direction: a pre-rename CONFIRMED MISS must now read
+        as unknown, never as False.
+
+        Unknown stops the miss streak, so retirement can under-escalate by at
+        most one cycle and can never over-escalate -- the fail-safe side.
+        """
+        report = _stage_report({'task_count_snapshot_written': 0})
+        assert extract_snapshot_written(report) is None
+
+    def test_pre_rename_key_1_is_unknown_on_raw_dict(self):
+        report = {'stats': {'task_count_snapshot_written': 1}}
         assert extract_snapshot_written(report) is None
 
 
