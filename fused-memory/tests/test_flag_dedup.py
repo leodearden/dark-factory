@@ -3713,6 +3713,126 @@ class TestResolveLiveCrossProjectFixTask:
 
 
 # ---------------------------------------------------------------------------
+# ---- task 4864 step-1 ----
+# RED: truncation parity between _sanitize_cited_tasks and title corroboration.
+# ---------------------------------------------------------------------------
+
+
+class TestCitedTaskTitleTruncationParity:
+    """A citation the gate's OWN sanitizer truncated must still corroborate.
+
+    ``_sanitize_cited_tasks`` truncates every string value to
+    ``_MAX_CITED_TASK_STR_CHARS`` (200), but the live record's ``title`` is
+    compared UNTRUNCATED — so the gate mutates a perfectly good citation into
+    one that can never match its own live task.  Every real title in this
+    factory is well under the cap, so this is not about ordinary titles: it is
+    about the sanitizer's mutation being lossless for MATCHING at whatever the
+    cap happens to be, which is what makes the cap safe to tune later.
+
+    RED until step-2 truncates BOTH sides before normalising.
+    """
+
+    PROJECT = 'know_live'
+    KNOWN = {'dark_factory': '/df'}
+    #: 250 chars — comfortably past _MAX_CITED_TASK_STR_CHARS (200).
+    LONG_TITLE = 'Fix the cross-project fix-task citation-suppression gate ' + ('x' * 193)
+
+    @staticmethod
+    def _cited(title):
+        """Sanitize a one-citation flag and hand back the surviving entry."""
+        from fused_memory.reconciliation.flag_dedup import _sanitize_cited_tasks
+
+        sanitized = _sanitize_cited_tasks(
+            {'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': title}]}
+        )
+        assert sanitized is not None and len(sanitized) == 1, (
+            f'the sanitizer must keep this citation; got {sanitized!r}'
+        )
+        return sanitized[0]
+
+    def test_sanitizer_actually_truncates_the_long_title(self):
+        """Premise check: without this the parity assertions below are vacuous."""
+        from fused_memory.reconciliation.flag_dedup import _MAX_CITED_TASK_STR_CHARS
+
+        assert len(self.LONG_TITLE) > _MAX_CITED_TASK_STR_CHARS
+        cited = self._cited(self.LONG_TITLE)
+        assert len(cited['title']) == _MAX_CITED_TASK_STR_CHARS, (
+            f'the fixture must exercise the truncation path; got {cited!r}'
+        )
+        assert cited['title'] != self.LONG_TITLE
+
+    def test_truncated_citation_still_corroborates_untruncated_live_title(self):
+        """THE DEFECT: the sanitizer's own mutation must not break matching."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        cited = self._cited(self.LONG_TITLE)
+        live = {'id': 3839, 'title': self.LONG_TITLE, 'status': 'pending'}
+
+        assert _cited_fix_task_live(cited, live) is True, (
+            'a citation truncated by the gate\'s OWN sanitizer must still '
+            f'corroborate the live record it was copied from; got {cited!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolver_returns_live_fix_task_for_truncated_citation(self):
+        """Same defect at the resolver seam dedup_flags actually calls."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _LiveFixTask,
+            _resolve_live_cross_project_fix_task,
+        )
+
+        cited = self._cited(self.LONG_TITLE)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': self.LONG_TITLE, 'status': 'pending'}
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, self.KNOWN, self.PROJECT, [cited]
+        )
+
+        assert isinstance(result, _LiveFixTask), (
+            f'the truncated citation must resolve to a live fix task; got {result!r}'
+        )
+        assert result.cited == cited and result.status == 'pending'
+
+    def test_long_title_differing_only_past_the_cap_does_not_corroborate(self):
+        """Companion: the fix must not degrade into "any long title matches".
+
+        Two 250-char titles sharing their first 200 characters and differing
+        only afterwards.
+        """
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        cited = self._cited(self.LONG_TITLE)
+        other = self.LONG_TITLE[:200] + ('z' * 50)
+        assert other != self.LONG_TITLE and other[:200] == self.LONG_TITLE[:200]
+        live = {'id': 3839, 'title': other, 'status': 'pending'}
+
+        assert _cited_fix_task_live(cited, live) is False, (
+            f'two genuinely different long titles must not corroborate; got {live!r}'
+        )
+
+    def test_short_citation_is_not_satisfied_by_a_long_title_that_starts_with_it(self):
+        """The prefix-match guard the companion above exists to protect.
+
+        A SHORT cited title (never truncated) against a long live title that
+        merely BEGINS with it must not corroborate — a prefix rule would accept
+        it, truncating-both-sides correctly rejects it.  This is the assertion
+        that distinguishes the two candidate fixes, so it is kept regardless of
+        how the past-the-cap case above resolves.
+        """
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        cited = self._cited('Fix the gate')
+        assert cited['title'] == 'Fix the gate', 'a short title must not be truncated'
+        live = {'id': 3839, 'title': 'Fix the gate ' + ('y' * 300), 'status': 'pending'}
+
+        assert _cited_fix_task_live(cited, live) is False, (
+            f'a long live title must not be corroborated by a short prefix; got {live!r}'
+        )
+
+# ---------------------------------------------------------------------------
 # task-1654 step-1 — RED: compute_content_fingerprint_signature tests
 # ---------------------------------------------------------------------------
 
