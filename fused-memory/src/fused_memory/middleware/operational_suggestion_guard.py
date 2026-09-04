@@ -81,6 +81,23 @@ this module is only:
   here at all — so the cost of an over-strip is a possible rise in the
   ``operational_task_suggestion.flagged`` census WARNING rate, not a hard
   reject of an honest submission.
+- SCOPE BOUNDARY: the strip feeds the ``_CODE_CHANGE_SIGNALS_RE``
+  suppression scan ONLY. The ``_WEAK_MARKER_LABELS`` / ``_CODE_ARTIFACT_RE``
+  gate — a suppression path this guard has and ``routing_intent_guard`` does
+  not — is evaluated INSIDE the marker loop and keeps reading RAW field
+  text. So a stamp that merely NAMES a code-level artifact noun still gates
+  a weak marker (``confirm``/``reload``/``deploy``) in that field. Measured:
+  ``'Confirm the fused-memory service is healthy.\n\n[RECON CORRECTION
+  2026-08-08] the dependencies field was wrong; a bug.'`` -> ``None``, while
+  the same stamp with "field" replaced by "prose" -> a ``'confirm'``
+  finding. Left unfixed deliberately: task 4569 is scoped to the
+  code-change-signal scan; ``routing_intent_guard``'s directional-safety
+  rule widens the carve-out only against observed-corpus evidence, and no
+  live-data measurement of this shape exists; and under-fixing degrades to
+  pre-4569 behaviour (a finding is lost, never manufactured), the safe
+  direction. Extending the strip here would also break the monotonicity
+  invariant above, so it needs its own precision matrix rather than a copy
+  of this one. Follow-up ticket ``tkt_0RT8E1WV27YBJ2RYS22GYK1Q49``.
 
 This module is declaration-only and WARN-ONLY: it never coerces
 ``task_kind`` or ``execution_class`` and never rejects a submission — see
