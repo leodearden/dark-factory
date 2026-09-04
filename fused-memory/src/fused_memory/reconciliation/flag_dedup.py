@@ -48,12 +48,14 @@ only a finding that stops recurring for 14 days is GC'd.
 The payload never carries the finding's ``cited_tasks`` (task 4712; it did,
 briefly, under task 4381 / esc-3841-1 — see the invariant below for why that
 was retired).  The cross-project fix-task suppression gate (see
-"Suppression") resolves ONLY against the CURRENT cycle's ``cited_tasks``,
+"Suppression") resolves against the CURRENT cycle's ``cited_tasks``,
 sanitized by :func:`_sanitize_cited_tasks` down to the three canonical keys
-``{project_id, task_id, title}`` with scalar values only.  That sanitizing
-now serves the gate's input validation alone — an unserialisable or
-malformed LLM-authored citation must never reach the resolver — not a
-payload write.
+``{project_id, task_id, title}`` with scalar values only, and — when those
+name no live foreign fix task — against a citation
+:func:`_discover_foreign_fix_task_citations` looks up deterministically for
+that cycle (task 4864).  Neither is persisted.  The sanitizing now serves
+the gate's input validation alone — an unserialisable or malformed
+LLM-authored citation must never reach the resolver — not a payload write.
 
 **Invariant (task 4712):** no INPUT to :func:`compute_flag_signature` may be
 persisted in the marker payload as durable cross-cycle state.
@@ -79,13 +81,45 @@ any cycle that keys to this row at all.
 regression guard: it fails again if a future change re-adds a
 signature-derived field as durable payload state.
 
-**Interaction with the Stage 1 producer gap (task 4712, recorded for that
-sibling task's author):** one option that task considers is having Stage 2
-enrich the Stage 1 marker row with cross-project citations.  That option is
-DEFINITIVELY defeated by the keying property above, not merely blocked:
-citations are folded into the row's KEY, so enriching a row with citations
-RELOCATES it to a different row rather than annotating the one already
-written.
+**The Stage 1 producer gap, and how it was closed (task 4864 — the sibling
+task the paragraph below was originally addressed to).**  Task 4712 recorded
+that the cross-project fix-task gate had no producer and left three options
+for this task to choose between.  The outcome:
+
+* **Option (a) — Stage 2 enriches the Stage 1 marker row with cross-project
+  citations — is DEFINITIVELY defeated** by the keying property above, not
+  merely blocked: citations are folded into the row's KEY, so enriching a row
+  RELOCATES it to a different row rather than annotating the one already
+  written.  Confirmed on the live ledger, where the repro finding occupies
+  THREE rows (``know_live/598``, ``know_live/3833,3839,598``,
+  ``know_live/3833,3839``) — one logical finding, keyed by whichever
+  citations each cycle happened to emit.
+* **Option (c) — route this complaint class through
+  :func:`filter_already_tracked_systemic_patterns` — does NOT subsume the
+  need**, even though its stated blocker was removed when task 4711 widened
+  ``_NEVER_TRACKED_PHRASES`` to reach the "no fix task has been filed"
+  wording.  :func:`_is_systemic_pattern_candidate` is a CONJUNCTION and 4711
+  widened only its second conjunct; the first still requires
+  ``category``/``flag_type == 'systemic_pattern'``, which the repro flag's
+  ``remediation_payload_live_workflow_signals_gap`` is not.  Widening that
+  conjunct is rejected on the MERITS rather than on scope: that filter drops
+  on text coverage alone, with no citation, no HIT requirement (it would drop
+  a FIRST-cycle finding), no status-bounded ceiling on an already-``done``
+  fix task and no cross-cycle counter — so routing this class there would
+  bypass every bound Leo's 2026-08-17 ruling placed on task 4381 and leave
+  4381 itself permanently inert.
+* **Option (b) — a bounded deterministic cross-project lookup — was built**:
+  :func:`_discover_foreign_fix_task_citations`, consumed by ``dedup_flags``
+  (see "Suppression").  It reuses this module's own proven matcher against
+  each FOREIGN project's non-cancelled backlog and synthesizes the citation
+  the LLM cannot supply, because Stage 1's context is its own project's task
+  tree.  Crucially it HONOURS the invariant above instead of fighting it: the
+  discovered citation travels a separate in-memory channel, never reaching
+  ``flag['cited_tasks']`` or the payload, so a discovery-driven suppression
+  leaves the marker identity byte-identical to a citation-less cycle.  The
+  Stage 1 prompt was also taught to cite a foreign fix task when it has
+  grounds to — necessary but never sufficient on its own, so it complements
+  discovery rather than replacing it.
 
 **Residual cost this task does not fix:** a varying citation set still
 mints a distinct marker row per distinct citation set it has recently
@@ -96,8 +130,13 @@ unbounded growth.  The direction that would fix the sprawl itself is
 de-folding ``cited_tasks`` from :func:`compute_flag_signature` and replacing
 task-2432's collision protection (see that function's docstring) with some
 other discriminator; that is a fleet-wide re-key across ~40 call sites and
-was declined here as disproportionate to a feature that has never once
-fired (task 4712, provenance esc-3841-1, 2026-08-24 measurement).
+was declined by task 4712 as disproportionate to a feature that had never
+once fired (provenance esc-3841-1, 2026-08-24 measurement).  That premise
+has since changed — task 4864 gave the gate a producer, so it CAN now fire —
+but the conclusion does not: the sprawl is driven by varying LLM-authored
+citation sets, and the discovery producer deliberately mints no new rows at
+all (its citation never reaches the signature), so it adds nothing to the
+row count it would have to justify.
 
 Because the identity excludes run_id, ``ON CONFLICT`` on the full primary
 key guarantees **exactly one row survives** per (task_id, flag_type)
@@ -129,6 +168,21 @@ task_id, family) for the process lifetime, on an observed family collision
 as a partial audit mitigation).  When both a wildcard and a scoped row
 exist for the same task_id, the wildcard wins (union semantics — a blanket
 suppression cannot be narrowed by a more specific record).
+A SECOND, independent suppression path runs inside the per-flag loop: the
+cross-project fix-task gate (task 4381 / esc-3841-1), which drops a
+CARRIED-FORWARD finding once a live, non-cancelled fix task for it exists in
+another known project.  It has TWO producers feeding one gate (task 4864):
+the flag's own ``cited_tasks`` are tried first, and only when they name no
+live foreign fix task does :func:`_discover_foreign_fix_task_citations`
+find one deterministically — matching the finding's key terms against each
+foreign project's non-cancelled backlog — after which the discovered
+citation re-enters the SAME resolver, so both producers inherit one status
+policy, one done-suppression ceiling and one set of ``stats`` counters
+rather than forking a second.  Discovery is HIT-only, FOREIGN-only and
+lazy (a cycle with no qualifying flag issues zero ``get_tasks`` calls), and
+its citation is an in-memory gate input that never reaches the flag or the
+payload — see the invariant above and ``dedup_flags`` for the full policy.
+
 ``write_suppression_record`` upserts these rows: ``flag_types=None``
 writes a single blanket row; a non-empty list writes one scoped row per
 flag_type.  Suppression rows never expire (``expires_at=None``) — they are
