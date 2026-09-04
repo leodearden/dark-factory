@@ -5344,6 +5344,126 @@ class TestFileInfraIssueSkipsRedundantEscalatedAdvance:
 
 
 # ---------------------------------------------------------------------------
+# Task 4048 (recovered task-2240 review suggestion): _file_milestone_gate_
+# and_block has the same pinned-illegal self-loop exposure as
+# _file_infra_issue_and_block above (ESCALATED->ESCALATED / DONE->ESCALATED)
+# but never got the guard — this is that sibling's pair. Unlike the infra
+# guard, the skip path must still stamp gate_escalated_at (a stamp-only
+# update_task, dropping only the illegal deploy_state half of the advance's
+# payload) rather than dropping the write entirely: that stamp is what
+# routes the next resume through section-1 quiescence (see
+# _file_milestone_gate_and_block's docstring).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
+    """On the rare crash-resume edge where deploy_state.phase is already
+    ESCALATED (or DONE) but a re-entrant always_escalates=True call site
+    reaches _file_milestone_gate_and_block again, the best-effort advance
+    must skip the illegal self-loop — while still stamping gate_escalated_at
+    so the task is not permanently denied the section-1 resume fork."""
+
+    @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
+    async def test_no_illegal_transition_escalation_when_already_at_target(
+        self, tmp_path: Path, seeded_phase: str,
+    ) -> None:
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase=seeded_phase)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # The milestone_gate itself is still filed — the skip only affects the
+        # redundant phase advance, not the loud gate signal.
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        # No spurious illegal_deploy_transition escalation was filed.
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        # No redundant deploy_state write was even attempted.
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls == []
+        assert task['metadata']['deploy_state']['phase'] == seeded_phase
+        # gate_escalated_at is still stamped — a stamp-only fallback, not a
+        # full skip — so the next resume still routes through section-1
+        # quiescence instead of being permanently denied it.
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1
+            and c.args[1].get('gate_escalated_at')
+            and 'deploy_state' not in c.args[1]
+        ]
+        assert len(stamp_calls) == 1
+        assert scheduler.update_task.call_count == 1
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+
+    async def test_legal_edge_still_advances_and_stamps(self, tmp_path: Path) -> None:
+        """Parity fence (GREEN before AND after the step-2 fix): a legal
+        RAN->ESCALATED edge must still take the full advance, unaffected by
+        the new guard."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase='ran')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.update_task.call_count == 1
+        payload = scheduler.update_task.call_args.args[1]
+        assert payload['deploy_state']['phase'] == 'escalated'
+        assert payload.get('gate_escalated_at')
+        assert task['metadata']['deploy_state']['phase'] == 'escalated'
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+
+    async def test_pure_gate_path_unchanged(self, tmp_path: Path) -> None:
+        """Parity fence (GREEN before AND after the step-2 fix): the pure-gate
+        (before_done=None) branch is byte-unchanged by this task's guard,
+        which is confined to the before_done-is-not-None deploy path."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='4048')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.update_task.call_count == 1
+        call = scheduler.update_task.call_args
+        assert call.args[0] == '4048'
+        assert set(call.args[1].keys()) == {'gate_escalated_at'}
+        assert call.args[1]['gate_escalated_at']
+        assert call.kwargs.get('metadata_mode') == 'merge'
+
+
+# ---------------------------------------------------------------------------
 # Step-5: B7b — verify-fail: stale/missing PID or non-fresh timestamp
 # (RED until step-6 implements the verify-fail path)
 # ---------------------------------------------------------------------------
