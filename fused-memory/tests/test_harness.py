@@ -1706,13 +1706,14 @@ class TestStage1CycleSummaryHarnessBackstop:
         """Complements the False-return case above: if the re-attempt
         itself raises (rather than returning False), the optimistic True
         stamped before the call (needed so a genuinely successful
-        re-attempt's OWN ledger row — serialized synchronously at call
-        time — carries the marker; see the method's docstring) is caught
-        and corrected back to False by an inner except before re-raising
-        to this method's own outer ``except BaseException`` (which must
-        never let this raise out of the finally block, per its docstring).
-        The cycle itself must still complete successfully; only the
-        best-effort backstop write failed."""
+        re-attempt's OWN ledger row — serialized into payload_json only
+        once the shielded task takes its first step, never synchronously
+        at call time — carries the marker; see the method's docstring) is
+        caught and corrected back to False by an inner except before
+        re-raising to this method's own outer ``except BaseException``
+        (which must never let this raise out of the finally block, per
+        its docstring). The cycle itself must still complete
+        successfully; only the best-effort backstop write failed."""
         from fused_memory.models.reconciliation import StageId
 
         mock_memory_service.recon_ledger = ledger_store
