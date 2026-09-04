@@ -721,8 +721,14 @@ class RestartPlan:
         """File ``self.on_failure_escalation`` (if configured) and report whether a NEW escalation was filed.
 
         Shared by the RESTART_FAILED and VERIFY_FAILED branches above — both
-        need the identical "file if configured, else log a warning and don't
-        claim escalated" fallback that RP-1's refuse branch also uses.
+        need the "file if configured, else log a warning and don't claim
+        escalated" fallback STRUCTURE. RP-1's two refuse branches in
+        ``execute()`` (the own_unit-unknown check and the same-unit-without-
+        transient-unit check) inline their own copies of that same
+        structure, but — as of task 4047, which reworded only this
+        verify-stage warning to be plan-scoped — their warning TEXT is no
+        longer identical to this method's. Don't assume a wording change
+        here also applies there, or vice versa.
 
         Returns ``False`` both when unconfigured (nothing to file) and when
         ``_file_inprocess_escalation``'s dedup guard skipped filing an
@@ -737,9 +743,9 @@ class RestartPlan:
                 'on_failure_escalation, so THIS PLAN did not file an L2 '
                 'itself. That claim is plan-scoped, NOT evidence of a '
                 'dropped escalation: a caller that owns escalation filing '
-                'passes on_failure_escalation=None deliberately and files '
-                'its own L2 for this same failure. Look for that record '
-                'before treating the report as lost.',
+                'may pass on_failure_escalation=None deliberately and file '
+                'its own L2 for this same failure instead — check for that '
+                'record before treating this report as lost.',
                 log_context,
             )
             return False
