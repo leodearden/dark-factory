@@ -1227,6 +1227,90 @@ _TWO_REJECTIONS_IN_ONE_FACT = (
 )
 
 
+# The four outcome classes the candidate simulation can produce, one fact
+# each, so the arithmetic invariant below is exercised on a corpus where every
+# term is nonzero for at least one candidate.
+_UNIT_CORPUS = [
+    _TWO_REJECTIONS_IN_ONE_FACT,  # two rejected matches, both preambles
+    _SUBJECT_POSITIVE,            # one match the SHIPPED guard already selects
+    _INTRA_CLAUSE_COMMA,          # candidate 'b' admits it -> over-selection
+    _COMPLEMENT_REJECTION,        # both shipped and candidate reject it
+]
+
+
+@pytest.mark.parametrize('candidate', ['shipped', 'a', 'b'])
+def test_candidate_result_accounts_in_one_unit_per_match(candidate):
+    """Every CandidateResult term is a per-MATCH count, and they sum.
+
+    The committed artifact used to mix three units in one band: over_selected
+    and recovered were appended once per newly-admitted MATCH while unchanged
+    was appended once per FACT, and a fact the shipped guard already selected
+    landed in unchanged alongside a rejection both guards agreed on. Nothing
+    could be added or subtracted across those columns, and the renderers put
+    them in one table anyway.
+
+    One unit — the rejected MATCH — makes the band arithmetic. A match the
+    shipped guard already selects is out of scope for a simulation that only
+    asks what a candidate does with the shipped guard's REJECTIONS, so it is
+    counted in ``already_selected`` rather than smuggled into ``unchanged``.
+    """
+    result = simulate_candidate(candidate, _UNIT_CORPUS)
+
+    # Per-MATCH records, not bare strings: a fact carrying two rejected
+    # enumerations must be distinguishable at the offset that was scored.
+    for bucket in (result.recovered, result.over_selected, result.unchanged):
+        for entry in bucket:
+            assert not isinstance(entry, str), (
+                'per-match records, not fact text'
+            )
+            assert isinstance(entry.fact, str)
+            assert isinstance(entry.match_start, int)
+
+    # The denominator is carried, not implied: five matches over four
+    # distinct shapes, one of which the shipped guard already selects.
+    assert result.matches_scanned == 5
+    assert result.already_selected == 1
+    assert result.facts_simulated == 4
+
+    assert result.matches_scanned == (
+        result.already_selected
+        + len(result.recovered)
+        + len(result.over_selected)
+        + len(result.unchanged)
+    )
+
+
+def test_the_per_match_unit_is_visible_where_the_per_fact_one_hid_it():
+    """The unit change is observable, not just a renaming.
+
+    Candidate 'b' recovers both of the two-rejection fact's matches and
+    re-opens the intra-clause-comma over-selection, leaving exactly ONE
+    rejected match ('Reviews of tasks ...') that both guards agree on. The
+    old per-FACT spelling answered 2 here, because it also counted the
+    subject-position fact the shipped guard had already selected — a fact
+    the simulation never had anything to say about.
+    """
+    by_name = {
+        name: simulate_candidate(name, _UNIT_CORPUS)
+        for name in _mod.CANDIDATE_NAMES
+    }
+
+    assert len(by_name['b'].recovered) == 2
+    assert len(by_name['b'].over_selected) == 1
+    assert len(by_name['b'].unchanged) == 1
+
+    # The shipped guard compared against itself changes nothing, so every
+    # rejected match — all four of them — is unchanged.
+    assert by_name['shipped'].recovered == []
+    assert by_name['shipped'].over_selected == []
+    assert len(by_name['shipped'].unchanged) == 4
+
+    # Candidate 'a' recovers only the second enumeration of the two-rejection
+    # fact; the 'As of <date>' shape it was never able to reach stays put.
+    assert len(by_name['a'].recovered) == 1
+    assert len(by_name['a'].unchanged) == 3
+
+
 @pytest.mark.asyncio
 async def test_candidate_simulation_scores_each_match_once_per_fact():
     """A multi-rejection fact must not be simulated once per rejection.
@@ -1240,6 +1324,15 @@ async def test_candidate_simulation_scores_each_match_once_per_fact():
 
     The live corpus currently has zero matches, which masks this entirely; it
     would first surface on precisely the re-run this script exists to enable.
+
+    Two different things meet in this test and are deliberately kept apart.
+    The DEDUP it guards is per distinct fact SHAPE — ``run()`` feeds each
+    shape to the simulation once, so a fact with N rejections is not scored N
+    times over. The UNIT the simulation counts in is the rejected MATCH — so
+    this one fact's two enumerations contribute 2, not 1, to whichever bucket
+    each lands in. Deduping shapes and counting matches are compatible, and
+    conflating them is what produced a per-FACT ``unchanged`` beside a
+    per-MATCH ``recovered`` in the same rendered table.
     """
     source = _FakeEdgeSource({'alpha': ([_TWO_REJECTIONS_IN_ONE_FACT], True)})
 
@@ -1254,12 +1347,20 @@ async def test_candidate_simulation_scores_each_match_once_per_fact():
     assert len(by_name['b'].recovered) == 2
     # Candidate 'a' admits only the 'As of ...' shape: 1, not 2.
     assert len(by_name['a'].recovered) == 1
-    # Neither re-opens an over-selection, and the shipped baseline changes
-    # nothing — one unchanged FACT, not one per rejection.
+    # Neither re-opens an over-selection. `unchanged` is counted per rejected
+    # MATCH, so the shipped baseline — which agrees with itself about both of
+    # this fact's rejections — reports 2, and the invariant holds for all three.
     for name, candidate in by_name.items():
         assert candidate.over_selected == [], name
-        assert len(candidate.unchanged) <= 1, name
-    assert len(by_name['shipped'].unchanged) == 1
+        assert len(candidate.unchanged) <= 2, name
+        assert candidate.matches_scanned == (
+            candidate.already_selected
+            + len(candidate.recovered)
+            + len(candidate.over_selected)
+            + len(candidate.unchanged)
+        ), name
+        assert candidate.facts_simulated == 1, name
+    assert len(by_name['shipped'].unchanged) == 2
 
 
 # ---------------------------------------------------------------------------
