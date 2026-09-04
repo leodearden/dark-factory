@@ -228,13 +228,16 @@ class _ConnectionProxy:
     and every PRAGMA still run for real.
     """
 
-    def __init__(self, con, *, fail_on=None, exc=None):
+    def __init__(self, con, *, fail_on=None, exc: BaseException | None = None):
         self._con = con
         self._fail_on = fail_on
         self._exc = exc
 
     def execute(self, *args, **kwargs):
         if self._fail_on is not None and args and self._fail_on(args[0]):
+            # `fail_on` is never passed without `exc`; the check narrows
+            # `_exc` for the type checker rather than adding a contract.
+            assert self._exc is not None, 'fail_on requires exc'
             raise self._exc
         return _CursorProxy(self._con.execute(*args, **kwargs))
 
