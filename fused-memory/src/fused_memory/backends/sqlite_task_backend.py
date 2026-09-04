@@ -32,6 +32,7 @@ from shared.task_metadata import (
 from shared.task_statuses import TERMINAL, TaskStatus
 
 from fused_memory.backends.task_backend_errors import (
+    AppendUnsupportedFieldError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     StatusWriteAuthorityError,
@@ -3355,6 +3356,80 @@ def _resolve_metadata_mode(
             )
         return 'replace'
     return 'merge'
+
+
+_REPLACE_ONLY_FIELDS: tuple[str, ...] = ('title', 'description', 'priority')
+
+
+def _reject_append_on_replace_only_fields(
+    append: bool | None,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    priority: str | None = None,
+    task_id: str | None = None,
+) -> None:
+    """Reject ``append=True`` combined with a REPLACE-ONLY text column.
+
+    INVARIANT: ``title``, ``description`` and ``priority`` can only ever be
+    REPLACED. ``append`` governs exactly two things — the ``details`` /
+    ``prompt`` concatenation and the metadata merge mode (see
+    ``sqlite_task_backend.py::_resolve_metadata_mode``) — and has never
+    applied to these three columns. Before task 4039 the combination was
+    accepted silently and the incoming value OVERWROTE the column: a caller
+    who wrote ``update_task(description='\\n\\n--- addendum ---',
+    append=True)`` believing they were extending the field instead destroyed
+    the whole original, with no error and no warning. Four live repros are on
+    record; the worst wiped ~17KB of a human-ratified decomposition record.
+
+    Task 4039 took the REJECT arm rather than making ``description``
+    concatenate like ``details``: the append-it arm would silently CHANGE the
+    meaning of an existing call shape (every historical
+    ``description=…, append=True`` caller wrote a replace and got a replace),
+    whereas rejecting changes no successful call's result — no in-repo caller
+    combines the two. This is the same loud-over-silent trade
+    ``_resolve_metadata_mode`` makes for the task-2180 metadata-wipe and the
+    task-3581 nested-metadata clobber; the two guards are twins on the same
+    method and should be read together.
+
+    PURE — a function of the call flags only. It never reads the stored row,
+    so it fires even when the existing column is empty. Making the rejection
+    depend on invisible stored state is precisely the recurrence mechanism
+    task 4039 documents: a caller whose first ``append=True`` description
+    write happens to land on an empty column learns "it worked", then gets
+    bitten later on the multi-KB record. Purity also lets the call sit before
+    ``ensure_connected()`` and the row SELECT, so the rejection precedes any
+    existence or connection error.
+
+    ``dependencies`` is also replace-only and is deliberately NOT covered —
+    the list is short, structurally visible in ``get_task``, and cheap to
+    re-derive, unlike the authored prose the recorded repros destroyed.
+
+    Args:
+        append: The call's ``append`` flag. Checked with ``is True`` (not
+            truthiness), matching ``_resolve_metadata_mode``'s merge+append
+            carve-out, so only the sanctioned flag value trips the guard.
+        title / description / priority: The call's replace-only field values;
+            non-``None`` means the write would touch that column.
+        task_id: Recorded on the raised error for structural branching.
+
+    Raises:
+        AppendUnsupportedFieldError: When ``append is True`` and at least one
+            replace-only field is non-``None``. ``.fields`` lists the
+            offenders in ``_REPLACE_ONLY_FIELDS`` order (deterministic, not
+            set-iteration order) and the message names them.
+    """
+    if append is not True:
+        return
+    offending = tuple(
+        name
+        for name, value in zip(
+            _REPLACE_ONLY_FIELDS, (title, description, priority), strict=True,
+        )
+        if value is not None
+    )
+    if offending:
+        raise AppendUnsupportedFieldError(offending, task_id)
 
 
 def _merge_values(old: object, new: object) -> object:
