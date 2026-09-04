@@ -954,17 +954,6 @@ class TestYamlLoaderSelection:
 
         assert _YAML_LOADER is yaml.CSafeLoader
 
-    def test_resolve_yaml_loader_prefers_c_loader(self):
-        """_resolve_yaml_loader(yaml) returns CSafeLoader when the real yaml module has it."""
-        import yaml
-
-        if not hasattr(yaml, "CSafeLoader"):
-            pytest.skip("libyaml not available in this environment")
-
-        from fused_memory.middleware.recon_code_fix_premise_guard import _resolve_yaml_loader
-
-        assert _resolve_yaml_loader(yaml) is yaml.CSafeLoader
-
     def test_resolve_yaml_loader_falls_back_when_c_loader_absent(self):
         """Fallback branch (otherwise unreachable with libyaml present): a
         yaml-like module exposing SafeLoader but no CSafeLoader resolves to
@@ -979,9 +968,17 @@ class TestYamlLoaderSelection:
 
     def test_shipped_registry_parses_under_active_loader(self):
         """Parity/smoke guard on real data: the shipped registry still parses
-        to well-formed entries under whichever loader is active.
+        to well-formed entries under whichever loader is active, and the
+        active loader's parse output is identical to the pure-Python
+        SafeLoader's output on that same registry.
         """
+        import yaml
+
+        if not hasattr(yaml, "CSafeLoader"):
+            pytest.skip("libyaml not available in this environment")
+
         from fused_memory.middleware.recon_code_fix_premise_guard import (
+            _YAML_LOADER,
             PremiseEntry,
             SourceAssertion,
             load_premise_registry,
@@ -992,8 +989,7 @@ class TestYamlLoaderSelection:
             / "config"
             / "recon_code_fix_premise_registry.yaml"
         )
-        if not registry_path.exists():
-            pytest.skip(f"shipped registry not found at {registry_path}")
+        assert registry_path.exists(), f"shipped registry missing at {registry_path}"
 
         entries = load_premise_registry(registry_path)
 
@@ -1003,10 +999,22 @@ class TestYamlLoaderSelection:
             for sa in entry.source_assertions:
                 assert isinstance(sa, SourceAssertion)
 
+        text = registry_path.read_text(encoding="utf-8")
+        assert yaml.load(text, Loader=yaml.SafeLoader) == yaml.load(text, Loader=_YAML_LOADER)
+
     def test_malformed_yaml_still_degrades_under_active_loader(self, tmp_path, caplog):
-        """Error-type contract survives the loader swap: CSafeLoader's
-        ParserError on malformed input is still a yaml.YAMLError, so the
-        existing handler still catches it without modification.
+        """A malformed-structure parse error survives the loader swap:
+        CSafeLoader's ParserError on this unclosed-flow-sequence input is
+        still a yaml.YAMLError, so the existing handler catches it without
+        modification.
+
+        Not a full error-type equivalence claim between the two loaders —
+        e.g. for a scalar containing a lone surrogate, CSafeLoader raises
+        UnicodeEncodeError (a ValueError, NOT a yaml.YAMLError) where
+        SafeLoader raises yaml.reader.ReaderError (which IS a YAMLError).
+        That divergence is unreachable via load_premise_registry today only
+        because its input is always strict-UTF-8-decoded text first, which
+        rejects lone surrogates before the parser ever sees them.
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import load_premise_registry
 
