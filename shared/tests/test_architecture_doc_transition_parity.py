@@ -441,3 +441,19 @@ class TestCheckArchitectureTransitionParity:
             architecture_doc_transitions.check_architecture_transition_parity()
 
         assert str(added_exc.value) != str(removed_exc.value)
+
+
+class TestArchitectureDiagramGate:
+    """The real, unmutated anti-rot gate: ARCHITECTURE.md section 3.1 must
+    draw exactly the edges in shared.task_transitions.TRANSITIONS, today,
+    on the real files -- no monkeypatching, no synthetic doc."""
+
+    def test_architecture_diagram_matches_transitions_table(self):
+        doc_edges = architecture_doc_transitions.check_architecture_transition_parity()
+        # A parser regression that returned frozenset() would make BOTH diff
+        # sides empty and the bare parity call above would pass silently --
+        # the exact vacuous-green failure this task exists to prevent.
+        # Cardinality is derived from the table, not pinned to the literal
+        # 37, so this assertion does not itself become the next stale pin.
+        assert doc_edges
+        assert len(doc_edges) == len(table_transition_edges())

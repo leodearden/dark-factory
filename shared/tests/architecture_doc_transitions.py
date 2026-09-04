@@ -329,3 +329,30 @@ def format_parity_failure(
         'to match it.'
     )
     return '\n\n'.join(sections)
+
+
+# ---------------------------------------------------------------------------
+# The gate
+# ---------------------------------------------------------------------------
+
+
+def check_architecture_transition_parity(
+    root: Path = REPO_ROOT,
+) -> frozenset[tuple[TaskStatus, TaskStatus]]:
+    """Assert ARCHITECTURE.md section 3.1 draws exactly ``TRANSITIONS``' edges.
+
+    Reads the doc, extracts and parses the diagram, reads the table (both
+    at CALL time -- see :func:`table_transition_edges`), and diffs them.
+    Raises :class:`AssertionError` (via :func:`format_parity_failure`) when
+    either side of the diff is non-empty; otherwise returns the parsed doc
+    edge set, so a caller can make further assertions (e.g. non-vacuousness)
+    without re-parsing.
+    """
+    text = read_architecture_doc(root)
+    body = extract_lifecycle_mermaid(text)
+    doc_edges = parse_state_diagram_edges(body)
+    table_edges = table_transition_edges()
+    diff = diff_transition_edges(doc_edges, table_edges)
+    if diff.missing_from_doc or diff.extra_in_doc:
+        raise AssertionError(format_parity_failure(diff.missing_from_doc, diff.extra_in_doc))
+    return doc_edges
