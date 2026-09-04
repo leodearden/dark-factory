@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
@@ -110,6 +111,82 @@ REPOINT_AGENT_ID = 'recon-stage-memory_consolidator'
 # ``recon_write_policy.is_terminal_annotation_add`` already blesses ``x_``
 # annotation adds, so no blessed-key change is needed.
 X_CITATION_TOMBSTONE_KEY = 'x_memory_citation_tombstones'
+
+# The finding fields that count as PROSE (task 4818): free text a human reader
+# will actually chase an id out of. Named once, module-level and public, so the
+# scanner, its docstrings and the tests all agree on what "prose" means rather
+# than each re-spelling the pair.
+PROSE_CITATION_FIELDS: tuple[str, ...] = ('description', 'suggested_action')
+
+# FINDER, not a gate (task 4818). The distinction matters for INV-5: a GATE
+# answers "is this value a well-formed id?" and stays single-sourced at
+# ``utils.validation.is_full_uuid`` (task 3132); a FINDER answers "where in this
+# free text is something id-shaped?", takes a haystack rather than a candidate,
+# and has no other implementation in the repo. ``is_full_uuid`` structurally
+# cannot do this job — it is anchored on the WHOLE value and rejects even
+# surrounding whitespace by design — so this pattern adds a locating capability
+# without forking the shape authority: every candidate it extracts is confirmed
+# through ``is_full_uuid`` before being admitted.
+#
+# The hex LOOKAROUNDS (not ``\b``) are load-bearing. ``\b`` sits between a word
+# and a non-word character, so it fires happily inside a longer hex run and
+# would extract a 36-char window out of the middle of a 40-hex-digit blob.
+# ``(?<![0-9a-fA-F])`` / ``(?![0-9a-fA-F])`` reject exactly that, while still
+# admitting an id preceded by a dash (``run-<uuid>``) or followed by a period.
+_PROSE_UUID_RE = re.compile(
+    r'(?<![0-9a-fA-F])'
+    r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    r'(?![0-9a-fA-F])'
+)
+
+
+def find_prose_uuids(finding: Any) -> dict[str, list[str]]:
+    """Locate every distinct UUID-shaped substring in *finding*'s prose.
+
+    Returns an insertion-ordered ``{lowercase_uuid: [field_name, ...]}`` map:
+    one key per DISTINCT id, whose value lists the ``PROSE_CITATION_FIELDS``
+    it appeared in, in field order, without duplicates. An id repeated three
+    times inside one description is one key with one field name — the caller
+    counts CLAIMS, not occurrences.
+
+    **Why field-scoped rather than a whole-finding walk.** Only ``description``
+    and ``suggested_action`` are the free text a human reader chases an id out
+    of. ``cited_memories`` is the STRUCTURED half's territory
+    (``verify_cited_memories``), and re-scanning it here would double-report
+    the same claim through two different mechanisms with two different
+    remedies. The identity fields (``finding_id``, ``task_id``) are uuid-shaped
+    by construction and are not citations at all, so scanning them would
+    manufacture a phantom out of every finding's own name.
+
+    **Why the id is lowercased.** Casing is a rendering choice, not a different
+    identifier — the rationale ``is_full_uuid``'s docstring already gives.
+    Mem0 point ids are ``uuid4()``-rendered lowercase, so normalising an
+    uppercase rendering can only AVOID a false phantom (an id that would
+    otherwise resolve to nothing purely because of its spelling), never create
+    one.
+
+    Pure and total: never mutates *finding*, and never raises. A non-dict, a
+    finding missing both keys, and a field holding ``None``/an int/a list all
+    yield ``{}`` — a malformed entry degrades rather than aborting a scan
+    mid-report.
+    """
+    if not isinstance(finding, dict):
+        return {}
+    found: dict[str, list[str]] = {}
+    for field_name in PROSE_CITATION_FIELDS:
+        value = finding.get(field_name)
+        if not isinstance(value, str):
+            continue
+        for match in _PROSE_UUID_RE.finditer(value):
+            memory_id = match.group(0).lower()
+            # Belt-and-braces, and the reason the ONE shape authority stays on
+            # this path: the finder locates, ``is_full_uuid`` decides.
+            if not is_full_uuid(memory_id):
+                continue
+            fields = found.setdefault(memory_id, [])
+            if field_name not in fields:
+                fields.append(field_name)
+    return found
 
 
 async def verify_cited_memories(
