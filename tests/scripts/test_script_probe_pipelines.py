@@ -269,3 +269,84 @@ def test_export_flushes_falkordb_on_a_clean_listing(tmp_path):
     combined = result.stdout + result.stderr
     assert "OK FalkorDB BGSAVE completed" in combined, combined
     assert "WARN FalkorDB container not running" not in combined, combined
+
+
+# --- import-data.sh section 1: stopping the backing stores ------------------
+# The byte-identical `ps --status running | grep -q falkordb` construct fixed
+# above, in a different executable.
+#
+# `end_after` IS REQUIRED HERE, and this was MEASURED rather than assumed:
+# without it the slice ends at the `fi` closing the PRECEDING
+# `systemctl --user is-active fused-memory` block and never reaches the docker
+# site at all — a slice of the wrong region that runs cleanly and produces a
+# vacuously green test. That is precisely the hazard slice_section's third
+# anchor exists for. All three anchors occur exactly once, on non-comment
+# lines, and survive the fix.
+_IMPORT_STOP_START = 'info "Stopping services"'
+_IMPORT_STOP_END = "\nfi\n"
+_IMPORT_STOP_END_AFTER = 'ok "FalkorDB + Qdrant containers stopped"'
+
+_STOPPED = "OK FalkorDB + Qdrant containers stopped"
+
+
+def _run_import_stop(tmp_path, ps_body):
+    """Slice import-data.sh's section-1 block and run it against a scripted docker.
+
+    The slice also runs `systemctl --user is-active` and `systemctl --user stop`;
+    the harness's PATH `systemctl` stub exits 0, so that branch is taken and is
+    harmless. The `compose ... stop falkordb qdrant` call falls to the docker
+    stub's catch-all — only the listing is under test.
+    """
+    return _run_probe(
+        tmp_path,
+        slice_section(
+            IMPORT_DATA_PATH,
+            _IMPORT_STOP_START,
+            _IMPORT_STOP_END,
+            end_after=_IMPORT_STOP_END_AFTER,
+        ),
+        docker_body=_dispatch_stub_body((('*" ps "*', ps_body),)),
+    )
+
+
+def test_import_stops_the_containers_when_the_listing_exits_nonzero(tmp_path):
+    """A listing that NAMED falkordb means there are containers to stop.
+
+    Misreading it leaves FalkorDB and Qdrant RUNNING while the next sections
+    replace the data trees underneath them — the import's whole reason for
+    stopping them first.
+    """
+    result = _run_import_stop(tmp_path, _match_then_nonzero("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _STOPPED in combined, combined
+
+
+def test_import_stops_the_containers_when_the_listing_is_sigpiped(tmp_path):
+    """Same misread via SIGPIPE: `grep -q` closes the pipe, the producer dies, 141."""
+    result = _run_import_stop(tmp_path, _match_then_bulk("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _STOPPED in combined, combined
+
+
+def test_import_stops_nothing_when_the_listing_says_nothing(tmp_path):
+    """A silent listing means nothing to stop — reached WITHOUT aborting.
+
+    The honest verdict for a producer that said nothing, and the guard against
+    the bare-assignment spelling: `returncode == 0` pins that the fix must not
+    turn an unavailable docker into a `set -e` abort of the whole import.
+    """
+    result = _run_import_stop(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _STOPPED not in combined, combined
+
+
+def test_import_stops_the_containers_on_a_clean_listing(tmp_path):
+    """Characterization: the ordinary path lists falkordb and exits 0."""
+    result = _run_import_stop(tmp_path, _clean_match("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _STOPPED in combined, combined
