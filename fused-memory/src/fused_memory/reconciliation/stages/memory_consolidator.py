@@ -1032,9 +1032,6 @@ class MemoryConsolidator(BaseStage):
         # 7b. Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
-        # 7c. Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
-        live_workflow_section = self._build_live_workflow_section()
-
         # 8. Format
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
@@ -1057,7 +1054,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1127,9 +1124,6 @@ Review the above data and perform memory consolidation:
         # Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
-        # Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
-        live_workflow_section = self._build_live_workflow_section()
-
         ctx_str, ctx_n = _format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
 
@@ -1147,7 +1141,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{live_workflow_section}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1264,16 +1258,11 @@ Review the above data and perform memory consolidation:
         """Focused payload for remediation runs — findings only, no full data."""
         self._entity_summary_snapshot_lines_stripped = 0
         findings = self.remediation_findings or []
-        # Live-Workflow Signals — parity with assemble_payload / _format_assembled_payload
-        # (task 3839, gate 3833). The harness DOES set filtered_task_tree on remediation
-        # passes (_configure_consolidator, harness.py:3949-3953), so this renders for real;
-        # it is not a no-op. Returns '' when nothing is live, keeping the payload tight.
-        live_workflow_section = self._build_live_workflow_section()
         return f"""## Remediation Run — Stage 1: Targeted Memory Fixes
 ## Project: {self.project_id}
 
 ### Actionable Findings to Remediate ({len(findings)})
-{_format_findings(findings)}{live_workflow_section}
+{_format_findings(findings)}{self._render_required_sections()}
 
 ## Your Task
 This is a focused remediation run. Address ONLY the specific findings listed above:
