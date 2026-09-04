@@ -6474,3 +6474,149 @@ class TestEvidencePaths:
         assert _evidence_paths(junk) == [], (
             f'Expected [] for {junk!r}, which is not a list of evidence dicts'
         )
+
+
+# ── Task 4723 / PRD D7: a contradicted verdict alerts a human ────────────
+#
+# A verdict of "the codebase does NOT support this completion claim" is a
+# finding a human should see.  Before this it lived only in a memory record
+# and an audit row — both pull-only surfaces nobody polls.  The contradicted
+# path now files an L1 escalation, which the escalation watcher triages.
+#
+# These tests read the queue back through the REAL EscalationQueue against a
+# per-test tmp_path, so they exercise the actual on-disk record a triager
+# would open — not a mocked submit call.
+
+
+def _contradicted_result(**overrides) -> VerificationResult:
+    kwargs = {
+        'verdict': VerificationVerdict.contradicted,
+        'confidence': 0.87,
+        'evidence': [
+            {'file_path': 'src/api.py', 'line_range': '10-20',
+             'snippet': 'UNIQUESNIPPETTOKEN', 'relevance': 'names no such handler'},
+            {'file_path': 'src/other.py', 'snippet': 'x'},
+        ],
+        'summary': 'UNIQUESUMMARYTOKEN — no such handler exists',
+        'agent_failed': False,
+        'failure_token': '',
+    }
+    kwargs.update(overrides)
+    return VerificationResult(**kwargs)
+
+
+class TestContradictedEscalation:
+    """A contradicted verdict files an L1 escalation; no other verdict does."""
+
+    @pytest.mark.asyncio
+    async def test_contradicted_files_an_l1_escalation_with_pointers(
+        self, reconciler, journal, mock_memory_service, mock_taskmaster, tmp_path
+    ):
+        """The filed record is a real, triageable L1 pointing at the finding."""
+        from escalation.queue import EscalationQueue
+
+        reconciler.verifier.verify = AsyncMock(return_value=_contradicted_result())
+
+        result = await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        pending = EscalationQueue(tmp_path / 'data' / 'escalations').get_pending()
+        assert len(pending) == 1, (
+            f'Expected exactly one filed escalation, got {[e.id for e in pending]}'
+        )
+        esc = pending[0]
+
+        assert esc.task_id == '1', f'Expected task_id 1, got {esc.task_id!r}'
+        assert esc.agent_role == 'reconciler', f'Got agent_role {esc.agent_role!r}'
+        assert esc.severity == 'info', f'Got severity {esc.severity!r}'
+        assert esc.level == 1, f'Expected an L1, got level {esc.level!r}'
+        assert esc.category == 'risk_identified', (
+            f'risk_identified is EXISTING vocabulary; got {esc.category!r}'
+        )
+        assert esc.suggested_action == 'reopen_task|create_followup_task|dismiss', (
+            f'Got suggested_action {esc.suggested_action!r}'
+        )
+        assert esc.status == 'pending', f'Got status {esc.status!r}'
+        assert esc.id.startswith('esc-1-'), (
+            f'Expected the queue.make_id shape esc-1-N, got {esc.id!r}'
+        )
+
+        assert '\n' not in esc.summary, (
+            f'summary is the one-line field; got {esc.summary!r}'
+        )
+        assert '1' in esc.summary, f'The summary must name the task; got {esc.summary!r}'
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        run_id = runs[0].id
+        for needle in ('1', run_id, 'contradicted', '0.87', 'src/api.py', 'src/other.py'):
+            assert needle in esc.detail, (
+                f'Expected {needle!r} in the escalation detail, got:\n{esc.detail}'
+            )
+
+        # POINTERS, NOT COPIES (INV-9). The finding's homes are the verification
+        # memory and the verify|codebase|contradicted audit row; the escalation
+        # says where to look, so a copy here could drift from the original.
+        assert 'UNIQUESNIPPETTOKEN' not in esc.detail, (
+            f'Evidence snippets must not be copied into the escalation:\n{esc.detail}'
+        )
+        assert 'UNIQUESUMMARYTOKEN' not in esc.detail, (
+            f'The verifier summary must not be copied into the escalation:\n{esc.detail}'
+        )
+
+        escalated = [
+            a for a in result.get('actions', [])
+            if a['type'] == 'verification_contradicted_escalated'
+        ]
+        assert len(escalated) == 1, (
+            f'Expected one verification_contradicted_escalated action, got '
+            f'{result.get("actions")}'
+        )
+        assert escalated[0]['escalation_id'] == esc.id, (
+            f'The action must carry the filed id {esc.id!r}, got {escalated[0]!r}'
+        )
+
+        # INV-3 / esc-3105-3: nothing auto-changes on an LLM verdict. The
+        # escalation is an ALERT for a human, not an action.
+        mock_taskmaster.update_task.assert_not_awaited()
+        assert reconciler.task_interceptor is None, (
+            'No set_task_status path may exist for this test to be meaningful'
+        )
+
+        # The contradiction memory still lands — the two consumers are independent.
+        writes = _verdict_writes(mock_memory_service)
+        assert len(writes) == 1, f'Expected the contradiction memory write, got {writes}'
+        assert writes[0].kwargs['content'].startswith('Codebase evidence CONTRADICTS'), (
+            f'Got {writes[0].kwargs["content"]!r}'
+        )
+
+    @pytest.mark.parametrize('result_kwargs, label', [
+        ({'verdict': VerificationVerdict.confirmed}, 'confirmed'),
+        ({'verdict': VerificationVerdict.inconclusive}, 'inconclusive'),
+        ({'agent_failed': True, 'failure_token': 'cli_output_empty'},
+         'contradicted-but-agent-failed'),
+    ])
+    @pytest.mark.asyncio
+    async def test_non_contradicted_verdicts_file_nothing(
+        self, reconciler, tmp_path, result_kwargs, label
+    ):
+        """Only `contradicted AND not agent_failed` alerts a human.
+
+        Asserted as "the queue directory was never created", not merely "no
+        escalation is pending": `EscalationQueue.__init__` does
+        `mkdir(parents=True, exist_ok=True)`, so an eagerly-constructed queue
+        would leave `data/escalations/` in every target project as a side
+        effect of an unrelated done transition. Lazy construction is the
+        contract, and the directory's absence is what proves it.
+        """
+        reconciler.verifier.verify = AsyncMock(
+            return_value=_contradicted_result(**result_kwargs)
+        )
+
+        result = await _run_done_transition(reconciler, project_root=str(tmp_path))
+
+        assert not (tmp_path / 'data' / 'escalations').exists(), (
+            f'A {label} verdict must not even create the escalation queue dir'
+        )
+        assert not [
+            a for a in result.get('actions', [])
+            if a['type'] == 'verification_contradicted_escalated'
+        ], f'A {label} verdict must not escalate, got {result.get("actions")}'
