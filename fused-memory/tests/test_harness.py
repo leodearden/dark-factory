@@ -17697,6 +17697,63 @@ class TestSnapshotMissStreakBridgesTheRenameBoundary:
         harness._escalate.assert_not_called()
 
 
+class TestPreRenameJournalRowIsNoLongerHonored:
+    """A pre-rename journal row must resolve as UNKNOWN, not as a miss — task 3488.
+
+    This class pins the DELIBERATE post-retirement contract, and it is the
+    only thing in the tree that would catch a silent re-introduction of
+    extract_snapshot_written's legacy-key fallback (or a `.get(...) or ...`
+    chain that recreates it).
+
+    Direction matters, and it is fail-SAFE. A pre-rename blob now reads
+    None, and compute_snapshot_miss_streak STOPS on unknown rather than
+    counting it — so retirement can under-escalate by at most one cycle and
+    can never over-escalate. That is the safe side of a guard whose job is
+    to notice an absence.
+
+    Retirement was gated on a measurement, not an assumption: at the time
+    the alias was deleted, all 24 in-window full+completed pre-rename rows
+    (my_solar_challenge 11, pump_web_ui 13) carried value 1, and a value of
+    1 is indistinguishable from unknown to the streak — both break the loop.
+    Value 0 is the only value where the fallback could change a streak, and
+    no in-window row carried it. See task 3488 / esc-3488-2.
+
+    The fixture uses the RAW LITERAL pre-rename spelling rather than a
+    constant: the constant is gone, and the literal is what real journal
+    blobs actually contain, which makes this a true regression guard rather
+    than a tautology over a symbol.
+    """
+
+    @pytest.mark.asyncio
+    async def test_legacy_keyed_prior_miss_no_longer_tips_the_streak(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """Current run is a CONFIRMED miss under the new key; the single
+        prior full+completed run carries ONLY the pre-rename spelling, also
+        with value 0.
+
+        Before retirement the legacy 0 resolved False, the streak reached
+        1 (prior) + 1 (current) == TASK_COUNT_SNAPSHOT_MISS_THRESHOLD and
+        the escalation FIRED. After retirement the prior row is unknown, the
+        streak stops at 1 < 2, and nothing fires.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        run = _make_current_run('run-current', 0, SNAPSHOT_WRITTEN_STAT_KEY)
+        harness.journal.get_recent_runs = AsyncMock(return_value=[
+            _make_prior_run(
+                'run-prior-pre-rename', 'full', 'completed', 0,
+                offset_seconds=100, key='task_count_snapshot_written',
+            ),
+        ])
+        harness._escalate = MagicMock()
+
+        await harness._maybe_escalate_stale_task_count_snapshot(
+            'test-project', 'run-current', run,
+        )
+
+        harness._escalate.assert_not_called()
+
+
 # ── Tests for Task 2417: reconciliation freshness pre-check wiring ───────
 
 
