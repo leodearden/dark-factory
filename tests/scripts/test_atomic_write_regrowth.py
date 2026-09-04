@@ -51,6 +51,7 @@ cross-tree gates still live there; they are enumerated, with measured counts, in
 import ast
 import functools
 import re
+import warnings
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
@@ -496,42 +497,62 @@ def _find_write_helpers(source: str, tree: ast.AST) -> list[tuple[str, bool]]:
 
 
 @functools.cache
-def _read_tree(tree: str) -> tuple[tuple[str, str], ...]:
+def _read_tree(tree: str, missing_ok: bool) -> tuple[tuple[str, str], ...]:
     """Read every ``*.py`` under ONE tree — once per process, then cached.
 
     Cached PER TREE rather than per tuple-of-trees on purpose: ``_SRC_TREES``
     and the pointer sweep's tree list overlap, and a per-tuple cache would
     re-read the six source trees for the sweep.
+
+    *missing_ok* decides what an absent tree MEANS, and the two answers are
+    genuinely different rather than a strictness knob — see the assert below.
+    Note the warning fires once per process, since a cache hit skips this body.
     """
     root = _REPO_ROOT / tree
-    # HARD assert, kept rather than downgraded to pytest.skip, and that is
-    # only correct BECAUSE this guard is now repo-level (task 3388): at the
-    # repo root every declared tree is guaranteed present, so a missing one
-    # is a real defect rather than a legitimate partial checkout.  The skip
-    # fallback was the price of NOT relocating; having relocated, do not
-    # also pay it.  Paired with
-    # test_every_declared_tree_contributes_scanned_files below, which
-    # catches the case this assert cannot: a tree that IS a directory and
-    # rglobs nothing.
-    assert root.is_dir(), (
-        f'{tree} not found under {_REPO_ROOT} — this guard walks fixed tree '
-        f'names, so a moved/renamed package must update its tree list rather '
-        f'than let the guard silently scan nothing.'
-    )
+    if not root.is_dir():
+        # HARD assert for a tree this guard SCANS, kept rather than downgraded
+        # to pytest.skip, and that is only correct BECAUSE this guard is now
+        # repo-level (task 3388): at the repo root every scanned tree is
+        # guaranteed present, so a missing one means the fence silently covers
+        # less.  The skip fallback was the price of NOT relocating; having
+        # relocated, do not also pay it.  Paired with
+        # test_every_declared_tree_contributes_scanned_files below, which
+        # catches the case this assert cannot: a tree that IS a directory and
+        # rglobs nothing.
+        assert missing_ok, (
+            f'{tree} not found under {_REPO_ROOT} — this guard walks fixed tree '
+            f'names, so a moved/renamed package must update its tree list rather '
+            f'than let the guard silently scan nothing.'
+        )
+        # SOFT for a tree this guard only READS (see _POINTER_OPTIONAL_TREES):
+        # absence costs some documentation coverage, not fence coverage, so it
+        # is reported rather than fatal.  Loud, not silent — and `assert
+        # pointers` still stops the sweep from covering nothing at all.
+        warnings.warn(
+            f'{tree} not found under {_REPO_ROOT}; skipping it. This tree is '
+            f'swept for stale documentation pointers only — it is not fenced '
+            f'by this guard — so its absence narrows a doc check rather than '
+            f'the atomic-write check. Update _POINTER_OPTIONAL_TREES if the '
+            f'package is gone for good.',
+            stacklevel=2,
+        )
+        return ()
     return tuple(
         (py.relative_to(_REPO_ROOT).as_posix(), py.read_text(encoding='utf-8'))
         for py in sorted(root.rglob('*.py'))
     )
 
 
-def _walk_trees(trees: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+def _walk_trees(
+    trees: tuple[str, ...], missing_ok: bool = False
+) -> tuple[tuple[str, str], ...]:
     """``(relpath, source)`` for every ``*.py`` under *trees*, in tree order.
 
     Duplicates are NOT removed here — ``scripts/tests`` sits inside the
     ``scripts`` scan root — because only the pointer sweep spans overlapping
     trees and it dedupes by relpath itself.
     """
-    return tuple(item for tree in trees for item in _read_tree(tree))
+    return tuple(item for tree in trees for item in _read_tree(tree, missing_ok))
 
 
 class _ScannedModule(NamedTuple):
@@ -1020,15 +1041,44 @@ _POINTER_RE = re.compile(r'_ALLOWED_RENAMERS`{0,2}[\s#]+in[\s#]+`{0,2}([\w./\-]+
 #: test files — which _SRC_TREES only reaches for the two flat operator trees.
 #: ``scripts/tests`` is already inside the ``scripts`` scan root and
 #: ``tests/scripts`` inside ``tests``; the walk dedupes by path.
+#:
+#: REQUIRED (hard ``assert root.is_dir()``): the tests dir of every package
+#: whose src tree this guard FENCES, plus the repo-root ``tests`` that hosts
+#: this module.  If one of those is absent, either a fenced package or the
+#: guard's own home is gone, and that is a real defect worth a red.
 _POINTER_EXTRA_TREES = (
     'shared/tests',
     'orchestrator/tests',
     'escalation/tests',
     'fused-memory/tests',
+    'tests',
+)
+
+#: OPTIONAL (warn and skip): sibling packages this guard does NOT fence and
+#: reads only for documentation-pointer hygiene.
+#:
+#: WHY THESE THREE ARE SOFT WHILE _SRC_TREES STAYS HARD — the hard-assert
+#: argument at the top of this module does not transfer, and applying it here
+#: anyway was a real defect rather than a stylistic quibble.  That argument is
+#: "a missing tree means the fence silently scans less".  For a tree the fence
+#: never scans, a missing dir means only that fewer doc comments got checked —
+#: yet it produced the identical red, so deleting or renaming an optional
+#: sibling package turned the ATOMIC-WRITE REGROWTH GUARD red for a reason
+#: with nothing to do with atomic writes.  The repo does not treat every
+#: package as guaranteed either: ``dark-factory-orchestrator.yaml``'s
+#: test_command still wraps cockpit in ``( [ -d cockpit ] || exit 0; ... )``.
+#:
+#: Soft is not silent: ``_read_tree`` emits a ``warnings.warn`` naming the
+#: tree, and ``assert pointers`` in the sweep below still fails if the whole
+#: sweep ends up covering nothing.  MEASURED at this base, which is why the
+#: split falls here: the repo's three real pointers live in
+#: ``orchestrator/src``, ``shared/tests`` and ``orchestrator/tests`` — all in
+#: the required set — and these three trees carry zero.  Promote one to
+#: _POINTER_EXTRA_TREES if it ever starts carrying a pointer worth pinning.
+_POINTER_OPTIONAL_TREES = (
     'cockpit/tests',
     'dashboard/tests',
     'sampler/tests',
-    'tests',
 )
 
 
@@ -1042,7 +1092,10 @@ def _iter_pointer_candidates():
     scans costs nothing beyond the dedupe.
     """
     seen: set[str] = set()
-    for relpath, source in _walk_trees(_SRC_TREES + _POINTER_EXTRA_TREES):
+    for relpath, source in (
+        _walk_trees(_SRC_TREES + _POINTER_EXTRA_TREES)
+        + _walk_trees(_POINTER_OPTIONAL_TREES, missing_ok=True)
+    ):
         if relpath in seen:
             continue
         seen.add(relpath)
