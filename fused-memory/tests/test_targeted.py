@@ -6380,3 +6380,97 @@ class TestVerdictMemoryTemplates:
             'task_id': '1',
             'verification_verdict': VerificationVerdict.contradicted,
         }, f'Metadata must be unchanged, got {writes[0].kwargs["metadata"]!r}'
+
+
+# ── Task 4723 / PRD D7: bounded evidence pointers for the L1 escalation ──
+
+
+class TestEvidencePaths:
+    """`_evidence_paths` extracts bounded, deduped, sanitized file pointers.
+
+    A pure function, so it is tested as one — no reconciler, no event loop.
+    Every read is defensive because `evidence` is agent-supplied: verify.py's
+    `verification_complete` tool schema does not mark `file_path` required, so
+    a malformed entry must cost its own pointer and nothing else.
+    """
+
+    def test_extracts_file_paths_in_input_order(self):
+        from fused_memory.reconciliation.targeted import _evidence_paths
+
+        evidence = [
+            {'file_path': 'src/api.py', 'line_range': '10-20', 'snippet': 'x', 'relevance': 'r'},
+            {'file_path': 'src/other.py', 'snippet': 'y'},
+        ]
+        assert _evidence_paths(evidence) == ['src/api.py', 'src/other.py']
+
+    def test_deduplicates_preserving_first_seen_order(self):
+        from fused_memory.reconciliation.targeted import _evidence_paths
+
+        evidence = [
+            {'file_path': 'src/api.py', 'line_range': '10-20'},
+            {'file_path': 'src/other.py'},
+            {'file_path': 'src/api.py', 'line_range': '90-99'},
+            {'file_path': 'src/api.py', 'line_range': '1-2'},
+        ]
+        assert _evidence_paths(evidence) == ['src/api.py', 'src/other.py'], (
+            'A verdict citing one file three times must yield one pointer'
+        )
+
+    def test_skips_malformed_entries_without_raising(self):
+        from fused_memory.reconciliation.targeted import _evidence_paths
+
+        evidence = [
+            'not-a-dict',
+            None,
+            {'line_range': '1-2'},              # no file_path at all
+            {'file_path': None},                # not a str
+            {'file_path': 123},                 # not a str
+            {'file_path': ''},                  # empty
+            {'file_path': '   '},               # whitespace-only
+            {'file_path': '  src/good.py  '},   # survives, stripped
+        ]
+        assert _evidence_paths(evidence) == ['src/good.py'], (
+            'Malformed agent-supplied evidence must cost its own pointer only'
+        )
+
+    def test_result_is_capped_at_the_module_bound(self):
+        from fused_memory.reconciliation.targeted import (
+            _ESCALATION_EVIDENCE_PATH_LIMIT,
+            _evidence_paths,
+        )
+
+        assert _ESCALATION_EVIDENCE_PATH_LIMIT <= 10, (
+            f'The cap must be a small number for the bound to be real, got '
+            f'{_ESCALATION_EVIDENCE_PATH_LIMIT}'
+        )
+        evidence = [{'file_path': f'src/f{i}.py'} for i in range(12)]
+        paths = _evidence_paths(evidence)
+        assert len(paths) == _ESCALATION_EVIDENCE_PATH_LIMIT, (
+            f'Expected the result capped at {_ESCALATION_EVIDENCE_PATH_LIMIT}, got {paths}'
+        )
+        assert paths == [f'src/f{i}.py' for i in range(_ESCALATION_EVIDENCE_PATH_LIMIT)], (
+            f'The cap must keep the FIRST pointers in input order, got {paths}'
+        )
+
+    def test_over_long_path_is_truncated_to_the_module_bound(self):
+        from fused_memory.reconciliation.targeted import (
+            _ESCALATION_EVIDENCE_PATH_MAXLEN,
+            _evidence_paths,
+        )
+
+        long_path = 'src/' + ('deeply/' * 200) + 'leaf.py'
+        assert len(long_path) > _ESCALATION_EVIDENCE_PATH_MAXLEN
+        paths = _evidence_paths([{'file_path': long_path}])
+        assert len(paths) == 1
+        assert all(len(p) <= _ESCALATION_EVIDENCE_PATH_MAXLEN for p in paths), (
+            f'Expected every pointer <= {_ESCALATION_EVIDENCE_PATH_MAXLEN} chars, '
+            f'got {[len(p) for p in paths]}'
+        )
+
+    @pytest.mark.parametrize('junk', [[], None, 'a string', 42, {'file_path': 'x'}])
+    def test_non_list_or_empty_input_returns_empty_list(self, junk):
+        from fused_memory.reconciliation.targeted import _evidence_paths
+
+        assert _evidence_paths(junk) == [], (
+            f'Expected [] for {junk!r}, which is not a list of evidence dicts'
+        )
