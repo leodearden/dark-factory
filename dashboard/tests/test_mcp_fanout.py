@@ -296,6 +296,92 @@ class TestFirstSuccessWholeOperationDeadline:
         assert attempted == ['http://a', 'http://b']
         assert 'http://a' not in _sessions
 
+# ── (b4) a CALLER-imposed cancellation must still invalidate ─────────
+
+
+class TestFirstSuccessInvalidatesOnCancellation:
+    """A cancellation mid-``call`` must not leave the wedged session cached.
+
+    ``asyncio.CancelledError`` derives from ``BaseException``, so it bypasses
+    first_success's ``except`` tuple entirely: a caller's enclosing
+    ``asyncio.wait_for`` firing mid-attempt used to unwind first_success with
+    the hung url's ``McpSession`` still in ``memory._sessions``, so the next
+    poll cycle reused it and hung identically. That is the incident shape this
+    class pins — for the call-site class that DOES carry its own deadline.
+
+    The cancellation must still PROPAGATE, never be swallowed into a
+    fall-through: shutdown and ``asyncio.gather`` sibling-cancellation depend
+    on it, which is why each test asserts the next url was never attempted.
+    """
+
+    @staticmethod
+    def _hanging_call(attempted: list[str]):
+        never = asyncio.Event()
+
+        async def call(url):
+            attempted.append(url)
+            if url == 'http://a':
+                await never.wait()
+            return 'ok'
+
+        return call
+
+    async def test_caller_wait_for_cancels_and_session_is_invalidated(self):
+        from dashboard.data.memory import _get_session, _sessions
+
+        _get_session('http://a')
+        assert 'http://a' in _sessions
+
+        attempted: list[str] = []
+        # per_url_timeout is deliberately LARGE so the OUTER wait_for is the
+        # one that fires, isolating the cancellation path from the
+        # deadline path exercised by TestFirstSuccessWholeOperationDeadline.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                first_success(
+                    ['http://a', 'http://b'],
+                    self._hanging_call(attempted),
+                    log_label='test',
+                    offline_result=_offline_result,
+                    per_url_timeout=30.0,
+                ),
+                timeout=0.05,
+            )
+
+        assert 'http://a' not in _sessions, (
+            'a cancelled in-flight url must have its wedged session '
+            'invalidated, or every subsequent poll reuses it and hangs'
+        )
+        assert attempted == ['http://a'], (
+            'the cancellation must propagate, not be swallowed into a '
+            f'fall-through to the next url, got {attempted}'
+        )
+
+    async def test_direct_task_cancel_propagates_and_invalidates(self):
+        from dashboard.data.memory import _get_session, _sessions
+
+        _get_session('http://a')
+        attempted: list[str] = []
+
+        task = asyncio.create_task(
+            first_success(
+                ['http://a', 'http://b'],
+                self._hanging_call(attempted),
+                log_label='test',
+                offline_result=_offline_result,
+                per_url_timeout=30.0,
+            ),
+        )
+        # Yield until the hung leg is actually in flight before cancelling.
+        while not attempted:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert 'http://a' not in _sessions
+        assert attempted == ['http://a']
+
 # ── (c) all-fail → offline_result(errors) ────────────────────────────
 
 
