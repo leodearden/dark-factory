@@ -178,7 +178,7 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> 
     """Every startup read binds to the config THIS lifespan built, not a later swap.
 
     ``lifespan`` assigns ``app.state.config`` at the top of startup and then
-    consumes it three more times: ``burndown_path``, ``_burndown_loop``\'s
+    consumes it three more times: ``burndown_path``, ``_burndown_loop``'s
     config argument, and ``metrics_path``.  ``await burndown_store.open()``
     sits between the first and the last two, and that await is a real
     suspension point -- so a concurrently starting lifespan can install its own
@@ -207,7 +207,7 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> 
     merely in object identity -- without that the two store-path assertions
     would hold under a swap and prove nothing.
 
-    Not pinned here: ``_build_http_limits``\'s own argument, because that call
+    Not pinned here: ``_build_http_limits``'s own argument, because that call
     IS the hook (its argument is evaluated before the swap runs).  It derives
     a connection-pool bound and touches no path or handle, so a stale read
     there is inert.
@@ -275,7 +275,7 @@ def test_lifespan_binds_burndown_loop_to_the_config_it_built(tmp_path: Path) -> 
         'task 3771: the simulated interleave must install a DISTINCT config object'
     )
     # Precondition for the two path assertions below: the roots really diverge,
-    # so "came from the lifespan\'s own config" is observable by VALUE.
+    # so "came from the lifespan's own config" is observable by VALUE.
     assert original.burndown_db != swapped.burndown_db, (
         'task 3771: the interleaving config must derive DIFFERENT store paths, '
         'or the store-path assertions below hold under a swap and prove nothing'
