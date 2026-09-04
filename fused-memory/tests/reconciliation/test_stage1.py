@@ -20,6 +20,16 @@ Covers:
 - Step-16: end-to-end fidelity — genuinely-absent task's flag survives run() when
   get_task RAISES the not-found TaskmasterError (real backend behavior)
   (TestMemoryConsolidatorRunWiring.test_genuine_absence_flag_survives_run)
+
+Payload builder/section PARITY is NOT covered here — it lives in
+tests/reconciliation/test_stage1_payload_section_parity.py (task 4708), which
+derives the payload-builder set by AST introspection and checks it against the
+declared ``MemoryConsolidator.REQUIRED_SECTIONS`` registry. The per-builder
+classes below are deliberately KEPT: they pin end-to-end RENDERING through real
+fixtures and the real detector monkeypatch, which a structural guard cannot.
+Parity is structural and belongs in the guard; rendering is behavioural and
+belongs here. A NEW inference-bearing section needs a REQUIRED_SECTIONS edit,
+not another class here — see the pointer comments below.
 """
 
 from __future__ import annotations
@@ -167,6 +177,13 @@ class TestStage1PayloadThreadsProjectRootAssembled:
 # coverage above (TestStage1PayloadThreadsProjectRootLegacy /
 # ...Assembled) — no need to duplicate those here (reviewer finding, amendment
 # pass round 1).
+#
+# POINTER (task 4708): this is a per-builder RENDERING pin, kept on purpose. Do
+# NOT clone it for a new section — add the section to
+# MemoryConsolidator.REQUIRED_SECTIONS, which covers every payload builder at
+# once and is enforced by tests/reconciliation/test_stage1_payload_section_parity.py.
+# (The project_root directive itself is deliberately NOT in that registry: it
+# carries no absence-inference in any prompt, so this class remains its coverage.)
 # ---------------------------------------------------------------------------
 
 
@@ -2591,6 +2608,14 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 # missing-builder-call shape, different section) and of
 # TestStage1PayloadLiveWorkflowSignalsSection above (same section, different
 # builder).
+#
+# POINTER (task 4708): 2552 and 3839 were the second and third hand-fixes of one
+# drift mechanism; the registry now closes it. This class is kept as a RENDERING
+# pin — do NOT clone it for a new section. Add the section to
+# MemoryConsolidator.REQUIRED_SECTIONS instead: all three payload builders render
+# it through one aggregator, and
+# tests/reconciliation/test_stage1_payload_section_parity.py fails loudly if any
+# builder skips it.
 # ---------------------------------------------------------------------------
 
 
@@ -2599,8 +2624,10 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
     section emitted by ``_build_live_workflow_section`` when the harness has
     set a ``filtered_task_tree`` with a live active task.
 
-    RED until step-2 wires ``_build_live_workflow_section()`` into
-    ``_assemble_remediation_payload`` (memory_consolidator.py:971).
+    Landed by task 3839, which wired the section into
+    ``memory_consolidator.py::MemoryConsolidator._assemble_remediation_payload``;
+    since task 4708 that builder reaches the section through
+    ``_render_required_sections`` rather than calling the renderer directly.
     """
 
     def _make_tree(self, tasks: list[dict]) -> FilteredTaskTree:
