@@ -1,15 +1,17 @@
 """Config-integrity drift test for the U2 orchestrator-restart-on-merge flip.
 
-Per plans/orchestrator-fleet-staleness-prd.md task γ: orchestrator/config.yaml
-enables orchestrator_restart_on_merge_enabled for dark-factory's own daemon,
-pointing at scripts/restart-all-orchestrators.sh with a set of watch prefixes.
+Per plans/orchestrator-fleet-staleness-prd.md task γ: dark-factory-orchestrator.yaml
+(the canonical top-level config filename — see the module docstring convention
+recorded in tests/scripts/conftest.py) declares orchestrator_restart_on_merge_enabled
+for dark-factory's own daemon, pointing at scripts/restart-all-orchestrators.sh
+with a set of watch prefixes.
 
 The dormant U2 coordinator (Harness._build_orchestrator_restart_coordinator)
 fails OPEN at fire time: a missing/non-executable script path raises
 FileNotFoundError which the coordinator swallows down to a WARNING log and
 clears the pending restart — so a typo'd path would silently no-op the whole
 fleet restart with no hard failure anywhere in the running system. Most of
-these tests assert directly on the *committed* orchestrator/config.yaml,
+these tests assert directly on the *committed* dark-factory-orchestrator.yaml,
 independent of the runtime config-loading / hot-reload path. One additional
 test loads the file through the real OrchestratorConfig pydantic model to
 guard the YAML-key-to-field binding itself: OrchestratorConfig uses
@@ -17,6 +19,20 @@ guard the YAML-key-to-field binding itself: OrchestratorConfig uses
 would otherwise silently revert to the field's (disabled-by-default) default
 with no error anywhere — passing the raw-YAML assertions below while the
 runtime coordinator stays dark.
+
+This file tracks the operator's COMMITTED value rather than pinning one fixed
+policy the operator may deliberately change. It was amended by task 5088 to
+survive the 2026-09-03 fleet deploy pause (orchestrator_restart_on_merge_enabled
+flipped ``true`` -> ``false``, see the ``DEPLOY PAUSE`` comment block above the
+key in dark-factory-orchestrator.yaml; task 5020 is the gate that restores it)
+without silently gutting coverage: the round-trip guard
+(``tests/scripts/test_orchestrator_restart_config_drift.py::_assert_key_binds``)
+and the policy pin
+(``tests/scripts/test_orchestrator_restart_config_drift.py::_assert_restart_enabled_or_pause_documented``)
+were both relaxed to tolerate a documented pause, and each is paired with a
+meta-test — ``test_binding_guard_bites_on_a_typod_key_and_on_a_renamed_field``
+and ``test_policy_pin_bites_on_an_undocumented_disable`` — proving the
+relaxation did not also let the failure mode it guards against through.
 """
 
 import pathlib
@@ -28,6 +44,14 @@ from orchestrator.config import OrchestratorConfig
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
+
+# Matches the "DEPLOY PAUSE — TEMPORARY" comment task 5020 step 1 deletes when
+# it restores orchestrator_restart_on_merge_enabled to `true` (verbatim wording,
+# including the U+2014 EM DASH — not a hyphen or en dash). Deleting that block
+# in the same edit that flips the value is what silently re-arms
+# _assert_restart_enabled_or_pause_documented's strict "must be true" behavior
+# with no test edit required.
+_PAUSE_MARKER = "DEPLOY PAUSE — TEMPORARY"
 
 
 def _load_df_config() -> dict:
@@ -69,12 +93,71 @@ def _assert_key_binds(cfg: dict, config: object, key: str) -> None:
     )
 
 
-def test_orchestrator_restart_on_merge_enabled_is_true() -> None:
-    """The U2 coordinator must be flipped on for the dark-factory daemon."""
-    cfg = _load_df_config()
-    assert cfg.get("orchestrator_restart_on_merge_enabled") is True, (
-        "orchestrator/config.yaml must set orchestrator_restart_on_merge_enabled: "
-        "true (PRD task γ) — the U2 coordinator is otherwise dormant"
+def _assert_restart_enabled_or_pause_documented(yaml_text: str) -> None:
+    """Assert the U2 coordinator is enabled, or disabled with a declared pause.
+
+    ``orchestrator_restart_on_merge_enabled`` is an OPERATOR LEVER, not a fixed
+    policy: it was flipped ``true`` -> ``false`` on 2026-09-03 to pause the
+    merge-landed fleet-restart coordinator tier while tasks 3730/3733/4755
+    stabilize (task 5020 is the deterministic gate that restores it). A bare,
+    UNDOCUMENTED ``false`` is exactly the accidental-silent-disable failure
+    mode this pin exists to catch — so a disable is only accepted when it is
+    self-documenting: the contiguous comment block immediately above the key
+    must carry the ``_PAUSE_MARKER`` text.
+
+    Only the comment block directly adjacent to the key is consulted (the
+    upward walk stops at the first non-comment line). A stale pause note
+    anywhere else in a 1000+ line YAML must not be able to license a new,
+    unrelated disable of this key.
+    """
+    cfg = yaml.safe_load(yaml_text)
+    key = "orchestrator_restart_on_merge_enabled"
+    assert key in cfg, (
+        f"{key!r} is missing entirely — this silently reverts to the field's "
+        "disabled-by-default default with no error anywhere"
+    )
+    value = cfg[key]
+    assert isinstance(value, bool), (
+        f"{key!r} must be a YAML boolean, got {value!r} ({type(value).__name__}) "
+        "— a quoted 'false'/'true' string is truthy in Python and would sail "
+        "past a bare `if value` check while the daemon parses it as a string"
+    )
+    if value:
+        return
+
+    lines = yaml_text.splitlines()
+    key_idx = next(
+        (i for i, line in enumerate(lines) if line.startswith(key + ":")),
+        None,
+    )
+    assert key_idx is not None, (
+        f"could not locate a top-level {key!r}: line to walk upward from"
+    )
+
+    start = key_idx
+    while start > 0 and lines[start - 1].lstrip().startswith("#"):
+        start -= 1
+
+    assert _PAUSE_MARKER in "\n".join(lines[start:key_idx]), (
+        f"{key!r} is disabled but the contiguous comment block immediately "
+        f"above it does not contain the {_PAUSE_MARKER!r} marker — a disable "
+        "must be a DECLARED, self-documenting pause (task 5020 is the gate "
+        "that restores it), not an undocumented accidental flip"
+    )
+
+
+def test_orchestrator_restart_on_merge_enabled_or_pause_is_documented() -> None:
+    """The U2 coordinator must be enabled, or disabled with the pause declared.
+
+    Renamed from ``test_orchestrator_restart_on_merge_enabled_is_true``: that
+    name asserted a conclusion (must be ``true``) the operator deliberately
+    stopped being true on 2026-09-03, and a test whose name contradicts its
+    body is how a future reader "restores" it and re-reds main. The pin is
+    now: enabled, OR disabled with the pause declared in the YAML comment
+    block directly above the key (task 5088; task 5020 restores the value).
+    """
+    _assert_restart_enabled_or_pause_documented(
+        DF_CONFIG_PATH.read_text(encoding="utf-8")
     )
 
 
