@@ -1162,6 +1162,17 @@ def _tmp_literal(value: ast.expr) -> str | None:
     return None
 
 
+def _names_project_root(name: str) -> bool:
+    """True if the bare identifier *name* denotes a ``project_root``.
+
+    Split out from ``_is_project_root_target`` because the detector must apply
+    the SAME rule to an ``ast.arg``, whose ``.arg`` is a plain ``str`` and not an
+    expression node.  Two callers, one rule — a second spelling here is how the
+    parameter-default shape would drift out from under the assignment shape.
+    """
+    return name.lower().strip('_').endswith('project_root')
+
+
 def _is_project_root_target(target: ast.expr) -> bool:
     """True if *target* names a ``project_root``, in either shape that occurs.
 
@@ -1181,8 +1192,45 @@ def _is_project_root_target(target: ast.expr) -> bool:
     if isinstance(target, ast.Attribute):
         return target.attr == 'project_root'
     if isinstance(target, ast.Name):
-        return target.id.lower().strip('_').endswith('project_root')
+        return _names_project_root(target.id)
     return False
+
+
+def _parameter_defaults(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[tuple[ast.arg, ast.expr]]:
+    """Every ``(parameter, default expression)`` pair on *func*.
+
+    ``ast`` stores defaults in two places with two different conventions, and
+    both are needed: ``args.defaults`` covers ``posonlyargs + args`` but is
+    RIGHT-ALIGNED — only the trailing parameters have defaults, so it is zipped
+    against the tail — while ``args.kw_defaults`` is index-aligned with
+    ``kwonlyargs`` and holds ``None`` for keyword-only parameters that have no
+    default.  Getting either convention wrong misattributes a default to the
+    wrong parameter, which for this detector means matching on the wrong NAME.
+
+    Keyword-only is the shape that actually matters here — the in-tree
+    sandboxed factory this guard's failure message points at,
+    ``test_workflow_already_done.py::_make``, is ``def _make(*, project_root:
+    Path, ...)`` — but both are walked so the rule does not depend on a caller's
+    choice of calling convention.
+    """
+    args = func.args
+    positional = [*args.posonlyargs, *args.args]
+    # strict=True on both: the right-aligned slice is exactly as long as
+    # `defaults` by construction, and `kw_defaults` is index-aligned with
+    # `kwonlyargs` by the ast contract. A length mismatch would mean one of those
+    # two conventions had changed under us, and silently truncating would
+    # misattribute a default to the wrong parameter name.
+    pairs = list(zip(
+        positional[len(positional) - len(args.defaults):], args.defaults, strict=True,
+    ))
+    pairs += [
+        (arg, default)
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+        if default is not None
+    ]
+    return pairs
 
 
 def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
@@ -1191,14 +1239,33 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
     Shape matches ``_steward_construction_sites``'s return so both censuses read
     the same way in a failure message.
 
-    WHAT IT MATCHES — an ``ast.Assign`` or ``ast.AnnAssign`` whose target names a
-    ``project_root`` (see ``_is_project_root_target``) and whose value is a
-    ``/tmp`` string literal, bare or wrapped in ``Path(...)`` (see
-    ``_tmp_literal``).  ``Assign.targets`` is a list, so a chained or tuple
-    assignment is covered by construction rather than by a special case.
+    WHAT IT MATCHES — two BINDING shapes, both of which put the literal in the
+    defining module rather than at a call site, and whose value is a ``/tmp``
+    string literal, bare or wrapped in ``Path(...)`` (see ``_tmp_literal``):
+
+    * an ``ast.Assign`` or ``ast.AnnAssign`` whose target names a
+      ``project_root`` (see ``_is_project_root_target``).  ``Assign.targets`` is
+      a list, so a chained or tuple assignment is covered by construction rather
+      than by a special case.
+    * a FUNCTION-PARAMETER DEFAULT — ``defaults`` and ``kw_defaults`` on any
+      ``def``/``async def``, for a parameter whose name passes
+      ``_names_project_root``.  This shape matches NOTHING in the tree today
+      (measured, task 4389 amendment pass: 0 hits across 559 modules), and it is
+      covered anyway because it is the shape THIS GUARD'S OWN FAILURE MESSAGE
+      steers authors into.  Fix (b) there says "give it a ``project_root: Path``
+      keyword"; an author who does that and writes
+      ``def _make(*, project_root: Path = Path('/tmp/x'))`` has moved the literal
+      from a line the census reads to one it would not — silently escaping the
+      very census the advice was meant to satisfy.  A remedy that opens a hole
+      in its own detector is worse than no remedy, so the hole is closed rather
+      than documented.
 
     WHAT IT DELIBERATELY DOES NOT MATCH, and this is a DECISION rather than a
-    limitation — ``ast.keyword``.  The tree holds ~16 call-keyword sites
+    limitation — ``ast.keyword``.  The line is drawn at DEFINITION versus CALL,
+    which is why a parameter default is in scope and a call keyword is not: a
+    default is one literal living in the module that owns the factory, exactly
+    like an assignment, whereas a keyword is one of N literals at N call sites
+    binding someone else's parameter.  The tree holds ~16 call-keyword sites
     (``LandedReconciler(project_root='/tmp/proj')`` and friends:
     test_merge_queue_landed_reconciler.py x13,
     test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
@@ -1221,6 +1288,14 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
     """
     sites: list[str] = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            for arg, default in _parameter_defaults(node):
+                if not _names_project_root(arg.arg):
+                    continue
+                literal = _tmp_literal(default)
+                if literal is not None:
+                    sites.append(f'{default.lineno} ({literal})')
+            continue
         if isinstance(node, ast.Assign):
             targets: list[ast.expr] = list(node.targets)
         elif isinstance(node, ast.AnnAssign):
@@ -1232,7 +1307,10 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
         literal = _tmp_literal(node.value)
         if literal is not None:
             sites.append(f'{node.lineno} ({literal})')
-    return sites
+    # Sorted because the walk is BFS over two different node kinds now, so source
+    # order is not the visit order; a census failure message is read by a human
+    # looking for a line number.
+    return sorted(sites, key=lambda site: int(site.split(' ', 1)[0]))
 
 
 @functools.cache
@@ -1258,7 +1336,7 @@ def _tmp_literal_census_by_module() -> Mapping[str, tuple[str, ...]]:
 
 
 class TestAbsoluteTmpProjectRootLiteralsAreCensused:
-    """Every absolute-``/tmp`` ``project_root`` literal is adjudicated, with a reason.
+    """Every absolute-``/tmp`` ``project_root`` BINDING is adjudicated, with a reason.
 
     This is the ENFORCEMENT of DECISION 2 — the ruling that the literals task
     3551's sweep found are deliberate-but-inert placeholders, NAMED rather than
@@ -1266,8 +1344,19 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
     ``_orch_helpers.MOCK_WORKFLOW_PROJECT_ROOT.__doc__``; the allowlist below
     records only the per-module reason, as a POINTER.
 
+    THE POPULATION, named precisely rather than as "every literal", because a
+    census that overstates its own reach is the failure it exists to prevent:
+    assignments and parameter DEFAULTS — the shapes that bind a ``/tmp`` literal
+    in the module that owns it.  Three shapes are outside it, each by a recorded
+    decision rather than by omission: ~16 call-KEYWORD sites
+    (``_absolute_tmp_project_root_literals.__doc__``, pinned by
+    ``test_the_detector_ignores_the_call_keyword_shape``), the COMPOUND
+    ``tmp_path or Path('/tmp/proj')`` form (``_tmp_literal.__doc__``), and
+    non-``/tmp`` absolute roots (pinned by
+    ``test_the_detector_ignores_an_absolute_literal_outside_tmp``).
+
     Same teeth as the steward census above, in both directions: a new
-    un-adjudicated literal cannot appear silently, and its author must either
+    un-adjudicated binding cannot appear silently, and its author must either
     use the shared constant or write down why they cannot.
     """
 
@@ -1417,6 +1506,59 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
         assert len(sites) == 1, sites
         assert '/tmp/dark-factory-review' in sites[0], sites
+
+    def test_the_detector_matches_a_parameter_default(self) -> None:
+        """The shape THIS GUARD'S OWN FAILURE MESSAGE steers authors into.
+
+        Fix (b) in the un-adjudicated message says "give it a ``project_root:
+        Path`` keyword and pass ``tmp_path / 'proj'`` from each call site".  An
+        author who takes the first half and gives the keyword a ``/tmp`` default
+        has moved the literal off an assignment line and onto a ``def`` line —
+        and before this was covered, that silently escaped the census the advice
+        exists to satisfy.  A remedy that opens a hole in its own detector is
+        worse than no remedy.
+
+        Nothing in the tree is spelled this way today (0 hits across 559
+        modules, measured), so this self-test is the ONLY thing keeping the
+        shape covered: without it a refactor could drop the branch and no census
+        result would change.
+        """
+        tree = ast.parse(
+            "def _make(*, project_root: Path = Path('/tmp/sneaky')):\n"
+            "    return project_root\n"
+        )
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert '/tmp/sneaky' in sites[0], sites
+
+    def test_the_detector_matches_a_positional_parameter_default(self) -> None:
+        """``args.defaults`` is RIGHT-ALIGNED against ``posonlyargs + args``, so
+        a detector that zipped it from the left would attribute this default to
+        ``label`` and miss it.  Pinned separately from the keyword-only case
+        because the two conventions are independent and only one is exercised by
+        the in-tree factory shape.
+        """
+        tree = ast.parse(
+            "def _make(label, project_root=Path('/tmp/positional')):\n"
+            "    return label, project_root\n"
+        )
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert '/tmp/positional' in sites[0], sites
+
+    def test_the_detector_ignores_a_sandboxed_parameter_with_no_default(self) -> None:
+        """Negative, and the reason the parameter shape is safe to cover: the
+        recommended fix itself — a ``project_root`` keyword with NO default,
+        every call site passing ``tmp_path / 'proj'`` — has no literal to match,
+        so following the advice cannot trip the guard that gave it.
+        """
+        tree = ast.parse('def _make(*, project_root: Path):\n    return project_root\n')
+
+        assert _absolute_tmp_project_root_literals(tree) == []
 
     def test_the_detector_counts_every_site_not_just_the_first(self) -> None:
         """The allowlist pins a COUNT per module, so the detector must return a
