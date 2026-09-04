@@ -306,12 +306,18 @@ _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
 #: That check is SOUNDNESS only — it cannot catch a writer left OUT of this
 #: mapping. COMPLETENESS is the converse check,
 #: ``TestRepairableFieldTable::test_no_plan_writing_tool_is_an_undeclared_alternate``:
-#: it sweeps every row here against a candidate set DERIVED from this
-#: module's own plan-mutating surface (``_plan_writing_tool_names()`` in the
-#: test file, not a hand-maintained list), so a new entry point that writes
-#: plan.json is swept automatically and that test fails until its impact on
-#: ``also_written_by`` is audited. Hand-adding a name here is therefore never
-#: required to be *seen* by the sweep — only to make it pass once seen.
+#: it sweeps every row here against a candidate set DERIVED from this module's
+#: own plan-mutating surface INTERSECTED WITH the tool surface
+#: ``create_server`` actually registers (``_plan_writing_tool_names()`` in the
+#: test file, not a hand-maintained list). The intersection is load-bearing:
+#: an INTERNAL helper may legitimately rewrite plan.json without being a
+#: probeable MCP tool — ``_read_plan_repaired`` does, on its read-repair
+#: write-back path — so "writes plan.json" alone was never sufficient to make
+#: something a sweep candidate, and adding such a helper does NOT drag it into
+#: the behavioural probe. A new plan-writing TOOL, by contrast, is swept
+#: automatically and that test fails until its impact on ``also_written_by``
+#: is audited. Hand-adding a name here is therefore never required to be
+#: *seen* by the sweep — only to make it pass once seen.
 _DESCRIPTION_ALSO: tuple[str, ...] = ('replace_plan_step', 'mark_step_committed')
 _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 
