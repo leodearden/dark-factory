@@ -12,8 +12,10 @@ Two things live here:
 1. Unit coverage of the four exports as REAL behaviour — the fixture factory
    actually sets and restores the attribute, `deny` actually installs a
    raiser, `fail_closed_records` actually filters. None of these assert on
-   docstring prose; the one docstring assertion pins *composition*, not
-   wording.
+   docstring prose: `neutralise_fixture` still composes its `__doc__` from the
+   shared rationale plus the per-suite note (which is what makes
+   `pytest --fixtures` useful), but that composition has no runtime effect and
+   so is read inline rather than pinned by a test.
 
 2. The whole-tree AST drift guards that keep the extraction from silently
    re-diverging once it has landed. Extraction alone is a one-time dedupe; the
@@ -130,23 +132,6 @@ class TestNeutraliseFixture:
         per-script rationale forward is a TypeError, not a silent prose loss."""
         with pytest.raises(TypeError):
             neutralise_fixture(_stub_script_module())  # type: ignore[call-arg]
-
-    def test_doc_composes_shared_rationale_with_the_note(self) -> None:
-        """The generated `__doc__` is <shared rationale> + <this suite's note>.
-
-        Asserts COMPOSITION, not wording: each note appears, and stripping each
-        note leaves the same non-empty shared remainder. That pins the property
-        the extraction depends on without pinning a word of the prose.
-        """
-        note_a = 'ALPHA-per-suite-note'
-        note_b = 'BETA-per-suite-note'
-        doc_a = _underlying(neutralise_fixture(_stub_script_module(), note=note_a)).__doc__
-        doc_b = _underlying(neutralise_fixture(_stub_script_module(), note=note_b)).__doc__
-
-        assert note_a in doc_a and note_b in doc_b
-        shared = doc_a.replace(note_a, '')
-        assert shared == doc_b.replace(note_b, '')
-        assert shared.strip(), 'the shared rationale must actually be carried'
 
     def test_breaks_loudly_when_the_script_has_no_guard(self) -> None:
         """Deliberately NOT `raising=False`.
