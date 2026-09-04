@@ -425,6 +425,23 @@ def harvest(
     con = _connect_readonly(db_path)
     try:
         try:
+            # PROBE for the table before scanning, so a genuine schema fault
+            # is DISTINGUISHED from every other sqlite failure rather than
+            # inferred from one.  Previously any `sqlite3.Error` here was
+            # relabelled `has no readable write_ops table`, so `database is
+            # locked` -- the likeliest failure against a journal a running
+            # server is writing to -- sent an operator to diagnose a missing
+            # table that was right there.
+            present = con.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='write_ops'"
+            ).fetchone()
+            if present is None:
+                # No `: {exc}` tail -- nothing raised.  An empty probe is a
+                # READING, not a failure, and `JournalUnavailableError` is
+                # not a `sqlite3.Error`, so this passes through the handler
+                # below untouched.
+                raise JournalUnavailableError(f'{db_path} has no write_ops table')
             # STREAMED, not `.fetchall()`ed: the live journal is
             # multi-gigabyte and the committed sidecar records 431,621 search
             # ops, so materializing the `params` blobs is a multi-hundred-MB
@@ -444,8 +461,13 @@ def harvest(
         # error` can now surface on any `next()` mid-scan.  Narrowing this
         # guard would let a mid-scan sqlite failure escape unnamed.
         except sqlite3.Error as exc:
+            # Names the REAL failure and the path, with `from exc` keeping
+            # the original message and traceback.  The named type is kept
+            # deliberately: `JournalUnavailableError` already covers
+            # "absent, unreadable, or is not a write journal", and a locked
+            # or I/O-failing journal IS unreadable.  Only the wording lied.
             raise JournalUnavailableError(
-                f'{db_path} has no readable write_ops table: {exc}'
+                f'cannot read write_ops from {db_path}: {exc}'
             ) from exc
     finally:
         con.close()
