@@ -5743,6 +5743,187 @@ class TestDedupFlagsCrossProjectDiscovery:
             f'not once per qualifying flag; got {self._roots(taskmaster)!r}'
         )
 
+    # ---- task 4381's bounds apply to the DISCOVERED path too (step-13) -----
+    #
+    # The failure mode this guards is the one the task names: a bound that
+    # exists on the citation path and silently does not apply to the new
+    # producer.  Discovery must feed the SAME policy branch, not a second one.
+
+    @classmethod
+    def _discovering_taskmaster(cls, status: str):
+        """Backlog and live record agreeing on *status*.
+
+        The gate reads status off the per-id ``get_task``, the matcher off the
+        bulk listing, so both must carry it or the test would prove nothing
+        about the policy actually applied.
+        """
+        return cls._taskmaster(
+            {'/df': [cls._covering(status=status)]},
+            get_task_result={
+                'id': '3839',
+                'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
+                'status': status,
+            },
+        )
+
+    async def _cycle(self, ledger_memory_service, taskmaster, run_id, stats=None):
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        return await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id=run_id,
+            flags=[self._flag()],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats if stats is not None else {},
+        )
+
+    async def _done_suppressions(self, ledger_memory_service):
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE,
+        )
+        assert row is not None, 'the marker must survive every cycle'
+        return json.loads(row.payload_json).get('cross_project_done_suppressions')
+
+    @pytest.mark.asyncio
+    async def test_done_discovered_fix_task_burns_the_bounded_counter(
+        self, ledger_memory_service
+    ):
+        """(i) A DONE discovered fix task suppresses — but each consecutive
+        cycle burns one of its bounded grace cycles, exactly as a DONE cited
+        one does."""
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        taskmaster = self._discovering_taskmaster('done')
+
+        for cycle, run_id in enumerate(('r2', 'r3'), start=1):
+            stats: dict[str, Any] = {}
+            result = await self._cycle(
+                ledger_memory_service, taskmaster, run_id, stats,
+            )
+            assert result == [], (
+                f'a done discovered fix task must still suppress within its '
+                f'grace window; got {result!r} on cycle {cycle}'
+            )
+            assert stats.get('cross_project_fix_task_suppressed') == 1
+            assert await self._done_suppressions(ledger_memory_service) == cycle, (
+                'each consecutive done-suppressed cycle must burn one grace '
+                'cycle on the marker, or the ceiling can never be reached'
+            )
+
+    @pytest.mark.asyncio
+    async def test_done_discovered_fix_task_stops_suppressing_at_the_ceiling(
+        self, ledger_memory_service, caplog
+    ):
+        """(ii) THE BOUND: at the ceiling the discovered path stops silencing
+        the finding and says so loudly — a fix that landed while the finding
+        keeps recurring is a fix that demonstrably did not work."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+        )
+
+        assert _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES == 8, (
+            'the ruled ceiling is 8 cycles; a change here is a policy change'
+        )
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+            extra_payload={
+                'cross_project_done_suppressions':
+                    _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+            },
+        )
+        stats: dict[str, Any] = {}
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.flag_dedup',
+        ):
+            result = await self._cycle(
+                ledger_memory_service, self._discovering_taskmaster('done'),
+                'r2', stats,
+            )
+
+        assert len(result) == 1, (
+            'past the ceiling the finding must be surfaced again, not silenced '
+            f'forever by a done fix task; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppression_exhausted') == 1
+        assert 'cross_project_fix_task_suppressed' not in stats
+        exhausted = [
+            rec.getMessage() for rec in caplog.records
+            if 'stage1_flag_cross_project_fix_task_suppression_exhausted'
+            in rec.getMessage() and rec.levelno == logging.WARNING
+        ]
+        assert len(exhausted) == 1, (
+            f'exhaustion must be audible at WARNING; got {caplog.records!r}'
+        )
+        assert 'fix_project_id=dark_factory' in exhausted[0]
+        assert await self._done_suppressions(ledger_memory_service) == (
+            _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES
+        ), (
+            'the count must FREEZE at the ceiling rather than keep climbing, '
+            'so the finding stays surfaced instead of oscillating'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('status', ['pending', 'blocked'])
+    async def test_filed_but_unfinished_discovered_task_resets_the_counter(
+        self, ledger_memory_service, status
+    ):
+        """(iii) A discovered fix task that is filed but NOT done suppresses
+        indefinitely and RESETS a partially-burned done counter — a reopened
+        fix task earns a fresh window."""
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+            extra_payload={'cross_project_done_suppressions': 3},
+        )
+        stats: dict[str, Any] = {}
+
+        result = await self._cycle(
+            ledger_memory_service, self._discovering_taskmaster(status),
+            'r2', stats,
+        )
+
+        assert result == [], (
+            f'a {status} discovered fix task must suppress; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1
+        assert await self._done_suppressions(ledger_memory_service) is None, (
+            'a non-done fix task must clear the burned done-grace, not carry '
+            'it forward'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_discovered_task_never_suppresses(
+        self, ledger_memory_service
+    ):
+        """(iv) A CANCELLED task means the work was abandoned; discovering it
+        would silence the complaint forever.  Guarded twice over — the matcher
+        skips it client-side, so the gate is never even consulted."""
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        taskmaster = self._discovering_taskmaster('cancelled')
+        stats: dict[str, Any] = {}
+
+        result = await self._cycle(ledger_memory_service, taskmaster, 'r2', stats)
+
+        assert len(result) == 1, (
+            f'a cancelled task must never suppress; got {result!r}'
+        )
+        assert stats == {}, f'nothing may be counted; got {stats!r}'
+        assert taskmaster.get_task.call_count == 0, (
+            'the cancelled task must be dropped before any live read — the '
+            'client-side skip is the belt to the query kwarg braces'
+        )
+
+
 
 # ---------------------------------------------------------------------------
 # task 4864 step-11 — THE ACCEPTANCE TEST: the real producer -> gate seam
