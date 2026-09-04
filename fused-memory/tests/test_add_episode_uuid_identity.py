@@ -433,3 +433,108 @@ class TestLegacyPayloadDrainedAfterTheFix:
             f'got {offenders}'
         )
         assert len(fake.episodes) == 1
+
+
+# ---------------------------------------------------------------------------
+# step-05: no silent fallthrough when the real uuid is unavailable
+# ---------------------------------------------------------------------------
+
+#: Results that carry no usable episode uuid. Step-02 moved registration onto
+#: ``result.episode.uuid``, which reintroduces TRAP 2's exact failure shape one
+#: layer up: each of these leaves ``episode_uuid`` falsy, and the guard block is
+#: an ``if/elif`` with no ``else``.
+DEGENERATE_RESULTS = [
+    pytest.param(None, id='result-is-None'),
+    pytest.param(SimpleNamespace(edges=[], nodes=[]), id='result-has-no-episode'),
+    pytest.param(
+        SimpleNamespace(episode=SimpleNamespace(uuid=None), edges=[], nodes=[]),
+        id='episode-uuid-is-None',
+    ),
+]
+
+CORRELATION_ID = 'corr_degenerate-write-1'
+
+
+def _planning_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        'name': 'episode_degen01',
+        'content': 'We plan to split the merge queue',
+        'source': 'text',
+        'group_id': 'degenerate-group',
+        'source_description': '[temporal:planning] PRD',
+        'correlation_id': CORRELATION_ID,
+        'temporal_context': 'planning',
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestDegenerateResultNeverRegistersSilently:
+    """A missed planning registration must be diagnosable from logs alone.
+
+    Planning registration is only ever OBSERVABLE via search results, so a miss
+    does not surface as an error — it surfaces, much later, as aspirational PRD
+    content leaking into default factual search.  That is why this path must
+    never fall through quietly.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('degenerate_result', DEGENERATE_RESULTS)
+    async def test_degenerate_result_warns_instead_of_registering(
+        self, svc_fake_registry, caplog, degenerate_result
+    ):
+        svc, _fake, reg = svc_fake_registry
+        svc.graphiti.add_episode = AsyncMock(return_value=degenerate_result)
+        register_spy = AsyncMock(wraps=reg.register)
+        reg.register = register_spy  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.WARNING):
+            # Must not raise — preserves the existing no-crash contract
+            # (test_execute_graphiti_write_none_result_no_crash).
+            await svc._execute_graphiti_write('add_episode', _planning_payload())
+
+        register_spy.assert_not_called()
+
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'degenerate-group' in r.getMessage()
+        ]
+        assert warnings, (
+            'A planning episode that could not be registered must WARN — the '
+            'miss is otherwise invisible until aspirational content shows up in '
+            'factual search. '
+            f'Records seen: {[r.getMessage() for r in caplog.records]}'
+        )
+        message = warnings[0]
+        assert CORRELATION_ID in message, (
+            'The warning must name the correlation id so the miss can be tied '
+            f'back to the originating write; got {message!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('degenerate_result', DEGENERATE_RESULTS)
+    async def test_degenerate_result_is_silent_when_not_planning(
+        self, svc_fake_registry, caplog, degenerate_result
+    ):
+        """Registration is genuinely not wanted here, so warning would be noise."""
+        svc, _fake, reg = svc_fake_registry
+        svc.graphiti.add_episode = AsyncMock(return_value=degenerate_result)
+        register_spy = AsyncMock(wraps=reg.register)
+        reg.register = register_spy  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.WARNING):
+            await svc._execute_graphiti_write(
+                'add_episode', _planning_payload(temporal_context=None)
+            )
+
+        register_spy.assert_not_called()
+        offenders = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'degenerate-group' in r.getMessage()
+        ]
+        assert not offenders, (
+            'A non-planning write is not meant to register, so the registration '
+            f'path must stay silent; got {offenders}'
+        )
