@@ -45,6 +45,7 @@ import json
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 from _dashboard_helpers import extract_function_body
 
@@ -163,6 +164,82 @@ def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
         'changed shape.'
     )
     return m.group(1).strip()
+
+
+# ---------------------------------------------------------------------------
+# API-surface extractors (task 4232) — the DF_SPARK_PATH -> DF_CHARTS route.
+#
+# `formatCountTick` is defined in spark_path.js and CONSUMED in tabs.jsx and
+# tab_escalation_analytics.jsx, which reach it only through `window.DF_CHARTS`.
+# charts.jsx is the one hop in between, and that hop is pure wiring — exactly
+# the kind of two-token join that goes silently missing in a rename.
+# ---------------------------------------------------------------------------
+
+_SPARK_PATH_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_SPARK_PATH')
+# Deliberately the SAME brace-hostile pattern as test_tab_burndown.py:53's
+# `_DF_CHARTS_EXPORT_RE`, copied verbatim rather than imported (this repo's test
+# modules do not import each other).  Asserted on explicitly below so that a
+# nested `{}` in the export literal fails HERE, naming the coupling, instead of
+# there as an opaque "could not parse the DF_CHARTS exports".
+_DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
+
+_SPARK_PATH_JS = (
+    Path(__file__).resolve().parent.parent
+    / 'src' / 'dashboard' / 'static' / 'redux' / 'spark_path.js'
+)
+
+
+def _binding_names(brace_body: str) -> set:
+    """The SOURCE property names in a destructure or object-literal brace body.
+
+    `sparkPaths: sparkSmoothPaths` -> `sparkPaths` — the name read OFF the
+    namespace, which is the one that has to actually exist on it. A bare
+    `axisY` is both source and local.
+    """
+    return {part.split(':', 1)[0].strip() for part in brace_body.split(',') if part.strip()}
+
+
+def _spark_path_destructure(charts_jsx_body: str) -> set:
+    """Names charts.jsx destructures off ``window.DF_SPARK_PATH`` at module top level."""
+    m = _SPARK_PATH_DESTRUCTURE_RE.search(charts_jsx_body)
+    assert m is not None, (
+        'charts.jsx no longer opens with a `const { ... } = window.DF_SPARK_PATH;` '
+        'destructure — either the spark_path.js dependency was rewired (in which '
+        'case the load-order and cache-buster reasoning in this file and in '
+        'charts.jsx:13-20 no longer applies) or the binding list grew a nested '
+        'brace this extractor cannot read. Not returning an empty set, because '
+        'that would make every routing assertion below vacuously GREEN.'
+    )
+    return _binding_names(m.group(1))
+
+
+def _df_charts_export_names(charts_jsx_body: str) -> set:
+    """Key names in the ``window.DF_CHARTS = { ... }`` export literal."""
+    m = _DF_CHARTS_EXPORT_RE.search(charts_jsx_body)
+    assert m is not None, (
+        'could not read the `window.DF_CHARTS = { ... }` export literal in '
+        'charts.jsx. The overwhelmingly likely cause is a NESTED BRACE inside '
+        'that literal: the pattern is `[^{}]*` by design, and the identical '
+        'pattern in test_tab_burndown.py:53 would silently yield an empty set '
+        'and fail test_every_labels_prop_sits_on_a_chart_component with an '
+        'unrelated-looking message. Keep every export a bare identifier.'
+    )
+    return _binding_names(m.group(1))
+
+
+def _spark_path_module_surface() -> dict:
+    """``{name: typeof}`` for the REAL shipped spark_path.js, executed under node.
+
+    Proves the name charts.jsx binds actually EXISTS at the source, rather than
+    merely being spelled the same in two files — the failure mode a pure
+    source-text pairing cannot see.
+    """
+    return _run_node(
+        'const api = require(%s);\n'
+        'console.log(JSON.stringify(Object.fromEntries('
+        'Object.keys(api).map(k => [k, typeof api[k]]))));'
+        % json.dumps(str(_SPARK_PATH_JS))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +426,59 @@ console.log(JSON.stringify(received));
         'percent or decimal formatter would see collapsed gridline labels.'
     )
 
+
+# ---------------------------------------------------------------------------
+# API surface — routing formatCountTick from DF_SPARK_PATH to DF_CHARTS.
+# ---------------------------------------------------------------------------
+
+
+def test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts(
+    charts_jsx_body: str,
+) -> None:
+    """charts.jsx must import `formatCountTick` and re-export it on DF_CHARTS.
+
+    This is the wiring the caller fix depends on, and it is invisible to every
+    other test in the repo: tabs.jsx and tab_escalation_analytics.jsx reach the
+    helper only through `window.DF_CHARTS`, so a missing hop here renders as
+    `formatY={undefined}` — LineChart silently falls back to its own default and
+    the fractional labels come straight back, with no error anywhere.
+
+    The last assertion executes the real spark_path.js, so the name charts.jsx
+    binds is proven to EXIST rather than merely to be spelled consistently in
+    two files.
+    """
+    destructured = _spark_path_destructure(charts_jsx_body)
+    assert 'formatCountTick' in destructured, (
+        'charts.jsx does not destructure `formatCountTick` off window.DF_SPARK_PATH. '
+        f'It binds {sorted(destructured)}. Without it the re-export below is a '
+        'reference to an undefined identifier.'
+    )
+
+    exported = _df_charts_export_names(charts_jsx_body)
+    assert 'formatCountTick' in exported, (
+        'charts.jsx does not re-export `formatCountTick` on window.DF_CHARTS. '
+        f'It exports {sorted(exported)}. tabs.jsx and tab_escalation_analytics.jsx '
+        'have no other route to the helper — they never touch DF_SPARK_PATH.'
+    )
+
+    # The brace-hostile coupling, asserted in its own right so the constraint is
+    # discoverable from the failure rather than only from the comment above.
+    assert _DF_CHARTS_EXPORT_RE.search(charts_jsx_body) is not None, (
+        'the window.DF_CHARTS export literal no longer parses under the '
+        r'`window\.DF_CHARTS\s*=\s*\{([^{}]*)\}` pattern that '
+        'test_tab_burndown.py:53 also uses — something in it grew a nested '
+        'brace. There it fails as an empty export set and a confusing '
+        '"not a chart component" error far from the cause. Every DF_CHARTS '
+        'export must stay a BARE IDENTIFIER.'
+    )
+
+    surface = _spark_path_module_surface()
+    assert surface.get('formatCountTick') == 'function', (
+        'requiring the real spark_path.js did not yield a `formatCountTick` '
+        f'function — its surface is {surface}. charts.jsx would then destructure '
+        '`undefined` and hand it to LineChart as formatY, which throws on the '
+        'first tick and blanks the entire chart.'
+    )
 
 # ---------------------------------------------------------------------------
 # Cache-buster floor.
