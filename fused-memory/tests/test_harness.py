@@ -5648,6 +5648,120 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
     )
 
 
+@pytest.mark.asyncio
+async def test_shielded_stage_report_persistence_still_propagates_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Guards against 'fixing' the finally's durability gap by wrapping the
+    shielded update_run_stage_reports call in `except BaseException`, which
+    would absorb the second cancellation and let run_full_cycle return a
+    value instead of propagating it — an uncancellable coroutine on the
+    success path (task 4431's plan, design decision 3). This is the
+    prospective half of the shield's contract: the write must survive a
+    second cancellation (see the two tests above), but the cancellation
+    ITSELF must still win.
+
+    Passes both BEFORE and AFTER the task-4431 shield fix by design, the
+    same shape as task 4128's
+    test_degraded_arm_still_skips_an_existing_row_under_a_second_cancellation
+    (test_harness.py:2800): asyncio.shield alone never suppresses the outer
+    task's own cancellation, only an added `except BaseException` around it
+    would — so this test's job is to keep failing that hypothetical future
+    change, not to distinguish the fix in this task.
+
+    Also pins that the shield does not change the run's terminal
+    disposition: status must still read 'failed' (the branch
+    resume_after_restart=False takes), unaffected by whichever write path
+    lands stage_reports.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = False
+
+    stage_entered = asyncio.Event()
+
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
+    ):
+        stage_entered.set()
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    outer_task_ref: list = [None]
+    original_update = journal.update_run_stage_reports
+    first_call = [True]
+
+    async def self_cancelling_update(run_id, stage_reports):
+        if first_call[0]:
+            first_call[0] = False
+            outer_task_ref[0].cancel()
+            await asyncio.sleep(0)
+        return await original_update(run_id, stage_reports)
+
+    journal.update_run_stage_reports = self_cancelling_update
+
+    outer_task = asyncio.create_task(
+        harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+    outer_task_ref[0] = outer_task
+
+    done, _ = await asyncio.wait(
+        [asyncio.ensure_future(stage_entered.wait()), outer_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if outer_task in done and not stage_entered.is_set():
+        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
+        pytest.fail(f'outer_task completed before slow_stage_run was invoked: {exc}')
+
+    outer_task.cancel()
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await outer_task
+
+    journal.update_run_stage_reports = original_update
+
+    assert not first_call[0], (
+        'self_cancelling_update never ran — this test no longer exercises '
+        "the finally's update_run_stage_reports call"
+    )
+
+    assert outer_task.cancelled(), (
+        "run_full_cycle's task must still end CANCELLED after a second "
+        'cancellation arrives while the shielded stage_reports write is in '
+        'flight — asyncio.shield protects the WRITE, not the outer '
+        'coroutine, so the cancellation must still propagate. If this '
+        'assertion fails, something (e.g. a stray except BaseException '
+        'wrapped around the shielded await) is swallowing the second '
+        'cancellation instead of letting it propagate, which would make '
+        "run_full_cycle uncancellable on its success path."
+    )
+
+    async def _run_persisted():
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        return recent[0] if recent else None
+
+    persisted = await _poll_until(_run_persisted)
+    assert persisted is not None, 'no run was persisted for test-project'
+    assert persisted.status == 'failed', (
+        f"expected status='failed' (resume_after_restart=False takes the "
+        f'failed-cleanup branch), got {persisted.status!r} — the shield '
+        'must not change the terminal disposition the cancel path records'
+    )
+
+
 # ── Tests for _select_tier ────────────────────────────────────────────────────
 
 
