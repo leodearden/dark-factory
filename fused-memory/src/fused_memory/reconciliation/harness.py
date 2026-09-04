@@ -3548,7 +3548,18 @@ class ReconciliationHarness:
                 await self._flush_cycle_summaries(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
-                await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                # Shielded against a second cancellation arriving mid-write;
+                # the write keeps running to completion in its own Task.
+                # asyncio.shield only protects work once its coroutine exists
+                # as its own Task — on the already-being-cancelled path this
+                # whole finally exists to serve, an unshielded await here
+                # would re-raise the very CancelledError the backstop arms
+                # above just survived, discarding the stage_reports copy
+                # (including the markers _flush_cycle_summaries just
+                # stamped) before it ever reaches the DB (task 4431).
+                await asyncio.shield(
+                    self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                )
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
                 # exit path (success/failure) EXCEPT an interrupted (resumable) run —
                 # its transcript must survive on disk for the startup --resume pass.
