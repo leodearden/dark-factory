@@ -142,7 +142,10 @@ docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
 
 # Wait for healthy
 for i in $(seq 1 30); do
-  if docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null | grep -q PONG; then
+  # Verdict read from the captured reply, not the pipeline status — see the
+  # section-1 block above, and scripts/export-data.sh for the full rationale.
+  _ping="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  if [[ "$_ping" == *PONG* ]]; then
     ok "FalkorDB healthy"
     break
   fi
