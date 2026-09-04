@@ -543,8 +543,10 @@ class TestAddEpisodeStampsReferents:
         )
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
+        # 'uuid' is deliberately absent: task 3561 removed it from the enqueue
+        # payload (a fresh uuid means "load this node" to graphiti_core).
         for key in (
-            'uuid', 'name', 'content', 'source', 'group_id', 'source_description',
+            'name', 'content', 'source', 'group_id', 'source_description',
             'project_id', 'agent_id', 'session_id', '_causation_id', '_write_op_id',
             'temporal_context', 'unverified_claim', 'reference_time',
         ):
@@ -580,12 +582,15 @@ def _encoded(source, *referents):
 
 #: The exact kwargs `_execute_graphiti_write` hands the backend today, for
 #: `_graphiti_payload()`. Epsilon must not change ANY of them.
+#: `uuid` is None rather than absent: task 3561 made the executor pass
+#: `uuid=None` unconditionally, so None is what the backend actually receives
+#: and this dict stays an exact pin rather than a subset check.
 _TODAYS_BACKEND_KWARGS = {
     'name': 'episode_test',
     'content': 'test content',
     'group_id': 'test',
     'source_description': 'notes',
-    'uuid': 'test-uuid',
+    'uuid': None,
     'temporal_context': None,
     'reference_time': None,
     'unverified_claim': False,
