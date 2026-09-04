@@ -235,7 +235,8 @@ def test_e2e_factories_identity() -> None:
 
 # ---------------------------------------------------------------------------
 # Group E: transcript-archival harness (task 4384): ENC, _config,
-# _make_git_ops, _make_transcript_workflow, _config_dir, _write_transcript, _archived —
+# _make_git_ops, _make_transcript_workflow, _config_dir, _write_transcript,
+# _archive_root, _archived —
 # promoted out of three divergent copies (test_transcript_archive_producer_hook.py,
 # test_transcript_archive_backstop.py, test_transcript_archival_boundary_gate.py).
 # ---------------------------------------------------------------------------
@@ -248,15 +249,26 @@ def test_transcript_archival_factories_smoke(tmp_path) -> None:
     deliberately NOT driven here: it needs a real git repo plus
     `create_worktree`, and all three consumer suites already drive it
     end-to-end, so duplicating that cost buys nothing.
+
+    Both path contracts are anchored to PRODUCTION, not to a re-spelling of
+    the helper bodies: the config dir against the real ``TaskConfigDir``
+    constructor, the archive root against ``TranscriptArchiveConfig().root``.
+    A literal-vs-literal assertion here would restate the one-line helpers and
+    could not detect the only drift that matters — the harness diverging from
+    the code it stands in for. ``ENC`` is deliberately NOT pinned: its value is
+    arbitrary (the archiver mirrors whatever ``projects/`` subdir name it
+    finds), so an equality check against its own literal would assert nothing.
     """
     from _workflow_helpers import (  # noqa: PLC0415
         ENC,
+        _archive_root,
         _archived,
         _config,
         _config_dir,
         _make_git_ops,
         _write_transcript,
     )
+    from shared.config_dir import TaskConfigDir  # noqa: PLC0415
 
     from orchestrator.config import TranscriptArchiveConfig  # noqa: PLC0415
     from orchestrator.git_ops import GitOps  # noqa: PLC0415
@@ -264,19 +276,25 @@ def test_transcript_archival_factories_smoke(tmp_path) -> None:
     repo = tmp_path / 'repo'
     wt = tmp_path / 'wt'
 
-    # The hyphen-encoded project dir the fake transcripts live under.
-    assert ENC == '-home-leo-projX'
-
-    # git_ops.py's per-task Claude config-dir derivation.
-    assert _config_dir(wt, '7') == wt / '.task' / 'claude-config-7'
+    # The per-task Claude config dir, cross-checked against the REAL
+    # constructor production uses (workflow.py builds exactly
+    # ``TaskConfigDir(task_id, base_dir=worktree / '.task')``). This is what
+    # goes red if the naming template behind CONFIG_DIR_PREFIX ever moves.
+    assert _config_dir(wt, '7') == TaskConfigDir('7', base_dir=wt / '.task').path
 
     src = _write_transcript(wt, '7', 'sess-A', b'x')
     assert src.exists()
     assert src == _config_dir(wt, '7') / 'projects' / ENC / 'sess-A.jsonl'
     assert src.read_bytes() == b'x'
 
+    # The archive root, composed from the config default production resolves
+    # against project_root (git_ops.py / harness.py both do
+    # ``project_root / transcript_archive.root``) rather than from hardcoded
+    # path segments.
+    assert _archive_root(repo) == repo / TranscriptArchiveConfig().root
+    # ...and _archived hangs off that root, so the two cannot drift apart.
     assert _archived(repo, '7', 'sess-A') == (
-        repo / 'data' / 'orchestrator' / 'agent-transcripts' / '7' / ENC / 'sess-A.jsonl'
+        _archive_root(repo) / '7' / ENC / 'sess-A.jsonl'
     )
 
     assert _config(repo).project_root == repo
@@ -334,6 +352,7 @@ def test_transcript_archival_factories_identity() -> None:
     import test_transcript_archive_producer_hook as ph  # noqa: PLC0415
     from _workflow_helpers import (  # noqa: PLC0415
         ENC,
+        _archive_root,
         _archived,
         _config,
         _config_dir,
@@ -348,15 +367,18 @@ def test_transcript_archival_factories_identity() -> None:
     assert ph._config is _config
     assert ph._make_transcript_workflow is _make_transcript_workflow
     assert ph._make_git_ops is _make_git_ops
+    assert ph._archive_root is _archive_root
     assert ph._archived is _archived
 
     # beta, the teardown-backstop suite.
     assert bs._make_git_ops is _make_git_ops
     assert bs._write_transcript is _write_transcript
+    assert bs._archive_root is _archive_root
     assert bs._archived is _archived
 
     # epsilon, the B+H boundary gate that had ported the fixtures from both.
     assert bg.ENC is ENC
+    assert bg._archive_root is _archive_root
     assert bg._archived is _archived
     assert bg._config is _config
     assert bg._config_dir is _config_dir

@@ -35,7 +35,8 @@ The ``git_repo``/``task_assignment`` fixtures are kept module-local (no
 conftest.py additions), matching ``test_transcript_archive_backstop.py``'s
 documented choice. The shared producer/backstop/gate harness pieces (``ENC``,
 ``_config``, ``_make_git_ops``, ``_make_transcript_workflow``, ``_config_dir``,
-``_write_transcript``, ``_archived``, ``_init_transcript_repo``) live in
+``_write_transcript``, ``_archive_root``, ``_archived``,
+``_init_transcript_repo``) live in
 ``_workflow_helpers.py`` — promoted there from three divergent copies by
 task 4384.
 """
@@ -53,6 +54,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _workflow_helpers import (
     ENC,
+    _archive_root,
     _archived,
     _config,
     _config_dir,
@@ -95,12 +97,6 @@ def git_ops(git_repo: Path) -> GitOps:
     """A backstop-INERT GitOps (no transcript_archive), the default for rows
     that isolate the producer. E3 builds its own armed instance."""
     return _make_git_ops(git_repo)
-
-
-def _archive_root(git_repo: Path) -> Path:
-    """The durable archive root the producer composes
-    (``config.project_root / transcript_archive.root``) — OUTSIDE the worktree."""
-    return git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
 
 
 # ---------------------------------------------------------------------------

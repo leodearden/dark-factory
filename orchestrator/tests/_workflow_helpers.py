@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
-from shared.config_dir import TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.locking import normalize_lock
 
 from orchestrator.agents.invoke import AgentResult
@@ -1200,8 +1200,34 @@ def _build_workflow_with_escalation(
 # boundary_gate.py's is '42').
 # ---------------------------------------------------------------------------
 
+# NAMING (why only `_make_workflow` was renamed on promotion). The bare
+# `_make_workflow` had an explicit in-file retirement precedent — Group B's
+# header 500 lines above records that the warm-lane factory was renamed off
+# it — so re-introducing it here would have contradicted this module's own
+# documented decision, hence `_make_transcript_workflow`.
+#
+# `_config` and `_make_git_ops` collide by NAME too (measured under
+# orchestrator/tests/ on 2026-09-05: 11 other modules define a local
+# `_config(`, 17 define a local `_make_git_ops(`, several with mutually
+# incompatible signatures — e.g. test_offline_lane.py returns a MagicMock,
+# test_merge_queue_build_chain.py takes `(repo, *, pool, size)`), and they are
+# kept bare deliberately, not by oversight:
+#   - No collision is REACHABLE. Every import of this module is explicit by
+#     name; there are zero `from _workflow_helpers import *` in the tests dir
+#     (measured 2026-09-05), so a consumer that defines its own `_config`
+#     simply never imports ours. A shadowing bug would require a file to do
+#     both, which the Group E identity test would then catch.
+#   - Neither name carries a retirement precedent, so renaming them buys
+#     consistency of style, not safety, at the cost of churn across three
+#     consumer suites in a behaviour-preserving diff.
+# If a future consumer ever needs both, rename then — `_make_transcript_git_ops`
+# / `_transcript_config` are the names to use.
+
 # The encoded-project dir the fake transcript is laid down under (the
 # hyphen-encoded form Claude Code's config layout uses for a project path).
+# The literal is arbitrary: the archiver mirrors whatever directory name it
+# finds under `projects/`, so nothing production-side depends on this value
+# and no test pins it — the suites use it symbolically on both sides.
 ENC = '-home-leo-projX'
 
 
@@ -1287,9 +1313,27 @@ async def _init_transcript_repo(repo: Path) -> None:
 
 
 def _config_dir(worktree: Path, task_id: str) -> Path:
-    """The on-disk per-task Claude config dir the β backstop reconstructs
-    (``<worktree>/.task/claude-config-<task_id>``, git_ops.py's derivation)."""
-    return worktree / '.task' / f'claude-config-{task_id}'
+    """The on-disk per-task Claude config dir the β backstop reconstructs:
+    ``<worktree>/.task/<CONFIG_DIR_PREFIX><task_id>``.
+
+    The leaf name is composed from ``shared.config_dir.CONFIG_DIR_PREFIX`` —
+    the same single source of truth ``TaskConfigDir.__init__`` uses — rather
+    than from a hand-written ``claude-config-`` literal, so a rename of the
+    template cannot leave this harness silently pointing at a directory
+    production no longer writes. (git_ops.py's teardown backstop reconstructs
+    the same path with its own literal; that copy is production's problem, not
+    this module's, and is out of scope here.)
+
+    Deliberately a PURE path composition rather than
+    ``TaskConfigDir(task_id, base_dir=worktree / '.task').path``: that
+    constructor has side effects — it ``mkdir(parents=True)``s the directory
+    and symlinks ~/.claude settings into it — and rows here call this helper to
+    name a path that must NOT exist (e.g. boundary_gate's assertion that
+    ``cleanup_worktree`` removed the config dir), which a constructing helper
+    would resurrect. The cross-check against the real constructor is made
+    once, in test_workflow_helpers.py's Group E smoke test.
+    """
+    return worktree / '.task' / f'{CONFIG_DIR_PREFIX}{task_id}'
 
 
 def _write_transcript(worktree: Path, task_id: str, sid: str, data: bytes) -> Path:
@@ -1301,12 +1345,31 @@ def _write_transcript(worktree: Path, task_id: str, sid: str, data: bytes) -> Pa
     return p
 
 
+def _archive_root(git_repo: Path) -> Path:
+    """The durable archive root the producer composes
+    (``config.project_root / transcript_archive.root``) — OUTSIDE the worktree.
+
+    Promoted out of test_transcript_archival_boundary_gate.py so this literal
+    and ``_archived``'s prefix are one expression again: before promotion
+    boundary_gate defined ``_archived`` as ``_archive_root(...) / ...``, and
+    lifting only ``_archived`` had split them into two independent copies. That
+    split is not benign — the gate's negative rows
+    (``assert not _archived(...).exists()``, and the ``.archive-tmp`` debris
+    rglobs) pass trivially against ANY wrong path, so a drift between the two
+    would degrade them to vacuous passes rather than failures.
+
+    NOT routed through here: the ``assert_called_once_with(archive_root=...)``
+    rows in the α/β suites, which spell the composition out by hand on purpose.
+    Those are independent oracles for what PRODUCTION passes; sharing this
+    helper with them would turn a real cross-check into a comparison of the
+    test harness with itself.
+    """
+    return git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
+
+
 def _archived(git_repo: Path, task_id: str, sid: str) -> Path:
     """The durable plain-.jsonl mirror the archiver should produce for *sid*."""
-    return (
-        git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-        / task_id / ENC / f'{sid}.jsonl'
-    )
+    return _archive_root(git_repo) / task_id / ENC / f'{sid}.jsonl'
 
 
 # ---------------------------------------------------------------------------

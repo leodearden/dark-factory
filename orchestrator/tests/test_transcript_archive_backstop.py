@@ -12,7 +12,8 @@ archiver can never block ``git worktree remove``).
 The ``git_repo`` fixture is kept module-local (no conftest.py), mirroring
 test_transcript_archive_producer_hook.py's established convention. The shared
 producer/backstop/gate harness pieces (``ENC``, ``_make_git_ops``,
-``_write_transcript``, ``_archived``) live in ``_workflow_helpers.py`` —
+``_write_transcript``, ``_archive_root``, ``_archived``) live in
+``_workflow_helpers.py`` —
 promoted there from three divergent copies by task 4384.
 """
 
@@ -26,6 +27,7 @@ from unittest.mock import patch
 
 import pytest
 from _workflow_helpers import (
+    _archive_root,
     _archived,
     _init_transcript_repo,
     _make_git_ops,
@@ -158,7 +160,7 @@ class TestBackstop:
 
         mock_helper.assert_not_called()
         # Nothing was written under the archive root at all.
-        assert not (git_repo / 'data' / 'orchestrator' / 'agent-transcripts').exists()
+        assert not _archive_root(git_repo).exists()
         # Teardown still happened — the kill switch gates archival, not removal.
         assert not wt.path.exists()
 

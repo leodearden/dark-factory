@@ -9,7 +9,8 @@ MANUALLY.
 The git_repo/git_ops/task_assignment fixtures are kept module-local (no
 conftest.py) — see test_config_verify_admission_reload.py's rationale — but
 their BODIES are no longer duplicated: the shared harness (``ENC``,
-``_config``, ``_make_git_ops``, ``_make_transcript_workflow``, ``_archived``,
+``_config``, ``_make_git_ops``, ``_make_transcript_workflow``,
+``_archive_root``, ``_archived``,
 ``_init_transcript_repo``) lives in ``_workflow_helpers.py``, promoted there
 from three divergent copies by task 4384.
 """
@@ -24,6 +25,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _workflow_helpers import (
     ENC,
+    _archive_root,
     _archived,
     _config,
     _init_transcript_repo,
@@ -315,7 +317,7 @@ class TestCleanupConfigDirArchivesFirst:
 
         mock_helper.assert_not_called()
         assert not config_dir_path.exists()
-        assert not (git_repo / 'data' / 'orchestrator' / 'agent-transcripts').exists()
+        assert not _archive_root(git_repo).exists()
 
     async def test_recycle_also_archives_before_it_destroys(
         self, monkeypatch, git_repo, git_ops, task_assignment
