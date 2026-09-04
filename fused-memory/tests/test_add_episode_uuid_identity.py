@@ -40,6 +40,7 @@ assertions here fail in that case.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -305,3 +306,130 @@ class TestPlanningRegistrationKeysOnTheRealUuid:
             'Registering anything else makes the search filter permanently '
             'vacuous.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-03: a pre-fix payload executed by post-fix code
+# ---------------------------------------------------------------------------
+
+LEGACY_UUID = 'stale-uuid-from-before-the-fix'
+
+
+def _pre_fix_payload(*, uuid: str | None = LEGACY_UUID) -> dict[str, Any]:
+    """A durable-queue payload in the shape ``add_episode`` produced BEFORE the fix.
+
+    Reproduced verbatim (minus the fields added since) rather than derived from
+    today's ``add_episode``, because the whole point is that these rows were
+    serialized by the OLD code and outlive it.
+    """
+    payload: dict[str, Any] = {
+        'name': 'episode_stale123',
+        'content': 'A row enqueued before the fix, drained after it',
+        'source': 'text',
+        'group_id': 'legacy-group',
+        'source_description': '',
+        'project_id': 'p',
+        '_causation_id': 'causation-legacy-1',
+        '_write_op_id': 'write-op-legacy-1',
+        'temporal_context': None,
+        'reference_time': None,
+    }
+    if uuid is not None:
+        payload['uuid'] = uuid
+    return payload
+
+
+class TestLegacyPayloadDrainedAfterTheFix:
+    """The durable queue outlives the deploy that fixed the producer.
+
+    Step-02 stopped PRODUCING ``'uuid'``, but a row enqueued before that deploy
+    and executed after it still carries the key.  If execution still forwarded
+    whatever the payload holds, those rows would reproduce the identical
+    ``NodeNotFoundError`` — the defect would survive its own fix for as long as
+    the backlog does.  (This is also what governs task 3584's replay gate.)
+    """
+
+    @pytest.mark.asyncio
+    async def test_legacy_uuid_payload_still_creates_the_episode(
+        self, svc_and_fake, caplog
+    ):
+        """A pre-fix row must execute successfully and keep its content."""
+        svc, fake = svc_and_fake
+        payload = _pre_fix_payload()
+        expected_content = payload['content']
+
+        with caplog.at_level(logging.WARNING):
+            # Must not raise: the stale uuid names no node, so forwarding it
+            # would be NodeNotFoundError all over again.
+            await svc._execute_graphiti_write('add_episode', payload)
+
+        assert len(fake.episodes) == 1, (
+            "The legacy row's episode must still be written, not silently "
+            f'dropped; store holds {list(fake.episodes)}'
+        )
+        (minted_uuid,) = fake.episodes
+        node = fake.episodes[minted_uuid]
+
+        assert node.content == expected_content, (
+            "The legacy row's content must survive the ignored uuid; got "
+            f'{node.content!r}'
+        )
+        assert minted_uuid != LEGACY_UUID, (
+            'The node must carry the uuid graphiti_core minted, never the '
+            f'stale payload one; got {minted_uuid!r}'
+        )
+        assert fake.calls[0]['uuid'] is None, (
+            'The backend must be reached with uuid=None even when the payload '
+            f'carries a legacy one; got {fake.calls[0]["uuid"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_uuid_payload_warns_naming_the_ignored_key(
+        self, svc_and_fake, caplog
+    ):
+        """Draining a pre-fix backlog must be visible in logs, not only in a graph diff."""
+        svc, fake = svc_and_fake
+
+        with caplog.at_level(logging.WARNING):
+            await svc._execute_graphiti_write('add_episode', _pre_fix_payload())
+
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and LEGACY_UUID in r.getMessage()
+        ]
+        assert warnings, (
+            'An operator draining pre-fix rows must see a WARNING naming the '
+            'ignored uuid; otherwise the only evidence is a graph diff. '
+            f'Records seen: {[r.getMessage() for r in caplog.records]}'
+        )
+        message = warnings[0]
+        assert 'uuid' in message, f"The warning must name the ignored key; got {message!r}"
+        assert 'legacy-group' in message, (
+            f'The warning must name the group_id so the row is locatable; got {message!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_payload_emits_no_legacy_warning(self, svc_and_fake, caplog):
+        """The warning must stay a real signal, not per-write noise.
+
+        Every post-fix write goes through this path, so a warning that fired
+        unconditionally would be worthless the moment a backlog existed.
+        """
+        svc, fake = svc_and_fake
+
+        with caplog.at_level(logging.WARNING):
+            await svc._execute_graphiti_write(
+                'add_episode', _pre_fix_payload(uuid=None)
+            )
+
+        offenders = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'legacy' in r.getMessage().lower()
+        ]
+        assert not offenders, (
+            'A clean post-fix payload carries no uuid key, so it must not warn; '
+            f'got {offenders}'
+        )
+        assert len(fake.episodes) == 1
