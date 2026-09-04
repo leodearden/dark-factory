@@ -5472,11 +5472,18 @@ class ReconciliationHarness:
             # by explicit design, so a lost row here is a genuine gap. Anchored
             # at run.started_at (this driver has no separate cycle_start_time
             # local), and placed strictly before update_run_stage_reports so the
-            # persisted copy captures whatever markers either arm stamped.
+            # persisted copy captures whatever markers either arm stamped —
+            # and that call is itself shielded against a second cancellation
+            # arriving mid-write, the identical mirror-site fix applied to
+            # run_full_cycle's finally: asyncio.shield only protects work
+            # once its coroutine exists as its own Task, so this driver needs
+            # the same guard for the same reason (task 4431).
             await self._flush_cycle_summaries(
                 run, run_id, project_id, current_stage_name, run.started_at,
             )
-            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            await asyncio.shield(
+                self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            )
             # Task 2744: GC this remediation run's per-run recon CLI config dir on
             # every exit path. Defensive — never mask the run's terminal outcome.
             try:
