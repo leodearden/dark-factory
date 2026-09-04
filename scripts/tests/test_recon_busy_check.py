@@ -62,6 +62,13 @@ def test_classify_non_dict_is_unreachable():
 
 # ---------------------------------------------------------------------------
 # CLI (reads /health body from stdin) — driven via subprocess.run
+#
+# Mirrors the defensive-timeout pattern in test_scan_task_toolcall_leaks.py
+# (task 4217/4515). A third sibling, scripts/tests/test_drain_check.py, runs
+# the identical ["python3", str(SCRIPT), *args] harness shape and still
+# hardcodes timeout=10; bringing it in line is outside this task's locked
+# scope (scripts/tests/test_recon_busy_check.py only) and a follow-up is
+# filed to cover it alongside the shared-helper extraction question.
 # ---------------------------------------------------------------------------
 
 def _cli_timeout_from_env(default: float = 60.0) -> float:
