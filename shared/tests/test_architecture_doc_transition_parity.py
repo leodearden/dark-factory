@@ -37,6 +37,7 @@ from architecture_doc_transitions import (
     DOC_PATH,
     diff_transition_edges,
     extract_lifecycle_mermaid,
+    format_parity_failure,
     parse_state_diagram_edges,
     read_architecture_doc,
     table_transition_edges,
@@ -310,3 +311,52 @@ class TestDiffTransitionEdges:
         diff = diff_transition_edges(doc_edges, table_edges)
         assert diff.missing_from_doc == frozenset({(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)})
         assert diff.extra_in_doc == frozenset({(TaskStatus.PENDING, TaskStatus.REVIEW)})
+
+
+class TestFormatParityFailure:
+    """``format_parity_failure`` — the user-observable failure text. The
+    task's own success signal is that the guard "fails naming the specific
+    divergent edge", so this text is real behavior, not incidental logging,
+    and gets pinned like any other output."""
+
+    def test_missing_from_doc_names_edge_direction_and_both_sources(self):
+        msg = format_parity_failure(
+            frozenset({(TaskStatus.IN_PROGRESS, TaskStatus.REVIEW)}),
+            frozenset(),
+        )
+        assert 'in-progress -> review' in msg
+        assert 'NOT drawn in ARCHITECTURE.md section 3.1' in msg
+        assert 'ARCHITECTURE.md section 3.1' in msg
+        assert 'shared/src/shared/task_transitions.py' in msg
+
+    def test_extra_in_doc_names_the_opposite_direction(self):
+        msg = format_parity_failure(
+            frozenset(),
+            frozenset({(TaskStatus.IN_PROGRESS, TaskStatus.REVIEW)}),
+        )
+        assert 'in-progress -> review' in msg
+        assert 'NOT in TRANSITIONS' in msg
+        assert 'ARCHITECTURE.md section 3.1' in msg
+        assert 'shared/src/shared/task_transitions.py' in msg
+
+    def test_the_two_directions_produce_distinguishable_messages(self):
+        edge = frozenset({(TaskStatus.IN_PROGRESS, TaskStatus.REVIEW)})
+        missing_msg = format_parity_failure(edge, frozenset())
+        extra_msg = format_parity_failure(frozenset(), edge)
+        assert missing_msg != extra_msg
+
+    def test_multiple_edges_all_listed_in_deterministic_sorted_order(self):
+        edges = frozenset(
+            {
+                (TaskStatus.REVIEW, TaskStatus.DONE),
+                (TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED),
+            }
+        )
+        msg = format_parity_failure(edges, frozenset())
+        assert 'in-progress -> blocked' in msg
+        assert 'review -> done' in msg
+        assert msg.index('in-progress -> blocked') < msg.index('review -> done')
+
+    def test_empty_and_empty_renders_no_edge_lines(self):
+        msg = format_parity_failure(frozenset(), frozenset())
+        assert '->' not in msg
