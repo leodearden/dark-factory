@@ -22,7 +22,6 @@ The companion source-level sweep at the bottom forbids the construct itself.
 from __future__ import annotations
 
 import os
-import re
 
 from setup_host_sections import (
     run_section,
@@ -32,6 +31,7 @@ from setup_host_sections import (
     stub_bin_dir,
     write_stub,
 )
+from shell_sections import grep_q_offenders
 
 # Trailing bytes a producer writes AFTER the matching line, to provoke (b).
 #
@@ -423,37 +423,11 @@ def test_section_12_reports_not_responding_when_the_producer_says_nothing(tmp_pa
 
 
 # --- the file-scoped contract ----------------------------------------------
-# A grep on the receiving end of a pipe, plus its arguments up to the end of
-# THAT command: `[^|;&)]*` stops at the next pipeline stage, at a `;` or `&&`,
-# and at the close of a command substitution, so a `-q` belonging to some later
-# command on the same line is never read as this grep's.
-_GREP_PIPE = re.compile(r"\|\s*grep\s+(?P<args>[^|;&)]*)")
-
-# Every spelling of "exit on the first match and close the read end": the short
-# clusters (`-q`, `-qF`, `-Fq`, `-iq`) and GNU's long forms. Matched against
-# whole TOKENS rather than positionally, which is what lets a flag taking an
-# argument sit in between — `grep -e PONG --quiet` is the same defect as
-# `grep -q PONG` and the sweep must see both. Deliberately does NOT match a
-# bare `| grep -F`, which reads its input to the end and cannot SIGPIPE the
-# producer.
-_QUIET_FLAG = re.compile(r"-[A-Za-z]*q[A-Za-z]*|--quiet|--silent")
-
-
-def _pipes_into_quiet_grep(line):
-    """True when *line* feeds a producer into a grep that exits on first match."""
-    return any(
-        any(_QUIET_FLAG.fullmatch(token) for token in match.group("args").split())
-        for match in _GREP_PIPE.finditer(line)
-    )
-
-
-def _grep_q_offenders(source):
-    """Every non-comment line of *source* piping a producer into a quiet grep."""
-    return [
-        (n, line)
-        for n, line in enumerate(source.splitlines(), start=1)
-        if not line.strip().startswith("#") and _pipes_into_quiet_grep(line)
-    ]
+# The DETECTOR itself lives in tests/scripts/shell_sections.py, shared with
+# test_script_probe_pipelines.py's sweep over export-data.sh / import-data.sh /
+# deploy-w5-recon-reliability.sh, so its three regexes exist once. The
+# guard-the-guard below stays HERE and now pins the copy BOTH suites use, which
+# is strictly stronger than guarding a private copy.
 
 
 def test_setup_host_never_pipes_a_producer_into_grep_q():
@@ -481,7 +455,7 @@ def test_setup_host_never_pipes_a_producer_into_grep_q():
 
     assert "set -euo pipefail" in source
 
-    offenders = _grep_q_offenders(source)
+    offenders = grep_q_offenders(source)
     assert not offenders, "producer piped into `grep -q`:\n" + "\n".join(
         f"  line {n}: {line.strip()}" for n, line in offenders
     )
@@ -493,6 +467,11 @@ def test_the_grep_q_sweep_detects_a_planted_pipeline():
     Same discipline tests/scripts/test_check_dashboard_unit_parity.py::
     test_the_sweep_finds_every_known_parity_call_site applies to its own sweep.
     Passes on arrival — it pins the mechanism, not the product behaviour.
+
+    Guards the SHARED detector in tests/scripts/shell_sections.py, so it covers
+    this file's sweep and test_script_probe_pipelines.py's alike. One detector
+    deserves one guard: a second copy of these eleven cases would be the same
+    drift this extraction removed.
     """
     planted = (
         "if foo | grep -q BAR; then\n"
@@ -507,13 +486,13 @@ def test_the_grep_q_sweep_detects_a_planted_pipeline():
         # A flag carrying an argument in between must not hide the quiet one.
         "if foo | grep -e BAR --quiet; then\n"
     )
-    assert len(_grep_q_offenders(planted)) == 7, _grep_q_offenders(planted)
+    assert len(grep_q_offenders(planted)) == 7, grep_q_offenders(planted)
 
     # A comment describing the construct is not the construct.
-    assert _grep_q_offenders("  # never write `foo | grep -q BAR` here\n") == []
+    assert grep_q_offenders("  # never write `foo | grep -q BAR` here\n") == []
     # Nor is a non-quiet grep, which drains its input instead of closing it.
-    assert _grep_q_offenders("out=\"$(foo | grep -F 'tag' || true)\"\n") == []
+    assert grep_q_offenders("out=\"$(foo | grep -F 'tag' || true)\"\n") == []
     # Nor is a `grep -q` over a FILE: no producer upstream, nothing to conflate.
-    assert _grep_q_offenders("if grep -q '^\\[Install\\]' \"$unit\"; then\n") == []
+    assert grep_q_offenders("if grep -q '^\\[Install\\]' \"$unit\"; then\n") == []
     # And a `-q` belonging to a LATER command on the line is not this grep's.
-    assert _grep_q_offenders("if foo | grep -F BAR; then bar -q; fi\n") == []
+    assert grep_q_offenders("if foo | grep -F BAR; then bar -q; fi\n") == []
