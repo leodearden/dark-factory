@@ -398,33 +398,40 @@ def harvest(
         tail_top = max(1, tail_sample // 2)
     tail_top = min(tail_top, tail_sample)
 
-    con = _connect_readonly(db_path)
-    try:
-        try:
-            rows = con.execute(
-                "SELECT params FROM write_ops WHERE operation = 'search'"
-            ).fetchall()
-        except sqlite3.Error as exc:
-            raise JournalUnavailableError(
-                f'{db_path} has no readable write_ops table: {exc}'
-            ) from exc
-    finally:
-        con.close()
-
     counts: Counter[str] = Counter()
     # The limit rides in the same params blob as the text, so it is
     # accumulated in the same pass.  Discarding it is what produced the
     # fabricated `observed_limit` this keying replaces.
     limits: dict[str, Counter[int | None]] = {}
     unparsed = 0
-    for (params,) in rows:
-        op = _query_op(params)
-        if op is None:
-            unparsed += 1
-            continue
-        text, limit = op
-        counts[text] += 1
-        limits.setdefault(text, Counter())[limit] += 1
+
+    con = _connect_readonly(db_path)
+    try:
+        try:
+            # STREAMED, not `.fetchall()`ed: the live journal is
+            # multi-gigabyte and the committed sidecar records 431,621 search
+            # ops, so materializing the `params` blobs is a multi-hundred-MB
+            # peak allocation for a stream consumed exactly once.
+            for (params,) in con.execute(
+                "SELECT params FROM write_ops WHERE operation = 'search'"
+            ):
+                op = _query_op(params)
+                if op is None:
+                    unparsed += 1
+                    continue
+                text, limit = op
+                counts[text] += 1
+                limits.setdefault(text, Counter())[limit] += 1
+        # Deliberately wrapped around the WHOLE loop, not just the
+        # `execute()`: streaming moves the point of failure, so a `disk I/O
+        # error` can now surface on any `next()` mid-scan.  Narrowing this
+        # guard would let a mid-scan sqlite failure escape unnamed.
+        except sqlite3.Error as exc:
+            raise JournalUnavailableError(
+                f'{db_path} has no readable write_ops table: {exc}'
+            ) from exc
+    finally:
+        con.close()
 
     total = sum(counts.values())
 
