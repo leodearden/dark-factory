@@ -82,7 +82,7 @@ import sys
 import types
 from collections.abc import Iterator
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SCRIPT_PATH = REPO_ROOT / "skills" / "factory-init" / "scripts" / "find_escalation_port.py"
