@@ -968,6 +968,41 @@ class TestRepairableFieldTable:
             'probe would call it and crash on its non-envelope return value'
         )
 
+    def test_a_non_envelope_return_is_reported_not_crashed(self, tmp_path, monkeypatch):
+        """A mis-derived candidate is reported ACTIONABLY, not crashed opaquely.
+
+        The second, INDEPENDENT half of the registered-surface fix. This test
+        calls :func:`_alternate_writer_changed_the_cell` DIRECTLY rather than
+        through :func:`_undeclared_alternates`, so it stays valid regardless
+        of what the derivation admits — the independence is the point. Even
+        if a future derivation change re-admits a non-tool, the failure names
+        the offending candidate instead of dying on ``.get``.
+
+        The staged return shape is the exact one main's ``_read_plan_repaired``
+        returns post-c005fabb00: the bare ``(plan, facts)`` tuple, never a
+        status envelope. Today the probe raises ``AttributeError: 'tuple'
+        object has no attribute 'get'``, which names neither the offending
+        candidate nor a remedy — what made the reviewer's reproduction so
+        hard to read.
+        """
+
+        def _tuple_returning_writer(artifacts, description):
+            plan = artifacts.read_plan()
+            plan['steps'][0]['description'] = description
+            artifacts.write_plan(plan)
+            return plan, []
+
+        _tuple_returning_writer.__module__ = plan_tools.__name__
+        monkeypatch.setattr(
+            plan_tools, '_tuple_returning_writer', _tuple_returning_writer, raising=False
+        )
+
+        with pytest.raises(AssertionError) as exc_info:
+            _alternate_writer_changed_the_cell(
+                tmp_path, 'steps', 'description', 'tuple_returning_writer'
+            )
+        assert 'tuple_returning_writer' in str(exc_info.value)
+
     def test_an_undeclared_plan_writer_cannot_escape_the_sweep(self, tmp_path, monkeypatch):
         """Pins the contract of ``_undeclared_alternates`` — the property
         nothing checks today, since the completeness sweep's candidate set
