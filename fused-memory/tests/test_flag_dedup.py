@@ -9200,6 +9200,388 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
 
 
 # ---------------------------------------------------------------------------
+# task 4864 — deterministic cross-project fix-task DISCOVERY (workstream 1,
+# design option (b)): the PRODUCER the task-4381 gate has never had
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverForeignFixTaskCitations:
+    """Tests for ``_discover_foreign_fix_task_citations(taskmaster,
+    known_projects, project_id, candidates)`` (task 4864, workstream 1).
+
+    The task-4381 gate suppresses a carried-forward finding whose
+    ``cited_tasks`` names a live FOREIGN fix task — but nothing has ever
+    PRODUCED such a citation.  Stage 1's context is its own project's task
+    tree, so the model has nothing to cite from, and design option (a)
+    (Stage 2 -> Stage 1 marker enrichment) is defeated outright by
+    ``compute_flag_signature`` folding citations into the marker row's own
+    KEY (task 4712's invariant).  This helper is the deterministic producer
+    that closes the gap: it matches a candidate finding's key terms against
+    every FOREIGN project's non-cancelled backlog through the module's own
+    proven ``_match_already_tracked_candidates`` and synthesises a
+    ``{project_id, task_id, title}`` citation from the winning task.
+
+    The result is an in-memory GATE INPUT ONLY and is never written back onto
+    the flag — see ``TestDedupFlagsCrossProjectDiscovery``'s anti-relocation
+    assertion for why that constraint is load-bearing.
+
+    RED until step-8 adds the helper.
+    """
+
+    PROJECT = 'know_live'
+    KNOWN = {'know_live': '/kl', 'dark_factory': '/df'}
+
+    #: The live repro shape (know_live flag e3527208 / dark_factory 598): a
+    #: recurring finding whose own wording is the "no fix task has been
+    #: filed" complaint the ruled gate exists to answer.  Yields 8 key terms
+    #: — comfortably above min_key_terms=4.
+    DESCRIPTION = (
+        'The Stage 2 remediation payload omits live workflow signals; '
+        'no fix task has been filed.'
+    )
+    #: What ``_safe_get_task`` reports for the matched task.  Deliberately
+    #: DIFFERENT from the ``get_tasks`` title below so a test can prove the
+    #: citation's title is read from the LIVE record rather than from the
+    #: bulk listing the match was computed against.
+    LIVE_TITLE = 'Remediation payload omits live workflow signals (renamed)'
+
+    @classmethod
+    def _candidate(cls, description: str | None = None) -> dict:
+        """A carried-forward finding in the repro's shape."""
+        return {
+            'task_id': 598,
+            'flag_type': 'remediation_payload_live_workflow_signals_gap',
+            'description': cls.DESCRIPTION if description is None else description,
+        }
+
+    @staticmethod
+    def _covering_task(task_id: str = '3839', status: str = 'blocked') -> dict:
+        """A foreign task whose title+description covers the candidate's terms.
+
+        Measured against the production thresholds: coverage 1.00 (>= 0.75)
+        and precision 0.67 (>= 0.2).
+        """
+        return {
+            'id': task_id,
+            'status': status,
+            'title': 'Remediation payload omits live workflow signals',
+            'description': (
+                'Stage 2 emits a remediation payload with no live workflow '
+                'signals; fix the payload builder so it carries them.'
+            ),
+        }
+
+    @classmethod
+    def _taskmaster(
+        cls,
+        project_tasks: dict[str, list[dict]] | None = None,
+        *,
+        tasks_side_effect=None,
+        tasks_result=None,
+        get_task_result: Any = None,
+        get_task_side_effect=None,
+    ):
+        """Fake exposing BOTH backend calls discovery makes: the per-project
+        ``get_tasks`` fan-out and the winning task's ``get_task`` title read."""
+        taskmaster = AsyncMock()
+        if tasks_side_effect is not None:
+            taskmaster.get_tasks = AsyncMock(side_effect=tasks_side_effect)
+        elif tasks_result is not None:
+            taskmaster.get_tasks = AsyncMock(return_value=tasks_result)
+        else:
+            tasks_by_root = project_tasks or {}
+
+            def _get_tasks(project_root, *, statuses=None):
+                return {'tasks': list(tasks_by_root.get(project_root, []))}
+
+            taskmaster.get_tasks = AsyncMock(side_effect=_get_tasks)
+        if get_task_side_effect is not None:
+            taskmaster.get_task = AsyncMock(side_effect=get_task_side_effect)
+        else:
+            taskmaster.get_task = AsyncMock(
+                return_value=(
+                    {'id': '3839', 'title': cls.LIVE_TITLE, 'status': 'blocked'}
+                    if get_task_result is None
+                    else get_task_result
+                )
+            )
+        return taskmaster
+
+    # ---- (i) the headline: a foreign match becomes a citation --------------
+
+    @pytest.mark.asyncio
+    async def test_matching_foreign_task_yields_citation_with_live_title(self):
+        """(i) HEADLINE: a candidate covered by a live FOREIGN task produces a
+        ``{project_id, task_id, title}`` citation, titled from the LIVE record."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _NON_CANCELLED_TASK_STATUSES,
+            _discover_foreign_fix_task_citations,
+        )
+
+        flag = self._candidate()
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [flag],
+        )
+
+        assert result == {
+            0: {
+                'project_id': 'dark_factory',
+                'task_id': '3839',
+                'title': self.LIVE_TITLE,
+            },
+        }, (
+            'a carried-forward complaint already covered by a filed foreign '
+            f'task must yield a citation naming it; got {result!r}'
+        )
+        # The title comes from the LIVE record (_safe_get_task), not from the
+        # bulk listing the coverage match was computed against — so a
+        # discovered citation corroborates by construction.
+        taskmaster.get_task.assert_awaited_once_with('3839', '/df')
+        # FOREIGN-only fan-out, with the ruled non-cancelled vocabulary.
+        roots = [call.args[0] for call in taskmaster.get_tasks.call_args_list]
+        assert roots == ['/df'], (
+            f'discovery must query FOREIGN projects only; got {roots!r}'
+        )
+        for call in taskmaster.get_tasks.call_args_list:
+            assert call.kwargs.get('statuses') == _NON_CANCELLED_TASK_STATUSES
+
+    @pytest.mark.asyncio
+    async def test_candidate_flag_is_never_mutated(self):
+        """(i, cont.) ANTI-RELOCATION at the helper boundary: discovery must
+        not write its result back onto the flag — ``cited_tasks`` is a
+        ``compute_flag_signature`` INPUT, so enriching the dict would move the
+        marker row instead of annotating it (task 4712)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        flag = self._candidate()
+        before = dict(flag)
+
+        await _discover_foreign_fix_task_citations(
+            self._taskmaster({'/df': [self._covering_task()]}),
+            self.KNOWN, self.PROJECT, [flag],
+        )
+
+        assert flag == before, (
+            f'discovery must not mutate the candidate flag; got {flag!r}'
+        )
+        assert 'cited_tasks' not in flag
+
+    # ---- (ii) foreign-only -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_same_project_match_is_never_returned(self):
+        """(ii) FOREIGN-ONLY, mirroring the gate's correctness core: a covering
+        task in the RUNNING project is never discovered, and that project is
+        not even queried."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({
+            '/kl': [self._covering_task(task_id='598')],
+            '/df': [],
+        })
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}, (
+            'a SAME-project covering task must never be discovered — a '
+            "finding's own subject task would otherwise self-suppress it; "
+            f'got {result!r}'
+        )
+        roots = [call.args[0] for call in taskmaster.get_tasks.call_args_list]
+        assert '/kl' not in roots, (
+            f'the running project must not even be queried; got {roots!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_foreign_project_known_issues_no_lookup(self):
+        """(ii, cont.) When the ONLY known project is the running one there is
+        nothing foreign to query, so discovery short-circuits with no I/O."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({'/kl': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, {'know_live': '/kl'}, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}
+        taskmaster.get_tasks.assert_not_called()
+
+    # ---- (iii) cancelled tasks can never be discovered ---------------------
+
+    @pytest.mark.asyncio
+    async def test_cancelled_foreign_task_is_never_returned(self):
+        """(iii) A CANCELLED task means the work was explicitly abandoned;
+        discovering it would silence the complaint forever.  Pinned with the
+        backend IGNORING the ``statuses`` kwarg (it returns the cancelled task
+        anyway), so the guarantee rests on the client-side re-check rather
+        than on the query alone."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({
+            '/df': [self._covering_task(status='cancelled')],
+        })
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}, (
+            'a cancelled foreign task must never be discovered, even when the '
+            f'backend ignores the statuses kwarg; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    # ---- (iv) too little signal -------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_below_min_key_terms_candidate_yields_nothing(self):
+        """(iv) A candidate with fewer than ``min_key_terms`` distinctive terms
+        is never matched — too little signal to trust a coverage match — and
+        because no candidate qualifies, no ``get_tasks`` call is issued."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+            _significant_terms,
+        )
+
+        thin = self._candidate(description='No fix task has been filed.')
+        assert len(_significant_terms(thin['description'])) < 4, (
+            'fixture must genuinely fall below min_key_terms'
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [thin],
+        )
+
+        assert result == {}, f'a thin candidate must not match; got {result!r}'
+        taskmaster.get_tasks.assert_not_called()
+
+    # ---- (v) fail-open in every direction ---------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('taskmaster_kwargs', 'known_projects'),
+        [
+            pytest.param({'tasks_side_effect': RuntimeError('backend down')},
+                         KNOWN, id='get-tasks-raises'),
+            pytest.param({'tasks_result': {'tasks': None}}, KNOWN,
+                         id='malformed-tasks-none'),
+            pytest.param({'tasks_result': 'not-a-dict'}, KNOWN,
+                         id='malformed-not-a-dict'),
+            pytest.param({'tasks_result': {}}, KNOWN, id='malformed-empty'),
+            pytest.param({}, {}, id='no-known-projects'),
+            pytest.param({}, None, id='none-known-projects'),
+            pytest.param({}, {'dark_factory': ''}, id='blank-project-root'),
+        ],
+    )
+    async def test_fail_open_yields_no_citation_and_never_raises(
+        self, taskmaster_kwargs, known_projects
+    ):
+        """(v) Every degraded input resolves to "no discovery" rather than a
+        raise — suppress-only-on-positive-confirmation, matching the sibling
+        filters' posture."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]},
+                                      **taskmaster_kwargs)
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, known_projects, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}, f'degraded input must yield no citation; got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_falsy_taskmaster_is_fail_open(self):
+        """(v, cont.) No taskmaster at all — the pre-4864 call shape — is a
+        no-op, which is what keeps every existing call site unaffected."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        assert await _discover_foreign_fix_task_citations(
+            None, self.KNOWN, self.PROJECT, [self._candidate()],
+        ) == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'get_task_kwargs',
+        [
+            pytest.param({'get_task_side_effect': RuntimeError('boom')},
+                         id='get-task-raises'),
+            pytest.param({'get_task_result': {'error': 'not found',
+                                              'error_type': 'TaskmasterError'}},
+                         id='not-found'),
+            pytest.param({'get_task_result': {'id': '3839', 'status': 'blocked'}},
+                         id='title-missing'),
+            pytest.param({'get_task_result': {'id': '3839', 'title': '',
+                                              'status': 'blocked'}},
+                         id='title-empty'),
+        ],
+    )
+    async def test_unresolvable_live_title_is_fail_open(self, get_task_kwargs):
+        """(v, cont.) The title read backs the "corroborates by construction"
+        property of a discovered citation, so when it cannot be resolved
+        discovery declines rather than synthesising a citation it cannot
+        stand behind."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]},
+                                      **get_task_kwargs)
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}, (
+            'an unresolvable live title must fail open to no discovery; '
+            f'got {result!r}'
+        )
+
+    # ---- (vi) the lazy-cost guarantee -------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_zero_candidates_issues_no_get_tasks_call(self):
+        """(vi) THE COST BOUND: with no candidates at all, discovery issues
+        ZERO ``get_tasks`` calls — the per-project fan-out is seconds of
+        blocking CPU on a real backlog, so a cycle with nothing to discover
+        must cost exactly what it costs today."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [],
+        )
+
+        assert result == {}
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a cycle with zero candidates must issue no get_tasks call at all; '
+            f'got {taskmaster.get_tasks.call_count}'
+        )
+        assert taskmaster.get_task.call_count == 0
+
+
+# ---------------------------------------------------------------------------
 # task 4711 — widen _NEVER_TRACKED_PHRASES so the pointer-free cross-project
 # filter reaches the "no fix task has been filed" complaint class
 # ---------------------------------------------------------------------------
