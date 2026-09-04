@@ -5615,16 +5615,33 @@ class MemoryService:
         # getattr-chained rather than attribute access because a None result
         # must not crash this path — see
         # test_execute_graphiti_write_none_result_no_crash.
+        # INVARIANT (task 3561): every path below is either a register or a
+        # loud warning — never an implicit fallthrough. A planning episode is
+        # only ever OBSERVABLE via search results, so a missed registration
+        # does not surface as an error; it surfaces, much later, as
+        # aspirational PRD content leaking into default factual search. By
+        # then nothing points back to the write that missed. That is why the
+        # `if/elif`-with-no-else this replaced was a defect in its own right,
+        # and why the miss must be diagnosable from logs alone.
         if temporal_context == 'planning' and self.planned_episode_registry is not None:
             episode_uuid = getattr(getattr(result, 'episode', None), 'uuid', None)
             group_id = payload.get('group_id')
             if episode_uuid and group_id:
                 await self.planned_episode_registry.register(episode_uuid, group_id)
-            elif episode_uuid and not group_id:
+            else:
+                missing = ' and '.join(
+                    part for part, absent in (
+                        ('result.episode.uuid', not episode_uuid),
+                        ('payload group_id', not group_id),
+                    ) if absent
+                )
                 logger.warning(
-                    'Skipping planned episode registration: group_id missing from payload '
-                    'for episode %s',
-                    episode_uuid,
+                    'Skipping planned episode registration (%s missing): this '
+                    'planning episode will NOT be filtered out of default search '
+                    'results. correlation_id=%r group_id=%r causation_id=%r '
+                    'episode_uuid=%r',
+                    missing, payload.get('correlation_id'), group_id,
+                    causation_id, episode_uuid,
                 )
 
         return result
