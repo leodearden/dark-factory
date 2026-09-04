@@ -37,8 +37,10 @@ from __future__ import annotations
 
 import pathlib
 
+import pytest
 from shell_sections import (
     REPO_ROOT,
+    grep_q_offenders,
     run_with_preamble,
     slice_section,
     slice_shell_function,
@@ -505,3 +507,66 @@ def test_import_health_reports_pong_on_a_clean_ping(tmp_path):
     combined = result.stdout + result.stderr
     assert _PONG_OK in combined, combined
     assert _NOT_RESPONDING not in combined, combined
+
+
+# --- the file-scoped contract ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script",
+    [EXPORT_DATA_PATH, IMPORT_DATA_PATH, DEPLOY_W5_PATH],
+    ids=lambda p: p.name,
+)
+def test_never_pipes_a_producer_into_grep_q(script):
+    """No code line in these three scripts may decide anything through `producer | grep --quiet PAT`.
+
+    The behavioural tests above pin what each site DOES; this pins that the
+    defective CONSTRUCT does not come back. Task 4204 added its equivalent
+    sweep AFTER its fixes for the same reason this one lands last: a sweep
+    added first would sit RED across every intervening commit and break
+    per-step greenness.
+
+    GUARD-THE-GUARD lives elsewhere, deliberately. The detector is the shared
+    `grep_q_offenders` in tests/scripts/shell_sections.py, and
+    test_setup_host_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline
+    pins it against seven planted spellings and four must-not-match cases —
+    on behalf of BOTH sweeps. One detector deserves one guard; a second copy
+    of those eleven cases here would be the drift this arrangement removes.
+
+    SCOPE IS FILE-SCOPED AND THAT IS A DECISION, not an oversight. Running
+    this same detector over every *.sh in the repo finds 295 lines. The
+    overwhelming majority are warm-lane SHELL TEST assertions of the
+    `printf "%s\n" "$1" | grep -q ...` shape — a different risk profile and a
+    different owner. But the scan also finds genuine same-class PRODUCTION
+    sites in other scripts (notably a `docker ps --format ... | grep -q
+    falkordb`, the identical construct fixed here) which are outside this
+    task's file locks and are filed as follow-up work. Widening this sweep
+    would turn it into that much larger task and leave it red until every one
+    of them is fixed; narrowing the claim keeps it honest. Task 4204 set the
+    same precedent by scoping its sweep to setup-host.sh alone.
+
+    WHAT THE RULE DOES NOT FORBID. It is scoped to greps that EXIT ON FIRST
+    MATCH — every spelling of that, short cluster or long `--quiet`/`--silent`,
+    since they share one defect. A `| grep -F ... || true` inside a command
+    substitution is a different, safe shape: a non-quiet grep drains its input
+    rather than SIGPIPE-ing the producer. Neither is a `grep -q` reading a
+    FILE swept in: with no producer upstream there is nothing for `pipefail`
+    to conflate.
+
+    And it mandates NO replacement spelling. These scripts happen to use
+    `[[ ]]`, but `case` or a `<<<` here-string remain open to a future author
+    — this forbids one known-defective construct, nothing more.
+    """
+    source = script.read_text(encoding="utf-8")
+
+    # FIRST, because it is what makes the rule load-bearing: without pipefail
+    # there is no defect here and the sweep below would be guarding nothing.
+    assert "set -euo pipefail" in source, (
+        f"{script.name} no longer sets `-o pipefail`, so this sweep would pass "
+        f"vacuously. Either restore it or retire this test deliberately."
+    )
+
+    offenders = grep_q_offenders(source)
+    assert not offenders, f"producer piped into `grep -q` in {script.name}:\n" + "\n".join(
+        f"  line {n}: {line.strip()}" for n, line in offenders
+    )
