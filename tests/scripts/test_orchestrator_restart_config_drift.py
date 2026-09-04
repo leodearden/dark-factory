@@ -191,3 +191,56 @@ def test_binding_guard_bites_on_a_typod_key_and_on_a_renamed_field(
     renamed_config = SimpleNamespace()
     with pytest.raises(AssertionError):
         _assert_key_binds(cfg, renamed_config, "orchestrator_restart_on_merge_enabled")
+
+
+def test_policy_pin_bites_on_an_undocumented_disable() -> None:
+    """``_assert_restart_enabled_or_pause_documented`` must still fail a silent,
+    undocumented disable -- the exact failure mode the pin exists to catch
+    (task 5088, the 2026-09-03 deploy pause).
+
+    Synthetic minimal YAML text exercises the guard independently of
+    whatever the committed file happens to say today; case 5 additionally
+    runs it against the REAL committed text (marker stripped), proving the
+    block-walk finds the real contiguous comment block rather than
+    accidentally matching the marker somewhere else in a 1000+ line file.
+    """
+    # 1. PASSES, no marker needed: an enabled config never needs a pause comment.
+    _assert_restart_enabled_or_pause_documented(
+        "orchestrator_restart_on_merge_enabled: true\n"
+    )
+
+    # 2. RAISES: a bare, undocumented disable -- the silent-disable case the
+    # pin exists for.
+    with pytest.raises(AssertionError):
+        _assert_restart_enabled_or_pause_documented(
+            "orchestrator_restart_on_merge_enabled: false\n"
+        )
+
+    # 3. RAISES: a disable preceded by a comment block that does NOT contain
+    # the marker -- proves the check is on the MARKER, not merely on the
+    # presence of any comment.
+    with pytest.raises(AssertionError):
+        _assert_restart_enabled_or_pause_documented(
+            "# some unrelated note\norchestrator_restart_on_merge_enabled: false\n"
+        )
+
+    # 4. PASSES: a disable preceded by a comment block containing the marker.
+    _assert_restart_enabled_or_pause_documented(
+        f"# {_PAUSE_MARKER}, 2026-09-03. Restore once X lands.\n"
+        "orchestrator_restart_on_merge_enabled: false\n"
+    )
+
+    # 5. RAISES: the REAL committed text with the marker removed.
+    committed_text = DF_CONFIG_PATH.read_text(encoding="utf-8")
+    with pytest.raises(AssertionError):
+        _assert_restart_enabled_or_pause_documented(
+            committed_text.replace(_PAUSE_MARKER, "deploy pause")
+        )
+
+    # 6. RAISES: a key that is present but non-boolean (a YAML-quoted
+    # string) -- a real config footgun and the reason the pin asserts
+    # isinstance(value, bool).
+    with pytest.raises(AssertionError):
+        _assert_restart_enabled_or_pause_documented(
+            "orchestrator_restart_on_merge_enabled: 'false'\n"
+        )
