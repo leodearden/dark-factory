@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -87,6 +87,16 @@ STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
+class RequiredSection(NamedTuple):
+    """One payload section every Stage-1 payload builder must emit (task 4708).
+
+    See :attr:`MemoryConsolidator.REQUIRED_SECTIONS` for the inclusion criterion.
+    """
+
+    header: str  # exact markdown header the shipped Stage-1 prompt names
+    renderer: str  # name of the MemoryConsolidator method that renders it
+
+
 async def write_stage1_cycle_summary(
     memory_service: MemoryService,
     project_id: str,
@@ -126,6 +136,37 @@ async def write_stage1_cycle_summary(
 
 class MemoryConsolidator(BaseStage):
     """Stage 1: Review and consolidate memories across Graphiti and Mem0."""
+
+    # ── Inference-bearing payload sections (task 4708) ──────────────────────
+    # INCLUSION CRITERION — a section belongs here iff the shipped Stage-1 prompt
+    # tells the model to draw an inference from that section's ABSENCE. Today
+    # prompts/stage1.py says: "If `### Live-Workflow Signals` is absent from the
+    # payload, all three signals are False for every task; no live-workflow
+    # suppression applies …". That makes absence load-bearing: a payload builder
+    # that omits the section does not merely produce a terser payload, it makes
+    # the model conclude something FALSE. Every builder therefore renders these
+    # via _render_required_sections() — adding a section is ONE edit here, not
+    # one edit per builder. Enforced by
+    # tests/reconciliation/test_stage1_payload_section_parity.py, which also
+    # cross-checks this tuple against STAGE1_SYSTEM_PROMPT in both directions.
+    #
+    # Replaces the drift mechanism behind three hand-fixed instances of the same
+    # defect — tasks 2150, 2552 and 3839 each wired ONE section into ONE missed
+    # builder after the fact.
+    #
+    # Deliberately NOT registered:
+    #   * _build_task_tree_section — 2 of 3 by design; registering it would dump
+    #     the whole task tree into the findings-only remediation payload.
+    #   * _build_task_count_census_section — 2 of 3 by design; its own contract
+    #     returns '' when task_count_verification is None, which is exactly the
+    #     remediation-pass state, so registering it would be a no-op.
+    #   * _build_project_root_directive — required in all three payloads, but as
+    #     an unconditional directive with NO absence-inference in any prompt.
+    #     Registering it would make the registry↔prompt sync guard unsatisfiable
+    #     by construction; it keeps its own dedicated tests instead (task 2552).
+    REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
+        RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
+    )
 
     # Tier limits — set by harness before run(); None until explicitly assigned
     episode_limit: int | None = None
@@ -1116,6 +1157,28 @@ Review the above data and perform memory consolidation:
 5. When you have completed your work, produce your final structured report as your response.
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
+
+    def _render_required_sections(self) -> str:
+        """Render every inference-bearing payload section, in registry order.
+
+        Every Stage-1 payload builder MUST interpolate this — enforced
+        structurally by
+        ``tests/reconciliation/test_stage1_payload_section_parity.py``, which
+        discovers the builders by AST introspection so a fourth builder is in
+        scope the day it is added. See :attr:`REQUIRED_SECTIONS` for which
+        sections qualify and why three others deliberately do not.
+
+        Each registered renderer keeps its own conditional-empty contract, so
+        ``''`` is a normal result and keeps the payload tight — that is why this
+        adds no separator of its own. Note the sections DO render on remediation
+        passes: the harness sets ``filtered_task_tree`` there too
+        (``ReconciliationHarness._configure_consolidator``), a measured fact from
+        task 3839 — the remediation call site is not a no-op.
+
+        Adding a section is a single :attr:`REQUIRED_SECTIONS` edit rather than
+        one edit per builder; that is the whole point of routing through here.
+        """
+        return ''.join(getattr(self, section.renderer)() for section in self.REQUIRED_SECTIONS)
 
     def _build_project_root_directive(self) -> str:
         """Return the project_root directive line for payload footers.
