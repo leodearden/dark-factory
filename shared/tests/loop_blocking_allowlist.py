@@ -87,6 +87,10 @@ guaranteed diff.  To re-derive the rows::
 A failure names every site whose disposition is missing or stale.
 
 Baseline measured at HEAD 6696f1ce0c: 167 files scanned, 60 findings.
+Task 4484's amendment pass re-measured 62 over the same 167 files: one
+row withdrawn as a scanner false positive (see the
+create_mcp_server._claim_commit_presence row) and three added by widening
+the vocabulary to shutil.rmtree.
 """
 
 from __future__ import annotations
@@ -269,6 +273,54 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     ),
 
     # ---- reconciliation/harness.py ----
+    (
+        'fused-memory/src/fused_memory/reconciliation/harness.py',
+        'ReconciliationHarness._recover_one_run',
+        '361d4c634750',
+        'to_file',
+        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
+        'sync cli_stage_runner.py::gc_run_config_dir inline, which '
+        'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
+        'syscall per file, all of them on the loop thread, and a config dir '
+        'is not one file. Found only once task 4484\'s amendment pass added '
+        'shutil.rmtree to the vocabulary, which is the same gap-B shape the '
+        'guard exists to close: the primitive was never enumerated, so the '
+        'sites were invisible however the census was run. Follow-up filed by '
+        'task 4484 amendment pass.'
+        ' Ticket: tkt_0RT88VW7RRECTHNCVTJXD6M5RJ.',
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/harness.py',
+        'ReconciliationHarness.run_full_cycle',
+        '21ec0716d946',
+        'to_file',
+        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
+        'sync cli_stage_runner.py::gc_run_config_dir inline, which '
+        'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
+        'syscall per file, all of them on the loop thread, and a config dir '
+        'is not one file. Found only once task 4484\'s amendment pass added '
+        'shutil.rmtree to the vocabulary, which is the same gap-B shape the '
+        'guard exists to close: the primitive was never enumerated, so the '
+        'sites were invisible however the census was run. Follow-up filed by '
+        'task 4484 amendment pass.'
+        ' Ticket: tkt_0RT88VW7RRECTHNCVTJXD6M5RJ.',
+    ),
+    (
+        'fused-memory/src/fused_memory/reconciliation/harness.py',
+        'ReconciliationHarness._run_remediation_pass',
+        '21ec0716d946',
+        'to_file',
+        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
+        'sync cli_stage_runner.py::gc_run_config_dir inline, which '
+        'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
+        'syscall per file, all of them on the loop thread, and a config dir '
+        'is not one file. Found only once task 4484\'s amendment pass added '
+        'shutil.rmtree to the vocabulary, which is the same gap-B shape the '
+        'guard exists to close: the primitive was never enumerated, so the '
+        'sites were invisible however the census was run. Follow-up filed by '
+        'task 4484 amendment pass.'
+        ' Ticket: tkt_0RT88VW7RRECTHNCVTJXD6M5RJ.',
+    ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._recover_stale_runs',
@@ -615,7 +667,9 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'f38dc5fc1e4c',
         'accepted',
         'ACCEPTED: run_server calls build_known_projects_map '
-        '(yaml.safe_load) during process STARTUP, before the server binds '
+        '(models/scope.py -- open() of each project manifest, then '
+        'yaml.safe_load; the sweep reports whichever the walk reaches '
+        'first) during process STARTUP, before the server binds '
         'and begins serving traffic, so there is no concurrent work for it '
         'to stall and no request whose latency it can affect. This is what '
         'an accepted row must say -- what makes the cost acceptable, not '

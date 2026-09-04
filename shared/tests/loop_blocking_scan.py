@@ -144,6 +144,11 @@ DOTTED_PRIMITIVES: dict[str, str] = {
         'of the child stdout pipe'
     ),
     'subprocess.check_call': 'subprocess: same fork+exec cost as subprocess.run',
+    'subprocess.call': (
+        'subprocess: subprocess.run\'s older spelling, same fork+exec and same '
+        'wait -- absent from the first cut of this table purely because nothing '
+        'in the scanned scope happens to use it yet'
+    ),
     'subprocess.Popen': (
         'subprocess: the fork+exec itself blocks even when the caller never '
         'waits; .communicate()/.wait() then block again'
@@ -151,6 +156,10 @@ DOTTED_PRIMITIVES: dict[str, str] = {
     'os.system': (
         'subprocess: spawns a shell AND blocks until it exits -- strictly worse '
         'than subprocess.run, never correct on a loop thread'
+    ),
+    'os.popen': (
+        'subprocess: a shell spawn whose pipe is then read synchronously; the '
+        'read blocks for as long as the child takes to produce output'
     ),
 
     # -- filesystem: the limb task 3778's vocabulary omitted entirely
@@ -162,6 +171,29 @@ DOTTED_PRIMITIVES: dict[str, str] = {
     'yaml.safe_dump': (
         'filesystem/CPU: the serialising half of the task 4201 measurement '
         '(8.15 ms / 11 KB); a stamping coroutine pays it on the loop thread'
+    ),
+    'json.load': (
+        'filesystem: reads a whole file handle to EOF and parses it; the same '
+        'read-off-disk cost as yaml.safe_load, and the spelling a coroutine '
+        'reaches for when the registry happens to be JSON rather than YAML'
+    ),
+    'json.dump': (
+        'filesystem: writes a whole document through a file handle on the '
+        'calling thread -- the serialising half of json.load'
+    ),
+    'os.listdir': (
+        'filesystem: a directory read, whose cost scales with the entry count '
+        'and is unbounded from the coroutine\'s point of view'
+    ),
+    'os.walk': (
+        'filesystem: os.listdir applied recursively -- the same cost per level '
+        'with no bound on the depth'
+    ),
+    'shutil.rmtree': (
+        'filesystem: a recursive delete, one unlink syscall per file, all of '
+        'them on the calling thread; this is the primitive behind '
+        'reconciliation/cli_stage_runner.py::gc_run_config_dir, which three '
+        'harness.py coroutines call inline'
     ),
 
     # -- lock: an flock waits on ANOTHER process, with no bound
@@ -176,16 +208,50 @@ DOTTED_PRIMITIVES: dict[str, str] = {
         'that yields instead, and is excluded below'
     ),
 
-    # -- network: a connect() can hang for the full TCP timeout
+    # -- network: NOMINAL in the scanned scope, and said plainly rather than
+    # left to read as coverage.  Measured at the amendment pass: no sync HTTP
+    # client is imported anywhere under `fused-memory/src` (no requests, no
+    # httpx, no urllib.request -- only urllib.parse, which is string work), and
+    # `socket.create_connection` matches nothing.  Both entries are here so the
+    # FIRST sync client to land is a finding rather than a fourth missed batch;
+    # neither is currently enforcing anything.
     'socket.create_connection': (
         'network: a DNS lookup plus a TCP handshake, either of which can park '
         'the loop thread for the full connect timeout'
+    ),
+    'urllib.request.urlopen': (
+        'network: the stdlib sync HTTP client -- blocks for connect, request '
+        'and the whole response body, bounded only by the server'
+    ),
+}
+
+# Builtins, matched as a bare `Name` that NOTHING has rebound: neither a
+# `from X import Y` binding nor a parameter or local assignment (a module that
+# writes its own `open` helper is then talking about that helper, not this).
+BUILTIN_PRIMITIVES: dict[str, str] = {
+    'open': (
+        'filesystem: the plainest spelling of a blocking file read or write, '
+        'and the one a coroutine reaches for without importing anything -- '
+        'invisible to a table that only knows dotted paths and methods, which '
+        'is how `open(p).read()` could have landed past this gate'
     ),
 }
 
 # Bare method names, matched on any receiver: `path.read_text()`.  Receiver
 # types are not inferred, so these match by attribute name alone -- the
 # deliberate trade for finding `self._path.read_text()` without type inference.
+#
+# DELIBERATELY ABSENT, with the counts that decided it: the directory-walk and
+# metadata methods.  Measured over `fused-memory/src` at this commit, adding
+# them would produce mkdir +18, exists +15, unlink +5, stat +4, iterdir +4,
+# glob +2, open (as a method) +7 -- ~55 new rows, every one of which needs a
+# hand-written disposition or the ledger becomes a page of "existing" waivers,
+# which is precisely the silent waiver this gate exists to prevent.  They are
+# also the names most likely to collide on an unrelated receiver, since match
+# is by attribute name alone.  Widening here is a triage exercise of its own,
+# filed as a follow-up rather than smuggled into an amendment pass; the
+# `open` BUILTIN below is included because it is unambiguous and costs zero
+# rows in the current tree.
 METHOD_PRIMITIVES: dict[str, str] = {
     'read_text': (
         'filesystem: the primitive behind task 4091\'s and task 4201\'s missed '
@@ -589,19 +655,21 @@ def _offloaded_callable_ids(func_node: ast.AST, ctx: _ModuleCtx) -> frozenset[in
 def _primitive_for_call(call: ast.Call, ctx: _ModuleCtx) -> str | None:
     """Return the blocking-primitive justification key, or ``None``.
 
-    Three match shapes, in order:
+    Four match shapes, in order:
       1. a bare ``Name`` bound by ``from <mod> import <name>`` whose resolved
          dotted path is in :data:`DOTTED_PRIMITIVES`;
-      2. a dotted ``Attribute`` chain (after ``import X as Y`` substitution)
+      2. an unbound, unshadowed bare ``Name`` in :data:`BUILTIN_PRIMITIVES`;
+      3. a dotted ``Attribute`` chain (after ``import X as Y`` substitution)
          in :data:`DOTTED_PRIMITIVES`;
-      3. a bare method name in :data:`METHOD_PRIMITIVES`, on any receiver.
+      4. a bare method name in :data:`METHOD_PRIMITIVES`, on any receiver.
     """
     func = call.func
 
     if isinstance(func, ast.Name):
         if ctx.name_is_rebound(func.id, call):
-            # A local binding holds this name, so the module's import bindings
-            # do not describe what it calls.
+            # A local binding holds this name, so neither the module's import
+            # bindings nor the builtins describe what it calls -- including a
+            # rebound `open`, which is then somebody's own helper.
             return None
         bound = ctx.bindings.get(func.id)
         if bound is not None:
@@ -610,6 +678,9 @@ def _primitive_for_call(call: ast.Call, ctx: _ModuleCtx) -> str | None:
                 return None
             if candidate in DOTTED_PRIMITIVES:
                 return candidate
+            return None
+        if func.id in BUILTIN_PRIMITIVES:
+            return func.id
         return None
 
     if isinstance(func, ast.Attribute):

@@ -56,6 +56,7 @@ from loop_blocking_allowlist import (
     DISPOSITIONS,
 )
 from loop_blocking_scan import (
+    BUILTIN_PRIMITIVES,
     DOTTED_PRIMITIVES,
     METHOD_PRIMITIVES,
     LoopBlockingSite,
@@ -813,6 +814,65 @@ class TestPrimitiveTable:
             'read_text', 'write_text', 'yaml.safe_dump', 'yaml.safe_load'
         ]
 
+    def test_builtin_open_is_a_finding_and_a_rebound_open_is_not(self):
+        """``open(...)`` blocks, and it is the one primitive nobody imports.
+
+        A bare builtin is invisible to both halves of the table -- it has no
+        dotted path and no receiver -- so ``open(p).read()`` in a coroutine
+        would have landed silently past this gate.  The rebinding half is what
+        keeps the builtin match honest: a module with its own ``open`` helper
+        is talking about that helper.
+        """
+        builtin = {
+            'pkg/mod.py': _module(
+                """
+                async def b(path):
+                    with open(path, encoding='utf-8') as fh:
+                        return fh.read()
+                """,
+            )
+        }
+        rebound = {
+            'pkg/mod.py': _module(
+                """
+                async def b(path, open):
+                    return open(path)
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(builtin)
+
+        assert [(f.qualname, f.primitive) for f in findings] == [('b', 'open')], (
+            f'a bare builtin open() in a coroutine must be a finding, got {findings}'
+        )
+        assert find_loop_blocking_sites(rebound) == []
+
+    def test_json_load_through_a_helper_is_a_finding(self):
+        """The vocabulary is not YAML-only: a JSON registry blocks identically.
+
+        Gap B (task 3778 enumerated ``subprocess.run`` alone) is a vocabulary
+        failure, and a vocabulary that stops at the spellings the tree happens
+        to use today re-opens it for the next author who picks a different one.
+        """
+        sources = {
+            'pkg/mod.py': _module(
+                'import json',
+                """
+                def load_registry(fh):
+                    return json.load(fh)
+                """,
+                """
+                async def b(fh):
+                    return load_registry(fh)
+                """,
+            )
+        }
+
+        findings = find_loop_blocking_sites(sources)
+
+        assert [(f.qualname, f.primitive) for f in findings] == [('b', 'json.load')]
+
     def test_from_import_binding_resolves_to_the_dotted_primitive(self):
         """``from subprocess import run`` then a bare ``run(...)`` still counts.
 
@@ -861,7 +921,7 @@ class TestPrimitiveTable:
 
     def test_every_table_entry_carries_a_justification(self):
         """A primitive with no stated reason is one a future census can drop unchallenged."""
-        for table in (DOTTED_PRIMITIVES, METHOD_PRIMITIVES):
+        for table in (DOTTED_PRIMITIVES, METHOD_PRIMITIVES, BUILTIN_PRIMITIVES):
             for name, justification in table.items():
                 assert justification.strip(), f'{name} has an empty justification'
 
@@ -872,13 +932,19 @@ class TestPrimitiveTable:
         """
         dotted = set(DOTTED_PRIMITIVES)
         assert {'subprocess.run', 'subprocess.check_output', 'subprocess.check_call',
-                'subprocess.Popen', 'os.system'} <= dotted
-        assert 'socket.create_connection' in dotted
+                'subprocess.call', 'subprocess.Popen', 'os.system',
+                'os.popen'} <= dotted
+        assert {'socket.create_connection', 'urllib.request.urlopen'} <= dotted
         assert 'fcntl.flock' in dotted
         assert 'time.sleep' in dotted
-        assert {'yaml.safe_load', 'yaml.safe_dump'} <= dotted
+        assert {'yaml.safe_load', 'yaml.safe_dump', 'json.load', 'json.dump',
+                'os.listdir', 'os.walk', 'shutil.rmtree'} <= dotted
         assert {'read_text', 'write_text', 'read_bytes', 'write_bytes'} <= set(
             METHOD_PRIMITIVES
+        )
+        assert 'open' in BUILTIN_PRIMITIVES, (
+            'the plainest filesystem spelling of all is a bare open(); a table '
+            'that only knows dotted paths and methods cannot see it'
         )
 
 
