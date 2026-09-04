@@ -40,7 +40,9 @@ assertions here fail in that case.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -48,6 +50,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import FALKOR_HOST, FALKOR_PORT, falkor_skipif, unique_graph_name
 from graphiti_core.errors import NodeNotFoundError
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
@@ -821,3 +824,143 @@ class TestPlanningEpisodeIsFilteredFromSearch:
         )
         assert results[0].metadata.get('planned') is not True
         assert results[0].provenance == [minted_uuid]
+
+
+# ---------------------------------------------------------------------------
+# step-11: acceptance criterion 1 verified DIRECTLY in FalkorDB
+#
+# Everything above runs against the fake. The fake is a faithful transcription
+# of graphiti_core 0.28.2's contract, but it is still a transcription — and the
+# defect this task fixes is precisely a case where the suite's model of the
+# backend and the backend disagreed for five months. This is the one test that
+# asks the real graph.
+#
+# Deselected by default (pyproject.toml's `-m 'not integration'`), so it
+# burdens neither CI nor a routine local run with OPENAI credits.
+# ---------------------------------------------------------------------------
+
+_LIVE_CONTENT = 'Task 3561 fixed the self-referential add_episode NodeNotFoundError.'
+
+
+async def _live_episodic_count(graph_name: str, episode_uuid: str) -> tuple[int, str | None]:
+    """Return ``(count, content)`` for the Episodic node named by *episode_uuid*.
+
+    READ-ONLY by construction: issued through FalkorDB's ``ro_query``, which the
+    server itself refuses to run a mutating statement on.  So this verification
+    cannot alter the graph it is inspecting — a real risk here, since the whole
+    claim under test is "a node with this uuid EXISTS", and a verification that
+    could write one would prove nothing.
+
+    DEVIATION from step-11 as written, recorded here and in esc-3561-10: the
+    step names ``_fm_helpers.assert_ro_query_only`` for this. That helper
+    installs a MagicMock over ``backend._driver._get_graph`` and asserts a
+    backend METHOD used ro_query; against a live graph it would return canned
+    rows and make this test vacuous — the exact opposite of its purpose. Its
+    stated rationale ("so the test cannot mutate the graph it is inspecting")
+    is what ``ro_query`` delivers directly, so the rationale is honoured and
+    only the mechanism differs.
+    """
+    from falkordb.asyncio import FalkorDB
+
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    try:
+        graph = client.select_graph(graph_name)
+        result = await graph.ro_query(
+            'MATCH (e:Episodic {uuid: $uuid}) RETURN count(e), e.content',
+            {'uuid': episode_uuid},
+        )
+        rows = list(getattr(result, 'result_set', None) or [])
+        if not rows:
+            return 0, None
+        count, content = rows[0][0], rows[0][1]
+        return int(count), content
+    finally:
+        await client.aclose()
+
+
+@falkor_skipif()
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='a real add_episode extracts entities via OpenAI',
+)
+# A real add_episode is an LLM round trip per extraction pass, well past the
+# suite's 60s default. Under `timeout_method = "thread"` an under-budget
+# timeout os._exit(1)s the whole xdist worker, so it would read as an
+# infrastructure crash rather than a slow test.
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
+    """Acceptance 1 + 3, against the REAL graph: the node exists AND carries the body.
+
+    The task description's measurement was that 0 of 28 historical episode_ids
+    resolved to a node — ``MATCH (e:Episodic {uuid: $uuid}) RETURN count(e)``
+    returned 0 every time.  This asserts it returns 1.
+
+    The content assertion is not redundant with it: it is what closes TRAP 1
+    end-to-end.  A "pre-create the EpisodicNode so the caller's uuid resolves"
+    fix would satisfy the count assertion — the node exists, by construction —
+    and fail this one, because when graphiti_core FINDS the uuid it saves the
+    stored node back and the caller's ``episode_body`` never lands.
+    """
+    from falkordb.asyncio import FalkorDB
+
+    graph_name = unique_graph_name('3561_episode_uuid')
+
+    config = mock_config.model_copy(deep=True)
+    # mock_config's api_keys are the literal string 'test-key'. Clearing them
+    # makes the OpenAI clients fall back to the real OPENAI_API_KEY env var —
+    # the idiom test_recon_dedup_premise.py:130-133 established for the two
+    # tests in this suite that need real embeddings.
+    config.llm.providers.openai.api_key = None
+    config.embedder.providers.openai.api_key = None
+    config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
+
+    backend = GraphitiBackend(config)
+    # skip_maintenance=True is load-bearing, not an optimisation: the default
+    # path enumerates EVERY graph on the server and runs an index build plus a
+    # dup-uuid-edge REPAIR (a write) over each. A test must never sweep the
+    # real project graphs sharing this FalkorDB instance.
+    await backend.initialize(skip_maintenance=True)
+    try:
+        # The scratch graph is virgin, and graphiti's entity-dedup search needs
+        # its indices. _ensure_indices is a deliberate no-op (task 3707);
+        # ensure_indices is the real provisioning path.
+        await backend.ensure_indices(group_id=graph_name)
+
+        svc = MemoryService(config)
+        svc.graphiti = backend
+        svc.mem0 = MagicMock()
+        svc.mem0.add = AsyncMock(return_value={'results': []})
+        svc.durable_queue = MagicMock()
+        svc.durable_queue.enqueue = AsyncMock(return_value=1)
+
+        # The real production route: enqueue, then execute the queued payload.
+        await svc.add_episode(content=_LIVE_CONTENT, project_id=graph_name)
+        result = await svc._execute_graphiti_write(
+            'add_episode', _enqueued_payload(svc)
+        )
+
+        real_uuid = result.episode.uuid
+        assert real_uuid, 'graphiti_core must report the uuid it minted'
+
+        count, stored_content = await _live_episodic_count(graph_name, real_uuid)
+
+        assert count == 1, (
+            f'MATCH (e:Episodic {{uuid: {real_uuid!r}}}) RETURN count(e) must be '
+            f'1. This query returned 0 for all 28 historical episode_ids — the '
+            f'measurement this task exists to correct. Got {count}.'
+        )
+        assert stored_content == _LIVE_CONTENT, (
+            'The persisted node must carry the content that was passed. A '
+            'pre-created-node fix (TRAP 1) satisfies the count assertion above '
+            f'and fails here. Got {stored_content!r}'
+        )
+    finally:
+        await backend.close()
+        cleanup = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            with contextlib.suppress(Exception):
+                await cleanup.select_graph(graph_name).delete()
+        finally:
+            await cleanup.aclose()
