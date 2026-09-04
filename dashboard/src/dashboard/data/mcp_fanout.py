@@ -444,6 +444,20 @@ async def first_success(
     passes a larger float; a caller wanting a tighter one keeps its own
     enclosing ``wait_for``. Expiry is an ordinary per-URL failure: it is logged,
     collected, invalidated and fallen through like any other.
+
+    **A cancellation invalidates the in-flight URL's session and then
+    re-raises.** ``asyncio.CancelledError`` derives from ``BaseException``, so
+    the ``except`` tuple above cannot catch it: a caller's enclosing
+    ``asyncio.wait_for`` firing mid-attempt used to unwind this function with
+    the hung URL's ``McpSession`` still cached, so every subsequent poll reused
+    it and hung identically — the incident shape this helper now closes.
+    Invalidating is consistent with the policy already in force here (a
+    ``httpx.TimeoutException`` invalidates too, and re-initialising a session
+    after a failure is cheap and strictly more conservative), and is harmless
+    during process shutdown, when the sessions are being torn down anyway.
+    Re-raising is mandatory: swallowing a ``CancelledError`` would break
+    shutdown and ``asyncio.gather`` sibling cancellation, which ``app.py``'s
+    ``safe_gather_result`` deliberately lets propagate.
     """
     # Local import breaks the memory<->mcp_fanout import cycle: memory.py
     # imports first_success at module top, so invalidate_session (which
@@ -462,6 +476,14 @@ async def first_success(
     for url in urls:
         try:
             result = await call_with_deadline(url, call, deadline)
+        except asyncio.CancelledError:
+            # Deliberately NOT reported through log_fanout_failure: a
+            # cancellation is not an endpoint failure, and counting it would
+            # corrupt the streak counters that gate the transition-only
+            # WARNING policy above (a cancelled poll would open a streak that
+            # demotes the next real failure's opening WARNING to DEBUG).
+            invalidate_session(url)
+            raise
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
                 TimeoutError, ValueError) as e:
             if log_failures:
