@@ -2643,12 +2643,37 @@ class SqliteTaskBackend:
                     parsed_metadata = None
             if isinstance(parsed_metadata, dict) and 'done_provenance' in parsed_metadata:
                 raise DoneProvenanceWriteAuthorityError(task_id)
-        # Structured fields (title/description/details/priority/dependencies)
-        # land deterministically — any non-None value overrides the current row.
-        # ``prompt`` is kept for backward compatibility: when no explicit
-        # ``details`` is passed it feeds the details path (replace, or append
-        # when ``append=True``). ``metadata`` retains the merge-or-replace
-        # semantics keyed off ``append``.
+        # Third pre-connection floor, and the last one: reject an append=True
+        # write aimed at a REPLACE-ONLY column. Placed here deliberately —
+        # after the two write-authority floors and BEFORE _resolve_metadata_mode
+        # and ensure_connected() — so the rejection precedes existence and
+        # connection errors, and so a call tripping BOTH this guard and
+        # _resolve_metadata_mode's merge+append carve-out surfaces the
+        # content-loss message rather than the metadata one (the description
+        # wipe is the hazard that was silent). See
+        # sqlite_task_backend.py::_reject_append_on_replace_only_fields.
+        _reject_append_on_replace_only_fields(
+            append, title=title, description=description, priority=priority,
+            task_id=task_id,
+        )
+        # How each field resolves against the current row:
+        # - ``title``/``description``/``priority`` are REPLACE-ONLY — a non-None
+        #   value overwrites the current row, and combining any of them with
+        #   ``append=True`` is REJECTED outright by the floor above (task 4039;
+        #   the pair used to be accepted silently and destroy authored prose,
+        #   four recorded live repros).
+        # - ``details`` honors ``append`` (concatenate) and otherwise replaces.
+        #   ``prompt`` is kept for backward compatibility: when no explicit
+        #   ``details`` is passed it feeds the details path with the same
+        #   append-or-replace semantics.
+        # - ``metadata`` keys off ``append``/``metadata_mode`` via
+        #   _resolve_metadata_mode.
+        # - ``dependencies`` is also replace-only but is deliberately NOT
+        #   covered by the task-4039 guard: the list is short, structurally
+        #   visible in ``get_task`` and cheap to re-derive, unlike the multi-KB
+        #   authored prose the repros destroyed. That is a decision, not an
+        #   oversight — widening the guard to a list-valued parameter with
+        #   different merge semantics is a separate call.
         # Validate the metadata_mode VALUE unconditionally — a bad value should
         # always raise immediately, even if no metadata is supplied in this
         # call. But scope the bare-append=False rejection (the task-2180
