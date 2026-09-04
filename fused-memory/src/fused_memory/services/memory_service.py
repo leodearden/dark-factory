@@ -5470,7 +5470,43 @@ class MemoryService:
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
-        """Dispatch a queued write to the Graphiti backend."""
+        """Dispatch a queued write to the Graphiti backend.
+
+        EPISODE-UUID CONTRACT (task 3561).  ``graphiti_core.Graphiti.add_episode``
+        treats its ``uuid=`` argument as a LOAD instruction, not a
+        create-with-this-id instruction (verified against the installed
+        0.28.2)::
+
+            episode = (await EpisodicNode.get_by_uuid(self.driver, uuid)
+                       if uuid is not None
+                       else EpisodicNode(...))
+
+        So a *freshly minted* uuid is unconditionally ``NodeNotFoundError``,
+        and only ``uuid=None`` reaches the CREATE branch.  Three consequences
+        are load-bearing here, and each has a guard below:
+
+        * The add_episode branch passes ``uuid=None`` unconditionally and is
+          deliberately not parameterised — there is no value other than None a
+          caller could legitimately supply at this seam.
+        * A legacy ``'uuid'`` key is POPPED and warned about before the write.
+          The durable queue outlives the deploy that stopped writing that key,
+          so rows enqueued before the fix still carry it; without the pop the
+          defect would survive its own fix for as long as the backlog does.
+        * Planning-episode registration keys on ``result.episode.uuid`` — the
+          uuid graphiti_core actually minted, and the ONLY place it is
+          observable.  Registering anything else is silently vacuous:
+          ``_search_graphiti`` matches registered uuids against edge episode
+          PROVENANCE, so a uuid naming no graph node makes the planned-episode
+          filter permanently inert while ``is_planned()`` still answers True.
+
+        ANTI-REGRESSION.  ``GraphitiBackend.add_episode`` still accepts a
+        ``uuid=`` parameter, and task 3561 deliberately did not remove it —
+        that layer is a faithful pass-through to graphiti_core, and the
+        parameter is meaningful for its documented purpose (naming an episode
+        that ALREADY exists).  It is not a create-time id, and no caller may
+        pass it a freshly minted one.  This function is the only production
+        caller; keep it that way, or re-derive this contract at the new one.
+        """
         source_str = payload.get('source', 'text')
         try:
             episode_type = EpisodeType[source_str]
@@ -5917,6 +5953,23 @@ class MemoryService:
         flag follows the same payload -> backend path as ``temporal_context``
         so both the Graphiti episodic node and every derived Mem0 fact carry
         it.
+
+        THE ENQUEUE PAYLOAD MUST NEVER CARRY A ``'uuid'`` KEY (task 3561).
+        ``_execute_graphiti_write`` forwards the payload to graphiti_core,
+        where ``uuid=`` means "LOAD this existing episode" — so a uuid minted
+        here, before any node exists, is unconditionally ``NodeNotFoundError``.
+        That is precisely what commit 64cb2538fe ("fix: include uuid in
+        add_episode enqueue payload") introduced: from it until task 3561
+        every add_episode write failed this way (304 attempts, 0 successes,
+        0 of 28 historical episode_ids resolving to a real node).  The
+        correlation id below therefore rides a ``'correlation_id'`` key, which
+        no code path can mistake for a load instruction.
+
+        ``AddEpisodeResponse.episode_id`` is consequently a CORRELATION id,
+        ``corr_``-prefixed, not an episode uuid: it is returned synchronously
+        at enqueue time, and the real uuid does not exist until the queued
+        write runs.  The two are tied together by an INFO log in
+        ``_execute_graphiti_write``, which is the only record of the mapping.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         # task 3561: this id is minted HERE, at enqueue time, before the queued
