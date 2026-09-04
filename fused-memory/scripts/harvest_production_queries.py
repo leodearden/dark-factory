@@ -209,6 +209,18 @@ class HarvestResult:
     tail_share: float | None
     literal_share: float | None
     family_share: float | None
+    """Share of all four BRIEFING TEMPLATES: the 3 literals PLUS the family.
+
+    The numerator is `literal_total + family_total`, i.e. the UNION -- not
+    the parameterized `task {task_id} ...` family alone.  The two are far
+    apart and the name invites the wrong reading: in the committed sidecar
+    this is 0.645536 while the parameterized family by itself is 0.125334
+    (its `TemplateClass.traffic_share`).  The CLI prints it under the label
+    `4-template family`, which is the union, and `read_transform_selection`
+    publishes the same union under the same name -- computed independently
+    as the sum of the four template shares.
+    """
+
     journal_path: str
     tail_sample: int
     tail_top: int
@@ -640,6 +652,8 @@ def harvest(
         tail_distinct=len(tail_counts),
         tail_share=_share(tail_total, total),
         literal_share=_share(literal_total, total),
+        # The UNION of all four briefing templates, not the parameterized
+        # family alone -- see `HarvestResult.family_share`.
         family_share=_share(literal_total + family_total, total),
         journal_path=_repo_relative(db_path),
         tail_sample=tail_sample,
