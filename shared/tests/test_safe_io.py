@@ -825,10 +825,14 @@ class TestAtomicWriteRaceSafety:
 # The anti-regrowth guard (task 3223) MOVED OUT of this file — task 3388.
 # ---------------------------------------------------------------------------
 #
-# It now lives at ``tests/scripts/test_atomic_write_regrowth.py``, unchanged
-# apart from the relocation.  Nothing was deleted and no coverage was dropped:
-# search there for ``_ALLOWED_RENAMERS``, ``_find_renamers``, ``_SRC_TREES`` and
-# ``TestNoRegrownAtomicWriters``.
+# Nothing was deleted and no coverage was dropped: ``_ALLOWED_RENAMERS`` in
+# ``tests/scripts/test_atomic_write_regrowth.py`` is the same allowlist, beside
+# the same ``_find_renamers``, ``_SRC_TREES`` and ``TestNoRegrownAtomicWriters``.
+#
+# That sentence is written in the canonical pointer form on purpose, so the
+# repo-level sweep (test_atomic_write_regrowth.py::
+# test_allowlist_pointers_resolve_to_the_guard_module) CHECKS it: if the guard
+# moves again, this comment goes red rather than quietly rotting into a lie.
 #
 # WHY IT LEFT.  Task 3388 widened the guard from three source trees to six, so
 # it began asserting on five packages ``shared`` does not own.  A guard that

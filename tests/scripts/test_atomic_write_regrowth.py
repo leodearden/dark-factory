@@ -49,6 +49,7 @@ cross-tree gates still live there; they are enumerated, with measured counts, in
 ``test_atomic_write_guard_does_not_scan_sibling_package_trees`` below.
 """
 import ast
+import re
 from pathlib import Path
 
 # tests/scripts/<file>.py and shared/tests/<file>.py are both exactly two levels
@@ -746,4 +747,118 @@ def test_every_declared_tree_contributes_scanned_files():
         'case repoint _CONTROL_MODULES at another long-lived module in the same '
         'tree rather than deleting the entry, which would restore the vacuity this '
         'test exists to prevent.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pointer resolution (task 3388)
+# ---------------------------------------------------------------------------
+
+#: Prose of the form ``_ALLOWED_RENAMERS`` in ``<path>.py`` — i.e. the path a
+#: comment CLAIMS is the symbol's home.  Keyed on that ADJACENCY, deliberately,
+#: and NOT on the obvious looser form "the file mentions the symbol and also
+#: names some .py path".  Measured: the loose form matches 30+ .py paths inside
+#: this module alone, because every _ALLOWED_RENAMERS KEY is a .py path sitting
+#: beside the symbol — so the check would fail on its own definition site.
+#:
+#: Backticks are optional and the gaps span newlines AND the ``#`` of a wrapped
+#: comment: session_registry.py wraps the phrase across a line break inside a
+#: docstring (pure whitespace), while test_safe_io.py's pointer wraps inside a
+#: ``#`` comment block.  A plain ``\s+`` matches the first and silently misses
+#: the second — measured, when this module's own pointer went unseen — so a
+#: pointer that merely got rewrapped would stop being checked without anything
+#: reporting it.  A pointer written without RST markup is still a pointer.
+_POINTER_RE = re.compile(r'_ALLOWED_RENAMERS`{0,2}[\s#]+in[\s#]+`{0,2}([\w./\-]+\.py)')
+
+#: Trees swept for pointers IN ADDITION to _SRC_TREES.  A stale pointer is a
+#: documentation defect, and documentation about this guard lives mostly in
+#: test files — which _SRC_TREES only reaches for the two flat operator trees.
+#: ``scripts/tests`` is already inside the ``scripts`` scan root and
+#: ``tests/scripts`` inside ``tests``; the walk dedupes by path.
+_POINTER_EXTRA_TREES = (
+    'shared/tests',
+    'orchestrator/tests',
+    'escalation/tests',
+    'fused-memory/tests',
+    'cockpit/tests',
+    'dashboard/tests',
+    'sampler/tests',
+    'tests',
+)
+
+
+def _iter_pointer_candidates():
+    """Yield (repo-relative posix path, source) over _SRC_TREES + the tests trees."""
+    seen: set[str] = set()
+    for relpath, source in _iter_source_files():
+        seen.add(relpath)
+        yield relpath, source
+    for tree in _POINTER_EXTRA_TREES:
+        root = _REPO_ROOT / tree
+        # Same loud-not-silent contract as _iter_source_files: a sweep that
+        # quietly stops covering a tree it can no longer find reports green by
+        # scanning nothing, which is the failure this whole module exists for.
+        assert root.is_dir(), (
+            f'{tree} not found under {_REPO_ROOT} — this sweep walks fixed tree '
+            f'names, so a moved/renamed package must update _POINTER_EXTRA_TREES '
+            f'rather than let the sweep silently cover less.'
+        )
+        for py in sorted(root.rglob('*.py')):
+            relpath = py.relative_to(_REPO_ROOT).as_posix()
+            if relpath in seen:
+                continue
+            seen.add(relpath)
+            yield relpath, py.read_text(encoding='utf-8')
+
+
+def test_allowlist_pointers_resolve_to_the_guard_module():
+    """Every comment claiming to name the allowlist's home names a file that has it.
+
+    A REFERENCE-RESOLUTION check, not a prose pin.  It asserts that a named path
+    exists AND actually contains the assignment — nothing about wording — so it
+    does not go stale when someone rewrites the surrounding sentence, and it is
+    not satisfied by a file that still exists but no longer owns the symbol.
+    That second half is the load-bearing one: it is exactly the state task 3388
+    step 4 created by moving the guard out of ``shared/tests/test_safe_io.py``,
+    a file that very much still exists.
+
+    The guard module itself is excluded by identity — the file that DEFINES the
+    symbol is the definition, not a pointer to it.  Belt-and-braces rather than
+    load-bearing: the adjacency matcher self-matches 0 times here (verified),
+    which is the whole reason it is keyed on adjacency.
+    """
+    guard_module = Path(__file__).resolve().relative_to(_REPO_ROOT).as_posix()
+
+    pointers: list[str] = []
+    broken: list[str] = []
+    for relpath, source in _iter_pointer_candidates():
+        if relpath == guard_module:
+            continue
+        for match in _POINTER_RE.finditer(source):
+            claimed = match.group(1)
+            site = f'{relpath}:{source.count(chr(10), 0, match.start()) + 1}'
+            pointers.append(site)
+            target = _REPO_ROOT / claimed
+            if not target.is_file():
+                broken.append(f'{site} names {claimed}, which does not exist')
+            elif '_ALLOWED_RENAMERS = ' not in target.read_text(encoding='utf-8'):
+                broken.append(
+                    f'{site} names {claimed}, which exists but no longer defines '
+                    f'the allowlist'
+                )
+
+    # Non-vacuity: pointers to this guard DO exist in the repo, so finding none
+    # means the matcher regressed, not that the docs got tidy.
+    assert pointers, (
+        'The pointer sweep matched nothing. Real pointers exist (orchestrator '
+        'session_registry.py and test_session_registry.py both carry one), so '
+        'an empty result means _POINTER_RE stopped matching or '
+        '_iter_pointer_candidates stopped walking — not that the repo is clean.'
+    )
+
+    assert not broken, (
+        'Stale pointers to the atomic-write allowlist:\n  '
+        + '\n  '.join(broken)
+        + f'\nThe allowlist lives in {guard_module}. Repoint the path and leave '
+        'the surrounding paragraph alone; the rationale it records is unchanged.'
     )
