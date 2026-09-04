@@ -235,7 +235,7 @@ class TestUnknownKeyStormDetector:
 
         detector.record('p', 'a', ['k'])
         detector.record('p', 'a', ['k'])
-        assert len(detector._warns[('p', 'a')]) == 2
+        assert detector._warns[('p', 'a')].prune(300) == 2
         # And the counting contract still holds across the sweep.
         assert detector.record('p', 'a', ['k']) is True
 
@@ -251,12 +251,12 @@ class TestUnknownKeyStormDetector:
         detector._sweep_every = 2
 
         assert detector.record('p', 'a', ['k', 'k2']) is True
-        assert ('p', 'a') in detector._firing
+        assert detector._warns[('p', 'a')].latched is True
 
         clock.advance(301)
         detector.record('p', 'other', ['k'])
         detector.record('p', 'other', ['k'])
-        assert ('p', 'a') not in detector._firing
+        assert ('p', 'a') not in detector._warns
 
         assert detector.record('p', 'a', ['k', 'k2']) is True, 'must fire again'
 
@@ -358,6 +358,38 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
             assert detector.record('p', 'a', ['k']) is False, (
                 f'the crossing is the event, not the state (t={offset})'
             )
+
+    def test_a_latched_writer_is_not_re_reported_by_one_multi_key_call(self):
+        """CHARACTERIZATION of the migration's exact-equivalence guard.
+
+        This class's contract is one decision per CALL, while a StormCounter
+        decides per EVENT — and a call carries every ``unknown_key`` violation
+        from one write, so multi-key calls are routine (``memory_service.py``
+        passes a list). Within a call the count only rises, so a naive
+        per-key ``fired = fired or ...`` fold would let the FIRST key of a call
+        land below the threshold, re-arm the counter mid-loop, and let a later
+        key of the SAME call fire — reporting a writer that was already latched
+        on entry.
+
+        Pre-migration that call returned False, and this pins that it still
+        does. Whether the latch SHOULD survive a window that fully drained is a
+        real question, but it is a live-path behaviour change and not this
+        task's (task 4519 is INV-5 de-duplication) — filed as its own follow-up
+        under esc-4519-2. Do not "simplify" the ``was_latched`` guard away
+        without reading it: this test is what would go red.
+        """
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=3, window_seconds=300)
+
+        assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
+
+        clock.advance(301)
+        assert detector.record('p', 'a', ['x', 'y', 'z']) is False, (
+            'the writer was latched on entry, so this call is not a new crossing'
+        )
+        assert detector._warns[('p', 'a')].latched is True, (
+            'and it stays latched, exactly as the pre-migration _firing set did'
+        )
 
 
 class TestFileUnknownKeyStormEscalation:
