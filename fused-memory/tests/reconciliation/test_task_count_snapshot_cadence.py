@@ -36,7 +36,6 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation import task_count_snapshot_cadence
 from fused_memory.reconciliation.stages import (
     task_knowledge_sync as task_knowledge_sync_module,
 )
@@ -163,20 +162,6 @@ class TestConstants:
     def test_escalation_category_value(self):
         assert ESCALATION_CATEGORY == 'recon_stale_task_count_snapshot'
 
-    def test_legacy_written_stat_key_is_retired(self):
-        """API-surface contract: the pre-rename alias must stay GONE — task 3488.
-
-        Asserts a runtime module export, not docstring prose. Deliberately
-        reads the MODULE rather than importing the name: importing a name in
-        order to assert its absence is self-defeating.
-
-        This is what stops a future edit from quietly resurrecting the
-        read-only back-compat alias that task 3045 introduced and task 3488
-        retired, once measurement confirmed no in-window journal row could
-        still change the computed miss streak.
-        """
-        assert not hasattr(task_count_snapshot_cadence, 'LEGACY_SNAPSHOT_WRITTEN_STAT_KEY')
-
 
 # ---------------------------------------------------------------------------
 # extract_snapshot_written
@@ -244,6 +229,13 @@ class TestExtractSnapshotWritten:
     #
     # Raw literals below, not a constant: the constant is gone, and the
     # literal is what real journal blobs contain.
+    #
+    # These two are the PRIMARY regression guard on the retirement: they fail
+    # for any behavioural resurrection of the fallback -- under the old
+    # constant name, a new one, an inline literal, or a `.get(...) or ...`
+    # chain. (An earlier symbol-introspection assertion on the constant's
+    # absence was dropped as strictly weaker: it missed every spelling but
+    # one, and fired on a harmless unused re-declaration.)
 
     def test_pre_rename_key_0_is_unknown_on_stage_report(self):
         """The important direction: a pre-rename CONFIRMED MISS must now read

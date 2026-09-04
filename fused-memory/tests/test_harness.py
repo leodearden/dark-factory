@@ -17381,18 +17381,17 @@ def _snapshot_stage_reports(stat: int | None, key: str = SNAPSHOT_WRITTEN_STAT_K
     handles both, and the raw shape keeps these test doubles lightweight.
 
     *key* selects the stat spelling. It survives the task-3488 retirement of
-    the pre-rename alias because TestPreRenameJournalRowIsNoLongerHonored
-    still needs to build a fixture carrying the old spelling — in order to
-    assert it is now read as UNKNOWN rather than as a miss.
+    the pre-rename alias for exactly one caller — _make_prior_run, used by
+    TestPreRenameJournalRowIsNoLongerHonored to build a fixture carrying the
+    old spelling, in order to assert it is now read as UNKNOWN rather than as
+    a miss. Every other caller takes the default.
     """
     if stat is None:
         return {}
     return {'task_knowledge_sync': {'stats': {key: stat}}}
 
 
-def _make_current_run(
-    run_id: str, stat: int | None, key: str = SNAPSHOT_WRITTEN_STAT_KEY,
-) -> ReconciliationRun:
+def _make_current_run(run_id: str, stat: int | None) -> ReconciliationRun:
     """Build a real ReconciliationRun (not a SimpleNamespace stand-in) so it
     type-checks against _maybe_escalate_stale_task_count_snapshot's ``run:
     ReconciliationRun`` parameter — mirrors the ``_make_fake_rfc`` convention
@@ -17404,7 +17403,7 @@ def _make_current_run(
         run_type=RunType.full,
         trigger_reason='test',
         started_at=datetime.now(UTC),
-        stage_reports=_snapshot_stage_reports(stat, key),
+        stage_reports=_snapshot_stage_reports(stat),
     )
 
 
@@ -17602,10 +17601,18 @@ class TestMaybeEscalateStaleTaskCountSnapshot:
 class TestPreRenameJournalRowIsNoLongerHonored:
     """A pre-rename journal row must resolve as UNKNOWN, not as a miss — task 3488.
 
-    This class pins the DELIBERATE post-retirement contract, and it is the
-    only thing in the tree that would catch a silent re-introduction of
-    extract_snapshot_written's legacy-key fallback (or a `.get(...) or ...`
-    chain that recreates it).
+    This class pins the DELIBERATE post-retirement contract END TO END: a
+    pre-rename prior row plus a confirmed current miss must flow all the way
+    through _maybe_escalate_stale_task_count_snapshot without escalating.
+    That wiring — streak stops -> _escalate not called — is what this test
+    uniquely covers.
+
+    It is NOT the primary guard on extract_snapshot_written itself. That is
+    test_pre_rename_key_0_is_unknown_on_stage_report (and its raw-dict twin)
+    in tests/reconciliation/test_task_count_snapshot_cadence.py, which catch
+    a re-introduced legacy-key fallback — or a `.get(...) or ...` chain that
+    recreates it — at the unit level, without standing up a harness, a
+    journal double and two ReconciliationRun models.
 
     Direction matters, and it is fail-SAFE. A pre-rename blob now reads
     None, and compute_snapshot_miss_streak STOPS on unknown rather than
@@ -17640,7 +17647,7 @@ class TestPreRenameJournalRowIsNoLongerHonored:
         streak stops at 1 < 2, and nothing fires.
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        run = _make_current_run('run-current', 0, SNAPSHOT_WRITTEN_STAT_KEY)
+        run = _make_current_run('run-current', 0)
         harness.journal.get_recent_runs = AsyncMock(return_value=[
             _make_prior_run(
                 'run-prior-pre-rename', 'full', 'completed', 0,
