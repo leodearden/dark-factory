@@ -165,6 +165,24 @@ class StormCounter:
         """
         return self._fire_mode
 
+    @property
+    def latched(self) -> bool:
+        """Whether a ``fire_mode='latched'`` counter has already reported.
+
+        ``True`` between the call that crossed the threshold and the first
+        call that finds the window back below it (the re-arm). Always ``False``
+        in ``rate_limited`` mode, which has no latch — that mode suppresses on
+        the elapsed window instead, via ``_last_fire_ts``.
+
+        Read-only, and exposed for the same reason :attr:`count_distinct` and
+        :attr:`fire_mode` are: a per-key consumer and its tests read this state
+        through a supported surface instead of coupling to private attributes
+        of another package — the coupling task 3259's amendment (3d4418c777)
+        removed when it replaced ``harness._dead_owner_storm._count_distinct``
+        with the public property.
+        """
+        return self._latched
+
     def _prune(self, now: float, window_seconds: float) -> int:
         """Drop events older than the window as of *now*; return how many remain.
 
@@ -194,6 +212,17 @@ class StormCounter:
         was still in the deque — so an empty window implies that fire has
         already aged past the rate limit, and a freshly constructed counter
         would decide identically on the next event.
+
+        That stays true in ``fire_mode='latched'``, whose only extra state is
+        :attr:`latched`. An empty window is below any threshold ``>= 1``, so
+        the next event lands under the line and RE-ARMS a kept counter before
+        the latch could ever suppress — it decides exactly as a fresh one
+        would. This is what lets a one-counter-per-key sweeper clear a latch
+        structurally, by deleting the object that holds it, rather than
+        remembering to reset a parallel set (the residue INV-5 deletes at
+        ``fused_memory/services/memory_metadata_census.py``). Pinned by
+        ``shared/tests/test_storm_counter.py::TestLatchedState::
+        test_a_latched_drained_counter_decides_like_a_fresh_one``.
 
         The returned count is the number of remaining EVENTS in every mode,
         never the distinct-key count: this is an emptiness probe for sweepers
