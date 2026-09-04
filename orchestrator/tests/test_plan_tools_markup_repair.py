@@ -449,6 +449,15 @@ def _alternate_writer_changed_the_cell(
     """(changed, refusal) for calling *tool_name* on a plan seeded through the
     real writers, addressed at the (*collection*, *field*) cell.
 
+    PRECONDITION — every candidate must be a real MCP tool impl, i.e. must
+    return a ``Mapping`` status envelope. A non-Mapping return is a DERIVATION
+    defect (something that writes plan.json but is not a probeable tool
+    reached the candidate set) and is reported as an ``AssertionError`` naming
+    the candidate, never as a bare ``AttributeError`` on ``.get``. The raise
+    is unconditional: skipping instead would leave the row unprobed and its
+    ``also_written_by`` under-reported, which is the defect class this whole
+    surface exists to end.
+
     ``changed`` is True iff the cell's value differs after the call AND its
     item still exists. ``refusal`` is the tool's own status envelope when that
     envelope indicates it declined the call (``None`` on a successful call,
@@ -545,6 +554,14 @@ def _alternate_writer_changed_the_cell(
                 'write plan.json'
             )
     result = impl(artifacts, **kwargs)
+    assert isinstance(result, Mapping), (
+        f'{impl.__name__} returned {type(result).__name__}, not a Mapping '
+        'status envelope — either it is not an MCP tool impl and must not be '
+        'a candidate (_registered_plan_tool_names() does not name it; check '
+        'whether the derivation in _plan_writing_tool_names regressed), or it '
+        'is a real tool whose status-envelope contract changed and this probe '
+        'must be updated'
+    )
     refusal = None
     if not (result.get('status') == 'ok' or result.get('ok') is True):
         refusal = result
