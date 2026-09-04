@@ -152,24 +152,73 @@ _LOCK_BYPASS_REWARN_EVERY = 100
 # worst case is a low tens of connections even if every key wedged at once.
 _MAX_LIVE_BYPASSES_PER_KEY = 3
 
+# ── the one fan-out failure tuple ───────────────────────────────────
+#
+# "This URL failed; log it, record it, invalidate its session and move on."
+# Exported rather than re-spelled per site: this tuple previously existed
+# verbatim in three places (:func:`first_success` plus ``memory``'s two
+# hand-rolled aggregating loops), and adding the builtin ``TimeoutError``
+# under task 4958 had to edit all three in lockstep — exactly the drift a
+# triple copy invites. One definition means the next addition cannot
+# half-land.
+#
+# Members:
+#   ``httpx.ConnectError`` / ``httpx.TimeoutException`` /
+#   ``httpx.HTTPStatusError`` — transport-level failures.
+#   ``TimeoutError`` (the BUILTIN) — a whole-operation expiry. Listed IN
+#     ADDITION to ``httpx.TimeoutException`` because the two are unrelated
+#     types: ``httpx.TimeoutException`` derives from ``httpx.HTTPError``, NOT
+#     from the builtin, so catching one does not catch the other.
+#   ``ValueError`` — a caller-detected "soft failure" (a structured MCP error
+#     dict, an empty/malformed result) that ``call`` raises to signal
+#     fall-through. :class:`PreformattedFanoutError` subclasses it.
+#
+# ``task_runtime`` and ``merge_halt`` carry their own near-copies with
+# ``OSError`` added. They are outside task 4958's file lock and deliberately
+# left alone; folding them in is a separate change.
+FANOUT_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.HTTPStatusError,
+    TimeoutError,
+    ValueError,
+)
+
+
 # ── per-URL whole-operation deadline (task 4958) ────────────────────
 #
-# DERIVATION, not a guessed threshold. ``memory.mcp_tool_call``'s per-request
-# default is 10s and a *cold* session performs three posts — ``initialize``,
-# ``notifications/initialized``, then ``tools/call`` — so 30s is the worst
-# LEGITIMATE cold-session cost. 45.0 adds 50% margin for server think time so a
-# slow-but-healthy endpoint is never converted into a false "offline" pill, and
-# stays deliberately BELOW the dashboard suite's ``timeout = 60`` pytest-timeout
-# ini value so an unbounded-wait regression surfaces as our own logged
-# fall-through rather than a SIGALRM kill mid-test.
+# DERIVATION, not a guessed threshold — and derived from the worst closure
+# :func:`first_success` SUPPORTS, not from the simplest one. Its contract
+# admits "a coroutine performing several paired calls against that URL", and
+# ``scheduler::collect_scheduler_state``'s ``_call`` is exactly that: one
+# ``get_scheduler_state`` plus two ``get_scheduler_events``. Against a COLD
+# session that is FIVE posts — ``initialize`` and
+# ``notifications/initialized``, then three ``tools/call`` — each at
+# ``memory.mcp_tool_call``'s 10s per-request default, so 50s is the worst
+# LEGITIMATE cost of a supported closure. 75.0 adds 50% margin for server
+# think time so a slow-but-healthy endpoint is never converted into a false
+# offline sentinel — for the scheduler that sentinel is ``(None, [], [])``,
+# i.e. the whole scheduler tab blanks out, and because that fan-out runs
+# per-project under ``asyncio.gather`` it would bite hardest on the
+# multi-project dashboards that are already slowest.
 #
-# This is a BACKSTOP, not a latency target: it is ~1600x below the 19.8h hang
+# (This was 45.0 as first written, derived from the three-post SINGLE-tool-call
+# case; that is below the 50s above, so the scheduler's legitimate worst case
+# sat outside the budget. Raised under review, task 4958.)
+#
+# Deliberately ABOVE the dashboard suite's ``timeout = 60`` pytest-timeout ini
+# value, which the 45.0 derivation had tried to stay under. The consequence is
+# accepted, not mitigated by shrinking an operator-facing backstop to fit the
+# test harness' clock: no test waits on this constant — every one either passes
+# an explicit ``per_url_timeout`` or monkeypatches this name (which works
+# because it is resolved at CALL time, see :func:`call_with_deadline`) — so the
+# only thing 60s would buy is a prettier failure for a hypothetical future test
+# that forgot to.
+#
+# This is a BACKSTOP, not a latency target: it is ~950x below the 19.8h hang
 # that motivated it, and callers needing tight latency keep their own enclosing
-# ``asyncio.wait_for`` (metrics.py does, at 2-5s). Resolved at CALL time by
-# :func:`first_success` rather than captured as a def-time default argument, so
-# a test can monkeypatch it and have it take effect immediately — the same
-# idiom :class:`TTLCache` documents for ``ttl_seconds``.
-_DEFAULT_PER_URL_DEADLINE_SECONDS = 45.0
+# ``asyncio.wait_for`` (metrics.py does, at 2-5s).
+_DEFAULT_PER_URL_DEADLINE_SECONDS = 75.0
 
 # ── why a per-HTTP-request budget cannot bound the operation ────────
 #
@@ -390,36 +439,53 @@ def reset_failure_streaks() -> None:
 async def call_with_deadline(
     url: str,
     call: Callable[[str], Awaitable[V]],
-    deadline: float,
+    deadline: float | None = None,
 ) -> V:
     """Await ``call(url)`` under a whole-operation *deadline*, in seconds.
 
     The shared layering primitive for this cluster: an MCP ``timeout`` is a
     per-HTTP-request budget and cannot bound an operation (see the note beside
     :data:`_DEFAULT_PER_URL_DEADLINE_SECONDS`), so a hard bound has to come
-    from an enclosing ``asyncio.wait_for``. ``task_runtime``, ``metrics`` and
+    from an enclosing deadline. ``task_runtime``, ``metrics`` and
     ``merge_halt`` each hand-rolled that pairing; this is the one copy the
     fan-out helpers use.
 
-    On expiry the bare ``TimeoutError`` ``asyncio.wait_for`` raises carries an
-    EMPTY message, which :func:`describe_exc` degrades to the content-free
-    string ``'TimeoutError'`` — exactly the causeless log line and offline pill
-    that function exists to prevent. It is therefore re-raised as a
-    message-bearing ``TimeoutError`` naming the budget, so an operator can tell
-    "our whole-operation backstop fired" from an httpx read timeout. A plain
+    ``deadline=None`` means :data:`_DEFAULT_PER_URL_DEADLINE_SECONDS`, resolved
+    HERE at *call* time rather than captured as a def-time default argument, so
+    a monkeypatched module constant takes effect immediately — the same idiom
+    :class:`TTLCache` documents for ``ttl_seconds``. Resolving it in this one
+    place is what lets :func:`first_success` and ``memory``'s two hand-rolled
+    aggregating loops share one policy instead of each re-implementing the
+    fallback, and keeps the constant private to this module rather than reached
+    into across a module boundary.
+
+    On expiry the ``TimeoutError`` ``asyncio.timeout`` raises carries an EMPTY
+    message, which :func:`describe_exc` degrades to the content-free string
+    ``'TimeoutError'`` — exactly the causeless log line and offline pill that
+    function exists to prevent. It is therefore re-raised as a message-bearing
+    ``TimeoutError`` naming the budget, so an operator can tell "our
+    whole-operation backstop fired" from an httpx read timeout. A plain
     ``TimeoutError`` (not :class:`PreformattedFanoutError`) is used because
     ``describe_exc``'s normal ``'Type: message'`` rendering is already correct
     here — the type name is the diagnosis, not a duplicate prefix.
 
-    Only the EMPTY-message ``TimeoutError`` is re-rendered. A ``TimeoutError``
-    that *call* raised itself already carries a cause (``metrics.py``'s inner
-    ``wait_for``, say) and is re-raised untouched, so this helper can never
-    overwrite a more specific diagnosis with a generic one.
+    Whose deadline fired is decided STRUCTURALLY, by ``asyncio.timeout``'s
+    ``expired()``, never by sniffing the exception's message. Only OUR budget's
+    expiry is re-rendered; a ``TimeoutError`` raised by *call* itself — most
+    importantly one from a nested ``asyncio.wait_for`` with its own, tighter
+    budget, which raises an EMPTY message too — is re-raised untouched. Message
+    emptiness would have mis-attributed such an expiry as "no response within
+    75.0s" after 2s, putting a wrong number in the one operator-facing string
+    this helper exists to make trustworthy.
     """
+    if deadline is None:
+        deadline = _DEFAULT_PER_URL_DEADLINE_SECONDS
+    cm = asyncio.timeout(deadline)
     try:
-        return await asyncio.wait_for(call(url), deadline)
-    except TimeoutError as e:
-        if str(e):
+        async with cm:
+            return await call(url)
+    except TimeoutError:
+        if not cm.expired():
             raise
         raise TimeoutError(
             f'no response within {deadline:.1f}s (whole-operation deadline)',
@@ -439,26 +505,18 @@ async def first_success(
 
     ``call`` is invoked with one URL at a time and must return an awaitable
     (a single MCP tool call, or a coroutine performing several paired calls
-    against that URL). On:
+    against that URL). On any member of
+    :data:`FANOUT_FAILURE_EXCEPTIONS` — transport errors, a whole-operation
+    ``TimeoutError``, or a caller-raised ``ValueError`` signalling a soft
+    failure; see that tuple for what each one means — the failing URL's cached
+    MCP session is invalidated, the error is recorded, and the loop continues
+    to the next URL. Any other exception type propagates uncaught.
 
-    - ``httpx.ConnectError`` / ``httpx.TimeoutException`` / ``httpx.HTTPStatusError``
-      — a transport-level failure;
-    - the builtin ``TimeoutError`` — a whole-operation expiry. It is listed
-      *in addition to* ``httpx.TimeoutException`` because the two are
-      unrelated types: ``httpx.TimeoutException`` derives from
-      ``httpx.HTTPError``, **not** from the builtin, so catching one does not
-      catch the other. Before it was listed here a bare ``TimeoutError`` (the
-      type ``asyncio.wait_for`` raises on expiry) propagated uncaught, which
-      is why ``metrics.py`` hand-converts ``TimeoutError`` into ``ValueError``
-      before calling in. That conversion is still correct — it happens before
-      this frame sees the exception — and is deliberately left in place;
-    - ``ValueError`` — a caller-detected "soft failure" (e.g. a structured
-      MCP error dict or an empty/malformed result) that *call* raises to
-      signal fall-through;
-
-    the failing URL's cached MCP session is invalidated, the error is
-    recorded, and the loop continues to the next URL. Any other exception
-    type propagates uncaught.
+    Before the builtin ``TimeoutError`` was listed there, it propagated
+    uncaught (it is not a ``httpx.TimeoutException``), which is why
+    ``metrics.py`` hand-converts ``TimeoutError`` into ``ValueError`` before
+    calling in. That conversion is still correct — it happens before this
+    frame sees the exception — and is deliberately left in place.
 
     If every URL fails, returns ``offline_result(errors)`` where *errors*
     is the list of collected ``f'{url}: {e}'`` strings — letting each
@@ -483,10 +541,20 @@ async def first_success(
     site: the failure is then reported exactly once, by the caller, rather
     than twice at the same level.
 
+    **A builtin ``TimeoutError`` is exempt from that suppression** and is
+    always reported. It cannot be a duplicate of a call-site line, by
+    construction: a whole-operation expiry cancels ``call`` mid-flight, so what
+    the call site sees is a ``CancelledError`` — a ``BaseException``, outside
+    its own ``except (ConnectError, TimeoutException, HTTPStatusError,
+    ValueError)`` — and it logs nothing. Suppressing here too would make a hang
+    the ONE failure at those two sites that leaves no journal trace at all,
+    which is the task-1814 shape this module's log policy exists to prevent.
+
     ``per_url_timeout`` is a **whole-operation deadline applied to each URL's
-    attempt**, and it is ON BY DEFAULT. ``None`` means "use
-    :data:`_DEFAULT_PER_URL_DEADLINE_SECONDS`", resolved at *call* time; there
-    is deliberately no way to disable it. A backstop with an off switch is a
+    attempt**, and it is ON BY DEFAULT. ``None`` is forwarded to
+    :func:`call_with_deadline`, which resolves it to
+    :data:`_DEFAULT_PER_URL_DEADLINE_SECONDS` at *call* time; there is
+    deliberately no way to disable it. A backstop with an off switch is a
     footgun — the only caller who would reach for it is one that has not
     thought about hangs, which is exactly the population it protects. Most live
     call sites (``app.py``'s two proxies, the three ``tasks.py`` sites,
@@ -518,17 +586,12 @@ async def first_success(
     # deferring resolution until call time (after both modules are loaded).
     from dashboard.data.memory import invalidate_session
 
-    # Resolved HERE, not as a def-time default, so a monkeypatched module
-    # constant takes effect immediately (the TTLCache ``ttl_seconds`` rule).
-    deadline = (
-        _DEFAULT_PER_URL_DEADLINE_SECONDS if per_url_timeout is None
-        else per_url_timeout
-    )
-
     errors: list[str] = []
     for url in urls:
         try:
-            result = await call_with_deadline(url, call, deadline)
+            # per_url_timeout is forwarded as-is: None means "the module
+            # default", which call_with_deadline resolves at call time.
+            result = await call_with_deadline(url, call, per_url_timeout)
         except asyncio.CancelledError:
             # Deliberately NOT reported through log_fanout_failure: a
             # cancellation is not an endpoint failure, and counting it would
@@ -537,15 +600,21 @@ async def first_success(
             # demotes the next real failure's opening WARNING to DEBUG).
             invalidate_session(url)
             raise
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                TimeoutError, ValueError) as e:
-            if log_failures:
+        except FANOUT_FAILURE_EXCEPTIONS as e:
+            # A whole-operation expiry is reported even when the caller asked
+            # for silence — see the log_failures paragraph above for why it
+            # can never be a duplicate of the call site's own line.
+            if log_failures or isinstance(e, TimeoutError):
                 log_fanout_failure(log_label, url, e)
             errors.append(f'{url}: {describe_exc(e)}')
             invalidate_session(url)
         else:
-            if log_failures:
-                note_fanout_success(log_label, url)
+            # Unconditional, unlike the failure report: a timeout can open a
+            # streak even at a log_failures=False site, and a streak left open
+            # would silently demote that site's NEXT opening WARNING to DEBUG.
+            # This stays silent for those callers as before whenever no streak
+            # is open — note_fanout_success is then a no-op.
+            note_fanout_success(log_label, url)
             return result
     return offline_result(errors)
 
