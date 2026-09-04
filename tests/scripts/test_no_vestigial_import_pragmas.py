@@ -42,6 +42,7 @@ parses as an import statement" rather than on a substring scan.
 from __future__ import annotations
 
 import ast
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -181,4 +182,143 @@ def test_no_missing_imports_pragma_on_pytest_import() -> None:
         f'{_PRAGMA_RULE} here converts a real env fault into silence. The '
         f'remedy for an unresolved pytest is `uv sync --all-packages`, never '
         f'a pragma'
+    )
+
+
+def _load_root_pyright_config() -> dict:
+    """Return the ``[tool.pyright]`` section of the ROOT pyproject.toml, or {}.
+
+    Same shape as ``tests/scripts/test_scripts_module_config.py::
+    _load_root_pyright_config``, COPIED rather than imported: task 4516's scope
+    forbids touching that file, and a cross-import would couple this guard to a
+    module it must leave alone — which is also the no-cross-import convention
+    this directory's guard family already states about itself.
+
+    The ROOT table is the one that governs, because both declared type gates
+    (``uv run --project shared pyright tests/scripts/`` and
+    ``uv run --project shared pyright scripts/``) run from the repo root with
+    no ``--directory``.
+    """
+    toml_path = REPO_ROOT / 'pyproject.toml'
+    assert toml_path.is_file(), f'pyproject.toml not found at {toml_path}'
+    with open(toml_path, 'rb') as fh:
+        config = tomllib.load(fh)
+    return config.get('tool', {}).get('pyright', {})
+
+
+def _import_search_roots() -> list[Path]:
+    """The directories pyright resolves a bare top-level import against, for this suite.
+
+    DERIVED FROM CONFIG, never hardcoded — see this guard's docstring for why
+    that is the whole point rather than a stylistic preference.
+
+    Two sources, and the second is not redundant:
+
+    1. Every ROOT ``[tool.pyright] extraPaths`` entry, resolved relative to the
+       repo root. This is what makes the flat ``scripts/`` imports here resolve
+       (task 3456).
+    2. This directory itself. ``--import-mode=importlib`` means pytest does not
+       put a test file's own directory on sys.path, so ``tests/scripts/
+       conftest.py`` inserts it explicitly; pyright reaches the same modules
+       because a bare import resolves against the importing file's own
+       directory. ``setup_host_parsing.py`` lives HERE, not in ``scripts/``, so
+       it resolves as a same-directory sibling and would otherwise be
+       misjudged unresolvable.
+    """
+    extra_paths = _load_root_pyright_config().get('extraPaths', [])
+    return [REPO_ROOT / entry for entry in extra_paths] + [_THIS_DIR]
+
+
+def _imported_top_level_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
+    """The top-level module name(s) *node* imports, or [] for a relative import.
+
+    Covers all three spellings present in this directory — ``import X``,
+    ``import X as Y`` and ``from X import (...)`` — and takes the first dotted
+    component, since that is the name resolved against a search root.
+
+    A relative import (``level > 0``) yields [] and is therefore never reported
+    as resolvable: it is not resolved against these roots at all, so this guard
+    has nothing to say about a suppression on one.
+    """
+    if isinstance(node, ast.ImportFrom):
+        if node.level != 0 or not node.module:
+            return []
+        return [node.module.split('.')[0]]
+    return [alias.name.split('.')[0] for alias in node.names]
+
+
+def _resolving_root(module: str, roots: list[Path]) -> Path | None:
+    """The first *root* on which *module* resolves as a bare top-level import, else None."""
+    for root in roots:
+        if (root / f'{module}.py').is_file() or (root / module).is_dir():
+            return root
+    return None
+
+
+def test_no_missing_imports_pragma_on_resolvable_import() -> None:
+    """No import that the search roots already resolve may carry the pragma.
+
+    CLASS (a) — the task-3456 case proper. Task 3456 added ``scripts``,
+    ``scripts/legibility`` and ``scripts/local-model-serving`` to the root
+    ``[tool.pyright] extraPaths`` precisely so this directory's flat
+    ``scripts/`` imports would resolve statically. Every suppression on such an
+    import became vestigial at that moment: it suppresses nothing, and it
+    silently masks a REAL ``reportMissingImports`` if one ever appears on that
+    line later.
+
+    DERIVED FROM ``extraPaths`` AT TEST TIME, NOT HARDCODED, and that is the
+    durable point of this guard rather than a stylistic preference. This task
+    exists because a suppression outlived the condition that justified it and
+    nothing detected the drift for four months. A guard that hardcoded "these
+    eight files must not contain this string" would reproduce that exact
+    failure mode one level up: it would freeze a single day's measurement as a
+    permanent truth, go stale silently the moment ``extraPaths`` changed, and
+    need hand-editing every time a test file was added. Reading the config
+    instead makes the guard track the MECHANISM rather than a snapshot of its
+    consequences — a future ``extraPaths`` entry that makes some pragma
+    vestigial turns this red automatically and names the pragma to delete,
+    while an import that genuinely does not resolve keeps it green and its
+    suppression allowed.
+
+    MEMBERSHIP/RESOLVABILITY, never list equality or a count pin, for the
+    reason ``test_scripts_module_config.py::
+    test_root_pyright_extrapaths_resolves_scripts_imports`` states about its
+    own assertion: a future entry is a legitimate change, not a regression.
+
+    THE REMEDY IS NEVER A PRAGMA. If a flat ``scripts/`` import here ever stops
+    resolving, the fix is restoring the ``extraPaths`` entries — removing one
+    is a TWO-gate outage, ``pyright scripts/`` and ``pyright tests/scripts/``
+    both — not re-adding suppressions to this directory.
+    """
+    roots = _import_search_roots()
+
+    offenders = [
+        (path, lineno, code, module, root)
+        for path, lineno, code, node in _pragma_carrying_imports()
+        for module in _imported_top_level_modules(node)
+        if (root := _resolving_root(module, roots)) is not None
+    ]
+
+    assert not offenders, (
+        f'{len(offenders)} import(s) in {_THIS_DIR} carry a `{_PRAGMA}` '
+        f'suppression while already resolving on the search roots pyright '
+        f'uses for this suite:\n'
+        + '\n'.join(
+            f'  {path.relative_to(REPO_ROOT)}:{lineno}: {code}\n'
+            f'      `{module}` resolves at {root.relative_to(REPO_ROOT)}/'
+            for path, lineno, code, module, root in offenders
+        )
+        + f'\nDELETE the pragma; keep the import byte-identical. A pragma on a '
+        f'resolvable import suppresses NOTHING today, and silently masks a '
+        f'REAL {_PRAGMA_RULE} if one appears on that line later — which is '
+        f'the whole defect task 4516 removed. These roots are read from the '
+        f'ROOT [tool.pyright] extraPaths at test time (plus this directory '
+        f'itself, for same-directory sibling modules), so this list is what '
+        f'pyright actually resolves against, not a snapshot of it. '
+        f'IF AN IMPORT HERE EVER STOPS RESOLVING, THE FIX IS RESTORING THE '
+        f'extraPaths ENTRIES, NOT RE-ADDING PRAGMAS: task 3456 added '
+        f'`scripts`, `scripts/legibility` and `scripts/local-model-serving` '
+        f'exactly so these resolve, and removing one is a TWO-gate outage '
+        f'(`pyright scripts/` and `pyright tests/scripts/` both run from the '
+        f'repo root against this same table)'
     )
