@@ -594,6 +594,30 @@ class TestReadOnlyAccess:
         finally:
             con.close()
 
+    def test_the_read_only_connection_carries_an_explicit_busy_timeout(self, tmp_path):
+        """A read that WAITS beats a read that refuses.
+
+        The journal is a live multi-gigabyte file a running fused-memory
+        server is appending to, so lock contention is the expected case, not
+        an exceptional one.  The busy timeout is what makes the reader wait
+        out a writer's lock instead of refusing -- and, before this change
+        set, `database is locked` was reported as a missing table.
+
+        The `> 5000` assertion is load-bearing and must not be dropped: 5000
+        is sqlite3's IMPLICIT default (measured on the pre-change code), so a
+        constant of 5.0 would let the equality assertion pass without any
+        `timeout=` ever being passed.
+        """
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        con = mod._connect_readonly(db)
+        try:
+            busy_timeout = con.execute('PRAGMA busy_timeout').fetchone()[0]
+            assert busy_timeout == int(mod.JOURNAL_CONNECT_TIMEOUT * 1000)
+            assert busy_timeout > 5000
+        finally:
+            con.close()
+
     def test_a_write_attempt_raises(self, tmp_path):
         import sqlite3  # noqa: PLC0415
 
