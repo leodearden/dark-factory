@@ -33,6 +33,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     classify_agent_failure,
     invoke_with_cap_retry,
+    is_server_error_status,
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
@@ -4500,14 +4501,72 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.REQUEUED
 
+    async def _requeue_on_server_error(self, result: AgentResult) -> WorkflowOutcome:
+        """Requeue a zero-output execute iteration attributed to a provider
+        5xx (PRD `plans/server-side-api-error-handling-prd.md` task γ,
+        contract C2 requeue-not-block invariant).
+
+        Called from ``_execute_iterations``'s zero-output branch BEFORE
+        ``consecutive_zero_output`` increments (the guard sits at the very
+        top of that branch) — so this class of result never touches the
+        zero-output wedge breaker. A watchdog SIGTERM kill flushes the CLI's
+        result JSON with ``api_error_status`` set, and ``is_zero_output_timeout``
+        is shape-only (PRD decision 2: ``timed_out`` + ``transcript_turns==0``,
+        consulting neither status nor subtype) — so without this guard a
+        provider outage is indistinguishable from a genuine local wedge and
+        eventually trips the breaker into a `blocked`/L0/steward chain
+        (2026-07-29 incident). Exits on the FIRST occurrence rather than
+        retrying in-loop: in-loop retries have no pacing, and the scheduler's
+        transient-requeue lane already owns cooldown/counters/cap (PRD
+        decisions 3 and 6) — so this method's only job is to get the row back
+        onto the queue with the right evidence attached, not to retry it here.
+
+        Exits via :meth:`_repend_for_requeue` so the REQUEUED return is
+        TRUTHFUL (the row is written ``pending`` before the harness slot is
+        released); a terminal row observed out-of-band during that write wins
+        over the requeue intent and is returned verbatim.
+        """
+        cls = classify_agent_failure(result)
+        reason = f'Execution failed: {cls.summary}'
+        detail = (
+            f'iteration={self.metrics.execute_iterations} '
+            f'api_error_status={result.api_error_status} '
+            f'policy=transient-requeue (exit-on-first, no in-loop retry — PRD '
+            f'decisions 3 and 6)\n'
+            f'{cls.diagnostic_detail}'
+        )
+        logger.warning(
+            'Task %s: server-side API error (HTTP %s) on execute iteration %s — '
+            'requeueing (transient, exit-on-first)',
+            self.task_id, result.api_error_status, self.metrics.execute_iterations,
+        )
+
+        repend_outcome = await self._repend_for_requeue()
+        if repend_outcome is not None:
+            return repend_outcome
+
+        self._terminal_report = TerminalReport(
+            outcome=WorkflowOutcome.REQUEUED,
+            reason=reason,
+            phase=self.machine.state,
+            detail=detail,
+            category=None,
+            # No BLOCKED transition on this path — blocked_from_phase mirrors
+            # the current (working) phase, same as _requeue_on_lock_conflict.
+            blocked_from_phase=self.machine.state,
+            api_error_status=result.api_error_status,
+        )
+        return WorkflowOutcome.REQUEUED
+
     async def _repend_for_requeue(self) -> WorkflowOutcome | None:
         """Write ``pending`` so a REQUEUED exit is TRUTHFUL, returning a terminal
         override outcome when the row turns out to be terminal, else ``None``.
 
-        The single choke point for the two SLOT-EXITING requeue paths that
+        The single choke point for the three SLOT-EXITING requeue paths that
         historically returned ``WorkflowOutcome.REQUEUED`` with NO status
-        write — ``_drive()``'s ``except WarmLaneRequeue`` clause and
-        ``_handle_soft_cancel``'s spurious-wakeup fallback (PRD γ3 / D6).
+        write — ``_drive()``'s ``except WarmLaneRequeue`` clause,
+        ``_handle_soft_cancel``'s spurious-wakeup fallback (PRD γ3 / D6), and
+        ``_requeue_on_server_error`` (PRD γ / task 3316, contract C2).
         Leaving the row ``in-progress`` there is not merely imprecise: the
         harness's slot ``finally`` nulls the claimant immediately afterwards,
         producing exactly the ``(in-progress, NULL claimant)`` shape
@@ -4520,7 +4579,7 @@ class TaskWorkflow:
         already used by ``_plan()``'s plan-lock requeue and the
         blocking-dependency requeue.
 
-        SCOPE — "two" is a claim about SLOT EXITS, not about the literal
+        SCOPE — "three" is a claim about SLOT EXITS, not about the literal
         ``return WorkflowOutcome.REQUEUED`` population, which is larger.  The
         membership test is "does this return hand control back to the harness,
         so the slot ``finally`` nulls the claimant next?".  The other REQUEUED
@@ -8416,6 +8475,25 @@ class TaskWorkflow:
             # the CLI never started real work.  Retrying identically burns time
             # (~20 min/iteration × threshold) with no chance of progress.
             if is_zero_output_timeout(result):
+                # A watchdog SIGTERM kill flushes the CLI's result JSON with
+                # api_error_status set BEFORE the wall-clock timeout is
+                # distinguished from a genuine pre-first-token wedge — and
+                # is_zero_output_timeout is shape-only (timed_out +
+                # transcript_turns==0), consulting neither status nor
+                # subtype, so a provider outage satisfies it exactly like a
+                # real wedge.  A genuine local wedge carries NO HTTP status
+                # (api_error_status is None), so this guard exits BEFORE the
+                # counter increment below — the class never touches the
+                # wedge breaker — and requeues on the FIRST occurrence
+                # (PRD `plans/server-side-api-error-handling-prd.md` task γ,
+                # contract C2; decisions 3 and 6: in-loop retries have no
+                # pacing, and blocked for this class is reachable only via
+                # transient-cap exhaust in the scheduler).  2026-07-29
+                # incident: an unclassified 5xx fed this breaker and produced
+                # a blocked/L0/steward storm.
+                if is_server_error_status(result.api_error_status):
+                    self._capture_zero_output_evidence(result, self.metrics.execute_iterations)
+                    return await self._requeue_on_server_error(result)
                 consecutive_zero_output += 1
                 # Capture forensic evidence for every zero-output timeout (best-effort;
                 # the helper suppresses all I/O errors internally).
