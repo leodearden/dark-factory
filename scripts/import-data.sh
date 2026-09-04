@@ -39,7 +39,11 @@ if systemctl --user is-active fused-memory &>/dev/null; then
 fi
 
 # Stop Docker backing stores so we can replace their data
-if docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q falkordb; then
+# Verdict read from the captured listing, not the pipeline status — see the
+# section-3 block of scripts/export-data.sh for the full rationale (`|| true`
+# is load-bearing, not `|| _running=""`, no re-piping).
+_running="$(docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null)" || true
+if [[ "$_running" == *falkordb* ]]; then
   docker compose -f "$COMPOSE_FILE" stop falkordb qdrant
   ok "FalkorDB + Qdrant containers stopped"
 fi
