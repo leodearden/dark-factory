@@ -489,6 +489,21 @@ current metadata, convert and merge the reshaped hints into it locally, then wri
 COMPLETE metadata blob back with `metadata_mode='replace'`. This preserves every sibling \
 key while replacing only the legacy hint shape.
 
+`append=True` applies ONLY to `metadata` and to `details`/`prompt`. It has NEVER applied \
+to `description`, `title` or `priority` — those columns are REPLACE-ONLY, and combining \
+any of them with `append=True` is now REJECTED by the backend with a \
+`TASKMASTER_TOOL_ERROR` (`error_type` `AppendUnsupportedFieldError`) naming the offending \
+field. Before that guard the pair was accepted silently and OVERWROTE the column: a \
+caller who passed `description='\\n\\n--- addendum ---'` with `append=True` believing they \
+were extending the field destroyed the entire original description instead, with no error \
+and no warning. To EXTEND a task's description (or title), do the same read-modify-write \
+as the RESHAPE case above: call `mcp__fused-memory__get_task(id=<task_id>, \
+project_root=<project_root>)` to read the FULL current text, concatenate your addition \
+locally, then write the COMPLETE new `description` with `append` OMITTED. If a write \
+genuinely means to REPLACE the field, omit `append` (or pass `append=False`) to confirm \
+it; if the `append=True` was meant for `metadata` or `details`, split it into a separate \
+`update_task` call.
+
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
 outcome.
