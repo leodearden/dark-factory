@@ -199,10 +199,14 @@ class UnknownKeyStormDetector:
         counters per writer and aggregates one CALL's worth of per-key events
         into one answer.
 
-        *now* is resolved ONCE and threaded through every per-key
-        :meth:`~shared.storm_counter.StormCounter.record`, because the body
-        this replaced computed a single ``cutoff`` for the whole call: a shared
-        instant keeps every key in a call landing in the same window.
+        The call's instant is resolved ONCE from ``time_fn`` and threaded
+        through every per-key
+        :meth:`~shared.storm_counter.StormCounter.record` as its ``now=``,
+        because the body this replaced computed a single ``cutoff`` for the
+        whole call: a shared instant keeps every key in a call landing in the
+        same window.  (It is a local, not a parameter of this method — the
+        ``*name*`` emphasis in this file is reserved for real arguments, as it
+        is on :meth:`~shared.storm_counter.StormCounter.record` itself.)
         """
         new_keys = list(keys)
         if not new_keys:

@@ -391,6 +391,45 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
             'and it stays latched, exactly as the pre-migration _firing set did'
         )
 
+    def test_the_latch_re_arms_without_eviction_when_the_window_drains(self):
+        """The OTHER half of the ``was_latched`` guard's behaviour.
+
+        :meth:`UnknownKeyStormDetector.record`'s docstring promises "a writer
+        that drifts, is fixed, and later drifts again is heard both times", but
+        the only detector-level test of that promise —
+        ``test_eviction_clears_the_firing_latch_so_a_recurrence_is_heard`` —
+        goes through the sweep, so it proves the latch was cleared by DELETING
+        the counter, not by the re-arm. The re-arm itself was pinned only
+        inside StormCounter's own suite.
+
+        That gap matters because the guard makes the detector's behaviour on a
+        drained window genuinely non-obvious, and asymmetric: single-key calls
+        after a drain DO re-cross and fire (here), while ONE multi-key call
+        that crosses in a single call does NOT (the sibling above). Pinning
+        only the suppressed side would leave a future edit free to widen the
+        guard into a permanent latch and stay green.
+
+        No eviction runs: ``sweep_every`` defaults to 256 and this drives six
+        records, which the closing identity assertion makes explicit rather
+        than assumed.
+        """
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=3, window_seconds=300)
+
+        assert [detector.record('p', 'a', ['k']) for _ in range(3)][-1] is True
+        counter = detector._warns[('p', 'a')]
+
+        clock.advance(301)
+        assert [detector.record('p', 'a', ['k']) for _ in range(3)] == [
+            False,
+            False,
+            True,
+        ], 'the drained window re-arms, so the second drift is heard'
+        assert detector._warns[('p', 'a')] is counter, (
+            'and it re-armed IN PLACE — no sweep ran, so this is the re-arm '
+            'path and not the eviction path the sibling test covers'
+        )
+
 
 class TestFileUnknownKeyStormEscalation:
     """Direct port of ``middleware/candidate_key_escalation.py``.
