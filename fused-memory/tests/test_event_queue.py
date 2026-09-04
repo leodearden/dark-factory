@@ -373,6 +373,38 @@ async def test_graceful_shutdown_flushes_within_window(tmp_path, real_buffer):
 
 
 @pytest.mark.asyncio
+async def test_graceful_shutdown_is_independent_of_flush_window(tmp_path, real_buffer):
+    """close() must drain fully even when shutdown_flush_seconds=0.0.
+
+    0.0 is not merely "small" — on CPython, asyncio.wait_for with timeout<=0
+    does ensure_future(coro) then checks fut.done(), which is False for a
+    freshly created coroutine, so it raises TimeoutError WITHOUT EVER READING
+    THE CLOCK. The window is therefore "already expired" as a matter of
+    logic, not of timing, so this test carries no wall-clock dependency in
+    either direction: it proves the drain outcome is independent of
+    shutdown_flush_seconds rather than merely giving the window a generous
+    margin.
+    """
+    q = EventQueue(
+        real_buffer,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.1,
+        shutdown_flush_seconds=0.0,
+    )
+    await q.start()
+    for _ in range(50):
+        q.enqueue(_make_event())
+    await q.close()
+    # All events landed; no dead-letter residue.
+    stats = await real_buffer.get_buffer_stats('test-project')
+    assert stats['size'] == 50
+    dl_path = tmp_path / 'dl.jsonl'
+    assert not dl_path.exists() or dl_path.read_text() == ''
+
+
+@pytest.mark.asyncio
 async def test_shutdown_timeout_dumps_remainder(tmp_path):
     """When flush window expires, unflushed events go to dead-letter."""
     buf = AsyncMock()
