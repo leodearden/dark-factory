@@ -691,6 +691,100 @@ class TestLoudDegradation:
         assert not out.exists()
 
 
+class TestTheRefusalNamesTheRealFailure:
+    """A refusal must be named ACCURATELY, not merely loudly.
+
+    This module's whole posture is that an unreadable journal raises a NAMED
+    error rather than returning an empty sample (module docstring, "READ-ONLY,
+    LOUDLY").  Yet every `sqlite3.Error` from the scan was relabelled as a
+    schema fault: `database is locked` -- the single most likely failure
+    against a journal a running server is writing to -- was reported as
+    `has no readable write_ops table`, sending an operator to diagnose a
+    missing table that is right there.
+
+    These tests close that contradiction from both sides: the injected
+    failures must stop claiming a schema fault, and a GENUINELY absent
+    `write_ops` table must still say so.
+    """
+
+    # The scan is the only statement that reads FROM write_ops; the schema
+    # probe reads FROM sqlite_master, so this predicate fails exactly the
+    # scan and lets every other statement run for real.
+    _SCAN = staticmethod(lambda sql: 'FROM write_ops' in sql)
+
+    def _harvest_with_scan_error(self, tmp_path, monkeypatch, exc):
+        import functools  # noqa: PLC0415
+
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        _patch_connect(
+            monkeypatch,
+            mod,
+            functools.partial(_ConnectionProxy, fail_on=self._SCAN, exc=exc),
+        )
+        return mod, db
+
+    def test_a_lock_contention_error_is_not_reported_as_a_missing_table(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('database is locked')
+        mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'database is locked' in msg
+        # The load-bearing assertion: the pre-change message satisfied the
+        # first one too, as `<path> has no readable write_ops table: database
+        # is locked`.
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_disk_io_error_is_not_reported_as_a_missing_table(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('disk I/O error')
+        mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'disk I/O error' in msg
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_genuinely_absent_write_ops_table_still_says_so(self, tmp_path):
+        """Pins the wording that must SURVIVE.
+
+        Without this, the two tests above could be greened by simply deleting
+        the schema-fault message -- trading one inaccurate refusal for
+        another.  The cause chain is `None` here because nothing raised: an
+        empty probe is a READING, not a failure.
+        """
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        mod = _mod()
+        db = tmp_path / 'wrong.db'
+        con = sqlite3.connect(str(db))
+        con.execute('CREATE TABLE other (id TEXT)')
+        con.commit()
+        con.close()
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'write_ops' in msg
+        assert str(db) in msg
+        assert exc.value.__cause__ is None
+
+
 class TestFixtureWrite:
     """The committed fixture is JSONL plus a provenance sidecar."""
 
