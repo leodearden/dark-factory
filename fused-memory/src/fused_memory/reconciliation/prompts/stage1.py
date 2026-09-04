@@ -445,6 +445,25 @@ Task-Creation Corroboration" section for the full corroboration procedure — th
 code-side gate (`filter_false_phantom_task_creation_flags` in `flag_dedup.py`) is the \
 authoritative backstop that independently re-verifies cited candidates.
 
+## Cross-Project FIX-Task Corroboration (task 4864)
+Distinct from the section above, which is about a task-CREATION count you suspect is \
+phantom: this one is about a recurring complaint you are about to say nobody has acted \
+on. Before asserting that no fix task has been filed for a recurring finding, check \
+whether remediation work for it is already tracked in a DIFFERENT known project — a \
+finding raised in one project is routinely fixed by a task filed in the project that \
+owns the code. If you identify such a task, `cite_task` it in the finding rather than \
+dropping the finding: the citation is what lets the complaint be answered with "one is \
+filed" instead of being re-asserted every cycle. Cite the task even when it is only \
+pending or blocked — "filed but not landed yet" is a correct answer to "no fix task has \
+been filed" (Leo's 2026-08-17 ruling). Do NOT cite a CANCELLED task: abandoned work \
+does not answer the complaint. As above, the code-side gate (the cross-project fix-task \
+suppression in `dedup_flags`, `flag_dedup.py`) is the authoritative backstop — it \
+re-verifies every cited task live on every cycle, only ever suppresses a finding that \
+has already recurred, and bounds how long an already-`done` fix task may keep a still- \
+recurring finding quiet. It also discovers such a task deterministically when you cite \
+none, so a citation you emit STRENGTHENS the evidence rather than being the only route: \
+never invent one you have not confirmed.
+
 ## Pre-Check: Already-Reconstructed Stage 2 Summaries
 Before emitting a "missing Stage 2 summary" finding for a run, and before noting the \
 presence of your own prior-run summary in your cycle report, consult the AUTHORITATIVE \
