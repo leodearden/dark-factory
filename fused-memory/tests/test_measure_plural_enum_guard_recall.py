@@ -207,6 +207,57 @@ def test_scan_corpus_rejections_are_triageable_records():
     assert by_fact[_PREAMBLE_REJECTION] == _PREAMBLE_REJECTION.index('tasks 1020')
 
 
+# Every pinned fact in the shared corpora, positives included (whose entries
+# are (fact, expected_ids) pairs). The near-miss subtraction below is only
+# safe while the lexical precondition is a SUPERSET of the full regex, so the
+# guard on that identity has to quantify over every shape the sweep suite
+# pins, not just the guarded ones.
+_ALL_PINNED_FACTS = _ALL_GUARDED_SHAPES + [fact for fact, _ids in _POSITIVE_SHAPES]
+
+
+@pytest.mark.parametrize('fact', _ALL_PINNED_FACTS)
+def test_the_lexical_precondition_is_a_superset_of_the_full_regex(fact):
+    """Anything the shipped regex matches must match the precondition too.
+
+    This is the identity that makes ``near_miss = lexical_precondition -
+    regex_matched`` a partition rather than a subtraction of two unrelated
+    counters: PLURAL_ENUM_SNAPSHOT_RE's pattern literally begins
+    ``\\btasks\\b\\s*#?\\s*(?P<ids>\\d++``, of which the probe's
+    ``_LEXICAL_PRECONDITION_RE`` (``\\btasks\\b\\s*#?\\s*\\d``) is a
+    literal prefix. A prefix cannot fail where the whole pattern succeeded.
+
+    Pinned mechanically rather than asserted in prose because both patterns
+    are editable: were either to drift so that a full match no longer carried
+    the precondition, ``near_miss`` could go NEGATIVE and the report would
+    render a nonsense column with nothing failing. Parametrizing over the
+    shared corpora keeps the gate automatic — a shape appended in
+    reconciliation/plural_enum_shapes.py re-validates the identity with no
+    second copy to go stale.
+    """
+    if _mod.PLURAL_ENUM_SNAPSHOT_RE.search(fact):
+        assert _mod._LEXICAL_PRECONDITION_RE.search(fact), fact
+
+
+def test_the_superset_corpus_actually_exercises_both_sides():
+    """The parametrization above must not be vacuous in either direction.
+
+    Its body is a conditional, so a corpus in which NOTHING matched the full
+    regex would leave every case green while checking nothing. Both sides
+    have to be populated for the identity to have been tested at all.
+    """
+    assert len(_ALL_PINNED_FACTS) == 61
+    matched = [f for f in _ALL_PINNED_FACTS if _mod.PLURAL_ENUM_SNAPSHOT_RE.search(f)]
+    precondition = [
+        f for f in _ALL_PINNED_FACTS if _mod._LEXICAL_PRECONDITION_RE.search(f)
+    ]
+    assert len(matched) == 48, 'the full-regex side emptied or drifted'
+    assert len(precondition) == 61, 'the precondition side emptied or drifted'
+    assert len(matched) < len(precondition), (
+        'a corpus where the two counts coincide cannot show near_miss is not '
+        'just a second name for lexical_precondition'
+    )
+
+
 def _first_enumeration_start(fact: str) -> int:
     """Where the shipped regex's first match begins in *fact*.
 
@@ -1079,6 +1130,37 @@ _BETA_FACTS = [
 ]
 
 
+def test_near_miss_excludes_the_facts_that_fully_matched():
+    """`near_miss` is the precondition MINUS the full matches, not the raw count.
+
+    ``lexical_precondition`` counts every fact carrying the ``tasks <n>``
+    shape — INCLUDING the ones the shipped regex went on to match in full.
+    The markdown column labelled "`tasks <n>` near-misses" rendered that raw
+    number, so a corpus where every shape matched in full was reported as
+    having that many near-misses, and a reader was invited to subtract a
+    column from a column it contains.
+
+    A near-miss is a fact that carried the shape and did NOT match: the two
+    are disjoint and sum to the precondition, which is what makes the column
+    interpretable.
+    """
+    alpha = scan_corpus(_ALPHA_FACTS)
+    # Both plural-task facts matched the full regex; nothing NEARLY matched.
+    assert alpha.lexical_precondition == 2
+    assert alpha.regex_matched == 2
+    assert alpha.near_miss == 0
+
+    beta = scan_corpus(_BETA_FACTS)
+    # 'Tasks 1752 and 1753 are related to ...' carries the shape and no
+    # status marker, so it is the only near-miss here.
+    assert beta.lexical_precondition == 2
+    assert beta.regex_matched == 1
+    assert beta.near_miss == 1
+
+    for scan in (alpha, beta):
+        assert scan.near_miss == scan.lexical_precondition - scan.regex_matched
+
+
 def _args(**overrides):
     parsed = build_parser().parse_args([])
     for key, value in overrides.items():
@@ -1565,6 +1647,46 @@ async def test_the_candidate_band_declares_its_unit_and_denominator():
     assert '2 distinct fact shape' in section
     assert '3 regex match' in section
     assert 'per rejected MATCH' in section
+
+
+@pytest.mark.asyncio
+async def test_the_artifacts_report_near_misses_not_the_raw_precondition_count():
+    """The near-miss LABEL must sit over the near-miss NUMBER.
+
+    `alpha` holds two facts carrying the shape and both match the regex in
+    full, so it has zero near-misses; the old column rendered 2. `zeta` holds
+    two carrying the shape of which one matches, so it has exactly one. The
+    JSON keeps the raw ``lexical_precondition`` under its own accurate name
+    alongside the derived ``near_miss``, so nothing is lost — only correctly
+    labelled.
+    """
+    report = await _fixed_report()
+    payload = json.loads(render_json(report))
+
+    by_id = {p['project_id']: p for p in payload['projects']}
+    assert by_id['alpha']['scan']['lexical_precondition'] == 2
+    assert by_id['alpha']['scan']['regex_matched'] == 2
+    assert by_id['alpha']['scan']['near_miss'] == 0
+    assert by_id['zeta']['scan']['near_miss'] == 1
+    assert payload['totals']['lexical_precondition'] == 4
+    assert payload['totals']['regex_matched'] == 3
+    assert payload['totals']['near_miss'] == 1
+
+    markdown = render_markdown(report)
+    rows = {
+        line.split('|')[1].strip(): line
+        for line in markdown.splitlines()
+        if line.startswith('| `')
+    }
+    # column order: project | valid edges | near-misses | regex matches | ...
+    assert rows['`alpha`'].split('|')[3].strip() == '0', rows['`alpha`']
+    assert rows['`zeta`'].split('|')[3].strip() == '1', rows['`zeta`']
+    assert '| **(all)** | **5** | **1** | **3** |' in markdown
+
+    # The partition is stated, so a reader is told the two columns are
+    # disjoint rather than left to discover they are not.
+    assert 'near-miss' in markdown
+    assert 'disjoint' in markdown
 
 
 @pytest.mark.asyncio
