@@ -11,9 +11,20 @@ justifies the splice. Two anchor-test modules assert that family today:
 - ``test_roles_tool_call_rejection.py`` — tasks 4273/4578,
   ``TOOL_CALL_REJECTION_GUIDANCE``.
 
-Both grew the same ~240-line shape independently. This module holds it once, so
+Both grew the same assertion shape independently. This module holds it once, and
+is the AUTHORITATIVE home for the rationale behind that shape — the consumers
+point here rather than restating it, so there is one place to correct.
+
+What the extraction bought, stated honestly, because the framing here previously
+overstated it (task 4405 review): NOT a smaller tree today. The helper plus its
+contract test cost considerably more lines than the consumers shed, and both
+consumers are in fact marginally LONGER than before, their assertion bodies
+having become call-site ``remedy`` prose. The win is structural and
+forward-looking: the shape is defined and independently tested in ONE place, so
 a THIRD prompt constant costs ~10 lines of contract construction plus one-line
-test bodies rather than a third clone.
+test bodies rather than a third clone — and a defect in the shape is fixed once
+instead of found twice or missed once. ``assert_placement``'s char-budget arm
+was exactly that: one latent bug, one fix, both consumers covered.
 
 THE STANDING RULE THIS MODULE MUST NOT WEAKEN, carried over from both consumers:
 every assertion here is an existence / containment / count / index check against

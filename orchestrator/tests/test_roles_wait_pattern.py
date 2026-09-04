@@ -54,12 +54,13 @@ vs-hardcoded role-set comparison, the count and index bookkeeping — lives in
 ``_role_splice_contract.py`` (task 4405), shared with the sibling
 ``test_roles_tool_call_rejection.py``. The tests below stay one thin function
 per invariant, each delegating its body to that helper while keeping its own
-docstring and its own remediation prose: a THIRD prompt constant now costs ~10
-lines of contract construction plus one-line bodies rather than a third clone of
-this file. What the helper deliberately does NOT absorb is the ``capability``
-predicate — ``'Bash' in role.allowed_tools`` answers a different question than
-the sibling's ``role.prompt_spec is None``, and both are correct for their own
-constant, so it is passed in.
+docstring and its own remediation prose. That module's docstring is the
+authoritative account of what the shared shape does and does not absorb — most
+of it is NOT restated here. This file's own ``capability`` predicate is
+``'Bash' in role.allowed_tools`` (see the comment on
+``_BACKGROUND_CAPABLE_ROLES`` below); it deliberately differs from the
+sibling's, and ``SpliceContract``'s class docstring explains why both are
+correct for their own constant.
 """
 
 from __future__ import annotations
