@@ -1758,3 +1758,150 @@ class TestScanProseCitationsBranches:
         assert stats['stage1_prose_phantom_citations'] == 1
         assert finding == before
         assert 'citation_failures' not in finding
+
+
+class TestScanProseCitationsSafety:
+    """The tombstone probe is the SOLE discriminator between the fabricated
+    branch and a deliberate reap, so a probe that is unavailable or broken must
+    degrade to INCONCLUSIVE — never to a phantom (task 4818)."""
+
+    @pytest.mark.asyncio
+    async def test_tombstone_reader_absent_degrades_to_inconclusive(self, caplog):
+        """A memory_service with NO ``get_mem0_deletion_tombstone`` attribute at
+        all — a wiring failure, not a data condition.
+
+        ``spec=`` is required: a bare ``AsyncMock`` auto-creates the attribute
+        and would silently pass a two-way implementation."""
+
+        class _NoTombstoneService:
+            async def get_memory_by_id(self, project_id, memory_id):
+                return None
+
+        service = _NoTombstoneService()
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 1
+        msg = caplog.records[0].getMessage().lower()
+        # Loud, not silent (the repo's loud-over-silent norm) — but it must not
+        # claim fabrication, which the probe never established.
+        assert 'phantom' not in msg
+        assert 'tombstone' in msg
+
+    @pytest.mark.asyncio
+    async def test_tombstone_reader_raising_degrades_to_inconclusive(self, caplog):
+        """Deliberate ASYMMETRY with ``server/tools.py::get_memory_by_id``,
+        which degrades a raising probe to "no tombstone".
+
+        There the probe only ADDS information to an already-correct
+        ``found: False``, so degrading it loses detail but tells no untruth —
+        its own comment says a tombstone failure "can never convert a correct
+        found:False into an error". HERE the tombstone is the only thing
+        separating a benign deliberate deletion from a fabrication, so the same
+        degradation would manufacture a FALSE phantom out of every GC'd memory.
+        The collapse must be unreachable even through a broken store."""
+        service = _prose_service(record=None)
+        service.get_mem0_deletion_tombstone = AsyncMock(
+            side_effect=RuntimeError('ledger locked'),
+        )
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 1
+        assert 'phantom' not in caplog.records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'stage_id',
+        [StageId.memory_consolidator, StageId.task_knowledge_sync, StageId.integrity_check],
+    )
+    async def test_stat_prefix_renames_every_prose_counter(self, stage_id):
+        """Routed through the SAME ``STAGE_STAT_PREFIX`` machinery task 2979
+        introduced, so Stages 1-3 all get the prose scan and a future stage
+        inherits it for the same reason it inherits the structured one."""
+        prefix = STAGE_STAT_PREFIX[stage_id]
+        service = _prose_service(record=None, tombstone=None)
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        stats = await scan_prose_citations(
+            [finding], service, 'test_project', stat_prefix=prefix,
+        )
+
+        assert set(stats) == {
+            f'{prefix}_prose_citations_verified',
+            f'{prefix}_prose_citations_tombstoned',
+            f'{prefix}_prose_phantom_citations',
+            f'{prefix}_prose_citation_verification_errors',
+        }
+        assert stats[f'{prefix}_prose_phantom_citations'] == 1
+
+    @pytest.mark.asyncio
+    async def test_default_stat_prefix_is_stage1(self):
+        """Omitting stat_prefix keeps the Stage-1 spelling byte-identical."""
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations([], service, 'test_project')
+
+        assert set(stats) == {
+            'stage1_prose_citations_verified',
+            'stage1_prose_citations_tombstoned',
+            'stage1_prose_phantom_citations',
+            'stage1_prose_citation_verification_errors',
+        }
+
+    @pytest.mark.asyncio
+    async def test_repeated_phantom_costs_one_lookup_but_counts_per_finding(self, caplog):
+        """Counters count FINDINGS, not lookups — the same distinction
+        ``verify_cited_memories``' docstring already draws. Both the point read
+        AND the tombstone probe are memoised per call."""
+        findings = [
+            {'finding_id': f'f{i}', 'description': f'see {_SPECIMEN_FABRICATED}'}
+            for i in range(3)
+        ]
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 3
+        assert service.get_memory_by_id.await_count == 1
+        assert service.get_mem0_deletion_tombstone.await_count == 1
+        assert len(caplog.records) == 3
+
+    @pytest.mark.asyncio
+    async def test_malformed_findings_are_skipped_not_raised(self):
+        """Matching ``repoint_task_citations``' ``if not isinstance(...): continue``
+        skip: one bad entry degrades rather than aborting the whole scan."""
+        real_finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations(
+            [None, 'a bare string', 42, real_finding], service, 'test_project',
+        )
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert stats['stage1_prose_citations_verified'] == 0
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_scoped_to_the_supplied_project_id(self):
+        """Positional ``(project_id, memory_id)``, matching the existing
+        ``assert_has_awaits([call('test_project', 'A')])`` convention."""
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+        service = _prose_service(record=None, tombstone=None)
+
+        await scan_prose_citations([finding], service, 'other_project')
+
+        service.get_memory_by_id.assert_has_awaits(
+            [call('other_project', _SPECIMEN_FABRICATED)],
+        )
+        service.get_mem0_deletion_tombstone.assert_has_awaits(
+            [call('other_project', _SPECIMEN_FABRICATED)],
+        )
