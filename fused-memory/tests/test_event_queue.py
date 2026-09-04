@@ -424,6 +424,41 @@ async def test_graceful_shutdown_is_independent_of_flush_window(tmp_path, real_b
 
 
 @pytest.mark.asyncio
+async def test_wait_for_drained_fails_loudly_when_drainer_stalls(tmp_path):
+    """_wait_for_drained must assert (not return silently) when the drainer
+    never catches up — pins the "fail loudly" contract _wait_for's docstring
+    states, so a future rewrite of the gate can't silently swallow a genuine
+    stall.
+    """
+    buf = AsyncMock()
+
+    # Drainer blocks forever — events_committed can never reach the target.
+    async def blocking_push(event):
+        await asyncio.sleep(1000)
+
+    buf.push = blocking_push
+
+    q = EventQueue(
+        buf,
+        dead_letter_path=tmp_path / 'dl.jsonl',
+        maxsize=100,
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
+        shutdown_flush_seconds=0.1,
+    )
+    await q.start()
+    try:
+        for _ in range(5):
+            q.enqueue(_make_event())
+        with pytest.raises(AssertionError, match='not satisfied within'):
+            await _wait_for_drained(q, 5, timeout=0.5)
+    finally:
+        # Close without waiting for the blocked push.
+        q._shutdown_flush = 0.05
+        await q.close()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_timeout_dumps_remainder(tmp_path):
     """When flush window expires, unflushed events go to dead-letter."""
     buf = AsyncMock()
