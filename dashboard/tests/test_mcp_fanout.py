@@ -35,6 +35,27 @@ def _http_status_error(url: str = 'http://x') -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError('Server Error', request=request, response=response)
 
 
+def _hanging_call(hang_url: str, attempted: list[str]):
+    """Build a *call* recording every url it is handed, parking on *hang_url*.
+
+    The never-set ``asyncio.Event`` models a server that accepted the request
+    and then went silent — the shape a per-HTTP-request budget cannot bound
+    (see the derivation beside
+    ``mcp_fanout._DEFAULT_PER_URL_DEADLINE_SECONDS``). One definition, shared
+    by the deadline class and the cancellation class below, so the two exits
+    they pin are exercised against the same notion of "hung".
+    """
+    never = asyncio.Event()
+
+    async def call(url):
+        attempted.append(url)
+        if url == hang_url:
+            await never.wait()
+        return 'ok'
+
+    return call
+
+
 @pytest.fixture(autouse=True)
 def _clean_sessions():
     """Reset the memory module's session cache before and after each test.
@@ -160,6 +181,13 @@ class TestFirstSuccessTimeoutIsAFailure:
         assert 'http://x' in warnings[0] and 'TimeoutError' in warnings[0], (
             f'the warning must name the url and the exception type, got {warnings[0]}'
         )
+        assert 'slow' in warnings[0], (
+            "call's OWN message must survive: call_with_deadline re-renders "
+            'only ITS budget\'s expiry (decided by asyncio.timeout.expired(), '
+            'not by message emptiness), so a caller-raised TimeoutError is '
+            'never overwritten with the generic whole-operation string — '
+            f'got {warnings[0]}'
+        )
 
     async def test_all_urls_timing_out_returns_the_offline_sentinel(self):
         urls = ['http://a', 'http://b']
@@ -176,6 +204,11 @@ class TestFirstSuccessTimeoutIsAFailure:
         assert 'http://b' in result['error']
         assert 'TimeoutError' in result['error'], (
             f'the operator must be told the cause was a timeout, got {result["error"]}'
+        )
+        assert 'http://a slow' in result['error'], (
+            "each url's OWN diagnosis must reach the operator verbatim, not be "
+            'replaced by the whole-operation budget string, got '
+            f'{result["error"]}'
         )
 
 # ── (b3) a HANGING url is bounded by first_success's own deadline ────
@@ -199,19 +232,6 @@ class TestFirstSuccessWholeOperationDeadline:
     pytest-timeout with no traceback, instead of failing fast and legibly.
     """
 
-    @staticmethod
-    def _hanging_call(hang_url: str, attempted: list[str]):
-        """Build a *call* whose *hang_url* leg awaits a never-set Event."""
-        never = asyncio.Event()
-
-        async def call(url):
-            attempted.append(url)
-            if url == hang_url:
-                await never.wait()
-            return 'ok'
-
-        return call
-
     async def test_hung_url_is_bounded_invalidated_and_fallen_through(self):
         from dashboard.data.memory import _get_session, _sessions
 
@@ -222,7 +242,7 @@ class TestFirstSuccessWholeOperationDeadline:
         result = await asyncio.wait_for(
             first_success(
                 ['http://a', 'http://b'],
-                self._hanging_call('http://a', attempted),
+                _hanging_call('http://a', attempted),
                 log_label='test',
                 offline_result=_offline_result,
                 per_url_timeout=0.05,
@@ -248,7 +268,10 @@ class TestFirstSuccessWholeOperationDeadline:
             # Unreachable: the Event is never set, so this leg only ever ends
             # by the deadline firing. Present so the closure's inferred return
             # type is NoReturn and V solves from offline_result, matching
-            # TestFirstSuccessAllFail's raising `call` above.
+            # TestFirstSuccessAllFail's raising `call` above — which is also
+            # why this one test does not use the module-level _hanging_call:
+            # that helper hangs on ONE url and returns 'ok' for the rest, so it
+            # can neither fail EVERY url nor keep V unbound from `str`.
             raise AssertionError('unreachable')  # pragma: no cover
 
         result = await asyncio.wait_for(
@@ -290,7 +313,7 @@ class TestFirstSuccessWholeOperationDeadline:
         result = await asyncio.wait_for(
             first_success(
                 ['http://a', 'http://b'],
-                self._hanging_call('http://a', attempted),
+                _hanging_call('http://a', attempted),
                 log_label='test',
                 offline_result=_offline_result,
             ),
@@ -319,19 +342,8 @@ class TestFirstSuccessInvalidatesOnCancellation:
     on it, which is why each test asserts the next url was never attempted.
     """
 
-    @staticmethod
-    def _hanging_call(attempted: list[str]):
-        never = asyncio.Event()
-
-        async def call(url):
-            attempted.append(url)
-            if url == 'http://a':
-                await never.wait()
-            return 'ok'
-
-        return call
-
-    async def test_caller_wait_for_cancels_and_session_is_invalidated(self):
+    async def test_caller_wait_for_cancels_and_session_is_invalidated(self, caplog):
+        from dashboard.data import mcp_fanout
         from dashboard.data.memory import _get_session, _sessions
 
         _get_session('http://a')
@@ -341,17 +353,36 @@ class TestFirstSuccessInvalidatesOnCancellation:
         # per_url_timeout is deliberately LARGE so the OUTER wait_for is the
         # one that fires, isolating the cancellation path from the
         # deadline path exercised by TestFirstSuccessWholeOperationDeadline.
-        with pytest.raises(TimeoutError):
+        with (
+            caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'),
+            pytest.raises(TimeoutError),
+        ):
             await asyncio.wait_for(
                 first_success(
                     ['http://a', 'http://b'],
-                    self._hanging_call(attempted),
+                    _hanging_call('http://a', attempted),
                     log_label='test',
                     offline_result=_offline_result,
                     per_url_timeout=30.0,
                 ),
                 timeout=0.05,
             )
+
+        # The handler's other half, and the one a refactor is most likely to
+        # undo: a cancellation must NOT be reported through log_fanout_failure.
+        # Doing so would open a streak for (test, http://a), and the next REAL
+        # failure there would then be its second — demoting that failure's
+        # opening WARNING to DEBUG under the transition-only policy, silently,
+        # for every subsequent poll. Without these two assertions, moving
+        # log_fanout_failure into the CancelledError branch passes the suite.
+        assert not [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ], 'a cancellation is not an endpoint failure and must not be reported'
+        assert mcp_fanout._failure_streaks == {}, (
+            'a cancellation must leave the streak counters untouched, or it '
+            "demotes the next real failure's opening WARNING to DEBUG"
+        )
 
         assert 'http://a' not in _sessions, (
             'a cancelled in-flight url must have its wedged session '
@@ -363,6 +394,7 @@ class TestFirstSuccessInvalidatesOnCancellation:
         )
 
     async def test_direct_task_cancel_propagates_and_invalidates(self):
+        from dashboard.data import mcp_fanout
         from dashboard.data.memory import _get_session, _sessions
 
         _get_session('http://a')
@@ -371,7 +403,7 @@ class TestFirstSuccessInvalidatesOnCancellation:
         task = asyncio.create_task(
             first_success(
                 ['http://a', 'http://b'],
-                self._hanging_call(attempted),
+                _hanging_call('http://a', attempted),
                 log_label='test',
                 offline_result=_offline_result,
                 per_url_timeout=30.0,
@@ -386,6 +418,10 @@ class TestFirstSuccessInvalidatesOnCancellation:
 
         assert 'http://a' not in _sessions
         assert attempted == ['http://a']
+        assert mcp_fanout._failure_streaks == {}, (
+            'a task.cancel() is not an endpoint failure either — see the '
+            'streak reasoning in the test above'
+        )
 
 # ── (c) all-fail → offline_result(errors) ────────────────────────────
 
