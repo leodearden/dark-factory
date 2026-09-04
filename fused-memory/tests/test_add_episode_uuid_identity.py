@@ -41,6 +41,7 @@ assertions here fail in that case.
 from __future__ import annotations
 
 import logging
+import re
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -537,4 +538,102 @@ class TestDegenerateResultNeverRegistersSilently:
         assert not offenders, (
             'A non-planning write is not meant to register, so the registration '
             f'path must stay silent; got {offenders}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# step-07: AddEpisodeResponse.episode_id demoted to a correlation id
+# ---------------------------------------------------------------------------
+
+#: The payload name must stay derived from the RAW uuid4, not the prefixed
+#: correlation id — episode names in the graph are unaffected by the demotion.
+_EPISODE_NAME_RE = re.compile(r'^episode_[0-9a-f]{8}$')
+
+
+class TestEpisodeIdIsACorrelationId:
+    """``episode_id`` is returned at ENQUEUE time, before any node uuid exists.
+
+    Leaving it silently returning a uuid that matches nothing is the status quo
+    this task removes: today a caller who copies ``episode_id`` into
+    ``delete_episode`` gets a silent no-op against a nonexistent node.  The
+    resolution is to demote it to a correlation id, enforced at RUNTIME by a
+    ``corr_`` prefix rather than by a docstring promise — so a ``corr_``-prefixed
+    id fails self-describingly instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returned_id_is_prefixed_and_distinct_from_the_minted_uuid(
+        self, svc_fake_registry, caplog
+    ):
+        svc, fake, reg = svc_fake_registry
+
+        with caplog.at_level(logging.INFO):
+            response = await svc.add_episode(
+                content='We plan to extract the merge queue',
+                project_id='p',
+                temporal_context='planning',
+            )
+            payload = _enqueued_payload(svc)
+            await svc._execute_graphiti_write('add_episode', dict(payload))
+
+        # (a) A caller or log reader can tell at a glance it is not a node uuid.
+        assert response.episode_id.startswith('corr_'), (
+            'episode_id is minted before the node exists, so it must announce '
+            f'itself as a correlation id; got {response.episode_id!r}'
+        )
+
+        # (b) It travels on a key that can never reach graphiti_core.
+        assert payload['correlation_id'] == response.episode_id
+        assert 'uuid' not in payload, (
+            "The enqueue payload must carry no 'uuid' key at all; got "
+            f'{payload.get("uuid")!r}'
+        )
+
+        # (c) Episode NAMES in the graph are unaffected by the demotion — the
+        # name stays derived from the raw uuid4, not from 'corr_...'.
+        assert _EPISODE_NAME_RE.match(payload['name']), (
+            "Episode name must stay 'episode_<8 hex>' off the RAW uuid4, so the "
+            f'prefix does not leak into the graph; got {payload["name"]!r}'
+        )
+
+        # (d) The two identities are provably distinct, and the registry holds
+        #     the one that names a real node.
+        assert len(fake.episodes) == 1
+        minted_uuid = next(iter(fake.episodes))
+        assert response.episode_id != minted_uuid
+        assert await reg.is_planned(minted_uuid) is True, (
+            f'The registry must hold the minted uuid {minted_uuid!r}'
+        )
+        assert await reg.is_planned(response.episode_id) is False, (
+            'The correlation id must never be registered as an episode uuid'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_info_log_ties_the_correlation_id_to_the_real_uuid(
+        self, svc_fake_registry, caplog
+    ):
+        """The mapping must be recoverable from logs alone.
+
+        This is what tasks 3583/3584 can key off without this task duplicating
+        their work: nothing else records which queued write became which node.
+        """
+        svc, fake, _reg = svc_fake_registry
+
+        with caplog.at_level(logging.INFO):
+            response = await svc.add_episode(content='an episode', project_id='p')
+            await svc._execute_graphiti_write(
+                'add_episode', dict(_enqueued_payload(svc))
+            )
+
+        minted_uuid = next(iter(fake.episodes))
+        tying = [
+            r.getMessage()
+            for r in caplog.records
+            if response.episode_id in r.getMessage() and minted_uuid in r.getMessage()
+        ]
+        assert tying, (
+            'An INFO log must name BOTH the correlation id '
+            f'({response.episode_id!r}) and the real episode uuid '
+            f'({minted_uuid!r}); otherwise the mapping is unrecoverable. '
+            f'Records seen: {[r.getMessage() for r in caplog.records]}'
         )
