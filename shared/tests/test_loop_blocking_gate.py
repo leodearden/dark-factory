@@ -729,7 +729,7 @@ class _TreeScan(NamedTuple):
     """Cached result of one whole-tree sweep (session-scoped)."""
 
     scanned_files: int
-    findings: list
+    findings: list[LoopBlockingSite]
 
 
 @pytest.fixture(scope='session')

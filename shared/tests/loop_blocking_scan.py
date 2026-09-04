@@ -110,7 +110,7 @@ def site_key(site: LoopBlockingSite) -> tuple[str, str, str]:
     Delegates to ``silent_fallthrough_scan.violation_key`` so the two gates in
     this directory cannot drift apart on what "the same site" means.
     """
-    return violation_key(site)  # type: ignore[arg-type]
+    return violation_key(site)
 
 
 # --------------------------------------------------------------------------- #
