@@ -17,6 +17,37 @@ erroring out at collection time.
 from __future__ import annotations
 
 import json
+from typing import Any
+
+import pytest
+from shared.task_statuses import ACTIVE, TERMINAL
+
+
+def _row(
+    task_id: str = '5902',
+    status: str = 'pending',
+    title: str = 'GATE: stranded task 5879 needs a human ruling',
+    metadata: Any = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """A task row in the real `_row_to_task` wire shape (`id` is a STRING).
+
+    Mirrors tests/test_live_task_write_guard.py::_flat — a plain dict
+    factory, no model construction.
+    """
+    payload: dict[str, Any] = {
+        'id': task_id,
+        'title': title,
+        'status': status,
+        'metadata': (
+            {'execution_class': 'operational', 'operational_mode': 'gate',
+             'gate_subject': '5879'}
+            if metadata is None
+            else metadata
+        ),
+    }
+    payload.update(extra)
+    return payload
 
 
 class TestGateSubjectKeyConstants:
@@ -251,3 +282,147 @@ class TestIsGateSubmission:
             is_gate_submission(json.dumps({'execution_class': 'operational'}))
             is True
         )
+
+
+class TestFindOpenGate:
+    """find_open_gate(tasks, subject) -> mapping | None. PURE — no I/O, no async."""
+
+    def test_matching_pending_carrier_is_returned(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        hit = find_open_gate([_row(task_id='5902', status='pending')], '5879')
+        assert hit is not None
+        assert hit['id'] == '5902'
+        assert isinstance(hit['id'], str)
+        assert hit['title'] == 'GATE: stranded task 5879 needs a human ruling'
+
+    @pytest.mark.parametrize('status', sorted(str(s) for s in ACTIVE))
+    def test_matches_across_every_non_terminal_status(self, status):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        # `deferred` is the planning_mode landing status — it must block too.
+        hit = find_open_gate([_row(status=status)], '5879')
+        assert hit is not None, f'{status} carrier must block a fresh gate'
+        assert hit['id'] == '5902'
+
+    @pytest.mark.parametrize('status', sorted(str(s) for s in TERMINAL))
+    def test_terminal_carriers_do_not_block(self, status):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        assert find_open_gate([_row(status=status)], '5879') is None
+
+    def test_different_subject_does_not_match(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        assert find_open_gate([_row()], '5858') is None
+
+    def test_non_gate_task_with_same_subject_does_not_match(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        code_tdd = _row(
+            metadata={'execution_class': 'code_tdd', 'gate_subject': '5879'}
+        )
+        llm = _row(
+            metadata={
+                'execution_class': 'operational',
+                'operational_mode': 'llm',
+                'gate_subject': '5879',
+            }
+        )
+        assert find_open_gate([code_tdd], '5879') is None
+        assert find_open_gate([llm], '5879') is None
+
+    def test_empty_corpus_returns_none(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        assert find_open_gate([], '5879') is None
+
+    def test_stored_carrier_keyed_by_stranded_task_id_alias_matches(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        # The measured 5902/5916/5929 population keys its subject this way.
+        row = _row(
+            metadata={
+                'execution_class': 'operational',
+                'operational_mode': 'gate',
+                'stranded_task_id': '5879',
+            }
+        )
+        hit = find_open_gate([row], '5879')
+        assert hit is not None
+        assert hit['id'] == '5902'
+
+    def test_stored_carrier_keyed_by_related_task_id_alias_matches(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        row = _row(
+            metadata={
+                'execution_class': 'operational',
+                'related_task_id': '5879',
+            }
+        )
+        hit = find_open_gate([row], '5879')
+        assert hit is not None
+        assert hit['id'] == '5902'
+
+    def test_stored_int_subject_matches_incoming_string(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        row = _row(
+            metadata={'execution_class': 'operational', 'gate_subject': 5879}
+        )
+        hit = find_open_gate([row], '5879')
+        assert hit is not None
+        assert hit['id'] == '5902'
+
+    def test_first_match_in_corpus_order_wins(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        rows = [_row(task_id='5902'), _row(task_id='5916'), _row(task_id='5929')]
+        hit = find_open_gate(rows, '5879')
+        assert hit is not None
+        assert hit['id'] == '5902'
+
+    def test_malformed_rows_never_raise_and_are_skipped(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        corpus = [
+            _row(task_id='5801', metadata=None),
+            _row(task_id='5802', metadata='not json at all {{{'),
+            _row(task_id='5803', metadata=['not', 'a', 'dict']),
+            _row(task_id='5804', metadata=42),
+            'not a mapping at all',
+            None,
+            42,
+        ]
+        assert find_open_gate(corpus, '5879') is None
+
+    def test_json_string_metadata_on_a_stored_row_still_matches(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        row = _row(
+            metadata=json.dumps(
+                {'execution_class': 'operational', 'gate_subject': '5879'}
+            )
+        )
+        hit = find_open_gate([row], '5879')
+        assert hit is not None
+        assert hit['id'] == '5902'
+
+    def test_blank_or_missing_id_row_is_skipped_not_returned(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        blank = _row(task_id='')
+        missing = _row()
+        del missing['id']
+        assert find_open_gate([blank], '5879') is None
+        assert find_open_gate([missing], '5879') is None
+        # ... and a skipped blank row does not mask a real later match.
+        hit = find_open_gate([blank, _row(task_id='5916')], '5879')
+        assert hit is not None
+        assert hit['id'] == '5916'
+
+    def test_none_corpus_returns_none_without_raising(self):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        assert find_open_gate(None, '5879') is None
