@@ -860,7 +860,16 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
             # the sweep could not even evaluate certainly cannot be vouched
             # for. False/None/ABSENT (a pre-flight failure, so no delete was
             # ever attempted) correctly stay record_error.
-            if record.get('delete_landed') is True:
+            #
+            # `not repaired` is the OTHER half of "no vouched-for replacement":
+            # a clean repair also carries delete_landed=True, so without it any
+            # future statement added after _repair_record that raised would
+            # emit repaired AND content_lost_in_flight together, sending an
+            # operator to hand-restore text that is live in the store --
+            # producing exactly the duplicate the probe's three-valued verdict
+            # exists to prevent. Unreachable today (nothing follows the call);
+            # kept because the cost is one token and the failure is silent.
+            if record.get('delete_landed') is True and not record.get('repaired'):
                 _report_content_lost(record, match.get('id'), str(exc))
             else:
                 record[RECORD_ERROR] = True
@@ -1079,9 +1088,11 @@ def resolve_exit_code(report: dict) -> int:
     ``skipped_metadata_would_be_rejected`` (a repairable record whose carried
     metadata would fail ``add_memory``'s own validation, so the pre-flight
     refused to delete it), and ``record_error`` (the record's repair aborted on
-    an unexpected error -- the sweep carried on, but whether that record's
-    delete landed is UNKNOWN, which is precisely the state a human has to
-    adjudicate).
+    an unexpected error -- the sweep carried on, and the record's
+    ``delete_landed`` says what that cost: ``False`` the delete demonstrably
+    did NOT land, ``None`` the read-only probe could not tell, ABSENT no delete
+    was ever attempted. All three need a human; only the first and third are
+    known-harmless).
     """
     if report['dry_run']:
         return 0

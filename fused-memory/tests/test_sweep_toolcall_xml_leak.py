@@ -1127,6 +1127,11 @@ class TestRunApplyAdjudicatesARaisedDelete:
         # The ORIGINAL delete error, not the probe's verdict, is the fact a
         # human needs to understand what happened.
         assert 'attempt to write a readonly database' in lost['error']
+        # ...and the probe's own account reaches the REPORT beside it. The
+        # runbook (docs/mcp-toolcall-xml-leak.md) sends the operator to
+        # `delete_landed_note` for the reasoning, so a refactor that stopped
+        # storing it would silently point that instruction at a missing key.
+        assert lost['delete_landed_note'].strip()
         assert _mod.resolve_exit_code(report) != 0
 
     @pytest.mark.asyncio
@@ -1147,6 +1152,9 @@ class TestRunApplyAdjudicatesARaisedDelete:
         assert 'content_lost_in_flight' not in failed
         assert failed['repaired'] is False
         assert 'attempt to write a readonly database' in failed['error']
+        # The runbook branches on `false` vs `null` and reads the reasoning out
+        # of `delete_landed_note`, so the note must reach the report itself.
+        assert failed['delete_landed_note'].strip()
         assert _mod.resolve_exit_code(report) != 0
 
     @pytest.mark.asyncio
@@ -1167,6 +1175,9 @@ class TestRunApplyAdjudicatesARaisedDelete:
         assert 'content_lost_in_flight' not in failed
         assert 'attempt to write a readonly database' in failed['error']
         assert 'qdrant read timed out' not in failed['error']
+        # It does not displace `error` -- it lives BESIDE it, in the report,
+        # which is where the runbook tells the operator to read it.
+        assert 'qdrant read timed out' in failed['delete_landed_note']
         assert _mod.resolve_exit_code(report) != 0
 
     @pytest.mark.parametrize(
@@ -1275,6 +1286,44 @@ class TestRunAttributesAnEscapeAfterALandedDelete:
         # The content is untouched in the store: never deleted, never re-added.
         service.delete_memory.assert_not_awaited()
         service.add_memory.assert_not_awaited()
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_raise_after_a_completed_repair_stays_a_record_error(self, monkeypatch):
+        """The second negative control: a landed delete WITH a vouched-for
+        replacement is not a loss.
+
+        ``delete_landed: True`` is set on the happy path too, so the catch-all
+        reads BOTH fields — a record that reached ``repaired: True`` had its
+        re-add vouched for by ``readd_persisted``, and the text is live in the
+        store. Escalating it would emit ``repaired`` and
+        ``content_lost_in_flight`` on the SAME record and send an operator to
+        hand-restore text that is not lost, producing the duplicate the
+        three-valued verdict exists to prevent.
+
+        Nothing follows the ``_repair_record`` call today, so this is
+        unreachable in production; the raise is injected by wrapping
+        ``_repair_record`` itself, which is exactly the shape a later statement
+        added after that call would take.
+        """
+        service = _service([_match('b', _TAIL_LEAK)])
+        repair_record = _mod._repair_record
+
+        async def _repair_then_raise(*args, **kwargs):
+            await repair_record(*args, **kwargs)
+            raise RuntimeError('a statement after the repair blew up')
+
+        monkeypatch.setattr(_mod, '_repair_record', _repair_then_raise)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        failed = _record_for(report, 'b')
+        assert failed['repaired'] is True
+        assert failed['delete_landed'] is True
+        # record_error, never a contradiction of the repair that did land.
+        assert failed['record_error'] is True
+        assert 'content_lost_in_flight' not in failed
+        assert 'a statement after the repair blew up' in failed['error']
         assert _mod.resolve_exit_code(report) != 0
 
     @pytest.mark.asyncio
