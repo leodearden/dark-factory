@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -927,6 +928,140 @@ class TestDeleteOrphanMarkersProtectedMirrorGuard:
             memory_service, 'dark_factory', [_orphan('o1')],
         )
         assert unprotected['protected_skipped'] == []
+
+
+# ===========================================================================
+# Tests: delete_orphan_markers writes task-3041 tombstones (task 4435)
+# ===========================================================================
+
+class TestDeleteOrphanMarkersWritesTombstones:
+    """Every confirmed delete leaves the task-3041 audit trail behind it.
+
+    Without this, an operator chasing a broken memory-id reference cannot
+    distinguish a record this sweep reaped from silent data loss — and
+    ``delete_orphan_markers``' deletes are permanent, so there is no later
+    cycle that would reconstruct the answer.
+    """
+
+    @staticmethod
+    def _rows(ledger: AsyncMock) -> list:
+        """The ReconLedgerRecord rows of the single batch write."""
+        return list(ledger.upsert_many.await_args.args[0])
+
+    @pytest.mark.asyncio
+    async def test_one_batch_carries_every_victim_in_input_order(self):
+        """ONE upsert_many for the whole sweep (not one per victim), whose
+        rows' task_id fields are the victims' Mem0 uuids in input order."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        assert ledger.upsert_many.await_count == 1, (
+            'Expected exactly one ledger transaction for the whole sweep, got '
+            f'{ledger.upsert_many.await_count}'
+        )
+        rows = self._rows(ledger)
+        assert [r.task_id for r in rows] == ['o1', 'o2'], (
+            f'Unexpected tombstone rows: {[r.task_id for r in rows]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_records_this_sweep_as_the_deleter(self):
+        """deleter is the same string delete_memory is passed as _source, and
+        created_at is the VICTIM's own created_at, not the tombstone's."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        victim = _orphan('o1')
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [victim],
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleter'] == 'sweep_orphan_flag_markers'
+        assert payload['created_at'] == victim['created_at']
+
+    @pytest.mark.asyncio
+    async def test_deleting_run_id_is_the_causation_id_when_supplied(self):
+        """The tombstone's run id and the write journal's causation id name
+        the same thing, which is what makes the two cross-referenceable."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+            causation_id='sweep-run-1',
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleting_run_id'] == 'sweep-run-1'
+
+    @pytest.mark.asyncio
+    async def test_deleting_run_id_is_empty_string_without_a_causation_id(self):
+        """A manual/nightly sweep genuinely has no reconciliation run, so ''
+        is the honest value — and matches the ledger row's own run_id default."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+        )
+
+        payload = json.loads(self._rows(ledger)[0].payload_json)
+        assert payload['deleting_run_id'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_failed_delete_is_never_tombstoned(self):
+        """ORDERING CONTRACT: a tombstone must never claim a record that is
+        still alive, so only the SUCCEEDING victim is written."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('boom'), None]
+        )
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        rows = self._rows(ledger)
+        assert len(rows) == 1, f'Expected only the succeeding victim: {rows!r}'
+        assert rows[0].task_id == 'o2'
+        assert result['deleted'] == 1
+        assert result['failed'] == ['o1']
+        assert result['tombstoned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_tombstoned_count_is_reported(self):
+        """The returned dict reports how many rows were actually written."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        assert result['tombstoned'] == 2
+        assert result['tombstoned'] == len(self._rows(ledger))
+
+    @pytest.mark.asyncio
+    async def test_zero_successful_deletes_writes_no_batch_at_all(self):
+        """An all-failing sweep must not open a ledger transaction it has
+        nothing to put in."""
+        memory_service, ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(
+            side_effect=[RuntimeError('boom'), RuntimeError('boom')]
+        )
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+        ledger.upsert_many.assert_not_awaited()
+        assert result['deleted'] == 0
+        assert result['tombstoned'] == 0
 
 
 # ===========================================================================
