@@ -201,6 +201,62 @@ a broken or absent ledger to go fix, not a clean bill of health. A
 more occurrences than one read returns, so the counters cover a partial
 window.
 
+### Reading the merge-lane throughput baseline
+
+```bash
+cd <dark-factory-repo>
+uv run --project shared python scripts/merge_lane_throughput.py \
+  --project-root /home/leo/src/dark-factory \
+  --project-root /home/leo/src/reify \
+  --window 14d
+```
+
+`--project-root` is **repeatable**, and that is the only way to get a
+per-project view: the `events` table has no project column, and the
+`project_id` that does exist belongs to `account_events` in a different
+store with a disjoint event vocabulary and no join key. Each root
+resolves its own `<root>/data/orchestrator/runs.db`, and every row is
+labelled with the root it came from — the projects are never pooled into
+one tally. A root whose store is missing or unreadable is reported as a
+named per-project error with **empty** sections (never a bundle of
+zeros), the remaining projects still print, and the exit code is 1.
+
+Prints six sections per project — landings/day, the four-segment
+lead-time split (queue wait → verify → finalize+CAS residual), verify
+duration by runner, host occupancy, heartbeat queue depth, and the
+`merge_attempt`/`merge_finalized` outcome mixes — plus two behind flags:
+`--speculation` (depth distributions, the chain-dead void rate, and a
+cross-project void-rate block) and `--chains` (deep merge-ahead chain
+landings and observed chain lengths). `--json` emits the same numbers
+keyed by project root and nothing else on stdout.
+
+It is strictly read-only: every connection is a `mode=ro` SQLite URI. It
+writes nothing, files nothing, escalates nothing and emits no events, so
+it is safe to run against a live store while the orchestrator is
+merging.
+
+**Three caveats, all of which change how you read the output.**
+*(a) Match the window to the row you are reading.* The
+`plans/merge-lane-throughput-prd.md` § Background table is not
+single-windowed: most rows are a 14-day window, but four are explicitly
+30-day (speculative merges/verdicts voided, the speculative-ahead
+landing share, the `merge_attempt` outcome mix, and the 30d occupancy
+parenthetical). Pass `--window 14d` or `--window 30d` to match the row,
+and `--window <iso>..<iso>` (e.g.
+`2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00`) to reproduce a
+dated baseline exactly — `14d` resolves against *now*, so it covers a
+different fortnight every day and cannot reproduce a table with a fixed
+date in its header. Every section header is stamped with the concrete
+resolved window for exactly this reason. *(b) The three occupancy
+estimators disagree by design.* LOCF integral, raw-sample fraction and
+verify-duration sum measure different things and are printed side by
+side, unreconciled; none is authoritative, and the spread between them
+is itself the finding. *(c) The script asserts no numeric target.* It
+reproduces a dated baseline and prints what it measures — it does not
+check the numbers against the PRD's, and no test asserts a live-store
+number. Do not "fix" it until a 30d run matches a 14d row; that would
+corrupt the baseline the PRD's decompositions inherit.
+
 ### Stopping gracefully
 
 Send `SIGTERM` to the **innermost `orchestrator` process**, not the shell
