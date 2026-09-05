@@ -242,3 +242,123 @@ class TestSessionFixtureSharesTheProvider:
             'unparseable first-party file(s): '
             + ', '.join(r.relpath for r in first_party_tree if r.syntax_error)
         )
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — the parent map is built LAZILY, and a pre-parsed tree is reusable
+# ---------------------------------------------------------------------------
+
+#: A signature-(a) violation nested two scopes deep, so a degraded qualname
+#: resolution shows up as a wrong ANSWER rather than merely a missing one.
+_SIG_A_SOURCE = '''class Harness:
+    async def run(self):
+        value, _ = await get_statuses()
+        return value
+'''
+
+#: A signature-(b) violation, likewise nested.
+_SIG_B_SOURCE = '''class Loader:
+    def load(self):
+        try:
+            return parse()
+        except Exception:
+            return None
+'''
+
+#: A file with neither signature — the 451-of-461 case in the real tree.
+_CLEAN_SOURCE = '''class Quiet:
+    def run(self):
+        try:
+            return compute()
+        except KeyError as exc:
+            logger.warning('missed: %s', exc)
+            raise
+'''
+
+
+class TestParentMapIsLazy:
+    """97.8% of the real tree yields no violation — so build no parent map for it.
+
+    Measured: 10 of 461 first-party files produce at least one violation, while
+    the pre-4520 scanner built a parent map for every one of them (3.73s per
+    full pass, done twice per session).
+    """
+
+    def test_a_clean_file_builds_no_parent_map(self, monkeypatch):
+        """The parent map is needed only to name a violation's enclosing scope."""
+        def boom(_tree):
+            raise AssertionError(
+                'a file with no violation must not pay for a parent map'
+            )
+
+        monkeypatch.setattr(sfs, '_build_parent_map', boom)
+        assert sfs.find_violations(_CLEAN_SOURCE, 'fake/quiet.py') == []
+
+    def test_a_syntax_error_builds_no_parent_map(self, monkeypatch):
+        """find_violations still returns [] on SyntaxError, without any map work."""
+        def boom(_tree):
+            raise AssertionError('an unparseable file must not pay for a parent map')
+
+        monkeypatch.setattr(sfs, '_build_parent_map', boom)
+        assert sfs.find_violations('def f(:\n', 'fake/broken.py') == []
+
+    def test_signature_a_qualname_and_hash_survive_laziness(self):
+        """Pinned against the pre-4520 values: laziness must not degrade qualname."""
+        (violation,) = sfs.find_violations(_SIG_A_SOURCE, 'fake/module.py')
+        assert violation.signature == 'a'
+        assert violation.qualname == 'Harness.run'
+        assert violation.content_hash == '4d5edf203564'
+
+    def test_signature_b_qualname_and_hash_survive_laziness(self):
+        """Pinned against the pre-4520 values (the other half of the ratchet key)."""
+        (violation,) = sfs.find_violations(_SIG_B_SOURCE, 'fake/module.py')
+        assert violation.signature == 'b'
+        assert violation.qualname == 'Loader.load'
+        assert violation.content_hash == '92b98f5b67f9'
+
+    def test_module_scope_violation_still_resolves(self):
+        """The <module> fallback needs the map too — it must still be built."""
+        (violation,) = sfs.find_violations('x, _ = get_statuses()\n', 'fake/module.py')
+        assert violation.qualname == '<module>'
+
+    def test_the_map_is_built_at_most_once_per_file(self, monkeypatch):
+        """Two violations in one file share one parent map, as they did before."""
+        calls = []
+        real = sfs._build_parent_map
+
+        def counting(tree):
+            calls.append(tree)
+            return real(tree)
+
+        monkeypatch.setattr(sfs, '_build_parent_map', counting)
+        source = _SIG_A_SOURCE + '\n' + _SIG_B_SOURCE
+        assert len(sfs.find_violations(source, 'fake/module.py')) == 2
+        assert len(calls) == 1, f'expected one parent map, built {len(calls)}'
+
+
+class TestFindViolationsInTree:
+    """The already-parsed entry point the shared provider feeds."""
+
+    @pytest.mark.parametrize(
+        'source',
+        [_SIG_A_SOURCE, _SIG_B_SOURCE, _CLEAN_SOURCE],
+        ids=['sig-a', 'sig-b', 'clean'],
+    )
+    def test_matches_find_violations_exactly(self, source):
+        tree = ast.parse(source, filename='fake/module.py')
+        assert sfs.find_violations_in_tree(tree, 'fake/module.py', source) == (
+            sfs.find_violations(source, 'fake/module.py')
+        )
+
+    def test_source_argument_is_optional(self):
+        """The scanner works off the tree; *source* is context, not input."""
+        tree = ast.parse(_SIG_B_SOURCE, filename='fake/module.py')
+        assert sfs.find_violations_in_tree(tree, 'fake/module.py') == (
+            sfs.find_violations(_SIG_B_SOURCE, 'fake/module.py')
+        )
+
+    def test_filename_is_what_lands_in_the_record(self):
+        """The gate keys on relpath, so the caller's filename must be honoured."""
+        tree = ast.parse(_SIG_A_SOURCE, filename='ignored.py')
+        (violation,) = sfs.find_violations_in_tree(tree, 'shared/src/shared/x.py')
+        assert violation.filename == 'shared/src/shared/x.py'
