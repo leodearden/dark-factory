@@ -445,8 +445,18 @@ def read_escalation_for_scan(
       For a ``status='pending'`` caller the record would have been filtered
       out anyway -- an archived record is by definition no longer pending --
       so warning here would only train operators to ignore the channel.
+    - ``'unreadable'`` -- any OTHER ``OSError``: EACCES, EIO, fd exhaustion.
+      The file IS present and something is genuinely wrong.  Logged at
+      WARNING, in wording deliberately disjoint from the parse channel's so
+      an operator can tell an I/O fault from corrupt JSON at a glance.
     - ``'unparsable'`` -- the bytes were read but did not parse.  Logged at
       WARNING; operator-actionable.
+
+    HANDLER ORDER IS LOAD-BEARING.  ``FileNotFoundError`` subclasses
+    ``OSError``, so an ``except OSError`` placed FIRST would swallow ENOENT
+    and permanently merge the 'vanished' and 'unreadable' channels, silently
+    demoting a real permissions/EIO fault to the treatment a routine archival
+    gets.  Do not "simplify" the two clauses into one.
 
     *context* names the calling scan (e.g. ``'queue.get_by_task'``) so a log
     line identifies which scan hit the file.  *parse_errors* is a parameter,
@@ -465,6 +475,9 @@ def read_escalation_for_scan(
             context, path,
         )
         return None, 'vanished'
+    except OSError as e:
+        logger.warning('%s: failed to read %s: %s', context, path, e)
+        return None, 'unreadable'
 
     try:
         return Escalation.from_json(text), 'ok'
