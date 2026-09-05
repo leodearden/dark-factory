@@ -35,8 +35,20 @@ from pathlib import Path
 
 import pytest
 from _config_default_scan import DEFAULT_CONFIG, iter_default_asserting_tests
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
+
+# The ratchet below rglob()s every test_*.py under tests/ and ast.parse()s each
+# one, which makes this module the newest member of the whole-tree-scanner
+# family.  Exceeding the 60s pyproject default does NOT merely fail the test:
+# pytest-timeout's thread method os._exit()s the whole xdist worker and
+# --max-worker-restart=0 then truncates the ENTIRE suite, reporting against
+# some innocent guard that shared the dead worker (esc-3980-1, esc-3787-1).
+# WHY 300s and the guard that ENFORCES this mark rather than trusting it to be
+# sprinkled: see WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _write(tmp_path: Path, name: str, body: str) -> Path:
