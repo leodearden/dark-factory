@@ -1337,3 +1337,99 @@ def test_mixes_are_empty_not_zero_on_an_empty_window():
     assert result['attempt_outcomes']['total'] == 0
     assert result['attempt_outcomes']['shares'] == {}
     assert result['finalize_states']['counts'] == {}
+
+
+# ---------------------------------------------------------------------------
+# compute_chains — `landed_via_chain` is an INT that is SUMMED.
+#
+# event_store.py documents it on the merge_finalized payload as "1 on an item
+# landed by a deep merge-ahead chain walk, None otherwise" (the task 3186
+# delta). It is designed to be SUMmed — scripts/merge-deep-canary-predicate.sh
+# is the existing consumer that pins the unit that way. It is NOT a boolean
+# flag and NOT the chain size.
+# ---------------------------------------------------------------------------
+
+
+def _chain_fixture():
+    finalized = [
+        _f('c1', 4, 0), _f('c2', 4, 1), _f('c3', 4, 2),
+        _f('c4', 4, 3), _f('c5', 4, 4), _f('c6', 4, 5),
+    ]
+    for event, value in zip(
+        finalized, [1, 1, None, '__absent__', 1, 2], strict=True
+    ):
+        if value != '__absent__':
+            event['data']['landed_via_chain'] = value
+    verify = [
+        _v('c1', 5, 0, 600_000, chain_items=1),
+        _v('c2', 5, 1, 600_000, chain_items=1),
+        _v('c5', 5, 2, 600_000, chain_items=3),
+        _v('c6', 5, 3, 600_000, chain_items=2),
+    ]
+    return finalized, verify
+
+
+def test_chains_sums_landed_via_chain_rather_than_counting_rows():
+    result = mlt.compute_chains(*_chain_fixture())
+    # Values are 1, 1, None, absent, 1, 2 -> the SUM is 5 over 4 chain
+    # landings. Treating the field as a boolean flag would give 4; treating it
+    # as a row count would also give 4.
+    assert result['items_landed_via_chain'] == 5
+    assert result['n_chain_landings'] == 4
+    assert result['items_landed_via_chain'] != result['n_chain_landings']
+
+
+def test_chains_share_is_chain_landings_over_all_landings():
+    result = mlt.compute_chains(*_chain_fixture())
+    assert result['n_landings'] == 6
+    assert result['chain_landed_share'] == pytest.approx(4 / 6)
+
+
+def test_chains_chain_items_distribution_comes_from_merge_verify():
+    result = mlt.compute_chains(*_chain_fixture())
+    # chain_items is >= 1 always and never None — a non-chained verify is a
+    # chain of one, not a missing value.
+    assert result['chain_items']['distribution'] == {1: 2, 2: 1, 3: 1}
+    assert result['chain_items']['n'] == 4
+
+
+def test_chains_items_per_deep_verify_averages_only_the_deep_ones():
+    result = mlt.compute_chains(*_chain_fixture())
+    # Deep = chain_items > 1: the 3 and the 2. Averaging in the two 1s would
+    # dilute the figure toward 1 and hide how long real chains get.
+    assert result['chain_items']['n_deep'] == 2
+    assert result['chain_items']['items_per_deep_verify'] == pytest.approx(2.5)
+
+
+def test_chains_reports_zero_items_and_a_real_zero_share_when_none_chained():
+    finalized = [_f('n1', 4, 0), _f('n2', 4, 1)]
+    result = mlt.compute_chains(finalized, [])
+    assert result['items_landed_via_chain'] == 0
+    assert result['n_chain_landings'] == 0
+    # 0.0, not None: two landings were observed and neither chained. Reporting
+    # None here would imply chains went unmeasured.
+    assert result['chain_landed_share'] == 0.0
+
+
+def test_chains_share_is_none_when_there_were_no_landings_at_all():
+    result = mlt.compute_chains([], [])
+    assert result['n_landings'] == 0
+    assert result['chain_landed_share'] is None
+    assert result['chain_items']['items_per_deep_verify'] is None
+
+
+def test_chains_ignores_non_done_finalize_rows():
+    finalized, verify = _chain_fixture()
+    finalized.append({'timestamp': _ts(11, 4, 9), 'task_id': 'c9',
+                      'data': {'state': 'blocked', 'landed_via_chain': 1}})
+    result = mlt.compute_chains(finalized, verify)
+    assert result['n_landings'] == 6
+    assert result['items_landed_via_chain'] == 5
+
+
+def test_chains_tolerates_a_non_numeric_landed_via_chain():
+    finalized = [_f('c1', 4, 0)]
+    finalized[0]['data']['landed_via_chain'] = 'yes'
+    result = mlt.compute_chains(finalized, [])
+    assert result['items_landed_via_chain'] == 0
+    assert result['n_unusable_landed_via_chain'] == 1
