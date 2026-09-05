@@ -2394,6 +2394,7 @@ class DeterministicRunner:
             )
             try:
                 if _already_at_target:
+                    assert _current_deploy_state is not None  # implied by _already_at_target (short-circuit `and` above)
                     # Task 4048 (recovered task-2240 review suggestion):
                     # already at (or past) ESCALATED — e.g. this is the rare
                     # crash-resume edge where a prior
