@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+import shared.testing_reify_layout as reify_layout
 from shared.reify_checkout import REIFY_ROOT_ENV, reify_skip_reason, resolve_reify_checkout
 
 from orchestrator.config import OrchestratorConfig
@@ -473,6 +474,124 @@ def _load_module_copy(tmp_path: Path, tests_relpath: str, *, plant_verify_sh: bo
 
 _BARE_LAYOUT = "dark-factory/orchestrator/tests"
 _WORKTREE_LAYOUT = "dark-factory/.worktrees/3978/orchestrator/tests"
+
+
+# ---------------------------------------------------------------------------
+# Adapter pins — `_load_module_copy` is this module's binding to the shared
+# harness, `shared.testing_reify_layout` (task 4259).  Deliberately white-box,
+# and deliberately the only genuinely-RED assertions available for what is
+# otherwise a behaviour-preserving refactor: every BLACK-BOX case below stays
+# green both before and after this module keeps a private copy of the planting
+# + `spec_from_file_location` dance, because a faithful duplicate behaves
+# identically.  That is precisely how this copy and shared's came to diverge
+# unnoticed — see the ambient-contamination case at the end of this block,
+# which shared's copy had and this one did not.
+# ---------------------------------------------------------------------------
+
+
+def test_load_module_copy_delegates_to_the_shared_single_source(tmp_path, monkeypatch):
+    """The planting + loading must live in ONE place.
+
+    RED before the rewire: the local helper runs its own dance and returns a
+    really-loaded module, so the sentinel never comes back.
+    """
+    sentinel = object()
+    seen = {}
+
+    def _stub(source, tmp, tests_relpath, *, marker, plant_marker=True):
+        seen.update(
+            source=source,
+            tmp_path=tmp,
+            tests_relpath=tests_relpath,
+            marker=marker,
+            plant_marker=plant_marker,
+        )
+        return sentinel
+
+    monkeypatch.setattr(reify_layout, "plant_reify_layout", _stub)
+
+    assert _load_module_copy(tmp_path, _BARE_LAYOUT) is sentinel, (
+        "this module must DELEGATE to "
+        "shared.testing_reify_layout.plant_reify_layout rather than keep a "
+        "private copy of the planted-layout harness"
+    )
+    assert Path(seen["source"]) == Path(__file__), (
+        "the harness must be bound to THIS module's file — the walk has to "
+        f"start at the CALL SITE (got {seen.get('source')!r})"
+    )
+    assert seen["tmp_path"] == tmp_path
+    assert seen["tests_relpath"] == _BARE_LAYOUT
+    assert seen["marker"] == _REIFY_VERIFY_RELPATH, (
+        "the shared harness must be bound to THIS call site's marker "
+        f"(expected {_REIFY_VERIFY_RELPATH}, got {seen.get('marker')!r})"
+    )
+    assert seen["plant_marker"] is True
+
+
+def test_plant_verify_sh_false_reaches_the_shared_harness(tmp_path, monkeypatch):
+    """The local ``plant_verify_sh=`` kwarg carries through as ``plant_marker=``.
+
+    The local spelling is preserved for the existing call sites; the shared one
+    is where the meaning lives.
+    """
+    seen = {}
+
+    def _stub(source, tmp, tests_relpath, *, marker, plant_marker=True):
+        seen["plant_marker"] = plant_marker
+        return object()
+
+    monkeypatch.setattr(reify_layout, "plant_reify_layout", _stub)
+
+    _load_module_copy(tmp_path, _BARE_LAYOUT, plant_verify_sh=False)
+
+    assert seen["plant_marker"] is False
+
+
+def test_layout_constants_come_from_the_shared_builders():
+    """The two layout constants must be the shared builders' output.
+
+    Deliberately NOT red before the rewire, and worth saying so: the hand-
+    written literals spell exactly what the builders produce today.  It is
+    written against the BUILDERS precisely because of that — a copy that merely
+    happens to match now would silently diverge the moment a builder changes,
+    which is the failure mode two independently-maintained copies of the same
+    layout string already demonstrate.
+    """
+    assert reify_layout.bare_layout("orchestrator") == _BARE_LAYOUT
+    assert reify_layout.worktree_layout("orchestrator", "3978") == _WORKTREE_LAYOUT
+
+
+def test_discovery_miss_case_is_protected_from_an_ambient_reify_checkout(
+    tmp_path, planted_env
+):
+    """THE case that closes this suite's measured gap against shared's copy.
+
+    ``test_gate_skips_instead_of_answering_from_this_machine`` below depends on
+    an environmental precondition — no ancestor of the copied module may carry
+    ``reify/scripts/verify.sh`` — that holds for the default
+    ``/tmp/pytest-of-<user>/...`` basetemp but not for every ``--basetemp`` or
+    an ambient ``/tmp/reify`` checkout.  shared/tests/test_locking.py grew that
+    precondition; THIS file, the copy it was ported FROM, never did, so an
+    unusual environment failed here with a message blaming the resolver.
+
+    RED before the rewire: the local helper has no such precondition at all, so
+    it loads happily and the contamination stays silent.
+    """
+    marker_file = tmp_path / "reify" / _REIFY_VERIFY_RELPATH
+    marker_file.parent.mkdir(parents=True, exist_ok=True)
+    marker_file.write_text("#!/bin/sh\necho stub\n")
+
+    with pytest.raises(reify_layout.AmbientReifyCheckoutError) as excinfo:
+        _load_module_copy(tmp_path, _BARE_LAYOUT, plant_verify_sh=False)
+
+    message = str(excinfo.value)
+    assert str(tmp_path) in message, (
+        "the contaminating ancestor must be named so the failure blames the "
+        f"environment, not the resolver: {message!r}"
+    )
+    assert str(_REIFY_VERIFY_RELPATH) in message, (
+        f"the marker must be named — contamination is marker-specific: {message!r}"
+    )
 
 
 def test_gate_resolves_against_the_planted_checkout_not_this_machine(tmp_path, planted_env):
