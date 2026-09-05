@@ -679,12 +679,21 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
             "`submit_task` declaring `metadata.operational_mode='gate'` "
             "alongside `metadata.execution_class='operational'`."
         )
-        alias_clause = (
-            ' `stranded_task_id` and `related_task_id` are accepted as '
-            'read-side ALIASES so carriers already filed under those older, '
-            'invented spellings are still matched. They are read-side only: '
-            'never use either for a NEW filing, and never rewrite an existing '
-            "carrier's metadata to canonicalise it."
+        dedupe_clause = (
+            'A second gate for a `gate_subject` that already has a '
+            'NON-TERMINAL carrier is REJECTED at the `submit_task` boundary — '
+            'a hard rejection invariant, not a lint warning. The rejection '
+            'names the open carrier. When you hit it, AMEND that carrier with '
+            '`update_task` (refresh its evidence, bump '
+            '`metadata.recurrence_count`) instead of filing again; do not work '
+            'around it by rewording the title. Once the carrier is `done` or '
+            '`cancelled` it no longer blocks, so a condition that genuinely '
+            'recurs after closure can be filed afresh. `stranded_task_id` and '
+            '`related_task_id` are accepted as read-side ALIASES so carriers '
+            'already filed under those older, invented spellings are still '
+            'matched. They are read-side only: never use either for a NEW '
+            "filing, and never rewrite an existing carrier's metadata to "
+            'canonicalise it.'
         )
     else:
         residual_clause = (
@@ -694,7 +703,14 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
             '`flag_for_stage2` / `flagged_items` channel, so Stage 2 files it '
             "as an `operational` task with `operational_mode='gate'`."
         )
-        alias_clause = ''
+        dedupe_clause = (
+            'A second gate for a `gate_subject` that already has a '
+            'NON-TERMINAL carrier is REJECTED when it is filed, so relay the '
+            'subject accurately — and say so in what you relay if you believe '
+            'an existing carrier already covers it. The amend-vs-refile '
+            'decision belongs to the stage that holds the task-write tools; '
+            'this stage does not hold them, so do not prescribe one here.'
+        )
     return (
         '## Source-Completion\n'
         'You ALREADY hold the memory-mutation tools (`add_memory` / '
@@ -719,15 +735,7 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
         'cluster/topic working key when it is a consolidation gate (the same '
         'topic slug the "## Consolidation Gate" section already requires — '
         'that is the natural cluster value, not a second key to invent).\n\n'
-        'A second gate for a `gate_subject` that already has a NON-TERMINAL '
-        'carrier is REJECTED at the `submit_task` boundary — a hard rejection '
-        'invariant, not a lint warning. The rejection names the open '
-        'carrier. When you hit it, AMEND that carrier with `update_task` '
-        '(refresh its evidence, bump `metadata.recurrence_count`) instead of '
-        'filing again; do not work around it by rewording the title. Once the '
-        'carrier is `done` or `cancelled` it no longer blocks, so a condition '
-        'that genuinely recurs after closure can be filed '
-        'afresh.' + alias_clause + '\n\n'
+        + dedupe_clause + '\n\n'
         'The "## Consolidation Gate" section is the AUTHORITY for what that '
         'gate must contain — its target end state, its topic working key, and '
         'the closure check that refuses to let it close over a malformed '

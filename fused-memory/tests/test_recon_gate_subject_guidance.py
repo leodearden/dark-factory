@@ -63,12 +63,27 @@ class TestSourceCompletionDeclaresGateSubject:
             f'while the first carrier is non-terminal'
         )
 
-    @pytest.mark.parametrize('can_file', [True, False])
-    def test_names_update_task_as_the_amend_path(self, can_file):
-        text = m.render_source_completion_section(can_file_tasks=can_file)
-        assert 'update_task' in text, (
-            f'can_file_tasks={can_file} must name the amend path'
-        )
+    def test_stage2_variant_names_update_task_as_the_amend_path(self):
+        """Scoped to can_file_tasks=True deliberately.
+
+        `update_task` is in DISALLOW_TASK_WRITES alongside `submit_task`, so
+        Stage 1 holds NEITHER. render_source_completion_section's own
+        docstring states the governing norm — "Never instruct Stage 1 to call
+        a tool it does not hold (loud-over-silent)" — and
+        test_operational_routing_boundary_matrix.py::
+        test_recon_stage_prompts_carry_source_completion_directives enforces
+        the `submit_task` half of it. Naming the amend tool in the Stage-1
+        variant would violate both.
+        """
+        text = m.render_source_completion_section(can_file_tasks=True)
+        assert 'update_task' in text, 'the filing stage must name the amend path'
+
+    def test_stage1_variant_names_no_tool_it_does_not_hold(self):
+        """The inverse pin, so a future edit cannot quietly reintroduce a
+        task-write tool name into the relay-only stage."""
+        text = m.render_source_completion_section(can_file_tasks=False)
+        assert '`update_task`' not in text, f'got {text!r}'
+        assert '`submit_task`' not in text, f'got {text!r}'
 
     def test_stage2_variant_names_the_read_side_aliases_as_legacy(self):
         """Stage 2 is the stage that actually files, so it is the one that
