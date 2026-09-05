@@ -1779,6 +1779,91 @@ class TestGetPendingParseFailure:
         )
 
 
+class TestScanSurvivesRecordArchivedMidScan:
+    """An unlocked glob-then-read scan must survive a record relocated by a
+    concurrent archive sweep between the directory listing and the read.
+
+    The glob snapshots the queue root; the reads happen afterwards, one file
+    at a time, holding no lock.  A concurrent ``resolve()`` or startup sweep
+    can ``os.replace`` any of those files into ``archive/<date>/`` in that
+    window, so the read raises ``FileNotFoundError`` — an ``OSError``, which
+    none of the scan sites' ``except (json.JSONDecodeError, KeyError,
+    TypeError)`` tuples cover.  The blast radius is the WHOLE listing, and it
+    crosses tasks: every root file is read before the ``task_id`` filter runs,
+    so archiving an unrelated task's record kills a caller's query.
+    """
+
+    @staticmethod
+    def _relocating_read_text(doomed: Path, archive_dir: Path):
+        """Interpose ``Path.read_text`` to really relocate *doomed* mid-scan.
+
+        Not a mocked exception: the file is genuinely ``os.replace``d into
+        *archive_dir* and then the original ``read_text`` is called through,
+        so the ``FileNotFoundError`` is raised by the filesystem exactly as it
+        is in the live incident.
+        """
+        original = Path.read_text
+
+        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(str(doomed), str(archive_dir / doomed.name))
+            return original(self, *args, **kwargs)
+
+        return flaky
+
+    def test_get_by_task_survives_unrelated_record_archived_mid_scan(
+        self, tmp_path: Path, caplog,
+    ):
+        """A task-4176 query must survive the archival of a task-3517 record.
+
+        RED on main: ``FileNotFoundError: [Errno 2] No such file or directory:
+        '.../queue/esc-3517-5.json'`` escapes ``get_by_task`` entirely.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-3517-5', task_id='3517'))
+
+        doomed = queue.queue_dir / 'esc-3517-5.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = self._relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status='pending')
+
+        # (a) The unrelated archival must not void the caller's listing.
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving task-4176 record, got '
+            f'{[e.id for e in results]}'
+        )
+
+        # (b) Loud enough to audit: the vanished path is named at DEBUG.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any(str(doomed) in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG naming {doomed}; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+        # (c) ...but NOT loud enough to cry wolf.  A record archived mid-scan
+        # is expected concurrency, not corruption — and for status='pending'
+        # it would have been filtered out anyway, an archived record being by
+        # definition no longer pending.
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not loud, (
+            f'Expected no WARNING-or-above for a benign mid-scan archival; '
+            f'got: {[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+
+
 class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
