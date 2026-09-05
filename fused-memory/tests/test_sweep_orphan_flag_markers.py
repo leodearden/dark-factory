@@ -1925,6 +1925,143 @@ class TestTargetedCorrection:
 
 
 # ===========================================================================
+# Tests: run() subtracts protected mirrors from the delete set (task 4435)
+# ===========================================================================
+
+class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
+    """run()'s REPORTING partition, the companion to the choke-point guard.
+
+    ``orphan_count``'s documented contract is "the actual number of records
+    deleted (or that would be deleted)". A DRY RUN never reaches
+    ``delete_orphan_markers`` at all, so without this partition a dry run
+    would print a count the subsequent ``--apply`` silently does not honour —
+    and dry-run-then-apply is exactly the operator workflow this script is
+    built around.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = False,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+        delete_ids: list[str] | None = None,
+    ):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _service(members: list[dict], *, apply: bool) -> AsyncMock:
+        memory_service = AsyncMock()
+        counts = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.count_memories_by_metadata = counts
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_dry_run_excludes_protected_members_from_orphan_count(self):
+        """A dry run reports the delete set it would actually take."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['o1'], (
+            f"Protected members leaked into the delete set: {report['orphan_ids']!r}"
+        )
+        assert report['orphan_count'] == 1
+        assert report['protected_skipped_count'] == 2
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_apply_reports_the_same_numbers_as_the_dry_run(self):
+        """A dry run and the --apply it precedes never disagree about the
+        delete set — the whole reason this partition exists in run()."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['o1']
+        assert report['orphan_count'] == 1
+        assert report['protected_skipped_count'] == 2
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'o1'}, f'Unexpected delete set: {deleted_ids!r}'
+
+    @pytest.mark.asyncio
+    async def test_bucket_counts_stay_consistent_with_orphan_count(self):
+        """bucket_counts is documented as a breakdown OF THE FINAL UNION, so
+        the protected members must be absent from it too."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert sum(report['bucket_counts'].values()) == report['orphan_count']
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_cannot_override_the_guard(self):
+        """--delete-ids is refused for a protected member, and the report
+        shows the request was SEEN and refused rather than silently lost."""
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True, delete_ids=['m1', 'l1']),
+            memory_service,
+            now=self._NEUTRAL_NOW,
+        )
+
+        deleted_ids = {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert 'm1' not in deleted_ids and 'l1' not in deleted_ids, (
+            f'--delete-ids overrode the guard: {deleted_ids!r}'
+        )
+        assert 'm1' not in report['orphan_ids']
+        assert 'l1' not in report['orphan_ids']
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+        # The operator's request stays visible: targeted_correction_ids
+        # records what --delete-ids MATCHED, which must not vanish just
+        # because the guard then refused it.
+        assert set(report['targeted_correction_ids']) == {'m1', 'l1'}
+
+    @pytest.mark.asyncio
+    async def test_keys_are_present_when_nothing_is_protected(self):
+        """The two keys are unconditional, so no report consumer needs a
+        .get fallback and a JSON diff across nights stays stable."""
+        members = [_orphan('o1'), _member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['protected_skipped_count'] == 0
+        assert report['protected_skipped_ids'] == []
+
+
+# ===========================================================================
 # Tests: the flag_for_stage2 pool is CENSUSED, never deleted (task 3897)
 # ===========================================================================
 
