@@ -2075,3 +2075,57 @@ class TestVerdictReadingIsNotRaceProne:
             f'the gate did not agree with itself across 30 identical runs: '
             f'{sorted(set(verdicts))}'
         )
+
+
+def _defect_first_eval_source(pattern_line: str) -> str:
+    """A synthetic ``eval_write_triage_judge.py`` source, defect pattern FIRST.
+
+    Mirrors ``_write_marker_first_probe_stub``'s shape one layer over: put the
+    matched pattern FIRST, then ``_PROBE_FILLER_BYTES`` of inert filler, so a
+    writer feeding this through ``grep -q PATTERN`` over a PIPE is certain to
+    be killed by SIGPIPE before it finishes -- grep exits at the match, and
+    ~1 MB still has to go down the pipe behind it. The ORDER is the mechanism
+    under test: a pattern at the END would let the writer finish before grep
+    can exit, so it would never expose the race no matter how large the
+    filler is. The filler line itself contains neither item 2's nor item 4's
+    pattern.
+    """
+    filler_line = 'filler line, module body continues\n'
+    repeats = _PROBE_FILLER_BYTES // len(filler_line) + 1
+    return pattern_line + '\n' + (filler_line * repeats)
+
+
+class TestItemsTwoAndFourReadingIsNotRaceProne:
+    """DEFECT-A regression lock for items 2 and 4 -- the other half of
+    ``TestVerdictReadingIsNotRaceProne``'s defect, over a different stream.
+
+    Item 1's verdict is read from the probe's stdout (``$probe_out``); items 2
+    and 4 read the ref's eval source (``$eval_src``) via the identical
+    ``printf | grep -q`` shape task 4810 also fixed in this file (commit
+    a671556834), over a here-string instead. Nothing pinned that fix until
+    now: ``test_items_2_and_4_still_fail_on_their_patterns`` uses a ~150-byte
+    fixture, far under the 64 KB pipe buffer, so a re-introduced pipe never
+    SIGPIPEs there and that test would stay green regardless. These tests
+    reuse the marker-first + large-filler technique above, applied to
+    ``$eval_src`` instead of ``$probe_out``, to make a reintroduced pipe
+    deterministically wrong rather than a rare flake.
+
+    ``judge='by_id'`` throughout so item 1 passes and a failure is
+    unambiguously attributable to the item under test.
+    """
+
+    def test_a_defect_pattern_ahead_of_a_large_eval_source_fails_item_2(self, tmp_path):
+        eval_text = _defect_first_eval_source('CONFUSION_COLUMNS = list(TRIAGE_OUTCOMES)')
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=eval_text)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert 'FAIL  item 2' in proc.stdout, proc.stdout[:4000]
+        assert 'PASS  item 2' not in proc.stdout, proc.stdout[:4000]
+
+    def test_a_defect_pattern_ahead_of_a_large_eval_source_fails_item_4(self, tmp_path):
+        eval_text = _defect_first_eval_source(
+            "def publish(report_path):\n    return report_path.with_suffix('.md')",
+        )
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=eval_text)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert 'FAIL  item 4' in proc.stdout, proc.stdout[:4000]
+        assert 'PASS  item 4' not in proc.stdout, proc.stdout[:4000]
