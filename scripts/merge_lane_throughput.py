@@ -991,3 +991,236 @@ def compute_chains(
             'items_per_deep_verify': sum(deep) / len(deep) if deep else None,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-project rim: one runs.db per project root, one labelled bundle each.
+# ---------------------------------------------------------------------------
+
+# This checkout, used when no --project-root is passed. `scripts/` sits
+# directly under the project root, so `parents[1]` is that root (the same
+# spelling `scripts/mint_hard_v2_fixtures.py` and `scripts/query-events.sh`
+# use).
+DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# The always-on sections, in report order. `chains` and `speculation` are
+# behind flags and appended after these.
+_ALWAYS_ON_SECTIONS = (
+    'landings_per_day', 'lead_time', 'verify_by_runner',
+    'occupancy', 'queue_depth', 'mixes',
+)
+
+
+def resolve_runs_db(root: str | Path) -> Path:
+    """``<root>/data/orchestrator/runs.db`` — the orchestrator event store.
+
+    That layout is fixed by `harness.py` and carries no config key, so it is
+    spelled here rather than read from `dark-factory-orchestrator.yaml`; the
+    same literal appears in `scripts/audit_wiped_metadata_files.py`,
+    `scripts/mint_hard_v2_fixtures.py` and `scripts/query-events.sh`.
+    """
+    return Path(root) / 'data' / 'orchestrator' / 'runs.db'
+
+
+def resolve_project_roots(values: Sequence[str] | None) -> list[Path]:
+    """Resolve the repeated ``--project-root`` values, defaulting to this checkout.
+
+    argparse's ``append`` action leaves the destination at ``None`` (not
+    ``[]``) when the flag never appears, so the default is applied here rather
+    than via ``default=[...]`` — an argparse list default is shared mutable
+    state that ``append`` extends rather than replaces, which would silently
+    add this checkout to every explicit invocation.
+    """
+    if not values:
+        return [DEFAULT_PROJECT_ROOT]
+    return [Path(value) for value in values]
+
+
+def collect_project(
+    root: str | Path,
+    lo: datetime,
+    hi: datetime,
+    *,
+    chains: bool = False,
+    speculation: bool = False,
+) -> dict[str, Any]:
+    """Read one project's runs.db and return one LABELLED result bundle.
+
+    WHY THE FLAG IS REPEATABLE rather than a project column being read
+    (plan decision 5).  The `events` table has no project/project_id column at
+    all — checked against the live DDL in `event_store.py::_SCHEMA`, which is
+    ten columns wide and carries none.  The only ``project_id`` in the system
+    belongs to `account_events` in a DIFFERENT store
+    (`shared/src/shared/cost_store.py`), whose event vocabulary is disjoint
+    from the merge-lane one and which shares no join key with it.  So a
+    per-project breakdown is not derivable from a single root by any query:
+    the project label IS the root you read, and reading several means passing
+    the flag several times.  The PRD's void-rate decomposition needs exactly
+    this — reify's rate against dark_factory's, side by side and never pooled.
+
+    Returns ``{'project_root', 'runs_db', 'window', 'error', 'sections'}``.
+    On failure ``error`` is a human-readable string naming the path that was
+    actually looked for and ``sections`` is EMPTY — never a bundle of zeros.
+    "This store could not be read" and "this project landed nothing in the
+    window" are different findings and must not render identically.
+    """
+    root_path = Path(root)
+    db_path = resolve_runs_db(root_path)
+    bundle: dict[str, Any] = {
+        'project_root': str(root_path),
+        'runs_db': str(db_path),
+        'window': (_iso(lo), _iso(hi)),
+        'error': None,
+        'sections': {},
+    }
+
+    if not db_path.is_file():
+        bundle['error'] = (
+            f'no runs.db at {db_path} (expected '
+            f'<project_root>/data/orchestrator/runs.db)'
+        )
+        return bundle
+
+    try:
+        conn = _connect_ro(db_path)
+    except sqlite3.Error as exc:
+        bundle['error'] = f'cannot open {db_path} read-only: {exc}'
+        return bundle
+
+    try:
+        loaded = {
+            event_type: load_events(conn, event_type, lo, hi)
+            for event_type in (
+                'merge_queued', 'merge_dequeued', 'merge_verify',
+                'merge_finalized', 'merge_heartbeat', 'merge_attempt',
+                'speculative_merge', 'verdict_voided',
+            )
+        }
+    except sqlite3.Error as exc:
+        # A file that is not a database, or a truncated one, fails on the
+        # first query rather than at connect time.
+        bundle['error'] = f'cannot read {db_path}: {exc}'
+        return bundle
+    finally:
+        conn.close()
+
+    sections: dict[str, Any] = {
+        'landings_per_day': compute_landings_per_day(
+            loaded['merge_finalized'], lo, hi
+        ),
+        'lead_time': compute_lead_time(
+            loaded['merge_queued'], loaded['merge_dequeued'],
+            loaded['merge_verify'], loaded['merge_finalized'], lo, hi,
+        ),
+        'verify_by_runner': compute_verify_by_runner(loaded['merge_verify']),
+        'occupancy': compute_occupancy(
+            loaded['merge_heartbeat'], loaded['merge_verify'], lo, hi
+        ),
+        'queue_depth': compute_queue_depth(loaded['merge_heartbeat']),
+        'mixes': compute_mixes(
+            loaded['merge_attempt'], loaded['merge_finalized']
+        ),
+    }
+    if speculation:
+        sections['speculation'] = compute_speculation(
+            loaded['speculative_merge'], loaded['verdict_voided'],
+            loaded['merge_verify'], loaded['merge_finalized'],
+        )
+    if chains:
+        sections['chains'] = compute_chains(
+            loaded['merge_finalized'], loaded['merge_verify']
+        )
+    bundle['sections'] = sections
+    return bundle
+
+
+def collect_projects(
+    roots: Sequence[str | Path],
+    lo: datetime,
+    hi: datetime,
+    *,
+    chains: bool = False,
+    speculation: bool = False,
+) -> list[dict[str, Any]]:
+    """One :func:`collect_project` bundle per root, in the order given.
+
+    A root whose store cannot be read yields an error bundle and the remaining
+    roots are still collected: a typo in one ``--project-root`` must not cost
+    the operator the other project's rows.
+    """
+    return [
+        collect_project(root, lo, hi, chains=chains, speculation=speculation)
+        for root in roots
+    ]
+
+
+def void_rate_by_project(
+    bundles: Sequence[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """The chain-dead void rate PER project, keyed by project root.
+
+    The cross-project view the ``--speculation`` section exists for: the rates
+    are placed beside each other, never pooled into one numerator over one
+    denominator.  Pooling is not a smaller version of the same finding — it is
+    a different one, and it erases the between-project spread that motivates
+    the PRD's decomposition.
+
+    A bundle that errored is ABSENT from the result rather than present with a
+    rate of 0.0: a project whose store could not be read has no measured void
+    rate at all.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for bundle in bundles:
+        speculation = bundle.get('sections', {}).get('speculation')
+        if bundle.get('error') is not None or speculation is None:
+            continue
+        out[bundle['project_root']] = {
+            'n_speculative': speculation['n_speculative'],
+            'n_voided_chain_dead': speculation['n_voided_chain_dead'],
+            'void_rate': speculation['void_rate'],
+        }
+    return out
+
+
+def any_bundle_failed(bundles: Sequence[dict[str, Any]]) -> bool:
+    """True when any project's store could not be read — drives a non-zero exit."""
+    return any(bundle.get('error') is not None for bundle in bundles)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface: repeatable ``--project-root``, ``--window``, and flags."""
+    parser = argparse.ArgumentParser(
+        description=(
+            'Reproduce the merge-lane throughput baseline from one or more '
+            'orchestrator runs.db stores. Strictly read-only.'
+        ),
+    )
+    parser.add_argument(
+        '--project-root', action='append', metavar='PATH',
+        help=(
+            'Project root holding data/orchestrator/runs.db. Repeat to report '
+            'several projects side by side (the events table has no project '
+            'column, so the root IS the project label). '
+            f'Default: {DEFAULT_PROJECT_ROOT}'
+        ),
+    )
+    parser.add_argument(
+        '--window', default='14d', metavar='SPEC',
+        help=(
+            '"<N>d" relative to now (default: %(default)s), or '
+            '"<iso>..<iso>" to reproduce a dated baseline exactly.'
+        ),
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Emit JSON keyed by project root instead of the text report.',
+    )
+    parser.add_argument(
+        '--chains', action='store_true',
+        help='Add the deep merge-ahead chain section (off by default).',
+    )
+    parser.add_argument(
+        '--speculation', action='store_true',
+        help='Add the speculation section, incl. void rate by project (off by default).',
+    )
+    return parser
