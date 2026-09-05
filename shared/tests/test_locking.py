@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import shared.reify_checkout as reify_checkout
+import shared.testing_reify_layout as reify_layout
 from shared.locking import (
     EXTENSIONLESS_FILENAMES,
     FILE_EXTENSIONS,
@@ -586,6 +587,96 @@ _BARE_LAYOUT = 'dark-factory/shared/tests'
 _WORKTREE_LAYOUT = 'dark-factory/.worktrees/4080/shared/tests'
 
 
+class TestPlantedLayoutHarnessAdapter:
+    """`_load_module_copy` — this module's binding to the shared harness.
+
+    The same shape, one layer up, as `TestReifyCheckoutAdapter` below the
+    resolver: deliberately white-box, and deliberately the only genuinely-RED
+    assertion available for what is otherwise a behaviour-preserving refactor.
+    Every BLACK-BOX assertion in `TestReifyCheckoutPlantedLayout` stays green
+    both before and after this module grows a private copy of the planting +
+    ``spec_from_file_location`` dance, because a faithful duplicate behaves
+    identically — which is exactly how the two copies task 4259 consolidates
+    came to diverge unnoticed in the first place.  What these pins buy is that
+    a SECOND copy of the harness cannot quietly reappear here.
+    """
+
+    def test_load_module_copy_delegates_to_the_shared_single_source(
+        self, tmp_path, monkeypatch
+    ):
+        """The planting + loading must live in ONE place.
+
+        RED before step-6: the local helper runs its own planting and
+        ``spec_from_file_location`` dance and returns a really-loaded module,
+        so the sentinel never comes back.
+        """
+        sentinel = object()
+        seen = {}
+
+        def _stub(source, tmp, tests_relpath, *, marker, plant_marker=True):
+            seen.update(
+                source=source,
+                tmp_path=tmp,
+                tests_relpath=tests_relpath,
+                marker=marker,
+                plant_marker=plant_marker,
+            )
+            return sentinel
+
+        monkeypatch.setattr(reify_layout, 'plant_reify_layout', _stub)
+
+        assert _load_module_copy(tmp_path, _BARE_LAYOUT) is sentinel, (
+            'this module must DELEGATE to '
+            'shared.testing_reify_layout.plant_reify_layout rather than keep a '
+            'private copy of the planted-layout harness'
+        )
+        assert Path(seen['source']) == Path(__file__), (
+            'the harness must be bound to THIS module\'s file — the walk has to '
+            f'start at the CALL SITE (got {seen.get("source")!r})'
+        )
+        assert seen['tmp_path'] == tmp_path
+        assert seen['tests_relpath'] == _BARE_LAYOUT
+        assert seen['marker'] == _REIFY_GUARD_RELPATH, (
+            'the shared harness must be bound to THIS call site\'s marker '
+            f'(expected {_REIFY_GUARD_RELPATH}, got {seen.get("marker")!r})'
+        )
+        assert seen['plant_marker'] is True
+
+    def test_plant_guard_false_reaches_the_shared_harness(self, tmp_path, monkeypatch):
+        """The local ``plant_guard=`` kwarg carries through as ``plant_marker=``.
+
+        The local spelling is preserved for the existing call site; the shared
+        one is where the meaning lives.  RED before step-6: the local helper
+        never calls the shared harness at all.
+        """
+        seen = {}
+
+        def _stub(source, tmp, tests_relpath, *, marker, plant_marker=True):
+            seen['plant_marker'] = plant_marker
+            return object()
+
+        monkeypatch.setattr(reify_layout, 'plant_reify_layout', _stub)
+
+        _load_module_copy(tmp_path, _BARE_LAYOUT, plant_guard=False)
+
+        assert seen['plant_marker'] is False
+
+    def test_layout_constants_come_from_the_shared_builders(self):
+        """The two layout constants must be the shared builders' output.
+
+        Deliberately NOT red before step-6, and worth saying so: the hand-
+        written literals this replaces spell exactly what the builders produce
+        today, so this passes either way.  It is written against the BUILDERS
+        rather than against the literals precisely because of that — a copy
+        that merely happens to match now would silently diverge the moment a
+        builder changes, which is the failure mode the two constants (one per
+        consumer suite) already demonstrate.  The genuinely-RED pins for this
+        step are the two delegation cases above.
+        """
+        assert reify_layout.bare_layout('shared') == _BARE_LAYOUT
+        assert reify_layout.worktree_layout('shared', '4080') == _WORKTREE_LAYOUT
+
+
 class TestReifyCheckoutPlantedLayout:
     """The four cross-repo guards, proven ARMED from a bare-checkout layout.
 
@@ -897,6 +988,98 @@ class TestSkipUnlessCheckout:
         it guards would never run against a real checkout.
         """
         assert _skip_unless_checkout('reify', tmp_path) == tmp_path
+
+    def test_set_but_absent_wording_comes_from_the_shared_builder(self, tmp_path):
+        """The set-but-absent arm must be the SHARED builder's output.
+
+        Checked the two ways this file's `test_module_constants_track_the_resolver`
+        documents: the INDEPENDENT invariant first (the reason names the bad
+        path), then the recomputed-call equality.
+
+        Green either side of step-6 by construction — the local f-string it
+        replaces spells exactly what `checkout_skip_reason` returns — and that
+        is the point rather than a gap: a coincidental match is indistinguishable
+        from delegation from the outside, which is how the two hand-rolled
+        copies (here and in fused-memory/tests/test_lock_charter_guard.py) stayed
+        identical for as long as they did.  What this case adds is that the two
+        cannot drift apart afterwards.  `test_skip_unless_checkout_delegates_to_
+        the_shared_builder` below is the genuinely-RED companion that pins the
+        call actually happening.
+        """
+        missing = tmp_path / 'no-such-reify-checkout'
+
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _skip_unless_checkout('reify', missing)
+
+        reason = str(excinfo.value)
+        assert str(missing) in reason, (
+            f'the skip reason must name the bad path so a REIFY_ROOT typo is '
+            f'self-evident: {reason!r}'
+        )
+        assert reason == reify_checkout.checkout_skip_reason(
+            'reify', missing, marker=_REIFY_GUARD_RELPATH
+        ), (
+            'the set-but-absent wording must come from the shared builder, not '
+            'a local f-string'
+        )
+
+    def test_none_arm_wording_comes_from_the_shared_builder(self):
+        """The discovery-miss arm must route through the SAME shared builder.
+
+        The existing `test_discovery_miss_skips_with_the_shared_wording` above
+        pins the wording against `reify_skip_reason`; this pins it against
+        `checkout_skip_reason`, so both arms of one skip decision keep a single
+        home.  Green either side of step-6 for the same reason as the case
+        above — `checkout_skip_reason` delegates its None arm to
+        `reify_skip_reason`, so the two spellings agree by construction.
+        """
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _skip_unless_checkout('reify', None)
+
+        reason = str(excinfo.value)
+        assert isinstance(reason, str) and reason
+        assert reason == reify_checkout.checkout_skip_reason(
+            'reify', None, marker=_REIFY_GUARD_RELPATH
+        )
+
+    def test_skip_unless_checkout_delegates_to_the_shared_builder(
+        self, tmp_path, monkeypatch
+    ):
+        """The skip DECISION must come from `checkout_skip_reason`, not a local copy.
+
+        The genuinely-RED pin for this helper, in the shape
+        `TestReifyCheckoutAdapter::test_resolver_delegates_to_the_shared_single_source`
+        established: the two recomputed-equality cases above cannot tell
+        delegation from a hand-rolled string that happens to agree, so they stay
+        green whether or not the call is made.  This one cannot: it patches the
+        shared builder to answer for a root that is a perfectly good directory,
+        which a local implementation would ADMIT.
+
+        RED before step-6: the local helper decides both arms itself, so a real
+        directory is returned unchanged and no skip is raised.
+        """
+        seen = {}
+
+        def _stub(repo, root, *, marker):
+            seen.update(repo=repo, root=root, marker=marker)
+            return 'stub reason from the shared builder'
+
+        monkeypatch.setattr(reify_checkout, 'checkout_skip_reason', _stub)
+
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _skip_unless_checkout('reify', tmp_path)
+
+        assert str(excinfo.value) == 'stub reason from the shared builder', (
+            'this module must DELEGATE the skip decision to '
+            'shared.reify_checkout.checkout_skip_reason rather than keep a '
+            'private copy of the two arms'
+        )
+        assert seen['repo'] == 'reify'
+        assert seen['root'] == tmp_path
+        assert seen['marker'] == _REIFY_GUARD_RELPATH, (
+            'the shared builder must be bound to THIS call site\'s marker '
+            f'(expected {_REIFY_GUARD_RELPATH}, got {seen.get("marker")!r})'
+        )
 
 
 class TestReifyGuardVectorNoneGuard:
