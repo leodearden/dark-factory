@@ -1948,6 +1948,118 @@ class TestReportSurvivesTruncation:
         assert 'FAILING ITEMS: none' in tail, tail
 
 
+def _result_block(stdout: str) -> str:
+    """The RESULT prose only, sliced from ``RESULT:`` to ``FAILING ITEMS:``.
+
+    Assertions against this slice cannot be satisfied or defeated by text
+    elsewhere in the ~9 KB report -- the item-2/4 and item-1 guidance blocks
+    higher up discuss the same findings in their own words.
+    """
+    start = stdout.find('RESULT:')
+    end = stdout.find('FAILING ITEMS:')
+    if start == -1 or end == -1:
+        raise AssertionError(
+            f"expected both 'RESULT:' and 'FAILING ITEMS:' markers in stdout:\n{stdout}"
+        )
+    return stdout[start:end]
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse every run of whitespace -- including the report's own line
+    wraps -- to a single space.
+
+    The report wraps prose across several ``note`` calls purely for terminal
+    width (e.g. today's unfixed else-arm splits ``"...task 4762's (priority"``
+    and ``"high); ..."`` across two lines). A clause marker must not care
+    WHERE the report happens to wrap it, only whether the words are there --
+    otherwise a marker check can silently stop testing anything the moment a
+    wrap point shifts, in either direction.
+    """
+    return ' '.join(text.split())
+
+
+# The items-2/4 ownership clause's marker. NOT bare 'task 4762': the item-1
+# clause also contains that substring ("option (b) is task 4762"), so it
+# would not discriminate between the two clauses.
+_TRIAGE_CLAUSE = "task 4762's (priority high)"
+#: The item-1 ownership clause's marker.
+_ITEM1_CLAUSE = 'Item 1 is closed by EITHER'
+
+# Item 2's defect pattern, with item 4 already FIXED -- isolates a report
+# where exactly item 2 fails. Items 2 and 4 are independent greps over the
+# same file, so a partial landing (one fixed, one not) is reachable.
+_EVAL_ITEM2_ONLY_FAILING = '''\
+"""Fixture stand-in: item 2 fails, item 4 fixed."""
+CONFUSION_COLUMNS = list(TRIAGE_OUTCOMES)
+
+
+def publish(report_path):
+    sibling = report_path.parent / (report_path.stem + '.md')
+    assert sibling != report_path
+    return sibling
+'''
+
+# The mirror image: item 4 fails, item 2 already fixed.
+_EVAL_ITEM4_ONLY_FAILING = '''\
+"""Fixture stand-in: item 4 fails, item 2 fixed."""
+EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))
+CONFUSION_COLUMNS = EVAL_OUTCOMES
+
+
+def publish(report_path):
+    return report_path.with_suffix('.md')
+'''
+
+
+class TestResultBlockBlamesOnlyFailingItems:
+    """DEFECT B: the RESULT block's ownership prose must never name a PASSING
+    item -- reproduced from esc-4810-12, which misread this fixture's output
+    as main's. The else-arm (``fail -ne 0``) prints its ownership clauses
+    UNCONDITIONALLY, so the report can say ``PASS item 2`` / ``PASS item 4``
+    and then blame items 2 and 4 a few lines later for a failure another item
+    caused. Items 2 and 4 are independent greps over the same file, so exactly
+    one can fail on a partial landing -- the clause must name the actually
+    -failing SUBSET, not a binary "Items 2 and 4 are ...". The symmetric
+    item-1 half of this same defect is added directly to this class below.
+    """
+
+    def test_items_2_and_4_passing_are_not_blamed(self, tmp_path):
+        """PRIMARY: the exact fixture the task description names (esc-4810-12)."""
+        repo = _make_gate_repo(tmp_path, judge='flat', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        # Non-vacuity: prove the fixture really has items 2/4 passing and only
+        # item 1 failing -- otherwise the clause-absence assertion below would
+        # also pass on a report where items 2/4 legitimately failed.
+        assert 'PASS  item 2' in proc.stdout, proc.stdout
+        assert 'PASS  item 4' in proc.stdout, proc.stdout
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 1' in tail, tail
+        assert _TRIAGE_CLAUSE not in _normalize_ws(_result_block(proc.stdout)), proc.stdout
+
+    def test_item_2_alone_failing_names_only_item_2(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=_EVAL_ITEM2_ONLY_FAILING)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 2' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+        assert 'Item 2 is' in block, proc.stdout
+        assert 'Items 2 and 4' not in block, proc.stdout
+
+    def test_item_4_alone_failing_names_only_item_4(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=_EVAL_ITEM4_ONLY_FAILING)
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 4' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+        assert 'Item 4 is' in block, proc.stdout
+        assert 'Items 2 and 4' not in block, proc.stdout
+
+
 def _gate_marker(name: str) -> str:
     """The gate's own literal value for a marker variable.
 
