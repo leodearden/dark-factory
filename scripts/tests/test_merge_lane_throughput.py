@@ -976,3 +976,158 @@ def test_verify_by_runner_is_empty_on_no_rows():
     result = mlt.compute_verify_by_runner([])
     assert result['runners'] == {}
     assert result['fallback_key_present'] is False
+
+
+# ---------------------------------------------------------------------------
+# compute_occupancy — THREE estimators, side by side, never reconciled.
+#
+# OCCUPANCY FIXTURE. Window 2026-08-11 00:00Z .. 10:00Z (600 min). Heartbeats
+# are at irregular intervals and hosts drop in and out of the `hosts` list, so
+# each host's LOCF integral is over ITS OWN samples.
+#
+#   laptop  samples 00:00 busy, 01:00 busy, 03:00 free, 04:00 busy, 09:00 free
+#           LOCF busy = 60 + 120 + 0 + 300 + 0 = 480 / 600 = 0.80
+#           raw-sample = 3 busy / 5 samples          = 0.60
+#           verify-duration = 60 min / 600           = 0.10
+#   local   samples 00:00 free, 02:00 busy, 03:00 free, 05:00 busy
+#           LOCF busy = 60 + 300 (last sample carried to hi) = 360 / 600 = 0.60
+#           raw-sample = 2 / 4                        = 0.50
+#           verify-duration = 120 min / 600           = 0.20
+#   idle    samples 00:00 parked, 05:00 None -> never busy: 0.0, not None
+#
+# All three estimators differ for BOTH real hosts, so a test that conflated any
+# two of them fails. That spread is the finding (plan decision 4): the live
+# measurement on reify over the dated 14d window was LOCF 22.2% (the PRD row)
+# against raw-sample 33.4% against verify-duration-sum 1.3%.
+# ---------------------------------------------------------------------------
+
+OCC_LO = datetime(2026, 8, 11, 0, 0, tzinfo=UTC)
+OCC_HI = datetime(2026, 8, 11, 10, 0, tzinfo=UTC)
+
+
+def _hb(hour, hosts, depth=0) -> dict[str, Any]:
+    return {'timestamp': _ts(11, hour), 'task_id': None,
+            'data': {'depth': depth,
+                     'hosts': [{'name': n, 'is_local': n == 'local',
+                                'slot_state': s} for n, s in hosts]}}
+
+
+def _occ_fixture():
+    heartbeats = [
+        _hb(0, [('laptop', 'busy'), ('local', 'free'), ('idle', 'parked')]),
+        _hb(1, [('laptop', 'busy')]),
+        _hb(2, [('local', 'busy')]),
+        _hb(3, [('laptop', 'free'), ('local', 'free')]),
+        _hb(4, [('laptop', 'busy')]),
+        _hb(5, [('local', 'busy'), ('idle', None)]),
+        _hb(9, [('laptop', 'free')]),
+    ]
+    verify = [
+        _v('v1', 1, 0, 3_600_000, runner='laptop'),
+        _v('v2', 2, 0, 5_400_000, runner='local'),
+        _v('v3', 6, 0, 1_800_000, runner='local'),
+    ]
+    return heartbeats, verify
+
+
+def _occ_result():
+    hb, v = _occ_fixture()
+    return mlt.compute_occupancy(hb, v, OCC_LO, OCC_HI)
+
+
+def test_occupancy_reports_all_three_estimators_for_every_host():
+    hosts = _occ_result()['hosts']
+    assert set(hosts) == {'laptop', 'local', 'idle'}
+    for entry in hosts.values():
+        # None suppressed, none reconciled, no "preferred" figure.
+        assert set(entry) >= {
+            'locf_busy_fraction', 'raw_sample_fraction',
+            'verify_duration_fraction', 'slot_states', 'n_samples',
+        }
+
+
+def test_occupancy_locf_integral_carries_each_sample_to_the_next():
+    hosts = _occ_result()['hosts']
+    assert hosts['laptop']['locf_busy_fraction'] == pytest.approx(0.80)
+    assert hosts['local']['locf_busy_fraction'] == pytest.approx(0.60)
+
+
+def test_occupancy_raw_sample_fraction_disagrees_with_the_locf_integral():
+    hosts = _occ_result()['hosts']
+    assert hosts['laptop']['raw_sample_fraction'] == pytest.approx(0.60)
+    assert hosts['local']['raw_sample_fraction'] == pytest.approx(0.50)
+    for name in ('laptop', 'local'):
+        assert (hosts[name]['raw_sample_fraction']
+                != hosts[name]['locf_busy_fraction'])
+
+
+def test_occupancy_verify_duration_fraction_disagrees_with_both():
+    hosts = _occ_result()['hosts']
+    assert hosts['laptop']['verify_duration_fraction'] == pytest.approx(0.10)
+    assert hosts['local']['verify_duration_fraction'] == pytest.approx(0.20)
+    for name in ('laptop', 'local'):
+        entry = hosts[name]
+        assert len({entry['locf_busy_fraction'], entry['raw_sample_fraction'],
+                    entry['verify_duration_fraction']}) == 3
+
+
+def test_occupancy_counts_parked_and_none_as_not_busy_but_tallies_them():
+    idle = _occ_result()['hosts']['idle']
+    assert idle['locf_busy_fraction'] == 0.0
+    assert idle['raw_sample_fraction'] == 0.0
+    # The states themselves are reported — 'parked' is a quarantine signal, not
+    # an unremarkable idle, and must not disappear into "not busy".
+    assert idle['slot_states'] == {'parked': 1, mlt.UNKNOWN: 1}
+
+
+def test_occupancy_last_sample_is_carried_forward_to_the_window_end():
+    # local's final sample is 'busy' at 05:00; the 300 minutes to `hi` are the
+    # difference between 0.60 and 0.10.
+    hosts = _occ_result()['hosts']
+    assert hosts['local']['locf_busy_fraction'] == pytest.approx(0.60)
+
+
+def test_occupancy_denominator_starts_at_a_hosts_first_sample():
+    hb = [_hb(5, [('late', 'busy')])]
+    result = mlt.compute_occupancy(hb, [], OCC_LO, OCC_HI)
+    late = result['hosts']['late']
+    # The host was unobserved for the window's first five hours. Charging it
+    # with those hours as "not busy" would report 0.5 for a host that was busy
+    # for every minute it was actually seen.
+    assert late['locf_busy_fraction'] == pytest.approx(1.0)
+    assert late['observed_span_minutes'] == pytest.approx(300.0)
+
+
+def test_occupancy_tolerates_a_heartbeat_with_an_empty_hosts_list():
+    hb = [
+        {'timestamp': _ts(11, 0), 'task_id': None,
+         'data': {'depth': 0, 'hosts': []}},
+        _hb(1, [('laptop', 'busy')]),
+    ]
+    result = mlt.compute_occupancy(hb, [], OCC_LO, OCC_HI)
+    # `hosts` is [] before the allocator has ever dispatched; that contributes
+    # no host rather than an unnamed one, and must not crash.
+    assert set(result['hosts']) == {'laptop'}
+
+
+def test_occupancy_tolerates_a_heartbeat_with_no_hosts_key_at_all():
+    hb = [{'timestamp': _ts(11, 0), 'task_id': None, 'data': {'depth': 3}}]
+    result = mlt.compute_occupancy(hb, [], OCC_LO, OCC_HI)
+    assert result['hosts'] == {}
+
+
+def test_occupancy_is_none_not_zero_on_a_window_with_no_heartbeats():
+    result = mlt.compute_occupancy([], [], OCC_LO, OCC_HI)
+    assert result['hosts'] == {}
+    # A window with no heartbeat is unmeasured, not idle.
+    assert result['n_heartbeats'] == 0
+
+
+def test_occupancy_verify_fraction_is_none_when_a_host_ran_no_verify():
+    hosts = _occ_result()['hosts']
+    assert hosts['idle']['verify_duration_fraction'] is None
+
+
+def test_occupancy_stamps_the_window_span_it_divided_by():
+    result = _occ_result()
+    assert result['window_span_minutes'] == pytest.approx(600.0)
