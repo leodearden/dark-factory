@@ -1190,12 +1190,15 @@ class TestValidateAssignment:
 class TestParkStopConfig:
     """park_stop_* config fields: defaults and ge/gt validators."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_park_stop_enabled_default_true(self):
         assert OrchestratorConfig().park_stop_enabled is True
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_park_stop_parked_threshold_default(self):
         assert OrchestratorConfig().park_stop_parked_threshold == 15
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_park_stop_parked_window_hours_default(self):
         assert OrchestratorConfig().park_stop_parked_window_hours == 1.0
 
@@ -2391,6 +2394,7 @@ class TestNoLandingsBreakerTuning:
             f'disk_free_floor_bytes ({floor:,}) must be >= 1 GiB; got {floor}'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_disk_free_floor_matches_warm_lane_min_free_gib_default(self):
         """Default disk_free_floor_bytes is aligned with git.warm_lane_min_free_gib.
 
@@ -3431,6 +3435,7 @@ class TestSessionResumeConfig:
                 '(green-tier hot-reloadable via _submodel_leaf_paths)'
             )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_restore_from_archive_defaults_on(self):
         """task 3578: the arm-site rehydration ships ON, with its own switch.
 
@@ -3476,6 +3481,7 @@ class TestMainTipSweepIsolatedPrefilterEnabled:
     ``main_tip_sweep_rerun_confirm_enabled``.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_to_true(self):
         """Default-on, matching the rest of the main_tip_sweep family."""
         assert OrchestratorConfig().main_tip_sweep_isolated_prefilter_enabled is True

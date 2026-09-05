@@ -415,8 +415,15 @@ class TestConvertToBlockedEnforceFlag:
     against ``OrchestratorConfig`` itself or it is not asserted at all.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_the_flag_ships_observe_only(self) -> None:
-        """Observe-before-enforce is the SHIPPED posture, not a test-only one."""
+        """Observe-before-enforce is the SHIPPED posture, not a test-only one.
+
+        task 4481: the hatch is what makes "SHIPPED" true.  Without it this
+        reads whatever dark-factory-orchestrator.yaml says, so an operator
+        opting the fleet into enforcement would turn a claim about the
+        shipped default into a claim about their own config.
+        """
         from orchestrator.config import OrchestratorConfig
 
         assert OrchestratorConfig().convert_to_blocked_enforce is False
