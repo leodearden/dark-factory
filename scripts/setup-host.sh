@@ -396,9 +396,10 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # a second run would only restate what the copy just did.)
 #
 # NON-FATAL, but not merely advisory: a finding never aborts this script (the
-# sections below still run, and five of the seven registered units are KNOWN
-# RED on this host until the follow-up task lands) — it makes the install of
-# THAT UNIT opt-in instead. A bare warning would not be an intervention point
+# sections below still run, and two of the nine registered units carry a
+# standing, deliberate finding on this host — re-measured 2026-09-05, see the
+# checker's KNOWN RED section) — it makes the install of THAT UNIT opt-in
+# instead. A bare warning would not be an intervention point
 # in a non-interactive `set -e` script: it scrolls past and the next line
 # overwrites the units anyway, so the operator is told to check the direction
 # at the one moment they can no longer act on it.
@@ -407,12 +408,18 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # per-unit install decision is taken from those verdicts further down. See the
 # section header for the policy that shape implements.
 #
-# NOTE the report does not mean "the installed copy is stale". Measured
-# 2026-08-02, the direction varies per unit: the repo copy is correct for
-# RestartSteps=4, but the INSTALLED copy is correct for the ExecStart --config
-# path (two committed units name config files that do not exist). That is why
-# the skip is the default and DF_INSTALL_ORCH_UNITS=1 is the override, rather
-# than the reverse.
+# NOTE the report does not mean "the installed copy is stale". The direction
+# varies per unit, which is why the skip is the default and
+# DF_INSTALL_ORCH_UNITS=1 is the override, rather than the reverse.
+# The instance that established this, measured 2026-08-02: the repo copy was
+# correct for RestartSteps=4, but the INSTALLED copy was correct for the
+# ExecStart --config path (two committed units named config files that did not
+# exist). Resolved by commit 4fcd43eec0 (task 3512) — but the argument is not
+# historical, only that instance is. Re-measured 2026-09-05, the direction
+# still varies and now runs the other way: orchestrator-watchdog.service
+# carries an installed-only Environment=ORCH_RESTART_MIN_INTERVAL_SECS the
+# committed copy lacks (a deliberate, self-expiring deploy pause owned by task
+# 5020), so installing the committed copy would silently delete it.
 # The exit code alone is NOT trusted, because 2 is overloaded three ways:
 # the checker's "not installed on this host" (benign), `python3` refusing to
 # open a missing script file, and argparse rejecting an unknown flag. Renaming
@@ -535,9 +542,14 @@ fi
 # A unit that did not clear is SKIPPED rather than warned about, because a
 # warning scrolling past in a non-interactive `set -e` script is not an
 # intervention point: the very next line would overwrite the installed unit.
-# A finding does not mean the installed copy is the stale one — measured
-# 2026-08-02, two COMMITTED units name --config paths that do not exist on this
-# host, so copying them would break those orchestrators on their next restart.
+# A finding does not mean the installed copy is the stale one. The instance
+# that established that, measured 2026-08-02: two COMMITTED units named
+# --config paths that did not exist on this host, so copying them would have
+# broken those orchestrators on their next restart (resolved by commit
+# 4fcd43eec0, task 3512). Re-measured 2026-09-05 the hazard is still live in a
+# different directive — the sole drift is an installed-only
+# Environment=ORCH_RESTART_MIN_INTERVAL_SECS on orchestrator-watchdog.service
+# that a copy would silently delete.
 # The gate stays non-fatal (it never aborts the run; sections below still
 # execute), it just declines to act on an unverified diff without being told.
 #
