@@ -1207,6 +1207,7 @@ class TestParkStopConfig:
         with pytest.raises(ValidationError):
             OrchestratorConfig(park_stop_parked_window_hours=0.0)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_yaml_has_park_stop_block(self):
         """defaults.yaml must carry the park_stop_* keys with the documented defaults.
 
@@ -1238,6 +1239,7 @@ class TestParkStopConfig:
 class TestMergeVerifyStormGuardFields:
     """Defaults and overrides for the merge-verify storm-guard knobs."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults_preserve_existing_behaviour(self):
         config = OrchestratorConfig()
         assert config.merge_verify_workspace is False
@@ -1547,6 +1549,7 @@ class TestVerifyRunnerConfig:
         ])
         assert config.verify_runners[0].df_checkout_path is None
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_verify_runners_defaults_empty(self):
         """OrchestratorConfig.verify_runners defaults to [] not None."""
         config = OrchestratorConfig()
@@ -1563,6 +1566,7 @@ class TestVerifyRunnerConfig:
         assert isinstance(config.verify_runners[0], VerifyRunnerConfig)
         assert config.verify_runners[0].name == 'laptop'
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_verify_drift_check_every_n_lands_default(self):
         """verify_drift_check_every_n_lands defaults to 20."""
         config = OrchestratorConfig()
@@ -1651,6 +1655,7 @@ class TestJobserverConfig:
         with pytest.raises(ValidationError):
             JobserverConfig(enabled=True, task_fifo='')
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_has_jobserver_field(self):
         """OrchestratorConfig exposes a jobserver field that defaults to disabled."""
         cfg = OrchestratorConfig()
@@ -1709,6 +1714,7 @@ class TestCpuPriorityConfig:
         assert cfg.nice == 19
         assert cfg.agent_env() == {'DF_AGENT_CPU_NICE': '19'}
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_has_cpu_priority_field(self):
         """OrchestratorConfig exposes a cpu_priority field defaulting to enabled."""
         cfg = OrchestratorConfig()
@@ -1822,6 +1828,7 @@ class TestCpuGovernConfig:
         assert cfg.resolved_exec_path(tmp_path) == str(exec_file)
         assert cfg.resolved_shim_dir(tmp_path) == str(agent_bin)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_has_cpu_governance_field(self):
         """OrchestratorConfig exposes a cpu_governance field defaulting to enabled=False."""
         from orchestrator.config import CpuGovernConfig
@@ -1847,6 +1854,7 @@ class TestStarvationWatchdogConfig:
           idle_secs at their defaults (deep-merge / no clobber).
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults(self):
         """Bare OrchestratorConfig() exposes starvation_watchdog with correct defaults."""
         from orchestrator.config import StarvationWatchdogConfig
@@ -1911,6 +1919,7 @@ class TestStarvationWatchdogConfig:
             f'got {cfg.starvation_watchdog.idle_secs!r}'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_idle_only_secs_default(self):
         """Bare OrchestratorConfig() exposes idle_only_secs == 259200.0 (== idle_secs default).
 
@@ -2040,6 +2049,7 @@ class TestParkBackfillConfig:
     instead of silently breaking the admission gate.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_defaults(self):
         """Bare OrchestratorConfig() exposes the four backfill leaves.
 
@@ -2410,6 +2420,7 @@ class TestNoLandingsBreakerTuning:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestWarmLaneGcConfig:
     """OrchestratorConfig exposes the two new warm-lane-GC cadence knobs.
 
@@ -3386,6 +3397,7 @@ class TestSessionResumeConfig:
         with pytest.raises(ValidationError):
             SessionResumeConfig(fallback_storm_threshold=-1)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_exposed_on_orchestrator_config(self):
         """A default OrchestratorConfig exposes `.session_resume` as a
         SessionResumeConfig instance under the literal field name.
@@ -3789,6 +3801,7 @@ class TestRecoveryEmissionConfig:
     this class only pins the operator-facing surface.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_section_is_registered_on_orchestrator_config(self):
         """OrchestratorConfig exposes recovery_emission with the shipped defaults.
 
