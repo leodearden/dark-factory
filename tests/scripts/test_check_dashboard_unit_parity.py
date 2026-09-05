@@ -3576,3 +3576,26 @@ def test_no_parity_call_site_branches_on_a_bare_exit_status(
         "the status anywhere but inside `_parity_verdict` re-creates the "
         f"defect the helper centralises.\n{block}"
     )
+def test_dashboard_reuses_the_shared_drift_and_absent():
+    """``Drift`` and ``_ABSENT`` are the SHARED objects, not local look-alikes.
+
+    IDENTITY, not equality, and the distinction is the whole point: a pasted
+    copy of a six-field frozen dataclass compares equal field-for-field with
+    the original while being a DISTINCT TYPE, so an ``==`` check on the class
+    — or on instances of it — would pass over exactly the fork this guard
+    exists to forbid. ``_ABSENT`` is worse still: two ``"<absent>"`` literals
+    may or may not be interned, so equality says nothing at all about whether
+    there is one definition or three.
+
+    The same pin the three earlier lifts carry (see
+    tests/scripts/test_check_orchestrator_unit_parity.py, which asserts this
+    shape for the parser and for ``find_dropins``). Duplicating a record inside
+    the tooling built to report silent duplication is the failure this family
+    exists to catch, one level up.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    mod = _load_checker()
+
+    assert mod.Drift is systemd_unit_parity.Drift
+    assert mod._ABSENT is systemd_unit_parity._ABSENT
