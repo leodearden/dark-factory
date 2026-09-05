@@ -296,6 +296,11 @@ if read_ref_file "$EVAL"; then
   # Here-string, not a pipe -- same pipefail/SIGPIPE race as item 1 above, and
   # here it fails the OTHER way: a spurious non-zero takes the else branch and
   # prints `PASS item 2` for an eval script that still iterates the frozenset.
+  # Measured: a 960 KB $eval_src with the pattern first gives PIPESTATUS=(141 0)
+  # piped -- grep matched, printf SIGPIPE-killed -- 200/200 spurious PASS piped
+  # vs 0/200 here-string. Pinned by
+  # scripts/tests/test_check_write_triage_flip_preconditions.py::TestItemsTwoAndFourReadingIsNotRaceProne
+  # so the two cannot drift apart silently. Do not "tidy" this back into a pipe.
   if grep -q 'dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)' <<<"$eval_src"; then
     note "FAIL  item 2  $EVAL still iterates the TRIAGE_OUTCOMES frozenset directly"
     note "              Column/key order is PYTHONHASHSEED-dependent, so the committed"
@@ -315,7 +320,9 @@ if read_ref_file "$EVAL"; then
   fi
 
   # --- item 4: --report-path must not destroy its own JSON --------------------
-  # Here-string, not a pipe -- see item 2. A flake here spuriously PASSES too.
+  # Here-string, not a pipe -- see item 2's comment above for the measurement.
+  # A flake here spuriously PASSES too. Pinned by the same
+  # scripts/tests/test_check_write_triage_flip_preconditions.py::TestItemsTwoAndFourReadingIsNotRaceProne.
   if grep -q "report_path\.with_suffix('\.md')" <<<"$eval_src"; then
     note "FAIL  item 4  $EVAL still derives the markdown sibling via with_suffix('.md')"
     note "              '--report-path foo.md' writes the JSON and then OVERWRITES it"
