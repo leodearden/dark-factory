@@ -500,6 +500,25 @@ def main(argv: Sequence[str]) -> int:
                 stream=sys.stderr,
             )
             return 1
+
+        # An override is neither synthesizable nor removable HERE, so a --fix
+        # run that repaired everything it could must still decline to report
+        # success. The repair was real and is kept; what it cannot establish is
+        # that the values it just wrote are the ones that would take effect,
+        # because the drop-in lives in a DIFFERENT FILE and systemd merges it
+        # over them at load time. Reporting 0 would be the checker
+        # manufacturing the reassurance.
+        #
+        # Reported and NOT removed, following the lms precedent: a drop-in can
+        # be load-bearing (task 3750), so removal has a correct owner with
+        # preconditions — scripts/remove-lms-arm-worktree-dropin.sh — that a
+        # general-purpose parity checker has no business re-implementing.
+        # The [override] block was already emitted above and is worded APART
+        # from the residual-drift report just above: they share exit 1 but send
+        # the operator to different places (hand-add a host-specific directive
+        # vs. inspect and remove a drop-in).
+        if dropins:
+            return 1
         return 0
 
     _log(
