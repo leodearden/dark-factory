@@ -1691,3 +1691,88 @@ class TestLegacyJournalRecordRederivesModules:
         assert any('deleted-module' in m for m in warnings), (
             f'the unresolved prefix must be named; warnings were {warnings!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-5063 — load() tolerates an UNKNOWN key instead of dropping the record.
+#
+# The forward-compat half of the module_prefixes schema change. Once the new
+# code writes that key, a REVERT of this commit leaves an older
+# merge_queue_store reading a journal it cannot parse: load() builds records
+# with PersistedMergeRequest(**entry) inside `except (TypeError, KeyError)`,
+# so one unexpected key made the whole entry vanish with only a
+# `skipping malformed entry` warning — and a vanished entry is an in-flight
+# merge request that is never recovered. That turns a rollback into an
+# incident.
+# ---------------------------------------------------------------------------
+
+
+def _current_journal_entry(request_id: str, **overrides: object) -> dict[str, object]:
+    """A journal entry in the CURRENT (post-module_prefixes) shape."""
+    entry = _legacy_journal_entry(request_id, task_files=['a.py'])
+    entry['module_prefixes'] = ['orchestrator']
+    entry.update(overrides)
+    return entry
+
+
+class TestJournalLoadToleratesUnknownKeys:
+    """An entry carrying a key this binary does not know still loads."""
+
+    def test_entry_with_an_unknown_key_still_loads_with_its_known_fields(
+        self, tmp_path: Path,
+    ) -> None:
+        entry = _current_journal_entry('mr-future', future_field='x')
+        store = _write_journal(tmp_path / 'merge_queue.json', entry)
+
+        records = store.load()
+
+        assert len(records) == 1, (
+            f'an entry with an unknown key must still load — dropping it '
+            f'silently loses an in-flight merge request; got {records!r}'
+        )
+        [p] = records
+        assert p.request_id == 'mr-future'
+        assert p.task_id == '5063'
+        assert p.branch == '5063'
+        assert p.task_files == ['a.py']
+        assert p.module_prefixes == ['orchestrator']
+
+    def test_unknown_key_is_reported_not_silently_dropped(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Tolerance must not trade one silent failure for another."""
+        entry = _current_journal_entry('mr-future', future_field='x')
+        store_path = tmp_path / 'merge_queue.json'
+        store = _write_journal(store_path, entry)
+
+        with caplog.at_level(logging.WARNING):
+            store.load()
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('mr-future' in m and 'future_field' in m for m in warnings), (
+            f'the dropped key must be reported by request_id and by name; '
+            f'warnings were {warnings!r}'
+        )
+
+    def test_entry_missing_a_required_field_is_still_skipped(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Only the EXTRA-key direction is relaxed.
+
+        A genuinely malformed record — one missing a required field — must
+        still be skipped rather than half-constructed.
+        """
+        entry = _current_journal_entry('mr-broken')
+        del entry['task_id']
+        store = _write_journal(tmp_path / 'merge_queue.json', entry)
+
+        with caplog.at_level(logging.WARNING):
+            records = store.load()
+
+        assert records == [], (
+            f'an entry missing a required field must still be skipped; '
+            f'got {records!r}'
+        )
+        assert [r for r in caplog.records if r.levelno == logging.WARNING], (
+            'the skip must still be warned about'
+        )
