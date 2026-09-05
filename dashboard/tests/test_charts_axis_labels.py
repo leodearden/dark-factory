@@ -252,10 +252,9 @@ def _spark_path_module_surface() -> dict:
     source-text pairing cannot see.
     """
     return _run_node(
-        'const api = require(%s);\n'
+        f'const api = require({json.dumps(str(_SPARK_PATH_JS))});\n'
         'console.log(JSON.stringify(Object.fromEntries('
         'Object.keys(api).map(k => [k, typeof api[k]]))));'
-        % json.dumps(str(_SPARK_PATH_JS))
     )
 
 
