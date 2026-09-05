@@ -1864,6 +1864,59 @@ class TestScanSurvivesRecordArchivedMidScan:
         )
 
 
+    def test_get_by_task_keeps_an_unreadable_file_loud_and_distinguishable(
+        self, tmp_path: Path, caplog,
+    ):
+        """A present-but-unreadable file must not void the listing OR go quiet.
+
+        This is the guard against the fix degrading into a silent fail-soft.
+        A ``PermissionError`` (or EIO, or fd exhaustion) means the file IS
+        there and something is genuinely wrong — operator-actionable, unlike
+        the benign archived-mid-scan case, and it must reach the channel
+        operators actually watch.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        original = Path.read_text
+
+        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed:
+                # Left on disk, unlike the relocation case above.
+                raise PermissionError(13, 'Permission denied', str(doomed))
+            return original(self, *args, **kwargs)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status='pending')
+
+        # (a) One unreadable file must not void the whole listing either.
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected the readable record to survive, got '
+            f'{[e.id for e in results]}'
+        )
+
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        # (b) A permissions/EIO fault is operator-actionable: stay loud.
+        assert any(str(doomed) in r.getMessage() for r in loud), (
+            f'Expected a WARNING-or-above naming {doomed}; got: '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+        # (c) ...on the right channel.  An I/O fault is not a parse fault, and
+        # conflating them sends an operator hunting for corrupt JSON.
+        assert not any('Failed to parse' in r.getMessage() for r in loud), (
+            f"An I/O fault must not be reported as a parse failure; got: "
+            f'{[r.getMessage() for r in loud]}'
+        )
+
+
 class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
