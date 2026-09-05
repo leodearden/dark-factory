@@ -2059,6 +2059,63 @@ class TestResultBlockBlamesOnlyFailingItems:
         assert 'Item 4 is' in block, proc.stdout
         assert 'Items 2 and 4' not in block, proc.stdout
 
+    def test_item_1_passing_is_not_blamed(self, tmp_path):
+        """The SYMMETRIC half: item 1 passes, items 2 and 4 fail -- the
+        mirror image of ``test_items_2_and_4_passing_are_not_blamed`` above.
+        The item-1 ownership clause is still unconditional at this point (it
+        is gated in a follow-up commit using the same ``item_failed()``
+        predicate), so the report prints ``PASS item 1`` and then still
+        blames item 1 a few lines later -- the identical defect, mirrored.
+        """
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='failing')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        # Non-vacuity: prove item 1 really passed and items 2/4 really failed.
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 2 4' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _ITEM1_CLAUSE not in block, proc.stdout
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+
+    def test_all_items_failing_keeps_both_clauses(self, tmp_path):
+        """GUARD: the all-fail run -- the one the gate actually produces
+        against today's main -- must keep BOTH ownership clauses. Exists so
+        gating either clause on its item's pass/fail state cannot "pass" the
+        RED tests here by simply deleting the guidance an operator needs on
+        the run that matters most: the one where every item still fails.
+        """
+        repo = _make_gate_repo(tmp_path, judge='flat', eval_src='failing')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 1 2 4' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+        assert _ITEM1_CLAUSE in block, proc.stdout
+        assert 'Items 2 and 4 are' in block, proc.stdout
+
+    def test_unreadable_ref_names_every_failing_item(self):
+        """GUARD: the multi-word ``record_fail '2 4'`` path.
+
+        ``ref='no-such-ref'`` is the ONLY caller that reaches a multi-word
+        ``record_fail`` argument (the unreadable-EVAL branch), so it is the
+        one case where ``item_failed()``'s ``case``-glob membership test
+        could silently mis-parse ``failed_items``. Reuses the negative
+        -control shape of ``test_unreadable_ref_fails_closed``: read-only
+        against the REAL checkout. Measured output today: ``FAIL  items 2+4
+        UNVERIFIABLE`` with ``FAILING ITEMS: 1 2 4``. Do not "simplify" this
+        into a duplicate of the fixture-based tests above -- it is the only
+        path that reaches this code shape.
+        """
+        proc = _run_gate(_GATE_SCRIPT, ref='no-such-ref')
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 1 2 4' in tail, tail
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE in block, proc.stdout
+        assert _ITEM1_CLAUSE in block, proc.stdout
+
 
 def _gate_marker(name: str) -> str:
     """The gate's own literal value for a marker variable.
