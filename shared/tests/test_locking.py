@@ -3,9 +3,6 @@ orchestrator scheduler and the task curator."""
 
 from __future__ import annotations
 
-import importlib.util
-import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -385,45 +382,29 @@ def _tracked_file_paths(repo_root: Path) -> list[str] | None:
 def _skip_unless_checkout(repo: str, repo_root: Path | None) -> Path:
     """Skip unless *repo_root* names a real checkout directory; else return it.
 
-    ONE reachability precondition for both reify-parametrized sweeps below —
-    counterpart of fused-memory/tests/test_lock_charter_guard.py:721-762's
-    helper of the same name — so the two sweeps cannot drift on what "the
-    reify checkout is missing" means, and neither can regress to raising
-    ``AttributeError`` at the point it was supposed to skip.
+    Marker-bound adapter over `shared.reify_checkout.checkout_skip_reason`,
+    which owns BOTH arms' wording — why a discovery MISS is not an operator's
+    REIFY_ROOT typo, why the set-but-absent arm names the path verbatim, and
+    why it does not borrow the stronger marker-based reason.  Do not restate or
+    re-derive them here, and do not reintroduce a local copy of either arm; the
+    same helper in fused-memory/tests/test_lock_charter_guard.py delegates to
+    the identical builder, which is the point (task 4259).
 
-    The two arms are deliberately distinct:
+    What is LOCAL is only the binding: this call site's guard-script marker,
+    and turning the reason into a ``pytest.skip`` — the shared module is
+    pytest-free.
 
-    ``None`` — discovery MISS.  ``_resolve_reify_checkout`` walked every
-    ancestor and none carried ``reify/scripts/lock-charter-guard.sh``, with
-    REIFY_ROOT unset.  That is the legitimate standalone-checkout case, and
-    its wording comes from ``shared.reify_checkout`` so it cannot drift from
-    what the Tier-2 skipifs above (or orchestrator's verify gate) say about
-    the same condition.
-
-    set-but-absent — an operator's REIFY_ROOT names a path that is not there.
-    Honored verbatim rather than silently falling back to discovery, so the
-    skip reason NAMES the bad path and a typo is self-evident instead of
-    resolving to a different repo than the operator asked for.  That arm is
-    the ``is_dir()`` check below, kept LOCAL on purpose rather than borrowed
-    from the shared marker-based reason: these sweeps need only a git
-    CHECKOUT, a weaker requirement than the guard script the Tier-2 gates
-    need, so they must not share a reason built around that stronger marker.
+    Called through the module attribute on purpose, for the same reason
+    `_resolve_reify_checkout` notes: the delegation pin in
+    TestSkipUnlessCheckout patches `reify_checkout.checkout_skip_reason`, which
+    a ``from ... import`` binding would put out of its reach.
     """
-    if repo_root is None:
-        # Only the reify parametrization can be None — _DF_REPO_ROOT is
-        # derived from __file__ and is always a path — and a None root is by
-        # construction the shared builder's discovery-miss arm.
-        reason = reify_checkout.reify_skip_reason(
-            _REIFY_GUARD_RELPATH, None, named_by_env=False
-        )
-        assert reason, (
-            f'a None {repo} root is the discovery-miss arm, which always '
-            f'yields a reason — a falsy one here would turn this skip into a '
-            f'phantom pass'
-        )
+    reason = reify_checkout.checkout_skip_reason(
+        repo, repo_root, marker=_REIFY_GUARD_RELPATH
+    )
+    if reason is not None:
         pytest.skip(reason)
-    if not repo_root.is_dir():
-        pytest.skip(f'{repo} checkout not present at {repo_root}')
+    assert repo_root is not None  # narrows for the return
     return repo_root
 
 
@@ -518,20 +499,12 @@ class TestReifyCheckoutAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Planted-synthetic-layout harness — ported from
-# orchestrator/tests/test_verify_role_integration.py:423-472 (task 3978),
-# which reused the same technique from fused-memory/tests/test_lock_charter_guard.py
-# (task 3843).  A real reify checkout is not enough to express the defect:
-# in the ``.worktrees/<id>`` layout this suite normally runs in, `parents[5]`
-# already resolves correctly (measured baseline: 135 passed, 0 skipped), so
-# every black-box assertion against THIS machine's real checkout stays green
-# both before and after the fix.  Only a synthetic ancestry — a module COPY
-# imported from a planted tree — can express what a bare (non-worktree)
-# checkout sees.
-#
-# The RED is host-independent in both directions: a parents[5] answer can
-# never equal a tmp_path, and a tmp_path with no reify in its ancestry must
-# resolve to None even on a machine where a real reify checkout exists.
+# Planted-synthetic-layout harness — `shared.testing_reify_layout` (task 4259,
+# consolidating this copy with orchestrator's).  Why a real reify checkout
+# cannot express the defect, why the RED is host-independent in both
+# directions, and how a copy's imports resolve from the parent process while
+# its ``__file__`` is the planted path: all in that module's docstring.  Only
+# the local binding lives here.
 # ---------------------------------------------------------------------------
 
 
@@ -550,41 +523,33 @@ def planted_env(monkeypatch):
 def _load_module_copy(tmp_path: Path, tests_relpath: str, *, plant_guard: bool = True):
     """Import a COPY of THIS module from a synthetic checkout layout.
 
-    Plants ``<tmp>/src/reify/scripts/lock-charter-guard.sh`` (a real file;
-    content irrelevant) when requested, creates ``<tmp>/src/<tests_relpath>/``,
-    copies this module in, and loads it via ``spec_from_file_location``.
+    Marker-bound adapter over `shared.testing_reify_layout.plant_reify_layout`,
+    which owns every semantic — what gets planted, where the copy is written,
+    why its ``__file__`` must be the planted path, the ``sys.modules`` pop, and
+    the ambient-contamination precondition on the ``plant_guard=False`` arm.
+    Do not restate or re-derive them here, and do not reintroduce a local copy
+    of the planting or the ``spec_from_file_location`` dance.
 
-    The copy's ``shared.locking`` / ``shared.reify_checkout`` imports resolve
-    from the parent process's sys.path, while its ``__file__`` is the PLANTED
-    path — so its import-time constant resolution walks the SYNTHETIC
-    ancestry, which is the whole point.  The temporary sys.modules entry is
-    popped in a finally block so no copy outlives the call.
+    What is LOCAL is only the binding: THIS module's ``__file__`` (the walk has
+    to start at the CALL SITE) and its guard-script marker.  ``plant_guard=``
+    keeps its local spelling for the one call site that passes it.
+
+    Called through the module attribute on purpose: the delegation pin in
+    TestPlantedLayoutHarnessAdapter patches
+    `reify_layout.plant_reify_layout`, which a ``from ... import`` binding
+    would put out of its reach.
     """
-    src = tmp_path / 'src'
-    if plant_guard:
-        planted = src / 'reify' / 'scripts' / 'lock-charter-guard.sh'
-        planted.parent.mkdir(parents=True, exist_ok=True)
-        planted.write_text('#!/bin/sh\necho stub\n')
-
-    tests_dir = src / tests_relpath
-    tests_dir.mkdir(parents=True, exist_ok=True)
-    copied = tests_dir / 'test_copy_probe.py'
-    shutil.copy2(__file__, copied)
-
-    module_name = '_reify_checkout_probe_' + re.sub(r'\W+', '_', tests_relpath)
-    spec = importlib.util.spec_from_file_location(module_name, copied)
-    assert spec is not None and spec.loader is not None, f'could not load {copied}'
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        sys.modules.pop(module_name, None)
-    return mod
+    return reify_layout.plant_reify_layout(
+        __file__,
+        tmp_path,
+        tests_relpath,
+        marker=_REIFY_GUARD_RELPATH,
+        plant_marker=plant_guard,
+    )
 
 
-_BARE_LAYOUT = 'dark-factory/shared/tests'
-_WORKTREE_LAYOUT = 'dark-factory/.worktrees/4080/shared/tests'
+_BARE_LAYOUT = reify_layout.bare_layout('shared')
+_WORKTREE_LAYOUT = reify_layout.worktree_layout('shared', '4080')
 
 
 class TestPlantedLayoutHarnessAdapter:
@@ -833,31 +798,14 @@ class TestReifyCheckoutPlantedLayout:
 
         This case's RED depends on an environmental precondition: no ancestor
         of the copied module may carry ``reify/scripts/lock-charter-guard.sh``.
-        That holds for the default ``/tmp/pytest-of-<user>/...`` basetemp, but
-        not for every possible ``--basetemp`` (e.g. one placed inside the repo
-        tree) or an ambient ``/tmp/reify`` checkout — so it is asserted
-        explicitly below, via the identical predicate
-        ``resolve_reify_checkout`` itself walks, before the behavioural
-        assertion.  Without it, an unusual environment would fail the
-        behavioural assertion with a confusing message that blames the
-        resolver instead of naming the real cause.
+        That precondition is enforced by the harness itself as of task 4259 —
+        `plant_reify_layout` raises `AmbientReifyCheckoutError` naming the
+        contaminating ancestors on the ``plant_guard=False`` arm — so an
+        unusual ``--basetemp`` or an ambient ``/tmp/reify`` checkout fails with
+        a message blaming the environment rather than the resolver, and it does
+        so for orchestrator's copy of this case too.
         """
         mod = _load_module_copy(tmp_path, _BARE_LAYOUT, plant_guard=False)
-
-        mod_file = mod.__file__
-        assert mod_file is not None, f'{mod!r} was loaded from a file and must have one'
-        contaminated = [
-            ancestor
-            for ancestor in Path(mod_file).resolve().parents
-            if (ancestor / 'reify' / _REIFY_GUARD_RELPATH).is_file()
-        ]
-        assert not contaminated, (
-            f'a real reify checkout exists in the ancestry of {mod_file!r} '
-            f'{contaminated!r} — likely an unusual --basetemp or an ambient '
-            f'checkout — so this environment cannot express a genuine '
-            f'discovery MISS here; this is an environment problem, not a '
-            f'resolver regression'
-        )
 
         assert mod._REIFY_REPO_ROOT is None, (
             f'no reify checkout exists in the planted ancestry, but the '
