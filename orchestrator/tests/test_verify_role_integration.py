@@ -46,12 +46,10 @@ REIFY_ROOT
 """
 from __future__ import annotations
 
-import importlib.util
 import os
 import re
 import shutil
 import subprocess
-import sys
 import warnings
 from pathlib import Path
 from typing import Literal
@@ -412,12 +410,11 @@ def test_skip_reasons_compose_instead_of_short_circuiting() -> None:
 # exists here, so "the integration test ran" was equally consistent with a
 # working resolver and with a broken one that happened to name the developer's
 # own checkout.  These cases load a COPY of this module out of a SYNTHETIC
-# checkout tree and assert on the constants it resolves there, so the answer is
-# about the planted layout rather than about this host.
-#
-# The RED is host-independent in both directions: a fixed literal can never
-# equal a tmp_path, and a tmp_path with no reify in its ancestry must resolve
-# to None on a machine where /home/leo/src/reify exists.
+# checkout tree — via `shared.testing_reify_layout` (task 4259, consolidating
+# this harness with shared/tests/test_locking.py's copy) — and assert on the
+# constants it resolves there, so the answer is about the planted layout rather
+# than about this host.  Why a real checkout cannot express the defect, and why
+# the RED is host-independent in both directions: that module's docstring.
 # ---------------------------------------------------------------------------
 
 
@@ -438,42 +435,33 @@ def planted_env(monkeypatch):
 def _load_module_copy(tmp_path: Path, tests_relpath: str, *, plant_verify_sh: bool = True):
     """Import a COPY of THIS module from a synthetic checkout layout.
 
-    Plants ``<tmp>/src/reify/scripts/verify.sh`` (a real file; content
-    irrelevant) when requested, creates ``<tmp>/src/<tests_relpath>/``, copies
-    this module in, and loads it via ``spec_from_file_location``.
+    Marker-bound adapter over `shared.testing_reify_layout.plant_reify_layout`,
+    which owns every semantic — what gets planted, where the copy is written,
+    why its ``__file__`` must be the planted path, the ``sys.modules`` pop, and
+    the ambient-contamination precondition on the ``plant_verify_sh=False``
+    arm.  Do not restate or re-derive them here, and do not reintroduce a local
+    copy of the planting or the ``spec_from_file_location`` dance.
 
-    The copy's ``orchestrator.config`` / ``orchestrator.verify`` /
-    ``shared.reify_checkout`` imports resolve from the parent process's
-    sys.path, while its ``__file__`` is the PLANTED path — so its import-time
-    constant resolution walks the SYNTHETIC ancestry, which is the whole point.
-    The temporary sys.modules entry is popped in a finally block so no copy
-    outlives the call.
+    What is LOCAL is only the binding: THIS module's ``__file__`` (the walk has
+    to start at the CALL SITE) and its ``scripts/verify.sh`` marker.
+    ``plant_verify_sh=`` keeps its local spelling for the call sites that pass
+    it.
+
+    Called through the module attribute on purpose: the delegation pins above
+    patch `reify_layout.plant_reify_layout`, which a ``from ... import``
+    binding would put out of their reach.
     """
-    src = tmp_path / "src"
-    if plant_verify_sh:
-        planted = src / "reify" / "scripts" / "verify.sh"
-        planted.parent.mkdir(parents=True, exist_ok=True)
-        planted.write_text("#!/bin/sh\necho stub\n")
-
-    tests_dir = src / tests_relpath
-    tests_dir.mkdir(parents=True, exist_ok=True)
-    copied = tests_dir / "test_copy_probe.py"
-    shutil.copy2(__file__, copied)
-
-    module_name = "_reify_gate_probe_" + re.sub(r"\W+", "_", tests_relpath)
-    spec = importlib.util.spec_from_file_location(module_name, copied)
-    assert spec is not None and spec.loader is not None, f"could not load {copied}"
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        sys.modules.pop(module_name, None)
-    return mod
+    return reify_layout.plant_reify_layout(
+        __file__,
+        tmp_path,
+        tests_relpath,
+        marker=_REIFY_VERIFY_RELPATH,
+        plant_marker=plant_verify_sh,
+    )
 
 
-_BARE_LAYOUT = "dark-factory/orchestrator/tests"
-_WORKTREE_LAYOUT = "dark-factory/.worktrees/3978/orchestrator/tests"
+_BARE_LAYOUT = reify_layout.bare_layout("orchestrator")
+_WORKTREE_LAYOUT = reify_layout.worktree_layout("orchestrator", "3978")
 
 
 # ---------------------------------------------------------------------------
