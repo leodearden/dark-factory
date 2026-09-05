@@ -449,14 +449,21 @@ def read_escalation_for_scan(
       The file IS present and something is genuinely wrong.  Logged at
       WARNING, in wording deliberately disjoint from the parse channel's so
       an operator can tell an I/O fault from corrupt JSON at a glance.
-    - ``'unparsable'`` -- the bytes were read but did not parse.  Logged at
-      WARNING; operator-actionable.
+    - ``'unparsable'`` -- the file's CONTENT is not a valid escalation record:
+      either the bytes would not decode as UTF-8, or they decoded but did not
+      parse.  Logged at WARNING; operator-actionable, and the file is left
+      exactly where it was for them to look at.
 
-    HANDLER ORDER IS LOAD-BEARING.  ``FileNotFoundError`` subclasses
-    ``OSError``, so an ``except OSError`` placed FIRST would swallow ENOENT
-    and permanently merge the 'vanished' and 'unreadable' channels, silently
-    demoting a real permissions/EIO fault to the treatment a routine archival
-    gets.  Do not "simplify" the two clauses into one.
+    HANDLER ORDER IS LOAD-BEARING, for one clause of the three.
+    ``FileNotFoundError`` subclasses ``OSError``, so an ``except OSError``
+    placed FIRST would swallow ENOENT and permanently merge the 'vanished' and
+    'unreadable' channels, silently demoting a real permissions/EIO fault to
+    the treatment a routine archival gets.  Do not "simplify" those two clauses
+    into one.  The ``parse_errors`` clause sits ahead of the broad
+    ``except OSError`` so that a content fault can never be misfiled as an I/O
+    fault even if some future caller passes a tuple containing an ``OSError``
+    subclass; for both tuples in use today the two families are disjoint, so
+    that placement is DEFENSIVE rather than a live hazard.
 
     *context* names the calling scan (e.g. ``'queue.get_by_task'``) so a log
     line identifies which scan hit the file.  *parse_errors* is a parameter,
@@ -504,10 +511,22 @@ def read_escalation_for_scan(
     the caller asked about rather than a whole listing, and the semantically
     correct repair is re-locate-and-retry -- the record MOVED, it did not
     vanish -- which is a different shape from "skip and continue".  Tracked as
-    a follow-up.  ``UnicodeDecodeError`` from ``read_text`` on a truncated or
-    binary file is a ``ValueError``, not an ``OSError``; it is uncaught at the
-    queue sites today and stays uncaught, since widening it would swallow more
-    than this helper is about.
+    a follow-up.
+
+    DECODE FAULTS follow the caller's ``parse_errors``, by design and not by
+    accident.  ``UnicodeDecodeError`` from ``read_text`` on a truncated or
+    binary file subclasses ``ValueError`` and NOT ``OSError``, so it is raised
+    inside the read block and would escape a guard covering only
+    FileNotFoundError/OSError.  The ``except parse_errors`` clause there means
+    it is caught if and only if the caller's own tuple covers it, which
+    reproduces each module's pre-existing behaviour exactly: queue.py's
+    ``(JSONDecodeError, KeyError, TypeError)`` does not match it, so it still
+    propagates at ``get_by_task`` / ``get_pending`` /
+    ``find_terminal_by_citation``; sweep.py's tuple carries a bare
+    ``ValueError`` and does match it, so both sweep sites count it as
+    unparsable, warn once, and continue the pass.  Hard-coding
+    ``except UnicodeDecodeError`` instead would silently overturn the queue-side
+    half of that contract.
     """
     try:
         text = path.read_text()
@@ -517,6 +536,14 @@ def read_escalation_for_scan(
             context, path,
         )
         return None, 'vanished'
+    except parse_errors as e:
+        # A DECODE fault (non-UTF-8 / truncated / binary bytes) surfaces here
+        # rather than at from_json below, because read_text() decodes.  Gated
+        # on the caller's own tuple, never hard-coded to UnicodeDecodeError:
+        # that keeps the clause a no-op for queue.py's narrow tuple and a full
+        # restoration of sweep.py's wider one.  See the docstring.
+        logger.warning(f'Failed to parse {path}: {e}')
+        return None, 'unparsable'
     except OSError as e:
         logger.warning('%s: failed to read %s: %s', context, path, e)
         return None, 'unreadable'
