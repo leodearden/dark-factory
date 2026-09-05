@@ -1294,6 +1294,83 @@ def test_gate_reports_skip_when_the_unit_is_genuinely_not_installed(
     )
 
 
+def test_gate_reports_an_override_as_needing_manual_removal(
+    tmp_path: pathlib.Path,
+):
+    """A drop-in override reaches the operator as needing MANUAL removal.
+
+    The checker reports an override on exit 1, which the shared
+    `_parity_verdict` classifier maps to the same `finding` token as drift. The
+    gate's arm therefore has to cover both, and the two remedies are different:
+    --fix appends directives to the unit FILE and can neither synthesize nor
+    resolve an override living in a different one. An arm that names only
+    `--fix` sends the operator to a command that cannot help, and — worse —
+    implies the state is repairable when it is not.
+
+    The false green this closes is the fourth assertion: before the checker
+    consulted drop-ins at all, this exact host state produced
+    `OK ... parity with template`.
+    """
+    repo = _gate_repo(tmp_path)
+    unit_dir = _gate_unit_dir(
+        tmp_path, content=TEMPLATE_PATH.read_text(encoding="utf-8")
+    )
+    dropin_dir = unit_dir / "fused-memory.service.d"
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    (dropin_dir / "10-override.conf").write_text(_FM_DROPIN, encoding="utf-8")
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    # (i) A post-install health check with nothing installing after it must
+    # never `fail` — see the gate's own comment.
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "FAIL " not in result.stdout, (
+        f"An override is a real verdict from a gate that RAN.\n{result.stdout}"
+    )
+
+    # (ii) The checker's own report is printed before classification, so the
+    # operator can see WHICH file overrides the unit.
+    assert "[fused_memory_unit_parity]" in result.stdout, result.stdout
+    assert "[override]" in result.stdout, result.stdout
+    assert str(dropin_dir / "10-override.conf") in result.stdout, result.stdout
+
+    # (iii) The `finding` arm ran, and it says manual removal — not that --fix
+    # resolves this.
+    assert "WARN " in result.stdout, result.stdout
+    warn_text = "\n".join(
+        line for line in result.stdout.splitlines() if line.startswith("WARN ")
+    )
+    assert "manual removal" in warn_text, warn_text
+
+    # (iv) The false green.
+    assert "OK " not in result.stdout, result.stdout
+    assert "parity with template" not in result.stdout, result.stdout
+
+
+def test_gate_still_names_fix_for_plain_directive_drift(tmp_path: pathlib.Path):
+    """Rewording the arm for overrides must stay ADDITIVE for plain drift.
+
+    Not redundant with ::test_gate_reports_drift_when_a_required_directive_is_
+    missing above. That test predates the override arm and asserts the tokens
+    incidentally; this one states explicitly that they are a CONSTRAINT on the
+    rewording, so an edit that drops `DRIFT detected` or `--fix` while widening
+    the arm fails here with a reason attached rather than in a neighbouring
+    test with none.
+
+    The unit is drop-in free on purpose: this is the arm's OTHER input, and
+    --fix genuinely is the remedy for it.
+    """
+    repo = _gate_repo(tmp_path)
+    unit_dir = _gate_unit_dir(tmp_path, content=_MISSING_MEM0_UNIT)
+    assert not (unit_dir / "fused-memory.service.d").exists()
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "DRIFT detected" in result.stdout, result.stdout
+    assert "--fix" in result.stdout, result.stdout
+
+
 # ---------------------------------------------------------------------------
 # ACCEPTANCE 3 — the checker, INCLUDING --fix, cannot undo the preservation
 # (step-7)
