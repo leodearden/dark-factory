@@ -13,6 +13,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import merge_lane_throughput as mlt
 import pytest
@@ -136,7 +137,9 @@ CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(timestamp);
 """
 
 
-def _make_runs_db(tmp_path: Path, events: list[dict], name: str = 'runs.db') -> Path:
+def _make_runs_db(
+    tmp_path: Path, events: list[dict[str, Any]], name: str = 'runs.db'
+) -> Path:
     """Build a temp runs.db mirroring the live events schema and insert *events*.
 
     Each event dict may carry: ``event_type`` (required), ``task_id``,
@@ -177,7 +180,9 @@ def _make_runs_db(tmp_path: Path, events: list[dict], name: str = 'runs.db') -> 
     return db_path
 
 
-def _make_project_root(tmp_path: Path, name: str, events: list[dict]) -> Path:
+def _make_project_root(
+    tmp_path: Path, name: str, events: list[dict[str, Any]]
+) -> Path:
     """Materialise a synthetic project root holding data/orchestrator/runs.db."""
     root = tmp_path / name
     (root / 'data' / 'orchestrator').mkdir(parents=True)
@@ -224,7 +229,7 @@ def _ts(day: int, hour: int = 0, minute: int = 0) -> str:
     return f'2026-08-{day:02d}T{hour:02d}:{minute:02d}:00+00:00'
 
 
-def _fin(task_id, day, hour, state='done', **data):
+def _fin(task_id, day, hour, state='done', **data) -> dict[str, Any]:
     return {
         'event_type': 'merge_finalized',
         'task_id': task_id,
@@ -233,9 +238,9 @@ def _fin(task_id, day, hour, state='done', **data):
     }
 
 
-def corpus_a() -> list[dict]:
+def corpus_a() -> list[dict[str, Any]]:
     """Event corpus for synthetic project root A (see known answers above)."""
-    events: list[dict] = []
+    events: list[dict[str, Any]] = []
 
     # Out-of-window landing: must never be counted.
     events.append(_fin('a00', 9, 3))
@@ -324,9 +329,9 @@ def corpus_a() -> list[dict]:
     return events
 
 
-def corpus_b() -> list[dict]:
+def corpus_b() -> list[dict[str, Any]]:
     """Event corpus for synthetic project root B (see known answers above)."""
-    events: list[dict] = [
+    events: list[dict[str, Any]] = [
         _fin('b01', 11, 3),
         _fin('b02', 12, 3), _fin('b03', 12, 9),
         _fin('b04', 13, 3), _fin('b05', 13, 9),
@@ -540,7 +545,7 @@ def test_percentile_uses_linear_interpolation_between_order_statistics():
 # ---------------------------------------------------------------------------
 
 
-def _in_window(events, event_type):
+def _in_window(events, event_type) -> list[dict[str, Any]]:
     """The corpus rows of *event_type* inside the corpus window, load_events-shaped."""
     return [
         {'timestamp': e['timestamp'], 'task_id': e['task_id'], 'data': e['data']}
@@ -550,7 +555,7 @@ def _in_window(events, event_type):
     ]
 
 
-def _landings_fixture():
+def _landings_fixture() -> list[dict[str, Any]]:
     """Corpus A's in-window merge_finalized rows."""
     return _in_window(corpus_a(), 'merge_finalized')
 
@@ -716,18 +721,18 @@ def test_landings_corpus_b_known_answer():
 # ---------------------------------------------------------------------------
 
 
-def _q(task_id, hour, minute):
+def _q(task_id, hour, minute) -> dict[str, Any]:
     return {'timestamp': _ts(11, hour, minute), 'task_id': task_id,
             'data': {'branch': f'task/{task_id}', 'queue_depth': 1}}
 
 
-def _v(task_id, hour, minute, duration_ms, **extra):
+def _v(task_id, hour, minute, duration_ms, **extra) -> dict[str, Any]:
     return {'timestamp': _ts(11, hour, minute), 'task_id': task_id,
             'data': {'runner': 'local', 'passed': True,
                      'duration_ms': duration_ms, **extra}}
 
 
-def _f(task_id, hour, minute, state='done'):
+def _f(task_id, hour, minute, state='done') -> dict[str, Any]:
     return {'timestamp': _ts(11, hour, minute), 'task_id': task_id,
             'data': {'branch': f'task/{task_id}', 'state': state}}
 
@@ -872,7 +877,7 @@ def test_lead_time_wait_needs_a_dequeue_after_the_joined_queue():
 # ---------------------------------------------------------------------------
 
 
-def _runner_fixture():
+def _runner_fixture() -> list[dict[str, Any]]:
     rows = [
         _v('r1', 1, 0, 600_000, runner='local', passed=True),
         _v('r2', 1, 1, 1_200_000, runner='local', passed=True),

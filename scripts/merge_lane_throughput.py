@@ -33,7 +33,7 @@ import json
 import math
 import re
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -506,3 +506,89 @@ def compute_lead_time(
         'unmatched_task_ids': unmatched_task_ids,
         'window': (_iso(lo), _iso(hi)),
     }
+
+
+# Explicit bucket label for a payload key that is absent or None. Never
+# silently dropped and never merged into a real value's bucket: an unexpected
+# vocabulary shows up in the report instead of quietly vanishing.
+UNKNOWN = '(unknown)'
+
+
+def _duration_minutes(data: dict[str, Any]) -> float | None:
+    """Minutes from a payload's ``duration_ms``, or ``None`` when unusable.
+
+    `merge_verify` stores its duration in the JSON payload; the events table's
+    ``duration_ms`` COLUMN is NULL for this event type (`event_store.py`
+    populates that column only for the invocation-shaped events).  Reading the
+    column instead is silently wrong rather than loudly wrong, which is why it
+    is never touched here.
+    """
+    raw = data.get('duration_ms')
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw) / 60_000.0
+
+
+# ---------------------------------------------------------------------------
+# Section: verify duration by runner.
+# ---------------------------------------------------------------------------
+
+
+def compute_verify_by_runner(
+    verify_events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bucket `merge_verify` rows by ``data['runner']``: p50/p90/n/pass rate.
+
+    Emitted by `verify_runner.py::VerifyRunnerPool.dispatch`; ``runner`` is the
+    host name that actually ran the verify ('local' for the orchestrator host,
+    otherwise a configured remote).  Durations come from
+    ``data['duration_ms']`` — see :func:`_duration_minutes` for why the column
+    is not read.
+
+    A runner with no rows in the window is ABSENT from the result, never
+    reported as zeros: "the laptop ran no verify in this window" and "the
+    laptop verified instantly and never passed" are different findings and must
+    not render identically.  A row whose ``runner`` is missing or None buckets
+    under :data:`UNKNOWN` rather than being dropped, so an unexpected value
+    surfaces.  Rows with no usable duration still count toward ``n`` and the
+    pass rate — only ``n_durations`` and the percentiles exclude them.
+
+    FORWARD COMPAT — ``fallback_reason``.  That key is introduced by the PRD's
+    task C, which is DOWNSTREAM of this script, so on main no row carries it.
+    The top-level ``fallback_key_present`` flag says whether ANY row in the
+    window carried it; when it is False the per-runner ``fallback_reasons``
+    tallies are empty *because the key does not exist yet*, which a caller must
+    render as "not present" rather than as a zero count.  Collapsing the two
+    would let a pre-task-C window read as positive evidence that busy-fallback
+    dispatches never happen.
+
+    Returns ``{'runners': {name: {...}}, 'fallback_key_present': bool}``.
+    """
+    durations: dict[str, list[float]] = defaultdict(list)
+    passes: dict[str, list[bool]] = defaultdict(list)
+    fallbacks: dict[str, Counter[str]] = defaultdict(Counter)
+    fallback_key_present = False
+
+    for event in verify_events:
+        data = event.get('data', {})
+        runner = data.get('runner') or UNKNOWN
+        passes[runner].append(bool(data.get('passed')))
+        minutes = _duration_minutes(data)
+        if minutes is not None:
+            durations[runner].append(minutes)
+        reason = data.get('fallback_reason')
+        if reason is not None:
+            fallback_key_present = True
+            fallbacks[runner][str(reason)] += 1
+
+    runners: dict[str, Any] = {}
+    for runner, outcomes in passes.items():
+        series = _series(durations.get(runner, []))
+        runners[runner] = {
+            **series,
+            'n': len(outcomes),
+            'n_durations': series['n'],
+            'pass_rate': sum(outcomes) / len(outcomes),
+            'fallback_reasons': dict(fallbacks.get(runner, Counter())),
+        }
+    return {'runners': runners, 'fallback_key_present': fallback_key_present}
