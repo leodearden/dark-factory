@@ -23,6 +23,7 @@ from fused_memory.reconciliation.citation_verifier import (
     PROSE_CITATION_FIELDS,
     STAGE_STAT_PREFIX,
     X_CITATION_TOMBSTONE_KEY,
+    _known_non_mem0_ids,
     build_citation_tombstone,
     find_citation_occurrences,
     find_live_citation_occurrences,
@@ -1987,3 +1988,145 @@ class TestScanProseCitationsSafety:
         service.get_mem0_deletion_tombstone.assert_has_awaits(
             [call('other_project', _SPECIMEN_FABRICATED)],
         )
+
+
+class TestScanProseCitationsKnownNonMem0Ids:
+    """Ids the finding has ALREADY declared are not Mem0 point ids are skipped
+    before the point read, so the two halves of the invariant cannot disagree
+    about the same id on the same finding (reviewer finding, task 4818
+    amendment pass).
+
+    ``verify_cited_memories`` deliberately declines to judge a ``store !=
+    'mem0'`` citation because a Mem0 point read "would return not-found for
+    EVERY graphiti citation and false-flag legitimate graph evidence as a
+    phantom". Recon findings routinely name the same graphiti edge/entity uuid
+    in both ``cited_memories`` and the prose — so without this the structured
+    half would decline to judge it while the prose half called it fabricated.
+    """
+
+    @pytest.mark.asyncio
+    async def test_graphiti_citation_named_in_prose_is_never_a_phantom(self, caplog):
+        """The headline case: one id, cited as ``store='graphiti'`` AND named in
+        the description. Neither half judges it, and no read is even issued."""
+        edge_uuid = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+        finding = {
+            'finding_id': 'f-graph',
+            'description': f'Edge {edge_uuid} contradicts the cluster.',
+            'cited_memories': [{'memory_id': edge_uuid, 'store': 'graphiti'}],
+        }
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert stats['stage1_prose_citation_verification_errors'] == 0
+        assert stats['stage1_prose_citations_verified'] == 0
+        assert caplog.records == []
+        # Skipped BEFORE the read, not after: a bounded false-positive
+        # reduction should also cost nothing on the critical path.
+        service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_mem0_citation_named_in_prose_is_still_scanned(self, caplog):
+        """The exclusion is scoped to NON-mem0 stores. A mem0-store citation
+        also named in the prose is a real, separate prose claim — this is the
+        interaction ``BaseStage.run()``'s ordering comment turns on, and
+        excluding it would silently delete half the counter's purpose."""
+        finding = {
+            'finding_id': 'f-mem0',
+            'description': f'Memory {_SPECIMEN_FABRICATED} is stale.',
+            'cited_memories': [{'memory_id': _SPECIMEN_FABRICATED, 'store': 'mem0'}],
+        }
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert len(caplog.records) == 1
+
+    @pytest.mark.asyncio
+    async def test_own_identity_and_run_id_quoted_in_prose_are_skipped(self, caplog):
+        """``find_prose_uuids`` already refuses to SCAN the identity fields, but
+        a description that quotes its own finding id — or the run in flight, as
+        4818's own charter does with Stage-2 run ``ab330f59`` — reaches the
+        scan anyway. Neither is a citation."""
+        finding_id = '0490e20e-cce2-4e68-a2ce-80f3b31987a1'
+        task_uuid = '11111111-2222-3333-4444-555555555555'
+        run_uuid = 'ab330f59-1111-4222-8333-444444444444'
+        finding = {
+            'finding_id': finding_id,
+            'task_id': task_uuid,
+            'description': (
+                f'Finding {finding_id} on task {task_uuid} from run {run_uuid} '
+                f'also names {_SPECIMEN_FABRICATED}.'
+            ),
+        }
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                [finding], service, 'test_project', run_id=run_uuid,
+            )
+
+        # Exactly ONE of the four ids is a candidate citation.
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert len(caplog.records) == 1
+        assert _SPECIMEN_FABRICATED in caplog.records[0].getMessage()
+        service.get_memory_by_id.assert_awaited_once_with(
+            'test_project', _SPECIMEN_FABRICATED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_exclusions_are_per_finding_not_global(self):
+        """An id excluded by finding A's graphiti citation is still judged when
+        finding B names it with no such declaration — the counter-evidence is
+        the FINDING's, not the report's."""
+        shared = _SPECIMEN_FABRICATED
+        findings = [
+            {
+                'finding_id': 'f-a',
+                'description': f'Edge {shared}.',
+                'cited_memories': [{'memory_id': shared, 'store': 'graphiti'}],
+            },
+            {'finding_id': 'f-b', 'description': f'Memory {shared}.'},
+        ]
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+
+    @pytest.mark.parametrize(
+        'finding',
+        [
+            None,
+            'a bare string',
+            {'cited_memories': 'not-a-list'},
+            {'cited_memories': [None, 42, {}, {'store': 'graphiti'}]},
+            {'finding_id': None, 'task_id': 42},
+        ],
+    )
+    def test_helper_is_total_on_malformed_input(self, finding):
+        """Pure and total, matching ``find_prose_uuids``: a malformed finding
+        yields no exclusions rather than aborting a scan mid-report."""
+        assert _known_non_mem0_ids(finding) == set()
+
+    def test_helper_lowercases_every_class(self):
+        """Normalised to the same lowercase key ``find_prose_uuids`` emits —
+        casing is a rendering choice, not a different identifier — so an
+        uppercase rendering in either place still matches."""
+        upper = _SPECIMEN_REAL.upper()
+        finding = {
+            'finding_id': '0490E20E-CCE2-4E68-A2CE-80F3B31987A1',
+            'cited_memories': [{'memory_id': upper, 'store': 'graphiti'}],
+        }
+
+        excluded = _known_non_mem0_ids(finding, run_id='AB330F59-1111-4222-8333-444444444444')
+
+        assert excluded == {
+            _SPECIMEN_REAL,
+            '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'ab330f59-1111-4222-8333-444444444444',
+        }

@@ -220,6 +220,66 @@ def find_prose_uuids(finding: Any) -> dict[str, list[str]]:
     return found
 
 
+def _known_non_mem0_ids(finding: Any, run_id: str | None = None) -> set[str]:
+    """Lowercased ids this finding has ALREADY declared are not Mem0 point ids.
+
+    The prose scan resolves through ``get_memory_by_id``, which is
+    Mem0/Qdrant-only, so any id that is known by CONSTRUCTION not to be a Mem0
+    point id resolves to ``None``, finds no Mem0 tombstone, and would be
+    reported as a fabrication. Three such classes are knowable for free, from
+    the finding itself and the caller's own ``run_id``:
+
+    - **a non-mem0 STRUCTURED citation.** :func:`verify_cited_memories`
+      deliberately skips ``store != 'mem0'`` entries because resolving a
+      graphiti edge uuid through a Mem0 point read "would return not-found for
+      EVERY graphiti citation and false-flag legitimate graph evidence as a
+      phantom". Recon findings routinely name the same graphiti edge/entity
+      uuid in BOTH ``cited_memories`` and the prose, so without this the two
+      halves would disagree about the same id on the same finding — one
+      deliberately declining to judge it, the other calling it fabricated. The
+      counter-evidence is sitting in the finding; use it.
+    - **the finding's own identity** (``finding_id``, ``task_id``), which is
+      uuid-shaped by construction and is not a citation at all.
+      :func:`find_prose_uuids` already refuses to SCAN those fields, but a
+      description that quotes its own finding id in prose reaches here anyway.
+    - **the run in flight** (``run_id``), for the same reason — 4818's own
+      charter cites Stage-2 run ``ab330f59`` in prose.
+
+    Deliberately NOT a counter, mirroring the structured half: that pass skips
+    a non-mem0 entry silently too, counting it neither verified nor dropped nor
+    errored. A skip here is an exclusion, not a fault — nothing was attempted,
+    so there is nothing to report.
+
+    This is a BOUNDED reduction of the acknowledged false-positive class, not
+    an attempt to close it by regex. Episode uuids, session ids and every other
+    non-Mem0 uuid a description can name remain unbounded and unknowable from
+    the finding, which is why the pass stays warn-only.
+
+    Pure and total: a non-dict finding, a malformed ``cited_memories``, and a
+    non-str id all yield no entry rather than raising.
+    """
+    excluded: set[str] = set()
+    if isinstance(run_id, str) and run_id:
+        excluded.add(run_id.lower())
+    if not isinstance(finding, dict):
+        return excluded
+    for identity_field in ('finding_id', 'task_id'):
+        value = finding.get(identity_field)
+        if isinstance(value, str) and value:
+            excluded.add(value.lower())
+    for entry in finding.get('cited_memories') or []:
+        if not isinstance(entry, dict) or entry.get('store') == 'mem0':
+            # A mem0-store citation is the STRUCTURED half's business and must
+            # NOT be excluded here: a phantom just dropped from
+            # ``cited_memories`` that is still named in the prose is a real,
+            # separate fact (see ``BaseStage.run()``'s ordering comment).
+            continue
+        memory_id = entry.get('memory_id')
+        if isinstance(memory_id, str) and memory_id:
+            excluded.add(memory_id.lower())
+    return excluded
+
+
 def _make_memory_resolver(
     memory_service: Any,
     project_id: str,
@@ -482,13 +542,17 @@ async def scan_prose_citations(
     :func:`verify_cited_memories`' docstring already draws — so a memoised
     resolution increments exactly as a fresh one does.
 
+    Ids the finding has ALREADY declared are not Mem0 point ids are skipped
+    before the read and counted nowhere — see :func:`_known_non_mem0_ids` for
+    the three classes and why a skip is an exclusion rather than a fault.
+
     All FOUR keys are ALWAYS present, on every path, so a caller merging them
     into ``report.stats`` never needs a ``.get(..., 0)`` fallback (the
     convention inherited verbatim from :func:`verify_cited_memories`' triple).
     A bare ``prose_phantom_citations: 0`` would be ambiguous between "we
     scanned and everything is clean" and "nothing was scannable"; reporting
     all four makes the zero self-explaining, and they sum to the number of
-    distinct pairs scanned, so no separate denominator key is needed.
+    distinct pairs RESOLVED, so no separate denominator key is needed.
 
     ``stat_prefix`` is caller-supplied for the same reason the structured pass
     takes one: ``BaseStage.run()`` runs this for EVERY stage and merges the
@@ -568,7 +632,16 @@ async def scan_prose_citations(
         if not isinstance(finding, dict):
             continue
         _finding_id = finding.get('finding_id')
+        _excluded = _known_non_mem0_ids(finding, run_id)
         for memory_id, fields in find_prose_uuids(finding).items():
+            if memory_id in _excluded:
+                # Known non-Mem0 by construction — see ``_known_non_mem0_ids``.
+                # Skipped silently and counted nowhere, exactly as
+                # ``verify_cited_memories`` skips a non-mem0 STRUCTURED
+                # citation: nothing was attempted, so there is nothing to
+                # report, and reporting it would put the two halves in
+                # contradiction about the same id on the same finding.
+                continue
             outcome, _error_type = await resolve(memory_id)
             if outcome == 'error':
                 # "Unknown", not "absent". Reporting this as a fabrication
