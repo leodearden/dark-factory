@@ -379,6 +379,14 @@ note ""
 if [ "$fail" -eq 0 ]; then
   note "RESULT: all preconditions satisfied — the flip may proceed."
 else
+  # BOTH ownership clauses below are gated on their OWN item(s)' pass/fail
+  # state via item_failed(), not just the items-2/4 one. This whole arm runs
+  # on ANY failure, so an ungated clause names an item the report declared
+  # PASS a few lines above, contradicting the authoritative `FAILING ITEMS:`
+  # line -- measured both directions: items 2/4 blamed while passing on
+  # judge='flat'/eval_src='fixed', and item 1 blamed while passing on
+  # judge='by_id'/eval_src='failing'. Pinned by
+  # scripts/tests/test_check_write_triage_flip_preconditions.py::TestResultBlockBlamesOnlyFailingItems.
   note "RESULT: preconditions NOT satisfied."
   triage_subject=''
   if item_failed 2 && item_failed 4; then triage_subject='Items 2 and 4 are'
@@ -389,9 +397,11 @@ else
     note "        $triage_subject task 4762's (priority high); see its description"
     note "        and details for the verbatim findings."
   fi
-  note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
-  note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
-  note "        satisfies it. See its report above for what was measured."
+  if item_failed 1; then
+    note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
+    note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
+    note "        satisfies it. See its report above for what was measured."
+  fi
 fi
 
 # LAST, deliberately. DeterministicRunner._default_run_script returns only the
