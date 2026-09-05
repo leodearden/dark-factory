@@ -51,11 +51,14 @@ class TestSourceCompletionDeclaresGateSubject:
     def test_names_the_boundary_rejection_consequence(self, can_file):
         text = m.render_source_completion_section(can_file_tasks=can_file)
         # A hard rejection invariant, not a lint warning — mirroring
-        # render_execution_class_section's existing phrasing.
-        assert 'rejected' in text, (
+        # render_execution_class_section's existing phrasing. Matched
+        # case-insensitively: the section's voice uses emphasis caps
+        # (MUST/REJECTED), which is style, not contract.
+        lowered = text.lower()
+        assert 'rejected' in lowered, (
             f'can_file_tasks={can_file} must name the rejection consequence'
         )
-        assert 'non-terminal' in text, (
+        assert 'non-terminal' in lowered, (
             f'can_file_tasks={can_file} must state the rejection applies only '
             f'while the first carrier is non-terminal'
         )
