@@ -527,3 +527,150 @@ def test_percentile_uses_linear_interpolation_between_order_statistics():
     assert mlt._percentile([0.0, 1.0, 2.0, 3.0], 90) == pytest.approx(2.7)
     # Unsorted input must be sorted internally.
     assert mlt._percentile([4.0, 0.0, 3.0, 1.0], 50) == 2.0
+
+
+# ---------------------------------------------------------------------------
+# compute_landings_per_day
+#
+# The definition is load-bearing and was pinned empirically (plan decision 1):
+# `merge_finalized` with data.state == 'done', bucketed by UTC calendar date,
+# COMPLETE buckets only. The two plausible-but-wrong variants — counting every
+# state, and keeping the partial leading bucket — are pinned as regressions
+# below, because each yields a different median from the same rows.
+# ---------------------------------------------------------------------------
+
+
+def _in_window(events, event_type):
+    """The corpus rows of *event_type* inside the corpus window, load_events-shaped."""
+    return [
+        {'timestamp': e['timestamp'], 'task_id': e['task_id'], 'data': e['data']}
+        for e in events
+        if e['event_type'] == event_type
+        and CORPUS_LO <= e['timestamp'] < CORPUS_HI
+    ]
+
+
+def _landings_fixture():
+    """Corpus A's in-window merge_finalized rows."""
+    return _in_window(corpus_a(), 'merge_finalized')
+
+
+def test_landings_counts_only_done_over_complete_buckets():
+    result = mlt.compute_landings_per_day(
+        _landings_fixture(), CORPUS_LO_DT, CORPUS_HI_DT
+    )
+    assert result['per_day'] == {
+        '2026-08-11': 3,
+        '2026-08-12': 1,
+        '2026-08-13': 0,
+        '2026-08-14': 4,
+    }
+    assert result['n_days'] == 4
+    assert result['median'] == 2.0
+    assert result['max'] == 4
+
+
+def test_landings_excludes_the_partial_leading_bucket():
+    result = mlt.compute_landings_per_day(
+        _landings_fixture(), CORPUS_LO_DT, CORPUS_HI_DT
+    )
+    # Aug 10 holds 5 `done` rows, but CORPUS_LO cuts it mid-day, so counting it
+    # would compare a half-day against four whole ones.
+    assert '2026-08-10' not in result['per_day']
+    # REGRESSION PIN: keeping it would give median 3, max 5 — a different table.
+    assert (result['median'], result['max']) != (3, 5)
+
+
+def test_landings_ignores_non_done_states():
+    result = mlt.compute_landings_per_day(
+        _landings_fixture(), CORPUS_LO_DT, CORPUS_HI_DT
+    )
+    # Aug 12 carries 1 done + 2 blocked + 1 superseded.
+    assert result['per_day']['2026-08-12'] == 1
+    # REGRESSION PIN: counting every state would give Aug 12: 4 and median 3.5.
+    assert result['median'] != 3.5
+
+
+def test_landings_zero_fills_an_empty_interior_day():
+    result = mlt.compute_landings_per_day(
+        _landings_fixture(), CORPUS_LO_DT, CORPUS_HI_DT
+    )
+    # Aug 13 saw no landing. Dropping the day instead of zero-filling would
+    # inflate the median by shortening the series.
+    assert result['per_day']['2026-08-13'] == 0
+    assert result['n_days'] == 4
+
+
+def test_landings_buckets_by_utc_calendar_date():
+    events = [
+        {'timestamp': '2026-08-11T23:59:59+00:00', 'task_id': 't1',
+         'data': {'state': 'done'}},
+        {'timestamp': '2026-08-12T00:00:01+00:00', 'task_id': 't2',
+         'data': {'state': 'done'}},
+    ]
+    result = mlt.compute_landings_per_day(
+        events,
+        datetime(2026, 8, 11, 0, 0, tzinfo=UTC),
+        datetime(2026, 8, 13, 0, 0, tzinfo=UTC),
+    )
+    assert result['per_day'] == {'2026-08-11': 1, '2026-08-12': 1}
+
+
+def test_landings_drops_a_partial_trailing_bucket_too():
+    events = [
+        {'timestamp': '2026-08-11T02:00:00+00:00', 'task_id': 't1',
+         'data': {'state': 'done'}},
+        {'timestamp': '2026-08-12T02:00:00+00:00', 'task_id': 't2',
+         'data': {'state': 'done'}},
+        {'timestamp': '2026-08-13T02:00:00+00:00', 'task_id': 't3',
+         'data': {'state': 'done'}},
+    ]
+    result = mlt.compute_landings_per_day(
+        events,
+        datetime(2026, 8, 11, 0, 0, tzinfo=UTC),
+        datetime(2026, 8, 13, 6, 0, tzinfo=UTC),   # mid-day hi
+    )
+    assert result['per_day'] == {'2026-08-11': 1, '2026-08-12': 1}
+    assert result['n_days'] == 2
+
+
+def test_landings_reports_none_when_no_complete_bucket_exists():
+    events = [
+        {'timestamp': '2026-08-11T13:00:00+00:00', 'task_id': 't1',
+         'data': {'state': 'done'}},
+    ]
+    result = mlt.compute_landings_per_day(
+        events,
+        datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 11, 18, 0, tzinfo=UTC),
+    )
+    assert result['n_days'] == 0
+    assert result['per_day'] == {}
+    # None, not 0 — "the window is too short to hold a whole day" is not the
+    # same finding as "a whole day passed with no landing".
+    assert result['median'] is None
+    assert result['max'] is None
+
+
+def test_landings_tolerates_a_row_with_no_state_key():
+    events = [
+        {'timestamp': '2026-08-11T02:00:00+00:00', 'task_id': 't1', 'data': {}},
+        {'timestamp': '2026-08-11T03:00:00+00:00', 'task_id': 't2',
+         'data': {'state': 'done'}},
+    ]
+    result = mlt.compute_landings_per_day(
+        events,
+        datetime(2026, 8, 11, 0, 0, tzinfo=UTC),
+        datetime(2026, 8, 12, 0, 0, tzinfo=UTC),
+    )
+    assert result['per_day'] == {'2026-08-11': 1}
+
+
+def test_landings_corpus_b_known_answer():
+    events = _in_window(corpus_b(), 'merge_finalized')
+    result = mlt.compute_landings_per_day(events, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert result['per_day'] == {
+        '2026-08-11': 1, '2026-08-12': 2, '2026-08-13': 2, '2026-08-14': 1,
+    }
+    assert result['median'] == 1.5
+    assert result['max'] == 2
