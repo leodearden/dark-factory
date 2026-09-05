@@ -1433,3 +1433,186 @@ def test_chains_tolerates_a_non_numeric_landed_via_chain():
     result = mlt.compute_chains(finalized, [])
     assert result['items_landed_via_chain'] == 0
     assert result['n_unusable_landed_via_chain'] == 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-project extent — `--project-root` is REPEATABLE (plan decision 5).
+#
+# The `events` table has no project column, and `account_events.project_id`
+# lives in a different store entirely (shared/src/shared/cost_store.py) with a
+# disjoint event vocabulary and no join key. So "by project" is not derivable
+# from one root: the only way to get it is to read one runs.db PER root and
+# label every bundle with the root it came from. Merging two roots into one
+# undifferentiated tally would destroy exactly the signal the PRD's void-rate
+# decomposition needs (root A 0.30 vs root B ~0.58 below).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_runs_db_is_data_orchestrator_runs_db_under_the_root(tmp_path):
+    assert mlt.resolve_runs_db(tmp_path / 'proj') == (
+        tmp_path / 'proj' / 'data' / 'orchestrator' / 'runs.db'
+    )
+
+
+def test_project_root_flag_is_repeatable(corpus_roots):
+    root_a, root_b = corpus_roots
+    args = mlt.build_parser().parse_args(
+        ['--project-root', str(root_a), '--project-root', str(root_b)]
+    )
+    assert args.project_root == [str(root_a), str(root_b)]
+    assert mlt.resolve_project_roots(args.project_root) == [root_a, root_b]
+
+
+def test_project_root_defaults_to_this_checkout_when_not_given():
+    args = mlt.build_parser().parse_args([])
+    # argparse's append action leaves None, not []; the default is applied by
+    # resolve_project_roots so a caller passing None gets the same answer.
+    assert args.project_root is None
+    roots = mlt.resolve_project_roots(args.project_root)
+    assert roots == [mlt.DEFAULT_PROJECT_ROOT]
+    assert (mlt.DEFAULT_PROJECT_ROOT / 'scripts' / 'merge_lane_throughput.py').is_file()
+
+
+def test_collect_project_labels_its_bundle_with_the_root_it_read(corpus_roots):
+    root_a, _ = corpus_roots
+    bundle = mlt.collect_project(root_a, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert bundle['project_root'] == str(root_a)
+    assert bundle['runs_db'] == str(mlt.resolve_runs_db(root_a))
+    assert bundle['error'] is None
+    assert bundle['window'] == (CORPUS_LO, CORPUS_HI)
+
+
+def test_collect_project_computes_every_always_on_section(corpus_roots):
+    root_a, _ = corpus_roots
+    sections = mlt.collect_project(root_a, CORPUS_LO_DT, CORPUS_HI_DT)['sections']
+    assert set(sections) == {
+        'landings_per_day', 'lead_time', 'verify_by_runner',
+        'occupancy', 'queue_depth', 'mixes',
+    }
+    # Known answer for root A: complete buckets Aug 11..14 = [3, 1, 0, 4].
+    assert sections['landings_per_day']['median'] == 2.0
+    assert sections['landings_per_day']['max'] == 4
+    assert sections['landings_per_day']['n_days'] == 4
+
+
+def test_collect_project_adds_chains_and_speculation_only_when_asked(corpus_roots):
+    root_a, _ = corpus_roots
+    default = mlt.collect_project(root_a, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert 'chains' not in default['sections']
+    assert 'speculation' not in default['sections']
+
+    both = mlt.collect_project(
+        root_a, CORPUS_LO_DT, CORPUS_HI_DT, chains=True, speculation=True
+    )
+    assert both['sections']['speculation']['void_rate'] == pytest.approx(0.30)
+    # Corpus A lands two rows carrying landed_via_chain=1.
+    assert both['sections']['chains']['items_landed_via_chain'] == 2
+
+
+def test_collect_projects_reads_both_roots_and_never_merges_them(corpus_roots):
+    root_a, root_b = corpus_roots
+    bundles = mlt.collect_projects(
+        [root_a, root_b], CORPUS_LO_DT, CORPUS_HI_DT
+    )
+    assert [b['project_root'] for b in bundles] == [str(root_a), str(root_b)]
+
+    landings = [b['sections']['landings_per_day'] for b in bundles]
+    # Root A's known answer is median 2.0/max 4; root B's is 1.5/2. A merged
+    # tally would be [4, 3, 2, 5] -> median 3.5, matching NEITHER row.
+    assert (landings[0]['median'], landings[0]['max']) == (2.0, 4)
+    assert (landings[1]['median'], landings[1]['max']) == (1.5, 2)
+    assert landings[0]['per_day'] != landings[1]['per_day']
+
+
+def test_collect_projects_with_a_single_root_still_works_unchanged(corpus_roots):
+    root_a, _ = corpus_roots
+    solo = mlt.collect_projects([root_a], CORPUS_LO_DT, CORPUS_HI_DT)
+    assert len(solo) == 1
+    assert solo[0] == mlt.collect_project(root_a, CORPUS_LO_DT, CORPUS_HI_DT)
+
+
+def test_speculation_void_rate_is_reported_per_project(corpus_roots):
+    root_a, root_b = corpus_roots
+    bundles = mlt.collect_projects(
+        [root_a, root_b], CORPUS_LO_DT, CORPUS_HI_DT, speculation=True
+    )
+    a, b = (bundle['sections']['speculation'] for bundle in bundles)
+    # Root A: 10 speculative_merge, 3 chain_dead voids. Root B: 12 and 7.
+    assert (a['n_speculative'], a['n_voided_chain_dead']) == (10, 3)
+    assert (b['n_speculative'], b['n_voided_chain_dead']) == (12, 7)
+    assert a['void_rate'] == pytest.approx(0.30)
+    assert b['void_rate'] == pytest.approx(7 / 12)
+
+
+def test_void_rate_by_project_keys_the_spread_by_root(corpus_roots):
+    root_a, root_b = corpus_roots
+    bundles = mlt.collect_projects(
+        [root_a, root_b], CORPUS_LO_DT, CORPUS_HI_DT, speculation=True
+    )
+    by_project = mlt.void_rate_by_project(bundles)
+    assert list(by_project) == [str(root_a), str(root_b)]
+    assert by_project[str(root_a)]['void_rate'] == pytest.approx(0.30)
+    assert by_project[str(root_b)]['void_rate'] == pytest.approx(7 / 12)
+    # The spread IS the finding — a pooled rate (10/22) would erase it.
+    assert by_project[str(root_a)]['void_rate'] != by_project[str(root_b)]['void_rate']
+
+
+def test_void_rate_by_project_skips_a_bundle_that_errored(tmp_path, corpus_roots):
+    root_a, _ = corpus_roots
+    missing = tmp_path / 'no_such_project'
+    bundles = mlt.collect_projects(
+        [root_a, missing], CORPUS_LO_DT, CORPUS_HI_DT, speculation=True
+    )
+    by_project = mlt.void_rate_by_project(bundles)
+    # The failed root is absent rather than present with a rate of 0.0 — a
+    # project whose DB could not be read has NO measured void rate.
+    assert list(by_project) == [str(root_a)]
+
+
+def test_collect_project_reports_a_missing_db_as_a_labelled_error(tmp_path):
+    missing = tmp_path / 'no_such_project'
+    bundle = mlt.collect_project(missing, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert bundle['project_root'] == str(missing)
+    assert bundle['error'] is not None
+    # Loud: the message names the path that was actually looked for, so the
+    # operator can see whether it was the root or the layout that was wrong.
+    assert str(mlt.resolve_runs_db(missing)) in bundle['error']
+    # And empty — NOT a bundle of zeros. "This DB could not be read" must never
+    # render identically to "this project landed nothing in the window".
+    assert bundle['sections'] == {}
+
+
+def test_collect_project_reports_an_unreadable_db_as_a_labelled_error(tmp_path):
+    root = tmp_path / 'corrupt'
+    (root / 'data' / 'orchestrator').mkdir(parents=True)
+    (root / 'data' / 'orchestrator' / 'runs.db').write_text('not a sqlite database')
+    bundle = mlt.collect_project(root, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert bundle['error'] is not None
+    assert str(mlt.resolve_runs_db(root)) in bundle['error']
+    assert bundle['sections'] == {}
+
+
+def test_collect_projects_keeps_reporting_when_one_root_fails(tmp_path, corpus_roots):
+    root_a, root_b = corpus_roots
+    missing = tmp_path / 'no_such_project'
+    bundles = mlt.collect_projects(
+        [missing, root_a, root_b], CORPUS_LO_DT, CORPUS_HI_DT
+    )
+    # Order is preserved and the failure does not abort the two good roots.
+    assert [b['project_root'] for b in bundles] == [
+        str(missing), str(root_a), str(root_b)
+    ]
+    assert bundles[0]['error'] is not None
+    assert bundles[1]['error'] is None and bundles[2]['error'] is None
+    assert bundles[1]['sections']['landings_per_day']['median'] == 2.0
+    assert bundles[2]['sections']['landings_per_day']['median'] == 1.5
+
+
+def test_collect_projects_flags_that_some_bundle_errored(tmp_path, corpus_roots):
+    root_a, _ = corpus_roots
+    good = mlt.collect_projects([root_a], CORPUS_LO_DT, CORPUS_HI_DT)
+    assert mlt.any_bundle_failed(good) is False
+    mixed = mlt.collect_projects(
+        [root_a, tmp_path / 'nope'], CORPUS_LO_DT, CORPUS_HI_DT
+    )
+    assert mlt.any_bundle_failed(mixed) is True
