@@ -143,7 +143,11 @@ class TestParseFirstPartyTreeContract:
         records = sfs.parse_first_party_tree(root)
         assert isinstance(records, tuple)
         with pytest.raises(AttributeError):
-            records[0].source = 'mutated'
+            # The write is rejected STATICALLY too (ParsedFile is a NamedTuple, so
+            # `source` is read-only) — that is the same contract this test pins at
+            # runtime, not a defect being papered over. Suppressed narrowly, by
+            # rule, so the assertion stays executable.
+            records[0].source = 'mutated'  # pyright: ignore[reportAttributeAccessIssue]
 
     def test_syntax_error_is_recorded_not_raised(self, tmp_path, isolated_parse_cache):
         """test_no_unparseable_files reports every bad file at once — so record, don't raise."""
