@@ -33,7 +33,8 @@ import json
 import math
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -328,4 +329,180 @@ def compute_landings_per_day(
         'max': max(counts),
         'n_days': len(counts),
         'partial_trailing_day': partial_trailing_day,
+    }
+
+
+def _series(values: Sequence[float]) -> dict[str, Any]:
+    """Summarise a duration series as p50/p90/min/max/n, all ``None`` if empty."""
+    return {
+        'p50': _percentile(values, 50),
+        'p90': _percentile(values, 90),
+        'min': min(values) if values else None,
+        'max': max(values) if values else None,
+        'n': len(values),
+    }
+
+
+def _by_task(events: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Index events by their ``task_id`` COLUMN, preserving row order.
+
+    The COLUMN is the only join key available: `merge_queued` / `merge_dequeued`
+    carry just ``{branch, queue_depth}``, with no ``request_id`` (that key
+    exists on `merge_finalized` alone), so a request-scoped join is impossible.
+    Rows with a NULL task_id (e.g. `merge_heartbeat`) are dropped.
+    """
+    index: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        task_id = event.get('task_id')
+        if task_id is None:
+            continue
+        index[str(task_id)].append(event)
+    return index
+
+
+def _last_before(
+    events: Sequence[dict[str, Any]], cutoff: datetime
+) -> tuple[datetime, dict[str, Any]] | None:
+    """The latest event strictly before *cutoff*, with its parsed timestamp."""
+    best: tuple[datetime, dict[str, Any]] | None = None
+    for event in events:
+        ts = _parse_ts(event.get('timestamp'))
+        if ts is None or ts >= cutoff:
+            continue
+        if best is None or ts > best[0]:
+            best = (ts, event)
+    return best
+
+
+def _first_at_or_after(
+    events: Sequence[dict[str, Any]], cutoff: datetime
+) -> tuple[datetime, dict[str, Any]] | None:
+    """The earliest event at or after *cutoff*, with its parsed timestamp."""
+    best: tuple[datetime, dict[str, Any]] | None = None
+    for event in events:
+        ts = _parse_ts(event.get('timestamp'))
+        if ts is None or ts < cutoff:
+            continue
+        if best is None or ts < best[0]:
+            best = (ts, event)
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Section: the four-segment lead-time split.
+# ---------------------------------------------------------------------------
+
+
+def compute_lead_time(
+    queued_events: Sequence[dict[str, Any]],
+    dequeued_events: Sequence[dict[str, Any]],
+    verify_events: Sequence[dict[str, Any]],
+    finalized_events: Sequence[dict[str, Any]],
+    lo: datetime,
+    hi: datetime,
+) -> dict[str, Any]:
+    """Split merge lead time into queue wait, verify, and a finalize+CAS residual.
+
+        merge_queued -> merge_dequeued -> sum(merge_verify) -> merge_finalized
+
+    THE JOIN (plan decision 2, validated live).  For each landing — a
+    `merge_finalized` row with ``data['state'] == 'done'`` — the lead-time
+    origin is the **last** `merge_queued` row for that task_id **strictly
+    before** the landing.  Not the first: a task re-enters the queue on
+    gate_retry, cas_retry and supersede (dark_factory saw 440 `merge_queued`
+    rows against 200 landings in one 14-day window), so a first-queued join
+    measures "time since this task first attempted to merge", which is a
+    different and much larger quantity — live it gave p50/p90 137.8/3114.8
+    minutes against the correct 50.1/171.3.  And strictly before, because a
+    task re-queued *after* it landed would otherwise yield a negative lead.
+
+    Neither `merge_queued` nor `merge_dequeued` carries an in-payload
+    timestamp, so every duration here is a difference of row ``timestamp``
+    columns.  Verify time is the sum of ``data['duration_ms']`` over the task's
+    in-window `merge_verify` rows — NOT the events table's ``duration_ms``
+    COLUMN, which `event_store.py` leaves NULL for this event type.
+
+    Segment availability differs per task, so each series carries its own ``n``:
+      lead      every matched landing
+      wait      landings with a `merge_dequeued` at or after the joined queue row
+      verify    landings with at least one in-window `merge_verify` row — a task
+                with none is EXCLUDED rather than contributing 0.0, which would
+                read as an instantaneous verify
+      residual  lead - wait - verify, over landings that have a wait (without
+                one the remainder is not attributable to finalize+CAS).  A
+                missing verify counts as 0 there, so a task whose verify rows
+                fell outside the window inflates its residual.
+
+    WINDOW EDGE.  A landing early in the window is often `unmatched` only
+    because its `merge_queued` row predates *lo*; that is a truncation
+    artefact, not evidence the task was never queued.  The resolved bounds are
+    returned so a caller can say so.
+
+    RE-MEASURED on this branch against the live dark_factory store over the
+    PRD's dated window 2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00
+    (n=199 matched landings, 1 unmatched at the window's leading edge):
+    lead p50/p90 = 49.9/172.0 min against the PRD's 50.0/171.7, and queue wait
+    p50/p90 = 0.0/110.7 against the PRD's "~0 / 110.4".  Residual p50/p90 =
+    1.8/19.6, verify p50/p90 = 41.3/70.3.
+
+    Returns ``{'lead', 'wait', 'verify', 'residual', 'matched', 'unmatched',
+    'unmatched_task_ids', 'window'}``; the four series are
+    :func:`_series` dicts.
+    """
+    queued_by_task = _by_task(queued_events)
+    dequeued_by_task = _by_task(dequeued_events)
+    verify_by_task = _by_task(verify_events)
+
+    lead: list[float] = []
+    wait: list[float] = []
+    verify: list[float] = []
+    residual: list[float] = []
+    matched = 0
+    unmatched_task_ids: list[str] = []
+
+    for event in finalized_events:
+        if event.get('data', {}).get('state') != 'done':
+            continue
+        task_id = event.get('task_id')
+        finalized_ts = _parse_ts(event.get('timestamp'))
+        if task_id is None or finalized_ts is None:
+            continue
+        task_id = str(task_id)
+
+        joined = _last_before(queued_by_task.get(task_id, []), finalized_ts)
+        if joined is None:
+            unmatched_task_ids.append(task_id)
+            continue
+        queued_ts, _ = joined
+        matched += 1
+
+        lead_min = (finalized_ts - queued_ts).total_seconds() / 60.0
+        lead.append(lead_min)
+
+        verify_min: float | None = None
+        verify_rows = [
+            e for e in verify_by_task.get(task_id, [])
+            if isinstance(e.get('data', {}).get('duration_ms'), (int, float))
+        ]
+        if verify_rows:
+            verify_min = sum(
+                float(e['data']['duration_ms']) for e in verify_rows
+            ) / 60_000.0
+            verify.append(verify_min)
+
+        dequeued = _first_at_or_after(dequeued_by_task.get(task_id, []), queued_ts)
+        if dequeued is not None:
+            wait_min = (dequeued[0] - queued_ts).total_seconds() / 60.0
+            wait.append(wait_min)
+            residual.append(lead_min - wait_min - (verify_min or 0.0))
+
+    return {
+        'lead': _series(lead),
+        'wait': _series(wait),
+        'verify': _series(verify),
+        'residual': _series(residual),
+        'matched': matched,
+        'unmatched': len(unmatched_task_ids),
+        'unmatched_task_ids': unmatched_task_ids,
+        'window': (_iso(lo), _iso(hi)),
     }
