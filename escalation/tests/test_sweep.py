@@ -9,7 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from _scan_race_helpers import pruning_read_text, relocating_read_text
+from _scan_race_helpers import (
+    pruning_read_text,
+    relocating_read_text,
+    unreadable_read_text,
+)
 
 from escalation import sweep
 from escalation.models import Escalation
@@ -344,6 +348,61 @@ class TestSweepSafety:
         # Arithmetic pinned against ground truth, not against a restatement
         # of the formula.
         assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+    def test_unreadable_file_is_counted_loud_and_does_not_abort_the_pass(
+        self, tmp_path: Path, caplog,
+    ):
+        """A present-but-unreadable file is counted and the pass continues.
+
+        This is a deliberate BEHAVIOUR CHANGE, so it is pinned: before the fix
+        a PermissionError propagated out of sweep() and — since the escalation
+        server wraps run_startup_sweep in a bare ``except Exception`` — took
+        the whole startup pass with it.  Now the record is skipped, counted,
+        and warned about.
+
+        It is the failure mode operators are most likely to actually hit (a
+        bad umask, a root-owned file, a full-disk EIO), and without a pin a
+        refactor that folds 'unreadable' back into an early return, or drops
+        the ``reason != 'ok'`` catch-all, silently reintroduces the abort.
+        """
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT)
+        doomed = _write_root_esc(
+            tmp_path, 'esc-9-1', 'resolved', resolved_at=self.RESOLVED_AT,
+        )
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', unreadable_read_text(doomed)),
+        ):
+            report = sweep.sweep(tmp_path, apply=True)
+
+        # The pass completed its real work despite the unreadable file.
+        assert report.archived == 1, f'expected the healthy record archived; got {report.archived}'
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+
+        # An I/O fault is a file left IN root for an operator to act on — the
+        # documented meaning of skipped_unparsable — and NOT a benign
+        # relocation, which is the one thing it must never be conflated with.
+        assert report.skipped_unparsable == 1, (
+            f'expected the unreadable file counted; got {report.skipped_unparsable}'
+        )
+        assert report.skipped_vanished == 0, (
+            f'an unreadable file did not vanish; got {report.skipped_vanished}'
+        )
+        assert doomed.exists(), 'an unreadable file must be left exactly where it was'
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+        # Loud, and on the I/O channel: an operator told 'Failed to parse'
+        # goes hunting for corrupt JSON instead of checking permissions.
+        loud = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(str(doomed) in r.getMessage() for r in loud), (
+            f'expected a WARNING naming {doomed}; got '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+        assert not any('Failed to parse' in r.getMessage() for r in loud), (
+            f'an I/O fault must not be reported as a parse failure; got '
+            f'{[r.getMessage() for r in loud]}'
+        )
 
     def test_missing_resolved_at_on_resolved_file_skipped(self, tmp_path: Path):
         """resolved file with resolved_at=None stays in root, counted as skipped."""
@@ -1636,3 +1695,72 @@ class TestSweepSurvivesRelocationInTheMoveWindow:
             f'expected the vanished root copy counted; got {report.skipped_vanished}'
         )
         assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
+
+class TestScanLogsNameTheScanThatHitTheFile:
+    """Every skip channel must say WHICH scan tripped over the file.
+
+    Before the shared helper, sweep()'s and reap_loose_archive_files()' parse
+    failures were distinguishable by their own wording ('skipping unparsable
+    %s' vs 'reap_loose: skipping unparsable %s') on the ``escalation.sweep``
+    logger.  Routing both through a helper that lives in queue.py moved them
+    onto the ``escalation.queue`` logger with one shared message, so the
+    ``context`` prefix is now the ONLY thing that tells an operator which of
+    the two passes hit the file — and a logger-name filter no longer helps.
+    That makes it a contract, not a nicety.
+    """
+
+    RESOLVED_AT = '2026-05-20T10:00:00+00:00'
+
+    def _messages(self, caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_root_sweep_parse_failure_names_the_root_sweep(self, tmp_path: Path, caplog):
+        (tmp_path / 'esc-99-1.json').write_text('{not valid json')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            sweep.sweep(tmp_path, apply=True)
+
+        msgs = self._messages(caplog)
+        assert any(m.startswith('sweep:') and 'Failed to parse' in m for m in msgs), (
+            f"expected a parse warning attributed to 'sweep'; got {msgs}"
+        )
+
+    def test_loose_reap_parse_failure_names_the_reap(self, tmp_path: Path, caplog):
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        (archive_root / 'esc-99-1.json').write_text('{not valid json')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        msgs = self._messages(caplog)
+        assert any(m.startswith('reap_loose:') and 'Failed to parse' in m for m in msgs), (
+            f"expected a parse warning attributed to 'reap_loose'; got {msgs}"
+        )
+
+    def test_archive_copy_parse_failure_is_distinguishable_from_the_root_read(
+        self, tmp_path: Path, caplog,
+    ):
+        """The reconciliation branch reads a SECOND file for the same record.
+
+        Both reads are of ``esc-1-1``, so without distinct contexts an operator
+        cannot tell whether the root copy or the archive copy is the corrupt
+        one — and they would go looking in the wrong tier.
+        """
+        archive_copy = _write_archive_esc(
+            tmp_path, 'esc-1-1', self.RESOLVED_AT, 'resolved', resolved_by=None,
+        )
+        archive_copy.write_text('{not valid json')
+        _write_root_esc(
+            tmp_path, 'esc-1-1', 'resolved',
+            resolved_at=self.RESOLVED_AT, resolved_by='steward',
+        )
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            sweep.sweep(tmp_path, apply=True)
+
+        msgs = self._messages(caplog)
+        assert any(
+            m.startswith('sweep.archive_copy:') and str(archive_copy) in m for m in msgs
+        ), f"expected the warning to name the ARCHIVE copy's read; got {msgs}"
