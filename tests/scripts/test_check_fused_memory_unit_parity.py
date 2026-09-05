@@ -497,6 +497,206 @@ def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytes
 
 
 # ---------------------------------------------------------------------------
+# The DROP-IN layer  (step-1 / step-2)
+# ---------------------------------------------------------------------------
+#
+# `systemctl --user edit` never modifies the unit file; it writes
+# `<unit>.d/override.conf` beside it, and systemd merges that OVER the unit at
+# load time. So this checker's whole-line membership test can find every
+# required directive present while the EFFECTIVE configuration is not the one
+# it just certified.
+#
+# This is the LAST drop-in-blind member of the check_*_unit_parity.py family:
+# the dashboard, orchestrator and lms checkers all consult
+# systemd_unit_parity.find_dropins already. Structural difference handled here:
+# this checker takes `--installed <FILE>`, not `--installed-dir`, so the
+# drop-in directory is derived from the file path as
+# `installed.parent / f"{installed.name}.d"`.
+#
+# Nothing below touches ~/.config/systemd/user: every unit is written into a
+# bare tmp_path and the drop-ins are planted beside it.
+
+# A drop-in redeclaring ONE directive. Deliberately a directive the checker
+# also requires (WatchdogSec), at a DIFFERENT value: that is the shape in
+# which the unit file passes every check while the running service does not
+# have the value the check certified.
+_FM_DROPIN = "[Service]\nWatchdogSec=600\n"
+
+
+def _plant_fm_dropin(
+    installed: pathlib.Path, name: str, text: str
+) -> pathlib.Path:
+    """Write a drop-in under ``<installed>.d/``, beside the installed unit.
+
+    Modelled on tests/scripts/test_check_lms_unit_parity.py::_plant_dropin, but
+    keyed off the ``--installed`` FILE path rather than an installed-DIR,
+    because that is this checker's CLI shape. The directory name systemd looks
+    for is the unit's FILE NAME plus ``.d``, so it is built from
+    ``installed.name`` and not from a hardcoded unit name — which keeps the
+    helper usable with the suite's ``_write_unit(..., name=...)`` variants.
+    """
+    dropin_dir = installed.parent / f"{installed.name}.d"
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    dropin = dropin_dir / name
+    dropin.write_text(text, encoding="utf-8")
+    return dropin
+
+
+def test_a_dropin_over_a_clean_unit_is_not_parity(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """A unit at full directive parity plus a drop-in must NOT report parity.
+
+    This is the behavioural claim the workstream rests on. The unit FILE is at
+    parity — find_drift has genuinely nothing to say — while the EFFECTIVE
+    configuration is not, because systemd merges the drop-in over it at load
+    time. Reporting `[ok] ... parity` here would be a green claim covering
+    exactly the configuration that is not running.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    dropin = _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+
+    # Precondition: the file layer genuinely has nothing to report, so the
+    # exit 1 below can only be coming from the drop-in.
+    assert mod.find_drift(_CLEAN_UNIT) == []
+
+    rc = mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 1, out
+    assert "[override]" in out
+    assert str(dropin) in out
+    assert "[ok]" not in out
+    assert "parity" not in out
+
+
+def test_every_applying_fm_dropin_is_named_by_path(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """EVERY applying drop-in is named by path — not a count, not just the first.
+
+    systemd merges all of them, so a report naming one leaves the operator
+    fixing half the problem and re-running into the same red.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    first = _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+    second = _plant_fm_dropin(
+        installed, "20-limits.conf", "[Service]\nTimeoutStartSec=60\n"
+    )
+
+    rc = mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 1, out
+    assert str(first) in out
+    assert str(second) in out
+
+
+def test_fm_dropin_report_is_worded_apart_from_drift(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """The [override] block is not phrased as a directive diff.
+
+    Mirrors tests/scripts/test_check_lms_unit_parity.py::
+    test_dropin_report_is_worded_apart_from_drift, for the same reason: the
+    required directives all MATCHED, so an operator sent hunting for a
+    directive diff that does not exist wastes the trip. The block must say what
+    was actually not established — the EFFECTIVE configuration — and must name
+    how to inspect the merged result.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+
+    mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    override_lines = [line for line in out.splitlines() if "[override]" in line]
+    assert override_lines, out
+
+    override_text = "\n".join(override_lines)
+    assert "EFFECTIVE" in override_text
+    assert "systemctl --user cat" in override_text
+    # The required directives DID all match, so nothing may be reported as a
+    # missing-directive difference.
+    assert "[drift]" not in out
+
+
+def test_fm_override_report_carries_the_log_tag_on_every_physical_line(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """The multi-line [override] block leaves no untagged physical line.
+
+    The LOG_TAG contract below is load-bearing for setup-host.sh's gate, which
+    reads tag ABSENCE as "the checker did not run". A multi-line override block
+    naming one path per line is exactly the shape that breaks a logger which
+    prefixes once per call, so the contract is re-asserted on THIS path rather
+    than assumed to carry over from the drift path.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+    _plant_fm_dropin(installed, "20-limits.conf", "[Service]\nTimeoutStartSec=60\n")
+
+    rc = mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    assert rc == 1, f"{captured.out}\n{captured.err}"
+    assert captured.out.strip(), "The checker must report something."
+    for line in (captured.out + captured.err).splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith(f"[{mod.LOG_TAG}]"), f"Untagged output line: {line!r}"
+
+
+def test_fm_checker_reuses_the_shared_find_dropins():
+    """The checker uses the SHARED find_dropins, not a fourth pasted copy.
+
+    Structural anti-fork guard, in the style the three existing lifts are
+    already pinned by (see tests/scripts/test_check_orchestrator_unit_parity.py,
+    which asserts the same identity for the checker and the dashboard). An
+    identity assertion, not an equality one: a pasted copy would satisfy every
+    behavioural test above while reproducing — inside the tooling built to
+    report silent duplication — exactly the duplication it exists to report.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    mod = _load_checker()
+
+    assert mod.find_dropins is systemd_unit_parity.find_dropins
+
+
+def test_a_non_conf_file_in_the_dropin_dir_is_not_an_override(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """A stray non-``.conf`` file in the ``.d/`` dir is not an override.
+
+    systemd only merges ``*.conf`` there, so counting an ``override.conf.bak``
+    would report an override that has no effect at all — and an operator sent
+    to remove a file systemd never read learns to distrust the report. Pins
+    that the shared find_dropins' ``.conf``-only rule is what is in force here,
+    rather than a bare "the directory exists" test.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    _plant_fm_dropin(installed, "override.conf.bak", _FM_DROPIN)
+
+    rc = mod.main(["--installed", str(installed)])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 0, out
+    assert "[ok]" in out
+    assert "parity" in out
+    assert "[override]" not in out
+
+
+# ---------------------------------------------------------------------------
 # LOG_TAG contract  (task 3909)
 # ---------------------------------------------------------------------------
 #
