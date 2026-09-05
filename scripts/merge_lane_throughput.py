@@ -419,9 +419,28 @@ def compute_lead_time(
 
     Neither `merge_queued` nor `merge_dequeued` carries an in-payload
     timestamp, so every duration here is a difference of row ``timestamp``
-    columns.  Verify time is the sum of ``data['duration_ms']`` over the task's
-    in-window `merge_verify` rows — NOT the events table's ``duration_ms``
-    COLUMN, which `event_store.py` leaves NULL for this event type.
+    columns.  Verify time is the sum of ``data['duration_ms']`` — read via
+    :func:`_duration_minutes`, NOT the events table's ``duration_ms`` COLUMN,
+    which `event_store.py` leaves NULL for this event type — over the task's
+    `merge_verify` rows in ``[queued_ts, finalized_ts)``.
+
+    THE VERIFY SUM IS SCOPED TO THE JOINED ATTEMPT, for the same reason the
+    lead join is.  A task that re-queued has `merge_verify` rows from its
+    earlier, superseded attempts still in the window under the same task_id;
+    summing every one of them charges this attempt for work it did not do, and
+    the residual then goes negative — a task queued 00:00, verified 50 min,
+    re-queued 02:00, verified 5 min and landed 02:20 gives lead 20.0, wait
+    2.0, verify 55.0 and a meaningless residual of -37.0.  Restricting the sum
+    to the joined attempt's span is what makes ``lead = wait + verify +
+    residual`` an actual decomposition.  This is not a hypothetical: over the
+    dated window below, the unscoped sum gave a NEGATIVE residual on 20 of 199
+    landings (worst -124.3 min) and inflated verify p90 from 52.5 to 70.3;
+    scoped, 0 of 199 are negative and the residual's own minimum is +0.08.  A
+    residual could still go negative if a single verify's duration reached
+    back before its own queue row (the event is emitted at completion, so a
+    long verify straddling the join is timestamped in-span), so
+    ``n_negative_residual`` counts them rather than letting them hide inside a
+    percentile.
 
     Segment availability differs per task, so each series carries its own ``n``:
       lead      every matched landing
@@ -443,12 +462,15 @@ def compute_lead_time(
     PRD's dated window 2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00
     (n=199 matched landings, 1 unmatched at the window's leading edge):
     lead p50/p90 = 49.9/172.0 min against the PRD's 50.0/171.7, and queue wait
-    p50/p90 = 0.0/110.7 against the PRD's "~0 / 110.4".  Residual p50/p90 =
-    1.8/19.6, verify p50/p90 = 41.3/70.3.
+    p50/p90 = 0.0/110.7 against the PRD's "~0 / 110.4".  Verify p50/p90 =
+    40.7/52.5 and residual p50/p90 = 2.0/24.6, with no negative residual.
+    Neither the lead nor the wait figure moved when the verify sum was scoped
+    — those two are joins, not sums — so the PRD rows this reproduces are
+    unaffected by that correction.
 
     Returns ``{'lead', 'wait', 'verify', 'residual', 'matched', 'unmatched',
-    'unmatched_task_ids', 'window'}``; the four series are
-    :func:`_series` dicts.
+    'unmatched_task_ids', 'n_negative_residual', 'window'}``; the four series
+    are :func:`_series` dicts.
     """
     queued_by_task = _by_task(queued_events)
     dequeued_by_task = _by_task(dequeued_events)
@@ -480,15 +502,24 @@ def compute_lead_time(
         lead_min = (finalized_ts - queued_ts).total_seconds() / 60.0
         lead.append(lead_min)
 
+        # Scoped to THIS attempt, exactly as the lead join is.  A task that
+        # re-queues has `merge_verify` rows from its earlier, superseded
+        # attempts still sitting in the window under the same task_id; summing
+        # all of them charges the current attempt for work it did not do and
+        # can drive the residual negative, which is meaningless as a
+        # "finalize+CAS" figure.  So only rows in [queued_ts, finalized_ts) —
+        # the span the lead was measured over — count.
         verify_min: float | None = None
-        verify_rows = [
-            e for e in verify_by_task.get(task_id, [])
-            if isinstance(e.get('data', {}).get('duration_ms'), (int, float))
-        ]
-        if verify_rows:
-            verify_min = sum(
-                float(e['data']['duration_ms']) for e in verify_rows
-            ) / 60_000.0
+        attempt_minutes: list[float] = []
+        for row in verify_by_task.get(task_id, []):
+            row_ts = _parse_ts(row.get('timestamp'))
+            if row_ts is None or row_ts < queued_ts or row_ts >= finalized_ts:
+                continue
+            minutes = _duration_minutes(row.get('data', {}))
+            if minutes is not None:
+                attempt_minutes.append(minutes)
+        if attempt_minutes:
+            verify_min = sum(attempt_minutes)
             verify.append(verify_min)
 
         dequeued = _first_at_or_after(dequeued_by_task.get(task_id, []), queued_ts)
@@ -505,6 +536,9 @@ def compute_lead_time(
         'matched': matched,
         'unmatched': len(unmatched_task_ids),
         'unmatched_task_ids': unmatched_task_ids,
+        # Surfaced, not swallowed: a negative residual means the three
+        # segments did not decompose the lead for that landing.
+        'n_negative_residual': sum(1 for value in residual if value < 0),
         'window': (_iso(lo), _iso(hi)),
     }
 
@@ -642,7 +676,10 @@ def compute_occupancy(
 
     'parked' and None count as not-busy, but every observed state is reported
     in ``slot_states`` so a quarantine ('parked') never disappears into a bland
-    "not busy".
+    "not busy".  By the same rule, a host that ran verifies but appears in no
+    heartbeat sample still gets a row — ``n_samples: 0`` and both sample-based
+    estimators ``None`` — rather than being dropped along with the
+    verify-duration evidence we actually have for it.
 
     Returns ``{'hosts': {name: {...}}, 'n_heartbeats': int,
     'window_span_minutes': float}``.
@@ -698,6 +735,31 @@ def compute_occupancy(
             ),
             'verify_minutes': host_verify,
             'slot_states': dict(Counter(state for _, state in ordered)),
+        }
+
+    # A host can run verifies in the window and never appear in a heartbeat's
+    # `hosts` list — a remote dropped from the allocator's roster mid-window,
+    # or a window whose heartbeats all predate the host's registration.
+    # Dropping it would discard the one estimator we DO have for it, which is
+    # the same silent-loss failure the `slot_states` tally exists to avoid, so
+    # it gets a row with the sample-based estimators explicitly None (never
+    # 0.0 — nobody observed it idle) and its real verify-duration figure.
+    for name in sorted(verify_minutes):
+        if name in hosts_out:
+            continue
+        host_verify = verify_minutes[name]
+        hosts_out[name] = {
+            'locf_busy_fraction': None,
+            'observed_span_minutes': None,
+            'raw_sample_fraction': None,
+            'n_samples': 0,
+            'n_busy_samples': 0,
+            'verify_duration_fraction': (
+                host_verify / window_span_minutes
+                if window_span_minutes > 0 else None
+            ),
+            'verify_minutes': host_verify,
+            'slot_states': {},
         }
 
     return {
@@ -1031,10 +1093,28 @@ def resolve_project_roots(values: Sequence[str] | None) -> list[Path]:
     than via ``default=[...]`` — an argparse list default is shared mutable
     state that ``append`` extends rather than replaces, which would silently
     add this checkout to every explicit invocation.
+
+    EVERY ROOT IS ``.resolve()``d, matching :data:`DEFAULT_PROJECT_ROOT`.  The
+    root is not just an input path here, it is the project LABEL — the only
+    per-project key the events table gives us (see :func:`collect_project`) —
+    so an unnormalised one labels a bundle ``'.'`` and, worse, makes the same
+    project reachable under two spellings.  The list is then de-duplicated
+    order-preservingly, because :func:`main` keys its ``--json`` payload by
+    that label: two spellings of one root would collapse to a single JSON
+    entry while the text report printed the block twice, and the two
+    renderings would then disagree about how many projects were read.
     """
     if not values:
         return [DEFAULT_PROJECT_ROOT]
-    return [Path(value) for value in values]
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for value in values:
+        root = Path(value).resolve()
+        if root in seen:
+            continue
+        seen.add(root)
+        roots.append(root)
+    return roots
 
 
 def collect_project(
@@ -1314,6 +1394,13 @@ def _format_lead_time(
             f"  {_num(series['min']):>7}  {_num(series['max']):>7}"
             f"  {series['n']:>5}"
         )
+    if section['n_negative_residual']:
+        lines.append(
+            f"  WARNING {section['n_negative_residual']} landing(s) have a "
+            'NEGATIVE finalize+CAS residual — the three segments did not '
+            'decompose the lead for those, so the residual row is not '
+            'finalize+CAS time'
+        )
     return lines
 
 
@@ -1364,10 +1451,16 @@ def _format_occupancy(
             f"  raw-sample {_pct(host['raw_sample_fraction']):>7}"
             f"  verify-duration {_pct(host['verify_duration_fraction']):>7}"
         )
-        lines.append(
+        detail = (
             f"      {host['n_samples']} sample(s), {host['n_busy_samples']} busy;"
             f" slot states {host['slot_states']}"
         )
+        if host['n_samples'] == 0:
+            detail += (
+                ' — ran verifies but appeared in no heartbeat, so only the '
+                'verify-duration estimator exists for it'
+            )
+        lines.append(detail)
     return lines
 
 

@@ -235,7 +235,7 @@ writes nothing, files nothing, escalates nothing and emits no events, so
 it is safe to run against a live store while the orchestrator is
 merging.
 
-**Three caveats, all of which change how you read the output.**
+**Four caveats, all of which change how you read the output.**
 *(a) Match the window to the row you are reading.* The
 `plans/merge-lane-throughput-prd.md` § Background table is not
 single-windowed: most rows are a 14-day window, but four are explicitly
@@ -255,7 +255,18 @@ is itself the finding. *(c) The script asserts no numeric target.* It
 reproduces a dated baseline and prints what it measures — it does not
 check the numbers against the PRD's, and no test asserts a live-store
 number. Do not "fix" it until a 30d run matches a 14d row; that would
-corrupt the baseline the PRD's decompositions inherit.
+corrupt the baseline the PRD's decompositions inherit. *(d) `n/a` is not
+zero.* Every unmeasured figure prints as `n/a` and never as `0.0` —
+"the laptop ran no verify this window" and "the laptop's verifies took
+0.0 minutes" are different findings, and reading the first as the second
+is the most consequential misreading this report can produce. A real
+measured zero (four complete day buckets in which nothing landed) does
+print as `0.0`. Two lines exist to keep that honest: a host that ran
+verifies but appeared in no heartbeat is still listed, with `0 sample(s)`
+and both sample-based estimators `n/a`, rather than dropped; and if the
+lead-time split fails to decompose for some landing, a `WARNING …
+NEGATIVE finalize+CAS residual` line names the count instead of letting
+it average away inside the residual percentile.
 
 ### Stopping gracefully
 

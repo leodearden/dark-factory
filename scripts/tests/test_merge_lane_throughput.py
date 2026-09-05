@@ -866,6 +866,89 @@ def test_lead_time_wait_needs_a_dequeue_after_the_joined_queue():
 
 
 # ---------------------------------------------------------------------------
+# THE VERIFY SUM IS SCOPED TO THE JOINED ATTEMPT.
+#
+# The lead join takes the LAST merge_queued strictly before the landing, so the
+# verify sum has to be scoped the same way: a re-queued task's earlier,
+# superseded merge_verify rows are still in the window under the same task_id,
+# and summing all of them charges this attempt for work it did not do.
+#
+# SCOPING FIXTURE, hand-computed (task R1, day 11):
+#   00:00  merge_queued          <- the SUPERSEDED attempt's queue row
+#   01:00  merge_verify  50 min  <- belongs to that superseded attempt
+#   02:00  merge_queued          <- the JOINED queue row
+#   02:05  merge_dequeued
+#   02:15  merge_verify   5 min  <- the only row inside [02:00, 02:20)
+#   02:16  merge_verify  True    <- duration_ms is a BOOL: not a duration
+#   02:20  merge_finalized done
+# scoped:   lead 20.0, wait 5.0, verify  5.0, residual  10.0
+# unscoped: lead 20.0, wait 5.0, verify 55.0, residual -40.0  (meaningless)
+# ---------------------------------------------------------------------------
+
+
+def _scoping_fixture():
+    queued = [_q('R1', 0, 0), _q('R1', 2, 0)]
+    dequeued = [_q('R1', 2, 5)]
+    verify = [
+        _v('R1', 1, 0, 3_000_000),    # 50 min, before the joined queue row
+        _v('R1', 2, 15, 300_000),     # 5 min, inside the joined attempt
+        _v('R1', 2, 16, True),        # bool duration_ms — never a duration
+    ]
+    finalized = [_f('R1', 2, 20)]
+    return queued, dequeued, verify, finalized
+
+
+def _scoping_result():
+    q, d, v, f = _scoping_fixture()
+    return mlt.compute_lead_time(q, d, v, f, CORPUS_LO_DT, CORPUS_HI_DT)
+
+
+def test_lead_time_verify_excludes_rows_from_a_superseded_attempt():
+    result = _scoping_result()
+    assert result['lead']['p50'] == 20.0
+    assert result['wait']['p50'] == 5.0
+    # 5.0, not 55.0: the 01:00 row belongs to the attempt that was superseded
+    # when the task re-queued at 02:00.
+    assert result['verify']['n'] == 1
+    assert result['verify']['p50'] == 5.0
+
+
+def test_lead_time_residual_is_never_negative_once_verify_is_scoped():
+    result = _scoping_result()
+    # REGRESSION PIN: summing every in-window verify row for the task gives
+    # 55.0 and a residual of -40.0, which is meaningless as finalize+CAS time.
+    assert result['residual']['p50'] == 10.0
+    assert result['residual']['min'] >= 0
+    assert result['n_negative_residual'] == 0
+
+
+def test_lead_time_verify_ignores_a_bool_duration_ms():
+    result = _scoping_result()
+    # `_duration_minutes` rejects a bool; the old inline filter accepted it via
+    # isinstance(True, int) and added 1 ms (1.667e-05 min) to the sum. An exact
+    # 5.0 pins that the two code paths agree on what a usable duration is.
+    assert result['verify']['p50'] == 5.0
+    assert mlt._duration_minutes({'duration_ms': True}) is None
+
+
+def test_lead_time_counts_a_negative_residual_rather_than_hiding_it():
+    # A single verify whose duration reaches back before its own queue row is
+    # emitted at completion, so it lands in-span and scoping cannot exclude
+    # it. That is reported, not swallowed inside a percentile.
+    q = [_q('N1', 1, 0)]
+    d = [_q('N1', 1, 1)]
+    v = [_v('N1', 1, 5, 3_000_000)]    # 50 min of verify inside a 10-min lead
+    f = [_f('N1', 1, 10)]
+    result = mlt.compute_lead_time(q, d, v, f, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert result['residual']['min'] < 0
+    assert result['n_negative_residual'] == 1
+
+
+def test_lead_time_reports_no_negative_residuals_on_the_main_fixture():
+    assert _lead_result()['n_negative_residual'] == 0
+
+
+# ---------------------------------------------------------------------------
 # compute_verify_by_runner
 #
 # RUNNER FIXTURE, hand-computed:
@@ -1131,6 +1214,43 @@ def test_occupancy_verify_fraction_is_none_when_a_host_ran_no_verify():
 def test_occupancy_stamps_the_window_span_it_divided_by():
     result = _occ_result()
     assert result['window_span_minutes'] == pytest.approx(600.0)
+
+
+def test_occupancy_keeps_a_host_that_verified_but_never_appeared_in_a_heartbeat():
+    # A remote dropped from the allocator's roster mid-window, or one whose
+    # registration postdates every heartbeat in the window: 'ghost' ran a
+    # 60-minute verify and is in nobody's `hosts` list. Dropping it would
+    # discard the one estimator we DO have for it.
+    hb, v = _occ_fixture()
+    v = [*v, _v('v4', 7, 0, 3_600_000, runner='ghost')]
+    hosts = mlt.compute_occupancy(hb, v, OCC_LO, OCC_HI)['hosts']
+    assert 'ghost' in hosts
+    ghost = hosts['ghost']
+    assert ghost['verify_minutes'] == pytest.approx(60.0)
+    assert ghost['verify_duration_fraction'] == pytest.approx(60.0 / 600.0)
+    # Unobserved is not idle: the two sample-based estimators are None, never
+    # 0.0, and the sample tally says plainly that there were none.
+    assert ghost['locf_busy_fraction'] is None
+    assert ghost['raw_sample_fraction'] is None
+    assert ghost['observed_span_minutes'] is None
+    assert ghost['n_samples'] == 0
+    assert ghost['slot_states'] == {}
+    # The heartbeat-observed hosts are unaffected.
+    assert set(hosts) == {'laptop', 'local', 'idle', 'ghost'}
+
+
+def test_occupancy_renders_a_verify_only_host_as_unobserved_not_idle():
+    hb, v = _occ_fixture()
+    v = [*v, _v('v4', 7, 0, 3_600_000, runner='ghost')]
+    section = mlt.compute_occupancy(hb, v, OCC_LO, OCC_HI)
+    rendered = '\n'.join(mlt._format_occupancy(section, (CORPUS_LO, CORPUS_HI)))
+    ghost_line = next(
+        ln for ln in rendered.splitlines() if ln.strip().startswith('ghost')
+    )
+    assert 'LOCF     n/a' in ghost_line
+    assert 'raw-sample     n/a' in ghost_line
+    assert '10.0%' in ghost_line          # the real verify-duration estimator
+    assert '0 sample(s)' in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -1460,7 +1580,42 @@ def test_project_root_flag_is_repeatable(corpus_roots):
         ['--project-root', str(root_a), '--project-root', str(root_b)]
     )
     assert args.project_root == [str(root_a), str(root_b)]
-    assert mlt.resolve_project_roots(args.project_root) == [root_a, root_b]
+    assert mlt.resolve_project_roots(args.project_root) == [
+        root_a.resolve(), root_b.resolve()
+    ]
+
+
+def test_resolve_project_roots_normalises_every_root():
+    # The root is the project LABEL, not just an input path, so '.' and a
+    # trailing '/..' must not produce two different labels for one project.
+    roots = mlt.resolve_project_roots([
+        str(mlt.DEFAULT_PROJECT_ROOT / 'scripts' / '..'),
+    ])
+    assert roots == [mlt.DEFAULT_PROJECT_ROOT]
+    assert roots[0].is_absolute()
+
+
+def test_resolve_project_roots_deduplicates_order_preservingly(corpus_roots):
+    root_a, root_b = corpus_roots
+    # Same project spelled two ways. Without de-duplication main's --json
+    # payload (keyed by the label) would collapse them while the text report
+    # printed the block twice, so the two renderings would disagree about how
+    # many projects were read.
+    roots = mlt.resolve_project_roots([
+        str(root_b), str(root_a), str(root_a / 'data' / '..'), str(root_b),
+    ])
+    assert roots == [root_b.resolve(), root_a.resolve()]
+
+
+def test_main_reports_a_repeated_root_once_in_both_renderings(capsys, corpus_roots):
+    root_a, _ = corpus_roots
+    argv = ['--project-root', str(root_a),
+            '--project-root', str(root_a / 'data' / '..'),
+            '--window', CORPUS_WINDOW]
+    _, text, _ = _run(capsys, *argv)
+    _, raw, _ = _run(capsys, *argv, '--json')
+    assert text.count('=== project: ') == 1
+    assert len(json.loads(raw)['projects']) == 1
 
 
 def test_project_root_defaults_to_this_checkout_when_not_given():
@@ -1619,6 +1774,93 @@ def test_collect_projects_flags_that_some_bundle_errored(tmp_path, corpus_roots)
 
 
 # ---------------------------------------------------------------------------
+# The None -> 'n/a' rendering contract.
+#
+# The compute layer is careful to return None rather than 0.0 for an empty
+# series, because "the laptop ran no verify this window" and "the laptop's
+# verifies took 0.0 minutes" are different findings. That care is worth
+# nothing if the four functions that translate None into TEXT get it wrong,
+# so they are pinned directly: a regression that prints 0.0 for an unmeasured
+# series would otherwise ship green (the compute-layer assertions all pass
+# with _num/_count/_pct/_rate rewritten to render None as zero).
+#
+# The converse is pinned too: a REAL zero must still print as a zero. An
+# empty window with complete day buckets genuinely landed nothing, and
+# `median 0.0` is the right rendering of that.
+# ---------------------------------------------------------------------------
+
+_NA_WINDOW = (CORPUS_LO, CORPUS_HI)
+
+
+@pytest.mark.parametrize(
+    'render', [mlt._num, mlt._count, mlt._pct, mlt._rate],
+    ids=['_num', '_count', '_pct', '_rate'],
+)
+def test_every_renderer_turns_none_into_n_a_never_a_zero(render):
+    assert render(None) == 'n/a'
+
+
+def test_the_renderers_still_format_a_real_value():
+    assert mlt._num(12.34) == '12.3'
+    assert mlt._num(12.34, 3) == '12.340'
+    assert mlt._num(0.0) == '0.0'
+    assert mlt._count(27) == '27'
+    assert mlt._count(0) == '0'
+    assert mlt._pct(0.222) == '22.2%'
+    assert mlt._rate(0.3) == '0.300'
+
+
+def test_lead_time_renders_an_empty_series_as_n_a_never_zero():
+    section = mlt.compute_lead_time([], [], [], [], CORPUS_LO_DT, CORPUS_HI_DT)
+    body = '\n'.join(mlt._format_lead_time(section, _NA_WINDOW))
+    # Four segments x p50/p90/min/max, every one unmeasured.
+    assert body.count('n/a') == 16
+    assert '0.0' not in body
+
+
+def test_queue_depth_renders_an_empty_series_as_n_a_never_zero():
+    body = '\n'.join(mlt._format_queue_depth(mlt.compute_queue_depth([]), _NA_WINDOW))
+    assert body.count('n/a') == 4
+    assert '0.0' not in body
+
+
+def test_verify_by_runner_renders_a_runner_with_no_duration_as_n_a():
+    # The scenario the contract exists for: the host appears, so it is not
+    # omitted, but nothing it did in this window is timed.
+    section = mlt.compute_verify_by_runner(
+        [_v('t1', 1, 0, None, runner='laptop')]
+    )
+    body = '\n'.join(mlt._format_verify_by_runner(section, _NA_WINDOW))
+    assert 'p50     n/a' in body
+    assert 'p90     n/a' in body
+    assert '0.0' not in body
+
+
+def test_format_report_renders_a_real_zero_as_a_zero_not_as_n_a():
+    # A window with four complete, empty day buckets DID measure something:
+    # nothing landed. That is 0.0, and rendering it as n/a would be the
+    # mirror-image error.
+    bundle = {
+        'project_root': '/nowhere',
+        'runs_db': '/nowhere/data/orchestrator/runs.db',
+        'window': _NA_WINDOW,
+        'error': None,
+        'sections': {
+            'landings_per_day': mlt.compute_landings_per_day(
+                [], CORPUS_LO_DT, CORPUS_HI_DT
+            ),
+            'lead_time': mlt.compute_lead_time(
+                [], [], [], [], CORPUS_LO_DT, CORPUS_HI_DT
+            ),
+            'queue_depth': mlt.compute_queue_depth([]),
+        },
+    }
+    out = mlt.format_report([bundle])
+    assert 'median 0.0' in out          # measured: four empty day buckets
+    assert 'n/a' in out                 # unmeasured: no landing to time
+
+
+# ---------------------------------------------------------------------------
 # End-to-end CLI — main(argv) over the two fixture roots.
 #
 # ALWAYS-ON vs FLAGGED. The always-on sections are landings/day, the lead-time
@@ -1664,16 +1906,40 @@ def test_main_returns_zero_and_prints_every_always_on_section(capsys, corpus_roo
         assert mlt.SECTION_TITLES[key] in out
 
 
+def _project_blocks(out: str) -> dict[str, str]:
+    """Split the text report into its per-project blocks, keyed by root.
+
+    Substring checks over the WHOLE report cannot test the never-pooled
+    property: the document carries dozens of formatted floats, so an absence
+    assertion breaks on any unrelated percentile that happens to collide and
+    passes for a pooling bug that happens to produce some other number. The
+    property is "each project's own block carries that project's own number",
+    which needs the blocks separated first.
+    """
+    blocks: dict[str, str] = {}
+    current: str | None = None
+    for line in out.splitlines():
+        if line.startswith('=== project: ') and line.endswith(' ==='):
+            current = line[len('=== project: '):-len(' ===')]
+            blocks[current] = ''
+        elif current is not None:
+            blocks[current] += line + '\n'
+    return blocks
+
+
 def test_main_labels_each_project_and_never_merges_them(capsys, corpus_roots):
     root_a, root_b = corpus_roots
     _, out, _ = _run(capsys, *_both(corpus_roots))
-    assert str(root_a) in out
-    assert str(root_b) in out
-    # Root A's landings median is 2.0 and root B's is 1.5; a merged tally would
-    # print one median of 3.5 and neither of these.
-    assert 'median 2.0' in out
-    assert 'median 1.5' in out
-    assert '3.5' not in out
+    blocks = _project_blocks(out)
+    # Exactly two blocks, one per root, each labelled with the root it read.
+    assert set(blocks) == {str(root_a.resolve()), str(root_b.resolve())}
+    # Root A's landings median is 2.0 and root B's is 1.5 — each printed in its
+    # OWN block. A pooled tally would put one median in both (3.5 for these
+    # fixtures, but the point is the per-block value, not that one number).
+    assert 'median 2.0' in blocks[str(root_a.resolve())]
+    assert 'median 1.5' in blocks[str(root_b.resolve())]
+    assert 'median 1.5' not in blocks[str(root_a.resolve())]
+    assert 'median 2.0' not in blocks[str(root_b.resolve())]
 
 
 def test_main_chains_and_speculation_are_off_by_default(capsys, corpus_roots):
@@ -1695,14 +1961,14 @@ def test_main_speculation_flag_adds_the_section_and_the_by_project_spread(
     _, out, _ = _run(capsys, *_both(corpus_roots), '--speculation')
     assert mlt.SECTION_TITLES['speculation'] in out
     assert mlt.SECTION_TITLES['chains'] not in out
-    # Root A 3/10 = 0.300, root B 7/12 = 0.583 — printed per project, in one
-    # invocation, never pooled into 10/22 = 0.455.
-    assert '0.300' in out
-    assert '0.583' in out
-    assert '0.455' not in out
-    # And the cross-project block names both roots.
+    # Root A 3/10 = 0.300, root B 7/12 = 0.583 — each on its OWN line, in one
+    # invocation. A pooled rate would be a single 10/22 line instead; asserting
+    # the numerator/denominator pair pins that per-project shape, where a bare
+    # '0.455' not in out would pass for any other pooled value.
     tail = out[out.index(mlt.VOID_RATE_BY_PROJECT_TITLE):]
-    assert str(root_a) in tail and str(root_b) in tail
+    assert f'{root_a.resolve()}: 3/10 = 0.300' in tail
+    assert f'{root_b.resolve()}: 7/12 = 0.583' in tail
+    assert '10/22' not in tail
 
 
 def test_main_every_section_header_carries_the_resolved_window(capsys, corpus_roots):
