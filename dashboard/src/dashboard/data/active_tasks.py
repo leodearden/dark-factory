@@ -63,12 +63,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 import httpx
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
+from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
 from dashboard.data.task_runtime import fetch_task_runtime
@@ -231,7 +232,14 @@ def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int | Non
     ``TaskRuntimeEntry.started``), and fabricating ``0`` there would render as
     '0m running' during precisely the failure this path exists to surface
     (loud-over-silent-degradation; INV-2 structured-facts-at-failure).
-    Returns ``0`` on parse failure or a future timestamp.
+    Returns ``None`` on parse failure too — a present-but-unparseable *iso*
+    is upstream data damage (``TaskRuntimeEntry.started`` is typed
+    ``str | None`` but pydantic does not validate ISO format), and rendering
+    it as ``0`` would produce the identical misleading '0m running' the
+    missing-input case above exists to avoid. Returns ``0`` for a genuine
+    sub-minute-old start, and for a future timestamp (clamped by the
+    ``max(minutes, 0)`` below) — a ``0`` in the payload does NOT imply parse
+    failure or clock skew; only ``None`` signals an unknown start.
 
     *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
     pass an explicit value for deterministic results or to share one instant
@@ -239,12 +247,13 @@ def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int | Non
     """
     if not iso:
         return None
-    try:
-        ts = datetime.fromisoformat(iso.replace('Z', '+00:00'))
-    except ValueError:
-        return 0
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
+    ts, ok = parse_timestamp_or_warn(iso, context='active_tasks._minutes_since')
+    if not ok:
+        # Logged once per call, not deduped/rate-limited: the docstring above
+        # notes there is no known producer of a damaged `started` today, so
+        # unbounded per-render volume is a theoretical concern, not an
+        # observed one. Revisit (e.g. a per-value seen-set) if that changes.
+        return None
     delta = resolve_now(now) - ts
     minutes = int(delta.total_seconds() // 60)
     return max(minutes, 0)
