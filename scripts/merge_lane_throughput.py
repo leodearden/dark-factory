@@ -704,3 +704,120 @@ def compute_occupancy(
         'n_heartbeats': len(heartbeat_events),
         'window_span_minutes': window_span_minutes,
     }
+
+
+def _depth_distribution(
+    events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Histogram ``data['depth']`` with a None-safe ``int()`` coercion.
+
+    Mirrors `analyze_speculation_depth.py::compute_per_depth`: an absent, None
+    or unparseable depth is SKIPPED and counted in ``n_skipped`` rather than
+    raising or landing in a 0 bucket.  Historical (pre-task-2340) `merge_verify`
+    rows carry no depth at all.
+    """
+    counts: Counter[int] = Counter()
+    skipped = 0
+    for event in events:
+        raw = event.get('data', {}).get('depth')
+        if raw is None:
+            skipped += 1
+            continue
+        try:
+            counts[int(raw)] += 1
+        except (TypeError, ValueError):
+            skipped += 1
+    return {
+        'distribution': dict(sorted(counts.items())),
+        'n_coerced': sum(counts.values()),
+        'n_skipped': skipped,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section: speculation (--speculation).
+# ---------------------------------------------------------------------------
+
+
+def compute_speculation(
+    speculative_events: Sequence[dict[str, Any]],
+    voided_events: Sequence[dict[str, Any]],
+    verify_events: Sequence[dict[str, Any]],
+    finalized_events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Speculation depth, chain-dead void rate, and speculative-ahead share.
+
+    DEPTH IS TWO DIFFERENT TYPES and the distributions are kept apart.
+    `merge_queue.py`'s `_emit_speculative` str-coerces every payload value, so
+    ``speculative_merge.data.depth`` is a STR (``"0"``), while
+    ``merge_verify.data.depth`` is a native ``int | None``.  The in-line
+    warning at that call site says a future consumer aggregating depth across
+    both event types must not assume one type; keeping ``speculative_depth``
+    and ``verify_depth`` separate avoids the trap outright rather than casting
+    and hoping.
+
+    VOID RATE = `verdict_voided` rows with ``reason == 'chain_dead'`` over
+    `speculative_merge` rows.  ``chain_dead`` is currently the only value that
+    field takes, but it is filtered rather than assumed, so a new reason shows
+    up as a shrinking numerator instead of being silently counted.  ``point``
+    ('dispatch' vs 'adoption') is tallied alongside.
+
+    SPECULATIVE-AHEAD SHARE = landings whose task has, strictly before the
+    landing, either a `speculative_merge` row or a `merge_verify` row with
+    ``speculative`` truthy — reported as ``matched``/``total`` as well as a
+    share, because the share alone hides how thin the denominator can be.
+
+    Every rate is ``None``, never ``0.0``, when its denominator is empty:
+    "nothing was speculated in this window" is not "speculation was tried and
+    never voided".
+
+    Returns ``{'speculative_depth', 'verify_depth', 'void_rate',
+    'n_speculative', 'n_voided_chain_dead', 'void_points',
+    'speculative_ahead'}``.
+    """
+    n_speculative = len(speculative_events)
+    chain_dead = [
+        e for e in voided_events
+        if e.get('data', {}).get('reason') == 'chain_dead'
+    ]
+    void_points = Counter(
+        str(e.get('data', {}).get('point') or UNKNOWN) for e in chain_dead
+    )
+
+    speculative_by_task = _by_task(speculative_events)
+    verify_by_task = _by_task(verify_events)
+
+    total_landings = 0
+    matched_landings = 0
+    for event in finalized_events:
+        if event.get('data', {}).get('state') != 'done':
+            continue
+        finalized_ts = _parse_ts(event.get('timestamp'))
+        task_id = event.get('task_id')
+        if finalized_ts is None or task_id is None:
+            continue
+        total_landings += 1
+        task_id = str(task_id)
+        ahead = _last_before(speculative_by_task.get(task_id, []), finalized_ts)
+        if ahead is None:
+            speculative_verifies = [
+                e for e in verify_by_task.get(task_id, [])
+                if e.get('data', {}).get('speculative')
+            ]
+            ahead = _last_before(speculative_verifies, finalized_ts)
+        if ahead is not None:
+            matched_landings += 1
+
+    return {
+        'speculative_depth': _depth_distribution(speculative_events),
+        'verify_depth': _depth_distribution(verify_events),
+        'n_speculative': n_speculative,
+        'n_voided_chain_dead': len(chain_dead),
+        'void_rate': len(chain_dead) / n_speculative if n_speculative else None,
+        'void_points': dict(void_points),
+        'speculative_ahead': {
+            'matched': matched_landings,
+            'total': total_landings,
+            'share': matched_landings / total_landings if total_landings else None,
+        },
+    }
