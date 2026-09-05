@@ -29,6 +29,11 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_fused_memory_unit_parity.py"
 TEMPLATE_PATH = REPO_ROOT / "scripts" / "fused-memory.service.template"
 
+# The checker's own log tag, duplicated here only as a literal to strip from
+# captured output (see _untagged). That the CHECKER still spells it this way is
+# asserted against the module in test_main_every_emitted_line_carries_the_log_tag.
+LOG_TAG = "fused_memory_unit_parity"
+
 
 def _load_checker() -> types.ModuleType:
     """Load scripts/check_fused_memory_unit_parity.py by file path."""
@@ -542,6 +547,19 @@ def _plant_fm_dropin(
     return dropin
 
 
+def _untagged(out: str) -> str:
+    """Strip the ``[fused_memory_unit_parity] `` prefix from every line.
+
+    Needed because LOG_TAG contains the word "parity". Asserting that the
+    checker did NOT claim parity has to look at what it SAID, not at how it
+    labelled itself — a bare ``"parity" not in out`` is unsatisfiable on any
+    line this checker emits, so it would assert nothing about the verdict.
+    """
+    return "\n".join(
+        line.removeprefix(f"[{LOG_TAG}] ") for line in out.splitlines()
+    )
+
+
 def test_a_dropin_over_a_clean_unit_is_not_parity(
     tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
 ):
@@ -568,8 +586,11 @@ def test_a_dropin_over_a_clean_unit_is_not_parity(
     assert rc == 1, out
     assert "[override]" in out
     assert str(dropin) in out
-    assert "[ok]" not in out
-    assert "parity" not in out
+    # Checked against the UNTAGGED text: LOG_TAG is literally
+    # "fused_memory_unit_parity", so a bare `"parity" not in out` can never
+    # pass and would be testing the tag rather than the verdict.
+    assert "[ok]" not in _untagged(out)
+    assert "parity" not in _untagged(out)
 
 
 def test_every_applying_fm_dropin_is_named_by_path(
@@ -909,8 +930,13 @@ def _gate_repo(
     """A tmp repo root holding the template and (optionally) the checker.
 
     The checker is copied from the real repo so the gate drives the real one;
-    only the TREE is fake. It imports nothing from scripts/, so one file is the
-    whole dependency.
+    only the TREE is fake. ``systemd_unit_parity.py`` is copied BESIDE it: the
+    checker imports ``find_dropins`` from that sibling by bare module name,
+    which resolves off ``sys.path[0]`` — the executed script's own directory —
+    so the sibling must be in the SAME fake ``scripts/`` dir or every gate test
+    dies at import with a ModuleNotFoundError that looks nothing like the
+    wiring under test. Same reason, same spelling, as
+    tests/scripts/test_check_orchestrator_unit_parity.py's installer harness.
     """
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True, exist_ok=True)
@@ -918,7 +944,12 @@ def _gate_repo(
         TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
     )
     if with_checker:
-        write_checker(repo, CHECKER_PATH.name, body=checker_body)
+        write_checker(
+            repo,
+            CHECKER_PATH.name,
+            body=checker_body,
+            siblings=("systemd_unit_parity.py",),
+        )
     return repo
 
 

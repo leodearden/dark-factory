@@ -6,8 +6,11 @@ carries all host-invariant safety directives committed in the template
 
 Exit codes
 ----------
-0 — parity (all required directives present)
-1 — drift   (one or more required directives missing)
+0 — parity (all required directives present, and no drop-in overrides the unit)
+1 — drift, OR a drop-in override applies (the unit FILE was compared, the
+    EFFECTIVE configuration was NOT). Both on 1 because "I could not verify"
+    belongs with "I found a difference", not with the benign 2 below, which
+    setup-host.sh's gate treats as a skip.
 2 — installed unit absent (no installed unit found at the given path)
 
 An exit status alone is not enough to read this script's verdict: 2 is also
@@ -33,7 +36,9 @@ Usage
 
 Design notes
 ------------
-- Stdlib-only (pathlib, argparse, subprocess, sys) — runs under plain python3.
+- Stdlib-only (pathlib, argparse, subprocess, sys) plus the sibling
+  scripts/systemd_unit_parity.py, which is itself stdlib-only — so this still
+  runs under a plain python3 with no environment set up.
 - Required directives are an explicit curated allow-list of host-INVARIANT safety
   switches. They are NOT auto-derived from the template, because some template lines
   are host-specific (e.g. Environment=...PREDONE_HOOK...) and would produce false
@@ -44,6 +49,18 @@ Design notes
 - All output goes through ``_log`` so the report is uniformly tagged; the
   contract is pinned by test_main_every_emitted_line_carries_the_log_tag in
   tests/scripts/test_check_fused_memory_unit_parity.py.
+- DROP-INS are consulted even when the unit file is at parity, via the shared
+  ``systemd_unit_parity.find_dropins``. `systemctl --user edit` never modifies
+  the unit file; it writes ``<unit>.d/override.conf`` beside it, which systemd
+  merges OVER the unit at load time — so the whole-line membership comparison
+  above can certify every required directive present while the configuration
+  that actually runs is a different one. This closed the LAST drop-in-blind
+  member of the check_*_unit_parity.py family (task-3775 lineage; defect
+  writeups 4382/4388); the dashboard, orchestrator and lms checkers already
+  consulted it. Reported, never removed: a drop-in can be load-bearing (task
+  3750), so removal has owners with preconditions
+  (scripts/remove-lms-arm-worktree-dropin.sh is the precedent) that a
+  general-purpose parity checker has no business re-implementing.
 """
 
 import argparse
@@ -51,6 +68,16 @@ import pathlib
 import subprocess
 import sys
 from collections.abc import Sequence
+
+# find_dropins lives in scripts/systemd_unit_parity.py, and this bare
+# module-name import is the same mechanism the three sibling checkers already
+# use — do not add a path shim. It resolves in BOTH contexts this script runs
+# in: under the CLI python puts the executed script's own directory
+# (``scripts/``) at ``sys.path[0]``, and under pytest
+# ``tests/scripts/conftest.py`` inserts ``scripts/`` explicitly (load-bearing,
+# because pyproject sets ``--import-mode=importlib``, under which pytest
+# deliberately does not perform that sys.path mutation itself).
+from systemd_unit_parity import find_dropins  # pyright: ignore[reportMissingImports]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -289,6 +316,52 @@ def fix_unit_text(
 
 
 # ---------------------------------------------------------------------------
+# Drop-in overrides
+# ---------------------------------------------------------------------------
+
+
+def _report_override(
+    installed_path: pathlib.Path, dropins: list[pathlib.Path]
+) -> None:
+    """Emit the ``[override]`` block for the drop-ins layered over the unit.
+
+    Worded APART from ``[drift]`` for the reason check_lms_unit_parity.py's
+    block gives: this is NOT a directive diff to propagate. Every required
+    directive may be present verbatim; what the run could not establish is that
+    the EFFECTIVE configuration matches, because systemd merges these over the
+    unit at load time.
+
+    Every applying drop-in is named by ABSOLUTE PATH, one per line. systemd
+    merges all of them, so naming a count — or only the first — leaves the
+    operator fixing half the problem and re-running into the same red.
+
+    ``_log`` already tags every physical line, so this multi-line block cannot
+    leave an untagged continuation behind. That matters because setup-host.sh's
+    gate reads tag ABSENCE as "the checker did not run", and that inference is
+    sound only if presence is guaranteed per line.
+    """
+    _log(
+        f"[override] {len(dropins)} drop-in(s) apply to {installed_path} — the "
+        "unit file was compared, but the EFFECTIVE configuration was NOT "
+        "verified by that comparison:"
+    )
+    for dropin in dropins:
+        _log(f"  {dropin}")
+    _log(
+        "[override] systemd merges these over the unit at load time, so a "
+        "directive set here silently wins over the committed value. Inspect "
+        "the merged result with: systemctl --user cat fused-memory.service"
+    )
+    _log(
+        "[override] Nothing was removed: this checker is read-only about "
+        "drop-ins BY DESIGN, because a drop-in can be load-bearing (task "
+        "3750). --fix appends to the unit FILE and can neither synthesize nor "
+        "resolve an override living in a different one — remove it by hand, or "
+        "move the setting into the committed template."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Systemd reload
 # ---------------------------------------------------------------------------
 
@@ -362,6 +435,15 @@ def main(argv: Sequence[str]) -> int:
     unit_text = installed_path.read_text(encoding="utf-8")
     drift = find_drift(unit_text)
 
+    # Consulted EVEN WHEN the unit file itself is at parity: a drop-in is
+    # layered OVER a matching unit file, so it is invisible to the whole-line
+    # membership comparison above. `--installed` names a FILE here (the three
+    # sibling checkers take an installed-DIR), so the drop-in directory is
+    # derived from it rather than passed in.
+    dropins = find_dropins(installed_path.parent, installed_path.name)
+    if dropins:
+        _report_override(installed_path, dropins)
+
     # Also verify that the template itself is not drifted (self-sanity check).
     if template_path.exists():
         template_drift = find_drift(template_path.read_text(encoding="utf-8"))
@@ -372,6 +454,13 @@ def main(argv: Sequence[str]) -> int:
             )
 
     if not drift:
+        if dropins:
+            # NOT parity, and deliberately not exit 0: the required directives
+            # all matched, but what this run could not establish is that the
+            # EFFECTIVE configuration matches. Reporting `[ok] ... parity` here
+            # would be a green claim covering exactly the configuration that is
+            # not running.
+            return 1
         _log(f"[ok] {installed_path}: parity — all required directives present.")
         return 0
 
