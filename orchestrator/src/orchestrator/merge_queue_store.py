@@ -12,6 +12,13 @@ Design highlights
   file → empty list **plus** ``journal_corrupt=True`` and a deduped WARNING
   (empty files are treated as corrupt because _save_raw never writes an empty
   string, so an empty file is an anomaly, not a legitimate fresh state).
+* Forward-compatible reads (task 5063): an entry carrying an UNKNOWN field is
+  loaded from its known keys with a WARNING naming the dropped ones, rather
+  than being skipped wholesale.  A journal written by a NEWER orchestrator
+  must survive being read by an older one — a skipped entry is an in-flight
+  merge request that is never recovered, so the alternative turns a rollback
+  into an incident.  Deliberately one-directional: an entry MISSING a required
+  field is still skipped.
 * Keyed by ``request_id`` so ``record()`` is idempotent on redispatch (updates
   in place) and ``remove()`` is O(1) on terminal.
 """
@@ -21,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -87,6 +94,14 @@ class PersistedMergeRequest:
     * ``[]``  — the task genuinely had NO assigned modules; the empty set is
       correct and is deliberately not widened.
     """
+
+
+_PERSISTED_FIELDS = frozenset(f.name for f in fields(PersistedMergeRequest))
+"""Field names :meth:`MergeQueueStore.load` will accept from a journal entry.
+
+Derived from the dataclass rather than written out, so the unknown-key filter
+can never drift from the schema it is filtering against.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +190,31 @@ class MergeQueueStore:
         Reads from the in-memory mirror (warmed at construction; kept in sync
         by record/remove).  Returns ``[]`` if the journal is empty or was
         corrupt at startup (fail-open).
+
+        UNKNOWN keys are tolerated (task 5063): an entry carrying a field this
+        binary does not know is constructed from its KNOWN keys alone, and the
+        dropped ones are named in one WARNING.  This is the forward direction
+        of schema evolution — a journal written by a NEWER orchestrator must
+        survive being read by an older one, because the alternative is
+        silently losing in-flight merge requests during a rollback.
+
+        The relaxation is one-directional: an entry MISSING a required field
+        still raises and is still skipped with the message below.
         """
         result: list[PersistedMergeRequest] = []
         for entry in self._cache.values():
+            known = {k: v for k, v in entry.items() if k in _PERSISTED_FIELDS}
+            unknown = sorted(set(entry) - _PERSISTED_FIELDS)
+            if unknown:
+                logger.warning(
+                    'merge_queue_store: entry %s carries unknown field(s) %s;'
+                    ' ignoring them and loading its known fields (a journal'
+                    ' written by a newer orchestrator)',
+                    entry.get('request_id', '<no request_id>'),
+                    unknown,
+                )
             try:
-                result.append(PersistedMergeRequest(**entry))
+                result.append(PersistedMergeRequest(**known))
             except (TypeError, KeyError) as exc:
                 logger.warning('merge_queue_store: skipping malformed entry: %s', exc)
         return result
