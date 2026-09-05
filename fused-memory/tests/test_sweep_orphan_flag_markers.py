@@ -2062,6 +2062,98 @@ class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
 
 
 # ===========================================================================
+# Tests: run() surfaces the tombstone count in the report (task 4435)
+# ===========================================================================
+
+class TestRunSurfacesTheTombstoneCount:
+    """An --apply run makes the audit trail's presence — or ABSENCE — readable
+    in the JSON the nightly timer prints.
+
+    The failure this exists to make visible is a deployment with no
+    ``recon_ledger`` wired: records get destroyed permanently and the only
+    trace is a WARNING in the systemd journal. ``deleted: 2, tombstoned: 0``
+    puts that divergence in the report an operator actually reads.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(self, apply: bool = True):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+        )
+
+    @staticmethod
+    def _rig(memory_service: AsyncMock, members: list[dict], *, apply: bool):
+        memory_service.count_memories_by_metadata = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_apply_reports_the_rows_written(self):
+        """A wired ledger: every confirmed delete is accounted for."""
+        memory_service, _ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['deleted'] == 2
+        assert report['tombstoned'] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_missing_ledger_is_visible_as_a_shortfall(self):
+        """No recon_ledger wired: the records are still destroyed, and the
+        report says so — deleted 2, tombstoned 0 — rather than hiding the
+        missing audit trail behind a successful-looking sweep."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['deleted'] == 2
+        assert report['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_dry_run_never_populates_tombstoned(self):
+        """tombstoned is apply-only, exactly like the pre-existing
+        deleted/failed/after keys — a dry run wrote no tombstone, and
+        reporting 0 would read as one that failed."""
+        memory_service, ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1')], apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert 'tombstoned' not in report, (
+            f"tombstoned must be apply-only, got: {report.get('tombstoned')!r}"
+        )
+        ledger.upsert_many.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_report_stays_json_serialisable(self):
+        """main() prints the report, so a non-serialisable value would only
+        blow up in production."""
+        memory_service, _ledger = _svc_with_ledger()
+        self._rig(memory_service, [_orphan('o1'), _orphan('o2')], apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        json.dumps(report)
+
+
+# ===========================================================================
 # Tests: the flag_for_stage2 pool is CENSUSED, never deleted (task 3897)
 # ===========================================================================
 
