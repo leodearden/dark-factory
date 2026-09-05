@@ -400,11 +400,23 @@ def _match(memory_id: str, content: str, *, payload: dict | None = None, **paylo
 # Realistic: ``Scope(project_id='dark_factory').mem0_collection_name('fused')``.
 _SCANNED_COLLECTION = 'fused_dark_factory'
 
+
+class _OmitKey:
+    """Type of the ``_OMIT_KEY`` sentinel below.
+
+    A dedicated class rather than a bare ``object()`` so ``_service`` can
+    annotate ``collection`` as "a collection name OR the omit sentinel". Left
+    as ``object()`` the parameter has no annotation to carry, so its type is
+    inferred from its ``str`` default and every omit-key call site is a
+    ``reportArgumentType`` error.
+    """
+
+
 # Distinguishes "the scan returned collection=''" from "the scan returned no
 # collection key at all" — the shape EVERY pre-3243 backend returned, and the
 # one whose silent ``.get(..., '')`` default put a blank field into two
 # committed live artifacts. A plain None default would collapse the two.
-_OMIT_KEY = object()
+_OMIT_KEY = _OmitKey()
 
 
 def _ok_response(**overrides) -> SimpleNamespace:
@@ -434,7 +446,7 @@ def _service(
     truncated=False,
     enforce=False,
     enforce_kind_registry=False,
-    collection=_SCANNED_COLLECTION,
+    collection: str | _OmitKey = _SCANNED_COLLECTION,
 ) -> AsyncMock:
     """An AsyncMock ``MemoryService`` for the sweep.
 
@@ -457,7 +469,7 @@ def _service(
             enforce=enforce, enforce_kind_registry=enforce_kind_registry
         )
     )
-    scan_result = {
+    scan_result: dict[str, object] = {
         'matches': matches,
         'scanned': len(matches) if scanned is None else scanned,
         'truncated': truncated,
