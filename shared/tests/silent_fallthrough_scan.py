@@ -18,6 +18,22 @@ Design:
   - iter_first_party_files(repo_root) enumerates the first-party source tree
     (added in step-6).
 
+THIS MODULE IS THE ONE PLACE THE FIRST-PARTY TREE IS READ AND PARSED (task
+4520). ``parse_first_party_tree(repo_root)`` reads and ``ast.parse``s each
+enumerated file exactly once per session and memoizes the result; every gate
+module in ``shared/tests/`` walks those already-built ASTs READ-ONLY rather
+than growing its own scan. Before that consolidation two gates each did the
+whole thing privately — 461 files read twice, parsed three times, 922 parent
+maps where 24 sufficed — and because pytest-timeout arms its timer over the
+entire runtest protocol (``func_only=False``), the duplicated work was billed
+to whichever single test item happened to trigger the fixture: 23.68s of setup
+against a 60s budget. ``shared/tests/test_tree_scan_sharing.py`` pins the
+contract and carries an anti-regrowth ratchet against a third private parse.
+
+Consumers must not mutate a shared ``ast.Module``: the trees are handed to
+every gate in the session, so an in-place rewrite in one would silently change
+what the others see.
+
 References:
   - plans/silent-fallthrough-dedup-prd.md (PRD task σ)
   - orchestrator/tests/test_event_loop_antipattern_guard.py (guard pattern)
@@ -484,3 +500,95 @@ def iter_first_party_files(repo_root: Path) -> Iterator[Path]:
             if name.startswith("test_") or name in _EXCLUDED_NAMES:
                 continue
             yield py_file
+
+
+# ---------------------------------------------------------------------------
+# Shared, memoized whole-tree provider (task 4520)
+# ---------------------------------------------------------------------------
+
+
+class ParsedFile(NamedTuple):
+    """One first-party source file, read and parsed exactly once per session.
+
+    Exactly one of *tree* / *syntax_error* is set — never both, never neither.
+    A file that parses carries its ``ast.Module``; one that does not carries
+    the ``SyntaxError`` so a consumer can REPORT it (see
+    ``test_silent_fallthrough_gate.test_no_unparseable_files``, which lists
+    every bad file at once) or RE-RAISE it (see
+    ``test_config_dir_archival_gate._scan``, whose contract is that a file it
+    actually needs must not be silently skipped).
+    """
+
+    path: Path              # absolute
+    relpath: str            # posix, relative to repo_root
+    source: str
+    tree: ast.Module | None
+    syntax_error: SyntaxError | None
+
+
+#: Memo keyed on the RESOLVED repo root, so two spellings of one tree share an
+#: entry. Module-level rather than an ``lru_cache`` so the tests can swap in a
+#: private dict (``test_tree_scan_sharing.isolated_parse_cache``) without
+#: evicting the session's warm entry for the real tree.
+_PARSE_CACHE: dict[Path, tuple[ParsedFile, ...]] = {}
+
+
+def _reset_parse_cache() -> None:
+    """Drop the memo — a test hook, not a runtime knob.
+
+    Mutates the dict in place rather than rebinding the global, so it also
+    clears a monkeypatched stand-in.
+    """
+    _PARSE_CACHE.clear()
+
+
+def parse_first_party_tree(repo_root: Path | str) -> tuple[ParsedFile, ...]:
+    """Read and parse every first-party source file ONCE, memoized on *repo_root*.
+
+    Enumeration is delegated verbatim to :func:`iter_first_party_files`, so the
+    7 scope roots, the ``mem0``/``graphiti``/``tests``/``conftest.py``
+    exclusions and the sentinel-dir validation that RAISES on a mis-resolved
+    root all keep their meaning here.
+
+    Failure modes are deliberately asymmetric, because the two consuming gates
+    have deliberately different contracts and both must survive:
+
+    * A read or decode error PROPAGATES. Reads use strict ``encoding='utf-8'``
+      (not ``errors='replace'``): a first-party file that cannot be read is a
+      real breakage, and silently skipping it would let a construction site
+      hide behind it — the archival gate's documented loudness contract.
+    * A ``SyntaxError`` is RECORDED on the file's :class:`ParsedFile` instead
+      of raised, because ``test_no_unparseable_files`` exists to report all of
+      them together. A consumer that needs a specific file re-raises the
+      recorded error itself.
+
+    Returns:
+        An immutable tuple of :class:`ParsedFile`, in ``iter_first_party_files``
+        order. The same tuple object is returned on every subsequent call for
+        the same resolved root, so ``is`` identity is part of the contract.
+    """
+    key = Path(repo_root).resolve()
+    cached = _PARSE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    records: list[ParsedFile] = []
+    for py_file in iter_first_party_files(key):
+        source = py_file.read_text(encoding="utf-8")
+        tree: ast.Module | None = None
+        syntax_error: SyntaxError | None = None
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError as exc:
+            syntax_error = exc
+        records.append(ParsedFile(
+            path=py_file,
+            relpath=py_file.relative_to(key).as_posix(),
+            source=source,
+            tree=tree,
+            syntax_error=syntax_error,
+        ))
+
+    result = tuple(records)
+    _PARSE_CACHE[key] = result
+    return result
