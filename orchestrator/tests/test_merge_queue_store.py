@@ -1776,3 +1776,139 @@ class TestJournalLoadToleratesUnknownKeys:
         assert [r for r in caplog.records if r.levelno == logging.WARNING], (
             'the skip must still be warned about'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9: a journal entry whose VALUE is not a mapping is skipped PER-ENTRY.
+#
+# step-8's unknown-key filter dereferences `entry.items()` / `set(entry)`
+# OUTSIDE the try, so a journal whose top level is a dict but whose value for
+# one key is a string / list / number / None raises an uncaught AttributeError
+# out of load().  recover_pending_merges calls store.load() unguarded and
+# Harness.run catches it only at the outermost `except Exception` around
+# _recover_pending_merges — so ONE bad value aborts the ENTIRE recovery pass
+# and every in-flight merge request in the journal is lost.  That is precisely
+# the failure mode steps 7-8 were written to prevent, and it contradicts this
+# module's documented per-entry fail-open contract.
+# ---------------------------------------------------------------------------
+
+
+def _write_journal_entries(
+    store_path: Path, entries: dict[str, object],
+) -> MergeQueueStore:
+    """Hand-write a multi-entry journal VERBATIM and return the store reading it.
+
+    Sibling of ``_write_journal``, which cannot express these fixtures: it takes
+    exactly ONE entry and keys the journal by ``entry['request_id']``, and a
+    non-dict entry has no ``['request_id']`` to subscript.
+
+    ``_load_raw``'s ``isinstance(data, dict)`` check inspects only the TOP
+    level, so a dict-with-a-non-dict-value parses cleanly, ``journal_corrupt``
+    stays False, and the bad value genuinely reaches ``load()``.
+    """
+    import json
+
+    store_path.write_text(json.dumps(entries), encoding='utf-8')
+    store = MergeQueueStore(store_path)
+    assert store.journal_corrupt is False, 'Hand-written journal must parse cleanly'
+    return store
+
+
+class TestJournalLoadToleratesNonDictEntries:
+    """A non-mapping entry value loses only ITSELF, never its siblings."""
+
+    def test_non_dict_entry_is_skipped_while_its_siblings_still_load(
+        self, tmp_path: Path,
+    ) -> None:
+        """The headline regression: one bad value must not abort the pass.
+
+        ``recover_pending_merges`` calls ``load()`` outside any try, so an
+        exception here drops every in-flight merge request in the journal —
+        not just the malformed one.
+        """
+        store = _write_journal_entries(
+            tmp_path / 'merge_queue.json',
+            {'mr-bad': 'not-a-dict', 'mr-ok': _current_journal_entry('mr-ok')},
+        )
+
+        records = store.load()
+
+        assert len(records) == 1, (
+            f'a non-dict entry must cost only itself — its siblings are '
+            f'in-flight merge requests; got {records!r}'
+        )
+        [p] = records
+        assert p.request_id == 'mr-ok'
+        assert p.task_files == ['a.py']
+        assert p.module_prefixes == ['orchestrator'], (
+            'the surviving sibling must be fully intact, not half-constructed'
+        )
+
+    @pytest.mark.parametrize(
+        'bad_value',
+        ['not-a-dict', ['a', 'b'], 42, None],
+        ids=['str', 'list', 'int', 'null'],
+    )
+    def test_every_non_mapping_entry_shape_is_skipped_not_raised(
+        self, tmp_path: Path, bad_value: object,
+    ) -> None:
+        """The guard keys on "is it a mapping", not on one incidental type.
+
+        These are the shapes a hand-edited journal, a foreign writer, or a
+        half-migrated schema can actually produce.
+        """
+        store = _write_journal_entries(
+            tmp_path / 'merge_queue.json',
+            {'mr-bad': bad_value, 'mr-ok': _current_journal_entry('mr-ok')},
+        )
+
+        records = store.load()
+
+        assert [p.request_id for p in records] == ['mr-ok'], (
+            f'a {type(bad_value).__name__} entry value must be skipped, not '
+            f'raised through; got {records!r}'
+        )
+
+    def test_non_dict_entry_is_reported_by_its_journal_key(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The journal KEY is the only id a non-dict entry has.
+
+        There is no ``request_id`` field to read defensively from, so the
+        warning must come from the key (loud-over-silent, as already pinned by
+        ``test_unknown_key_is_reported_not_silently_dropped``).
+        """
+        store = _write_journal_entries(
+            tmp_path / 'merge_queue.json',
+            {'mr-bad': 'not-a-dict', 'mr-ok': _current_journal_entry('mr-ok')},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            store.load()
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('mr-bad' in m for m in warnings), (
+            f'the skipped entry must be named by its journal key; '
+            f'warnings were {warnings!r}'
+        )
+
+    def test_a_non_dict_entry_does_not_mark_the_whole_journal_corrupt(
+        self, tmp_path: Path,
+    ) -> None:
+        """A per-entry defect must not escalate to the journal-wide signal.
+
+        ``recover_pending_merges`` emits a much louder, operator-facing
+        "journal was corrupt at startup — pending merges may have been lost"
+        warning for the corrupt case.  This also forecloses "just mark it
+        corrupt" as a fix.
+        """
+        store = _write_journal_entries(
+            tmp_path / 'merge_queue.json',
+            {'mr-bad': 'not-a-dict', 'mr-ok': _current_journal_entry('mr-ok')},
+        )
+
+        store.load()
+
+        assert store.journal_corrupt is False, (
+            'one malformed entry value is a per-entry skip, not a corrupt journal'
+        )
