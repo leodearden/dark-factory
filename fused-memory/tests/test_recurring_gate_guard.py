@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from shared.task_statuses import ACTIVE, TERMINAL
@@ -498,3 +499,213 @@ class TestRecurringGateError:
         assert err['error_type'] == 'RecurringGateViolation'
         assert err['existing_gate_task_id'] == '5902'
         assert '5902' in err['error']
+
+
+def _gate_meta(subject: str | None = '5879', **extra: Any) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+    }
+    if subject is not None:
+        meta['gate_subject'] = subject
+    meta.update(extra)
+    return meta
+
+
+class TestRecurringGateGuardError:
+    """The async orchestrator — the only function in the module that does I/O.
+
+    ``fetch_tasks`` is an INJECTED zero-arg async callable (the
+    ``live_task_write_guard.GetTaskFn`` precedent), so every test fakes the
+    corpus with a one-line AsyncMock and can prove via ``await_count`` that
+    the cheap short-circuits do ZERO I/O.
+    """
+
+    @staticmethod
+    def _corpus(*rows: Any) -> AsyncMock:
+        return AsyncMock(return_value={'tasks': list(rows)})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'agent_id', ['claude-interactive', None, 'orchestrator-merge', 'recon-stage']
+    )
+    async def test_non_recon_caller_is_exempt_and_does_no_io(self, agent_id):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = self._corpus(_row())
+        assert (
+            await recurring_gate_guard_error(
+                _gate_meta(), agent_id, '/p', fetch_tasks=fetch
+            )
+            is None
+        )
+        assert fetch.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_non_gate_submission_does_no_io(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = self._corpus(_row())
+        meta = {'execution_class': 'code_tdd', 'gate_subject': '5879'}
+        assert (
+            await recurring_gate_guard_error(
+                meta, 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+            )
+            is None
+        )
+        assert fetch.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_gate_without_a_subject_does_no_io(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = self._corpus(_row())
+        # No dedupe key => nothing to enforce.
+        assert (
+            await recurring_gate_guard_error(
+                _gate_meta(subject=None),
+                'recon-stage-task_knowledge_sync',
+                '/p',
+                fetch_tasks=fetch,
+            )
+            is None
+        )
+        assert fetch.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_no_matching_carrier_passes_with_exactly_one_read(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = self._corpus(
+            _row(metadata={'execution_class': 'operational', 'gate_subject': '5858'})
+        )
+        assert (
+            await recurring_gate_guard_error(
+                _gate_meta(), 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+            )
+            is None
+        )
+        assert fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_matching_open_carrier_is_rejected_naming_its_id(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = self._corpus(_row(task_id='5902'))
+        err = await recurring_gate_guard_error(
+            _gate_meta(), 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+        )
+        assert err is not None
+        assert err['error_type'] == 'RecurringGateViolation'
+        assert err['existing_gate_task_id'] == '5902'
+        assert '5902' in err['error']
+        assert fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('status', sorted(str(s) for s in TERMINAL))
+    async def test_terminal_carrier_does_not_block_a_recurrence(self, status):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        # The condition genuinely recurred after closure — a fresh gate is
+        # exactly what should happen.
+        fetch = self._corpus(_row(status=status))
+        assert (
+            await recurring_gate_guard_error(
+                _gate_meta(), 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_incoming_alias_matches_stored_canonical(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        incoming = _gate_meta(subject=None, stranded_task_id='5879')
+        fetch = self._corpus(_row(task_id='5902'))
+        err = await recurring_gate_guard_error(
+            incoming, 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+        )
+        assert err is not None
+        assert err['existing_gate_task_id'] == '5902'
+
+    @pytest.mark.asyncio
+    async def test_incoming_canonical_matches_stored_alias(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        stored = _row(
+            task_id='5916',
+            metadata={
+                'execution_class': 'operational',
+                'operational_mode': 'gate',
+                'stranded_task_id': '5879',
+            },
+        )
+        fetch = self._corpus(stored)
+        err = await recurring_gate_guard_error(
+            _gate_meta(), 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+        )
+        assert err is not None
+        assert err['existing_gate_task_id'] == '5916'
+
+    @pytest.mark.asyncio
+    async def test_fails_open_when_the_lookup_raises(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = AsyncMock(side_effect=RuntimeError('backend down'))
+        # Must not propagate: failing closed would block EVERY recon human
+        # gate on a transient blip, including genuinely novel ones.
+        assert (
+            await recurring_gate_guard_error(
+                _gate_meta(), 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+            )
+            is None
+        )
+        assert fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'junk', [None, [], ['not a row'], 42, 'a string', {'no_tasks_key': 1}]
+    )
+    async def test_junk_lookup_result_returns_none_without_raising(self, junk):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = AsyncMock(return_value=junk)
+        assert (
+            await recurring_gate_guard_error(
+                _gate_meta(), 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_bare_list_lookup_result_is_accepted(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = AsyncMock(return_value=[_row(task_id='5929')])
+        err = await recurring_gate_guard_error(
+            _gate_meta(), 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+        )
+        assert err is not None
+        assert err['existing_gate_task_id'] == '5929'
