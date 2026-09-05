@@ -257,3 +257,42 @@ def test_not_a_default():
         assert list(iter_default_asserting_tests(src)) == [], (
             'only literals equal to the package default may be flagged'
         )
+
+
+# ---------------------------------------------------------------------------
+# THE RATCHET
+# ---------------------------------------------------------------------------
+
+#: One param per FILE, not one per suite, so a regression names the offending
+#: file directly and each repair turns a specific subset green.  Collected by
+#: glob so a newly added test module is covered automatically.
+_SUITE_FILES = sorted(Path(__file__).parent.glob('test_*.py'))
+
+
+@pytest.mark.parametrize('source', _SUITE_FILES, ids=lambda p: p.name)
+def test_no_unhatched_code_default_assertions(source):
+    """No test may assert a package default off an un-isolated bare config.
+
+    See this module's docstring for the incident.  The remedy is one line.
+    """
+    findings = list(iter_default_asserting_tests(source))
+    if not findings:
+        return
+    lines = '\n'.join(
+        f'  {cls or "<module>"}::{test}  line {lineno}  '
+        f'{attr} == {literal!r}'
+        for cls, test, lineno, attr, literal in findings
+    )
+    tests = {(cls, test) for cls, test, _, _, _ in findings}
+    pytest.fail(
+        f'{source.name}: {len(tests)} test(s) / {len(findings)} assertion(s) '
+        f'assert a CODE DEFAULT off a bare OrchestratorConfig() that is NOT '
+        f'isolated from the operational dark-factory-orchestrator.yaml:\n'
+        f'{lines}\n\n'
+        f'Each of these passes only because the repo does not currently '
+        f'declare that key. Declaring it — an ordinary ops edit — turns the '
+        f'test red for a reason that has nothing to do with the change.\n'
+        f'Remedy: add @pytest.mark.usefixtures("code_default_config") to the '
+        f'test (or to its class, if every test in the class is defaults-only), '
+        f'so the assertion means what the test name already claims.'
+    )
