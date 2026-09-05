@@ -16,6 +16,7 @@ mode, so a flat import works from both suites.
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,26 @@ def unreadable_read_text(doomed: Path) -> Callable[..., str]:
         if self == doomed:
             # Left on disk, unlike the relocation case.
             raise PermissionError(13, 'Permission denied', str(doomed))
+        return original(self, *args, **kwargs)
+
+    return flaky
+
+
+def pruning_read_text(doomed: Path) -> Callable[..., str]:
+    """Interpose ``Path.read_text`` to ``rmtree`` *doomed*'s containing dir.
+
+    Models ``archive.prune_archive``, which drops a whole dated subdir at
+    once — the actor that can invalidate an archive path between
+    ``sweep._build_archive_index``'s rglob and the read of an indexed copy.
+    ``run_startup_sweep`` runs prune as pass 3 of its own sequence, so the
+    concurrent runner is a second orchestrator's startup sweep during a fleet
+    redeploy, when several restart together.
+    """
+    original = Path.read_text
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == doomed and doomed.exists():
+            shutil.rmtree(doomed.parent)
         return original(self, *args, **kwargs)
 
     return flaky
