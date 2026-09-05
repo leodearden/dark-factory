@@ -1248,3 +1248,92 @@ def test_speculation_void_rate_is_none_when_voids_exist_without_speculation():
     result = mlt.compute_speculation([], [_vv('x', 0, 'dispatch')], [], [])
     assert result['void_rate'] is None
     assert result['n_voided_chain_dead'] == 1
+
+
+# ---------------------------------------------------------------------------
+# compute_queue_depth / compute_mixes
+# ---------------------------------------------------------------------------
+
+
+def test_queue_depth_percentiles_over_the_heartbeat_depth_field():
+    hb = [_hb(h, [], depth=d) for h, d in enumerate([0, 1, 2, 3])]
+    result = mlt.compute_queue_depth(hb)
+    assert result['p50'] == 1.5
+    assert result['p90'] == pytest.approx(2.7)
+    assert result['max'] == 3
+    assert result['n'] == 4
+
+
+def test_queue_depth_is_none_not_zero_on_an_empty_window():
+    result = mlt.compute_queue_depth([])
+    assert result['p50'] is None and result['p90'] is None
+    assert result['max'] is None
+    assert result['n'] == 0
+
+
+def test_queue_depth_skips_a_heartbeat_with_no_usable_depth():
+    hb = [_hb(0, [], depth=4), {'timestamp': _ts(11, 1), 'data': {}},
+          {'timestamp': _ts(11, 2), 'data': {'depth': None}}]
+    assert mlt.compute_queue_depth(hb)['n'] == 1
+
+
+def _mix_fixture():
+    attempts = [
+        {'timestamp': _ts(11, 2, i), 'task_id': f'm{i}', 'data': {'outcome': o}}
+        for i, o in enumerate([
+            'done', 'done', 'conflict',
+            'gate_retry', 'gate_retry', 'cas_retry',
+            'superseded',            # emitted by workflow.py, OUTSIDE OutcomeKind
+            'a_future_outcome',      # vocabulary this script has never seen
+        ])
+    ]
+    attempts.append({'timestamp': _ts(11, 2, 9), 'task_id': 'm9', 'data': {}})
+    finalized = [
+        _f('f1', 3, 0), _f('f2', 3, 1),
+        _f('f3', 3, 2, state='blocked'),
+        _f('f4', 3, 3, state='a_future_state'),
+        {'timestamp': _ts(11, 3, 4), 'task_id': 'f5', 'data': {}},
+    ]
+    return attempts, finalized
+
+
+def test_mixes_tally_outcomes_including_values_outside_the_enum():
+    result = mlt.compute_mixes(*_mix_fixture())
+    counts = result['attempt_outcomes']['counts']
+    # 'superseded' is emitted from workflow.py and is deliberately NOT an
+    # OutcomeKind member; validating against an imported enum would drop it.
+    assert counts['superseded'] == 1
+    assert counts['a_future_outcome'] == 1
+    assert counts['done'] == 2
+    assert counts[mlt.UNKNOWN] == 1
+    assert result['attempt_outcomes']['total'] == 9
+    assert result['attempt_outcomes']['shares']['done'] == pytest.approx(2 / 9)
+
+
+def test_mixes_split_non_terminal_outcomes_from_terminal_ones():
+    result = mlt.compute_mixes(*_mix_fixture())
+    outcomes = result['attempt_outcomes']
+    # gate_retry/cas_retry mean "the attempt is still live". Folding them in
+    # with terminal outcomes makes the mix read as a landing tally.
+    assert outcomes['non_terminal'] == {'gate_retry': 2, 'cas_retry': 1}
+    assert outcomes['n_non_terminal'] == 3
+    assert outcomes['n_terminal'] == 6
+    assert 'superseded' in outcomes['terminal']
+
+
+def test_mixes_tally_finalize_states_including_unknown_ones():
+    result = mlt.compute_mixes(*_mix_fixture())
+    states = result['finalize_states']
+    assert states['counts'] == {
+        'done': 2, 'blocked': 1, 'a_future_state': 1, mlt.UNKNOWN: 1,
+    }
+    assert states['total'] == 5
+    assert states['shares']['done'] == pytest.approx(0.4)
+
+
+def test_mixes_are_empty_not_zero_on_an_empty_window():
+    result = mlt.compute_mixes([], [])
+    assert result['attempt_outcomes']['counts'] == {}
+    assert result['attempt_outcomes']['total'] == 0
+    assert result['attempt_outcomes']['shares'] == {}
+    assert result['finalize_states']['counts'] == {}
