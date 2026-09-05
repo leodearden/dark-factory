@@ -126,6 +126,26 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # clobber demonstrated by ::test_a_required_known_project_roots_line_would_reclobber.
 # No code in either module can prevent an edit to a constant in the other, which
 # is why the guard is a cross-module test and this is a comment.
+#
+# PINNED FROM BOTH ENDS, and the second anchor is not redundant. The test above
+# derives its preserved set solely from render_dashboard_unit.UNITS[*].
+# host_local_environment, so dropping the name from a UnitSpec while
+# fused_memory/models/scope.py still read it would make that test pass
+# VACUOUSLY — the intersection goes empty for the wrong reason and this hazard
+# is wide open again underneath a green suite. So the same suite also holds
+# ::test_scope_known_project_roots_env_is_disjoint_from_required_service_directives
+# (anchored on scope.py::KNOWN_PROJECT_ROOTS_ENV, the constant whose value is
+# what makes a clobber damaging) and
+# ::test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer,
+# which is the join: it goes red exactly when the renderer stops preserving
+# what scope.py still reads.
+#
+# Those guards read scope.py with `ast` rather than importing it, and that is
+# MEASURED, not stylistic: fused_memory is not installed in the
+# `uv run --project shared` environment tests/scripts/ runs under
+# (scripts/orchestrator.yaml's test_command), so `import fused_memory` raises
+# ModuleNotFoundError. "Simplifying" the source read into an import turns the
+# guard into a collection error that says nothing about the invariant.
 # Restart=on-failure / RestartSec=5 / RestartSteps=4 / TimeoutStartSec=300 /
 # TimeoutStopSec=90 are host-invariant literal strings (already present
 # verbatim in scripts/fused-memory.service.template) — exact membership
