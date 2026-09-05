@@ -2047,6 +2047,58 @@ class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
         assert set(report['targeted_correction_ids']) == {'m1', 'l1'}
 
     @pytest.mark.asyncio
+    async def test_the_subtraction_is_logged_at_warning(self, caplog):
+        """The subtraction is never silent in the journal.
+
+        run() pre-subtracts, so the choke-point guard's own per-member
+        WARNING cannot fire on this path — this is the ONLY journal output
+        the event produces, and the journal is where an operator greps after
+        a nightly run. The JSON key is not a substitute: `undated_kept_count`
+        is the precedent that a "why do this run's numbers look like that"
+        condition warrants both.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        naming_both = [
+            r for r in warnings
+            if 'm1' in r.getMessage() and 'l1' in r.getMessage()
+        ]
+        assert len(naming_both) == 1, (
+            'Expected exactly one WARNING naming both protected ids, got: '
+            f'{[r.getMessage() for r in warnings]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_nothing_is_protected(self, caplog):
+        """A clean run stays quiet — otherwise the warning above is noise an
+        operator learns to filter out."""
+        members = [_orphan('o1'), _member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        protected_warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers'
+            and r.levelno == logging.WARNING
+            and 'protected' in r.getMessage()
+        ]
+        assert protected_warnings == []
+
+    @pytest.mark.asyncio
     async def test_keys_are_present_when_nothing_is_protected(self):
         """The two keys are unconditional, so no report consumer needs a
         .get fallback and a JSON diff across nights stays stable."""

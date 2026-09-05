@@ -516,6 +516,23 @@ def find_terminal_task_markers(
     return result
 
 
+def _member_metadata(member: dict) -> dict:
+    """Return *member*'s metadata dict, or ``{}`` for any non-dict payload.
+
+    The sibling ``find_*`` predicates use ``(m.get('metadata') or {})``, which
+    is enough for a truthiness test but raises ``AttributeError`` on a
+    metadata that is present and NOT a dict (a list, a string). The
+    protected-record log lines below read INDIVIDUAL keys off a payload the
+    guard has already flagged as anomalous, so they use this stricter form:
+    a weird payload must never crash the sweep from inside the reporting for
+    the guard that exists to make it safer.
+
+    Pure, sync, no I/O.
+    """
+    metadata = member.get('metadata')
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def find_protected_markers(members: list[dict]) -> list[dict]:
     """Return members this sweep must NEVER delete (task 3041/4435).
 
@@ -622,8 +639,7 @@ async def delete_orphan_markers(
     if protected:
         protected_ids = {id(m) for m in protected}  # builtin id(), see NOTE below
         for member in protected:
-            metadata = member.get('metadata')
-            metadata = metadata if isinstance(metadata, dict) else {}
+            metadata = _member_metadata(member)
             logger.warning(
                 'sweep_orphan_flag_markers: SKIPPING protected cycle_summary '
                 'mirror memory_id=%s (kind=%s record_type=%s) — this record '
@@ -822,8 +838,11 @@ async def run(
               ``--delete-ids`` named it. Every id listed here is absent from
               ``orphan_ids``. Present unconditionally in BOTH modes
               (``0``/``[]`` when nothing was protected), so the skip is a
-              first-class, greppable fact in the nightly JSON rather than
-              something visible only in the journal.
+              first-class, greppable fact in the nightly JSON. A non-empty
+              subset ALSO emits one aggregate WARNING naming the ids and
+              both discriminators, so the event is greppable in the journal
+              too — the report key and the log line are complements here,
+              exactly as they are for ``undated_kept_count``.
             - cross_check (dict): adjacent-population census (task 3897) —
               ``{'source_total', 'flag_for_stage2_total', 'blind_spot',
               'probe_failed'}``. Diagnostic only, NEVER part of the delete
@@ -1085,6 +1104,42 @@ async def run(
     # and is pinned directly by its own tests.
     protected = find_protected_markers(members)
     if protected:
+        # The subtraction is never SILENT. Because it happens here, the
+        # choke-point guard's own per-member WARNING can no longer fire on
+        # this path, so this is the only journal output the event produces —
+        # and the systemd journal, not the JSON report, is where an operator
+        # greps after a nightly run has already scrolled past. The report key
+        # is not a substitute for it; `undated_kept_count` above sets the
+        # precedent that a "why do this run's numbers look like that"
+        # condition warrants BOTH.
+        #
+        # Aggregate rather than one-per-member (the shape the choke-point
+        # guard uses, mirroring ``_sweep_stale_mem0_pool``): this warning is
+        # enumeration-scoped like `undated_kept`'s directly above it, and
+        # says the same class of thing — a permanent floor under
+        # ``--check --max-backlog`` that draining cannot reach below.
+        rendered = ', '.join(
+            '{}(kind={!r} record_type={!r})'.format(
+                m.get('id'),
+                _member_metadata(m).get('kind'),
+                _member_metadata(m).get('record_type'),
+            )
+            for m in protected
+        )
+        logger.warning(
+            'sweep_orphan_flag_markers: %d of %d enumerated markers are '
+            'protected records that must never be deleted by a marker sweep '
+            'and are excluded from the delete set: %s. Reaching this means '
+            "this run's ``source`` enumeration matched a record from another "
+            'pool (mem0_tombstone: the enumeration filter is over-broad for '
+            'this pool), so the filter — or the --delete-ids that named one — '
+            'should be tightened. These records also floor the residual '
+            'backlog permanently: no amount of draining removes them, so a '
+            '--check/--max-backlog gate at or below that floor can never '
+            'pass (task 3041/4435).',
+            len(protected), len(members), rendered,
+            extra={'project_id': project_id},
+        )
         protected_obj_ids = {id(m) for m in protected}  # builtin id(), not the key
         orphans = [m for m in orphans if id(m) not in protected_obj_ids]
 
