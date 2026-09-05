@@ -2693,24 +2693,6 @@ class TestStage2CycleSummaryHarnessBackstop:
     # caller swallows BaseException.
 
     @staticmethod
-    async def _poll_until(predicate, *, attempts=200, interval=0.01):
-        """Poll an async zero-arg *predicate* (bounded: up to `attempts`
-        tries, `interval` seconds apart — a 2s ceiling at the defaults)
-        instead of a fixed sleep. The common case resolves as soon as the
-        awaited signal is observed, and a loaded CI box gets real headroom
-        instead of a fixed sleep timing out and misreporting itself as the
-        very ordering regression these tests exist to catch. Returns the
-        last predicate result (truthy on success, falsy if every attempt
-        was exhausted)."""
-        result = await predicate()
-        for _ in range(attempts):
-            if result:
-                return result
-            await asyncio.sleep(interval)
-            result = await predicate()
-        return result
-
-    @staticmethod
     async def _drive_degraded_arm_cancelling_first_identity_read(
         harness, run, run_id, project_id, anchor, ledger_store,
     ) -> bool:
@@ -2784,7 +2766,7 @@ class TestStage2CycleSummaryHarnessBackstop:
             )
 
         # Give any shield-wrapped inner Task time to complete the write.
-        record = await self._poll_until(_read_degraded_row)
+        record = await _poll_until(_read_degraded_row)
         assert record is not None, (
             'the clobber-guard identity read must not run ahead of the '
             'shield — the shield exists precisely to guarantee this row '
@@ -2843,7 +2825,7 @@ class TestStage2CycleSummaryHarnessBackstop:
             # predicate — polling still buys an early exit if a regression
             # makes the closure call the writer, so that surfaces fast
             # instead of relying solely on the row-content check below.
-            await self._poll_until(_write_invoked, attempts=20, interval=0.01)
+            await _poll_until(_write_invoked, attempts=20, interval=0.01)
 
         assert injection_fired, (
             'the clobber-guard read never ran — this test no longer '
@@ -5351,9 +5333,9 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
 async def _poll_until(predicate, *, attempts=200, interval=0.01):
     """Poll an async zero-arg *predicate* (bounded: up to `attempts` tries,
     `interval` seconds apart — a 2s ceiling at the defaults) instead of a
-    fixed sleep. Module-level twin of
-    TestStage2CycleSummaryHarnessBackstop._poll_until (test_harness.py:2695)
-    for the module-level second-cancellation tests below: a shield's
+    fixed sleep. Shared by the module-level second-cancellation tests below
+    and by `TestStage2CycleSummaryHarnessBackstop` (task 4431 amendment —
+    each previously defined its own copy of this helper): a shield's
     detached inner Task can finish its write AFTER `await outer_task`
     returns, and fused-memory's pytest timeout_method="thread" hard-exits
     the worker at 60s, so these tests must self-bound rather than guess a
@@ -5368,35 +5350,107 @@ async def _poll_until(predicate, *, attempts=200, interval=0.01):
     return result
 
 
+async def _drive_cancelling_first_stage_report_write(
+    harness, journal, stage_entered, make_task,
+):
+    """Drive `make_task()` under a second cancellation injected from inside
+    `journal.update_run_stage_reports`'s first call — the shared rig behind
+    the three task-4431 tests below, which differ only in which driver
+    `make_task` invokes (`run_full_cycle` vs `_run_remediation_pass`) and in
+    their post-hoc assertions. Mirrors
+    `TestStage2CycleSummaryHarnessBackstop._drive_degraded_arm_cancelling_first_identity_read`
+    for the finally-block persistence write instead of the clobber-guard
+    identity read.
+
+    `stage_entered` is the caller's `asyncio.Event`, set by whichever stage
+    the caller made slow — used to race against `outer_task` so the first
+    cancellation is guaranteed to land inside the driver's try block rather
+    than during pre-try setup.
+
+    Returns `(outer_task, injection_fired)` — the finished (cancelled)
+    outer task, and whether the self-cancelling stub actually ran. Callers
+    MUST assert `injection_fired` — otherwise no second cancellation was
+    ever delivered and the rest of the test silently exercises a path that
+    doesn't discriminate the fix.
+    """
+    outer_task_ref: list = [None]
+    original_update = journal.update_run_stage_reports
+    first_call = [True]
+
+    async def self_cancelling_update(run_id, stage_reports):
+        if first_call[0]:
+            first_call[0] = False
+            # Simulate a second external cancellation (e.g. server shutdown)
+            # arriving while the finally's persistence write is in flight.
+            outer_task_ref[0].cancel()
+            # Without asyncio.shield: this await runs in the outer task's own
+            # context, so the pending cancel fires here — CancelledError
+            # aborts the write before it ever reaches original_update.
+            # With asyncio.shield: this coroutine runs inside shield's own
+            # inner Task, unreached by the outer cancel, so sleep(0)
+            # completes and the write below proceeds.
+            await asyncio.sleep(0)
+        return await original_update(run_id, stage_reports)
+
+    journal.update_run_stage_reports = self_cancelling_update
+
+    outer_task = asyncio.create_task(make_task())
+    outer_task_ref[0] = outer_task
+
+    # Race the event against outer_task to avoid an infinite hang if the
+    # driver fails before the slowed stage is ever invoked.
+    done, _ = await asyncio.wait(
+        [asyncio.ensure_future(stage_entered.wait()), outer_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if outer_task in done and not stage_entered.is_set():
+        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
+        pytest.fail(f'outer_task completed before the slowed stage was invoked: {exc}')
+
+    # First cancellation: triggers CancelledError in the slowed stage, which
+    # propagates to the finally — whose update_run_stage_reports call
+    # delivers the SECOND cancellation via self_cancelling_update.
+    outer_task.cancel()
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await outer_task
+
+    journal.update_run_stage_reports = original_update
+
+    return outer_task, not first_call[0]
+
+
 @pytest.mark.asyncio
 async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_cancellation(
     journal, event_buffer, mock_memory_service,
 ):
-    """Task 4431: run_full_cycle's `finally` must shield
-    `update_run_stage_reports` (harness.py:3551) against a second
+    """Task 4431: `ReconciliationHarness.run_full_cycle`'s `finally` must
+    shield its `update_run_stage_reports` call against a second
     cancellation.
 
-    Reviewer finding: `_flush_cycle_summaries` (harness.py:3548) is careful
-    — it never raises and shields its own writes — but the very
-    `update_run_stage_reports` call its markers exist to reach is awaited
-    UNSHIELDED one line later. On an already-being-cancelled path, a second
-    CancelledError arriving while that write is in flight re-raises at this
-    unshielded await, so the persisted stage_reports — including the
-    `_error` breadcrumb the `except asyncio.CancelledError` handler stamps
-    at harness.py:3485-3490 — never lands.
+    Reviewer finding: `_flush_cycle_summaries` (called earlier in the same
+    `finally`) is careful — it never raises and shields its own writes —
+    but the very `update_run_stage_reports` call its markers exist to reach
+    was awaited UNSHIELDED one line later. On an already-being-cancelled
+    path, a second CancelledError arriving while that write is in flight
+    re-raises at this unshielded await, so the persisted stage_reports —
+    including the `_error` breadcrumb the `except asyncio.CancelledError`
+    handler stamps — never lands.
 
     Mirrors test_cancellation_cleanup_shielded_from_second_cancel above,
     but injects the second cancellation FROM WITHIN
     `journal.update_run_stage_reports` itself rather than from
     `journal.complete_run` (design decision 4): on the cancellation path,
-    the finally's call is the ONLY update_run_stage_reports invocation
-    (stage 0 is cancelled long before the success-path call at line 3405),
-    so a one-shot injection targets it unambiguously.
+    the finally's call is the ONLY update_run_stage_reports invocation —
+    the success-path call inside the `try` is never reached, since stage 0
+    is cancelled long before it — so a one-shot injection targets it
+    unambiguously.
 
-    Unshielded (today, RED): the stub body runs in the outer task's own
-    context, so `await asyncio.sleep(0)` after the self-cancel raises
-    CancelledError; the real write never runs; the persisted stage_reports
-    stays empty/stale.
+    Without the shield on this call, the persisted stage_reports stays
+    empty: the self-cancelling stub runs in the outer task's own context,
+    so `await asyncio.sleep(0)` after the self-cancel raises CancelledError
+    before the real write ever runs. This test is the regression guard for
+    that.
     """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     # task σ's resume_after_restart defaults on and would take the
@@ -5429,55 +5483,12 @@ async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_ca
 
     await event_buffer.push(_make_event())
 
-    # Capture the outer task reference so the mock can cancel it from within.
-    outer_task_ref: list = [None]
-    original_update = journal.update_run_stage_reports
-    first_call = [True]
-
-    async def self_cancelling_update(run_id, stage_reports):
-        if first_call[0]:
-            first_call[0] = False
-            # Simulate a second external cancellation (e.g. server shutdown)
-            # arriving while the finally's persistence write is in flight.
-            outer_task_ref[0].cancel()
-            # Without asyncio.shield: this await runs in the outer task's own
-            # context, so the pending cancel fires here — CancelledError
-            # aborts the write before it ever reaches original_update.
-            # With asyncio.shield: this coroutine runs inside shield's own
-            # inner Task, unreached by the outer cancel, so sleep(0)
-            # completes and the write below proceeds.
-            await asyncio.sleep(0)
-        return await original_update(run_id, stage_reports)
-
-    journal.update_run_stage_reports = self_cancelling_update
-
-    outer_task = asyncio.create_task(
-        harness.run_full_cycle('test-project', 'buffer_size:1'),
+    _outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
     )
-    outer_task_ref[0] = outer_task
 
-    # Race the event against outer_task to avoid an infinite hang if
-    # run_full_cycle fails before slow_stage_run is invoked.
-    done, _ = await asyncio.wait(
-        [asyncio.ensure_future(stage_entered.wait()), outer_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    if outer_task in done and not stage_entered.is_set():
-        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
-        pytest.fail(f'outer_task completed before slow_stage_run was invoked: {exc}')
-
-    # First cancellation: triggers CancelledError in slow_stage_run, which
-    # propagates to the except/finally chain and reaches the finally's
-    # update_run_stage_reports call — where self_cancelling_update delivers
-    # the SECOND cancellation.
-    outer_task.cancel()
-
-    with contextlib.suppress(asyncio.CancelledError):
-        await outer_task
-
-    journal.update_run_stage_reports = original_update
-
-    assert not first_call[0], (
+    assert injection_fired, (
         'self_cancelling_update never ran — this test no longer exercises '
         "the finally's update_run_stage_reports call, so it would pass "
         'vacuously regardless of whether the shield fix is present'
@@ -5505,8 +5516,8 @@ async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_ca
 async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_cancellation(
     journal, event_buffer, mock_memory_service,
 ):
-    """Task 4431: _run_remediation_pass's finally (harness.py:5459) must
-    shield update_run_stage_reports (harness.py:5479) against a second
+    """Task 4431: `ReconciliationHarness._run_remediation_pass`'s `finally`
+    must shield its `update_run_stage_reports` call against a second
     cancellation — the undocumented structural mirror of run_full_cycle's
     finally, already covered above by
     test_run_full_cycle_finally_persists_stage_reports_despite_a_second_cancellation.
@@ -5527,10 +5538,11 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
     stub, one-shot-guarded, cancelling the driving task and yielding once
     before delegating to the real implementation.
 
-    Expected to FAIL on the tree produced by step 2 (which shielded only
-    run_full_cycle) — that failure is the evidence this mirror is genuinely
-    unfixed, per harness.py:5473-5474's claim that update_run_stage_reports
-    is "placed strictly before ... so the persisted copy captures whatever
+    Without the shield on this call, this mirror site loses Stage 1's
+    report the same way run_full_cycle's finally loses its `_error`
+    breadcrumb above — this test is the regression guard for that, and for
+    the comment on this finally's claim that update_run_stage_reports is
+    "placed strictly before ... so the persisted copy captures whatever
     markers either arm stamped."
     """
     from fused_memory.reconciliation.harness import TierConfig
@@ -5562,30 +5574,9 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
     harness.stages[1].run = slow_stage_run
     _mock_stage_run(harness.stages[2])
 
-    # Capture the outer task reference so the mock can cancel it from within.
-    outer_task_ref: list = [None]
-    original_update = journal.update_run_stage_reports
-    first_call = [True]
-
-    async def self_cancelling_update(run_id, stage_reports):
-        if first_call[0]:
-            first_call[0] = False
-            # Simulate a second external cancellation arriving while the
-            # finally's persistence write is in flight.
-            outer_task_ref[0].cancel()
-            # Without asyncio.shield: this await runs in the outer task's own
-            # context, so the pending cancel fires here — CancelledError
-            # aborts the write before it ever reaches original_update.
-            # With asyncio.shield: this coroutine runs inside shield's own
-            # inner Task, unreached by the outer cancel, so sleep(0)
-            # completes and the write below proceeds.
-            await asyncio.sleep(0)
-        return await original_update(run_id, stage_reports)
-
-    journal.update_run_stage_reports = self_cancelling_update
-
-    outer_task = asyncio.create_task(
-        harness._run_remediation_pass(
+    _outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness._run_remediation_pass(
             'test-project',
             'parent-run-id',
             [_make_s3_findings()[0]],
@@ -5593,30 +5584,8 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
             scope=_scope('test-project', '/tmp/test-project'),
         ),
     )
-    outer_task_ref[0] = outer_task
 
-    # Race the event against outer_task to avoid an infinite hang if the
-    # remediation pass fails before slow_stage_run (Stage 2) is invoked.
-    done, _ = await asyncio.wait(
-        [asyncio.ensure_future(stage_entered.wait()), outer_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    if outer_task in done and not stage_entered.is_set():
-        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
-        pytest.fail(f'outer_task completed before slow_stage_run was invoked: {exc}')
-
-    # First cancellation: triggers CancelledError in slow_stage_run (Stage 2),
-    # which propagates uncaught (no except asyncio.CancelledError handler on
-    # this driver) straight to the finally, whose update_run_stage_reports
-    # call delivers the SECOND cancellation via self_cancelling_update.
-    outer_task.cancel()
-
-    with contextlib.suppress(asyncio.CancelledError):
-        await outer_task
-
-    journal.update_run_stage_reports = original_update
-
-    assert not first_call[0], (
+    assert injection_fired, (
         'self_cancelling_update never ran — this test no longer exercises '
         "_run_remediation_pass's finally update_run_stage_reports call, so "
         'it would pass vacuously regardless of whether the shield fix is present'
@@ -5639,11 +5608,11 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
     )
     assert 'memory_consolidator' in persisted.stage_reports, (
         "_run_remediation_pass's finally must shield update_run_stage_reports "
-        '(harness.py:5479) so a second cancellation cannot discard the Stage 1 '
-        'report already recorded in run.stage_reports before this finally ran '
-        "— harness.py:5473-5474's claim that the call is \"placed strictly "
-        'before update_run_stage_reports so the persisted copy captures '
-        'whatever markers either arm stamped" is hollow while this write '
+        'so a second cancellation cannot discard the Stage 1 report already '
+        'recorded in run.stage_reports before this finally ran — the '
+        'comment on this finally claims the call is "placed strictly before '
+        'update_run_stage_reports so the persisted copy captures whatever '
+        'markers either arm stamped", which is hollow while this write '
         'stays unshielded'
     )
 
@@ -5663,11 +5632,11 @@ async def test_shielded_stage_report_persistence_still_propagates_cancellation(
 
     Passes both BEFORE and AFTER the task-4431 shield fix by design, the
     same shape as task 4128's
-    test_degraded_arm_still_skips_an_existing_row_under_a_second_cancellation
-    (test_harness.py:2800): asyncio.shield alone never suppresses the outer
-    task's own cancellation, only an added `except BaseException` around it
-    would — so this test's job is to keep failing that hypothetical future
-    change, not to distinguish the fix in this task.
+    `TestStage2CycleSummaryHarnessBackstop.test_degraded_arm_still_skips_an_existing_row_under_a_second_cancellation`:
+    asyncio.shield alone never suppresses the outer task's own
+    cancellation, only an added `except BaseException` around it would —
+    so this test's job is to keep failing that hypothetical future change,
+    not to distinguish the fix in this task.
 
     Also pins that the shield does not change the run's terminal
     disposition: status must still read 'failed' (the branch
@@ -5700,40 +5669,12 @@ async def test_shielded_stage_report_persistence_still_propagates_cancellation(
 
     await event_buffer.push(_make_event())
 
-    outer_task_ref: list = [None]
-    original_update = journal.update_run_stage_reports
-    first_call = [True]
-
-    async def self_cancelling_update(run_id, stage_reports):
-        if first_call[0]:
-            first_call[0] = False
-            outer_task_ref[0].cancel()
-            await asyncio.sleep(0)
-        return await original_update(run_id, stage_reports)
-
-    journal.update_run_stage_reports = self_cancelling_update
-
-    outer_task = asyncio.create_task(
-        harness.run_full_cycle('test-project', 'buffer_size:1'),
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
     )
-    outer_task_ref[0] = outer_task
 
-    done, _ = await asyncio.wait(
-        [asyncio.ensure_future(stage_entered.wait()), outer_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    if outer_task in done and not stage_entered.is_set():
-        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
-        pytest.fail(f'outer_task completed before slow_stage_run was invoked: {exc}')
-
-    outer_task.cancel()
-
-    with contextlib.suppress(asyncio.CancelledError):
-        await outer_task
-
-    journal.update_run_stage_reports = original_update
-
-    assert not first_call[0], (
+    assert injection_fired, (
         'self_cancelling_update never ran — this test no longer exercises '
         "the finally's update_run_stage_reports call"
     )
