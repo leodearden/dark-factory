@@ -2047,6 +2047,49 @@ class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
         assert set(report['targeted_correction_ids']) == {'m1', 'l1'}
 
     @pytest.mark.asyncio
+    async def test_apply_report_accounts_for_every_enumerated_member(self):
+        """The two views of "protected" are pinned against each other.
+
+        run() pre-subtracts, so the choke-point guard has nothing left to
+        catch and its refusal list must come back empty — which is what makes
+        ``deleted + len(failed) == orphan_count`` hold, i.e. the report's
+        delete count is fully accounted for. The guard exists for the case
+        where that stops being true, so the invariant it relies on is pinned
+        mechanically here rather than only asserted in a comment: a future
+        edit that reorders or drops the partition fails this test instead of
+        silently over-reporting the delete set in the nightly JSON.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['enforced_protected_skipped'] == [], (
+            'The choke-point guard fired on a delete set run() had already '
+            'partitioned — the two protected views have diverged: '
+            f"{report['enforced_protected_skipped']!r}"
+        )
+        assert report['deleted'] + len(report['failed']) == report['orphan_count']
+        # And the enumeration-scoped view still reports the full finding.
+        assert report['protected_skipped_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_enforced_protected_skipped_is_apply_only(self):
+        """Apply-only, exactly like the sibling deleted/failed/tombstoned
+        keys — a dry run performs no delete, so it refused nothing."""
+        members = [_orphan('o1'), _mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert 'enforced_protected_skipped' not in report
+        assert json.dumps(report)
+
+    @pytest.mark.asyncio
     async def test_the_subtraction_is_logged_at_warning(self, caplog):
         """The subtraction is never silent in the journal.
 

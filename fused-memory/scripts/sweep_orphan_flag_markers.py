@@ -861,6 +861,18 @@ async def run(
               audit trail (typically no ``recon_ledger`` wired, or a failed
               batch write — both logged at WARNING); it never indicates a
               failed delete, which is reported by ``failed`` instead.
+            - enforced_protected_skipped (list[str], only when
+              apply=True): ids the UNCONDITIONAL guard inside
+              :func:`delete_orphan_markers` refused at the delete choke
+              point. Normally ``[]``, because the protected subtraction
+              above already removed them from the delete set — so a
+              non-empty value means the choke-point guard caught something
+              that partition did not, and it is the only key that accounts
+              for ``deleted + len(failed) < orphan_count``. Deliberately
+              NOT merged into ``protected_skipped_ids``, which is
+              enumeration-scoped and answers a different question (what
+              this script's filter matched, vs. what was refused at the
+              door).
             - after (dict with counts, only when apply=True)
     """
     project_id: str = getattr(args, 'project_id', 'dark_factory')
@@ -1185,6 +1197,18 @@ async def run(
         report['deleted'] = delete_result['deleted']
         report['failed'] = delete_result['failed']
         report['tombstoned'] = delete_result['tombstoned']
+        # What the CHOKE-POINT guard actually refused, as distinct from what
+        # the enumeration-scoped partition above skipped. Today it is always
+        # [] — the partition hands delete_orphan_markers a delete set the
+        # guard has nothing left to catch — and that identity is exactly what
+        # must not degrade silently: without this key, a future edit that
+        # reorders or drops the partition would make the guard fire, leave
+        # deleted + len(failed) < orphan_count, and put NOTHING in the report
+        # accounting for the difference (protected_skipped_ids reports the
+        # enumeration, not what was refused at the door). Reported under its
+        # own name rather than unioned into protected_skipped_ids so the two
+        # views stay distinguishable; the identity is pinned by a test.
+        report['enforced_protected_skipped'] = delete_result['protected_skipped']
 
         # After counts
         after_source = await memory_service.count_memories_by_metadata(
