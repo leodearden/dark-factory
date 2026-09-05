@@ -150,6 +150,17 @@ note() { report="${report}$1"$'\n'; }
 # shell, never from inside a `$(...)` — see the note above read_ref_file.
 record_fail() { fail=1; failed_items="${failed_items}${1} "; }
 
+# Did item $1 record a failure? Derived from failed_items -- the SAME string
+# the authoritative `FAILING ITEMS:` line below is built from -- so the
+# RESULT block's ownership prose can never disagree with it again. A `case`
+# glob, deliberately: no pipe (see item 1's SIGPIPE note above) and no
+# `$(...)` subshell (see the note above read_ref_file). Tolerates the
+# multi-word `record_fail '2 4'` on the unreadable-EVAL branch below: the
+# comparison is " $failed_items" against "*\" $1 \"*", and failed_items
+# already carries a TRAILING space per entry, so " 2 4 " matches both
+# *" 2 "* and *" 4 "*.
+item_failed() { case " $failed_items" in *" $1 "*) return 0 ;; esac; return 1; }
+
 # item 1 extracts the ref's package tree to a temp dir. `git archive` is
 # read-only and touches no .git state, unlike `git worktree add` -- which
 # matters in this repo, where refs are shared across every worktree.
@@ -368,8 +379,16 @@ note ""
 if [ "$fail" -eq 0 ]; then
   note "RESULT: all preconditions satisfied — the flip may proceed."
 else
-  note "RESULT: preconditions NOT satisfied. Items 2 and 4 are task 4762's (priority"
-  note "        high); see its description and details for the verbatim findings."
+  note "RESULT: preconditions NOT satisfied."
+  triage_subject=''
+  if item_failed 2 && item_failed 4; then triage_subject='Items 2 and 4 are'
+  elif item_failed 2; then triage_subject='Item 2 is'
+  elif item_failed 4; then triage_subject='Item 4 is'
+  fi
+  if [ -n "$triage_subject" ]; then
+    note "        $triage_subject task 4762's (priority high); see its description"
+    note "        and details for the verbatim findings."
+  fi
   note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
   note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
   note "        satisfies it. See its report above for what was measured."
