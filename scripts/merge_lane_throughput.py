@@ -592,3 +592,115 @@ def compute_verify_by_runner(
             'fallback_reasons': dict(fallbacks.get(runner, Counter())),
         }
     return {'runners': runners, 'fallback_key_present': fallback_key_present}
+
+
+# ---------------------------------------------------------------------------
+# Section: remote-host occupancy — three estimators, deliberately unreconciled.
+# ---------------------------------------------------------------------------
+
+
+def compute_occupancy(
+    heartbeat_events: Sequence[dict[str, Any]],
+    verify_events: Sequence[dict[str, Any]],
+    lo: datetime,
+    hi: datetime,
+) -> dict[str, Any]:
+    """Estimate per-host verify-slot occupancy THREE independent ways.
+
+    `merge_heartbeat` carries ``data['hosts']``, a list of
+    ``{name, is_local, slot_state, quarantined, ...}`` (see
+    `verify_runner.py::_SLOT_WIRE`); ``slot_state`` is one of 'free', 'busy',
+    'parked' or None, and ``hosts`` is ``[]`` before the allocator has ever
+    dispatched.
+
+    The three estimators, each reported per host and NEVER reconciled:
+
+    ``locf_busy_fraction``
+        Last-observation-carried-forward integral: each sample holds its
+        ``slot_state`` until that host's next sample, and the final sample is
+        carried to *hi*.  The denominator is the host's OBSERVED span — from
+        its first sample to *hi*, reported as ``observed_span_minutes`` — not
+        the whole window, so a host that appeared halfway through is not
+        charged as idle for hours nobody looked at it.
+    ``raw_sample_fraction``
+        Busy samples over total samples.  Unweighted, so it over-weights
+        whatever the heartbeat cadence happened to sample densely.
+    ``verify_duration_fraction``
+        Sum of that host's `merge_verify` ``data['duration_ms']`` over the FULL
+        window span.  ``None`` when the host ran no verify in the window.
+
+    They use different denominators and different evidence, which is part of
+    why they disagree.  DO NOT collapse them (plan decision 4, PRD
+    § Decomposition A).  RE-MEASURED on this branch against the live reify
+    store over the dated window
+    2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00, the laptop's spread
+    was LOCF 22.2% — the PRD's row — against raw-sample 33.4% (n=2506 samples)
+    against verify-duration-sum 1.3%.  The disagreement is the signal
+    the downstream decomposition needs; a single blended figure would destroy
+    it.
+
+    'parked' and None count as not-busy, but every observed state is reported
+    in ``slot_states`` so a quarantine ('parked') never disappears into a bland
+    "not busy".
+
+    Returns ``{'hosts': {name: {...}}, 'n_heartbeats': int,
+    'window_span_minutes': float}``.
+    """
+    window_span_minutes = (hi - lo).total_seconds() / 60.0
+
+    samples: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
+    for event in heartbeat_events:
+        ts = _parse_ts(event.get('timestamp'))
+        if ts is None:
+            continue
+        hosts = event.get('data', {}).get('hosts')
+        if not isinstance(hosts, list):
+            continue
+        for host in hosts:
+            if not isinstance(host, dict):
+                continue
+            name = host.get('name')
+            if not name:
+                continue
+            samples[str(name)].append((ts, host.get('slot_state') or UNKNOWN))
+
+    verify_minutes: dict[str, float] = defaultdict(float)
+    for event in verify_events:
+        data = event.get('data', {})
+        minutes = _duration_minutes(data)
+        if minutes is not None and data.get('runner'):
+            verify_minutes[str(data['runner'])] += minutes
+
+    hosts_out: dict[str, Any] = {}
+    for name, host_samples in samples.items():
+        ordered = sorted(host_samples, key=lambda pair: pair[0])
+        busy_seconds = 0.0
+        for i, (ts, state) in enumerate(ordered):
+            end = ordered[i + 1][0] if i + 1 < len(ordered) else hi
+            if state == 'busy' and end > ts:
+                busy_seconds += (end - ts).total_seconds()
+        observed_span_minutes = (hi - ordered[0][0]).total_seconds() / 60.0
+        n_busy = sum(1 for _, state in ordered if state == 'busy')
+        host_verify = verify_minutes.get(name)
+        hosts_out[name] = {
+            'locf_busy_fraction': (
+                busy_seconds / 60.0 / observed_span_minutes
+                if observed_span_minutes > 0 else None
+            ),
+            'observed_span_minutes': observed_span_minutes,
+            'raw_sample_fraction': n_busy / len(ordered),
+            'n_samples': len(ordered),
+            'n_busy_samples': n_busy,
+            'verify_duration_fraction': (
+                host_verify / window_span_minutes
+                if host_verify is not None and window_span_minutes > 0 else None
+            ),
+            'verify_minutes': host_verify,
+            'slot_states': dict(Counter(state for _, state in ordered)),
+        }
+
+    return {
+        'hosts': hosts_out,
+        'n_heartbeats': len(heartbeat_events),
+        'window_span_minutes': window_span_minutes,
+    }
