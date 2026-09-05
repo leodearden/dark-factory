@@ -1131,3 +1131,120 @@ def test_occupancy_verify_fraction_is_none_when_a_host_ran_no_verify():
 def test_occupancy_stamps_the_window_span_it_divided_by():
     result = _occ_result()
     assert result['window_span_minutes'] == pytest.approx(600.0)
+
+
+# ---------------------------------------------------------------------------
+# compute_speculation
+#
+# The depth ASYMMETRY is the trap: `_emit_speculative` str-coerces every value,
+# so speculative_merge.data.depth is a STR ("0"), while merge_verify.data.depth
+# is a native int|None. The two distributions are kept SEPARATE so nothing ever
+# aggregates across the types.
+# ---------------------------------------------------------------------------
+
+
+def _sm(task_id, minute, depth) -> dict[str, Any]:
+    return {'timestamp': _ts(11, 3, minute), 'task_id': task_id,
+            'data': {'base_sha': f'sha{minute}', 'depth': depth}}
+
+
+def _vv(task_id, minute, point, reason='chain_dead') -> dict[str, Any]:
+    return {'timestamp': _ts(11, 7, minute), 'task_id': task_id,
+            'data': {'dead_link': f'l{minute}', 'reason': reason, 'point': point}}
+
+
+def _spec_fixture():
+    speculative = [
+        _sm('s1', 0, '0'), _sm('s2', 1, '0'), _sm('s3', 2, '1'),
+        _sm('s4', 3, '2'), _sm('s5', 4, None), _sm('s6', 5, 'not-a-depth'),
+    ]
+    voided = [
+        _vv('s1', 0, 'dispatch'), _vv('s2', 1, 'dispatch'),
+        _vv('s3', 2, 'adoption'), _vv('s4', 3, 'dispatch', reason='other'),
+    ]
+    verify = [
+        _v('L1', 4, 0, 600_000, depth=0, speculative=False),
+        _v('L2', 4, 1, 600_000, depth=1, speculative=True),
+        _v('L3', 4, 2, 600_000, depth=1, speculative=False),
+        _v('L4', 4, 3, 600_000, depth=None, speculative=False),
+    ]
+    finalized = [_f('L1', 5, 0), _f('L2', 5, 1), _f('L3', 5, 2)]
+    return speculative, voided, verify, finalized
+
+
+def _spec_result():
+    return mlt.compute_speculation(*_spec_fixture())
+
+
+def test_speculation_coerces_str_depth_and_skips_unusable_values():
+    dist = _spec_result()['speculative_depth']
+    # "0","0","1","2" coerce; None and 'not-a-depth' are skipped, not crashes
+    # and not a zero bucket.
+    assert dist['distribution'] == {0: 2, 1: 1, 2: 1}
+    assert dist['n_coerced'] == 4
+    assert dist['n_skipped'] == 2
+
+
+def test_speculation_keeps_the_verify_depth_distribution_separate():
+    result = _spec_result()
+    assert result['verify_depth']['distribution'] == {0: 1, 1: 2}
+    assert result['verify_depth']['n_skipped'] == 1
+    # Two distributions, never summed: one is keyed off str depths, the other
+    # off native ints, and merging them would silently double-count.
+    assert result['verify_depth'] is not result['speculative_depth']
+
+
+def test_speculation_void_rate_counts_only_chain_dead():
+    result = _spec_result()
+    # 3 chain_dead voids over 6 speculative merges. The fourth voided row
+    # carries reason='other' and is excluded from the numerator.
+    assert result['void_rate'] == pytest.approx(0.5)
+    assert result['n_voided_chain_dead'] == 3
+    assert result['n_speculative'] == 6
+
+
+def test_speculation_tallies_the_void_point():
+    assert _spec_result()['void_points'] == {'dispatch': 2, 'adoption': 1}
+
+
+def test_speculation_ahead_landing_share_is_matched_over_total():
+    result = _spec_result()
+    # L1 had a speculative_merge? No — but L2 has a speculative merge_verify,
+    # and L3 has neither. Only tasks with speculative evidence count.
+    assert result['speculative_ahead']['total'] == 3
+    assert result['speculative_ahead']['matched'] == 1
+    assert result['speculative_ahead']['share'] == pytest.approx(1 / 3)
+
+
+def test_speculation_ahead_counts_a_preceding_speculative_merge_too():
+    speculative, voided, verify, finalized = _spec_fixture()
+    speculative = [*speculative, _sm('L3', 6, '1')]
+    result = mlt.compute_speculation(speculative, voided, verify, finalized)
+    assert result['speculative_ahead']['matched'] == 2
+
+
+def test_speculation_ignores_a_speculative_merge_after_the_landing():
+    speculative, voided, verify, finalized = _spec_fixture()
+    # _sm builds a 03:xx timestamp; this landing is at 02:00, so the
+    # speculative merge happened afterwards and is not evidence for it.
+    finalized = [{'timestamp': _ts(11, 2, 0), 'task_id': 'LATE',
+                  'data': {'state': 'done'}}]
+    speculative = [*speculative, _sm('LATE', 7, '1')]
+    result = mlt.compute_speculation(speculative, voided, verify, finalized)
+    assert result['speculative_ahead']['matched'] == 0
+
+
+def test_speculation_returns_none_rates_on_a_zero_speculation_window():
+    result = mlt.compute_speculation([], [], [], [])
+    # None, not 0.0: "nothing speculated in this window" is not "speculation
+    # was tried and never voided".
+    assert result['void_rate'] is None
+    assert result['speculative_ahead']['share'] is None
+    assert result['n_speculative'] == 0
+    assert result['speculative_depth']['distribution'] == {}
+
+
+def test_speculation_void_rate_is_none_when_voids_exist_without_speculation():
+    result = mlt.compute_speculation([], [_vv('x', 0, 'dispatch')], [], [])
+    assert result['void_rate'] is None
+    assert result['n_voided_chain_dead'] == 1
