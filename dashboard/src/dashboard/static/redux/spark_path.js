@@ -376,11 +376,39 @@ function axisY(value, geom) {
 // axis. So this is opt-in per caller, and LineChart's default stays
 // `(v) => String(v)`.
 //
+// A THIRD OPTION EXISTS AND IS DEFERRED, NOT OVERLOOKED (esc-4232 review).
+// Blanking is the better of the two options above, but both of them take the
+// axis maximum as given. What charting libraries actually do is snap it: round
+// maxV UP to a multiple of the tick count (7 -> 8, 999 -> 1000) so every tick
+// is whole and NOTHING is either fabricated or omitted. The cost of not doing
+// that is now measured, over every integer maxV in 1..200: 100 axes label only
+// 2 of 5 ticks (floor + peak), 50 label 3, and 50 label all 5 — so on
+// arbitrary count data roughly half of all renders lose three gridline labels,
+// and maxV=999 reads `0 ... 999` with three bare gridlines.
+//
+// It is deferred because a caller cannot reach maxV from here. LineChart
+// computes `plottableMax(all, 1)` internally and this function only sees the
+// tick it is handed, so snapping means changing LineChart's OWN scale — its
+// range, its gridline positions and the height every plotted point maps to —
+// which is a chart-geometry change across all eight of its call sites and all
+// of StackedAreaChart's, not a label change. Task 4232 is scoped to labels and
+// its plan freezes LineChart's tick generator (task 4059's
+// `test_line_chart_hands_format_y_the_raw_tick` pins it). A `niceCountMax`
+// belongs with that geometry change, in its own task; blanking is strictly
+// better than today's fabricated fractions in the meantime, and is forward-
+// compatible — under a snapped maximum every tick is whole, so this function
+// labels all five and the blank branch simply stops being reached.
+//
 // Non-finite and absent input yields '' rather than `String(v)`: this is
 // called from inside a JSX render, so `NaN`/`undefined` must never reach an
 // axis as text and it must never throw (one exception blanks the whole chart).
+// `Number.isInteger` is the WHOLE guard for that, with no finiteness conjunct
+// beside it: unlike the global `isNaN`/`parseInt` family it does not coerce, so
+// it returns false for every non-number (`null`, `undefined`, `'4'`, `{}`) and
+// for `NaN`/`±Infinity` on its own. Verified under node — the two spellings
+// never diverge on any input.
 function formatCountTick(v) {
-  return Number.isFinite(v) && Number.isInteger(v) ? String(v) : '';
+  return Number.isInteger(v) ? String(v) : '';
 }
 
 // ── Line + area path builder for a PADDED chart (charts.jsx's `LineChart`) ─

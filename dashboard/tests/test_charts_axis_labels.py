@@ -199,6 +199,10 @@ _SPARK_PATH_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_
 # nested `{}` in the export literal fails HERE, naming the coupling, instead of
 # there as an opaque "could not parse the DF_CHARTS exports".
 _DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
+# The CONSUMER side of that export, for the last hop of the route (tabs.jsx).
+# Same pattern as test_charts_consumer_bindings.py:43 and test_tab_burndown.py,
+# again copied rather than imported.
+_DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
 
 _SPARK_PATH_JS = (
     Path(__file__).resolve().parent.parent
@@ -242,6 +246,20 @@ def _df_charts_export_names(charts_jsx_body: str) -> set:
         'unrelated-looking message. Keep every export a bare identifier.'
     )
     return _binding_names(m.group(1))
+
+
+def _df_charts_destructure(src: str) -> set:
+    """Names ``src`` pulls off ``window.DF_CHARTS`` by destructure, across all of them."""
+    matches = list(_DF_CHARTS_DESTRUCTURE_RE.finditer(src))
+    assert matches, (
+        'this source no longer has a `const { ... } = window.DF_CHARTS` destructure '
+        'at all — either it was rewired onto a namespace binding (`const C = '
+        'window.DF_CHARTS`, which needs no per-name entry and would make the '
+        'assertion below inapplicable rather than failing) or the binding list grew '
+        'a nested brace this extractor cannot read. Not returning an empty set, '
+        'because that would make the binding assertion vacuously GREEN.'
+    )
+    return {name for m in matches for name in _binding_names(m.group(1))}
 
 
 def _spark_path_module_surface() -> dict:
@@ -607,15 +625,12 @@ def test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts(
         'reference to an undefined identifier.'
     )
 
-    exported = _df_charts_export_names(charts_jsx_body)
-    assert 'formatCountTick' in exported, (
-        'charts.jsx does not re-export `formatCountTick` on window.DF_CHARTS. '
-        f'It exports {sorted(exported)}. tabs.jsx and tab_escalation_analytics.jsx '
-        'have no other route to the helper — they never touch DF_SPARK_PATH.'
-    )
-
     # The brace-hostile coupling, asserted in its own right so the constraint is
     # discoverable from the failure rather than only from the comment above.
+    # It MUST come before `_df_charts_export_names`, which runs the very same
+    # `search` and asserts on it internally: ordered the other way this line is
+    # unreachable, because the helper always raises first with a message that
+    # does not name test_tab_burndown.py.
     assert _DF_CHARTS_EXPORT_RE.search(charts_jsx_body) is not None, (
         'the window.DF_CHARTS export literal no longer parses under the '
         r'`window\.DF_CHARTS\s*=\s*\{([^{}]*)\}` pattern that '
@@ -625,12 +640,49 @@ def test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts(
         'export must stay a BARE IDENTIFIER.'
     )
 
+    exported = _df_charts_export_names(charts_jsx_body)
+    assert 'formatCountTick' in exported, (
+        'charts.jsx does not re-export `formatCountTick` on window.DF_CHARTS. '
+        f'It exports {sorted(exported)}. tabs.jsx and tab_escalation_analytics.jsx '
+        'have no other route to the helper — they never touch DF_SPARK_PATH.'
+    )
+
     surface = _spark_path_module_surface()
     assert surface.get('formatCountTick') == 'function', (
         'requiring the real spark_path.js did not yield a `formatCountTick` '
         f'function — its surface is {surface}. charts.jsx would then destructure '
         '`undefined` and hand it to LineChart as formatY, which throws on the '
         'first tick and blanks the entire chart.'
+    )
+
+
+def test_tabs_jsx_binds_format_count_tick_off_df_charts(tabs_jsx_body: str) -> None:
+    """tabs.jsx must DESTRUCTURE `formatCountTick`, or its two call sites throw.
+
+    The last hop of the route, and the only one no other test in the repo can
+    see. spark_path.js -> charts.jsx -> DF_CHARTS is pinned above; from there
+    the two tabs diverge. tab_escalation_analytics.jsx reads
+    `C.formatCountTick` off a namespace binding, so it needs no per-name entry
+    and cannot lose one. tabs.jsx names it in the line-2 destructure, and if
+    that entry were dropped the two `formatY={formatCountTick}` references
+    below become free identifiers: the shipped page throws a ReferenceError at
+    render and blanks the Memory and Merge tabs.
+
+    The behavioural tests further down do NOT cover this, and would stay GREEN
+    through it: `_line_chart_axis_program` binds `formatCountTick` off the real
+    spark_path module directly, precisely so it measures what the caller's
+    expression RENDERS rather than how the name reached it. Nor does
+    test_charts_consumer_bindings.py, which only checks the opposite direction
+    (destructured-but-never-used). This is the same silent two-token join the
+    routing test above exists to prevent, one file further along.
+    """
+    bound = _df_charts_destructure(tabs_jsx_body)
+    assert 'formatCountTick' in bound, (
+        'tabs.jsx does not bind `formatCountTick` in its `const { ... } = '
+        f'window.DF_CHARTS` destructure. It binds {sorted(bound)}. Its MemoryTab '
+        'reads/writes chart and MergeTab attempt-depth chart both pass '
+        '`formatY={formatCountTick}`, which without this entry is an undefined '
+        'identifier — a ReferenceError at render, not a fallback to the default.'
     )
 
 # ---------------------------------------------------------------------------
@@ -988,4 +1040,49 @@ def test_rounding_default_control_shows_the_ratio_guard_actually_fires() -> None
         'the caller extractor no longer reports "no formatY" on a verbatim '
         'pre-fix count call site, so it can no longer tell a wired caller from '
         'an unwired one.'
+    )
+
+
+# tabs.jsx's line-2 DF_CHARTS destructure exactly as it stood BEFORE step 6
+# wired the count formatter, and a DF_CHARTS export literal that grew a nested
+# brace — the two shapes the routing guards above are supposed to catch.
+_PRE_FIX_TABS_DESTRUCTURE = (
+    'const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, '
+    'HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, '
+    'defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = '
+    'window.DF_CHARTS;'
+)
+_NESTED_BRACE_EXPORT = 'window.DF_CHARTS = { LineChart, formatCountTick, PALETTE: { fg3 } };'
+
+
+def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> None:
+    """The two source-text guards added for the routing hops are discriminating.
+
+    Both assert on ABSENCE, which is the shape that rots silently: an extractor
+    that stopped matching would report "no formatCountTick" as "nothing to
+    check" and pass forever. So each is run against a frozen source in which it
+    must report the bad answer.
+
+    Also pins the ORDERING fix in the routing test: `_DF_CHARTS_EXPORT_RE` is
+    what fails on a nested-brace literal, and `_df_charts_export_names` raises on
+    the identical `search`, so only the standalone assertion placed BEFORE that
+    call can ever be the one that names test_tab_burndown.py in its message.
+    """
+    pre_fix = _df_charts_destructure(_PRE_FIX_TABS_DESTRUCTURE)
+    assert 'LineChart' in pre_fix, (
+        f'the DF_CHARTS destructure extractor misread the frozen pre-fix tabs.jsx '
+        f'binding list — it returned {sorted(pre_fix)}, which does not even '
+        'contain LineChart, so it is not reading binding names at all.'
+    )
+    assert 'formatCountTick' not in pre_fix, (
+        'the DF_CHARTS destructure extractor reports `formatCountTick` bound in a '
+        'source that predates the wiring, so it can no longer tell a wired '
+        'consumer from an unwired one and its assertion is vacuous.'
+    )
+
+    assert _DF_CHARTS_EXPORT_RE.search(_NESTED_BRACE_EXPORT) is None, (
+        'the brace-hostile export pattern now matches a literal containing a '
+        'nested brace, so neither this module nor test_tab_burndown.py:53 would '
+        'notice one being introduced — and test_tab_burndown.py would go on to '
+        'fail opaquely on an empty export set.'
     )
