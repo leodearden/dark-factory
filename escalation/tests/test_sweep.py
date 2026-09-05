@@ -312,6 +312,38 @@ class TestSweepSafety:
         assert report.skipped_unparsable == 1
         assert report.archived == 0
 
+    def test_undecodable_bytes_in_root_do_not_abort_the_pass(self, tmp_path: Path):
+        """A non-UTF-8 esc-*.json is counted unparsable; the pass still completes.
+
+        The sibling above writes ``b'{not valid json'`` -- valid UTF-8 that
+        fails at ``Escalation.from_json``.  This one fails EARLIER, inside
+        ``read_text()``'s decode, which is a different exception path:
+        ``UnicodeDecodeError`` subclasses ``ValueError`` and NOT ``OSError``,
+        so a read guard that catches only FileNotFoundError/OSError lets it
+        escape.  Blast radius when it does: ``run_startup_sweep`` is wrapped in
+        a bare ``except Exception`` by the escalation server, so the whole
+        startup pass -- archive, loose-reap, prune, lock-reap -- is skipped and
+        logged as merely non-fatal.  That is the whole-pass abort this class of
+        fix exists to eliminate, so it is pinned here.
+        """
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=self.RESOLVED_AT)
+        bad = tmp_path / 'esc-9-1.json'
+        bad.write_bytes(b'\xff\xfe\x00bad')
+
+        report = sweep.sweep(tmp_path, apply=True)
+
+        # The pass completed its real work despite the bad file.
+        assert report.archived == 1
+        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
+        # A content fault that STAYED in root -- not a benign relocation.
+        # Conflating the two would misreport corruption as a routine race.
+        assert report.skipped_unparsable == 1
+        assert report.skipped_vanished == 0
+        assert bad.exists()
+        # Arithmetic pinned against ground truth, not against a restatement
+        # of the formula.
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json')))
+
     def test_missing_resolved_at_on_resolved_file_skipped(self, tmp_path: Path):
         """resolved file with resolved_at=None stays in root, counted as skipped."""
         path = _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at=None)
@@ -775,6 +807,42 @@ class TestReapLooseArchiveFiles:
 
         assert loose_path.exists()
         assert count == 0
+
+    def test_undecodable_bytes_do_not_abort_the_reap(self, tmp_path: Path):
+        """A non-UTF-8 loose file is left in place; the reap still relocates the rest.
+
+        Distinct from the sibling above: ``b'{not valid json'`` is valid UTF-8
+        and fails at ``Escalation.from_json``, whereas these bytes fail inside
+        ``read_text()``'s decode.  ``UnicodeDecodeError`` subclasses
+        ``ValueError`` but not ``OSError``, so a read guard covering only
+        FileNotFoundError/OSError lets it escape and abort the whole reap pass.
+        """
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        good_path = archive_root / 'esc-1-1.json'
+        good_path.write_text(
+            Escalation(
+                id='esc-1-1',
+                task_id='1',
+                agent_role='test',
+                severity='info',
+                category='cleanup_needed',
+                summary='loose test',
+                status='resolved',
+                resolved_at='2026-05-20T10:00:00+00:00',
+            ).to_json()
+        )
+        bad_path = archive_root / 'esc-7-1.json'
+        bad_path.write_bytes(b'\xff\xfe\x00bad')
+
+        count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # The good record was still relocated -- the pass continued.
+        assert count == 1
+        assert (archive_root / '2026-05-20' / 'esc-1-1.json').exists()
+        assert not good_path.exists()
+        # The undecodable one is left exactly where it was, for an operator.
+        assert bad_path.exists()
 
 
     def test_reap_survives_a_loose_file_relocated_mid_scan(self, tmp_path: Path):
