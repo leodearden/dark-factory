@@ -18,7 +18,10 @@ logger = logging.getLogger(__name__)
 
 # Substantive SessionRecord fields a snapshot is keyed on. Deliberately
 # excludes start_ts/age-derived values so a purely-time-passing poll tick
-# (nothing on disk actually changed) diffs as a no-op.
+# (nothing on disk actually changed) diffs as a no-op. That rule is about
+# values that MOVE ON THEIR OWN, not about timestamps as such: build_snapshot
+# appends the record's question.asked_at for exactly the reason spelled out
+# in its docstring.
 _SNAPSHOT_FIELDS = (
     'status',
     'title',
@@ -206,12 +209,30 @@ def build_snapshot(
     Deliberately excludes start_ts/age so a quiet (nothing-changed) tick
     produces an identical snapshot -- this is what lets the app's poll
     rebuild the table only when something real changed (PRD §5).
+
+    question.asked_at is deliberately INCLUDED, and that is not in tension
+    with the exclusion rule above. This snapshot is the WAKE-UP TRIGGER for
+    CockpitApp._prune_overlays: _apply_scan short-circuits on an unchanged
+    snapshot, so a tick that diffs as a no-op never reaches _rebuild_queue
+    and never runs the prune. The trigger must therefore be AT LEAST AS
+    STRONG as the identity the prune keys an overlay on
+    (CockpitApp._ask_identity: `(question.text, question.asked_at)`) -- a
+    weaker trigger lets a real new ask pass the diff unnoticed and pins the
+    operator's stale drop forever, silently suppressing a live ask. Do not
+    "optimize" asked_at back out of this tuple.
+
+    It does NOT reintroduce the flicker the start_ts exclusion guards
+    against: asked_at is an on-disk stamp written only when a new Question
+    is stamped, unlike start_ts-derived age which moves on every tick by
+    construction. A quiet poll (nothing changed on disk) still diffs as a
+    no-op.
     """
     snapshot: dict[str, tuple] = {}
     for record in records:
         values = tuple(getattr(record, field) for field in _SNAPSHOT_FIELDS)
         question_text = record.question.text if record.question is not None else None
-        snapshot[record.session_slug] = (*values, question_text)
+        question_asked_at = record.question.asked_at if record.question is not None else None
+        snapshot[record.session_slug] = (*values, question_text, question_asked_at)
     return snapshot
 
 

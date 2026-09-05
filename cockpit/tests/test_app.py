@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -991,6 +991,539 @@ class TestDropRemovesAndPersists:
             # proving no registry write was attempted for a session row.
             reread = sr.read_record('awaiting-1', root=tmp_path)
             assert reread.status == sr.Status.AWAITING_INPUT
+
+
+class TestDroppedOverlayExpiresWithTheAsk:
+    @pytest.mark.timeout(10)
+    async def test_dropped_session_key_does_not_suppress_a_later_unrelated_ask(self, tmp_path):
+        """self._dropped is an in-memory overlay keyed by QueueItem.key, and
+        for a SESSION-backed row that key ('session:<slug>') is stable for
+        the session's whole lifetime. Dropping it must therefore expire once
+        the ask it was set against is gone -- otherwise a brand-new,
+        completely unrelated question from the SAME session is silently
+        suppressed for the cockpit's whole process lifetime, and the
+        operator never learns an agent is blocked on them.
+
+        The prune deliberately CANNOT copy self._handling's
+        `&= self._queue_items_by_key.keys()` predicate: a dropped item is by
+        construction absent from the rebuilt queue, so queue membership
+        would clear every drop on the very rebuild action_drop itself
+        triggers. Clause (b) below is the standing guard against that
+        mistake -- a live drop must survive an unrelated rebuild.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='drop title')
+        first_ask = _make_record(
+            session_slug='drop-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='First ask?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(first_ask, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            # (a) the operator drops the row -- it leaves the queue and the
+            # overlay records the suppression.
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+            assert 'session:drop-1' in app._dropped
+
+            # (b) GUARD: an unrelated session appears and forces a real
+            # rebuild. The live drop must SURVIVE it -- this is exactly what
+            # a copied `&= queue keys` prune would break.
+            other = _make_record(
+                session_slug='other-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=sr.Display(kind='wm', wm_title='other title'),
+                question=sr.Question(text='Unrelated ask?', asked_at='2026-07-07T01:00:00+00:00'),
+            )
+            sr.write_record(other, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.row_count == 1  # only other-1
+            assert 'session:drop-1' in app._dropped
+
+            # (c) the dropped session's ask resolves -- it stops awaiting
+            # input entirely, so the overlay has nothing left to suppress.
+            answered = _make_record(
+                session_slug='drop-1', status=sr.Status.RUNNING, display=display
+            )
+            sr.write_record(answered, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:drop-1' not in app._dropped
+
+            # (d) the SAME session asks something brand new. It is a
+            # different ask, so it must be visible to the operator again.
+            second_ask = _make_record(
+                session_slug='drop-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Second ask?', asked_at='2026-07-08T00:00:00+00:00'),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert queue.get_row('session:drop-1')
+            assert queue.row_count == 2
+
+    @pytest.mark.timeout(10)
+    async def test_dropped_session_key_expires_on_a_new_question_without_a_status_change(
+        self, tmp_path
+    ):
+        """A bare status rule is NOT enough: the drop must also expire when
+        the same session posts a brand-new question WITHOUT ever leaving
+        AWAITING_INPUT.
+
+        Reachability (the finding that motivates keying on ask identity
+        rather than status): orchestrator.session_hooks.run_notification
+        writes status=AWAITING_INPUT PLUS a fresh Question on every
+        Notification hook, and does not require an intervening Stop hook
+        (-> IDLE). So AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) is a real
+        transition an operator can hit, and a status-only expiry rule would
+        still silently suppress Q2 -- the exact failure class this whole
+        prune exists to kill.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='renew title')
+        first_ask = _make_record(
+            session_slug='renew-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='First ask?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(first_ask, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+
+            # A second Notification hook: STILL awaiting input (no Stop hook
+            # in between), but asking something completely different.
+            second_ask = _make_record(
+                session_slug='renew-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(
+                    text='Totally different ask?', asked_at='2026-07-08T00:00:00+00:00'
+                ),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:renew-1' not in app._dropped
+            assert queue.row_count == 1
+
+    @pytest.mark.timeout(10)
+    async def test_dropped_session_key_expires_on_a_reask_with_identical_text(self, tmp_path):
+        """A re-ask carrying the SAME text as the dropped one must still expire it.
+
+        Identical text is the COMMON case, not an edge case:
+        orchestrator.session_hooks._extract_question sets
+        `text=str(message)` verbatim from the Claude Code Notification
+        hook's `message`, and `asked_at=datetime.now(UTC).isoformat()` -- a
+        FRESH stamp on every hook. A repeated permission-prompt notification
+        therefore carries its canned message string unchanged and differs
+        from the previous ask ONLY in asked_at, which is exactly this shape.
+
+        This is the case the sibling
+        test_..._without_a_status_change cannot detect, because it also
+        changes the question TEXT ('First ask?' -> 'Totally different
+        ask?'): a text change moves build_snapshot's per-session tuple all
+        by itself, so _apply_scan never short-circuits there. Here the whole
+        difference lives in asked_at, so the prune only ever runs if the
+        WAKE-UP TRIGGER (the snapshot) is at least as strong as the overlay
+        identity (_ask_identity's `(question.text, question.asked_at)`).
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='same title')
+        first_ask = _make_record(
+            session_slug='same-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(first_ask, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+            assert 'session:same-1' in app._dropped
+
+            # The next Notification hook: still AWAITING_INPUT, the very same
+            # canned message text, only a fresh asked_at stamp. It is a
+            # genuinely new ask and must be visible to the operator again.
+            second_ask = _make_record(
+                session_slug='same-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
+            )
+            sr.write_record(second_ask, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:same-1' not in app._dropped
+            assert queue.row_count == 1
+
+    @pytest.mark.timeout(10)
+    async def test_dropped_session_key_expires_across_a_question_less_round_trip(self, tmp_path):
+        """An AWAITING_INPUT session with NO question stamped is a real queue
+        row (order_queue renders its question as ''), so it is droppable and
+        its drop must expire too.
+
+        Reachable shape: session_hooks._extract_question returns None for an
+        absent/blank Notification `message` and deliberately leaves
+        record.question untouched, so RUNNING -> AWAITING_INPUT(question=
+        None) really happens.
+
+        This pins the OBSERVED round trip -- the poll sees the intervening
+        IDLE, so _ask_identity returns None on that tick and the drop
+        expires there and then, before the second awaiting state is ever
+        scanned. It is a regression pin rather than a defect reproduction:
+        the sibling test below is the one that was red, since it is the
+        identity itself (not the liveness gate) that has to do the work
+        when the non-awaiting state is never observed.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='quiet title')
+        awaiting = _make_record(
+            session_slug='qless-1', status=sr.Status.AWAITING_INPUT, display=display
+        )
+        assert awaiting.question is None
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+            assert 'session:qless-1' in app._dropped
+
+            idle = _make_record(session_slug='qless-1', status=sr.Status.IDLE, display=display)
+            sr.write_record(idle, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+            assert 'session:qless-1' not in app._dropped
+
+            # Asks again, still with nothing stamped -- must be visible.
+            sr.write_record(awaiting, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:qless-1' not in app._dropped
+            assert queue.row_count == 1
+
+    @pytest.mark.timeout(10)
+    async def test_dropped_question_less_key_expires_when_the_record_itself_is_replaced(
+        self, tmp_path
+    ):
+        """A question-less identity must not be a bare constant shared by every
+        question-less ask in the fleet.
+
+        A session slug outlives any one record: a reaped record can be
+        recreated under the same slug (session_registry's upsert path
+        repopulates schema_version/session_slug/start_ts/status), and the
+        cockpit's overlay keys are slug-derived. If a question-less awaiting
+        session identifies as the same constant before and after, the
+        operator's drop of the FIRST record silently suppresses the SECOND
+        record's ask -- the exact failure class this machinery exists to
+        kill, in the question-less corner. Keying it on the record's own
+        (immutable, per-record) start_ts distinguishes them.
+
+        The replacement record differs in `title` as well, which is what
+        moves build_snapshot's tuple and so wakes the prune at all --
+        start_ts is deliberately NOT a snapshot field (it would make a
+        purely-time-passing tick diff). So this pins the IDENTITY's job,
+        with the wake-up trigger supplied independently.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='wm', wm_title='recycled title')
+        first = _make_record(
+            session_slug='recycled-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            title='first run',
+            start_ts='2026-07-07T00:00:00+00:00',
+        )
+        assert first.question is None
+        sr.write_record(first, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 0
+            assert 'session:recycled-1' in app._dropped
+
+            second = _make_record(
+                session_slug='recycled-1',
+                status=sr.Status.AWAITING_INPUT,
+                display=display,
+                title='second run',
+                start_ts='2026-07-09T00:00:00+00:00',
+            )
+            sr.write_record(second, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:recycled-1' not in app._dropped
+            assert queue.row_count == 1
+
+
+class TestBoostAndDeferOverlaysExpireWithTheAsk:
+    @pytest.mark.timeout(10)
+    async def test_session_boost_expires_once_the_session_leaves_awaiting_input(self, tmp_path):
+        """self._boosts leaks exactly like self._dropped: a SESSION boost is
+        keyed by a slug-stable 'session:<slug>' key and nothing ever shrinks
+        it, so a stale boost silently mis-ranks a brand-new, unrelated ask
+        from the same session. It must expire under the same ask-liveness
+        rule -- and self._overlay_asks, the bookkeeping side-table, must be
+        garbage-collected along with it rather than becoming the new leak.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+
+        display = sr.Display(kind='wm', wm_title='boost title')
+        awaiting = _make_record(
+            session_slug='boost-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('b')
+            await pilot.pause()
+            assert 'session:boost-1' in app._boosts
+
+            # The ask resolves -- the session leaves the queue entirely.
+            idle = _make_record(session_slug='boost-1', status=sr.Status.IDLE, display=display)
+            sr.write_record(idle, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'session:boost-1' not in app._boosts
+            assert app._overlay_asks == {}
+
+    @pytest.mark.timeout(10)
+    async def test_decision_defer_expires_once_the_decision_leaves_open(self, tmp_path):
+        """self._deferred leaks the same way, and applies to BOTH kinds (a
+        defer is uniform -- see action_defer). A decision key is live only
+        while that decision is OPEN, so once it is answered elsewhere the
+        stamp must expire rather than sit in memory forever suppressing the
+        effective age of whatever later reuses that id.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+
+        decision = sr.DecisionRecord(
+            id='dec-defer',
+            project='df',
+            text='Proceed?',
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await pilot.press('d')
+            await pilot.pause()
+            assert 'decision:dec-defer' in app._deferred
+
+            # Answered elsewhere (e.g. a C8 watcher) -- no longer OPEN.
+            sr.update_decision_state('dec-defer', sr.DecisionState.ANSWERED, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+
+            assert 'decision:dec-defer' not in app._deferred
+            assert app._overlay_asks == {}
+
+
+class TestReorderTargetsAreDeduped:
+    @pytest.mark.timeout(10)
+    async def test_a_shared_target_is_passed_to_reorder_only_once(self, tmp_path):
+        """A DecisionRecord and the AWAITING_INPUT session it links to
+        resolve to the exact SAME DisplayTarget (resolve_target maps a
+        decision through its session's display -- the case that method's own
+        docstring calls out). _update_attention dedups the URGENCY half
+        through a set, but builds its reorder list with a bare append per
+        queue item, so backend.reorder() receives that one target twice.
+
+        TmuxBackend.reorder assigns a running per-session index, so a
+        duplicate consumes two indices, its second park fails against the
+        already-vacated source (a warning), and the final compacted 0..N-1
+        range is left with a gap. Each target must therefore be handed to
+        reorder at most once. queue_items is score-ordered, so the dedup
+        must keep the FIRST (highest-scoring) occurrence -- for tmux that
+        surviving position IS the destination window index.
+
+        Uses a tmux display because tmux is the only backend whose reorder
+        is not a documented no-op.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        display = sr.Display(kind='tmux', tmux_target='s:1')
+        awaiting = _make_record(
+            session_slug='shared-1',
+            status=sr.Status.AWAITING_INPUT,
+            display=display,
+            question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        sr.write_record(awaiting, root=tmp_path)
+        decision = sr.DecisionRecord(
+            id='dec-shared',
+            project='df',
+            text='Proceed?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            session_id='shared-1',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            # Both items really are in the queue, so the duplicate target is
+            # genuinely produced -- this isn't a vacuously-passing assertion.
+            assert app.query_one(DecisionQueue).row_count == 2
+
+            assert backend.reorder_calls[-1] == [DisplayTarget(kind='tmux', tmux_target='s:1')]
+
+    @pytest.mark.timeout(10)
+    async def test_dedup_keeps_the_highest_scoring_occurrence_of_a_repeated_target(
+        self, tmp_path
+    ):
+        """The dedup must keep the FIRST occurrence, not just SOME occurrence.
+
+        queue_items is score-descending, and for tmux the position a target
+        holds in the reorder list IS its destination window index -- so
+        keeping the first occurrence is what makes a shared target land at
+        its highest-scoring item's position rather than its lowest-scoring
+        one's. The sibling test above cannot see that: with a single
+        distinct target, ordering is unobservable. Nor can the tmux
+        backend's [s:1, s:1, s:0] case, whose surviving order is the same
+        under keep-first and keep-last.
+
+        Here the queue resolves to [A, B, A]: the two policies diverge --
+        keep-first yields [A, B], keep-last [B, A] -- so a refactor to a
+        keep-last dedup (or a set-then-sort) fails instead of passing
+        silently while swapping which window lands at index 0.
+
+        Scores are made deterministic with an injected now_fn, and the
+        premise (the queue really is A, B, A before dedup) is asserted
+        rather than assumed:
+          - dec-a       severity='urgent' (weight 6.0)        -> ~2.87
+          - session s-b asked_at 9d old, age term saturated   -> ~2.69
+          - session s-a asked_at == now, no age term          -> ~2.60
+        dec-a carries session_id='sess-a', so resolve_target maps it
+        through sess-a's own display -- target A, the same object the
+        sess-a row resolves to.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        now = datetime(2026, 7, 10, tzinfo=UTC)
+        target_a = DisplayTarget(kind='tmux', tmux_target='s:0')
+        target_b = DisplayTarget(kind='tmux', tmux_target='s:1')
+
+        sess_a = _make_record(
+            session_slug='sess-a',
+            status=sr.Status.AWAITING_INPUT,
+            display=sr.Display(kind='tmux', tmux_target='s:0'),
+            question=sr.Question(text='Newest ask?', asked_at='2026-07-10T00:00:00+00:00'),
+        )
+        sr.write_record(sess_a, root=tmp_path)
+        sess_b = _make_record(
+            session_slug='sess-b',
+            status=sr.Status.AWAITING_INPUT,
+            display=sr.Display(kind='tmux', tmux_target='s:1'),
+            question=sr.Question(text='Older ask?', asked_at='2026-07-01T00:00:00+00:00'),
+        )
+        sr.write_record(sess_b, root=tmp_path)
+        decision = sr.DecisionRecord(
+            id='dec-a',
+            project='df',
+            text='Proceed?',
+            filed_at='2026-07-10T00:00:00+00:00',
+            session_id='sess-a',
+            severity='urgent',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05, now_fn=lambda: now)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            assert app.query_one(DecisionQueue).row_count == 3
+            # Premise: the pre-dedup target sequence really is [A, B, A].
+            items = sorted(app._queue_items_by_key.values(), key=lambda i: (-i.score, i.key))
+            assert [item.target for item in items] == [target_a, target_b, target_a]
+
+            assert backend.reorder_calls[-1] == [target_a, target_b]
 
 
 class TestCopyAction:
