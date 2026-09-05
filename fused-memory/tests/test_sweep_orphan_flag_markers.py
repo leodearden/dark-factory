@@ -1065,6 +1065,81 @@ class TestDeleteOrphanMarkersWritesTombstones:
 
 
 # ===========================================================================
+# Tests: the tombstone write can never break the sweep it accounts for
+# (task 4435)
+# ===========================================================================
+
+class TestTombstoneWriteIsFailSafe:
+    """The tombstone is an audit ADJUNCT to the delete, never a gate on it.
+
+    A deployment with no ``recon_ledger`` wired, a ledger that is down, or a
+    helper someone patched must all degrade to "records deleted, audit trail
+    missing, said out loud" — never to a raise that turns a successful sweep
+    into a fatal error, and never to a ``deleted`` count the caller cannot
+    trust.
+    """
+
+    @staticmethod
+    async def _run_two_deletes(memory_service) -> dict:
+        return await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), _orphan('o2')],
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_wired_still_deletes(self):
+        """recon_ledger=None: no raise, deletes still counted, tombstoned 0."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_raising_ledger_does_not_break_the_sweep(self):
+        """A down ledger exercises record_mem0_deletion_tombstones' OWN
+        internal fail-safe: it absorbs the error and returns 0."""
+        memory_service, ledger = _svc_with_ledger()
+        ledger.upsert_many = AsyncMock(side_effect=RuntimeError('ledger down'))
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_raising_helper_is_caught_by_the_second_belt(self, caplog):
+        """SECOND BELT: the helper is internally fail-safe already, so this
+        arm rigs a PATCHED/broken one that raises anyway — the only arm that
+        reaches the sweep's own try/except. It must not raise, must not alter
+        the count, and must say so out loud.
+        """
+        memory_service, _ledger = _svc_with_ledger()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError('patched helper exploded')
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_mod, 'record_mem0_deletion_tombstones', _boom)
+            with caplog.at_level(
+                logging.WARNING, logger='sweep_orphan_flag_markers'
+            ):
+                result = await self._run_two_deletes(memory_service)
+
+        assert result['deleted'] == 2
+        assert result['tombstoned'] == 0
+        # Level and existence only, never message prose (repo norm, task 3799).
+        assert any(
+            r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), f'Expected a WARNING from the sweep logger, got: {caplog.records!r}'
+
+
+# ===========================================================================
 # Tests: run()
 # ===========================================================================
 
