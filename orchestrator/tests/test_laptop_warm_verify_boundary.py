@@ -2887,13 +2887,26 @@ _FLOCK_GATE_RE = re.compile(
 )
 
 
-#: Task 5019 (amendment): matches just the marker plus the rest of its line,
-#: so :func:`parse_flock_gate_waits` can tell "marker present but its fields
-#: don't conform" (a genuine corruption -- must fail loudly) apart from
-#: "marker's fields matched, followed by an abutting co-writer's text" (the
-#: tolerated case _FLOCK_GATE_RE's bounded groups already handle via
-#: ``.match()`` not requiring end-of-line).
-_FLOCK_GATE_LINE_RE = re.compile(re.escape(FLOCK_GATE_MARKER) + r'[^\n]*')
+#: Task 5019 (amendment; tempered per step-4): matches just the marker plus
+#: the rest of its line, tempered -- via the negative lookahead below -- to
+#: stop at the next marker occurrence instead of running unbounded to
+#: end-of-line, so :func:`parse_flock_gate_waits` can tell apart THREE cases
+#: rather than two: (1) "marker present but its fields don't conform" (a
+#: genuine corruption -- must fail loudly); (2) "marker's fields matched,
+#: followed by an abutting co-writer's text" (tolerated: _FLOCK_GATE_RE's
+#: bounded groups plus ``.match()`` not requiring end-of-line already handle
+#: it); and (3) "marker's fields matched, followed immediately by a SECOND
+#: marker record with no separating newline" (also tolerated, but only
+#: because tempering stops the region before it can swallow the second
+#: marker's text). An earlier, unbounded ``[^\n]*`` version of this regex
+#: handled (1) and (2) but silently mishandled (3): it swallowed both
+#: abutted records into a single finditer hit, so only the first record's
+#: fields were ever offered to _FLOCK_GATE_RE and the second vanished
+#: without a trace instead of being scanned on its own -- see
+#: test_parse_flock_gate_waits_recovers_both_abutted_marker_records.
+_FLOCK_GATE_LINE_RE = re.compile(
+    re.escape(FLOCK_GATE_MARKER) + r'(?:(?!' + re.escape(FLOCK_GATE_MARKER) + r')[^\n])*'
+)
 
 
 def parse_flock_gate_waits(stderr: str) -> list[FlockGateWait]:
@@ -2904,7 +2917,14 @@ def parse_flock_gate_waits(stderr: str) -> list[FlockGateWait]:
     ``ValueError`` instead of being silently dropped, so a partial
     corruption can't quietly lower the ``max()`` the ceiling assertions in
     this module are computed over (task 5019 amendment; mirrors
-    :func:`parse_watchdog_gate_fire_delays`).
+    :func:`parse_watchdog_gate_fire_delays`). That guarantee depends on
+    :data:`_FLOCK_GATE_LINE_RE` tempering its line region to stop at the
+    next marker occurrence (task 5019 step-4): an earlier, unbounded version
+    of that regex made the claim true only for non-marker trailing
+    corruption -- a SECOND marker record abutting the first with no
+    separating newline was swallowed into the first's line region and its
+    fields were never even offered to :data:`_FLOCK_GATE_RE`, so it vanished
+    silently instead of raising.
     """
     waits = []
     for line_match in _FLOCK_GATE_LINE_RE.finditer(stderr):
@@ -3230,14 +3250,28 @@ _WATCHDOG_GATE_RE = re.compile(
     + r' fire_delay=(?P<fire_delay>-?\d+\.\d{4}) grace=(?P<grace>-?\d+\.\d{4})'
 )
 
-#: Task 5019 (amendment): matches just the marker plus the rest of its line,
-#: so :func:`parse_watchdog_gate_fire_delays` can tell "marker present but
-#: its fields don't conform" (a genuine corruption -- must fail loudly)
-#: apart from "marker's fields matched, followed by an abutting co-writer's
-#: text" (the exact production defect this task fixes, tolerated because
-#: ``.match()`` doesn't require end-of-line -- see
-#: test_parse_watchdog_gate_fire_delays_survives_abutting_log_line).
-_WATCHDOG_GATE_LINE_RE = re.compile(re.escape(WATCHDOG_GATE_MARKER) + r'[^\n]*')
+#: Task 5019 (amendment; tempered per step-4): matches just the marker plus
+#: the rest of its line, tempered -- via the negative lookahead below -- to
+#: stop at the next marker occurrence instead of running unbounded to
+#: end-of-line, so :func:`parse_watchdog_gate_fire_delays` can tell apart
+#: THREE cases rather than two: (1) "marker present but its fields don't
+#: conform" (a genuine corruption -- must fail loudly); (2) "marker's
+#: fields matched, followed by an abutting co-writer's text" (the exact
+#: production defect this task fixes, tolerated because ``.match()``
+#: doesn't require end-of-line -- see
+#: test_parse_watchdog_gate_fire_delays_survives_abutting_log_line); and
+#: (3) "marker's fields matched, followed immediately by a SECOND marker
+#: record with no separating newline" (also tolerated, but only because
+#: tempering stops the region before it can swallow the second marker's
+#: text). An earlier, unbounded ``[^\n]*`` version of this regex handled
+#: (1) and (2) but silently mishandled (3): it swallowed both abutted
+#: records into a single finditer hit, so only the first record's fields
+#: were ever offered to _WATCHDOG_GATE_RE and the second vanished without a
+#: trace instead of being scanned on its own -- see
+#: test_parse_watchdog_gate_fire_delays_recovers_both_abutted_marker_records.
+_WATCHDOG_GATE_LINE_RE = re.compile(
+    re.escape(WATCHDOG_GATE_MARKER) + r'(?:(?!' + re.escape(WATCHDOG_GATE_MARKER) + r')[^\n])*'
+)
 
 
 def parse_watchdog_gate_fire_delays(stderr: str) -> list[WatchdogGateFire]:
@@ -3248,7 +3282,14 @@ def parse_watchdog_gate_fire_delays(stderr: str) -> list[WatchdogGateFire]:
     raises ``ValueError`` instead of being silently dropped, so a partial
     corruption can't quietly lower the ``max()`` the ceiling assertions in
     this module are computed over (task 5019 amendment; mirrors
-    :func:`parse_flock_gate_waits`).
+    :func:`parse_flock_gate_waits`). That guarantee depends on
+    :data:`_WATCHDOG_GATE_LINE_RE` tempering its line region to stop at the
+    next marker occurrence (task 5019 step-4): an earlier, unbounded version
+    of that regex made the claim true only for non-marker trailing
+    corruption -- a SECOND marker record abutting the first with no
+    separating newline was swallowed into the first's line region and its
+    fields were never even offered to :data:`_WATCHDOG_GATE_RE`, so it
+    vanished silently instead of raising.
     """
     fires = []
     for line_match in _WATCHDOG_GATE_LINE_RE.finditer(stderr):
