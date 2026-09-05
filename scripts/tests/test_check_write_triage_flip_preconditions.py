@@ -1980,8 +1980,12 @@ def _normalize_ws(text: str) -> str:
 
 # The items-2/4 ownership clause's marker. NOT bare 'task 4762': the item-1
 # clause also contains that substring ("option (b) is task 4762"), so it
-# would not discriminate between the two clauses.
-_TRIAGE_CLAUSE = "task 4762's (priority high)"
+# would not discriminate between the two clauses. The possessive "'s" alone
+# already discriminates (the item-1 clause reads "is task 4762 --", never
+# "task 4762's") -- deliberately NOT extended with "(priority high)", which
+# is incidental wording (a mutable task-tracker attribute) rather than the
+# ownership behaviour under test.
+_TRIAGE_CLAUSE = "task 4762's"
 #: The item-1 ownership clause's marker.
 _ITEM1_CLAUSE = 'Item 1 is closed by EITHER'
 
@@ -2012,15 +2016,17 @@ def publish(report_path):
 
 
 class TestResultBlockBlamesOnlyFailingItems:
-    """DEFECT B: the RESULT block's ownership prose must never name a PASSING
-    item -- reproduced from esc-4810-12, which misread this fixture's output
-    as main's. The else-arm (``fail -ne 0``) prints its ownership clauses
-    UNCONDITIONALLY, so the report can say ``PASS item 2`` / ``PASS item 4``
-    and then blame items 2 and 4 a few lines later for a failure another item
-    caused. Items 2 and 4 are independent greps over the same file, so exactly
-    one can fail on a partial landing -- the clause must name the actually
+    """DEFECT B (fixed here): the RESULT block's ownership prose must never
+    name a PASSING item -- reproduced from esc-4810-12, which misread this
+    fixture's output as main's. The else-arm (``fail -ne 0``) used to print
+    its ownership clauses UNCONDITIONALLY, so the report could say ``PASS
+    item 2`` / ``PASS item 4`` and then blame items 2 and 4 a few lines later
+    for a failure another item caused. Both clauses are now gated on
+    ``item_failed()`` (see ``check_write_triage_flip_preconditions.sh``).
+    Items 2 and 4 are independent greps over the same file, so exactly
+    one can fail on a partial landing -- the clause names the actually
     -failing SUBSET, not a binary "Items 2 and 4 are ...". The symmetric
-    item-1 half of this same defect is added directly to this class below.
+    item-1 half of this same defect is tested directly in this class below.
     """
 
     def test_items_2_and_4_passing_are_not_blamed(self, tmp_path):
@@ -2035,7 +2041,13 @@ class TestResultBlockBlamesOnlyFailingItems:
         assert 'PASS  item 4' in proc.stdout, proc.stdout
         tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
         assert 'FAILING ITEMS: 1' in tail, tail
-        assert _TRIAGE_CLAUSE not in _normalize_ws(_result_block(proc.stdout)), proc.stdout
+        block = _normalize_ws(_result_block(proc.stdout))
+        assert _TRIAGE_CLAUSE not in block, proc.stdout
+        # Mirrors test_item_1_passing_is_not_blamed's positive assertion: a
+        # mis-gating of the item-1 clause (e.g. `if item_failed 3`) would drop
+        # this guidance silently, and only the all-fail/unreadable-ref guards
+        # would catch it -- neither of which isolates item 1 failing alone.
+        assert _ITEM1_CLAUSE in block, proc.stdout
 
     def test_item_2_alone_failing_names_only_item_2(self, tmp_path):
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_text=_EVAL_ITEM2_ONLY_FAILING)
@@ -2062,10 +2074,8 @@ class TestResultBlockBlamesOnlyFailingItems:
     def test_item_1_passing_is_not_blamed(self, tmp_path):
         """The SYMMETRIC half: item 1 passes, items 2 and 4 fail -- the
         mirror image of ``test_items_2_and_4_passing_are_not_blamed`` above.
-        The item-1 ownership clause is still unconditional at this point (it
-        is gated in a follow-up commit using the same ``item_failed()``
-        predicate), so the report prints ``PASS item 1`` and then still
-        blames item 1 a few lines later -- the identical defect, mirrored.
+        The item-1 clause used to print unconditionally; it is now gated on
+        ``item_failed 1``, the mirror image of the items-2/4 gating.
         """
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='failing')
         proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
