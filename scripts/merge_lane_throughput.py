@@ -29,8 +29,14 @@ baseline the downstream decompositions inherit.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import re
+import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 # `<N>d`, N a positive integer.  Anchored: '14' and '14x' must both be
 # rejected rather than silently truncated to 14 days.
@@ -117,3 +123,96 @@ def parse_window(spec: str, now: datetime) -> tuple[datetime, datetime]:
         f'2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00, which is how '
         f'a dated baseline is reproduced exactly).'
     )
+
+
+# ---------------------------------------------------------------------------
+# I/O rim — the ONLY part of this module that touches a database or a clock.
+# Everything below the rim is a pure function over event dicts.
+# ---------------------------------------------------------------------------
+
+
+def _connect_ro(path: str | Path) -> sqlite3.Connection:
+    """Open *path* strictly read-only, via a `mode=ro` SQLite URI.
+
+    `mode=ro` (rather than a bare `sqlite3.connect`) is the house convention
+    for a script that reads a LIVE store — see
+    `scripts/audit_wiped_metadata_files.py`, `scripts/census_tagger_debris.py`
+    and `scripts/scan_task_toolcall_leaks.py`. It buys two things a bare
+    connect does not: a write attempted through this connection fails loudly
+    instead of mutating an orchestrator's event store, and a typo'd path
+    raises rather than silently creating an empty database that would then
+    report every section as "no data".
+    """
+    uri = f'file:{Path(path).resolve()}?mode=ro'
+    return sqlite3.connect(uri, uri=True)
+
+
+def load_events(
+    conn: sqlite3.Connection, event_type: str, lo: datetime, hi: datetime
+) -> list[dict[str, Any]]:
+    """Load `event_type` rows whose timestamp falls in ``[lo, hi)``.
+
+    Returns a list of ``{'timestamp', 'task_id', 'data'}`` dicts ordered by
+    ``id`` (insertion order), with ``data`` parsed from JSON.
+
+    The window is half-open — ``lo`` inclusive, ``hi`` exclusive — so
+    consecutive windows tile without double-counting the boundary row.  Bounds
+    are compared as strings against the TEXT `timestamp` column using
+    :func:`_iso`; that is a correct chronological comparison because
+    `event_store.py::EventStore.emit` writes one fixed ISO-8601 spelling
+    (always UTC, always a `+00:00` offset, never `Z`), which sorts
+    lexicographically. The predicate hits `idx_events_type`.
+
+    Malformed JSON, a NULL payload, or a payload that parses to a non-object
+    all degrade to an empty dict rather than raising: `emit` is
+    fire-and-forget, so a truncated or corrupt row is possible and must not
+    abort the read of every other row in the window.
+    """
+    rows = conn.execute(
+        'SELECT timestamp, task_id, data FROM events '
+        'WHERE event_type=? AND timestamp>=? AND timestamp<? ORDER BY id',
+        (event_type, _iso(lo), _iso(hi)),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for ts, task_id, data in rows:
+        parsed: Any = {}
+        if data:
+            try:
+                parsed = json.loads(data)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        out.append({'timestamp': ts, 'task_id': task_id, 'data': parsed})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Shared numeric helpers.
+# ---------------------------------------------------------------------------
+
+
+def _percentile(values: Sequence[float], pct: float) -> float | None:
+    """Return the *pct*-th percentile of *values*, or ``None`` when empty.
+
+    Linear interpolation between the two nearest order statistics (the
+    ``numpy.percentile`` default, and what `statistics.quantiles` approximates)
+    on the ascending sort of *values*: with ``k = (n - 1) * pct / 100``, the
+    result is ``s[floor(k)] + (k - floor(k)) * (s[ceil(k)] - s[floor(k)])``.
+
+    Returns ``None`` — never ``0.0`` — for an empty series.  `scripts/
+    mint_hard_v2_fixtures.py::_percentile` returns 0.0 there; that would render
+    "no laptop verify ran in this window" as a p50 of zero minutes, which is
+    the single most consequential misreading this report can produce.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    k = (len(ordered) - 1) * (pct / 100.0)
+    lo_i = math.floor(k)
+    hi_i = math.ceil(k)
+    if lo_i == hi_i:
+        return float(ordered[lo_i])
+    return float(ordered[lo_i] + (k - lo_i) * (ordered[hi_i] - ordered[lo_i]))
