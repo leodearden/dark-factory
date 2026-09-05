@@ -37,6 +37,7 @@ from orchestrator.verify import VerifyResult
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_main_tip_sweep() -> None:
     """OrchestratorConfig exposes main_tip_sweep_enabled (True) and
     main_tip_sweep_interval_secs (1800.0) with the correct defaults."""

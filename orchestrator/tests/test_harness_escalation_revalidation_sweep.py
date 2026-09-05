@@ -48,6 +48,7 @@ from orchestrator.verify import VerifyResult
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_escalation_revalidation() -> None:
     """OrchestratorConfig exposes escalation_revalidation_enabled (True) —
     the single operator kill-switch for both new auto-closure paths."""

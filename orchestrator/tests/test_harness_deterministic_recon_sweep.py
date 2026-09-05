@@ -89,6 +89,7 @@ from orchestrator.recovery_emission import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 def test_config_defaults_deterministic_recon_sweep() -> None:
     """OrchestratorConfig exposes deterministic_recon_sweep_enabled (True) and
     deterministic_recon_sweep_interval_secs (900.0) with the correct defaults."""
