@@ -9,6 +9,7 @@ check_fused_memory_unit_parity.py via importlib.util.spec_from_file_location,
 mirroring the pattern in tests/scripts/test_orchestrator_watchdog.py::_load_watchdog.
 """
 
+import ast
 import importlib.util
 import pathlib
 import subprocess
@@ -1570,6 +1571,149 @@ def test_a_required_known_project_roots_line_would_reclobber():
     # And the checker would then report the clobbered unit as being at parity,
     # which is what makes the loss invisible rather than merely bad.
     assert mod.find_drift(fixed, (*mod.REQUIRED_SERVICE_DIRECTIVES, single_root_line)) == []
+
+
+# The SECOND anchor for the invariant above, and the reason it exists.
+#
+# (ii) derives `preserved` solely from render_dashboard_unit.UNITS[*].
+# host_local_environment. That is one END of the coupling. The other end —
+# the one that makes a clobber DAMAGING rather than merely untidy — is that
+# fused_memory/models/scope.py reads the variable as reconciliation's
+# project-root scope, and reconciliation/harness.py raises UnknownProjectError
+# for anything outside it.
+#
+# Drop the name from a UnitSpec while scope.py still reads it and (ii) goes
+# VACUOUSLY GREEN: `preserved` shrinks, the intersection is empty for the wrong
+# reason, and the hazard is wide open again with a passing test over it. So the
+# invariant is pinned from BOTH ends.
+#
+# READ BY `ast`, NOT BY IMPORT, and that is measured rather than stylistic:
+# `uv run --project shared python -c 'import fused_memory'` raises
+# ModuleNotFoundError. tests/scripts/ runs under `--project shared`
+# (scripts/orchestrator.yaml's test_command, whose own comment records that
+# neither target directory is a workspace member), and that environment
+# installs no fused_memory. An import-based guard would fail at COLLECTION with
+# an error bearing no resemblance to the invariant under test.
+
+_SCOPE_PATH = (
+    REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "models" / "scope.py"
+)
+
+
+def _scope_known_project_roots_env() -> str | None:
+    """Return the literal of scope.py's ``KNOWN_PROJECT_ROOTS_ENV: str = ...``.
+
+    A SOURCE read, never an import — see the section comment above for the
+    measurement that forces it. Returns None if the annotated assignment is not
+    found or is not a plain string literal, which callers must treat as a
+    FAILURE rather than as "nothing to check": a rename or a refactor into a
+    computed value has to fail loudly here, not yield None and pass vacuously.
+    That vacuity is the exact failure mode this guard exists to close.
+    """
+    tree = ast.parse(_SCOPE_PATH.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.AnnAssign):
+            continue
+        target = node.target
+        if not isinstance(target, ast.Name) or target.id != "KNOWN_PROJECT_ROOTS_ENV":
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return node.value.value
+        return None
+    return None
+
+
+def test_scope_known_project_roots_env_is_readable_from_source():
+    """The ast read finds a non-empty str, so the two guards below cannot go vacuous.
+
+    Asserted separately from the invariants it feeds because the failure modes
+    are different and want different messages: this one says "the helper can no
+    longer see the constant", the two below say "the constant is now in a place
+    it must not be".
+    """
+    name = _scope_known_project_roots_env()
+    assert isinstance(name, str) and name, (
+        f"Could not read KNOWN_PROJECT_ROOTS_ENV as a string literal from "
+        f"{_SCOPE_PATH}. It was renamed, moved, or made computed. Without it "
+        "the two guards below silently stop checking anything — repair the "
+        "read rather than deleting them, and do NOT switch to importing "
+        "fused_memory: it is not installed in the `uv run --project shared` "
+        "environment this suite runs under."
+    )
+
+
+def test_scope_known_project_roots_env_is_disjoint_from_required_service_directives():
+    """The CONSUMER's variable name is not on this checker's required list.
+
+    Anchors the (ii) invariant on the module that actually reads the variable,
+    so it keeps meaning something even if the renderer's spec changes. Same
+    hazard, stated from the other end: put this name on the required list and
+
+      1. find_drift tests EXACT WHOLE-LINE membership, so on a host whose value
+         differs from the committed one the required line reads as MISSING;
+      2. --fix appends it after the LAST [Service] line;
+      3. systemd applies Environment= in file order with LAST-WINS, so the
+         appended line BEATS the host's;
+      4. the checker reports parity and exits 0.
+
+    The projects dropped from the set stop being known to reconciliation, and
+    nothing reports it.
+    """
+    name = _scope_known_project_roots_env()
+    assert isinstance(name, str) and name
+
+    mod = _load_checker()
+    required_env_vars = {
+        directive[len("Environment=") :].split("=", 1)[0]
+        for directive in mod.REQUIRED_SERVICE_DIRECTIVES
+        if directive.startswith("Environment=")
+        and "=" in directive[len("Environment=") :]
+    }
+
+    assert name not in required_env_vars, (
+        f"{name} is read by {_SCOPE_PATH}::KNOWN_PROJECT_ROOTS_ENV as "
+        "reconciliation's project-root scope AND exact-matched by "
+        "REQUIRED_SERVICE_DIRECTIVES. On a host whose value differs from the "
+        "committed one, find_drift reports the required line as missing, --fix "
+        "APPENDS it after the last [Service] line, systemd's last-wins "
+        "silently beats the host's value, and the checker then exits 0 — so "
+        "projects silently stop being known to reconciliation "
+        "(reconciliation/harness.py raises UnknownProjectError for a project "
+        "outside the set). See "
+        "test_a_required_known_project_roots_line_would_reclobber for the "
+        "demonstration. The remedy for a host-local value is the renderer's "
+        "preserve set, not this list."
+    )
+
+
+def test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer():
+    """The JOIN between the two anchors: the renderer still preserves what scope.py reads.
+
+    This is what makes the disjointness invariant non-vacuous. If the renderer
+    ever stopped preserving this name while scope.py went on reading it, the
+    (ii) guard's `preserved` set would no longer contain it, the intersection
+    would be empty for the wrong reason, and the hazard would be reopened under
+    a passing test. That state is precisely what goes red here.
+    """
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    name = _scope_known_project_roots_env()
+    assert isinstance(name, str) and name
+
+    preserved = {
+        preserved_name
+        for spec in render_dashboard_unit.UNITS.values()
+        for preserved_name in spec.host_local_environment
+    }
+
+    assert name in preserved, (
+        f"{name} is read by {_SCOPE_PATH}::KNOWN_PROJECT_ROOTS_ENV but no "
+        f"render_dashboard_unit.UNITS spec preserves it (preserved: "
+        f"{sorted(preserved)}). Either a re-render now silently drops this "
+        "host's reconciliation scope, or the variable moved and this guard "
+        "plus ::test_preserved_names_are_disjoint_from_required_service_"
+        "directives are both now checking nothing."
+    )
 
 
 # ---------------------------------------------------------------------------
