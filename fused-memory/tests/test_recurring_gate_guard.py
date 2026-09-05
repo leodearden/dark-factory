@@ -22,18 +22,24 @@ from typing import Any
 import pytest
 from shared.task_statuses import ACTIVE, TERMINAL
 
+_DEFAULT_METADATA = object()
+
 
 def _row(
     task_id: str = '5902',
     status: str = 'pending',
     title: str = 'GATE: stranded task 5879 needs a human ruling',
-    metadata: Any = None,
+    metadata: Any = _DEFAULT_METADATA,
     **extra: Any,
 ) -> dict[str, Any]:
     """A task row in the real `_row_to_task` wire shape (`id` is a STRING).
 
     Mirrors tests/test_live_task_write_guard.py::_flat — a plain dict
     factory, no model construction.
+
+    ``metadata`` defaults to a distinct ``_DEFAULT_METADATA`` sentinel, NOT
+    to ``None``, so a caller can pass a literal ``metadata=None`` row (the
+    malformed-corpus case) without silently getting the default gate blob.
     """
     payload: dict[str, Any] = {
         'id': task_id,
@@ -42,7 +48,7 @@ def _row(
         'metadata': (
             {'execution_class': 'operational', 'operational_mode': 'gate',
              'gate_subject': '5879'}
-            if metadata is None
+            if metadata is _DEFAULT_METADATA
             else metadata
         ),
     }

@@ -29,12 +29,16 @@ with a one-line ``AsyncMock``.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Mapping
 from typing import Any
+
+from shared.task_statuses import TERMINAL
 
 __all__ = [
     'GATE_SUBJECT_ALIASES',
     'GATE_SUBJECT_KEY',
     'extract_gate_subject',
+    'find_open_gate',
     'is_gate_submission',
 ]
 
@@ -135,3 +139,64 @@ def is_gate_submission(metadata: str | dict[str, Any] | None) -> bool:
     if meta.get('execution_class') != 'operational':
         return False
     return meta.get('operational_mode', 'gate') == 'gate'
+
+
+# ---------------------------------------------------------------------------
+# Corpus predicate
+# ---------------------------------------------------------------------------
+
+
+def _iter_task_rows(result: Any) -> Iterable[Any]:
+    """Normalize a raw ``get_tasks`` return into an iterable of task rows.
+
+    ``{'tasks': [...]}`` → the list; a bare list → itself; anything else →
+    ``()``. No flattening is performed and
+    ``task_curator.flatten_task_tree`` is deliberately NOT imported: all
+    task rows are top-level post-DF-D (see ``sqlite_task_backend``'s
+    ``_row_to_task``, "All tasks are top-level after DF-D"), so a leaf guard
+    would be coupling itself to the curator module for nothing.
+    """
+    if isinstance(result, Mapping):
+        tasks = result.get('tasks')
+        return tasks if isinstance(tasks, list) else ()
+    if isinstance(result, list):
+        return result
+    return ()
+
+
+def find_open_gate(tasks: Any, subject: str) -> dict[str, Any] | None:
+    """Return the first NON-TERMINAL gate carrier for *subject*, else ``None``.
+
+    Pure and total: *tasks* is any iterable of task-row mappings (or a raw
+    ``get_tasks`` return, or ``None``), and no branch raises on a malformed
+    row — a corpus arriving from the backend is treated as untrusted.
+
+    The terminal set is imported from :data:`shared.task_statuses.TERMINAL`
+    rather than re-spelled (the same single-sourcing ``live_task_write_guard``
+    does), so a carrier that has been ``done``/``cancelled`` correctly stops
+    blocking a genuinely fresh gate for the same subject.
+
+    Terminal filtering is re-checked here even though the tools.py call site
+    already narrows the query with ``statuses=``: this is a PURE function
+    contracted to be correct on ANY caller-supplied corpus, and a future
+    caller passing an unfiltered one must not silently get a wrong answer.
+    """
+    for row in _iter_task_rows(tasks):
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get('status', '')) in TERMINAL:
+            continue
+        metadata = row.get('metadata')
+        if extract_gate_subject(metadata) != subject:
+            continue
+        if not is_gate_submission(metadata):
+            continue
+        task_id = str(row.get('id', '') or '')
+        if not task_id:
+            continue
+        return {
+            'id': task_id,
+            'title': str(row.get('title', '') or ''),
+            'status': str(row.get('status', '') or ''),
+        }
+    return None
