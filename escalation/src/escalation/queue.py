@@ -939,10 +939,10 @@ class EscalationQueue:
         for path in itertools.chain(
             self.queue_dir.glob(pattern), self._iter_archive_paths(pattern),
         ):
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse {path}: {e}')
+            esc, reason = read_escalation_for_scan(
+                path, context='queue.find_terminal_by_citation',
+            )
+            if reason != 'ok' or esc is None:
                 continue
             # task_id is authoritative — the glob over-matches hyphenated siblings.
             if esc.task_id != task_id:
@@ -972,13 +972,11 @@ class EscalationQueue:
         """Get all pending escalations."""
         results = []
         for path in self.queue_dir.glob('esc-*.json'):
-            try:
-                esc = Escalation.from_json(path.read_text())
-                if esc.status == 'pending':
-                    results.append(esc)
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse {path}: {e}')
+            esc, reason = read_escalation_for_scan(path, context='queue.get_pending')
+            if reason != 'ok' or esc is None:
                 continue
+            if esc.status == 'pending':
+                results.append(esc)
         return results
 
     def resolve(
