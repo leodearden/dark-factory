@@ -19,6 +19,13 @@ Design highlights
   merge request that is never recovered, so the alternative turns a rollback
   into an incident.  Deliberately one-directional: an entry MISSING a required
   field is still skipped.
+* Per-entry ENTRY-SHAPE validation (task 5063): a journal whose top level is a
+  JSON object but whose value for one key is not a mapping loses only THAT
+  key — never the whole recovery pass.  ``_load_raw``'s ``isinstance`` check
+  inspects only the top level, so such a value reaches ``load()`` intact, and
+  ``merge_queue_store.py::recover_pending_merges`` calls ``load()`` unguarded:
+  one exception raised there drops every in-flight merge request in the
+  journal, not just the malformed one.
 * Keyed by ``request_id`` so ``record()`` is idempotent on redispatch (updates
   in place) and ``remove()`` is O(1) on terminal.
 """
@@ -200,9 +207,27 @@ class MergeQueueStore:
 
         The relaxation is one-directional: an entry MISSING a required field
         still raises and is still skipped with the message below.
+
+        ENTRY SHAPE is validated per-entry too (task 5063): a value that is
+        not a JSON object is skipped by its journal KEY — the only id such an
+        entry has — rather than dereferenced.  ``recover_pending_merges``
+        calls this method unguarded, so a raise here would cost the whole
+        recovery pass, not just the malformed entry.
         """
         result: list[PersistedMergeRequest] = []
-        for entry in self._cache.values():
+        for request_id, entry in self._cache.items():
+            # Shape guard FIRST: everything below dereferences `entry` as a
+            # mapping, and a non-mapping value must cost only ITSELF.  Named
+            # by journal key because a non-dict entry has no `request_id`
+            # field to read defensively from.
+            if not isinstance(entry, dict):
+                logger.warning(
+                    'merge_queue_store: skipping malformed entry %s'
+                    ' (not a JSON object, got %s)',
+                    request_id,
+                    type(entry).__name__,
+                )
+                continue
             known = {k: v for k, v in entry.items() if k in _PERSISTED_FIELDS}
             unknown = sorted(set(entry) - _PERSISTED_FIELDS)
             if unknown:
