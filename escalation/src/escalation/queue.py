@@ -466,6 +466,48 @@ def read_escalation_for_scan(
 
     The read and the parse sit in SEPARATE ``try`` blocks so an I/O error can
     never be misfiled as a parse failure or vice versa.
+
+    SCAN SITES, AND WHY THE OTHERS ARE NOT HERE.  Every read of an escalation
+    file in this package was audited when this helper was introduced; the
+    asymmetry below is deliberate, not an oversight.
+
+    FIXED -- the unlocked ``glob``-then-read scans, all five routed through
+    this helper: ``queue.py::EscalationQueue.get_by_task``,
+    ``queue.py::EscalationQueue.get_pending`` (which also backs
+    ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
+    ``queue.py::EscalationQueue.find_terminal_by_citation``,
+    ``sweep.py::sweep`` and ``sweep.py::reap_loose_archive_files``.
+
+    NOT NEEDED -- protected by the LOCK rather than by exception handling.
+    The single-id read-modify-write methods in this module
+    (``add_members_to_l2``, ``stamp_triage``, ``attach_dedupe_child``,
+    ``patch_resolution_metadata``, ``note_suppressed_refile``) each open
+    ``escalation_id_lock`` BEFORE locating and reading the record, and BOTH
+    movers take that same per-id sidecar lock: ``queue.py::_archive_resolved``
+    is reached only from ``resolve()`` and ``submit_resolved()``, each inside
+    the lock, and ``sweep.py::_relocate_terminal`` locks around its move.
+    Relocation therefore cannot interleave with those reads for the same id,
+    and adding a catch there would imply a race that cannot occur.
+
+    ALREADY GUARDED elsewhere: ``watcher.py``'s two scan loops already catch
+    ``OSError`` (and ``UnicodeDecodeError`` in its text-read helper), so they
+    do not crash -- though they do so with no log at all.  That silence is a
+    separate, smaller concern, filed as a follow-up rather than widened into
+    this change.  Every cross-package consumer of ``iter_all_escalation_paths``
+    guards its own read already: ``dashboard.data.performance``
+    (``json.JSONDecodeError, OSError``), ``dashboard.data.escalation_analytics``,
+    ``orchestrator.digest`` and ``fused_memory.reconciliation.harness``
+    (``Exception``).
+
+    EXPLICITLY OUT OF SCOPE: ``EscalationQueue.get`` is ``_locate_path``-then-
+    read rather than glob-then-read.  Its blast radius is the single record
+    the caller asked about rather than a whole listing, and the semantically
+    correct repair is re-locate-and-retry -- the record MOVED, it did not
+    vanish -- which is a different shape from "skip and continue".  Tracked as
+    a follow-up.  ``UnicodeDecodeError`` from ``read_text`` on a truncated or
+    binary file is a ``ValueError``, not an ``OSError``; it is uncaught at the
+    queue sites today and stays uncaught, since widening it would swallow more
+    than this helper is about.
     """
     try:
         text = path.read_text()
