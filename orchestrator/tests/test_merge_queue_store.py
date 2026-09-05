@@ -191,6 +191,7 @@ class TestMergeQueueStoreRecordLoad:
             lane='high',
             task_files=['src/foo.py', 'tests/test_foo.py'],
             pre_rebased=True,
+            module_configs=[ModuleConfig(prefix='orchestrator')],
         )
 
         store.record(req)
@@ -209,6 +210,7 @@ class TestMergeQueueStoreRecordLoad:
         assert p.generation == 2
         assert p.lane == 'high'
         assert p.enqueued_at == pytest.approx(req.enqueued_at, rel=1e-6)
+        assert p.module_prefixes == ['orchestrator']
 
 
 # ---------------------------------------------------------------------------
@@ -1422,3 +1424,123 @@ class TestDelegatesToSharedAtomicWriter:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, f'expected one WARNING, got {caplog.records}'
         assert 'disk full' in warnings[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# task-5063 — the journal persists the request's module PREFIXES.
+#
+# reconstruct_merge_request used to hardcode ``module_configs=[]`` in the belief
+# that [] meant "all configured modules".  It does not: merge_queue.
+# _merge_boundary_module_configs deliberately never widens an empty set, so a
+# restart-rehydrated request was verified FILE-SCOPED.  Persisting the prefixes
+# is what lets reconstruction restore a truthful set.
+#
+# ``None`` and ``[]`` are NOT interchangeable on the persisted field:
+#   None -> written before the field existed; the module set is UNKNOWN.
+#   []   -> the task genuinely had no assigned modules.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_journal_entry(
+    request_id: str,
+    *,
+    task_id: str = '5063',
+    branch: str = '5063',
+    worktree: str = '/tmp/wt',
+    task_files: list[str] | None = None,
+) -> dict[str, object]:
+    """A journal entry in the PRE-task-5063 ten-field shape.
+
+    Deliberately a dict LITERAL rather than ``asdict(PersistedMergeRequest(...))``:
+    asdict generates its keys from the CURRENT dataclass, so it could never
+    produce an entry that is genuinely MISSING ``module_prefixes`` — which is
+    the whole point of these fixtures.
+    """
+    return {
+        'request_id': request_id,
+        'task_id': task_id,
+        'branch': branch,
+        'worktree': worktree,
+        'pre_rebased': False,
+        'task_files': task_files,
+        'snapshot_tip': 'abc123',
+        'generation': 1,
+        'lane': 'normal',
+        'enqueued_at': 1000.0,
+    }
+
+
+class TestJournalPersistsModulePrefixes:
+    """record() persists the request's module prefixes; load() round-trips them."""
+
+    def test_record_persists_the_requests_module_prefixes(self, tmp_path: Path) -> None:
+        """A request scoped to two modules journals both prefixes, in order."""
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+        config = _real_config(tmp_path)
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        req = _make_req(
+            task_id='5063',
+            branch='5063',
+            worktree=worktree,
+            config=config,
+            module_configs=[
+                ModuleConfig(prefix='orchestrator'),
+                ModuleConfig(prefix='shared'),
+            ],
+        )
+        store.record(req)
+
+        [p] = store.load()
+        assert p.module_prefixes == ['orchestrator', 'shared'], (
+            f'the journal must persist the module prefixes in order; '
+            f'got {p.module_prefixes!r}'
+        )
+
+    def test_zero_module_request_persists_an_explicit_empty_list(
+        self, tmp_path: Path,
+    ) -> None:
+        """A genuinely zero-module task journals ``[]``, NOT ``None``.
+
+        Load-bearing: an explicit ``[]`` is the ONLY thing distinguishing "this
+        task has no modules" from "this record predates the field", and
+        reconstruct_merge_request branches on exactly that difference.
+        """
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+        config = _real_config(tmp_path)
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+
+        store.record(_make_req('5063', '5063', worktree, config))
+
+        [p] = store.load()
+        assert p.module_prefixes == []
+        assert p.module_prefixes is not None, (
+            'a zero-module task must persist an EXPLICIT empty list; None is '
+            'reserved for records written before the field existed'
+        )
+
+    def test_legacy_journal_entry_without_the_key_loads_with_the_none_sentinel(
+        self, tmp_path: Path,
+    ) -> None:
+        """A pre-task-5063 entry still loads, with ``module_prefixes is None``."""
+        import json
+
+        store_path = tmp_path / 'merge_queue.json'
+        store_path.write_text(
+            json.dumps({'mr-legacy': _legacy_journal_entry('mr-legacy')}),
+            encoding='utf-8',
+        )
+
+        store = MergeQueueStore(store_path)
+        assert store.journal_corrupt is False, 'Hand-written journal must parse cleanly'
+
+        records = store.load()
+        assert len(records) == 1, (
+            f'a legacy entry must still load, not be skipped; got {records!r}'
+        )
+        assert records[0].module_prefixes is None, (
+            'an entry written before the field existed must carry the None '
+            'sentinel ("module set UNKNOWN"), never an empty list'
+        )
