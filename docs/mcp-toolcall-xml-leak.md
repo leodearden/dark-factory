@@ -462,7 +462,7 @@ non-raising add that fails any of them is treated **identically to a throw**.
 | `content_lost_in_flight` | The delete landed but the re-add did **not** persist (raised, or returned without evidence of a mem0 write). The original text now exists **only in the printed JSON report**. | Restore it by hand from the report — it carries the old id, the original content, the repaired content, and `metadata_preserved` / `metadata_dropped` — **before** re-running the sweep. |
 | `skipped_not_mem0_routed` | A repairable record whose `category` does not route to mem0 (or is absent/unrecognised). Left **entirely untouched**: nothing deleted, nothing added. | Needs a human decision. Neither option is safe unattended — a plain re-add would route the repaired text to Graphiti only and the Qdrant copy the delete removed would be gone, while `dual_write=True` would duplicate the Graphiti copy that the mem0-scoped delete deliberately left alive. |
 | `skipped_metadata_would_be_rejected` | A repairable record whose carried metadata would fail `add_memory`'s own validation, under the enforcement flags resolved for that run. The pre-flight refused to delete it, so it is left **entirely untouched**. | Fix the metadata (the record's `metadata_preserved` / `metadata_dropped` lists name what it carries) or relax the enforcement setting, then re-run. Without this pre-flight the rejection would land *after* the delete and turn a repairable record into a `content_lost_in_flight`. |
-| `record_error` | That record's repair aborted on an unexpected error (a `delete_memory` transport failure, a Qdrant outage). The sweep **continued** to the remaining records rather than unwinding. | The delete demonstrably did **not** land, **or** the sweep could not tell — read the record's `delete_landed` field to see which (`false` vs `null`, with the reasoning in `delete_landed_note`). On `false` nothing was destroyed and the record can simply be re-swept. On `null` check the record's id in the store by hand, read-only, before re-running. `record['error']` always holds the **original** failure, never the probe's. |
+| `record_error` | That record's repair aborted on an unexpected error (a `delete_memory` transport failure, a Qdrant outage, or a pre-flight raising before anything was deleted). The sweep **continued** to the remaining records rather than unwinding. | Read the record's `delete_landed` field, which has **three** readings on a `record_error` record (the reasoning is in `delete_landed_note`). `false` — the delete demonstrably did not land, nothing was destroyed, re-sweep the record. **Key absent** — the failure happened *before* any delete was attempted, so nothing was touched; re-sweep it too. `null` — the sweep could not tell: check the record's id in the store by hand, read-only, before re-running. `record['error']` always holds the **original** failure, never the probe's. |
 
 #### A raised delete is adjudicated, not assumed unknown
 
@@ -473,14 +473,21 @@ Qdrant point *before* writing its SQLite history, so a failure in the second
 half raises with the content already gone.
 
 The sweep now performs that read-only id check itself (`probe_delete_landed`,
-via `MemoryService.get_memory_by_id`) and records a three-valued verdict on the
-record as `delete_landed`:
+via `MemoryService.get_memory_by_id`) and records its three-valued verdict on
+the record as `delete_landed` — so the field has **four** readings in a report,
+the three verdicts plus "no delete was attempted, so no verdict was ever
+recorded":
 
 | `delete_landed` | Meaning | Flag the record gets |
 | --- | --- | --- |
 | `true` | The point is **absent** — the delete landed and the stored copy is gone. | `content_lost_in_flight` |
 | `false` | The point **survived** — nothing was destroyed. | `record_error` |
 | `null` | The probe could not answer (timeout, transport error, or a service without the method). | `record_error` |
+| *(key absent)* | No delete was ever **attempted** — the record failed a pre-flight (`routes_to_mem0` / `carried_metadata` / `metadata_accepted` raising), so there was nothing to probe. Nothing was touched. | `record_error` |
+
+An absent key is a real reading, not an omission: the field is written only by
+the code paths that ran a delete, so its absence is itself the evidence that
+none did. Do not read it as "unknown" — that is what `null` means.
 
 The verdict **measures** rather than infers: it reads the store, and never
 sniffs the exception's type or message, which would encode mem0's internal
@@ -492,7 +499,10 @@ the honest label for a genuine unknown.
 
 A successful repair also carries `delete_landed: true`. It is **evidence, not an
 outcome**: it is deliberately not one of the four flags above and never by
-itself makes a run exit non-zero.
+itself makes a run exit non-zero. A record that reached `repaired: true` is
+therefore never escalated to `content_lost_in_flight` on the strength of that
+field — its re-add was vouched for, so the text is live in the store, and the
+two flags can never appear together on one record.
 
 *This was motivated by a real incident* —
 `docs/toolcall-xml-leak-sweep-2026-08-05/investigation.md` §4, which predates the
