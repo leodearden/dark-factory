@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import importlib.util
-import inspect
 import shutil
 import subprocess
 import sys
@@ -2041,19 +2040,13 @@ class TestWallClockDeadlineDebtBaseline:
         with no type error and no failing test. Requiredness is the whole guard,
         so it is pinned here rather than trusted.
         """
-        param = inspect.signature(_checker._apply_debt_budget).parameters[
-            'build_overrun_msg'
-        ]
-        assert param.default is inspect.Parameter.empty, (
-            'build_overrun_msg must have NO default: a defaulted message builder '
-            "hands the next rule some other rule's remedy"
-        )
-        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
-            'build_overrun_msg must be keyword-only so a positional argument can '
-            'never land in it by accident'
-        )
+        # Omitting the builder must fail: no default to fall back on.
         with pytest.raises(TypeError):
             _checker._apply_debt_budget([], 1)  # type: ignore[call-arg]
+        # Passing it positionally must fail too: keyword-only, so a stray
+        # positional argument can never land in it by accident.
+        with pytest.raises(TypeError):
+            _checker._apply_debt_budget([], 1, _checker._wall_clock_overrun_msg)  # type: ignore[misc]
 
 
 class TestDebtBaselineIsolation:
