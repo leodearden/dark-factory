@@ -432,3 +432,69 @@ class TestFindOpenGate:
         from fused_memory.middleware.recurring_gate_guard import find_open_gate
 
         assert find_open_gate(None, '5879') is None
+
+
+class TestRecurringGateError:
+    """recurring_gate_error(existing, subject) -> the rejection payload.
+
+    This is the user-observable contract: "rejected at the boundary with an
+    error naming the open carrier's task id".
+    """
+
+    @staticmethod
+    def _existing() -> dict[str, Any]:
+        return {
+            'id': '5902',
+            'title': 'GATE: stranded task 5879 needs a human ruling',
+            'status': 'pending',
+        }
+
+    def test_guard_family_shape(self):
+        from fused_memory.middleware.recurring_gate_guard import recurring_gate_error
+
+        err = recurring_gate_error(self._existing(), '5879')
+        assert isinstance(err['error'], str)
+        assert err['error_type'] == 'RecurringGateViolation'
+        assert isinstance(err['hint'], str)
+
+    def test_error_message_names_the_carrier_id_and_subject(self):
+        from fused_memory.middleware.recurring_gate_guard import recurring_gate_error
+
+        err = recurring_gate_error(self._existing(), '5879')
+        assert '5902' in err['error']
+        assert '5879' in err['error']
+
+    def test_hint_names_update_task_as_the_amend_path(self):
+        from fused_memory.middleware.recurring_gate_guard import recurring_gate_error
+
+        hint = recurring_gate_error(self._existing(), '5879')['hint']
+        assert 'update_task' in hint
+        assert 'amend' in hint.lower()
+        assert '5902' in hint
+
+    def test_hint_warns_that_append_does_not_append_description(self):
+        from fused_memory.middleware.recurring_gate_guard import recurring_gate_error
+
+        hint = recurring_gate_error(self._existing(), '5879')['hint']
+        assert 'append=True' in hint
+        assert 'description' in hint
+        assert 'updated_task' in hint
+
+    def test_structured_machine_readable_keys(self):
+        from fused_memory.middleware.recurring_gate_guard import recurring_gate_error
+
+        err = recurring_gate_error(self._existing(), '5879')
+        # A consumer must never have to regex the prose to learn which
+        # carrier to amend.
+        assert err['existing_gate_task_id'] == '5902'
+        assert isinstance(err['existing_gate_task_id'], str)
+        assert err['gate_subject'] == '5879'
+        assert isinstance(err['gate_subject'], str)
+
+    def test_total_on_a_carrier_missing_its_title(self):
+        from fused_memory.middleware.recurring_gate_guard import recurring_gate_error
+
+        err = recurring_gate_error({'id': '5902'}, '5879')
+        assert err['error_type'] == 'RecurringGateViolation'
+        assert err['existing_gate_task_id'] == '5902'
+        assert '5902' in err['error']
