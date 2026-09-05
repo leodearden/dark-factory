@@ -388,6 +388,7 @@ else
   # judge='by_id'/eval_src='failing'. Pinned by
   # scripts/tests/test_check_write_triage_flip_preconditions.py::TestResultBlockBlamesOnlyFailingItems.
   note "RESULT: preconditions NOT satisfied."
+  clause_printed=''
   triage_subject=''
   if item_failed 2 && item_failed 4; then triage_subject='Items 2 and 4 are'
   elif item_failed 2; then triage_subject='Item 2 is'
@@ -396,11 +397,21 @@ else
   if [ -n "$triage_subject" ]; then
     note "        $triage_subject task 4762's (priority high); see its description"
     note "        and details for the verbatim findings."
+    clause_printed=1
   fi
   if item_failed 1; then
     note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
     note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
     note "        satisfies it. See its report above for what was measured."
+    clause_printed=1
+  fi
+  # Fallback so this block can never go guidance-free: unreachable today
+  # (every record_fail call site passes 1, 2, 4, or '2 4', so one of the two
+  # clauses above always fires when fail -ne 0), but a future item added
+  # without a matching clause here would otherwise degrade silently to a
+  # bare RESULT line with no ownership guidance.
+  if [ -z "$clause_printed" ]; then
+    note "        See the FAILING ITEMS line below and each item's report above."
   fi
 fi
 
