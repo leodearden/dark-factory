@@ -7747,7 +7747,13 @@ class TestClaimantLivenessDispatchGate:
 
     def test_live_claimant_refuses_dispatch(self):
         heartbeat = (self.FIXED_DT - timedelta(minutes=1)).isoformat()  # fresh (ttl=300s default)
-        config = OrchestratorConfig(max_per_module=1)
+        # task 4481: pin the gate ON rather than inheriting it — this test
+        # is about the gate REFUSING dispatch, not about the flag's default.
+        # Mirrors this class's own test_kill_switch_disables_gate, which
+        # pins the same flag off.
+        config = OrchestratorConfig(
+            max_per_module=1, claimant_dispatch_gate_enabled=True,
+        )
         scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
 
         task = self._pending_task_with_claimant('5001', 'run-x/session-y/pid=1', heartbeat)
@@ -8389,6 +8395,13 @@ class TestParkStopTrip:
         import re
 
         config = OrchestratorConfig(
+            # task 4481: pin the trip ON rather than inheriting it.  These
+            # tests are about trip BEHAVIOUR, not about park_stop_enabled's
+            # default; an operator setting park_stop_enabled=false in
+            # dark-factory-orchestrator.yaml disarms the trip entirely and
+            # silently deletes this coverage.  The threshold/window knobs
+            # beside it are already pinned for the same reason.
+            park_stop_enabled=True,
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8487,6 +8500,13 @@ class TestParkStopTrip:
         reached the guard returns early.
         """
         config = OrchestratorConfig(
+            # task 4481: pin the trip ON rather than inheriting it.  These
+            # tests are about trip BEHAVIOUR, not about park_stop_enabled's
+            # default; an operator setting park_stop_enabled=false in
+            # dark-factory-orchestrator.yaml disarms the trip entirely and
+            # silently deletes this coverage.  The threshold/window knobs
+            # beside it are already pinned for the same reason.
+            park_stop_enabled=True,
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8536,6 +8556,13 @@ class TestParkStopTrip:
         is_paused must still be False.
         """
         config = OrchestratorConfig(
+            # task 4481: pin the trip ON rather than inheriting it.  These
+            # tests are about trip BEHAVIOUR, not about park_stop_enabled's
+            # default; an operator setting park_stop_enabled=false in
+            # dark-factory-orchestrator.yaml disarms the trip entirely and
+            # silently deletes this coverage.  The threshold/window knobs
+            # beside it are already pinned for the same reason.
+            park_stop_enabled=True,
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,

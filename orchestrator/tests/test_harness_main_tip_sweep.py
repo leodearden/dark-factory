@@ -75,7 +75,16 @@ def _make_sweep_harness(*, main_sha: str = MAIN_SHA) -> Harness:
     """Build a minimal bare Harness for single-pass sweep tests."""
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
-    h.config = OrchestratorConfig()
+    # task 4481: pin the tip re-confirmation arm ON rather than inheriting it.
+    # test_run_main_tip_sweep_tip_advanced_suppresses_no_escalation is about
+    # what that arm DOES (two get_main_sha calls, filing suppressed when the
+    # tip advanced), not about the flag's default — which
+    # test_config_defaults_main_tip_sweep owns under code_default_config.  An
+    # operator setting main_tip_sweep_rerun_confirm_enabled=false in
+    # dark-factory-orchestrator.yaml would otherwise delete that coverage
+    # silently.  The disabled-arm test builds its own config, so it is
+    # unaffected.
+    h.config = OrchestratorConfig(main_tip_sweep_rerun_confirm_enabled=True)
     h.git_ops = MagicMock()
     h.git_ops.get_main_sha = AsyncMock(return_value=main_sha)
     h._escalation_queue = MagicMock()
