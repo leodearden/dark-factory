@@ -27,6 +27,7 @@ carry a floor so the guard cannot pass vacuously.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -362,3 +363,109 @@ class TestFindViolationsInTree:
         tree = ast.parse(_SIG_A_SOURCE, filename='ignored.py')
         (violation,) = sfs.find_violations_in_tree(tree, 'shared/src/shared/x.py')
         assert violation.filename == 'shared/src/shared/x.py'
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — the silent-fallthrough gate consumes the shared provider
+# ---------------------------------------------------------------------------
+
+
+def _prefix_tree_scan_reference():
+    """Recompute the gate's inputs the PRE-4520 way: read, parse, find_violations.
+
+    Deliberately verbatim (``errors='replace'``, a separate ``ast.parse`` for
+    the SyntaxError check, ``find_violations(source, rel)`` re-parsing the same
+    text) so the parity assertions below compare against what the gate actually
+    saw before the rewrite — not against a tidied-up restatement of it.
+
+    This is the one expensive thing in this file, and it is expensive ON
+    PURPOSE: it is the whole-tree evidence that consolidating the scan changed
+    no answer. It is charged to exactly one test item.
+    """
+    files = list(iter_first_party_files(_REPO_ROOT))
+    violations = []
+    parse_failures = []
+    for filepath in files:
+        source = filepath.read_text(encoding='utf-8', errors='replace')
+        rel = str(filepath.relative_to(_REPO_ROOT))
+        try:
+            ast.parse(source, filename=str(filepath))
+        except SyntaxError as exc:
+            parse_failures.append(f'{filepath}: {exc}')
+        violations.extend(sfs.find_violations(source, rel))
+    return files, violations, parse_failures
+
+
+class TestSilentFallthroughGateUsesTheSharedTree:
+    """tree_scan_data walks the shared ASTs and parses nothing itself."""
+
+    def test_building_the_scan_data_does_no_io_and_no_parsing(
+        self, first_party_tree, monkeypatch
+    ):
+        """With the memo warm, the gate's own work must be a WALK and nothing more."""
+        import test_silent_fallthrough_gate as gate
+
+        counter = _WorkCounter(monkeypatch)
+        data = gate._build_tree_scan_data(first_party_tree)
+        assert counter.parses == [], (
+            f'tree_scan_data re-parsed {len(counter.parses)} file(s): '
+            f'{counter.parses[:5]}'
+        )
+        assert counter.reads == [], (
+            f'tree_scan_data re-read {len(counter.reads)} file(s): '
+            f'{counter.reads[:5]}'
+        )
+        assert len(data.files) == len(first_party_tree)
+
+    def test_parse_failure_message_shape_is_preserved(self):
+        """test_no_unparseable_files prints these — keep the pre-4520 shape.
+
+        Non-vacuous by construction: the real tree has zero parse failures
+        today, so whole-tree parity alone would assert ``[] == []``.
+        """
+        import test_silent_fallthrough_gate as gate
+
+        source = 'def f(:\n'
+        try:
+            ast.parse(source, filename='fake/broken.py')
+        except SyntaxError as exc:
+            error = exc
+        record = sfs.ParsedFile(
+            path=Path('/repo/shared/src/shared/broken.py'),
+            relpath='shared/src/shared/broken.py',
+            source=source,
+            tree=None,
+            syntax_error=error,
+        )
+        data = gate._build_tree_scan_data((record,))
+        assert data.parse_failures == [f'{record.path}: {error}']
+        assert data.violations == []
+
+    def test_output_parity_with_the_prefix_computation(self, first_party_tree):
+        """files, violation_key_counts and parse_failures are unchanged.
+
+        The read half cannot silently diverge and so is not re-measured here:
+        the provider reads with STRICT utf-8, so a file the pre-4520 loop would
+        have papered over with ``errors='replace'`` raises instead of returning
+        different text (pinned by ``test_undecodable_file_propagates``).
+        """
+        import test_silent_fallthrough_gate as gate
+
+        expected_files, expected_violations, expected_failures = (
+            _prefix_tree_scan_reference()
+        )
+        data = gate._build_tree_scan_data(first_party_tree)
+
+        assert data.files == expected_files
+        assert data.parse_failures == expected_failures
+        expected_counts = Counter(sfs.violation_key(v) for v in expected_violations)
+        assert sorted(data.violation_key_counts.items()) == sorted(
+            expected_counts.items()
+        ), (
+            'the consolidated scan sees a different violation multiset than the '
+            'pre-4520 read-then-parse-then-find_violations loop did'
+        )
+        assert sum(expected_counts.values()) > 0, (
+            'parity would be vacuous with no violations in the tree — the '
+            'allowlist records 14 today'
+        )
