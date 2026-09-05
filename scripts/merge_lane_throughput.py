@@ -34,7 +34,7 @@ import math
 import re
 import sqlite3
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -216,3 +216,116 @@ def _percentile(values: Sequence[float], pct: float) -> float | None:
     if lo_i == hi_i:
         return float(ordered[lo_i])
     return float(ordered[lo_i] + (k - lo_i) * (ordered[hi_i] - ordered[lo_i]))
+
+
+def _parse_ts(raw: str | None) -> datetime | None:
+    """Parse an events-table `timestamp` into a tz-aware UTC datetime.
+
+    A row whose timestamp is absent or unparseable yields ``None`` and is
+    skipped by its caller rather than aborting the section — same
+    fire-and-forget rationale as :func:`load_events`'s JSON degradation.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+# ---------------------------------------------------------------------------
+# Section: landings per day.
+# ---------------------------------------------------------------------------
+
+
+def compute_landings_per_day(
+    finalized_events: Sequence[dict[str, Any]], lo: datetime, hi: datetime
+) -> dict[str, Any]:
+    """Landings per UTC calendar day over the COMPLETE day buckets in the window.
+
+    A landing is a `merge_finalized` row whose ``data['state'] == 'done'``.
+    The other terminal states — 'blocked', 'superseded', 'conflict',
+    'unknown_branch', 'abandoned' (see `merge_types.py::MergeOutcome.status`,
+    plus 'abandoned' which `event_store.py` documents on this payload) — are
+    NOT landings and are reported separately by :func:`compute_mixes`.
+
+    Bucketing.  When *lo* falls mid-day, that leading day is a partial bucket
+    and is DROPPED.  The trailing day is KEPT even when *hi* falls mid-day, and
+    is named in ``partial_trailing_day`` so its under-count is legible instead
+    of silent — see the asymmetry note below.  Interior days with no landing
+    are zero-filled, so a quiet day pulls the median down instead of vanishing
+    from the series.
+
+    THE LEADING/TRAILING ASYMMETRY, stated plainly because it is a definitional
+    choice and not an obvious one: dropping BOTH partial buckets is the more
+    symmetric rule, but it is not the rule the PRD's § Background table was
+    computed under, and this script exists to reproduce that table.  Over the
+    dated window below, drop-both gives median 13.0 over 13 buckets — a
+    different table from the one every downstream decomposition inherits.  So
+    the trailing bucket is kept and LABELLED: a caller reading a live
+    ``--window 14d`` run (where *hi* is "now", so the last bucket is always a
+    day in progress) must read the final ``per_day`` entry as partial.
+
+    EMPIRICALLY PINNED (plan decision 1), and re-measured on this branch.  Run
+    against the live dark_factory store over the PRD's dated window
+    2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00, this definition
+    reproduces the PRD § Background row EXACTLY: median 12.0, max 27 over 14
+    buckets (Aug 21 .. Sep 3).  Each neighbouring definition gives a different
+    table on the same rows:
+      - counting every `merge_finalized` state:  median 19.0, max 75
+      - keeping the partial leading bucket:      median 11,   max 27 (15 buckets)
+      - dropping the partial trailing bucket:    median 13.0, max 27 (13 buckets)
+    The PRD's ``12.0`` is a ``.0`` float, i.e. the mean of the two middle values
+    of an EVEN-length series, which only an even bucket count can produce.
+
+    Returns ``{'per_day': {iso_date: count}, 'median': float | None,
+    'max': int | None, 'n_days': int, 'partial_trailing_day': str | None}``.
+    ``median``/``max`` are ``None`` — not ``0`` — when the window holds no
+    bucket at all: "too short to contain a whole day" is a different finding
+    from "a whole day passed with no landing".
+    """
+    at_midnight = time(0, 0, tzinfo=UTC)
+    first_day = lo.date() if lo.timetz() == at_midnight else (
+        lo.date() + timedelta(days=1)
+    )
+    # `hi` is exclusive, so a `hi` at exactly midnight completes the PREVIOUS
+    # day and opens no new bucket; a mid-day `hi` leaves its own day open, and
+    # that day is kept but reported as partial.
+    partial_trailing_day: str | None = None
+    if hi.timetz() == at_midnight:
+        last_day = hi.date() - timedelta(days=1)
+    else:
+        last_day = hi.date()
+        partial_trailing_day = last_day.isoformat()
+
+    if first_day > last_day:
+        return {'per_day': {}, 'median': None, 'max': None, 'n_days': 0,
+                'partial_trailing_day': None}
+
+    per_day: dict[str, int] = {}
+    day = first_day
+    while day <= last_day:
+        per_day[day.isoformat()] = 0
+        day += timedelta(days=1)
+
+    for event in finalized_events:
+        if event.get('data', {}).get('state') != 'done':
+            continue
+        ts = _parse_ts(event.get('timestamp'))
+        if ts is None:
+            continue
+        key = ts.date().isoformat()
+        if key in per_day:
+            per_day[key] += 1
+
+    counts = list(per_day.values())
+    return {
+        'per_day': per_day,
+        'median': _percentile([float(c) for c in counts], 50),
+        'max': max(counts),
+        'n_days': len(counts),
+        'partial_trailing_day': partial_trailing_day,
+    }

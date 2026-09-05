@@ -616,7 +616,12 @@ def test_landings_buckets_by_utc_calendar_date():
     assert result['per_day'] == {'2026-08-11': 1, '2026-08-12': 1}
 
 
-def test_landings_drops_a_partial_trailing_bucket_too():
+def test_landings_keeps_but_labels_a_partial_trailing_bucket():
+    # ASYMMETRY, deliberate: the leading partial bucket is dropped, the
+    # trailing one is kept and named. Dropping both is more symmetric but is
+    # NOT the rule the PRD's table was computed under — on the live dated
+    # window it gives median 13.0 over 13 buckets against the PRD's 12.0 over
+    # 14. Keeping it silent would be the real defect, so it is labelled.
     events = [
         {'timestamp': '2026-08-11T02:00:00+00:00', 'task_id': 't1',
          'data': {'state': 'done'}},
@@ -630,8 +635,18 @@ def test_landings_drops_a_partial_trailing_bucket_too():
         datetime(2026, 8, 11, 0, 0, tzinfo=UTC),
         datetime(2026, 8, 13, 6, 0, tzinfo=UTC),   # mid-day hi
     )
-    assert result['per_day'] == {'2026-08-11': 1, '2026-08-12': 1}
-    assert result['n_days'] == 2
+    assert result['per_day'] == {
+        '2026-08-11': 1, '2026-08-12': 1, '2026-08-13': 1,
+    }
+    assert result['n_days'] == 3
+    assert result['partial_trailing_day'] == '2026-08-13'
+
+
+def test_landings_reports_no_partial_trailing_day_when_hi_is_midnight():
+    result = mlt.compute_landings_per_day(
+        _landings_fixture(), CORPUS_LO_DT, CORPUS_HI_DT
+    )
+    assert result['partial_trailing_day'] is None
 
 
 def test_landings_reports_none_when_no_complete_bucket_exists():
