@@ -1679,6 +1679,41 @@ class TestScanProseCitationsBranches:
             assert 'phantom' not in rec.getMessage().lower()
 
     @pytest.mark.asyncio
+    async def test_backend_error_is_logged_with_its_error_type(self, caplog):
+        """The sick-backend branch is LOUD, not an anonymous counter.
+
+        Its sibling inconclusive branch logs and cites its ``reason``, and
+        ``verify_cited_memories`` records the same fault as a
+        ``verification_error`` marker carrying ``error_type``. Warn-only cannot
+        append a marker, so this log line is the ONLY place ``error_type``
+        survives — and the assertion above ('phantom' absent from every record)
+        passes vacuously if nothing is logged at all, which is exactly the
+        silence this pins shut (reviewer finding, task 4818 amendment pass)."""
+        finding = {
+            'finding_id': '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
+            'description': f'see {_SPECIMEN_FABRICATED}',
+        }
+        service = _prose_service(get_raises=TimeoutError('qdrant timeout'))
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                [finding], service, 'test_project', run_id='run-sick',
+            )
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert len(caplog.records) == 1
+        rec = caplog.records[0]
+        blob = f'{rec.getMessage()} {rec.__dict__}'
+        # Actionable on its own: which id, in which finding/field, from which
+        # run — and WHAT went wrong, which is the part the counter cannot say.
+        assert 'TimeoutError' in blob
+        assert _SPECIMEN_FABRICATED in blob
+        assert '0490e20e-cce2-4e68-a2ce-80f3b31987a1' in blob
+        assert 'description' in blob
+        assert 'run-sick' in blob
+        assert 'phantom' not in rec.getMessage().lower()
+
+    @pytest.mark.asyncio
     async def test_specimen_pair_warns_on_the_fabricated_id_only(self, caplog):
         """End-to-end near-miss regression: one description naming BOTH
         specimen ids, where the real one resolves and the fabricated one is a
@@ -1817,6 +1852,49 @@ class TestScanProseCitationsSafety:
         assert stats['stage1_prose_phantom_citations'] == 0
         assert len(caplog.records) == 1
         assert 'phantom' not in caplog.records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    async def test_unwired_ledger_degrades_to_inconclusive(self, caplog):
+        """USABILITY, not merely PRESENCE — the branch that makes the guarantee
+        hold against the REAL collaborator (reviewer finding, task 4818
+        amendment pass).
+
+        ``MemoryService.get_mem0_deletion_tombstone`` is "fail-safe
+        throughout": it NEVER raises, and returns ``None`` when no ledger is
+        wired (``recon_ledger_enabled=False``, a supported production config).
+        So on such a deployment a probe-PRESENT check would see a well-behaved
+        reader answering ``None`` for every id on earth and read each of those
+        as "no tombstone" — turning every ordinary miss into a fabricated
+        phantom, i.e. the exact two-way collapse the two tests above make
+        unreachable only for the wiring failures they model. Mirroring the
+        reader's own ``getattr(self, 'recon_ledger', None)`` guard is what
+        closes it."""
+        service = _prose_service(record=None, tombstone=None)
+        service.recon_ledger = None
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 1
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 1
+        assert 'phantom' not in caplog.records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    async def test_wired_ledger_still_reaches_the_fabricated_branch(self, caplog):
+        """The usability guard must not swallow the branch it protects: with a
+        ledger WIRED, a readable "no tombstone" is still a phantom."""
+        service = _prose_service(record=None, tombstone=None)
+        service.recon_ledger = object()
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        assert stats['stage1_prose_citation_verification_errors'] == 0
+        assert 'phantom' in caplog.records[0].getMessage().lower()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

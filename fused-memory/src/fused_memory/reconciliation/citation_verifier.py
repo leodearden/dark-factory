@@ -50,9 +50,13 @@ a warning; the point read or the tombstone probe faulting ->
 4818's near-miss specimen pair (fabricated and real ids differing only
 mid-string) and the requirement that a warning fire only on the fabricated
 branch of the three-way contract: a two-way found/not-found test would report
-every deliberately-tombstoned memory as a phantom. It runs from
-``BaseStage.run()`` on the same ``STAGE_STAT_PREFIX`` machinery as Half 1, so
-all three stages get it.
+every deliberately-tombstoned memory as a phantom. The tombstone is evidence,
+not a proof obligation: a probe that is missing, raising or ledger-less
+degrades to the inconclusive counter rather than to a phantom, but an expired
+(30-day TTL) or never-written tombstone still reads as absent, so the phantom
+counter is a lower-confidence signal — see ``scan_prose_citations``' docstring
+for the exact bound. It runs from ``BaseStage.run()`` on the same
+``STAGE_STAT_PREFIX`` machinery as Half 1, so all three stages get it.
 
 **It is WARN-ONLY, and that is load-bearing rather than merely cautious.** It
 drops nothing, mutates no finding, and appends no ``citation_failures`` marker.
@@ -426,9 +430,36 @@ async def scan_prose_citations(
     probe to "no tombstone". There the probe can only ADD information to an
     answer that is already correct; here it is the ONLY discriminator between
     the benign and fabricated branches, so degrading it would manufacture a
-    false phantom out of every deliberately-reaped memory. Making that collapse
-    unreachable even through a wiring failure is what makes the guarantee hold
-    in production rather than only in the tests.
+    false phantom out of every deliberately-reaped memory.
+
+    **How strong that discriminator actually is** — stated precisely, because
+    the honest bound is narrower than "no false phantoms" and an operator
+    reading the counter needs to know which (reviewer finding, task 4818
+    amendment pass). Three probe-side conditions are caught and degrade to
+    INCONCLUSIVE: a reader that is missing, a reader that raises, and a reader
+    whose ledger is not wired (``recon_ledger is None``, i.e. the supported
+    ``recon_ledger_enabled=False`` deployment). That last check exists because
+    ``MemoryService.get_mem0_deletion_tombstone`` is "fail-safe throughout" and
+    NEVER raises — it returns ``None`` on a locked/corrupt ledger, on an
+    undecodable payload and on no ledger at all — so a presence-only check
+    would read those ``None``s as "no tombstone" and collapse the split anyway.
+
+    Two blind spots remain, and NEITHER is closable from here, because both are
+    a readable ledger truthfully reporting no row:
+
+    - a delete that was never recon-initiated writes no tombstone at all (the
+      ledger only records recon-initiated Mem0 deletes); and
+    - a recon delete older than
+      :data:`~fused_memory.reconciliation.mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS`
+      (30 days) has had its tombstone expire —
+      ``get_mem0_deletion_tombstone``'s own docstring already says "a tombstone
+      proves deliberate deletion; its absence does not prove the converse".
+
+    So ``_prose_phantom_citations`` is a LOWER-CONFIDENCE signal, not a proof
+    of fabrication, and it is a lower-confidence one on every deployment rather
+    than only a degraded one. Which is precisely why the pass is warn-only: the
+    remedy for a residual false positive is one log line a reader dismisses,
+    not a dropped claim.
 
     **Why WARN-ONLY, and why it never mutates a finding.** The structured half
     (:func:`verify_cited_memories`) can safely DROP a phantom because
@@ -480,11 +511,25 @@ async def scan_prose_citations(
 
     resolve = _make_memory_resolver(memory_service, project_id)
 
-    # Resolve the tombstone reader ONCE, defensively. A service without the
-    # method is a WIRING failure, not a data condition, and it must not be able
-    # to collapse the four-way split into a two-way one — see the asymmetry
-    # comment on the miss branch below.
+    # Establish the tombstone reader's USABILITY once — not merely its
+    # PRESENCE (reviewer finding, task 4818 amendment pass). Both are wiring
+    # conditions rather than data conditions, and neither may collapse the
+    # four-way split into a two-way one — see the asymmetry comment on the miss
+    # branch below.
+    #
+    # Presence alone is not enough because
+    # ``MemoryService.get_mem0_deletion_tombstone`` is documented and
+    # implemented as "fail-safe throughout": it returns ``None`` — never raises
+    # — on a raising ledger read, an undecodable payload, AND when no ledger is
+    # wired at all. So on a ``recon_ledger_enabled=False`` deployment (a
+    # SUPPORTED production config, not a misconfiguration) the reader would
+    # answer ``None`` for every id on earth, and a probe-present check alone
+    # would read each of those ``None``s as "no tombstone" and manufacture a
+    # phantom out of every miss. Mirroring the reader's OWN guard —
+    # ``getattr(self, 'recon_ledger', None)`` — is what makes the degradation
+    # land on the inconclusive counter instead.
     tombstone_reader = getattr(memory_service, 'get_mem0_deletion_tombstone', None)
+    ledger_wired = getattr(memory_service, 'recon_ledger', None) is not None
 
     # Per-call memo of the tombstone probe, alongside the resolver's own memo,
     # so a missing id named by N findings costs ONE tombstone read as well as
@@ -499,6 +544,12 @@ async def scan_prose_citations(
             return cached
         if tombstone_reader is None:
             outcome: tuple[str, str | None] = ('inconclusive', 'reader_unavailable')
+        elif not ledger_wired:
+            # The reader exists but has nothing to read: it would short-circuit
+            # to ``None`` on its own ``recon_ledger is None`` guard, which is
+            # INDISTINGUISHABLE from "no tombstone exists" by return value
+            # alone. Refuse to draw the distinction rather than invent it.
+            outcome = ('inconclusive', 'ledger_unavailable')
         else:
             try:
                 tombstone = await tombstone_reader(project_id, memory_id)
@@ -516,13 +567,39 @@ async def scan_prose_citations(
         # the ``finding.get('finding_id')`` read on the warn branch below.
         if not isinstance(finding, dict):
             continue
+        _finding_id = finding.get('finding_id')
         for memory_id, fields in find_prose_uuids(finding).items():
             outcome, _error_type = await resolve(memory_id)
             if outcome == 'error':
                 # "Unknown", not "absent". Reporting this as a fabrication
                 # would be a silent-fail in the loud direction: it asserts
                 # something the read never established.
+                #
+                # It is logged for the same reason the inconclusive branch
+                # below is, and the symmetry is the point (reviewer finding,
+                # task 4818 amendment pass): this is the one branch where the
+                # BACKEND is actually sick, so leaving it as an anonymous
+                # counter — while its sibling logs loudly — would bury the only
+                # case with an operational remedy. ``verify_cited_memories``
+                # surfaces the same fault as a ``verification_error`` marker
+                # carrying ``error_type``; warn-only cannot append a marker, so
+                # the log line is where ``error_type`` has to survive.
                 stats[errors_key] += 1
+                log.warning(
+                    'reconciliation.prose_citation_read_failed: could not resolve '
+                    'memory_id=%s named in finding=%s field(s)=%s — the point read '
+                    'FAILED (error_type=%s, run_id=%s); counted INCONCLUSIVE, NOT '
+                    'reported as fabricated',
+                    memory_id, _finding_id, ','.join(fields), _error_type, run_id,
+                    extra={
+                        'run_id': run_id,
+                        'stat_prefix': stat_prefix,
+                        'finding_id': _finding_id,
+                        'fields': list(fields),
+                        'memory_id': memory_id,
+                        'error_type': _error_type,
+                    },
+                )
                 continue
             if outcome == 'found':
                 stats[verified_key] += 1
@@ -533,7 +610,6 @@ async def scan_prose_citations(
             # the probe runs ONLY here — guarded to the miss branch exactly as
             # ``server/tools.py::get_memory_by_id`` guards it, where it "never
             # runs on the hit branch".
-            _finding_id = finding.get('finding_id')
             probe, probe_reason = await _probe_tombstone(memory_id)
             if probe == 'tombstoned':
                 stats[tombstoned_key] += 1
