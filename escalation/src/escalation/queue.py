@@ -413,6 +413,185 @@ def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
                 yield path
 
 
+#: Parse-failure exceptions caught by ``queue.py``'s scan sites.  Deliberately
+#: NOT widened to bare ``ValueError``: a validation ``ValueError`` raised by
+#: ``Escalation.from_json`` must still surface to a queue caller.  ``sweep.py``
+#: catches the wider tuple and passes its own; see ``read_escalation_for_scan``.
+_SCAN_PARSE_ERRORS: tuple[type[BaseException], ...] = (json.JSONDecodeError, KeyError, TypeError)
+
+
+def read_escalation_for_scan(
+    path: Path, *, context: str,
+    parse_errors: tuple[type[BaseException], ...] = _SCAN_PARSE_ERRORS,
+) -> tuple[Escalation | None, str]:
+    """Read and parse one escalation file during an unlocked directory scan.
+
+    Returns ``(esc, 'ok')`` on success, or ``(None, reason)`` on failure.
+
+    THE TRI-STATE IS THE POINT.  Every unlocked ``glob``-then-read scan
+    snapshots a directory listing and then reads the files one at a time
+    holding NO lock, so a concurrent ``resolve()`` or archive sweep can
+    ``os.replace`` any of them out from under the read.  Swallowing that with
+    a blanket ``except OSError: continue`` would be the silent fail-soft this
+    repo's no-silent-fail-soft invariant forbids -- it would demote a real
+    permissions/EIO fault to the same treatment as a routine archival.  The
+    reason tag keeps the outcomes DISTINGUISHABLE at the call site, which is
+    also what lets ``sweep()`` count them into different report fields:
+
+    - ``'vanished'``   -- the file was relocated or pruned between the glob and
+      this read.  Logged at DEBUG, because it is EXPECTED concurrent
+      behaviour rather than corruption: the archive sweep and ``resolve()``
+      both move terminal records out of the queue root as a matter of course.
+      That severity is fully justified only for a ``status='pending'``
+      caller, where the record would have been filtered out anyway -- an
+      archived record is by definition no longer pending -- so warning would
+      only train operators to ignore the channel.  For an ARCHIVE-INCLUDING
+      scan it is a deliberate residual, stated plainly rather than implied:
+      ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
+      record relocated root -> ``archive/<date>/`` inside that window is in
+      NEITHER listing and drops out of the result entirely, reported only at
+      DEBUG.  Such a caller (``server.py``'s ``get_task_escalations`` when its
+      caller passes no status, and ``orchestrator.workflow``'s unfiltered
+      ``get_by_task(self.task_id)`` sweeps) can therefore receive a listing
+      that is silently short by one.  Still strictly better than the
+      pre-change crash, and bounded by the race window -- but recovering the
+      record would take a second archive glob after the root pass, which is
+      tracked as a follow-up rather than smuggled in here.
+    - ``'unreadable'`` -- any OTHER ``OSError``: EACCES, EIO, fd exhaustion.
+      The file IS present and something is genuinely wrong.  Logged at
+      WARNING, in wording deliberately disjoint from the parse channel's so
+      an operator can tell an I/O fault from corrupt JSON at a glance.
+    - ``'unparsable'`` -- the file's CONTENT is not a valid escalation record:
+      either the bytes would not decode as UTF-8, or they decoded but did not
+      parse.  Logged at WARNING; operator-actionable, and the file is left
+      exactly where it was for them to look at.
+
+    HANDLER ORDER IS LOAD-BEARING, for one clause of the three.
+    ``FileNotFoundError`` subclasses ``OSError``, so an ``except OSError``
+    placed FIRST would swallow ENOENT and permanently merge the 'vanished' and
+    'unreadable' channels, silently demoting a real permissions/EIO fault to
+    the treatment a routine archival gets.  Do not "simplify" those two clauses
+    into one.  The ``parse_errors`` clause sits ahead of the broad
+    ``except OSError`` so that a content fault can never be misfiled as an I/O
+    fault even if some future caller passes a tuple containing an ``OSError``
+    subclass; for both tuples in use today the two families are disjoint, so
+    that placement is DEFENSIVE rather than a live hazard.
+
+    *context* names the calling scan (e.g. ``'queue.get_by_task'``) so a log
+    line identifies which scan hit the file.  *parse_errors* is a parameter,
+    not a constant, because ``queue.py`` and ``sweep.py`` deliberately catch
+    different parse tuples; hard-coding either would silently change the other
+    module's behaviour.
+
+    The read and the parse sit in SEPARATE ``try`` blocks so an I/O error can
+    never be misfiled as a parse failure or vice versa.
+
+    SCAN SITES, AND WHY THE OTHERS ARE NOT HERE.  Every read of an escalation
+    file in this package was audited when this helper was introduced; the
+    asymmetry below is deliberate, not an oversight.
+
+    FIXED -- the unlocked scans, all six reads routed through this helper:
+    ``queue.py::EscalationQueue.get_by_task``,
+    ``queue.py::EscalationQueue.get_pending`` (which also backs
+    ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
+    ``queue.py::EscalationQueue.find_terminal_by_citation``,
+    ``sweep.py::reap_loose_archive_files``, and BOTH of ``sweep.py::sweep``'s
+    reads -- the root file, and the ARCHIVE copy its reconciliation branch
+    compares that file against.  The second one is not a glob-then-read but an
+    INDEX-then-read, and exposed for the same reason: ``_build_archive_index``
+    is an rglob snapshot taken before the loop, which a concurrent
+    ``archive.prune_archive`` invalidates wholesale by rmtree-ing a dated
+    subdir -- and ``run_startup_sweep`` runs prune as its own pass 3, so the
+    concurrent runner is a second orchestrator's startup sweep during a fleet
+    redeploy.
+
+    NOT THE WHOLE WINDOW, for sweep.py.  Guarding the READ leaves the MOVE
+    exposed: the record is read outside any lock and relocated a few lines
+    later, and ``os.replace``/``os.unlink`` raise ENOENT just as readily when a
+    concurrent ``resolve()`` gets there first.  That half is guarded in
+    sweep.py itself -- ``_source_vanished`` plus a ``FileNotFoundError`` catch
+    around each of the three movers -- rather than here, because it is not a
+    read at all.  Both halves feed the same ``SweepReport.skipped_vanished``.
+
+    NOT NEEDED -- protected by the LOCK rather than by exception handling.
+    The single-id read-modify-write methods in this module
+    (``add_members_to_l2``, ``stamp_triage``, ``attach_dedupe_child``,
+    ``patch_resolution_metadata``, ``note_suppressed_refile``) each open
+    ``escalation_id_lock`` BEFORE locating and reading the record, and BOTH
+    movers take that same per-id sidecar lock: ``queue.py::_archive_resolved``
+    is reached only from ``resolve()`` and ``submit_resolved()``, each inside
+    the lock, and ``sweep.py::_relocate_terminal`` locks around its move.
+    Relocation therefore cannot interleave with those reads for the same id,
+    and adding a catch there would imply a race that cannot occur.
+
+    ALREADY GUARDED elsewhere: ``watcher.py``'s two scan loops already catch
+    ``OSError`` (and ``UnicodeDecodeError`` in its text-read helper), so they
+    do not crash -- though they do so with no log at all.  That silence is a
+    separate, smaller concern, filed as a follow-up rather than widened into
+    this change.  Every cross-package consumer of ``iter_all_escalation_paths``
+    guards its own read already: ``dashboard.data.performance``
+    (``json.JSONDecodeError, OSError``), ``dashboard.data.escalation_analytics``,
+    ``orchestrator.digest`` and ``fused_memory.reconciliation.harness``
+    (``Exception``).
+
+    EXPLICITLY OUT OF SCOPE: ``EscalationQueue.get`` is ``_locate_path``-then-
+    read rather than glob-then-read.  Its blast radius is the single record
+    the caller asked about rather than a whole listing, and the semantically
+    correct repair is re-locate-and-retry -- the record MOVED, it did not
+    vanish -- which is a different shape from "skip and continue".  Tracked as
+    a follow-up.
+
+    DECODE FAULTS follow the caller's ``parse_errors``, by design and not by
+    accident.  ``UnicodeDecodeError`` from ``read_text`` on a truncated or
+    binary file subclasses ``ValueError`` and NOT ``OSError``, so it is raised
+    inside the read block and would escape a guard covering only
+    FileNotFoundError/OSError.  The ``except parse_errors`` clause there means
+    it is caught if and only if the caller's own tuple covers it, which
+    reproduces each module's pre-existing behaviour exactly: queue.py's
+    ``(JSONDecodeError, KeyError, TypeError)`` does not match it, so it still
+    propagates at ``get_by_task`` / ``get_pending`` /
+    ``find_terminal_by_citation``; sweep.py's tuple carries a bare
+    ``ValueError`` and does match it, so both sweep sites count it as
+    unparsable, warn once, and continue the pass.  Hard-coding
+    ``except UnicodeDecodeError`` instead would silently overturn the queue-side
+    half of that contract.
+    """
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        logger.debug(
+            '%s: %s vanished mid-scan (archived or pruned concurrently); skipping',
+            context, path,
+        )
+        return None, 'vanished'
+    except parse_errors as e:
+        # A DECODE fault (non-UTF-8 / truncated / binary bytes) surfaces here
+        # rather than at from_json below, because read_text() decodes.  Gated
+        # on the caller's own tuple, never hard-coded to UnicodeDecodeError:
+        # that keeps the clause a no-op for queue.py's narrow tuple and a full
+        # restoration of sweep.py's wider one.  See the docstring.
+        logger.warning('%s: Failed to parse %s: %s', context, path, e)
+        return None, 'unparsable'
+    except OSError as e:
+        logger.warning('%s: failed to read %s: %s', context, path, e)
+        return None, 'unreadable'
+
+    try:
+        return Escalation.from_json(text), 'ok'
+    except parse_errors as e:
+        # Capitalised 'Failed to parse' is pinned by
+        # tests/test_queue.py::TestGetPendingParseFailure -- and the helper
+        # lives in queue.py so the logger name stays 'escalation.queue' for
+        # every caller, including sweep.py's.  That single logger name is why
+        # *context* is interpolated here as well as on the other two channels:
+        # sweep()'s and reap_loose_archive_files()' parse failures used to be
+        # distinguishable by their own wording on the 'escalation.sweep'
+        # logger, and without the prefix an operator could no longer tell which
+        # scan hit the file.
+        logger.warning('%s: Failed to parse %s: %s', context, path, e)
+        return None, 'unparsable'
+
+
 class EscalationQueue:
     """Filesystem queue for escalations.
 
@@ -768,27 +947,31 @@ class EscalationQueue:
         seen: set[str] = set()
         results = []
         for path in paths:
-            try:
-                esc = Escalation.from_json(path.read_text())
-                if esc.task_id != task_id:
-                    continue
-                if status is not None and esc.status != status:
-                    continue
-                if level is not None and esc.level != level:
-                    continue
-                if agent_role is not None and esc.agent_role != agent_role:
-                    continue
-                if esc.id in seen:
-                    logger.debug(
-                        f'Duplicate escalation id {esc.id!r} at {path}; '
-                        'skipping (pre-scan WARNING already logged; queue_dir copy takes precedence)'
-                    )
-                    continue
-                seen.add(esc.id)
-                results.append(esc)
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse {path}: {e}')
+            # The glob above snapshotted the listing; nothing holds a lock over
+            # these reads, so a concurrent resolve()/sweep can relocate any of
+            # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
+            # distinguishable from a genuinely faulty file (WARNING).
+            esc, reason = read_escalation_for_scan(path, context='queue.get_by_task')
+            # esc is None iff reason != 'ok'; the second clause narrows the
+            # type without relying on an assert (stripped under -O).
+            if reason != 'ok' or esc is None:
                 continue
+            if esc.task_id != task_id:
+                continue
+            if status is not None and esc.status != status:
+                continue
+            if level is not None and esc.level != level:
+                continue
+            if agent_role is not None and esc.agent_role != agent_role:
+                continue
+            if esc.id in seen:
+                logger.debug(
+                    f'Duplicate escalation id {esc.id!r} at {path}; '
+                    'skipping (pre-scan WARNING already logged; queue_dir copy takes precedence)'
+                )
+                continue
+            seen.add(esc.id)
+            results.append(esc)
         return results
 
     def has_open_l1(self, task_id: str, *, category: str | None = None) -> bool:
@@ -859,10 +1042,10 @@ class EscalationQueue:
         for path in itertools.chain(
             self.queue_dir.glob(pattern), self._iter_archive_paths(pattern),
         ):
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse {path}: {e}')
+            esc, reason = read_escalation_for_scan(
+                path, context='queue.find_terminal_by_citation',
+            )
+            if reason != 'ok' or esc is None:
                 continue
             # task_id is authoritative — the glob over-matches hyphenated siblings.
             if esc.task_id != task_id:
@@ -892,13 +1075,11 @@ class EscalationQueue:
         """Get all pending escalations."""
         results = []
         for path in self.queue_dir.glob('esc-*.json'):
-            try:
-                esc = Escalation.from_json(path.read_text())
-                if esc.status == 'pending':
-                    results.append(esc)
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse {path}: {e}')
+            esc, reason = read_escalation_for_scan(path, context='queue.get_pending')
+            if reason != 'ok' or esc is None:
                 continue
+            if esc.status == 'pending':
+                results.append(esc)
         return results
 
     def resolve(

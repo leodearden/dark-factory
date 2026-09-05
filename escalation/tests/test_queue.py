@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _scan_race_helpers import relocating_read_text, unreadable_read_text
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
@@ -1777,6 +1778,180 @@ class TestGetPendingParseFailure:
             f"Expected a WARNING containing 'Failed to parse'; "
             f"got: {[r.message for r in warning_records]}"
         )
+
+
+class TestScanSurvivesRecordArchivedMidScan:
+    """An unlocked glob-then-read scan must survive a record relocated by a
+    concurrent archive sweep between the directory listing and the read.
+
+    The glob snapshots the queue root; the reads happen afterwards, one file
+    at a time, holding no lock.  A concurrent ``resolve()`` or startup sweep
+    can ``os.replace`` any of those files into ``archive/<date>/`` in that
+    window, so the read raises ``FileNotFoundError`` — an ``OSError``, which
+    none of the scan sites' ``except (json.JSONDecodeError, KeyError,
+    TypeError)`` tuples cover.  The blast radius is the WHOLE listing, and it
+    crosses tasks: every root file is read before the ``task_id`` filter runs,
+    so archiving an unrelated task's record kills a caller's query.
+    """
+
+    def test_get_by_task_survives_unrelated_record_archived_mid_scan(
+        self, tmp_path: Path, caplog,
+    ):
+        """A task-4176 query must survive the archival of a task-3517 record.
+
+        RED on main: ``FileNotFoundError: [Errno 2] No such file or directory:
+        '.../queue/esc-3517-5.json'`` escapes ``get_by_task`` entirely.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-3517-5', task_id='3517'))
+
+        doomed = queue.queue_dir / 'esc-3517-5.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status='pending')
+
+        # (a) The unrelated archival must not void the caller's listing.
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving task-4176 record, got '
+            f'{[e.id for e in results]}'
+        )
+
+        # (b) Loud enough to audit: the vanished path is named at DEBUG.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any(str(doomed) in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG naming {doomed}; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+        # (c) ...but NOT loud enough to cry wolf.  A record archived mid-scan
+        # is expected concurrency, not corruption — and for status='pending'
+        # it would have been filtered out anyway, an archived record being by
+        # definition no longer pending.
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not loud, (
+            f'Expected no WARNING-or-above for a benign mid-scan archival; '
+            f'got: {[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+
+
+    def test_get_by_task_keeps_an_unreadable_file_loud_and_distinguishable(
+        self, tmp_path: Path, caplog,
+    ):
+        """A present-but-unreadable file must not void the listing OR go quiet.
+
+        This is the guard against the fix degrading into a silent fail-soft.
+        A ``PermissionError`` (or EIO, or fd exhaustion) means the file IS
+        there and something is genuinely wrong — operator-actionable, unlike
+        the benign archived-mid-scan case, and it must reach the channel
+        operators actually watch.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        flaky = unreadable_read_text(doomed)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status='pending')
+
+        # (a) One unreadable file must not void the whole listing either.
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected the readable record to survive, got '
+            f'{[e.id for e in results]}'
+        )
+
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        # (b) A permissions/EIO fault is operator-actionable: stay loud.
+        assert any(str(doomed) in r.getMessage() for r in loud), (
+            f'Expected a WARNING-or-above naming {doomed}; got: '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+        # (c) ...on the right channel.  An I/O fault is not a parse fault, and
+        # conflating them sends an operator hunting for corrupt JSON.
+        assert not any('Failed to parse' in r.getMessage() for r in loud), (
+            f"An I/O fault must not be reported as a parse failure; got: "
+            f'{[r.getMessage() for r in loud]}'
+        )
+
+
+    def test_get_pending_survives_a_record_archived_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """get_pending() carries the identical gap and is pinned independently.
+
+        This scan also backs ``dismiss_all_pending``, so the startup L0 sweep
+        inherits the fix.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-3517-5', task_id='3517'))
+
+        doomed = queue.queue_dir / 'esc-3517-5.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            results = queue.get_pending()
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record, got {[e.id for e in results]}'
+        )
+
+    def test_find_terminal_by_citation_survives_a_record_archived_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """The targeted ``esc-{task_id}-*.json`` glob has the same shape.
+
+        Both records are terminal and both match the glob, so both are read —
+        and the one the caller is NOT looking for is the one relocated, again
+        pinning that the blast radius is the whole listing rather than the
+        record that moved.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        citation = 'b' * 40
+        category = 'provenance_unattributed'
+
+        # Written directly rather than submit+resolve()'d: resolve() archives
+        # the record, and this test needs BOTH terminal records sitting in the
+        # queue root where the concurrent sweep would find them.
+        for esc_id, sha in (('esc-4176-1', citation), ('esc-4176-2', 'c' * 40)):
+            esc = _make_escalation(esc_id, task_id='4176', status='resolved', level=1)
+            esc.category = category
+            esc.citation_sha = sha
+            esc.resolved_at = datetime.now(UTC).isoformat()
+            (queue.queue_dir / f'{esc_id}.json').write_text(esc.to_json())
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            found = queue.find_terminal_by_citation('4176', category, citation)
+
+        assert found is not None, (
+            'the surviving terminal record must still be found when an '
+            'unrelated sibling is archived mid-scan'
+        )
+        assert found.id == 'esc-4176-1', f'wrong record returned: {found.id!r}'
 
 
 class TestMakeIdCounter:
