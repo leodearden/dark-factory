@@ -682,17 +682,37 @@ async def delete_orphan_markers(
         # documented contract for the field ("the delete's `_source` audit
         # tag, i.e. WHICH sweep took it") — so the write journal and the
         # tombstone name this sweep identically.
-        tombstoned = await record_mem0_deletion_tombstones(
-            memory_service,
-            project_id,
-            tombstone_victims,
-            deleter='sweep_orphan_flag_markers',
-            # Same id the deletes above were journaled under, which is what
-            # makes the two cross-referenceable. A manual/nightly sweep has no
-            # reconciliation run, so '' is the honest value (and matches the
-            # ledger row's own run_id default).
-            deleting_run_id=causation_id or '',
-        )
+        #
+        # record_mem0_deletion_tombstones is internally fail-safe (returns 0,
+        # never raises); this try/except is a SECOND belt so that even a
+        # helper that is patched or broken cannot raise out of — or alter the
+        # count of — this sweep, while still saying so out loud rather than
+        # swallowing it. `deleted`/`failed` are already final above, so no
+        # path through here can perturb what the caller is told.
+        try:
+            tombstoned = await record_mem0_deletion_tombstones(
+                memory_service,
+                project_id,
+                tombstone_victims,
+                deleter='sweep_orphan_flag_markers',
+                # Same id the deletes above were journaled under, which is
+                # what makes the two cross-referenceable. A manual/nightly
+                # sweep has no reconciliation run, so '' is the honest value
+                # (and matches the ledger row's own run_id default).
+                deleting_run_id=causation_id or '',
+            )
+        except Exception:
+            logger.warning(
+                'sweep_orphan_flag_markers: tombstone batch raised for %d '
+                'deleted record(s); the deletes themselves succeeded and are '
+                'counted, but this sweep left no task-3041 audit trail for '
+                'them — an auditor chasing one of these memory ids will find '
+                'nothing distinguishing this sweep from silent data loss.',
+                len(tombstone_victims),
+                exc_info=True,
+                extra={'project_id': project_id},
+            )
+            tombstoned = 0
 
     return {
         'deleted': deleted,
