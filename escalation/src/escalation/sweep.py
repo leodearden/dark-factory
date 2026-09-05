@@ -404,10 +404,16 @@ def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
     # Only glob the archive top level — non-recursive, so dated-subdir files
     # are excluded (the glob `esc-*.json` does not recurse into subdirs).
     for path in list(archive_root.glob('esc-*.json')):
-        try:
-            esc = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            logger.warning('reap_loose: skipping unparsable %s: %s', path.name, e)
+        # Same unlocked glob-then-read exposure as sweep(): a concurrent sweep
+        # can file this loose record into its dated subdir before the read.
+        # No counter is needed here, unlike sweep() — `moved` tallies the
+        # relocations THIS pass performed, and one already done by someone else
+        # simply is not among them, so the tally stays truthful as-is.
+        esc, reason = read_escalation_for_scan(
+            path, context='reap_loose',
+            parse_errors=(json.JSONDecodeError, KeyError, TypeError, ValueError),
+        )
+        if reason != 'ok' or esc is None:
             continue
 
         if esc.status not in ('resolved', 'dismissed'):
