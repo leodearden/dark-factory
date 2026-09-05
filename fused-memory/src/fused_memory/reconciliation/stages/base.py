@@ -24,6 +24,7 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.reconciliation.citation_verifier import (
     STAGE_STAT_PREFIX,
+    make_memory_resolver,
     scan_prose_citations,
     verify_cited_memories,
 )
@@ -388,8 +389,22 @@ class BaseStage:
         # remediation early-return), full and remediation passes alike are
         # verified and the citation stats are always present on report.stats.
         _cite_prefix = STAGE_STAT_PREFIX.get(self.stage_id, self.stage_id.value)
+
+        # ONE memoised resolver, shared by BOTH halves of the invariant
+        # (reviewer finding, task 4818 amendment pass). `make_memory_resolver`
+        # was extracted precisely so the two passes cannot disagree about what
+        # a backend timeout means, but sharing the FACTORY and not the INSTANCE
+        # left that only half done: two independent memos meant an id that is
+        # both structurally cited and named in the same report's prose cost two
+        # Qdrant point reads per stage run — on the critical path, for all
+        # three stages — and the two reads could straddle a concurrent delete
+        # and return contradictory verdicts for the same id in the same report.
+        # One instance closes both, and its memo is still scoped to this run.
+        _cite_resolve = make_memory_resolver(self.memory, self.project_id)
+
         _cite_stats = await verify_cited_memories(
             _flagged, self.memory, self.project_id, stat_prefix=_cite_prefix,
+            resolve=_cite_resolve,
         )
         _stats.update(_cite_stats)
 
@@ -409,7 +424,7 @@ class BaseStage:
         # not double-counting the same claim.
         _prose_stats = await scan_prose_citations(
             _flagged, self.memory, self.project_id,
-            stat_prefix=_cite_prefix, run_id=run_id,
+            stat_prefix=_cite_prefix, run_id=run_id, resolve=_cite_resolve,
         )
         _stats.update(_prose_stats)
 

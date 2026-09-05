@@ -20,6 +20,7 @@ import pytest
 
 from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.citation_verifier import (
+    MAX_PROSE_IDS_PER_RUN,
     PROSE_CITATION_FIELDS,
     STAGE_STAT_PREFIX,
     X_CITATION_TOMBSTONE_KEY,
@@ -29,6 +30,7 @@ from fused_memory.reconciliation.citation_verifier import (
     find_live_citation_occurrences,
     find_prose_uuids,
     is_concrete_memory_id,
+    make_memory_resolver,
     repoint_metadata,
     repoint_task_citations,
     repoint_tombstone_chain,
@@ -2130,3 +2132,147 @@ class TestScanProseCitationsKnownNonMem0Ids:
             '0490e20e-cce2-4e68-a2ce-80f3b31987a1',
             'ab330f59-1111-4222-8333-444444444444',
         }
+
+
+class TestSharedResolverAndProseCeiling:
+    """Both passes accept an injected ``resolve=`` so ONE memo can span the
+    whole report, and the prose pass caps its unbounded fan-out (reviewer
+    finding, task 4818 amendment pass)."""
+
+    @staticmethod
+    def _uuid(n: int) -> str:
+        return f'{n:08x}-0000-4000-8000-000000000000'
+
+    @pytest.mark.asyncio
+    async def test_injected_resolver_is_used_by_both_passes(self):
+        """The point read goes through the SUPPLIED resolver, so a caller
+        sharing one instance across both halves gets one memo, not two."""
+        calls: list[Any] = []
+
+        async def _fake_resolve(memory_id):
+            calls.append(memory_id)
+            return ('found', None)
+
+        service = _prose_service(record=None, tombstone=None)
+        structured = [
+            {
+                'finding_id': 'f1',
+                'cited_memories': [{'memory_id': _SPECIMEN_REAL, 'store': 'mem0'}],
+            },
+        ]
+        prose = [{'finding_id': 'f2', 'description': f'see {_SPECIMEN_REAL}'}]
+
+        s1 = await verify_cited_memories(
+            structured, service, 'test_project', resolve=_fake_resolve,
+        )
+        s2 = await scan_prose_citations(
+            prose, service, 'test_project', resolve=_fake_resolve,
+        )
+
+        assert s1['stage1_citations_verified'] == 1
+        assert s2['stage1_prose_citations_verified'] == 1
+        assert calls == [_SPECIMEN_REAL, _SPECIMEN_REAL]
+        # The injected resolver REPLACES the private one — neither pass reached
+        # around it to the service.
+        service.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_shared_resolver_costs_one_read_across_both_halves(self):
+        """The point of sharing the INSTANCE and not just the factory: an id
+        both structurally cited and named in the prose of the same report is
+        read ONCE, so the two passes also cannot straddle a concurrent delete
+        and return contradictory verdicts for it."""
+        service = _prose_service(record=None, tombstone=None)
+        shared_resolve = make_memory_resolver(service, 'test_project')
+        findings = [
+            {
+                'finding_id': 'f1',
+                'description': f'Memory {_SPECIMEN_FABRICATED} is stale.',
+                'cited_memories': [{'memory_id': _SPECIMEN_FABRICATED, 'store': 'mem0'}],
+            },
+        ]
+
+        s1 = await verify_cited_memories(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+        s2 = await scan_prose_citations(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+
+        assert s1['stage1_phantom_citations_dropped'] == 1
+        assert s2['stage1_prose_phantom_citations'] == 1
+        service.get_memory_by_id.assert_awaited_once_with(
+            'test_project', _SPECIMEN_FABRICATED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_resolve_none_still_builds_a_private_resolver(self):
+        """Omitting ``resolve`` keeps every standalone caller on the original
+        behaviour — the parameter is an optimisation, not a new requirement."""
+        service = _prose_service(record=None, tombstone=None)
+        finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
+
+        stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 1
+        service.get_memory_by_id.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_distinct_prose_ids_are_capped_per_run(self, caplog):
+        """A description naming more distinct uuids than the ceiling must not
+        stall report assembly with unbounded serial point reads for a WARN-ONLY
+        diagnostic. Unlike the structured pass, whose fan-out is bounded by the
+        model-emitted citation list, this one is driven by arbitrary free
+        text."""
+        over = MAX_PROSE_IDS_PER_RUN + 3
+        ids = [self._uuid(n) for n in range(over)]
+        finding = {'finding_id': 'f-flood', 'description': ' '.join(ids)}
+        service = _prose_service(record=None, tombstone=None)
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                [finding], service, 'test_project', run_id='run-flood',
+            )
+
+        # Exactly the ceiling is resolved; the remainder is INCONCLUSIVE, never
+        # phantom — declining to look establishes nothing either way.
+        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_RUN
+        assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_RUN
+        assert stats['stage1_prose_citation_verification_errors'] == 3
+        # ...and the four counters still account for every distinct pair.
+        assert sum(stats.values()) == over
+
+        capped = [r for r in caplog.records if 'scan_capped' in r.getMessage()]
+        assert len(capped) == 1, 'the ceiling must be logged ONCE per run, not per id'
+        assert 'run-flood' in capped[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_a_report_under_the_ceiling_is_untouched(self):
+        """The ceiling is a backstop, not a throttle on ordinary reports."""
+        ids = [self._uuid(n) for n in range(5)]
+        findings = [{'finding_id': f'f{i}', 'description': u} for i, u in enumerate(ids)]
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert stats['stage1_prose_phantom_citations'] == 5
+        assert stats['stage1_prose_citation_verification_errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_ceiling_counts_distinct_ids_not_pairs(self):
+        """A repeat of an ALREADY-resolved id is free (the memo answers it), so
+        it must not consume ceiling budget — the ceiling bounds reads, and the
+        counters keep counting per-finding CLAIMS."""
+        ids = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_RUN)]
+        blob = ' '.join(ids)
+        findings = [
+            {'finding_id': 'f-a', 'description': blob},
+            {'finding_id': 'f-b', 'description': blob},
+        ]
+        service = _prose_service(record=None, tombstone=None)
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
+
+        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_RUN
+        assert stats['stage1_prose_phantom_citations'] == 2 * MAX_PROSE_IDS_PER_RUN
+        assert stats['stage1_prose_citation_verification_errors'] == 0

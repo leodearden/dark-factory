@@ -633,6 +633,116 @@ class TestProseCitationScanWiring:
         assert report.stats['stage1_prose_citations_tombstoned'] == 1
         assert report.stats['stage1_prose_phantom_citations'] == 0
 
+    @staticmethod
+    def _assembled_citing_and_naming(memory_id: str) -> dict:
+        """One finding whose STRUCTURED citation and PROSE both name the same
+        mem0 id — the interaction the two passes' ordering turns on."""
+        return {
+            'summary': 's',
+            'flagged_items': [
+                {
+                    'finding_id': 'f-both',
+                    'description': f'Memory {memory_id} contradicts this cluster.',
+                    'severity': 'minor',
+                    'cited_memories': [{'memory_id': memory_id, 'store': 'mem0'}],
+                    'cited_tasks': [{'task_id': '1', 'project_id': 'p', 'title': 't'}],
+                },
+            ],
+            'stats': {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_one_shared_resolver_serves_both_halves(self):
+        """BaseStage.run() builds ONE `make_memory_resolver` and hands it to
+        both passes, so an id that is both structurally cited and named in the
+        same report's prose costs ONE Qdrant point read, not two (reviewer
+        finding, task 4818 amendment pass).
+
+        Two independent memos would also let the two reads straddle a
+        concurrent delete and return contradictory verdicts for the same id in
+        the same report; sharing the instance makes them agree by construction
+        rather than by coincidence of timing."""
+        missing = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+
+        class _WritebackState(_FakeReconState):
+            def apply_citation_verification(self, run_id, corrections):
+                self.calls.append(('apply_citation_verification', run_id, corrections))
+
+        state = _WritebackState(assembled_report=self._assembled_citing_and_naming(missing))
+        stage = _make_stage(recon_report_state=state)
+        stage.memory.get_memory_by_id = AsyncMock(return_value=None)
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(return_value=None)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            await stage.run([], watermark, [], run_id='run-shared-resolver')
+
+        stage.memory.get_memory_by_id.assert_awaited_once_with('test_project', missing)
+
+    @pytest.mark.asyncio
+    async def test_structured_drop_and_prose_warning_both_fire_for_the_same_id(self):
+        """Running the prose pass AFTER the structured one is deliberate, and
+        this pins WHY (reviewer finding, task 4818 amendment pass).
+
+        A phantom just dropped from `cited_memories` that is STILL named in the
+        finding's prose is a real, separate fact: the structured drop removes
+        the machine-readable claim, but the human-readable one survives into
+        the journal and will be chased by a reader. So both counters fire for
+        the one id, and they are NOT double-counting the same claim — they
+        count two claims with two different remedies. A future refactor that
+        reordered or merged the passes would silently break exactly this."""
+        missing = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+        description = f'Memory {missing} contradicts this cluster.'
+
+        class _WritebackState(_FakeReconState):
+            def apply_citation_verification(self, run_id, corrections):
+                self.calls.append(('apply_citation_verification', run_id, corrections))
+
+        state = _WritebackState(assembled_report=self._assembled_citing_and_naming(missing))
+        stage = _make_stage(recon_report_state=state)
+        stage.memory.get_memory_by_id = AsyncMock(return_value=None)
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(return_value=None)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-both-halves')
+
+        assert report.stats['stage1_phantom_citations_dropped'] == 1
+        assert report.stats['stage1_prose_phantom_citations'] == 1
+
+        item = report.items_flagged[0]
+        # The STRUCTURED half acted: the citation is gone and exactly ONE
+        # marker was appended. The PROSE half did not: warn-only means no
+        # second marker, and the description is returned byte-identical.
+        assert item['cited_memories'] == []
+        assert item['citation_failures'] == [
+            {'memory_id': missing, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+        assert item['description'] == description
+
+        # ...and the durable write-back carries only that one structured entry.
+        writebacks = [c for c in state.calls if c[0] == 'apply_citation_verification']
+        assert len(writebacks) == 1
+        assert writebacks[0][2] == [
+            {
+                'finding_id': 'f-both',
+                'cited_memories': [],
+                'citation_failures': [
+                    {'memory_id': missing, 'store': 'mem0', 'reason': 'memory_not_found'},
+                ],
+            },
+        ]
+
     @pytest.mark.asyncio
     async def test_start_report_failed_stamp_uses_stage_stat_prefix(self):
         """The degraded short-circuit's zero-stamp derives its prefix from the

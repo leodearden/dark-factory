@@ -164,6 +164,18 @@ PROSE_CITATION_FIELDS: tuple[str, ...] = ('description', 'suggested_action')
 # would extract a 36-char window out of the middle of a 40-hex-digit blob.
 # ``(?<![0-9a-fA-F])`` / ``(?![0-9a-fA-F])`` reject exactly that, while still
 # admitting an id preceded by a dash (``run-<uuid>``) or followed by a period.
+# Ceiling on how many DISTINCT prose ids one run will resolve (reviewer
+# finding, task 4818 amendment pass). The structured pass's fan-out is bounded
+# by the model-emitted ``cited_memories`` list; the prose pass's is not — it is
+# driven by arbitrary LLM free text, so a description naming 200 distinct
+# uuid-shaped substrings would cost 200 serial point reads (plus up to 200
+# tombstone reads) on report assembly's critical path, for a WARN-ONLY
+# diagnostic. Ids past the ceiling are counted INCONCLUSIVE rather than
+# silently dropped — "we did not establish anything about this id" is exactly
+# what that counter already means — and the ceiling is logged ONCE per run, so
+# a pathological report is visible rather than merely slow.
+MAX_PROSE_IDS_PER_RUN: int = 200
+
 _PROSE_UUID_RE = re.compile(
     r'(?<![0-9a-fA-F])'
     r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
@@ -280,11 +292,11 @@ def _known_non_mem0_ids(finding: Any, run_id: str | None = None) -> set[str]:
     return excluded
 
 
-def _make_memory_resolver(
+def make_memory_resolver(
     memory_service: Any,
     project_id: str,
 ) -> Callable[[Any], Awaitable[tuple[str, str | None]]]:
-    """Build a per-call memoised three-way resolver for a Mem0 point id.
+    """Build a per-RUN memoised three-way resolver for a Mem0 point id.
 
     Returns an async callable answering ``('found', None) | ('missing', None) |
     ('error', '<ExcTypeName>')`` for a ``memory_id``, resolved through
@@ -299,13 +311,25 @@ def _make_memory_resolver(
     reintroduce exactly that drift, in the one place where the two halves are
     most expected to agree.
 
-    Each distinct id is resolved AT MOST ONCE per call: an id cited by N
-    findings costs one point read, not N. ``get_memory_by_id`` is a network
-    round trip on the stage's critical path and task 2979 put the structured
-    pass on ALL THREE stages, so the repeat-citation case is three times as
-    common as it was.
+    **PUBLIC because the sharing is cross-module.** Both passes take an
+    optional ``resolve=``, and ``BaseStage.run()`` builds ONE resolver and
+    hands it to both, so the memo spans the whole report rather than one pass
+    (reviewer finding, task 4818 amendment pass). Sharing the factory but not
+    the INSTANCE left the drift only half-closed: two independent memos meant
+    an id that is both structurally cited and named in the prose of the same
+    report cost two point reads per stage run, on the critical path, for all
+    three stages — and the two reads could straddle a concurrent delete and
+    yield contradictory verdicts for the same id in the same report. One
+    instance makes the two passes agree by construction rather than by
+    coincidence of timing.
 
-    The memo is scoped to the CALL, never module-level: a longer-lived cache
+    Each distinct id is resolved AT MOST ONCE per resolver: an id cited by N
+    findings — in either pass — costs one point read, not N.
+    ``get_memory_by_id`` is a network round trip on the stage's critical path
+    and task 2979 put the structured pass on ALL THREE stages, so the
+    repeat-citation case is three times as common as it was.
+
+    The memo is scoped to the RUN, never module-level: a longer-lived cache
     would reintroduce exactly the stale-read TOCTOU these passes exist to
     close. Caching the ``'error'`` outcome too is deliberate — a backend that
     just failed for this id will almost certainly fail again within the same
@@ -336,6 +360,7 @@ async def verify_cited_memories(
     project_id: str,
     *,
     stat_prefix: str = 'stage1',
+    resolve: Callable[[Any], Awaitable[tuple[str, str | None]]] | None = None,
 ) -> dict[str, int]:
     """Verify each finding's cited Mem0 memories still resolve; drop phantoms.
 
@@ -378,10 +403,20 @@ async def verify_cited_memories(
     what makes the report-level claim hold on the one path that never calls
     this function at all.
 
-    Each distinct ``memory_id`` is resolved AT MOST ONCE per call: outcomes are
-    memoised in a per-call cache, so an id cited by N findings costs one point
-    read, not N. The counters are unaffected — they count CITATIONS, not
-    lookups, so a memoised hit increments exactly as a fresh one does.
+    Each distinct ``memory_id`` is resolved AT MOST ONCE: outcomes are memoised
+    in the resolver's cache, so an id cited by N findings costs one point read,
+    not N. The counters are unaffected — they count CITATIONS, not lookups, so
+    a memoised hit increments exactly as a fresh one does.
+
+    ``resolve`` lets the caller supply that memoised resolver instead of this
+    function building its own, so ONE memo can span both halves of the
+    invariant — ``BaseStage.run()`` shares a single
+    :func:`make_memory_resolver` instance with :func:`scan_prose_citations`, so
+    an id that is both structurally cited and named in the prose of the same
+    report costs one point read rather than two, and the two passes cannot
+    reach contradictory verdicts by straddling a concurrent delete. It defaults
+    to ``None`` (build a private one) so every standalone caller keeps the
+    task-2978 behaviour unchanged.
     """
     # Why re-verify at all, at report-assembly time? Two root causes this pass
     # closes that a cite-time check cannot:
@@ -400,7 +435,7 @@ async def verify_cited_memories(
     errors_key = f'{stat_prefix}_citation_verification_errors'
     stats = {dropped_key: 0, verified_key: 0, errors_key: 0}
 
-    _resolve = _make_memory_resolver(memory_service, project_id)
+    _resolve = resolve or make_memory_resolver(memory_service, project_id)
 
     for finding in findings:
         cited = finding.get('cited_memories') or []
@@ -467,6 +502,7 @@ async def scan_prose_citations(
     *,
     stat_prefix: str = 'stage1',
     run_id: str | None = None,
+    resolve: Callable[[Any], Awaitable[tuple[str, str | None]]] | None = None,
     log: logging.Logger | None = None,
 ) -> dict[str, int]:
     """WARN-ONLY prose half of the citation invariant (task 4818).
@@ -546,13 +582,30 @@ async def scan_prose_citations(
     before the read and counted nowhere — see :func:`_known_non_mem0_ids` for
     the three classes and why a skip is an exclusion rather than a fault.
 
+    ``resolve`` lets the caller supply the memoised resolver rather than this
+    function building its own; ``BaseStage.run()`` shares ONE
+    :func:`make_memory_resolver` instance with :func:`verify_cited_memories`,
+    so an id both structurally cited and named in the prose of the same report
+    costs one point read rather than two and cannot get two contradictory
+    verdicts. It defaults to ``None`` (build a private one), so a standalone
+    caller needs nothing new.
+
+    At most :data:`MAX_PROSE_IDS_PER_RUN` DISTINCT ids are resolved per call.
+    Unlike the structured pass — whose fan-out is bounded by the model-emitted
+    citation list — this one is driven by arbitrary free text, so the ceiling
+    is what stops a pathological description stalling report assembly for a
+    warn-only diagnostic. Ids past it land on the inconclusive counter (we
+    declined to look, which establishes nothing) and the ceiling is logged
+    ONCE per run.
+
     All FOUR keys are ALWAYS present, on every path, so a caller merging them
     into ``report.stats`` never needs a ``.get(..., 0)`` fallback (the
     convention inherited verbatim from :func:`verify_cited_memories`' triple).
     A bare ``prose_phantom_citations: 0`` would be ambiguous between "we
     scanned and everything is clean" and "nothing was scannable"; reporting
     all four makes the zero self-explaining, and they sum to the number of
-    distinct pairs RESOLVED, so no separate denominator key is needed.
+    distinct pairs CONSIDERED after exclusion (an over-ceiling pair counts
+    inconclusive), so no separate denominator key is needed.
 
     ``stat_prefix`` is caller-supplied for the same reason the structured pass
     takes one: ``BaseStage.run()`` runs this for EVERY stage and merges the
@@ -573,7 +626,14 @@ async def scan_prose_citations(
     errors_key = f'{stat_prefix}_prose_citation_verification_errors'
     stats = {verified_key: 0, tombstoned_key: 0, phantom_key: 0, errors_key: 0}
 
-    resolve = _make_memory_resolver(memory_service, project_id)
+    _resolve = resolve or make_memory_resolver(memory_service, project_id)
+
+    # Ceiling state for MAX_PROSE_IDS_PER_RUN — see the constant for why the
+    # prose pass needs one and the structured pass does not. Distinct ids, not
+    # pairs: the memo means a repeat costs nothing, so the ceiling belongs on
+    # the thing that actually issues reads.
+    scanned_ids: set[str] = set()
+    cap_logged = False
 
     # Establish the tombstone reader's USABILITY once — not merely its
     # PRESENCE (reviewer finding, task 4818 amendment pass). Both are wiring
@@ -642,7 +702,30 @@ async def scan_prose_citations(
                 # report, and reporting it would put the two halves in
                 # contradiction about the same id on the same finding.
                 continue
-            outcome, _error_type = await resolve(memory_id)
+            if memory_id not in scanned_ids:
+                if len(scanned_ids) >= MAX_PROSE_IDS_PER_RUN:
+                    # Over the ceiling. Counted INCONCLUSIVE, never phantom: we
+                    # declined to look, which establishes nothing either way.
+                    stats[errors_key] += 1
+                    if not cap_logged:
+                        cap_logged = True
+                        log.warning(
+                            'reconciliation.prose_citation_scan_capped: run_id=%s '
+                            'named more than %d distinct uuid-shaped substrings in '
+                            'finding prose; the remainder are counted INCONCLUSIVE '
+                            'and NOT resolved (first over-cap id=%s in finding=%s)',
+                            run_id, MAX_PROSE_IDS_PER_RUN, memory_id, _finding_id,
+                            extra={
+                                'run_id': run_id,
+                                'stat_prefix': stat_prefix,
+                                'finding_id': _finding_id,
+                                'memory_id': memory_id,
+                                'cap': MAX_PROSE_IDS_PER_RUN,
+                            },
+                        )
+                    continue
+                scanned_ids.add(memory_id)
+            outcome, _error_type = await _resolve(memory_id)
             if outcome == 'error':
                 # "Unknown", not "absent". Reporting this as a fabrication
                 # would be a silent-fail in the loud direction: it asserts
