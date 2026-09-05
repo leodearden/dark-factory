@@ -392,6 +392,7 @@ class TestExecuteVerifyReviewLoopPropagation:
 
         assert outcome == WorkflowOutcome.BLOCKED
         wf._mark_blocked.assert_awaited_once()
+        assert wf._mark_blocked.await_args is not None
         call_args, call_kwargs = wf._mark_blocked.await_args
         assert ZERO_OUTPUT_HANG_REASON in call_args[0]
         assert call_kwargs['category'] == 'infra_issue'
