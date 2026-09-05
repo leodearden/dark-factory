@@ -33,6 +33,7 @@ from orchestrator.merge_types import (
     QueuedBranch,
     WaiterRecord,
 )
+from orchestrator.module_charter import derive_modules
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -260,7 +261,22 @@ def _reconstruct_module_configs(
       Reproducing its grouping is what makes the reconstructed set equal the
       original's by construction rather than by coincidence.
     * ``module_prefixes is None`` (a record written before the field existed)
-      -> the module set is UNKNOWN and must be re-derived; see step 6.
+      -> the module set is UNKNOWN, so it is re-derived from the preserved
+      ``task_files`` by :func:`_modules_from_task_files`.  ``None`` therefore
+      does the OPPOSITE of ``[]`` here, which is why the two encodings must
+      stay distinct.
+    * a non-empty ``module_prefixes`` that resolves to ZERO ModuleConfigs
+      (every prefix de-registered) -> re-derive from ``task_files`` too, after
+      a WARNING naming the unresolved prefixes.  A non-empty list is positive
+      evidence the task HAD modules, so degrading it silently to ``[]`` would
+      reintroduce the narrow gate this whole path exists to close.
+    * nothing recoverable at all (unknown set, no re-derivable ``task_files``)
+      -> ``[]`` plus one WARNING naming the ``request_id``.  Widening to the
+      whole registry instead would put every genuinely docs-only legacy record
+      onto a per-module full-suite gate, and would break the ``[]``-is-never-
+      widened policy the zero-module control pins.  The exposure is bounded
+      and transient: the journal holds only in-flight requests, so it turns
+      over completely on the first restart after this lands.
 
     Prefixes are re-resolved rather than persisted as objects because a
     ``ModuleConfig`` holds live command strings, timeouts and env dicts from
@@ -270,14 +286,77 @@ def _reconstruct_module_configs(
     config is always correct.
     """
     prefixes = persisted.module_prefixes
-    if prefixes is None:
+
+    if prefixes == []:
         return []
+
+    if prefixes:
+        resolved = _resolve_prefixes(prefixes, config)
+        if resolved:
+            return resolved
+        logger.warning(
+            'merge_queue_store: %s: none of the persisted module prefixes %s'
+            ' resolve against the current config; re-deriving from task_files',
+            persisted.request_id,
+            sorted(prefixes),
+        )
+
+    rederived = _modules_from_task_files(persisted.task_files, config)
+    if not rederived:
+        logger.warning(
+            'merge_queue_store: %s: module set is unrecoverable (no persisted'
+            ' prefixes resolved, nothing re-derivable from task_files=%r);'
+            ' this recovered request will verify file-scoped, narrower than'
+            ' its original',
+            persisted.request_id,
+            persisted.task_files,
+        )
+    return rederived
+
+
+def _resolve_prefixes(
+    prefixes: list[str],
+    config: OrchestratorConfig,
+) -> list[ModuleConfig]:
+    """Map *prefixes* onto live ModuleConfigs, deduped by ``mc.prefix``.
+
+    Mirrors ``orchestrator.workflow::TaskWorkflow._resolve_module_configs``'
+    ``seen`` dict keyed by ``mc.prefix``: several prefixes can resolve to the
+    same config (``for_module`` walks inward), and first-seen order is what
+    that function — the producer of the ORIGINAL request's ``module_configs``
+    — preserves.  A prefix that resolves to nothing is dropped here; the
+    caller decides what an all-dropped list means.
+    """
     seen: dict[str, ModuleConfig] = {}
     for prefix in prefixes:
         mc = config.for_module(prefix)
         if mc is not None:
             seen[mc.prefix] = mc
     return list(seen.values())
+
+
+def _modules_from_task_files(
+    task_files: list[str] | None,
+    config: OrchestratorConfig,
+) -> list[ModuleConfig]:
+    """Re-derive ModuleConfigs from *task_files* — the legacy-record path.
+
+    Routes through ``orchestrator.module_charter::derive_modules`` (the single
+    composition of the Contract-1 α-strip -> depth-coarsen pipeline, which
+    exists precisely because divergent inline copies had accumulated) rather
+    than calling ``shared.locking.files_to_modules`` directly, then through
+    the same ``for_module`` + dedupe stage as
+    :func:`_resolve_prefixes`.  That is the identical pipeline
+    ``TaskWorkflow._resolve_module_configs`` ran to build the original set,
+    so the re-derivation reproduces it rather than approximating it.
+
+    Returns ``[]`` when *task_files* is empty/None or nothing resolves — a
+    docs-only task genuinely has no modules and must keep its global-fallback
+    gate.
+    """
+    if not task_files:
+        return []
+    return _resolve_prefixes(derive_modules(task_files, config.lock_depth), config)
 
 
 def reconstruct_merge_request(
