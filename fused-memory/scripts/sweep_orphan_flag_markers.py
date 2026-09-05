@@ -154,11 +154,17 @@ the plain backlog verdict for an ad-hoc census.
 
 The adjacent pool is CENSUSED, NEVER DELETED here: the probe counts it and stops,
 never enumerating it, never running a predicate over it, never adding it to the
-delete set — a boundary enforced by ``TestFlagForStage2IsNeverDeleted``. In short:
-live relay markers would be caught by this script's own predicates, it has neither
-the ``is_protected_mirror_record`` guard nor the tombstone write that the in-cycle
-``_sweep_stale_mem0_pool`` applies, and task 2966's collector already drains that
-pool correctly.
+delete set — a boundary enforced by ``TestFlagForStage2IsNeverDeleted``. That
+ruling now rests on two reasons, not three: live relay markers would be caught by
+this script's own ``find_taskless_markers`` / ``--terminal-drain`` predicates (they
+are live, not dead weight), and task 2966's in-cycle collector already drains that
+pool, so a second collector here would race a correct one. The third reason is
+retired — task 4435 closed the parity gap, and this script now applies BOTH the
+``is_protected_mirror_record`` guard (at :func:`delete_orphan_markers`, the delete
+choke point, so every caller inherits it) and the ``record_mem0_deletion_tombstones``
+write over its confirmed deletes, exactly as the in-cycle ``_sweep_stale_mem0_pool``
+does. Closing it changes nothing about the boundary: the two surviving reasons are
+each independently sufficient.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
 records, in which project, when), for the full censused-never-deleted

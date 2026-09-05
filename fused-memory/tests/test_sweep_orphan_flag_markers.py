@@ -2161,14 +2161,18 @@ class TestFlagForStage2IsNeverDeleted:
     """The cross-check must never widen the delete set. Guard against a
     future well-meaning edit that turns the census into a deletion.
 
-    The census probe is count-only BY DESIGN: live relay markers in that pool
-    would be caught by this script's own predicates, the script has neither
-    the protected-mirror guard nor the tombstone write the in-cycle
-    _sweep_stale_mem0_pool applies, and task 2966's collector already drains
-    the pool correctly. Full rationale and the dated measurements that back
-    each of those: docs/flag-marker-sweep-recurring.md ("Why the relay pool
-    is censused, never deleted") — deliberately not restated here, so there
-    is one copy to keep current. This class is what stops the design from
+    The census probe is count-only BY DESIGN, on two surviving reasons: live
+    relay markers in that pool would be caught by this script's own
+    predicates (they are live, not dead weight), and task 2966's in-cycle
+    collector already drains the pool, so a second collector here would race
+    a correct one. A third reason — that this script had neither the
+    protected-mirror guard nor the tombstone write the in-cycle
+    _sweep_stale_mem0_pool applies — is retired: task 4435 added both, and
+    the boundary stands unchanged on the other two, each independently
+    sufficient. Full rationale and the dated measurements that back each of
+    those: docs/flag-marker-sweep-recurring.md ("Why the relay pool is
+    censused, never deleted") — deliberately not restated here, so there is
+    one copy to keep current. This class is what stops the design from
     silently regressing.
     """
 

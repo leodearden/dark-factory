@@ -64,23 +64,35 @@ and this script deliberately counts them without ever deleting them — see
 The cross-check counts the `flag_for_stage2` pool and stops there. It never
 enumerates it, never runs a predicate over it, and never adds it to the
 delete set — a boundary enforced by `TestFlagForStage2IsNeverDeleted` in
-`fused-memory/tests/test_sweep_orphan_flag_markers.py`. Three reasons, two
-of them measured on 2026-08-09:
+`fused-memory/tests/test_sweep_orphan_flag_markers.py`. Three reasons were
+originally given, two of them measured on 2026-08-09. Item 2 has since been
+closed by task 4435 and no longer carries any weight; the ruling stands on
+items 1 and 3, each independently sufficient:
 
 1. **23 of the 61 live records carry no usable `task_id`**, so the script's
    existing `find_taskless_markers` predicate would delete all 23 on the
    very next nightly `--apply` run. They are live Stage-1 → Stage-2 relay
    markers, not dead weight — and the nightly timer's `--terminal-drain`
    would additionally reap markers citing already-done tasks.
-2. **The script has no protected-mirror guard and writes no tombstone.**
-   `delete_orphan_markers` has neither the `is_protected_mirror_record`
-   check nor the `record_mem0_deletion_tombstones` write that the shared
-   in-cycle `_sweep_stale_mem0_pool` applies. `flag_for_stage2` is an
-   LLM-supplied key any writer can stamp on any record — `mem0_tombstone.py`'s
-   module docstring names this exact filter as its motivating over-breadth
-   case. (Measured: 0 `cycle_summary`/`ledger_stamp` records in the pool
-   today, so the risk is latent rather than active — but this script is the
-   wrong place to take it.)
+2. **CLOSED by task 4435 — the script now has both.** *Originally:* the
+   script had neither the `is_protected_mirror_record` check nor the
+   `record_mem0_deletion_tombstones` write that the shared in-cycle
+   `_sweep_stale_mem0_pool` applies, which mattered because `flag_for_stage2`
+   is an LLM-supplied key any writer can stamp on any record —
+   `mem0_tombstone.py`'s module docstring names this exact filter as its
+   motivating over-breadth case. Task 4435 closed that parity gap:
+   `delete_orphan_markers` now enforces the mirror guard at the delete choke
+   point (so every current and future caller inherits it, and it overrides
+   `--delete-ids`) and tombstones its confirmed deletes in one batched
+   ledger transaction. The gap was closed while still LATENT — the measured
+   population of `cycle_summary`/`ledger_stamp` records in this pool was 0
+   both when the risk was recorded (2026-08-09) and when it was fixed — so
+   no record was ever actually lost to it. **This item no longer supports
+   the censused-never-deleted ruling, which now rests on items 1 and 3
+   alone; each is independently sufficient.** It is kept rather than deleted
+   so the item numbering the surrounding prose refers to stays stable, and
+   so a reader can see the gap existed and was closed rather than wondering
+   whether it was ever considered.
 3. **The pool is already drained correctly** by task 2966's in-cycle
    collector, on a rolling 14-day window. A second collector here would race
    a correct one, producing duplicate deletes and duplicate tombstones for
