@@ -689,3 +689,172 @@ def test_landings_corpus_b_known_answer():
     }
     assert result['median'] == 1.5
     assert result['max'] == 2
+
+
+# ---------------------------------------------------------------------------
+# compute_lead_time — the four-segment split
+#   merge_queued -> merge_dequeued -> sum(merge_verify.data.duration_ms)
+#                -> merge_finalized
+#
+# The join is on the LAST merge_queued STRICTLY BEFORE the landing, per task_id
+# (plan decision 2). A task re-enters the queue on gate_retry, cas_retry and
+# supersede, so a first-queued join measures "time since the task first tried",
+# not lead time — live, that was off by 18x at p90.
+#
+# LEAD-TIME FIXTURE, hand-computed (minutes):
+#   task  lead  wait  verify  residual   note
+#   T1     60    10      15        35    queued THREE times before landing
+#   T2     40    20       0        20    no merge_verify row in window
+#   T3     20     5      10         5    re-queued AFTER landing (must not join)
+#   T4     80    15      30        35
+#   T5      -     -       -         -    landing with no preceding queue
+#   T6      -     -       -         -    finalized 'blocked' -> not a landing
+# lead     sorted [20,40,60,80] -> p50 50.0, p90 74.0
+# wait     sorted [5,10,15,20]  -> p50 12.5, p90 18.5
+# verify   sorted [10,15,30]    -> p50 15.0, p90 27.0  (n=3: T2 has no rows)
+# residual sorted [5,20,35,35]  -> p50 27.5, p90 35.0
+# ---------------------------------------------------------------------------
+
+
+def _q(task_id, hour, minute):
+    return {'timestamp': _ts(11, hour, minute), 'task_id': task_id,
+            'data': {'branch': f'task/{task_id}', 'queue_depth': 1}}
+
+
+def _v(task_id, hour, minute, duration_ms, **extra):
+    return {'timestamp': _ts(11, hour, minute), 'task_id': task_id,
+            'data': {'runner': 'local', 'passed': True,
+                     'duration_ms': duration_ms, **extra}}
+
+
+def _f(task_id, hour, minute, state='done'):
+    return {'timestamp': _ts(11, hour, minute), 'task_id': task_id,
+            'data': {'branch': f'task/{task_id}', 'state': state}}
+
+
+def _lead_fixture():
+    queued = [
+        _q('T1', 0, 0), _q('T1', 0, 30), _q('T1', 1, 0),
+        _q('T2', 3, 0),
+        _q('T3', 5, 0),
+        _q('T3', 6, 0),          # re-queue AFTER T3 landed at 05:20
+        _q('T4', 7, 0),
+        _q('T6', 10, 0),
+    ]
+    dequeued = [
+        _q('T1', 1, 10), _q('T2', 3, 20), _q('T3', 5, 5), _q('T4', 7, 15),
+        _q('T6', 10, 5),
+    ]
+    verify = [
+        _v('T1', 1, 15, 300_000), _v('T1', 1, 25, 600_000),
+        _v('T3', 5, 6, 600_000),
+        _v('T4', 7, 20, 1_800_000),
+    ]
+    finalized = [
+        _f('T1', 2, 0), _f('T2', 3, 40), _f('T3', 5, 20), _f('T4', 8, 20),
+        _f('T5', 9, 0),                       # no preceding merge_queued
+        _f('T6', 10, 30, state='blocked'),    # not a landing
+    ]
+    return queued, dequeued, verify, finalized
+
+
+def _lead_result():
+    q, d, v, f = _lead_fixture()
+    return mlt.compute_lead_time(q, d, v, f, CORPUS_LO_DT, CORPUS_HI_DT)
+
+
+def test_lead_time_joins_on_the_last_queued_strictly_before_the_landing():
+    result = _lead_result()
+    assert result['lead']['p50'] == 50.0
+    assert result['lead']['p90'] == pytest.approx(74.0)
+    assert result['lead']['n'] == 4
+    # REGRESSION PIN: a FIRST-queued join would take T1's 00:00 row and give a
+    # 120-minute lead, moving p50 to 60.0. Live, the same mistake moved p90
+    # from 171 to 3114 minutes.
+    assert result['lead']['p50'] != 60.0
+
+
+def test_lead_time_ignores_a_requeue_that_happened_after_the_landing():
+    result = _lead_result()
+    # T3 was re-queued at 06:00, twenty minutes AFTER it landed at 05:20.
+    # Taking the last queued row overall (rather than the last one BEFORE the
+    # landing) would give a negative lead.
+    assert result['lead']['min'] == 20.0
+
+
+def test_lead_time_queue_wait_is_dequeued_minus_last_queued():
+    result = _lead_result()
+    assert result['wait']['p50'] == 12.5
+    assert result['wait']['p90'] == pytest.approx(18.5)
+    assert result['wait']['n'] == 4
+
+
+def test_lead_time_verify_sums_the_payload_duration_not_the_column():
+    q, d, v, f = _lead_fixture()
+    # The events table's duration_ms COLUMN is NULL for merge_verify; the real
+    # figure lives in data['duration_ms']. Poison the column to prove it is
+    # never read.
+    v = [dict(row, duration_ms=999_999_999) for row in v]
+    result = mlt.compute_lead_time(q, d, v, f, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert result['verify']['p50'] == 15.0
+    assert result['verify']['p90'] == pytest.approx(27.0)
+    # n=3, not 4: T2 has no merge_verify row in the window, and a zero there
+    # would drag the verify percentile down as if the verify were instant.
+    assert result['verify']['n'] == 3
+
+
+def test_lead_time_residual_is_lead_minus_wait_minus_verify():
+    result = _lead_result()
+    assert result['residual']['p50'] == 27.5
+    assert result['residual']['p90'] == pytest.approx(35.0)
+    assert result['residual']['n'] == 4
+
+
+def test_lead_time_reports_a_residual_when_verify_rows_are_absent():
+    q, d, _v_rows, f = _lead_fixture()
+    result = mlt.compute_lead_time(q, d, [], f, CORPUS_LO_DT, CORPUS_HI_DT)
+    # With no verify rows at all the split still resolves: residual absorbs the
+    # unattributed time rather than the section vanishing.
+    assert result['verify']['n'] == 0
+    assert result['verify']['p50'] is None
+    assert result['residual']['n'] == 4
+    # residuals become lead - wait: [50, 20, 15, 65] -> sorted [15,20,50,65]
+    assert result['residual']['p50'] == 35.0
+
+
+def test_lead_time_excludes_a_landing_with_no_preceding_queue():
+    result = _lead_result()
+    # T5 landed without a merge_queued row in the supplied set. It is counted
+    # and reported, never silently folded into the matched series.
+    assert result['matched'] == 4
+    assert result['unmatched'] == 1
+    assert 'T5' in result['unmatched_task_ids']
+
+
+def test_lead_time_ignores_non_done_finalize_rows():
+    result = _lead_result()
+    # T6 was queued, dequeued and finalized 'blocked'. It is not a landing, so
+    # it appears in neither the matched nor the unmatched tally.
+    assert 'T6' not in result['unmatched_task_ids']
+    assert result['matched'] + result['unmatched'] == 5
+
+
+def test_lead_time_is_empty_but_not_zero_on_an_empty_window():
+    result = mlt.compute_lead_time([], [], [], [], CORPUS_LO_DT, CORPUS_HI_DT)
+    for series in ('lead', 'wait', 'verify', 'residual'):
+        assert result[series]['n'] == 0
+        assert result[series]['p50'] is None
+        assert result[series]['p90'] is None
+    assert result['matched'] == 0
+    assert result['unmatched'] == 0
+
+
+def test_lead_time_wait_needs_a_dequeue_after_the_joined_queue():
+    q = [_q('Z1', 1, 0)]
+    d = [_q('Z1', 0, 30)]          # dequeue predates the joined queue row
+    f = [_f('Z1', 2, 0)]
+    result = mlt.compute_lead_time(q, d, [], f, CORPUS_LO_DT, CORPUS_HI_DT)
+    assert result['lead']['n'] == 1
+    assert result['wait']['n'] == 0
+    # Residual needs a wait to mean "finalize + CAS", so it is not invented.
+    assert result['residual']['n'] == 0
