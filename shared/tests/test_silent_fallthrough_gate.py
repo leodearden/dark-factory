@@ -21,7 +21,6 @@ References:
 """
 from __future__ import annotations
 
-import ast
 import textwrap
 from typing import NamedTuple
 
@@ -30,6 +29,7 @@ from silent_fallthrough_scan import (
     KNOWN_VALUE_ERROR_RESOLVERS,
     Violation,
     find_violations,
+    find_violations_in_tree,
 )
 
 # ---------------------------------------------------------------------------
@@ -724,7 +724,6 @@ from pathlib import Path  # noqa: E402
 
 from silent_fallthrough_allowlist import ALLOWLIST_ENTRIES, ALLOWLIST_KEYS  # noqa: E402
 from silent_fallthrough_scan import (  # noqa: E402
-    iter_first_party_files,
     reconcile_against_allowlist,
     violation_key,
 )
@@ -741,33 +740,59 @@ class _TreeScanData(NamedTuple):
     parse_failures: list    # list[str]
 
 
-@pytest.fixture(scope="session")
-def tree_scan_data() -> _TreeScanData:
-    """Enumerate, read, parse, and scan the first-party tree once per test session.
+def _build_tree_scan_data(records) -> _TreeScanData:
+    """Derive the gate's inputs from already-parsed :class:`ParsedFile` records.
 
-    All integration and integrity tests consume this fixture rather than
-    re-scanning ~215 files independently on each test invocation.
+    A WALK and nothing else — no read, no parse. Both were done once, for the
+    whole session and for every gate, by
+    ``silent_fallthrough_scan.parse_first_party_tree`` (task 4520). Before that
+    this function did its own read, its own ``ast.parse`` for the SyntaxError
+    check, and then called ``find_violations``, which parsed the same source a
+    third time; the archival gate did the whole thing again privately.
+
+    A record carrying a ``syntax_error`` is REPORTED, not raised, preserving
+    the ``f'{path}: {e}'`` shape ``test_no_unparseable_files`` prints — that
+    test exists to list every unparseable file at once, so raising on the first
+    one would destroy it.
+
+    Split out of the fixture so ``test_tree_scan_sharing`` can call it directly
+    and count the work it does, without reaching into pytest's fixture
+    internals.
     """
-    files = list(iter_first_party_files(_REPO_ROOT))
     violations: list[Violation] = []
     parse_failures: list[str] = []
-    for filepath in files:
-        source = filepath.read_text(encoding="utf-8", errors="replace")
-        rel = str(filepath.relative_to(_REPO_ROOT))
-        try:
-            ast.parse(source, filename=str(filepath))
-        except SyntaxError as e:
-            parse_failures.append(f"{filepath}: {e}")
-        violations.extend(find_violations(source, rel))
+    for record in records:
+        if record.syntax_error is not None:
+            parse_failures.append(f"{record.path}: {record.syntax_error}")
+            continue
+        violations.extend(
+            find_violations_in_tree(record.tree, record.relpath, record.source)
+        )
     violation_key_counts: _Counter[tuple[str, str, str]] = _Counter(
         violation_key(v) for v in violations
     )
     return _TreeScanData(
-        files=files,
+        files=[record.path for record in records],
         violations=violations,
         violation_key_counts=violation_key_counts,
         parse_failures=parse_failures,
     )
+
+
+@pytest.fixture(scope="session")
+def tree_scan_data(first_party_tree) -> _TreeScanData:
+    """Scan the first-party tree once per test session.
+
+    All integration and integrity tests consume this fixture rather than
+    re-scanning the tree independently on each test invocation. The enumerate/
+    read/parse half now comes from the session-scoped ``first_party_tree``
+    fixture (conftest.py), which is shared with every other gate module — see
+    ``shared/tests/test_tree_scan_sharing.py``.
+
+    The scan covers 461 first-party files today; the "~215 files" figure this
+    docstring used to quote was stale by more than a factor of two.
+    """
+    return _build_tree_scan_data(first_party_tree)
 
 
 class TestGateSelfIntegrity:

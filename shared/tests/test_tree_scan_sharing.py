@@ -370,29 +370,52 @@ class TestFindViolationsInTree:
 # ---------------------------------------------------------------------------
 
 
-def _prefix_tree_scan_reference():
-    """Recompute the gate's inputs the PRE-4520 way: read, parse, find_violations.
+def _prefix_tree_scan_reference(records):
+    """Recompute the gate's inputs with the PRE-4520 loop's plumbing.
 
-    Deliberately verbatim (``errors='replace'``, a separate ``ast.parse`` for
-    the SyntaxError check, ``find_violations(source, rel)`` re-parsing the same
-    text) so the parity assertions below compare against what the gate actually
-    saw before the rewrite — not against a tidied-up restatement of it.
+    Reproduces the old fixture statement for statement — the same
+    ``iter_first_party_files`` enumeration and order, the same
+    ``str(filepath.relative_to(REPO_ROOT))`` filename spelling (NOT the
+    provider's posix ``relpath``, which is the thing being changed), the same
+    ``f'{path}: {e}'`` parse-failure message, the same skip-a-broken-file
+    structure — and then compares that against what the rewritten gate
+    produces. So every piece of PLUMBING the rewrite touches is re-derived
+    independently, whole-tree.
 
-    This is the one expensive thing in this file, and it is expensive ON
-    PURPOSE: it is the whole-tree evidence that consolidating the scan changed
-    no answer. It is charged to exactly one test item.
+    ONE THING IS DELIBERATELY NOT RE-DERIVED: the ``ast.parse`` itself. The old
+    loop reached the scanner through ``find_violations(source, rel)``, which
+    since task 4520 is a two-line wrapper that parses and then calls
+    ``find_violations_in_tree(tree, filename, source)`` — the exact function
+    the new gate calls. ``source`` is unused by the scan and ``filename``
+    reaches only ``Violation.filename`` (which IS re-derived here, in the old
+    spelling), so a second ``ast.parse`` of the same bytes could only prove
+    that ``ast.parse`` is deterministic. On this tree that ceremony measured
+    18.87s in a single test item under load — against the 60s budget whose
+    thin headroom is the entire defect this task exists to remove, and worse
+    than the 23.68s item it replaces once the provider's own setup lands on
+    the same item. Re-parsing is therefore done only where it could actually
+    differ: :meth:`TestSilentFallthroughGateUsesTheSharedTree.
+    test_recorded_violations_survive_a_real_reparse` pushes every file that
+    produces a violation back through the full ``find_violations`` entry point.
+
+    The read is not re-derived either: the provider reads with STRICT utf-8,
+    so a file the old ``errors='replace'`` loop would have papered over now
+    RAISES rather than yielding different text (``test_undecodable_file_
+    propagates``).
     """
     files = list(iter_first_party_files(_REPO_ROOT))
+    by_path = {record.path: record for record in records}
     violations = []
     parse_failures = []
     for filepath in files:
-        source = filepath.read_text(encoding='utf-8', errors='replace')
+        record = by_path[filepath]
         rel = str(filepath.relative_to(_REPO_ROOT))
-        try:
-            ast.parse(source, filename=str(filepath))
-        except SyntaxError as exc:
-            parse_failures.append(f'{filepath}: {exc}')
-        violations.extend(sfs.find_violations(source, rel))
+        if record.syntax_error is not None:
+            parse_failures.append(f'{filepath}: {record.syntax_error}')
+            continue
+        violations.extend(
+            sfs.find_violations_in_tree(record.tree, rel, record.source)
+        )
     return files, violations, parse_failures
 
 
@@ -444,15 +467,17 @@ class TestSilentFallthroughGateUsesTheSharedTree:
     def test_output_parity_with_the_prefix_computation(self, first_party_tree):
         """files, violation_key_counts and parse_failures are unchanged.
 
-        The read half cannot silently diverge and so is not re-measured here:
-        the provider reads with STRICT utf-8, so a file the pre-4520 loop would
-        have papered over with ``errors='replace'`` raises instead of returning
-        different text (pinned by ``test_undecodable_file_propagates``).
+        Whole-tree, against an independent re-derivation of the pre-4520
+        loop's plumbing — including its ``str(relative_to)`` filename spelling,
+        which the rewrite replaces with the provider's posix ``relpath`` and
+        which ``violation_key`` keys on. See
+        :func:`_prefix_tree_scan_reference` for exactly what is and is not
+        re-derived, and why.
         """
         import test_silent_fallthrough_gate as gate
 
         expected_files, expected_violations, expected_failures = (
-            _prefix_tree_scan_reference()
+            _prefix_tree_scan_reference(first_party_tree)
         )
         data = gate._build_tree_scan_data(first_party_tree)
 
@@ -469,3 +494,27 @@ class TestSilentFallthroughGateUsesTheSharedTree:
             'parity would be vacuous with no violations in the tree — the '
             'allowlist records 14 today'
         )
+
+    def test_recorded_violations_survive_a_real_reparse(self, first_party_tree):
+        """The one place a second ast.parse could differ — so do it there, only there.
+
+        For every file that actually produces a violation, push the source back
+        through the full pre-4520 ``find_violations`` entry point (which parses
+        from scratch) and require the identical records. Fourteen files today,
+        microseconds; re-parsing the other 447 would only re-prove that
+        ``ast.parse`` is deterministic.
+        """
+        producing = [
+            record for record in first_party_tree
+            if record.tree is not None
+            and sfs.find_violations_in_tree(record.tree, record.relpath, record.source)
+        ]
+        assert producing, (
+            'no first-party file produces a violation — this cross-check would '
+            'be vacuous; the allowlist records 14 today'
+        )
+        for record in producing:
+            rel = str(record.path.relative_to(_REPO_ROOT))
+            assert sfs.find_violations(record.source, rel) == (
+                sfs.find_violations_in_tree(record.tree, rel, record.source)
+            ), f'a real re-parse of {rel} yields different violations'
