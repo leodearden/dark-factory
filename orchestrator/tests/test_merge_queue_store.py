@@ -22,12 +22,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Literal
 from unittest.mock import MagicMock
 
 import pytest
 from _orch_helpers import make_placeholder_future
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.merge_queue import GroupMergeRequest, MergeRequest
 
 # Import the module under test — will fail (ImportError) until step-2 creates it.
@@ -44,10 +45,19 @@ from orchestrator.merge_types import InFlightMergeRegistry, QueuedBranch
 # ---------------------------------------------------------------------------
 
 
-def _real_config(tmp_path: Path) -> OrchestratorConfig:
-    """Minimal real OrchestratorConfig pointing at tmp_path."""
+def _real_config(
+    tmp_path: Path,
+    *,
+    merge_verify_breadth: Literal['scoped', 'full'] = 'scoped',
+) -> OrchestratorConfig:
+    """Minimal real OrchestratorConfig pointing at tmp_path.
+
+    *merge_verify_breadth* mirrors ``test_merge_queue_main_health._make_config``'s
+    knob of the same name; the default preserves every pre-existing call site.
+    """
     return OrchestratorConfig(
         project_root=tmp_path,
+        merge_verify_breadth=merge_verify_breadth,
         git=GitConfig(
             main_branch='main',
             branch_prefix='task/',
@@ -69,21 +79,59 @@ def _make_req(
     lane: str = 'normal',
     task_files: list[str] | None = None,
     pre_rebased: bool = False,
+    module_configs: list[ModuleConfig] | None = None,
 ) -> MergeRequest:
-    """Build a MergeRequest with a placeholder future (safe outside a running loop)."""
+    """Build a MergeRequest with a placeholder future (safe outside a running loop).
+
+    *module_configs* defaults to ``None`` -> ``[]``, so every pre-existing call
+    site is byte-identical to the old hardcoded empty list.
+    """
     return MergeRequest(
         task_id=task_id,
         branch=QueuedBranch.parse(branch, config.git.branch_prefix),
         worktree=worktree,
         pre_rebased=pre_rebased,
         task_files=task_files,
-        module_configs=[],
+        module_configs=list(module_configs or []),
         config=config,
         result=make_placeholder_future(),
         snapshot_tip=snapshot_tip,
         generation=generation,
         lane=lane,  # type: ignore[arg-type]
     )
+
+
+def _config_with_modules(
+    tmp_path: Path,
+    prefixes: list[str],
+    *,
+    merge_verify_breadth: Literal['scoped', 'full'] = 'full',
+) -> OrchestratorConfig:
+    """A real OrchestratorConfig whose module registry holds *prefixes*.
+
+    Populates the ``_module_configs`` PrivateAttr directly — the repo-wide
+    blessed idiom for a module registry in tests (``conftest.mock_orch_config``
+    structurally cannot carry a PrivateAttr, and a bare MagicMock config is
+    rejected by orchestrator's ``check_bare_magicmock_config.py`` lint).
+
+    All three commands are non-None so ``verify_plan._derive_full_suite_runs``
+    emits real FULL_SUITE runs rather than reasoned SKIPPED ones.
+    """
+    config = _real_config(tmp_path, merge_verify_breadth=merge_verify_breadth)
+    config._module_configs = {
+        prefix: ModuleConfig(
+            prefix=prefix,
+            test_command=(
+                f'uv run --project {prefix} --directory {prefix} '
+                'pytest tests/ --tb=short -q'
+            ),
+            lint_command=f'uv run --project {prefix} ruff check src/',
+            type_check_command=f'uv run --project {prefix} pyright src/',
+        )
+        for prefix in prefixes
+    }
+    return config
+
 
 
 def _make_group_req(
