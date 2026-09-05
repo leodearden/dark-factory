@@ -1544,3 +1544,150 @@ class TestJournalPersistsModulePrefixes:
             'an entry written before the field existed must carry the None '
             'sentinel ("module set UNKNOWN"), never an empty list'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-5063 — a LEGACY journal record (written before module_prefixes existed)
+# re-derives its module set from the preserved task_files.
+#
+# The exposure is transient by construction: the journal holds only in-flight
+# requests, so it turns over completely on the first restart after this lands.
+# It is closed anyway because that one window is exactly the restart the
+# recovery path exists to survive.
+# ---------------------------------------------------------------------------
+
+
+_NINE_PREFIXES = [
+    'cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
+    'sampler', 'scripts', 'shared', 'tests/scripts',
+]
+
+
+def _write_journal(store_path: Path, entry: dict[str, object]) -> MergeQueueStore:
+    """Hand-write a one-entry journal and return the store reading it."""
+    import json
+
+    store_path.write_text(
+        json.dumps({str(entry['request_id']): entry}), encoding='utf-8',
+    )
+    store = MergeQueueStore(store_path)
+    assert store.journal_corrupt is False, 'Hand-written journal must parse cleanly'
+    return store
+
+
+@pytest.mark.asyncio
+class TestLegacyJournalRecordRederivesModules:
+    """A record with no ``module_prefixes`` re-derives its modules from
+    ``task_files`` rather than silently reconstructing an empty (file-scoped)
+    set."""
+
+    async def test_legacy_record_rederives_modules_from_task_files(
+        self, tmp_path: Path,
+    ) -> None:
+        """The re-derivation runs the same pipeline that produced the original
+        set: derive_modules -> for_module -> dedupe by prefix.
+
+        Measured stable at BOTH the test default ``lock_depth=2`` and the live
+        ``lock_depth=12``, so the expectation is not depth-fragile.
+        """
+        config = _config_with_modules(tmp_path, _NINE_PREFIXES)
+        store = _write_journal(
+            tmp_path / 'merge_queue.json',
+            _legacy_journal_entry(
+                'mr-legacy',
+                task_files=[
+                    'orchestrator/src/orchestrator/merge_queue_store.py',
+                    'tests/scripts/test_x.py',
+                    'README.md',
+                ],
+            ),
+        )
+        [record] = store.load()
+
+        req = reconstruct_merge_request(record, config)
+
+        assert [mc.prefix for mc in req.module_configs] == ['orchestrator', 'tests/scripts'], (
+            f'a legacy record must re-derive its modules from the preserved '
+            f'task_files; got {[mc.prefix for mc in req.module_configs]!r}'
+        )
+
+    async def test_legacy_record_with_docs_only_task_files_rederives_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        """A docs-only legacy record keeps the global-fallback path.
+
+        Guards the re-derivation against widening indiscriminately: neither
+        derived key resolves through ``for_module``, so the correct answer is
+        the empty set — the same gate that task already had.
+        """
+        config = _config_with_modules(tmp_path, _NINE_PREFIXES)
+        store = _write_journal(
+            tmp_path / 'merge_queue.json',
+            _legacy_journal_entry(
+                'mr-docs', task_files=['README.md', 'docs/foo.md'],
+            ),
+        )
+        [record] = store.load()
+
+        req = reconstruct_merge_request(record, config)
+
+        assert req.module_configs == [], (
+            f'a docs-only legacy record must NOT be widened; got '
+            f'{[mc.prefix for mc in req.module_configs]!r}'
+        )
+
+    async def test_legacy_record_without_task_files_logs_and_reconstructs_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The one genuinely unrecoverable case must be LOUD, not silent.
+
+        With neither ``module_prefixes`` nor ``task_files`` the module set
+        cannot be recovered at all, so this request WILL verify narrower than
+        its original.  Widening to the whole registry instead would put every
+        genuinely docs-only legacy record onto a nine-module full-suite gate,
+        so the empty set stays — but a WARNING names the record.
+        """
+        config = _config_with_modules(tmp_path, _NINE_PREFIXES)
+        store = _write_journal(
+            tmp_path / 'merge_queue.json',
+            _legacy_journal_entry('mr-blind', task_files=None),
+        )
+        [record] = store.load()
+
+        with caplog.at_level(logging.WARNING):
+            req = reconstruct_merge_request(record, config)
+
+        assert req.module_configs == []
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('mr-blind' in m for m in warnings), (
+            f'the unrecoverable case must be diagnosed by request_id, not '
+            f'silently degraded; warnings were {warnings!r}'
+        )
+
+    async def test_persisted_prefixes_that_no_longer_resolve_fall_back_to_task_files(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A non-empty persisted list that resolves to nothing is POSITIVE
+        evidence the task had modules — so it must not silently produce the
+        narrow gate this fix exists to close."""
+        config = _config_with_modules(tmp_path, _NINE_PREFIXES)
+        entry = _legacy_journal_entry(
+            'mr-stale',
+            task_files=['orchestrator/src/orchestrator/merge_queue.py'],
+        )
+        entry['module_prefixes'] = ['deleted-module']
+        store = _write_journal(tmp_path / 'merge_queue.json', entry)
+        [record] = store.load()
+
+        with caplog.at_level(logging.WARNING):
+            req = reconstruct_merge_request(record, config)
+
+        assert [mc.prefix for mc in req.module_configs] == ['orchestrator'], (
+            f'an unresolvable persisted prefix must fall back to the '
+            f'task_files re-derivation, not to the empty (file-scoped) set; '
+            f'got {[mc.prefix for mc in req.module_configs]!r}'
+        )
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('deleted-module' in m for m in warnings), (
+            f'the unresolved prefix must be named; warnings were {warnings!r}'
+        )
