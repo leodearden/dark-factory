@@ -1279,7 +1279,18 @@ else
     ;;
   finding | *)
     # `*` folded in for the reason given at the orchestrator gate.
+    #
+    # A finding is "drift OR unverifiable": it also covers a drop-in override,
+    # which the checker words apart so the operator is not sent hunting for a
+    # directive diff that does not exist. The two remedies differ, so naming
+    # only --fix here would collapse that distinction back and point at a
+    # command that CANNOT help — --fix appends to the unit FILE and can
+    # neither synthesize nor resolve an override living in a different one.
+    # Same wording the dashboard and orchestrator gates already carry.
     warn "Fused-memory unit: DRIFT detected — run: python3 $_fm_parity_script --fix"
+    warn "  This verdict also covers a drop-in override, which --fix cannot"
+    warn "  resolve and which needs manual removal — see the"
+    warn "  [fused_memory_unit_parity] report above for which it was."
     ;;
   esac
 fi
