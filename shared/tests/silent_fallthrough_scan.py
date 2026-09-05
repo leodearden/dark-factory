@@ -374,6 +374,12 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     Returns ``[]`` on ``SyntaxError`` (the file is not flagged but also not
     silently skipped — callers should track and report parse failures).
 
+    A thin parse-then-delegate wrapper over :func:`find_violations_in_tree`,
+    kept because ~40 unit tests feed it source strings directly. A caller that
+    already holds the parsed tree (every whole-tree gate, via
+    :func:`parse_first_party_tree`) should call the tree entry point instead
+    and not re-parse.
+
     Args:
         source: UTF-8 source text of the file.
         filename: Path string used in :class:`Violation` records (for display).
@@ -382,8 +388,47 @@ def find_violations(source: str, filename: str) -> list[Violation]:
         tree = ast.parse(source, filename=filename)
     except SyntaxError:
         return []
+    return find_violations_in_tree(tree, filename, source)
 
-    parent_map = _build_parent_map(tree)
+
+def find_violations_in_tree(
+    tree: ast.Module,
+    filename: str,
+    source: str | None = None,
+) -> list[Violation]:
+    """Scan an ALREADY-PARSED *tree* for silent-fallthrough signatures.
+
+    The entry point the whole-tree gates use, so the ASTs built once by
+    :func:`parse_first_party_tree` are walked rather than re-parsed.
+
+    The parent map is built LAZILY — on the first violation this file actually
+    records, and at most once per call. It exists only to name a violation's
+    enclosing scope, and 451 of the real tree's 461 first-party files record
+    none, so building it eagerly spent 97.8% of 3.73s per pass on files that
+    never consulted it.
+
+    Args:
+        tree: Parsed module. Walked READ-ONLY: under
+            :func:`parse_first_party_tree` this object is shared with every
+            other gate in the session.
+        filename: Path string used in :class:`Violation` records (for display).
+            The caller's spelling is honoured verbatim — the gates key on a
+            repo-relative path, not on whatever ``ast.parse`` was told.
+        source: Unused by the scan (``content_hash`` is computed from
+            ``ast.unparse``, which needs no source text). Accepted so a caller
+            holding a :class:`ParsedFile` can pass the whole record through
+            without deciding what the scanner needs.
+    """
+    del source  # accepted for call-site symmetry; the scan works off the tree
+
+    _parent_map: dict[int, ast.AST] | None = None
+
+    def parent_map() -> dict[int, ast.AST]:
+        nonlocal _parent_map
+        if _parent_map is None:
+            _parent_map = _build_parent_map(tree)
+        return _parent_map
+
     violations: list[Violation] = []
 
     for node in ast.walk(tree):
@@ -409,7 +454,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                             f"bind the error to a named variable and "
                             f"escalate via resolver_failed() or raise"
                         ),
-                        qualname=_compute_qualname(node, parent_map),
+                        qualname=_compute_qualname(node, parent_map()),
                         content_hash=_content_hash(node),
                     ))
 
@@ -436,7 +481,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                     f"without logging WARN+ or re-raising — add "
                     f"logger.warning/error/exception(...) before the return"
                 ),
-                qualname=_compute_qualname(node, parent_map),
+                qualname=_compute_qualname(node, parent_map()),
                 content_hash=_content_hash(node),
             ))
 
