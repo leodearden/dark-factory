@@ -913,3 +913,81 @@ def compute_mixes(
         str(e.get('data', {}).get('state') or UNKNOWN) for e in finalized_events
     )
     return {'attempt_outcomes': outcomes, 'finalize_states': states}
+
+
+# ---------------------------------------------------------------------------
+# Section: merge-ahead chains (--chains).
+# ---------------------------------------------------------------------------
+
+
+def compute_chains(
+    finalized_events: Sequence[dict[str, Any]],
+    verify_events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Deep merge-ahead chain landings and observed chain lengths.
+
+    ``landed_via_chain`` IS AN INT AND IS SUMMED.  `event_store.py` documents
+    it on the `merge_finalized` payload as ``1`` on an item landed by a deep
+    merge-ahead chain walk and ``None`` otherwise (the task 3186 delta), and
+    `scripts/merge-deep-canary-predicate.sh` — the existing consumer — pins
+    that unit by SUMming it.  It is not a boolean flag, and it is not the chain
+    size: reading it either of those ways gives a different number the moment a
+    payload ever carries a value other than 1.  A non-numeric value is counted
+    in ``n_unusable_landed_via_chain`` rather than coerced.
+
+    Chain length comes from `merge_verify`'s ``data['chain_items']``, which is
+    always >= 1 and never None — a non-chained verify is a chain of ONE, not a
+    missing measurement.  ``items_per_deep_verify`` therefore averages only the
+    DEEP verifies (``chain_items > 1``); including the chains of one would
+    drag the figure toward 1 and hide how long real chains get.
+
+    ``chain_landed_share`` is a real ``0.0`` when landings were observed and
+    none chained — that is a measurement, and returning ``None`` there would
+    imply chains went unmeasured.  It is ``None`` only when the window holds no
+    landing at all.
+
+    Returns ``{'items_landed_via_chain', 'n_chain_landings', 'n_landings',
+    'chain_landed_share', 'n_unusable_landed_via_chain', 'chain_items'}``.
+    """
+    items = 0
+    n_chain_landings = 0
+    n_landings = 0
+    n_unusable = 0
+
+    for event in finalized_events:
+        data = event.get('data', {})
+        if data.get('state') != 'done':
+            continue
+        n_landings += 1
+        raw = data.get('landed_via_chain')
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            n_unusable += 1
+            continue
+        items += int(raw)
+        n_chain_landings += 1
+
+    chain_items: list[int] = []
+    for event in verify_events:
+        raw = event.get('data', {}).get('chain_items')
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        chain_items.append(int(raw))
+    deep = [c for c in chain_items if c > 1]
+
+    return {
+        'items_landed_via_chain': items,
+        'n_chain_landings': n_chain_landings,
+        'n_landings': n_landings,
+        'chain_landed_share': (
+            n_chain_landings / n_landings if n_landings else None
+        ),
+        'n_unusable_landed_via_chain': n_unusable,
+        'chain_items': {
+            'distribution': dict(sorted(Counter(chain_items).items())),
+            'n': len(chain_items),
+            'n_deep': len(deep),
+            'items_per_deep_verify': sum(deep) / len(deep) if deep else None,
+        },
+    }
