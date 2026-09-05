@@ -2108,6 +2108,15 @@ class TestScanProseCitationsKnownNonMem0Ids:
             {'cited_memories': 'not-a-list'},
             {'cited_memories': [None, 42, {}, {'store': 'graphiti'}]},
             {'finding_id': None, 'task_id': 42},
+            # Truthy NON-ITERABLES. The cases above were all either falsy
+            # (rescued by ``or []``) or iterable (a str iterates harmlessly
+            # into chars that fail the isinstance-dict check), so none of them
+            # exercised the ``for`` statement's own type requirement. These do:
+            # before the task-4818 amendment-pass fix each raised TypeError out
+            # of this helper, breaking the "total" half of its contract.
+            {'cited_memories': 5},
+            {'cited_memories': True},
+            {'cited_memories': object()},
         ],
     )
     def test_helper_is_total_on_malformed_input(self, finding):

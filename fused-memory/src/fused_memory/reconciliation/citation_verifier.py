@@ -279,7 +279,17 @@ def _known_non_mem0_ids(finding: Any, run_id: str | None = None) -> set[str]:
         value = finding.get(identity_field)
         if isinstance(value, str) and value:
             excluded.add(value.lower())
-    for entry in finding.get('cited_memories') or []:
+    # Guard the ITERATION, not just the truthiness: ``or []`` rescues a falsy
+    # value (None, [], 0) but hands a truthy NON-ITERABLE (e.g.
+    # ``{'cited_memories': 5}``) straight to ``for``, raising TypeError out of
+    # this helper — and out of ``scan_prose_citations`` and ``BaseStage.run``
+    # above it — which contradicts the "pure and total" contract this
+    # docstring states (reviewer finding, task 4818 amendment pass). A ``str``
+    # is iterable and so never raised here, but it is not a citation list
+    # either; admitting only list/tuple makes the accepted shape explicit
+    # instead of relying on every rejected shape happening to be iterable.
+    cited = finding.get('cited_memories')
+    for entry in cited if isinstance(cited, (list, tuple)) else ():
         if not isinstance(entry, dict) or entry.get('store') == 'mem0':
             # A mem0-store citation is the STRUCTURED half's business and must
             # NOT be excluded here: a phantom just dropped from
