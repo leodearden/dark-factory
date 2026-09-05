@@ -18,6 +18,26 @@ repo's standing rule against documentation meta-tests; the prompt wording is
 already correct and does not need a lock. The surviving assertions are either
 symbol-coupled (above) or structural (the region-slicing sentinel).
 
+COVERAGE LEDGER for the removed pins, so nobody re-adds one believing it was
+the only guard:
+- ``execution_class='operational'`` / ``metadata.operational_mode='gate'`` —
+  still pinned in BOTH can_file_tasks modes by test_recon_self_model.py::
+  TestRenderSourceCompletionSection::
+  test_both_modes_state_operational_gate_filing_vocabulary, and on both
+  ASSEMBLED prompts by test_operational_routing_boundary_matrix.py::
+  test_recon_stage_prompts_carry_source_completion_directives.
+- ``'`submit_task`' not in stage1_section`` — still pinned by that same
+  boundary-matrix test.
+- ``'`update_task`' not in stage1_section`` — GENUINELY LOST, accepted. The
+  pin was backtick-only (an unbackticked `update_task` slipped straight
+  through it) and it duplicated a norm already stated in
+  render_source_completion_section's own docstring. Re-adding it in any
+  tighter form is exactly what the review forbade; no follow-up is filed.
+- Everything else ('## Consolidation Gate', set_task_status,
+  '### Live-Workflow Signals', 'MUST', 'rejected', 'non-terminal', 'cancel',
+  'AMEND', 'read-side', 'recurrence_count', 'append=True', 'updated_task') —
+  prose this change never needed to own. Nothing to preserve.
+
 WHY THE KEY EXISTS. The carrier→subject linkage key was LLM-invented and
 inconsistent — reify carriers used ``stranded_task_id``, dark-factory 3463
 used ``related_task_id`` — so no deterministic consumer could join a gate to
