@@ -5321,18 +5321,41 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         assert stats.get('cross_project_fix_task_suppressed') == 1, (
             f'the drop must be counted ({shape}); got {stats!r}'
         )
+        # THE WARNING RIDES THE DECISION, not the resolution (amendment).
+        # Level is asserted explicitly: a weak suppression that ACTUALLY
+        # happened must be audible at WARNING.
         warnings = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and 'cross_project_fix_task_title_uncorroborated' in r.message
+            and 'stage1_flag_cross_project_fix_task_suppressed_weakly_corroborated'
+            in r.message
         ]
-        assert warnings, (
+        assert len(warnings) == 1, (
             f'a weakly-corroborated suppression must be logged at WARNING '
-            f'({shape}); got {[(r.levelname, r.message) for r in caplog.records]!r}'
+            f'exactly once ({shape}); got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
         )
         message = warnings[0].message
         assert 'cited_project_id=dark_factory' in message and 'cited_task_id=3839' in message, (
             f'the warning must name the cited project/task; got {message!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed_weakly_corroborated') == 1, (
+            'the weak subset must be separately countable for the cycle '
+            f'report ({shape}); got {stats!r}'
+        )
+        # The resolver's own line stays, demoted to INFO and reworded to an
+        # OBSERVATION: it runs before the policy branch has decided anything,
+        # so it must not assert an outcome (see the exhausted-branch case).
+        observations = [
+            r for r in caplog.records
+            if 'cross_project_fix_task_title_uncorroborated' in r.message
+        ]
+        assert observations and all(
+            r.levelno == logging.INFO for r in observations
+        ), (
+            'the resolver must merely OBSERVE the uncorroborated title, at '
+            f'INFO ({shape}); got '
+            f'{[(r.levelname, r.message) for r in observations]!r}'
         )
 
     @pytest.mark.asyncio
@@ -5741,6 +5764,222 @@ class TestDedupFlagsCrossProjectDiscovery:
         assert self._roots(taskmaster) == ['/df'], (
             'each foreign project must be fetched ONCE per dedup_flags call, '
             f'not once per qualifying flag; got {self._roots(taskmaster)!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_term_extraction_is_paid_once_per_batch_not_once_per_flag(
+        self, ledger_memory_service, monkeypatch
+    ):
+        """(vi-b) THE COST BOUND THE MEMO ACTUALLY OWES (amendment).
+
+        Memoising the fetched task LISTS bounds the round trips but not the
+        CPU: term extraction is the expensive half (~0.6s of blocking CPU per
+        ~4.2k-task project, and the plan's cost decision cites 9 known
+        projects), and discovery is invoked once per qualifying flag.  With a
+        raw-payload memo, N carried-forward findings in one family re-extract
+        every foreign task N times — the comment on the memo claimed the
+        opposite outright.  The memo therefore holds the EXTRACTED TERMS.
+        """
+        from fused_memory.reconciliation import flag_dedup as fd
+
+        calls: list[list[str]] = []
+        real = fd._extract_tracked_task_terms
+
+        def _counting(project_ids, project_task_lists):
+            calls.append(list(project_ids))
+            return real(project_ids, project_task_lists)
+
+        monkeypatch.setattr(fd, '_extract_tracked_task_terms', _counting)
+
+        ledger = ledger_memory_service.recon_ledger
+        flags = [self._flag(task_id=598), self._flag(task_id=599)]
+        for tid in ('598', '599'):
+            await _seed_marker(ledger, self.PROJECT, tid, self.FLAG_TYPE, run_id='r1')
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+
+        result = await fd.dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=flags,
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], f'both findings must be suppressed; got {result!r}'
+        assert calls == [['dark_factory']], (
+            'each foreign project must be term-extracted ONCE per dedup_flags '
+            'call, not once per qualifying flag — otherwise the per-batch memo '
+            f'bounds the fetch and not the CPU; got {calls!r}'
+        )
+
+    # ---- (vii) citations that FAIL to resolve fall through to discovery ----
+    #
+    # Amendment (reviewer_comprehensive, test-coverage).  Every other test in
+    # this class uses a citation-LESS flag.  A flag that HAS cited_tasks which
+    # do not resolve is the interesting branch: it keys to a citation-FOLDED
+    # signature, so its HIT depends on the model re-emitting the same citation
+    # set, and it makes two _resolve_live_cross_project_fix_task passes rather
+    # than one.
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_own_citation_falls_through_to_discovery(
+        self, ledger_memory_service
+    ):
+        """(vii) A finding citing only its OWN subject task — the live repro's
+        actual shape — resolves nothing (FOREIGN-only), falls through to
+        discovery, and is suppressed by the foreign task discovery found.
+
+        The gate and discovery also SHARE the get_task memo, so the winning
+        task is read exactly once across both resolver passes: the gate cannot
+        be looking at a different snapshot than the one discovery matched.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        own = {'project_id': self.PROJECT, 'task_id': '601', 'title': 'The subject'}
+        flag = self._flag(cited_tasks=[own])
+        tid, ftype = compute_flag_signature(flag)
+        assert tid == '598,601', (
+            'fixture drift: this flag must key to a CITATION-FOLDED signature '
+            f'— that is the branch under test; got {tid!r}'
+        )
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1',
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert result == [], (
+            'a same-project citation resolves nothing, so discovery must still '
+            f'answer the complaint; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1
+        assert [
+            (c.args, c.kwargs) for c in taskmaster.get_task.await_args_list
+        ] == [(('3839', '/df'), {})], (
+            'the discovered task must be read exactly ONCE despite two '
+            'resolver passes — discovery and the gate share fix_task_cache; '
+            f'got {taskmaster.get_task.await_args_list!r}'
+        )
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+        )
+        assert row is not None and row.task_id == tid, (
+            'the flag\'s OWN citation still keys the marker; discovery must '
+            f'not move it either; got {row!r}'
+        )
+        assert 'cited_tasks' not in json.loads(row.payload_json)
+
+    @pytest.mark.asyncio
+    async def test_not_found_foreign_citation_falls_through_to_discovery(
+        self, ledger_memory_service
+    ):
+        """(vii) Same branch via the other route: a FOREIGN citation the
+        backend cannot confirm.  The near-miss must not short-circuit the
+        fallback."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        stale = {'project_id': 'dark_factory', 'task_id': '404', 'title': 'Gone'}
+        flag = self._flag(cited_tasks=[stale])
+        tid, ftype = compute_flag_signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1',
+        )
+
+        def _get_task(task_id, project_root):
+            if str(task_id) == '3839':
+                return {
+                    'id': '3839',
+                    'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
+                    'status': 'blocked',
+                }
+            return {'error': f'No tasks found for id {task_id}',
+                    'error_type': 'TaskmasterError'}
+
+        taskmaster = self._taskmaster(
+            {'/df': [self._covering()]}, get_task_side_effect=_get_task,
+        )
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert result == [], (
+            'a citation naming a task that no longer exists must not disable '
+            f'the discovery fallback; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1
+        assert [c.args[0] for c in taskmaster.get_task.await_args_list] == [
+            '404', '3839',
+        ], (
+            'the dead citation is tried first, then the discovered task once; '
+            f'got {taskmaster.get_task.await_args_list!r}'
+        )
+
+    # ---- (viii) discovery is scoped to the complaint class -----------------
+
+    @pytest.mark.asyncio
+    async def test_flag_that_asserts_nothing_is_never_discovered_for(
+        self, ledger_memory_service
+    ):
+        """(viii) A carried-forward finding of some OTHER complaint class is
+        not suppressed by a foreign task that merely covers its wording, and
+        costs no fan-out (amendment — see the candidacy predicate)."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._flag(
+            description=TestDiscoverForeignFixTaskCitations.NON_ASSERTING_DESCRIPTION,
+        )
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert len(result) == 1, (
+            'only the "no fix task has been filed" complaint class may be '
+            f'answered with "one is filed"; got {result!r}'
+        )
+        assert 'cross_project_fix_task_suppressed' not in stats
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a non-candidate must not trigger the discovery fan-out at all; '
+            f'got {taskmaster.get_tasks.call_args_list!r}'
         )
 
     # ---- task 4381's bounds apply to the DISCOVERED path too (step-13) -----
@@ -10359,6 +10598,156 @@ class TestDiscoverForeignFixTaskCitations:
             f'got {taskmaster.get_tasks.call_count}'
         )
         assert taskmaster.get_task.call_count == 0
+
+    # ---- (vii) CANDIDACY: only the complaint class the gate answers -------
+    #
+    # Amendment (reviewer_comprehensive, architecture).  Without this
+    # predicate discovery applied to EVERY carried-forward flag, replacing the
+    # citation path's anchor — an LLM's judgment that the cited task FIXES the
+    # finding — with bare term overlap for findings that never claimed nothing
+    # was filed.  A recurring stranded-work or metadata-drift flag whose
+    # wording happened to be 75%-covered by any non-cancelled foreign task
+    # would then be suppressed for as long as that task stayed open, with only
+    # a stats counter and an INFO line as the trace.
+
+    #: Same subject and term count as DESCRIPTION, but it makes no
+    #: never-tracked assertion at all — a plain recurring observation.
+    NON_ASSERTING_DESCRIPTION = (
+        'The Stage 2 remediation payload omits live workflow signals; '
+        'operators keep re-deriving them by hand.'
+    )
+
+    @pytest.mark.asyncio
+    async def test_candidate_that_asserts_nothing_is_not_discovered_for(self):
+        """(vii) A finding that never says "no fix task has been filed" is not
+        answered with "one is filed", however well its wording overlaps."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _asserts_never_tracked,
+            _discover_foreign_fix_task_citations,
+            _significant_terms,
+        )
+
+        # The fixture must fail ONLY the candidacy predicate — if it were also
+        # below min_key_terms this test would pass for the wrong reason.
+        assert not _asserts_never_tracked(self.NON_ASSERTING_DESCRIPTION)
+        assert len(_significant_terms(self.NON_ASSERTING_DESCRIPTION)) >= 4
+        flag = self._candidate(description=self.NON_ASSERTING_DESCRIPTION)
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [flag],
+        )
+
+        assert result == {}, (
+            'discovery must be scoped to the "no fix task has been filed" '
+            f'complaint class the gate answers; got {result!r}'
+        )
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a non-asserting candidate must not even trigger the per-project '
+            f'fan-out; got {taskmaster.get_tasks.call_args_list!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_asserting_candidate_still_carries_the_batch(self):
+        """(vii) The predicate zeroes out non-candidates WITHOUT shifting the
+        returned indices — a mixed batch still answers for the right flag."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        candidates = [
+            self._candidate(description=self.NON_ASSERTING_DESCRIPTION),
+            self._candidate(),
+        ]
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, candidates,
+        )
+
+        assert set(result) == {1}, (
+            'the citation must key to the ASSERTING candidate\'s own index; '
+            f'got {result!r}'
+        )
+        assert result[1]['task_id'] == '3839'
+
+    # ---- (viii) an OPEN match beats a better-covering DONE one -------------
+    #
+    # Amendment (reviewer_comprehensive, robustness).  Discovery synthesises
+    # exactly ONE citation per candidate, and the gate bounds a `done` fix task
+    # to _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES cycles.  So a marginally
+    # better-covering done task winning over a still-open one burns that
+    # ceiling and re-asserts the finding — logging "the cited fix task is done
+    # yet the finding keeps recurring" — while an OPEN fix task for it sits in
+    # the same backlog.  Safe direction, misleading signal, gate inert for
+    # exactly the case it was built for.
+
+    #: An OPEN (blocked) fix task covering 7 of the candidate's 8 key terms —
+    #: 0.875 coverage, 0.70 precision, both comfortably over the thresholds.
+    OPEN_TASK = {
+        'id': '3839',
+        'status': 'blocked',
+        'title': 'Carry live workflow signals through the remediation payload',
+        'description': (
+            'The remediation payload lacks live workflow signals; fix the '
+            'stage 2 payload builder.'
+        ),
+    }
+    #: A DONE task covering ALL 8 — 1.00 coverage, 0.89 precision.  On
+    #: coverage alone it beats OPEN_TASK outright, which is the whole point.
+    BETTER_COVERING_DONE_TASK = {
+        'id': '9001',
+        'status': 'done',
+        'title': 'Remediation payload omits live workflow signals',
+        'description': 'Fix stage 2 so the payload carries live workflow signals.',
+    }
+
+    @pytest.mark.asyncio
+    async def test_open_match_wins_over_a_better_covering_done_match(self):
+        """(viii) The open task is cited even though the done one covers more."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+            _extract_tracked_task_terms,
+            _match_extracted_tracked_tasks,
+            _significant_terms,
+        )
+
+        backlog = [self.BETTER_COVERING_DONE_TASK, self.OPEN_TASK]
+        # Prove the fixture is the adversarial one: on COVERAGE alone the done
+        # task wins, so a passing assertion below can only come from the
+        # status preference and not from fixture luck or ordering.
+        tracked = [
+            entry
+            for per_project in _extract_tracked_task_terms(
+                ['dark_factory'], [backlog],
+            )
+            if per_project is not None
+            for entry in per_project
+        ]
+        terms = [_significant_terms(self.DESCRIPTION)]
+        coverage_only = _match_extracted_tracked_tasks(tracked, terms, 4, 0.75, 0.2)
+        assert coverage_only[0].task_id == '9001', (
+            'fixture drift: the DONE task must out-cover the open one, or '
+            f'this test proves nothing; got {coverage_only!r}'
+        )
+
+        by_id = {task['id']: task for task in backlog}
+        taskmaster = self._taskmaster(
+            {'/df': backlog},
+            get_task_side_effect=lambda task_id, project_root: dict(
+                by_id[str(task_id)]
+            ),
+        )
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [self._candidate()],
+        )
+
+        assert result[0]['task_id'] == '3839', (
+            'a still-OPEN fix task must be preferred over an already-done one '
+            'whatever the coverage — the gate bounds a done suppression to 8 '
+            f'cycles and would then re-assert the finding; got {result!r}'
+        )
 
 
 # ---------------------------------------------------------------------------

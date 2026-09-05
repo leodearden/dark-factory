@@ -462,7 +462,13 @@ re-verifies every cited task live on every cycle, only ever suppresses a finding
 has already recurred, and bounds how long an already-`done` fix task may keep a still- \
 recurring finding quiet. It also discovers such a task deterministically when you cite \
 none, so a citation you emit STRENGTHENS the evidence rather than being the only route: \
-never invent one you have not confirmed.
+never invent one you have not confirmed. Be CONSISTENT once you do cite one — cite the \
+SAME task on every cycle the finding recurs. The marker that tracks a finding's \
+recurrence is keyed partly by the tasks it cites, so a citation that appears, changes \
+or disappears between cycles restarts that finding's recurrence history and costs it \
+one cycle of the very suppression you are trying to earn. That relocation cost is \
+exactly why the deterministic discovery above, not your citation, is the load-bearing \
+path here.
 
 ## Pre-Check: Already-Reconstructed Stage 2 Summaries
 Before emitting a "missing Stage 2 summary" finding for a run, and before noting the \
