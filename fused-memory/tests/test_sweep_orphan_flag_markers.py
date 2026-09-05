@@ -127,6 +127,54 @@ def _bothmissing(id: str) -> dict:
     return _member(id, kind=None, task_id=None)
 
 
+def _mirror(id: str) -> dict:
+    """Member that is a protected cycle_summary ledger MIRROR (task 3041).
+
+    Isolates the first of ``is_protected_mirror_record``'s two independent
+    discriminators: ``kind == 'cycle_summary'``. Everything else about it
+    looks exactly like a sweepable marker (same ``source``, a valid numeric
+    ``task_id``, ``_member``'s default ``created_at``), which is the point —
+    the guard must key on the discriminator, not on the record looking odd.
+
+    Note this shape is ALSO caught by ``find_orphan_markers`` (its ``kind``
+    is not ``stage1_flag_marker``), so without the protected-mirror guard it
+    reaches the delete set through the ordinary orphan predicate.
+    """
+    return _member(id, kind='cycle_summary')
+
+
+def _ledger_stamp(id: str) -> dict:
+    """Member that is a protected ledger STAMP (task 3041).
+
+    Isolates the second discriminator: ``record_type == 'ledger_stamp'``,
+    while carrying a perfectly ordinary ``kind='stage1_flag_marker'`` and a
+    valid numeric ``task_id``. No automatic predicate catches this shape at
+    all — it reaches the delete set only via ``--delete-ids``, which is
+    precisely the case design_decision 2 says the guard must still refuse.
+    """
+    member = _member(id, kind='stage1_flag_marker')
+    member['metadata']['record_type'] = 'ledger_stamp'
+    return member
+
+
+def _svc_with_ledger() -> tuple[AsyncMock, AsyncMock]:
+    """Build ``(memory_service, ledger)`` with a spyable ``recon_ledger``.
+
+    Ported from ``tests/test_mem0_tombstone.py::_svc_with_ledger`` (kept
+    local rather than imported, matching how this suite already keeps its own
+    member builders local). Gives the tombstone tests a direct read on the
+    written ``ReconLedgerRecord`` rows via
+    ``ledger.upsert_many.await_args.args[0]``, so ``deleter`` /
+    ``deleting_run_id`` / ``created_at`` are asserted on the actual row shape
+    an auditor reads rather than on a return count alone.
+    """
+    ledger = AsyncMock()
+    ledger.upsert_many = AsyncMock(return_value=None)
+    memory_service = AsyncMock()
+    memory_service.recon_ledger = ledger
+    return memory_service, ledger
+
+
 # ---------------------------------------------------------------------------
 # count_memories_by_metadata mock, keyed by FILTER rather than call ORDER
 # (task 3897 amendment, reviewer_comprehensive #4)
