@@ -3915,7 +3915,7 @@ class TestTimeoutMarkCoverage:
 # _DATACLASS_DOUBLE_DEBT baseline, so a regression here fails the gate.
 #
 # The single deliberate bare double below keeps a per-site
-# `# noqa: bare-dataclass-double` pragma, which is now its SOLE suppression.
+# `bare-dataclass-double` noqa pragma, which is now its SOLE suppression.
 
 
 # ===========================================================================
