@@ -7,6 +7,8 @@ import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 from escalation import sweep
 from escalation.models import Escalation
@@ -560,6 +562,72 @@ class TestRunStartupSweep:
             r.name == 'escalation.sweep' and r.levelno == logging.INFO
             for r in caplog.records
         ), f'Expected INFO report line; got: {[r.getMessage() for r in caplog.records]}'
+
+
+def _relocating_read_text(doomed: Path, dest_dir: Path):
+    """Interpose ``Path.read_text`` to really relocate *doomed* mid-scan.
+
+    Not a mocked exception: the file is genuinely ``os.replace``d into
+    *dest_dir* and the original ``read_text`` is then called through, so the
+    ``FileNotFoundError`` comes from the filesystem exactly as it does when a
+    concurrent ``resolve()`` — or a second startup sweep during a fleet
+    redeploy — moves a record between the glob and the read.  Neither actor
+    holds a lock over that window: ``_relocate_terminal`` takes the per-id
+    lock only around the move itself.
+    """
+    original = Path.read_text
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == doomed and doomed.exists():
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(str(doomed), str(dest_dir / doomed.name))
+        return original(self, *args, **kwargs)
+
+    return flaky
+
+
+class TestSweepSurvivesRecordVanishedMidScan:
+    """One record vanishing must not abort a whole sweep pass — and must be
+    accounted for HONESTLY rather than folded into an existing counter."""
+
+    def test_sweep_completes_and_counts_the_vanished_record(self, tmp_path: Path):
+        """RED on main for two independent reasons: FileNotFoundError escapes
+        the read, and SweepReport has no skipped_vanished field."""
+        _write_root_esc(tmp_path, 'esc-1-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00')
+        _write_root_esc(tmp_path, 'esc-2-1', 'pending')
+        doomed = _write_root_esc(
+            tmp_path, 'esc-3-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00',
+        )
+
+        flaky = _relocating_read_text(doomed, tmp_path / 'archive' / '2026-09-04')
+
+        with patch.object(Path, 'read_text', flaky):
+            report = sweep.sweep(tmp_path, apply=True)
+
+        # (b) The sweep still completes its real work.
+        assert report.archived == 1, f'expected the terminal record archived; got {report.archived}'
+        assert report.untouched_pending == 1, (
+            f'expected the pending record untouched; got {report.untouched_pending}'
+        )
+
+        # (c) A file relocated by someone else is NOT an unparsable file left
+        # in root.  Folding it into skipped_unparsable would misreport a benign
+        # race as operator-actionable corruption.
+        assert report.skipped_vanished == 1, (
+            f'expected 1 vanished record; got {report.skipped_vanished}'
+        )
+        assert report.skipped_unparsable == 0, (
+            f'a vanished file is not unparsable; got {report.skipped_unparsable}'
+        )
+
+        # (d) root_after must match GROUND TRUTH, not a restatement of the
+        # formula: the vanished file was counted in root_before yet belongs to
+        # none of the other subtracted categories, so without its own term the
+        # operator-facing figure over-reports.
+        assert report.root_after == len(list(tmp_path.glob('esc-*.json'))), (
+            f'root_after={report.root_after} disagrees with the actual on-disk '
+            f'root count {len(list(tmp_path.glob("esc-*.json")))}'
+        )
 
 
 class TestReapLooseArchiveFiles:
