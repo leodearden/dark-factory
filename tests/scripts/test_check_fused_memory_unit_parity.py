@@ -718,6 +718,107 @@ def test_a_non_conf_file_in_the_dropin_dir_is_not_an_override(
 
 
 # ---------------------------------------------------------------------------
+# --fix must not launder an override into a green verdict  (step-3 / step-4)
+# ---------------------------------------------------------------------------
+#
+# The sharper half of the drop-in workstream. --fix APPENDS missing directives
+# and then reports; if it reported 0 while a drop-in silently overrode the
+# values it had just written, the checker would have MANUFACTURED the
+# reassurance — an operator watching it "repair" a unit whose effective
+# configuration is still not the committed one.
+#
+# The three tests below also fix the shape of the remedy: repair what can be
+# repaired, refuse to call the result parity, and never touch the drop-in.
+
+
+def test_fix_does_not_report_success_while_an_override_applies(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """--fix repairs the unit, reports the override, and still returns 1.
+
+    Both halves are the point. --fix legitimately appends the directives it
+    can synthesize — refusing to repair because an override exists would make
+    the drop-in block a repair, which it is not. And it must still decline to
+    report success, because what it wrote is not what would run.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+    _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+
+    # Precondition: WITHOUT the drop-in this exact input returns 0 — pinned by
+    # ::test_main_fix_rewrites_file. So a 1 below is the drop-in's doing.
+    assert "Environment=MEM0_TELEMETRY=false" in mod.find_drift(
+        _DRIFTED_WITH_HOST_SPECIFIC
+    )
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 1, out
+    assert "[override]" in out
+
+    # The fix still did its job: the missing directive is now in [Service].
+    sections = mod.parse_unit_sections(installed.read_text(encoding="utf-8"))
+    assert "Environment=MEM0_TELEMETRY=false" in sections["Service"]
+
+
+def test_fix_on_a_clean_unit_with_an_override_still_returns_1(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """No directive drift + a drop-in + --fix => 1, and the unit file is untouched.
+
+    There was nothing for --fix to append, and a drop-in is not something it
+    may resolve: it lives in a DIFFERENT FILE, and this checker is read-only
+    about those by design. So the unit file must come back byte-identical —
+    "--fix ran" is not licence to rewrite a file that had nothing wrong with
+    it — while the verdict is still not parity.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _CLEAN_UNIT)
+    _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+    before = installed.read_bytes()
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert rc == 1, out
+    assert "[override]" in out
+    assert installed.read_bytes() == before
+
+
+def test_fix_never_removes_a_dropin(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """Reporting an override never deletes it, even on the --fix path.
+
+    Mirrors tests/scripts/test_check_lms_unit_parity.py::
+    test_a_dropin_is_never_removed_by_the_checker and its recorded reason: the
+    real observed drop-in was LOAD-BEARING (task 3750), so removing it would
+    have broken exactly the thing the check exists to protect. Removal has a
+    correct owner with preconditions
+    (scripts/remove-lms-arm-worktree-dropin.sh); a general-purpose parity
+    checker has no business re-implementing them. Fail loud, do not "fix".
+
+    A regression guard that passes on arrival, kept because it is what forbids
+    the tempting wrong way to green the two tests above.
+    """
+    mod = _load_checker()
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+    dropin = _plant_fm_dropin(installed, "10-override.conf", _FM_DROPIN)
+    before = dropin.read_bytes()
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+    capsys.readouterr()
+
+    assert rc == 1
+    assert dropin.is_file()
+    assert dropin.read_bytes() == before
+    assert dropin.parent.is_dir()
+
+
+# ---------------------------------------------------------------------------
 # LOG_TAG contract  (task 3909)
 # ---------------------------------------------------------------------------
 #
