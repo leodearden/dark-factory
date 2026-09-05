@@ -284,6 +284,18 @@ async def terminate_process_group(
 # ---------------------------------------------------------------------------
 
 
+#: The procfs mount the at-or-under scan walks.
+#:
+#: Module-level solely so the synthetic-/proc tests can point the scan at a
+#: fabricated tree (``test_proc_group.TestScanProcessGroupsAgainstASyntheticProc``
+#: monkeypatches it, the same way other tests here monkeypatch ``os.readlink``
+#: and ``os.killpg``). It is an INJECTION SEAM FOR TESTS, not a runtime knob:
+#: nothing in production reads a config value into it, and the whole module
+#: already assumes Linux procfs semantics (os.killpg, /proc/<pid>/stat field
+#: order), so pointing it elsewhere at runtime would not make it portable.
+_PROC_ROOT = Path('/proc')
+
+
 def _path_at_or_under(candidate: str, root: str) -> bool:
     """Return True iff *candidate* is *root* exactly or a descendant of it.
 
@@ -340,7 +352,7 @@ def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[in
     result: set[int] = set()
     exclude = frozenset(exclude_pgids)
 
-    proc_dir = Path('/proc')
+    proc_dir = _PROC_ROOT
     if not proc_dir.exists():
         return result
     try:
