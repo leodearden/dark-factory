@@ -32,7 +32,7 @@ def test_minutes_since_handles_z_suffix_and_naive_iso():
     assert 59 <= minutes <= 61
 
 
-def test_minutes_since_returns_none_on_missing_and_on_bad():
+def test_minutes_since_returns_none_on_missing_and_on_bad(caplog):
     """A MISSING start time and a present-but-unparseable one are both None.
 
     ``None``/``''`` is the per-task artifact-read-failure signal on
@@ -43,10 +43,17 @@ def test_minutes_since_returns_none_on_missing_and_on_bad():
     identically misleadingly as '0m running' if faked to 0, so it is also
     surfaced as None rather than fabricated (task 4365; task 4055 scoped its
     fix to the missing/empty case only and left this branch for follow-up).
+    The unparseable case must also be LOUD (loud-over-silent-degradation): a
+    WARNING naming the offending value, not just a silently-swapped return —
+    mirroring ``test_queue.py::test_unparseable_timestamp_logs_a_warning``.
     """
     assert _minutes_since(None) is None
     assert _minutes_since('') is None
-    assert _minutes_since('not-a-date') is None
+
+    with caplog.at_level(logging.WARNING):
+        assert _minutes_since('not-a-date') is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('not-a-date' in m for m in warnings), warnings
 
 
 def test_minutes_since_uses_provided_now():
@@ -428,6 +435,39 @@ async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state
     assert row['lane'] == '_lane-7'
     assert row['phase'] == 'EXECUTE'
     assert row['lane_state'] == 'assigned'
+    assert row['runtime_offline'] is False
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """An ONLINE entry whose ``started`` is present-but-unparseable renders as
+    ``None`` on the row, not a fabricated ``0`` — the row-level counterpart to
+    ``test_minutes_since_returns_none_on_missing_and_on_bad`` (task 4365),
+    mirroring ``test_task_runtime_boundary.py``'s
+    ``test_b6_online_per_task_read_failure_yields_none_started`` shape for the
+    unparseable-rather-than-missing case. ``runtime_offline`` stays False: this
+    is a damaged field on an otherwise-online snapshot, not an outage.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='damagedlane',
+        tasks=[{'id': 9, 'title': 'damaged task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {
+        'damagedlane': [_runtime_entry(9, started='not-a-date')],
+    })
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    assert len(active) == 1
+    row = active[0]
+    assert row['started'] is None
     assert row['runtime_offline'] is False
 
 
