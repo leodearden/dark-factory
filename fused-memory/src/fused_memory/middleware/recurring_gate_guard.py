@@ -29,7 +29,8 @@ with a one-line ``AsyncMock``.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+import logging
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
 from shared.task_statuses import TERMINAL
@@ -41,7 +42,16 @@ __all__ = [
     'find_open_gate',
     'is_gate_submission',
     'recurring_gate_error',
+    'recurring_gate_guard_error',
 ]
+
+logger = logging.getLogger(__name__)
+
+# Injected task-corpus reader. Mirrors live_task_write_guard's GetTaskFn /
+# DoWriteFn / FileFindingFn aliases: the concrete callable is bound at the
+# tools.py call site to task_interceptor.get_tasks, so this module stays a
+# leaf and every unit test can supply a one-line AsyncMock.
+GetTasksFn = Callable[[], Awaitable[Any]]
 
 # The canonical metadata key a recon-filed human gate uses to name the
 # subject it is gating. Rendered into the recon prompt authority by
@@ -251,3 +261,86 @@ def recurring_gate_error(
             f'block.'
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Async orchestrator (the module's only I/O)
+# ---------------------------------------------------------------------------
+
+
+async def recurring_gate_guard_error(
+    metadata: str | dict[str, Any] | None,
+    agent_id: str | None,
+    project_root: str,
+    *,
+    fetch_tasks: GetTasksFn,
+) -> dict[str, Any] | None:
+    """Reject a recon-stage human gate that duplicates an already-open one.
+
+    Returns a :func:`recurring_gate_error` dict when the submission is a
+    recon-stage gate carrying a ``gate_subject`` that already has a
+    NON-TERMINAL carrier, and ``None`` otherwise — including for every
+    non-recon caller, which is never enforced.
+
+    Gates run cheapest-first, so the extra task read is issued ONLY on the
+    narrow recon gate-filing path: a non-recon caller costs one string
+    ``startswith`` and nothing else. ``fetch_tasks`` is awaited at most once.
+
+    FAILS OPEN. If the lookup raises, this logs a WARNING and returns
+    ``None``, letting the submission proceed — the same policy
+    ``TaskInterceptor._check_escalation_idempotency`` adopts when its own
+    ``get_tasks`` fails ("callers fall through to CREATE rather than
+    treating a failure as a clean no-hit"). The failure modes are
+    asymmetric: failing closed on a transient backend blip would block
+    EVERY recon human gate including genuinely novel ones a human needs to
+    see, whereas failing open costs at most one duplicate gate — precisely
+    the bounded, already-tolerated cost this guard reduces.
+
+    Args:
+        metadata: The submission's declared metadata (dict, JSON string or
+            None), read BEFORE ``inject_operational_routing`` normalizes it.
+        agent_id: The resolved caller identity. Enforcement fires only when
+            this is a string starting with ``'recon-stage-'``.
+        project_root: Absolute path to the project root. Unused — the check
+            is metadata-only — but kept to mirror ``execution_class_error``'s
+            signature so the two guards read as a matched pair, and so a
+            future project-scoped rule has a home without a signature change.
+        fetch_tasks: Injected zero-arg async callable returning a raw
+            ``get_tasks`` result. The caller is responsible for narrowing it
+            to non-terminal statuses; :func:`find_open_gate` re-checks anyway.
+    """
+    if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
+        return None
+
+    meta = _parse_metadata(metadata)
+    if not is_gate_submission(meta):
+        return None
+
+    subject = extract_gate_subject(meta)
+    if subject is None:
+        # No dedupe key => nothing to enforce, and nothing to read.
+        return None
+
+    try:
+        result = await fetch_tasks()
+    except Exception:
+        logger.warning(
+            'recurring_gate_guard: task lookup failed for gate_subject=%s — '
+            'failing open (submission proceeds)',
+            subject,
+            exc_info=True,
+        )
+        return None
+
+    existing = find_open_gate(_iter_task_rows(result), subject)
+    if existing is None:
+        return None
+
+    logger.warning(
+        'recurring_gate_guard: rejecting duplicate human gate for '
+        'gate_subject=%s — task %s is already open (status=%s)',
+        subject,
+        existing.get('id'),
+        existing.get('status'),
+    )
+    return recurring_gate_error(existing, subject)
