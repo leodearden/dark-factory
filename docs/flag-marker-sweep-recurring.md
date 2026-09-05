@@ -66,16 +66,18 @@ enumerates it, never runs a predicate over it, and never adds it to the
 delete set — a boundary enforced by `TestFlagForStage2IsNeverDeleted` in
 `fused-memory/tests/test_sweep_orphan_flag_markers.py`. Three reasons were
 originally given, two of them measured on 2026-08-09. Item 2 has since been
-closed by task 4435 and no longer carries any weight; the ruling stands on
-items 1 and 3, each independently sufficient:
+closed by task 4435 (on the two gaps it named — see the divergence note under
+it) and no longer carries any weight; the ruling stands on items 1 and 3, each
+independently sufficient:
 
 1. **23 of the 61 live records carry no usable `task_id`**, so the script's
    existing `find_taskless_markers` predicate would delete all 23 on the
    very next nightly `--apply` run. They are live Stage-1 → Stage-2 relay
    markers, not dead weight — and the nightly timer's `--terminal-drain`
    would additionally reap markers citing already-done tasks.
-2. **CLOSED by task 4435 — the script now has both.** *Originally:* the
-   script had neither the `is_protected_mirror_record` check nor the
+2. **CLOSED by task 4435 — the script now has both of the two things this
+   item named.** *Originally:* the script had neither the
+   `is_protected_mirror_record` check nor the
    `record_mem0_deletion_tombstones` write that the shared in-cycle
    `_sweep_stale_mem0_pool` applies, which mattered because `flag_for_stage2`
    is an LLM-supplied key any writer can stamp on any record —
@@ -93,6 +95,29 @@ items 1 and 3, each independently sufficient:
    so the item numbering the surrounding prose refers to stays stable, and
    so a reader can see the gap existed and was closed rather than wondering
    whether it was ever considered.
+
+   **Do not read this as full parity with the in-cycle collector.**
+   `_sweep_stale_mem0_pool` applies a THIRD protected-record predicate the
+   script still lacks: `is_protected_audit_record` /
+   `PROTECTED_AUDIT_KINDS` (task 4375), which withholds
+   deliberately-permanent audit records such as `kind='cadence_check'` —
+   the guard added after an age-only rule destroyed 40 of them in
+   `autopilot_video`. The script's own `find_stale_markers` /
+   `find_terminal_task_markers` can still reach such a record if it carries
+   `source='stage1_flag_marker'`. That divergence is deliberate (task
+   4435's scope was the two counts above, and the audit arm does not port
+   mechanically — in the in-cycle collector it sits BEHIND a primary
+   terminal-task-closure gate, whereas this script's `--terminal-drain`
+   deliberately deletes markers *because* their task went terminal) and is
+   tracked as **task 5129**. It does not reopen this item, whose subject was
+   the mirror guard and the tombstone write — both closed. If anything it
+   argues the other way: the 40 destroyed `cadence_check` records were in
+   *this* `flag_for_stage2` pool, so a script that deleted from it while
+   still missing the audit guard would repeat exactly that loss. Within the
+   script's own `source` enumeration the gap is live but latent for the same
+   structural reason item 2 was before it was closed: that filter is
+   documented above as matching zero records in every project probed, so it
+   reaches no `cadence_check` record either — today.
 3. **The pool is already drained correctly** by task 2966's in-cycle
    collector, on a rolling 14-day window. A second collector here would race
    a correct one, producing duplicate deletes and duplicate tombstones for

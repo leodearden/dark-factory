@@ -159,12 +159,27 @@ ruling now rests on two reasons, not three: live relay markers would be caught b
 this script's own ``find_taskless_markers`` / ``--terminal-drain`` predicates (they
 are live, not dead weight), and task 2966's in-cycle collector already drains that
 pool, so a second collector here would race a correct one. The third reason is
-retired — task 4435 closed the parity gap, and this script now applies BOTH the
-``is_protected_mirror_record`` guard (at :func:`delete_orphan_markers`, the delete
-choke point, so every caller inherits it) and the ``record_mem0_deletion_tombstones``
-write over its confirmed deletes, exactly as the in-cycle ``_sweep_stale_mem0_pool``
-does. Closing it changes nothing about the boundary: the two surviving reasons are
-each independently sufficient.
+retired — task 4435 closed the parity gap it named, and this script now applies
+BOTH the ``is_protected_mirror_record`` guard (at :func:`delete_orphan_markers`,
+the delete choke point, so every caller inherits it) and the
+``record_mem0_deletion_tombstones`` write over its confirmed deletes, as the
+in-cycle ``_sweep_stale_mem0_pool`` does. Closing it changes nothing about the
+boundary: the two surviving reasons are each independently sufficient.
+
+Read that as parity ON THOSE TWO COUNTS, not as equivalence. This script is still
+the looser of the two paths: ``_sweep_stale_mem0_pool`` applies a THIRD
+protected-record predicate that has NOT been ported here —
+``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS`` (task
+4375), added after the age-only rule destroyed the 40 ``kind='cadence_check'``
+audit records described above. So ``find_stale_markers`` / ``find_terminal_task_markers`` here can still
+destroy a permanent audit record that happens to carry
+``source='stage1_flag_marker'``, and deletion here is permanent (see "Deletion vs
+backfill"). That divergence is deliberate, not an oversight: task 4435's scope was
+the two counts its own description named, and the audit arm does not port
+mechanically (in ``_sweep_stale_mem0_pool`` it is documented as defence-in-depth
+BEHIND a primary terminal-task-closure gate, whereas this script's
+``--terminal-drain`` deliberately deletes markers BECAUSE their task went
+terminal). Tracked as task 5129.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
 records, in which project, when), for the full censused-never-deleted
@@ -543,8 +558,20 @@ def find_protected_markers(members: list[dict]) -> list[dict]:
     so it is refused unconditionally, however it reached the delete set.
 
     Restores parity with the in-cycle collector
-    ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool``, which applies
-    the same guard before its own eligibility test.
+    ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` ON THIS ONE
+    GUARD, which it applies before its own eligibility test. Parity is not
+    total, and this predicate must not be read as making it so: that
+    collector applies a SECOND protected-record predicate this script still
+    lacks — ``mem0_tombstone.is_protected_audit_record`` (task 4375), a
+    membership test over ``PROTECTED_AUDIT_KINDS`` withholding
+    deliberately-permanent audit records such as ``kind='cadence_check'``.
+    Until that lands (task 5129), this script's ``find_stale_markers`` /
+    ``find_terminal_task_markers`` can still reach such a record if it
+    carries ``source='stage1_flag_marker'``. The two are deliberately
+    separate predicates rather than one — ``mem0_tombstone``'s own docstring
+    gives the reason (they answer different questions, and separate skips
+    keep distinct attribution) — so folding the audit arm in here would be
+    the wrong shape even once it is in scope.
 
     The two discriminators are single-sourced in
     ``fused_memory.reconciliation.mem0_tombstone`` and deliberately IMPORTED
