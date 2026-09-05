@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 import silent_fallthrough_scan as sfs
+import test_config_dir_archival_gate as archival_gate
 from silent_fallthrough_scan import iter_first_party_files
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -518,3 +519,256 @@ class TestSilentFallthroughGateUsesTheSharedTree:
             assert sfs.find_violations(record.source, rel) == (
                 sfs.find_violations_in_tree(record.tree, rel, record.source)
             ), f'a real re-parse of {rel} yields different violations'
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — the archival gate consumes the shared provider, and nothing grows
+# a third private whole-tree parse
+# ---------------------------------------------------------------------------
+
+#: Identifiers the archival gate tracks. All three are Python identifiers, so
+#: an ``ast.Name``/``ast.Attribute`` carrying one cannot exist unless the
+#: literal substring is present in the file's source — which is what makes the
+#: gate's source-text prefilter exact rather than a heuristic.
+_TRACKED_NAMES = frozenset({
+    'TaskConfigDir', 'archive_task_transcripts', 'archive_before_delete',
+})
+
+#: Ceiling on how many first-party files may mention a tracked name. 14 of 461
+#: today. A budget rather than an equality so ordinary churn does not turn this
+#: into a nuisance ratchet reviewers re-bless blindly — the same reasoning the
+#: archival gate already applies to its own ``>= 6`` site floor.
+_TRACKED_FILE_BUDGET = 40
+
+
+def _unfiltered_archival_scan(records):
+    """The archival scan with NO prefilter — a parent map for every file.
+
+    The pre-4520 ``_scan`` body, verbatim apart from taking already-parsed
+    records. Exists so the prefiltered scan can be pinned against it as a
+    multiset: the argument that a source-text prefilter cannot drop a site is
+    sound, but this asserts it rather than trusting it.
+    """
+    sites = []
+    archival_refs = []
+    for record in records:
+        parent_map = sfs._build_parent_map(record.tree)
+        for node in ast.walk(record.tree):
+            if isinstance(node, ast.Name) and node.id in archival_gate._ARCHIVAL_NAMES:
+                archival_refs.append(
+                    (record.relpath, sfs._compute_qualname(node, parent_map))
+                )
+                continue
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                callee = func.id
+            elif isinstance(func, ast.Attribute):
+                callee = func.attr
+            else:
+                continue
+            if callee != 'TaskConfigDir':
+                continue
+            sites.append((record.relpath, sfs._compute_qualname(node, parent_map)))
+    return sites, archival_refs
+
+
+class TestArchivalGateUsesTheSharedTree:
+    """_scan walks the shared ASTs, prefilters on source text, and drops no site."""
+
+    def test_prefilter_changes_no_answer(self, first_party_tree):
+        """Multiset parity against the unfiltered scan — sites AND archival refs.
+
+        Counter, not set: two byte-distinct constructions can share one
+        (path, qualname) key (``UsageGate.__init__`` legitimately has two), and
+        set equality would hide a prefilter that dropped one of them.
+        """
+        expected_sites, expected_refs = _unfiltered_archival_scan(first_party_tree)
+        sites, refs = archival_gate._scan(first_party_tree)
+        assert Counter(sites) == Counter(expected_sites)
+        assert Counter(refs) == Counter(expected_refs)
+        assert len(expected_sites) >= 6, (
+            f'only {len(expected_sites)} TaskConfigDir sites — parity would be '
+            f'near-vacuous; is repo_root correct? ({_REPO_ROOT})'
+        )
+        assert len(set(expected_refs)) >= 5, (
+            f'only {len(set(expected_refs))} archival reference sites — parity '
+            f'would be near-vacuous; is repo_root correct? ({_REPO_ROOT})'
+        )
+
+    def test_parent_maps_are_built_only_for_tracked_files(
+        self, first_party_tree, monkeypatch
+    ):
+        """3% of the tree mentions a tracked name; the other 97% must cost nothing."""
+        tracked = [
+            record for record in first_party_tree
+            if any(name in record.source for name in _TRACKED_NAMES)
+        ]
+        assert len(tracked) <= _TRACKED_FILE_BUDGET, (
+            f'{len(tracked)} first-party files mention one of '
+            f'{sorted(_TRACKED_NAMES)} (budget {_TRACKED_FILE_BUDGET}). Either '
+            f'the names leaked into general use or the prefilter has stopped '
+            f'being selective — the archival gate pays a parent map for each.'
+        )
+        assert tracked, 'no file mentions a tracked name — the gate is vacuous'
+
+        built = []
+        real = sfs._build_parent_map
+        monkeypatch.setattr(
+            sfs, '_build_parent_map', lambda tree: (built.append(tree), real(tree))[1]
+        )
+        archival_gate._scan(first_party_tree)
+        assert len(built) <= len(tracked), (
+            f'_scan built {len(built)} parent maps for {len(tracked)} files that '
+            f'mention a tracked name — the source prefilter is not being applied'
+        )
+
+    def test_scan_does_no_io_and_no_parsing(self, first_party_tree, monkeypatch):
+        """With the memo warm, the archival gate reads nothing and parses nothing."""
+        counter = _WorkCounter(monkeypatch)
+        archival_gate._scan(first_party_tree)
+        assert counter.parses == [], (
+            f'_scan re-parsed {len(counter.parses)} file(s): {counter.parses[:5]}'
+        )
+        assert counter.reads == [], (
+            f'_scan re-read {len(counter.reads)} file(s): {counter.reads[:5]}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The anti-regrowth ratchet
+# ---------------------------------------------------------------------------
+
+#: Modules allowed to name ``iter_first_party_files`` AND call ``ast.parse``:
+#:
+#:   silent_fallthrough_scan.py  — IS the provider. It owns the enumeration and
+#:       the one parse; that is the whole point.
+#:   test_tree_scan_sharing.py   — this file, which pins the provider's
+#:       contract. It must name the enumerator and must parse synthetic sources
+#:       to assert what the provider does with them.
+#:
+#: Nothing else. The defect this task fixed was not that someone wrote a slow
+#: scan — it was that a SECOND scan grew alongside the first and nothing
+#: noticed until the two collided with a wall-clock budget under load.
+_PRIVATE_PARSE_EXEMPT = frozenset({
+    'silent_fallthrough_scan.py',
+    'test_tree_scan_sharing.py',
+})
+
+_TESTS_DIR = Path(__file__).resolve().parent
+
+
+def _names_referenced(tree: ast.Module) -> set[str]:
+    """Every identifier the module names — as a Name, an Attribute, or an import."""
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            found.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            found.add(node.attr)
+        elif isinstance(node, ast.alias):
+            found.add(node.asname or node.name.split('.')[-1])
+    return found
+
+
+def _calls_ast_parse(tree: ast.Module) -> bool:
+    """True if the module calls ``ast.parse`` — attribute or from-import form."""
+    bare_parse_is_ast = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == 'ast'
+        and any(alias.name == 'parse' for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'parse'
+            and isinstance(func.value, ast.Name)
+            and func.value.id == 'ast'
+        ):
+            return True
+        if bare_parse_is_ast and isinstance(func, ast.Name) and func.id == 'parse':
+            return True
+    return False
+
+
+def _grows_a_private_tree_parse(tree: ast.Module) -> bool:
+    """The offence: enumerate the first-party tree AND parse it yourself."""
+    return 'iter_first_party_files' in _names_referenced(tree) and _calls_ast_parse(tree)
+
+
+class TestNoRegrownWholeTreeParse:
+    """No shared/tests module may grow a SECOND private whole-tree parse.
+
+    Written in this directory's established ratchet idiom
+    (``test_safe_io.TestNoRegrownAtomicWriters``, the silent-fallthrough gate,
+    the archival gate): AST scan, name the offender, carry an anti-vacuity
+    floor. Keyed on ``iter_first_party_files`` rather than on "parses anything"
+    so it stays scoped to the shared enumerator — ``test_safe_io`` and
+    ``test_auth_failed`` roll their own roots and are a separate, filed
+    follow-up.
+    """
+
+    def test_no_module_enumerates_and_parses_the_tree_itself(self):
+        offenders = []
+        scanned = 0
+        for module_path in sorted(_TESTS_DIR.glob('*.py')):
+            if module_path.name in _PRIVATE_PARSE_EXEMPT:
+                continue
+            scanned += 1
+            if _grows_a_private_tree_parse(
+                ast.parse(module_path.read_text(encoding='utf-8'),
+                          filename=str(module_path))
+            ):
+                offenders.append(module_path.name)
+        assert scanned >= 50, (
+            f'only {scanned} modules scanned — is the tests dir correct? '
+            f'({_TESTS_DIR})'
+        )
+        assert not offenders, (
+            'These shared/tests modules enumerate the first-party tree with '
+            'iter_first_party_files AND parse it themselves:\n'
+            + '\n'.join(f'  {name}' for name in offenders)
+            + '\n\nThat is a SECOND whole-tree parse. Two of them already '
+              'collided with the 60s pytest-timeout budget under load (task '
+              '4520): pytest-timeout arms its timer over the whole runtest '
+              'protocol, so the duplicated work lands on one arbitrary test '
+              'item as an ERROR-at-setup. Take the session-scoped '
+              '`first_party_tree` fixture (conftest.py) and walk the ASTs '
+              'silent_fallthrough_scan.parse_first_party_tree already built.'
+        )
+
+    def test_the_detector_actually_fires(self):
+        """Anti-vacuity: a synthetic offender must be caught."""
+        offender = ast.parse(
+            'import ast\n'
+            'from silent_fallthrough_scan import iter_first_party_files\n'
+            'def scan(root):\n'
+            '    return [ast.parse(p.read_text()) for p in iter_first_party_files(root)]\n'
+        )
+        assert _grows_a_private_tree_parse(offender)
+
+    def test_the_detector_catches_the_from_import_spelling(self):
+        """`from ast import parse` must not evade the ratchet."""
+        offender = ast.parse(
+            'from ast import parse\n'
+            'from silent_fallthrough_scan import iter_first_party_files\n'
+            'def scan(root):\n'
+            '    return [parse(p.read_text()) for p in iter_first_party_files(root)]\n'
+        )
+        assert _grows_a_private_tree_parse(offender)
+
+    def test_the_detector_does_not_fire_on_either_half_alone(self):
+        """Parsing a synthetic source, or naming the enumerator, is fine alone."""
+        parses_only = ast.parse('import ast\nast.parse("x = 1")\n')
+        enumerates_only = ast.parse(
+            'from silent_fallthrough_scan import iter_first_party_files\n'
+            'def files(root):\n'
+            '    return list(iter_first_party_files(root))\n'
+        )
+        assert not _grows_a_private_tree_parse(parses_only)
+        assert not _grows_a_private_tree_parse(enumerates_only)
