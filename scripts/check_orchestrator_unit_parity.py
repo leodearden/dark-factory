@@ -245,7 +245,6 @@ encodes host state rather than checker behaviour.
 """
 
 import argparse
-import dataclasses
 import pathlib
 import sys
 from collections.abc import Sequence
@@ -255,7 +254,12 @@ from collections.abc import Sequence
 # check_dashboard_unit_parity.py until check_lms_unit_parity.py would have made
 # it three copies; this suite's existing find_dropins tests still call
 # mod.find_dropins, so they are what proves the lift was behaviour-preserving.
-from systemd_unit_parity import find_dropins, parse_unit_directives
+from systemd_unit_parity import (
+    _ABSENT,  # noqa: F401  (re-exported: read by the test suite)
+    Drift,
+    find_dropins,
+    parse_unit_directives,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -301,23 +305,9 @@ def _log(message: str, *, stream=None) -> None:
 # Drift records and comparison
 # ---------------------------------------------------------------------------
 
-# Rendered in place of a value on whichever side does not declare the
-# directive at all.  Deliberately not '' or None: it appears verbatim in the
-# operator's report, where "<absent>" reads unambiguously and an empty string
-# would look like a directive set to nothing.
-_ABSENT = "<absent>"
-
-
-@dataclasses.dataclass(frozen=True)
-class Drift:
-    """One disagreement between the repo copy and the installed copy."""
-
-    unit: str
-    section: str
-    key: str
-    repo_value: str
-    installed_value: str
-    reason: str
+# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
+# (see the import above). They were code-identical in all three checkers; the
+# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
 
 
 def _render(values: list[str] | None) -> str:
