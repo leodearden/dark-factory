@@ -50,9 +50,19 @@ logger = logging.getLogger(__name__)
 class PersistedMergeRequest:
     """Serializable identity subset of a MergeRequest.
 
-    All fields are JSON-safe primitives or None.  Non-serializable fields
-    (result Future, config, module_configs) are excluded — they are
-    re-injected at recovery time.
+    All fields are JSON-safe primitives or None.  The non-serializable fields
+    (result Future, config) are excluded — they are re-injected at recovery
+    time.  ``module_configs`` is a middle case: the ``ModuleConfig`` OBJECTS
+    are not persistable (they hold live command strings, timeouts and env
+    dicts sourced from each subproject's ``orchestrator.yaml``, which go stale
+    the moment an operator edits one), but their PREFIXES are — so the
+    prefixes are journaled here and the objects are re-resolved against the
+    LIVE config at reconstruction by
+    :func:`_reconstruct_module_configs` (task 5063).
+
+    New fields MUST be added last and defaulted: :meth:`MergeQueueStore.load`
+    builds records with ``PersistedMergeRequest(**entry)``, so an older entry
+    lacking the key must still construct.
     """
 
     request_id: str
@@ -65,6 +75,17 @@ class PersistedMergeRequest:
     generation: int
     lane: str
     enqueued_at: float
+    module_prefixes: list[str] | None = None
+    """Prefixes of the request's ``module_configs`` (task 5063).
+
+    ``None`` and ``[]`` are NOT interchangeable, and
+    :func:`_reconstruct_module_configs` branches on the difference:
+
+    * ``None`` — this record was written before the field existed; the module
+      set is UNKNOWN and must be re-derived (from ``task_files``).
+    * ``[]``  — the task genuinely had NO assigned modules; the empty set is
+      correct and is deliberately not widened.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +147,12 @@ class MergeQueueStore:
             generation=req.generation,
             lane=req.lane,
             enqueued_at=req.enqueued_at,
+            # Persist the module PREFIXES, not the ModuleConfig objects: a
+            # prefix is stable identity, re-resolvable against the live config
+            # at reconstruction (task 5063).  `req` is the LIVE MergeRequest,
+            # whose module_configs WorkflowRunner._resolve_module_configs has
+            # already populated, so no new plumbing is needed here.
+            module_prefixes=[mc.prefix for mc in req.module_configs],
         )
 
         # Update in-memory mirror first; then flush atomically without re-reading.
