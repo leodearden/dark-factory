@@ -25,7 +25,7 @@ from pathlib import Path
 
 from escalation import archive
 from escalation.models import Escalation
-from escalation.queue import SEQ_COUNTER_SUFFIX, escalation_id_lock
+from escalation.queue import SEQ_COUNTER_SUFFIX, escalation_id_lock, read_escalation_for_scan
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,14 @@ class SweepReport:
     # resolved_at on a resolved/dismissed file, or unknown status value.
     # Individual cases are logged at WARNING level for operator review.
     skipped_unparsable: int = 0
+    # Counts records relocated OUT of the root by a CONCURRENT actor between
+    # the glob and the read — a resolve() in another process, or a second
+    # startup sweep during a fleet redeploy, when several orchestrators
+    # restart together.  Deliberately NOT skipped_unparsable: that counter
+    # means "left IN root for an operator-actionable reason", and a vanished
+    # file is neither.  Logged at DEBUG, not WARNING — this is expected
+    # concurrency, not corruption.
+    skipped_vanished: int = 0
     root_before: int = 0
     root_after: int = 0
 
@@ -195,10 +203,23 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
     archive_index = _build_archive_index(archive_root)
 
     for path in root_files:
-        try:
-            esc = Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            logger.warning('skipping unparsable %s: %s', path.name, e)
+        # root_files was materialized above; nothing holds a lock over these
+        # reads (the per-id lock is taken later, at the move), so a concurrent
+        # actor can relocate any of them in this window.  The helper logs each
+        # outcome on its own channel — hence no local warning here.
+        # parse_errors preserves sweep's own (wider) tuple exactly: it catches
+        # bare ValueError where queue.py deliberately does not.
+        esc, reason = read_escalation_for_scan(
+            path, context='sweep',
+            parse_errors=(json.JSONDecodeError, KeyError, TypeError, ValueError),
+        )
+        if reason == 'vanished':
+            report.skipped_vanished += 1
+            continue
+        if reason != 'ok' or esc is None:
+            # 'unreadable' is routed here deliberately: today a PermissionError
+            # aborts the ENTIRE sweep, so counting it and staying loud (the
+            # helper already warned) is strictly better.
             report.skipped_unparsable += 1
             continue
 
@@ -243,11 +264,15 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
         logger.warning('skipping %s: unknown status %r', path.name, esc.status)
         report.skipped_unparsable += 1
 
+    # root_before is the glob count, so a vanished file WAS counted there but
+    # belongs to none of the other subtracted categories — omitting its term
+    # would leave this operator-facing figure over-reporting by that many.
     report.root_after = (
         report.root_before
         - report.archived
         - report.reconciled_root_wins
         - report.reconciled_archive_wins
+        - report.skipped_vanished
     )
     return report
 
@@ -322,7 +347,8 @@ def run_startup_sweep(
     )
     logger.info(
         'Startup sweep %s: archived=%d reconciled(root=%d archive=%d) '
-        'loose_reaped=%d pruned_dirs=%d orphan_locks=%d pending=%d skipped=%d; root: %d → %d',
+        'loose_reaped=%d pruned_dirs=%d orphan_locks=%d pending=%d skipped=%d '
+        'vanished=%d; root: %d → %d',
         'APPLIED' if apply else 'DRY-RUN',
         sweep_report.archived,
         sweep_report.reconciled_root_wins,
@@ -332,6 +358,7 @@ def run_startup_sweep(
         orphan_locks_reaped,
         sweep_report.untouched_pending,
         sweep_report.skipped_unparsable,
+        sweep_report.skipped_vanished,
         sweep_report.root_before,
         sweep_report.root_after,
     )
@@ -564,13 +591,15 @@ def main(argv: list[str] | None = None) -> int:
 
     report = sweep(args.queue_dir, apply=args.apply)
     logger.info(
-        'Sweep %s: archived=%d reconciled(root_wins=%d, archive_wins=%d) pending=%d skipped=%d; root: %d → %d',
+        'Sweep %s: archived=%d reconciled(root_wins=%d, archive_wins=%d) pending=%d '
+        'skipped=%d vanished=%d; root: %d → %d',
         'APPLIED' if args.apply else 'DRY-RUN',
         report.archived,
         report.reconciled_root_wins,
         report.reconciled_archive_wins,
         report.untouched_pending,
         report.skipped_unparsable,
+        report.skipped_vanished,
         report.root_before,
         report.root_after,
     )
