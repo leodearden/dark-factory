@@ -3012,6 +3012,37 @@ def test_parse_flock_gate_waits_raises_loudly_on_malformed_marker_line():
         parse_flock_gate_waits(malformed)
 
 
+def test_parse_flock_gate_waits_recovers_both_abutted_marker_records():
+    """Two marker records landing back-to-back with no separator must both
+    survive the parse.
+
+    Task 5019 step-3 -- the marker-to-marker analogue of
+    test_parse_flock_gate_waits_survives_abutting_log_line's marker-to-log
+    abutment: the same shared stderr fd that lets an unrelated co-writer's
+    text land immediately after a marker's trailing field can just as well
+    let a SECOND marker record land there instead, with no intervening
+    newline. _FLOCK_GATE_LINE_RE's unbounded ``[^\n]*`` line region greedily
+    swallows the whole physical line -- including the second marker's text
+    -- as one hit, so ``_FLOCK_GATE_RE.match()`` only ever sees (and
+    returns) the FIRST record, and the second is silently dropped because
+    finditer never revisits text its first match already consumed. Built
+    from FLOCK_GATE_LINE_FMT (not hand-copied literals) so a field rename
+    breaks this round-trip by construction.
+    """
+    abutted = (
+        f'{FLOCK_GATE_LINE_FMT % ("a", 0.5, 0.0001, True)}'
+        f'{FLOCK_GATE_LINE_FMT % ("b", 0.5, 9.9999, False)}\n'
+    )
+
+    waits = parse_flock_gate_waits(abutted)
+
+    assert len(waits) == 2
+    # The larger wait sits on the SECOND (currently-dropped) record -- if it
+    # silently vanishes, the ceiling assertions this parser feeds would be
+    # computed over a falsely-low max() instead of surfacing the corruption.
+    assert max(w.waited_secs for w in waits) == 9.9999
+
+
 # ---------------------------------------------------------------------------
 # Task 4474 -- watchdog twin of the flock-gate timing bootstrap above.  Same
 # defect class, same remedy: task 4248's verify attempt-1 observed
@@ -3327,6 +3358,33 @@ def test_parse_watchdog_gate_fire_delays_raises_loudly_on_malformed_marker_line(
 
     with pytest.raises(ValueError, match=re.escape(WATCHDOG_GATE_MARKER)):
         parse_watchdog_gate_fire_delays(malformed)
+
+
+def test_parse_watchdog_gate_fire_delays_recovers_both_abutted_marker_records():
+    """Two marker records landing back-to-back with no separator must both
+    survive the parse.
+
+    Task 5019 step-3 -- twin of
+    test_parse_flock_gate_waits_recovers_both_abutted_marker_records; see
+    that test's docstring for the mechanism
+    (_WATCHDOG_GATE_LINE_RE's unbounded ``[^\n]*`` swallows the second
+    marker's text into the first's line region, so finditer never revisits
+    it and the second record is silently dropped). Built from
+    WATCHDOG_GATE_LINE_FMT (not hand-copied literals) so a field rename
+    breaks this round-trip by construction.
+    """
+    abutted = (
+        f'{WATCHDOG_GATE_LINE_FMT % (0.6931, 0.2003)}'
+        f'{WATCHDOG_GATE_LINE_FMT % (14.9807, 5.0012)}\n'
+    )
+
+    fires = parse_watchdog_gate_fire_delays(abutted)
+
+    assert len(fires) == 2
+    # The larger fire_delay sits on the SECOND (currently-dropped) record --
+    # if it silently vanishes, the ceiling assertion this parser feeds would
+    # be computed over a falsely-low max() instead of surfacing corruption.
+    assert max(f.fire_delay_secs for f in fires) == 14.9807
 
 
 # ---------------------------------------------------------------------------
