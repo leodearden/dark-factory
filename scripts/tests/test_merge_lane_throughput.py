@@ -858,3 +858,116 @@ def test_lead_time_wait_needs_a_dequeue_after_the_joined_queue():
     assert result['wait']['n'] == 0
     # Residual needs a wait to mean "finalize + CAS", so it is not invented.
     assert result['residual']['n'] == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_verify_by_runner
+#
+# RUNNER FIXTURE, hand-computed:
+#   local:  durations 10, 20, 30, 40 min; passed T,T,T,F -> pass rate 0.75
+#           p50 25.0, p90 37.0
+#   laptop: durations 5, 15 min;          passed T,F     -> pass rate 0.5
+#           p50 10.0, p90 14.0
+#   (unknown): one row with runner=None
+# ---------------------------------------------------------------------------
+
+
+def _runner_fixture():
+    rows = [
+        _v('r1', 1, 0, 600_000, runner='local', passed=True),
+        _v('r2', 1, 1, 1_200_000, runner='local', passed=True),
+        _v('r3', 1, 2, 1_800_000, runner='local', passed=True),
+        _v('r4', 1, 3, 2_400_000, runner='local', passed=False),
+        _v('r5', 1, 4, 300_000, runner='laptop', passed=True),
+        _v('r6', 1, 5, 900_000, runner='laptop', passed=False),
+    ]
+    # _v seeds runner='local'/passed=True; the kwargs above override.
+    return [dict(r, data={**r['data']}) for r in rows]
+
+
+def test_verify_by_runner_groups_and_summarises_each_runner():
+    result = mlt.compute_verify_by_runner(_runner_fixture())
+    assert set(result['runners']) == {'local', 'laptop'}
+    local = result['runners']['local']
+    assert local['n'] == 4
+    assert local['p50'] == 25.0
+    assert local['p90'] == pytest.approx(37.0)
+    assert local['pass_rate'] == 0.75
+    laptop = result['runners']['laptop']
+    assert laptop['n'] == 2
+    assert laptop['p50'] == 10.0
+    assert laptop['p90'] == pytest.approx(14.0)
+    assert laptop['pass_rate'] == 0.5
+
+
+def test_verify_by_runner_reads_payload_duration_not_the_column():
+    rows = [dict(r, duration_ms=999_999_999) for r in _runner_fixture()]
+    result = mlt.compute_verify_by_runner(rows)
+    assert result['runners']['local']['p50'] == 25.0
+
+
+def test_verify_by_runner_omits_a_runner_with_no_rows():
+    result = mlt.compute_verify_by_runner(
+        [r for r in _runner_fixture() if r['data']['runner'] == 'local']
+    )
+    # Absent, not reported as a zero — "no laptop verify ran in this window" is
+    # not the same finding as "the laptop verified instantly, and never passed".
+    assert 'laptop' not in result['runners']
+
+
+def test_verify_by_runner_buckets_a_missing_runner_under_an_explicit_label():
+    rows = _runner_fixture()
+    rows.append(_v('r7', 1, 6, 600_000, runner=None, passed=True))
+    rows.append({'timestamp': _ts(11, 1, 7), 'task_id': 'r8',
+                 'data': {'duration_ms': 600_000, 'passed': True}})
+    result = mlt.compute_verify_by_runner(rows)
+    unknown = result['runners'][mlt.UNKNOWN]
+    assert unknown['n'] == 2
+
+
+def test_verify_by_runner_skips_a_row_with_no_usable_duration():
+    rows = [
+        _v('r1', 1, 0, 600_000, runner='local', passed=True),
+        _v('r2', 1, 1, None, runner='local', passed=True),
+        {'timestamp': _ts(11, 1, 2), 'task_id': 'r3',
+         'data': {'runner': 'local', 'passed': False}},
+    ]
+    result = mlt.compute_verify_by_runner(rows)
+    local = result['runners']['local']
+    assert local['n'] == 3            # every row counts toward the pass rate
+    assert local['n_durations'] == 1  # only one carried a usable duration
+    assert local['p50'] == 10.0
+
+
+# FORWARD COMPAT: `fallback_reason` is a task-C key. Task C is downstream of
+# this one, so on main NO merge_verify row carries it. "This window contains no
+# row with the key" must stay distinguishable from "the key was present and the
+# count was 0", or a pre-task-C window reads as evidence that busy-fallbacks
+# never happen.
+
+
+def test_verify_by_runner_reports_fallback_as_key_not_present_before_task_c():
+    result = mlt.compute_verify_by_runner(_runner_fixture())
+    assert result['fallback_key_present'] is False
+    for runner in result['runners'].values():
+        assert runner['fallback_reasons'] == {}
+
+
+def test_verify_by_runner_counts_fallback_reason_per_runner_once_task_c_lands():
+    rows = _runner_fixture()
+    rows.append(_v('r7', 1, 6, 600_000, runner='local', passed=True,
+                   fallback_reason='remote_busy'))
+    rows.append(_v('r8', 1, 7, 600_000, runner='local', passed=True,
+                   fallback_reason='remote_busy'))
+    rows.append(_v('r9', 1, 8, 600_000, runner='laptop', passed=True,
+                   fallback_reason='quarantined'))
+    result = mlt.compute_verify_by_runner(rows)
+    assert result['fallback_key_present'] is True
+    assert result['runners']['local']['fallback_reasons'] == {'remote_busy': 2}
+    assert result['runners']['laptop']['fallback_reasons'] == {'quarantined': 1}
+
+
+def test_verify_by_runner_is_empty_on_no_rows():
+    result = mlt.compute_verify_by_runner([])
+    assert result['runners'] == {}
+    assert result['fallback_key_present'] is False
