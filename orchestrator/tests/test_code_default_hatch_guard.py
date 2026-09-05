@@ -29,10 +29,14 @@ This module holds three things:
 """
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
-from _config_default_scan import iter_default_asserting_tests
+from _config_default_scan import DEFAULT_CONFIG, iter_default_asserting_tests
+
+from orchestrator.config import OrchestratorConfig
 
 
 def _write(tmp_path: Path, name: str, body: str) -> Path:
@@ -296,3 +300,115 @@ def test_no_unhatched_code_default_assertions(source):
         f'test (or to its class, if every test in the class is defaults-only), '
         f'so the assertion means what the test name already claims.'
     )
+
+
+# ---------------------------------------------------------------------------
+# CONTRACT GUARDS
+#
+# The two premises every repair in this sweep rests on.  Both are ratchets:
+# green on arrival, red only if a future change breaks the contract.  Both are
+# behavioural — nothing here asserts on docstring wording, comments or prose.
+# ---------------------------------------------------------------------------
+
+#: A probe leaf for the efficacy guard.  Its package default is read live from
+#: DEFAULT_CONFIG rather than spelled as a literal, so this guard cannot itself
+#: become the landmine it exists to prevent.
+_PROBE_SECTION = 'delivered_checks'
+_PROBE_LEAF = 'max_checks_per_tick'
+
+
+def _probe_default() -> int:
+    return getattr(getattr(DEFAULT_CONFIG, _PROBE_SECTION), _PROBE_LEAF)
+
+
+def _probe_value() -> int:
+    """Read the probe leaf off a freshly constructed bare config."""
+    return getattr(getattr(OrchestratorConfig(), _PROBE_SECTION), _PROBE_LEAF)
+
+
+@pytest.fixture
+def declared_probe_config(monkeypatch, tmp_path) -> Path:
+    """Point ORCH_CONFIG_PATH at a yaml DECLARING the probe leaf off-default.
+
+    Returns the yaml's path.  Overrides the autouse ``_isolate_orch_config``
+    (which pins the operational dark-factory-orchestrator.yaml); a test that
+    also requests ``code_default_config`` must list THIS fixture first so the
+    hatch is the last writer of the env var.
+    """
+    path = tmp_path / 'declared-orchestrator.yaml'
+    path.write_text(
+        f'{_PROBE_SECTION}:\n  {_PROBE_LEAF}: {_probe_default() + 7}\n'
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(path))
+    return path
+
+
+class TestHatchEfficacy:
+    """The hatch really does swap a DECLARED value for the package default.
+
+    This is the load-bearing premise of every repair in task 4481: the
+    ``@pytest.mark.usefixtures("code_default_config")`` sites are a repair only
+    if the fixture actually defeats the project config layer.  Nothing else in
+    the suite pins it.  Measured during planning on three probe keys —
+    operational, then declared-off-default, then hatched back to the default.
+    """
+
+    def test_a_declared_value_wins_without_the_hatch(self, declared_probe_config):
+        """Control leg — proves the probe yaml is actually being read.
+
+        Without it the hatched leg below would pass vacuously if the
+        declaration were silently ignored.
+        """
+        declared = _probe_default() + 7
+        assert declared != _probe_default()
+        assert _probe_value() == declared, (
+            f'a bare OrchestratorConfig() must read the DECLARED value '
+            f'{declared} from the project config layer; got {_probe_value()}'
+        )
+
+    def test_the_hatch_defeats_a_declared_value(
+        self, declared_probe_config, code_default_config,
+    ):
+        """The hatched leg: the same construction reads the PACKAGE default.
+
+        ``declared_probe_config`` is requested first so ``code_default_config``
+        is the last writer of ORCH_CONFIG_PATH.  That ordering is asserted
+        outright rather than assumed, so a future change in fixture
+        instantiation order fails loudly instead of making this guard vacuous.
+        """
+        in_effect = Path(os.environ['ORCH_CONFIG_PATH'])
+        assert in_effect != declared_probe_config, (
+            'fixture ordering regression: code_default_config must be the last '
+            'writer of ORCH_CONFIG_PATH, but the declared probe yaml is the '
+            'path in effect'
+        )
+        assert _probe_value() == _probe_default(), (
+            f'code_default_config must restore the PACKAGE default '
+            f'{_probe_default()}; got {_probe_value()} while '
+            f'{declared_probe_config} declared {_probe_default() + 7} — the '
+            f'hatch is not defeating the project config layer, so every '
+            f'@pytest.mark.usefixtures("code_default_config") in this suite '
+            f'is a no-op'
+        )
+
+
+class TestHatchIsNotAutouse:
+    """``code_default_config`` must stay OPT-IN.
+
+    Making it autouse is the inversion task 3886 rejected on the record: it
+    would strip the operational config from the thousands of tests that
+    legitimately read it, turning this sweep's premise into its opposite.
+    Asserted off the fixture's own marker, not off any prose.
+    """
+
+    def test_fixture_marker_is_not_autouse(self):
+        conftest = sys.modules['conftest']
+        assert Path(conftest.__file__).parent == Path(__file__).parent, (
+            f'resolved the wrong conftest: {conftest.__file__}'
+        )
+        marker = conftest.code_default_config._fixture_function_marker
+        assert marker.autouse is False, (
+            'code_default_config must never be autouse — it would re-point '
+            'ORCH_CONFIG_PATH at an absent file for the whole suite, stripping '
+            'the operational config from every test that legitimately reads it'
+        )
