@@ -514,6 +514,21 @@ class TestReexportNames:
         source = 'import a\n'
         assert metrics.reexport_names(source, path='t.py') == []
 
+    def test_a_future_import_is_not_a_reexport(self) -> None:
+        # `from __future__ import annotations` is a compiler directive, not a
+        # name a downstream module could import, and ruff's F401 -- the
+        # predicate this measure claims to agree with -- explicitly never flags
+        # it. Counting it inflated 19 of 22 baseline paths by one and made the
+        # ratchet REWARD deleting a future import, which silently changes
+        # runtime annotation semantics (esc-5021-6).
+        source = 'from __future__ import annotations\nimport os\nx = 1\n'
+        assert metrics.reexport_names(source, path='t.py') == []
+
+    def test_a_future_import_does_not_mask_a_real_shim(self) -> None:
+        # Excluding __future__ must not swallow the genuine shims beside it.
+        source = 'from __future__ import annotations\nfrom a import B\n'
+        assert metrics.reexport_names(source, path='t.py') == ['B']
+
     def test_star_import_is_not_reported_as_a_name(self) -> None:
         source = 'from a import *\n'
         assert metrics.reexport_names(source, path='t.py') == []

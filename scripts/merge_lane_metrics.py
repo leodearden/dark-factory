@@ -362,8 +362,12 @@ def reexport_names(source: str, *, path: str) -> list[str]:
     Scoped to MODULE-LEVEL ``from X import ...`` bindings: a bare ``import x``
     binds a module rather than re-exporting a name, a function-local import is
     the ``function_local_imports`` measure's business, and ``import *`` binds
-    nothing nameable. Returns the bound names (``asname or name``) sorted and
-    deduped.
+    nothing nameable. ``from __future__ import ...`` is likewise excluded: it is
+    a compiler directive, not a name a downstream module could import, and ruff
+    explicitly never flags it under F401 -- counting it would both inflate every
+    baseline and make the ratchet REWARD deleting a future import, which silently
+    changes runtime annotation semantics. Returns the bound names
+    (``asname or name``) sorted and deduped.
     """
     tree = _parse(source, path=path)
     used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
@@ -374,6 +378,8 @@ def reexport_names(source: str, *, path: str) -> list[str]:
     names: set[str] = set()
     for node in tree.body:
         if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module == '__future__':
             continue
         for alias in node.names:
             if alias.name == '*':
