@@ -36,9 +36,18 @@ class SweepReport:
     reconciled_root_wins: int = 0
     reconciled_archive_wins: int = 0
     untouched_pending: int = 0
-    # Counts files left in root for any skip reason: unparsable JSON, missing
-    # resolved_at on a resolved/dismissed file, or unknown status value.
-    # Individual cases are logged at WARNING level for operator review.
+    # Counts files left in root for any skip reason: unparsable JSON (which
+    # includes bytes that would not DECODE as UTF-8), an UNREADABLE file (any
+    # other OSError -- EACCES, EIO, fd exhaustion), missing resolved_at on a
+    # resolved/dismissed file, or unknown status value.  Individual cases are
+    # logged at WARNING level for operator review.
+    #
+    # The I/O fault is folded in here DELIBERATELY, despite the name: this
+    # counter's meaning is "left IN root for an operator-actionable reason",
+    # and a file that is present but unreadable is exactly that.  Its own
+    # WARNING says 'failed to read', not 'Failed to parse', so the log
+    # distinguishes the two even though the tally does not — do not read a
+    # nonzero count as proof of corrupt JSON.
     skipped_unparsable: int = 0
     # Counts records relocated OUT of the root by a CONCURRENT actor between
     # the glob and the read — a resolve() in another process, or a second

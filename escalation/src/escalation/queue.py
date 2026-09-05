@@ -442,9 +442,21 @@ def read_escalation_for_scan(
       this read.  Logged at DEBUG, because it is EXPECTED concurrent
       behaviour rather than corruption: the archive sweep and ``resolve()``
       both move terminal records out of the queue root as a matter of course.
-      For a ``status='pending'`` caller the record would have been filtered
-      out anyway -- an archived record is by definition no longer pending --
-      so warning here would only train operators to ignore the channel.
+      That severity is fully justified only for a ``status='pending'``
+      caller, where the record would have been filtered out anyway -- an
+      archived record is by definition no longer pending -- so warning would
+      only train operators to ignore the channel.  For an ARCHIVE-INCLUDING
+      scan it is a deliberate residual, stated plainly rather than implied:
+      ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
+      record relocated root -> ``archive/<date>/`` inside that window is in
+      NEITHER listing and drops out of the result entirely, reported only at
+      DEBUG.  Such a caller (``server.py``'s ``get_task_escalations`` when its
+      caller passes no status, and ``orchestrator.workflow``'s unfiltered
+      ``get_by_task(self.task_id)`` sweeps) can therefore receive a listing
+      that is silently short by one.  Still strictly better than the
+      pre-change crash, and bounded by the race window -- but recovering the
+      record would take a second archive glob after the root pass, which is
+      tracked as a follow-up rather than smuggled in here.
     - ``'unreadable'`` -- any OTHER ``OSError``: EACCES, EIO, fd exhaustion.
       The file IS present and something is genuinely wrong.  Logged at
       WARNING, in wording deliberately disjoint from the parse channel's so
@@ -542,7 +554,7 @@ def read_escalation_for_scan(
         # on the caller's own tuple, never hard-coded to UnicodeDecodeError:
         # that keeps the clause a no-op for queue.py's narrow tuple and a full
         # restoration of sweep.py's wider one.  See the docstring.
-        logger.warning(f'Failed to parse {path}: {e}')
+        logger.warning('%s: Failed to parse %s: %s', context, path, e)
         return None, 'unparsable'
     except OSError as e:
         logger.warning('%s: failed to read %s: %s', context, path, e)
@@ -551,10 +563,16 @@ def read_escalation_for_scan(
     try:
         return Escalation.from_json(text), 'ok'
     except parse_errors as e:
-        # Wording pinned by tests/test_queue.py::TestGetPendingParseFailure --
-        # and the helper lives in queue.py so the logger name stays
-        # 'escalation.queue' for every caller, including sweep.py's.
-        logger.warning(f'Failed to parse {path}: {e}')
+        # Capitalised 'Failed to parse' is pinned by
+        # tests/test_queue.py::TestGetPendingParseFailure -- and the helper
+        # lives in queue.py so the logger name stays 'escalation.queue' for
+        # every caller, including sweep.py's.  That single logger name is why
+        # *context* is interpolated here as well as on the other two channels:
+        # sweep()'s and reap_loose_archive_files()' parse failures used to be
+        # distinguishable by their own wording on the 'escalation.sweep'
+        # logger, and without the prefix an operator could no longer tell which
+        # scan hit the file.
+        logger.warning('%s: Failed to parse %s: %s', context, path, e)
         return None, 'unparsable'
 
 
