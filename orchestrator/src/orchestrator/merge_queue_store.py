@@ -35,7 +35,7 @@ from orchestrator.merge_types import (
 )
 
 if TYPE_CHECKING:
-    from orchestrator.config import OrchestratorConfig
+    from orchestrator.config import ModuleConfig, OrchestratorConfig
     from orchestrator.merge_queue import MergeRequest
 
 logger = logging.getLogger(__name__)
@@ -236,6 +236,50 @@ class MergeQueueStore:
 # ---------------------------------------------------------------------------
 
 
+def _reconstruct_module_configs(
+    persisted: PersistedMergeRequest,
+    config: OrchestratorConfig,
+) -> list[ModuleConfig]:
+    """Re-resolve *persisted*'s module set against the LIVE config (task 5063).
+
+    Branch precedence — ``None`` and ``[]`` are NOT interchangeable, and this
+    is the one place the difference is decided:
+
+    * ``module_prefixes == []`` (explicitly persisted empty) -> ``[]``.
+      The task genuinely had no assigned modules, so the global-fallback path
+      is the correct gate and
+      ``orchestrator.merge_queue::_merge_boundary_module_configs``' deliberate
+      no-widen policy is preserved.  Deliberately NOT widened to the registry.
+    * ``module_prefixes`` non-empty -> one ``ModuleConfig`` per prefix via
+      ``orchestrator.config::OrchestratorConfig.for_module`` (a longest-prefix
+      inward walk, so a de-registered deep prefix degrades to its parent
+      rather than vanishing), deduped by ``mc.prefix`` preserving first-seen
+      order — mirroring
+      ``orchestrator.workflow::TaskWorkflow._resolve_module_configs``, the
+      function that produced the ORIGINAL request's ``module_configs``.
+      Reproducing its grouping is what makes the reconstructed set equal the
+      original's by construction rather than by coincidence.
+    * ``module_prefixes is None`` (a record written before the field existed)
+      -> the module set is UNKNOWN and must be re-derived; see step 6.
+
+    Prefixes are re-resolved rather than persisted as objects because a
+    ``ModuleConfig`` holds live command strings, timeouts and env dicts from
+    each subproject's ``orchestrator.yaml`` — persisting those would freeze a
+    snapshot that goes stale on the next operator edit or hot reload, while
+    ``reconstruct_merge_request``'s standing contract is that the CURRENT
+    config is always correct.
+    """
+    prefixes = persisted.module_prefixes
+    if prefixes is None:
+        return []
+    seen: dict[str, ModuleConfig] = {}
+    for prefix in prefixes:
+        mc = config.for_module(prefix)
+        if mc is not None:
+            seen[mc.prefix] = mc
+    return list(seen.values())
+
+
 def reconstruct_merge_request(
     persisted: PersistedMergeRequest,
     config: OrchestratorConfig,
@@ -245,8 +289,8 @@ def reconstruct_merge_request(
     The returned request has:
     * A fresh unresolved ``asyncio.Future`` (the original died with the crash).
     * Preserved ``request_id`` and all identity fields.
-    * ``module_configs=[]`` — re-injecting the full scope is not possible
-      post-restart; [] causes the worker to run the default verification scope.
+    * ``module_configs`` re-resolved from the persisted prefixes against the
+      LIVE config by :func:`_reconstruct_module_configs` (task 5063).
     * ``pre_rebased=False`` — ensures the worker rebases before merging.
     * ``config`` from the live harness (current config is always correct).
     """
@@ -255,21 +299,30 @@ def reconstruct_merge_request(
     loop = asyncio.get_running_loop()
     future: asyncio.Future[Any] = loop.create_future()
 
-    # NOTE — module_configs divergence (suggestion 4):
-    # The original request may have been scoped to a narrower set of verification
-    # modules.  That information is not persisted (it holds live objects).  The
-    # recovered request therefore runs the *default* verification scope ([] means
-    # "all configured modules").  This is intentionally conservative — it errs on
-    # the side of verifying more than the original, never less.  Callers that care
-    # about scope parity should persist a scope hint in task_files (which IS
-    # preserved) and filter inside the verifier.
+    # module_configs (task 5063).  This block previously asserted that leaving
+    # the set EMPTY was "intentionally conservative" because "[] means all
+    # configured modules", and so "errs on the side of verifying more than the
+    # original, never less".  Both claims were FALSE, and the real behaviour is
+    # the exact inverse: `merge_queue::_merge_boundary_module_configs`
+    # deliberately never widens an empty set (task 3787 γ), so the empty set
+    # reached `verify_plan::derive_verify_plan`'s fallback branch and the
+    # recovered merge was verified FILE-SCOPED — narrower than its original, and
+    # silently so, since a file-scoped verify does run and does pass.
+    #
+    # The module PREFIXES are now persisted (`PersistedMergeRequest.
+    # module_prefixes`) and re-resolved here against the live registry, so a
+    # recovered request plans the same merge-role module set its original would
+    # have.  An EXPLICITLY empty set still reconstructs empty: that means the
+    # task genuinely had no assigned modules, for which the global-fallback
+    # gate is correct.  See `_reconstruct_module_configs` for the full branch
+    # precedence, including why `None` and `[]` are not interchangeable.
     return MergeRequest(
         task_id=persisted.task_id,
         branch=QueuedBranch.parse(persisted.branch, config.git.branch_prefix),
         worktree=Path(persisted.worktree),
         pre_rebased=False,
         task_files=persisted.task_files,
-        module_configs=[],
+        module_configs=_reconstruct_module_configs(persisted, config),
         config=config,
         result=future,
         request_id=persisted.request_id,
