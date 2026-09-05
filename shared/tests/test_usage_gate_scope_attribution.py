@@ -448,33 +448,6 @@ class TestScopedCapHitReleasesProbeSlot:
         assert acct.scope_caps == {}
         assert gate._open.is_set() is False
 
-    async def test_near_cap_via_detect_cap_hit_releases_probe(self):
-        """``_handle_near_cap_warning`` never transitions phase in EITHER scope,
-        so this arm strands an UNSCOPED near-cap too — the same invariant.
-
-        NOTE (misplaced by scope, deliberately): this is the ONLY coverage for
-        the unscoped near-cap strand, and it has nothing to do with this file's
-        scope-attribution charter (PRD task β / invariant S5). Its proper home
-        is ``test_usage_gate_exhaustive.py`` beside ``TestReleaseProbeSlot``,
-        next to the ``test_noop_after_handle_cap_detected_already_cleared``
-        idempotency test that this fix's comments cite; task 4096 held no lock
-        on that file, so the move is filed as follow-up. If this file is ever
-        narrowed or retired, MOVE this test there — do not delete it with the
-        file.
-        """
-        gate = make_gate(['a'])
-        acct, slot = await _probe_in_flight_slot(gate, scope=None)
-
-        assert slot.detect_cap_hit(NEAR_CAP_STDERR, '') is True
-
-        assert acct.near_cap is True  # annotation kept (clear_near_cap=False)
-        assert acct.phase == AccountPhase.AVAILABLE
-        assert gate._open.is_set() is True
-
-        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
-        assert lease is not None
-        assert lease.name == 'a'
-
     # --- through the real invoke_slot() CM, not a hand-built InvokeSlot ----
     #
     # Every comment justifying this fix reasons about the interaction between
