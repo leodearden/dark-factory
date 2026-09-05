@@ -777,6 +777,49 @@ class TestReapLooseArchiveFiles:
         assert count == 0
 
 
+    def test_reap_survives_a_loose_file_relocated_mid_scan(self, tmp_path: Path):
+        """A concurrent sweep can relocate a loose file between this scan's
+        glob and its read — neither actor holds a lock over that window, since
+        _relocate_terminal takes the per-id lock only around the move itself.
+
+        RED on main: this loop catches only
+        (JSONDecodeError, KeyError, TypeError, ValueError), so the
+        FileNotFoundError propagates and the whole reap pass aborts.
+        """
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir(parents=True)
+        for esc_id in ('esc-1-1', 'esc-2-1'):
+            esc = Escalation(
+                id=esc_id,
+                task_id='1',
+                agent_role='test',
+                severity='info',
+                category='cleanup_needed',
+                summary='loose test',
+                status='resolved',
+                resolved_at='2026-05-20T10:00:00+00:00',
+            )
+            (archive_root / f'{esc_id}.json').write_text(esc.to_json())
+
+        doomed = archive_root / 'esc-2-1.json'
+        flaky = _relocating_read_text(doomed, archive_root / '2026-05-20')
+
+        with patch.object(Path, 'read_text', flaky):
+            count = sweep.reap_loose_archive_files(tmp_path, apply=True)
+
+        # (b) The tally counts relocations this pass actually performed; the
+        # one a concurrent sweep already moved is neither counted nor re-moved.
+        assert count == 1, f'expected 1 relocation performed by this pass; got {count}'
+
+        # (c) Both records end up filed, and nothing is left loose.
+        assert (archive_root / '2026-05-20' / 'esc-1-1.json').exists()
+        assert (archive_root / '2026-05-20' / 'esc-2-1.json').exists()
+        assert not list(archive_root.glob('esc-*.json')), (
+            f'no loose file may remain; found '
+            f'{[p.name for p in archive_root.glob("esc-*.json")]}'
+        )
+
+
 class TestSweepRelocationLock:
     """sweep.sweep relocations must take the per-id sidecar lock."""
 
