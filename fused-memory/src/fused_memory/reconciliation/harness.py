@@ -3560,6 +3560,15 @@ class ReconciliationHarness:
                 await asyncio.shield(
                     self.journal.update_run_stage_reports(run_id, run.stage_reports)
                 )
+                # Known residual (task 4431): asyncio.shield protects the
+                # WRITE, not this awaiting frame — a second cancellation
+                # still raises CancelledError HERE, so the gc_run_config_dir
+                # block below remains unreachable on that path, exactly as
+                # before this fix (not a regression). Deliberately not
+                # addressed here: making it reachable would need a
+                # BaseException swallow with cancellation-semantics
+                # consequences of its own (design decision 3) — left for a
+                # follow-up task.
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
                 # exit path (success/failure) EXCEPT an interrupted (resumable) run —
                 # its transcript must survive on disk for the startup --resume pass.
@@ -3930,7 +3939,10 @@ class ReconciliationHarness:
         whatever exception is already propagating and skip that persistence
         call, so the body swallows ``BaseException`` and each write itself
         runs under ``asyncio.shield`` to survive a second cancellation
-        arriving mid-write.
+        arriving mid-write. ``update_run_stage_reports`` itself is now also
+        shielded (task 4431), so the persisted copy this guarantee protects
+        actually reaches the DB instead of being discarded by a second
+        cancellation landing at that next, previously-unshielded await.
         """
         s1_key = StageId.memory_consolidator.value
         s1_report = run.stage_reports.get(s1_key)
@@ -3980,7 +3992,8 @@ class ReconciliationHarness:
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
             # narrow, bounded best-effort upsert, and letting any of those
             # interrupt the finally risks skipping the update_run_stage_reports
-            # call that follows (see docstring).
+            # call that follows — itself now shielded against a second
+            # cancellation too (task 4431; see docstring).
             logger.warning(
                 'reconciliation.stage1_cycle_summary_backstop_failed',
                 exc_info=True,
@@ -4109,7 +4122,10 @@ class ReconciliationHarness:
         exception is already propagating and skip that persistence call, so
         the body swallows ``BaseException`` and each write itself runs under
         ``asyncio.shield`` to survive a second cancellation arriving
-        mid-write.
+        mid-write. ``update_run_stage_reports`` itself is now also shielded
+        (task 4431), so the persisted copy this guarantee protects actually
+        reaches the DB instead of being discarded by a second cancellation
+        landing at that next, previously-unshielded await.
         """
         s2_key = StageId.task_knowledge_sync.value
         s2_report = run.stage_reports.get(s2_key)
@@ -4168,7 +4184,8 @@ class ReconciliationHarness:
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
             # narrow, bounded best-effort upsert, and letting any of those
             # interrupt the finally risks skipping the update_run_stage_reports
-            # call that follows (see docstring).
+            # call that follows — itself now shielded against a second
+            # cancellation too (task 4431; see docstring).
             logger.warning(
                 'reconciliation.stage2_cycle_summary_backstop_failed',
                 exc_info=True,
@@ -5484,6 +5501,14 @@ class ReconciliationHarness:
             await asyncio.shield(
                 self.journal.update_run_stage_reports(run_id, run.stage_reports)
             )
+            # Known residual (task 4431): asyncio.shield protects the WRITE,
+            # not this awaiting frame — a second cancellation still raises
+            # CancelledError HERE, so the gc_run_config_dir block below
+            # remains unreachable on that path, exactly as before this fix
+            # (not a regression). Deliberately not addressed here: making it
+            # reachable would need a BaseException swallow with
+            # cancellation-semantics consequences of its own (design
+            # decision 3) — left for a follow-up task.
             # Task 2744: GC this remediation run's per-run recon CLI config dir on
             # every exit path. Defensive — never mask the run's terminal outcome.
             try:
