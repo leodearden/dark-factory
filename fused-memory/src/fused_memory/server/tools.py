@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
+from shared.task_statuses import ACTIVE
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.backends.mem0_client import (
@@ -50,6 +51,7 @@ from fused_memory.middleware.operational_suggestion_guard import (
     operational_suggestion_warning,
 )
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
+from fused_memory.middleware.recurring_gate_guard import recurring_gate_guard_error
 from fused_memory.middleware.routing_intent_guard import (
     routing_intent_enforced,
     routing_intent_finding,
@@ -8728,6 +8730,57 @@ def create_mcp_server(
         if _exec_err is not None:
             return _exec_err
         metadata = inject_execution_class(metadata)
+
+        # Recurring-human-gate dedupe guard (task 3588) — refuse to mint a
+        # SECOND open human gate for a subject that already has one.
+        #
+        # WHY HERE. Placed after inject_execution_class and BEFORE
+        # inject_operational_routing so it reads the caller's DECLARED
+        # (execution_class, operational_mode) rather than the normalised
+        # form — that is what makes the predicate correspond to what the
+        # recon agent actually wrote, and what lets the rejection message
+        # explain itself. One placement covers the normal, planning_mode and
+        # every MCP-tool path, because the branch split happens INSIDE
+        # task_interceptor.submit_task below — the same argument the
+        # operational-routing comment records for itself.
+        #
+        # WHY RECON-SCOPED. Enforcement fires only for
+        # agent_id.startswith('recon-stage-'), mirroring execution_class_error's
+        # exemption. That is also why the corpus read below costs nothing on
+        # the general submit_task path: the guard's own cheap gates
+        # (recon-scoped, is-a-gate, has-a-subject) all run before the lambda
+        # is ever awaited, so an exempt caller pays one string startswith.
+        #
+        # statuses=sorted(ACTIVE) pushes the non-terminal filter into the
+        # backend's WHERE status IN (...) rather than fetching every task and
+        # filtering in Python — this runs on a write path. A done/cancelled
+        # carrier deliberately does NOT block: the condition genuinely
+        # recurred after closure, and a fresh gate is the right outcome.
+        #
+        # FAILS OPEN. A raising lookup logs a WARNING and lets the
+        # submission through (see the guard's docstring): failing closed on a
+        # transient blip would block every recon human gate including
+        # genuinely novel ones, while failing open costs at most one
+        # duplicate — the bounded cost this guard is reducing.
+        #
+        # NAMED RESIDUAL. This is a CROSS-CYCLE dedupe keyed on committed
+        # task rows. In the non-planning_mode path submit_task returns only
+        # {'ticket': ...} and the row does not exist until the curator
+        # resolves it, so a second submission whose predecessor is still an
+        # unresolved TICKET has nothing to match against. Out of scope by
+        # decision: the measured failure mode is one carrier per CYCLE
+        # (5902 -> 5916 -> 5929 for subject 5879), hours-to-days apart, by
+        # which time the predecessor is a committed row this guard sees.
+        _gate_err = await recurring_gate_guard_error(
+            metadata,
+            agent_id,
+            project_root,
+            fetch_tasks=lambda: task_interceptor.get_tasks(
+                project_root, tag, statuses=sorted(ACTIVE),
+            ),
+        )
+        if _gate_err is not None:
+            return _gate_err
 
         # Operational-routing boundary coercion (task 2802/β) — the
         # AUTHORITATIVE operational→deterministic coercion, an unbypassable
