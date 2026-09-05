@@ -187,6 +187,14 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 and (f) the cold fall-through. Do not infer a measurement floor
 #                 here that does not exist.
 #
+#   shared        W was RE-MEASURED by task 5131 under a real NINE-WAY gather
+#                 at base 1b3c50e98f, so unlike the other five entries here it
+#                 is NOT from the 5a7770d239 epoch. Collection grew 3243 ->
+#                 4802 (+49%) over that epoch, but the worst-run wall clock
+#                 grew only ~35.5% (219.08s -> 296.88s) — LESS than the count
+#                 ratio predicts. Do NOT scale this figure by a test-count
+#                 ratio next time it goes stale — RE-MEASURE instead.
+#
 # ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE. The concurrent arm of the sweep
 # was a 6-WAY wave (the six modules this task closed). Production's
 # ``verify.run_full_verification`` gathers over EVERY registered module config —
@@ -194,7 +202,7 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # wave is a LOWER BOUND on the fully-concurrent cost, not a reproduction of it.
 # See the same note in each yaml's provenance block for what bounds the gap.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
-    'shared': 219.08,
+    'shared': 296.88,
     'escalation': 354.56,
     'fused-memory': 439.80,
     'dashboard': 653.54,
