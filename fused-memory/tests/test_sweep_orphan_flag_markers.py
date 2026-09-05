@@ -693,6 +693,71 @@ class TestFindTerminalTaskMarkers:
 
 
 # ===========================================================================
+# Tests: find_protected_markers (task 4435)
+# ===========================================================================
+
+class TestFindProtectedMarkers:
+    """Tests for the pure function find_protected_markers(members).
+
+    The script's half of the task-3041 protected-mirror guard: a thin,
+    order-preserving projection over
+    ``mem0_tombstone.is_protected_mirror_record``. A member it returns must
+    NEVER be deleted by this sweep.
+    """
+
+    def test_cycle_summary_mirror_is_returned(self):
+        """The kind=='cycle_summary' discriminator alone suffices."""
+        member = _mirror('m1')
+        result = _mod.find_protected_markers([member])
+        assert result == [member], f'Expected [m1], got: {result!r}'
+
+    def test_ledger_stamp_is_returned(self):
+        """The record_type=='ledger_stamp' discriminator alone suffices —
+        the predicate is an OR over two INDEPENDENT discriminators, not an
+        AND, so a record carrying only the second is protected too."""
+        member = _ledger_stamp('l1')
+        result = _mod.find_protected_markers([member])
+        assert result == [member], f'Expected [l1], got: {result!r}'
+
+    def test_ordinary_marker_shapes_are_never_returned(self):
+        """A well-formed marker, a kind-orphan and a taskless marker are all
+        sweepable — the guard must not over-protect the sweep's own targets."""
+        members = [_member('keep'), _orphan('o1'), _taskless('t1')]
+        result = _mod.find_protected_markers(members)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_preserves_order_and_identity(self):
+        """Returned dicts are the same objects, in input order, and only the
+        protected subset comes back from a mixed input."""
+        mirror = _mirror('m1')
+        stamp = _ledger_stamp('l1')
+        members = [_orphan('o1'), mirror, _member('keep'), stamp]
+        result = _mod.find_protected_markers(members)
+        assert result == [mirror, stamp], f'Expected [m1, l1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
+
+    def test_empty_input_returns_empty(self):
+        """Empty input list returns empty list."""
+        assert _mod.find_protected_markers([]) == []
+
+    @pytest.mark.parametrize('metadata', [None, ['not', 'a', 'dict'], 'string'])
+    def test_non_dict_metadata_is_not_protected_and_does_not_raise(self, metadata):
+        """A weird metadata payload is neither protected nor a crash.
+
+        The sweep runs against whatever Mem0 hands back, so the guard that
+        exists to make it SAFER must never be the thing that kills it.
+        """
+        member = {'id': 'weird', 'created_at': None, 'metadata': metadata}
+        assert _mod.find_protected_markers([member]) == []
+
+    def test_missing_metadata_key_is_not_protected_and_does_not_raise(self):
+        """A member with no 'metadata' key at all is handled, not raised on."""
+        member = {'id': 'nometa', 'created_at': None}
+        assert _mod.find_protected_markers([member]) == []
+
+
+# ===========================================================================
 # Tests: delete_orphan_markers
 # ===========================================================================
 
