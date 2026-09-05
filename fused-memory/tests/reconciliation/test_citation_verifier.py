@@ -1883,9 +1883,13 @@ class TestScanProseCitationsSafety:
         real_finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
         service = _prose_service(record=None, tombstone=None)
 
-        stats = await scan_prose_citations(
-            [None, 'a bare string', 42, real_finding], service, 'test_project',
-        )
+        # These entries intentionally violate the declared ``list[dict[str, Any]]``.
+        # That violation is precisely what the runtime isinstance skip exists to
+        # survive, so the OFF-CONTRACT cases are hoisted into an ``Any``-annotated
+        # local rather than the production signature being widened to admit them.
+        findings: list[Any] = [None, 'a bare string', 42, real_finding]
+
+        stats = await scan_prose_citations(findings, service, 'test_project')
 
         assert stats['stage1_prose_phantom_citations'] == 1
         assert stats['stage1_prose_citations_verified'] == 0
