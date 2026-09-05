@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _scan_race_helpers import relocating_read_text, unreadable_read_text
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
@@ -1793,25 +1794,6 @@ class TestScanSurvivesRecordArchivedMidScan:
     so archiving an unrelated task's record kills a caller's query.
     """
 
-    @staticmethod
-    def _relocating_read_text(doomed: Path, archive_dir: Path):
-        """Interpose ``Path.read_text`` to really relocate *doomed* mid-scan.
-
-        Not a mocked exception: the file is genuinely ``os.replace``d into
-        *archive_dir* and then the original ``read_text`` is called through,
-        so the ``FileNotFoundError`` is raised by the filesystem exactly as it
-        is in the live incident.
-        """
-        original = Path.read_text
-
-        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                archive_dir.mkdir(parents=True, exist_ok=True)
-                os.replace(str(doomed), str(archive_dir / doomed.name))
-            return original(self, *args, **kwargs)
-
-        return flaky
-
     def test_get_by_task_survives_unrelated_record_archived_mid_scan(
         self, tmp_path: Path, caplog,
     ):
@@ -1826,7 +1808,7 @@ class TestScanSurvivesRecordArchivedMidScan:
 
         doomed = queue.queue_dir / 'esc-3517-5.json'
         archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
-        flaky = self._relocating_read_text(doomed, archive_dir)
+        flaky = relocating_read_text(doomed, archive_dir)
 
         with (
             caplog.at_level(logging.DEBUG, logger='escalation.queue'),
@@ -1880,13 +1862,7 @@ class TestScanSurvivesRecordArchivedMidScan:
         queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
 
         doomed = queue.queue_dir / 'esc-4176-2.json'
-        original = Path.read_text
-
-        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed:
-                # Left on disk, unlike the relocation case above.
-                raise PermissionError(13, 'Permission denied', str(doomed))
-            return original(self, *args, **kwargs)
+        flaky = unreadable_read_text(doomed)
 
         with (
             caplog.at_level(logging.DEBUG, logger='escalation.queue'),
@@ -1931,7 +1907,7 @@ class TestScanSurvivesRecordArchivedMidScan:
 
         doomed = queue.queue_dir / 'esc-3517-5.json'
         archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
-        flaky = self._relocating_read_text(doomed, archive_dir)
+        flaky = relocating_read_text(doomed, archive_dir)
 
         with patch.object(Path, 'read_text', flaky):
             results = queue.get_pending()
@@ -1966,7 +1942,7 @@ class TestScanSurvivesRecordArchivedMidScan:
 
         doomed = queue.queue_dir / 'esc-4176-2.json'
         archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
-        flaky = self._relocating_read_text(doomed, archive_dir)
+        flaky = relocating_read_text(doomed, archive_dir)
 
         with patch.object(Path, 'read_text', flaky):
             found = queue.find_terminal_by_citation('4176', category, citation)

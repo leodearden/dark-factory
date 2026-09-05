@@ -7,8 +7,9 @@ import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
+
+from _scan_race_helpers import relocating_read_text
 
 from escalation import sweep
 from escalation.models import Escalation
@@ -596,28 +597,6 @@ class TestRunStartupSweep:
         ), f'Expected INFO report line; got: {[r.getMessage() for r in caplog.records]}'
 
 
-def _relocating_read_text(doomed: Path, dest_dir: Path):
-    """Interpose ``Path.read_text`` to really relocate *doomed* mid-scan.
-
-    Not a mocked exception: the file is genuinely ``os.replace``d into
-    *dest_dir* and the original ``read_text`` is then called through, so the
-    ``FileNotFoundError`` comes from the filesystem exactly as it does when a
-    concurrent ``resolve()`` — or a second startup sweep during a fleet
-    redeploy — moves a record between the glob and the read.  Neither actor
-    holds a lock over that window: ``_relocate_terminal`` takes the per-id
-    lock only around the move itself.
-    """
-    original = Path.read_text
-
-    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
-        if self == doomed and doomed.exists():
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            os.replace(str(doomed), str(dest_dir / doomed.name))
-        return original(self, *args, **kwargs)
-
-    return flaky
-
-
 class TestSweepSurvivesRecordVanishedMidScan:
     """One record vanishing must not abort a whole sweep pass — and must be
     accounted for HONESTLY rather than folded into an existing counter."""
@@ -631,7 +610,7 @@ class TestSweepSurvivesRecordVanishedMidScan:
             tmp_path, 'esc-3-1', 'resolved', resolved_at='2026-05-20T10:00:00+00:00',
         )
 
-        flaky = _relocating_read_text(doomed, tmp_path / 'archive' / '2026-09-04')
+        flaky = relocating_read_text(doomed, tmp_path / 'archive' / '2026-09-04')
 
         with patch.object(Path, 'read_text', flaky):
             report = sweep.sweep(tmp_path, apply=True)
@@ -870,7 +849,7 @@ class TestReapLooseArchiveFiles:
             (archive_root / f'{esc_id}.json').write_text(esc.to_json())
 
         doomed = archive_root / 'esc-2-1.json'
-        flaky = _relocating_read_text(doomed, archive_root / '2026-05-20')
+        flaky = relocating_read_text(doomed, archive_root / '2026-05-20')
 
         with patch.object(Path, 'read_text', flaky):
             count = sweep.reap_loose_archive_files(tmp_path, apply=True)

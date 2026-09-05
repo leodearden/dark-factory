@@ -29,6 +29,22 @@ from escalation.queue import SEQ_COUNTER_SUFFIX, escalation_id_lock, read_escala
 
 logger = logging.getLogger(__name__)
 
+#: Parse-failure exceptions caught by ``sweep.py``'s two scan sites, passed to
+#: ``read_escalation_for_scan``.  Deliberately WIDER than queue.py's
+#: ``_SCAN_PARSE_ERRORS``: the bare ``ValueError`` is what makes a sweep
+#: tolerate a validation failure from ``Escalation.from_json`` — and, since
+#: ``UnicodeDecodeError`` subclasses ``ValueError``, an undecodable file too —
+#: by skipping that one record instead of aborting the whole pass.  Named once
+#: rather than spelled out at each call site: the two modules' tuples must stay
+#: independently controllable, which is the entire reason ``parse_errors`` is a
+#: parameter, and a literal repeated at both sites invites a future widening
+#: applied to one and not the other — splitting sweep()'s behaviour from
+#: reap_loose_archive_files()' silently, the exact drift the parameter exists
+#: to prevent.
+_SWEEP_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    json.JSONDecodeError, KeyError, TypeError, ValueError,
+)
+
 
 @dataclass
 class SweepReport:
@@ -219,8 +235,7 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
         # parse_errors preserves sweep's own (wider) tuple exactly: it catches
         # bare ValueError where queue.py deliberately does not.
         esc, reason = read_escalation_for_scan(
-            path, context='sweep',
-            parse_errors=(json.JSONDecodeError, KeyError, TypeError, ValueError),
+            path, context='sweep', parse_errors=_SWEEP_PARSE_ERRORS,
         )
         if reason == 'vanished':
             report.skipped_vanished += 1
@@ -419,8 +434,7 @@ def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
         # relocations THIS pass performed, and one already done by someone else
         # simply is not among them, so the tally stays truthful as-is.
         esc, reason = read_escalation_for_scan(
-            path, context='reap_loose',
-            parse_errors=(json.JSONDecodeError, KeyError, TypeError, ValueError),
+            path, context='reap_loose', parse_errors=_SWEEP_PARSE_ERRORS,
         )
         if reason != 'ok' or esc is None:
             continue
