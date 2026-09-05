@@ -282,9 +282,11 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
             report.skipped_vanished += 1
             continue
         if reason != 'ok' or esc is None:
-            # 'unreadable' is routed here deliberately: today a PermissionError
-            # aborts the ENTIRE sweep, so counting it and staying loud (the
-            # helper already warned) is strictly better.
+            # 'unreadable' is routed here deliberately: before this guard a
+            # PermissionError aborted the ENTIRE sweep, so counting it and
+            # staying loud (the helper already warned) is strictly better.
+            # Pinned by TestSweepSafety::
+            # test_unreadable_file_is_counted_loud_and_does_not_abort_the_pass.
             report.skipped_unparsable += 1
             continue
 
@@ -329,7 +331,9 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
                     continue
 
             if existing_archive is None or archive_esc is None:
-                # No archive copy: move to dated subdir via shared helper.
+                # No archive copy — or it vanished under us just above, which
+                # amounts to the same thing: move to the dated subdir via the
+                # shared helper.
                 # The helper re-checks for collisions inside the per-id lock so
                 # a file that appeared between index-build and lock-acquire is
                 # detected atomically (TOCTOU safe).
