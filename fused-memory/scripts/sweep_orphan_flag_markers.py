@@ -191,6 +191,7 @@ from functools import partial
 from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+from fused_memory.reconciliation.mem0_tombstone import is_protected_mirror_record
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
@@ -504,6 +505,51 @@ def find_terminal_task_markers(
             if all(part in terminal_task_ids for part in components):
                 result.append(m)
     return result
+
+
+def find_protected_markers(members: list[dict]) -> list[dict]:
+    """Return members this sweep must NEVER delete (task 3041/4435).
+
+    A member returned here is a protected ``cycle_summary`` ledger MIRROR —
+    the durable audit anchor a later auditor resolves a memory id against —
+    not a marker. Deleting one is unrecoverable (see the module docstring's
+    "Deletion vs backfill": deletion here is permanent, not self-healing),
+    so it is refused unconditionally, however it reached the delete set.
+
+    Restores parity with the in-cycle collector
+    ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool``, which applies
+    the same guard before its own eligibility test.
+
+    The two discriminators are single-sourced in
+    ``fused_memory.reconciliation.mem0_tombstone`` and deliberately IMPORTED
+    rather than copied here. A local copy would be exactly the lockstep
+    literal duplication INV-5 forbids, and ``mem0_tombstone``'s own module
+    docstring records that private copies "kept in sync BY CONVENTION"
+    already produced this half-disabled-guard failure once: an edit to
+    either side would silently protect one pool and not the other. (This is
+    a deliberate exception to the by-value mirroring used for
+    ``FLAG_FOR_STAGE2_FILTERS`` above: that rationale is about staying
+    decoupled from the heavy reconciliation-STAGE module, and
+    ``mem0_tombstone`` is a near-leaf that pulls in neither
+    ``fused_memory.services.*`` nor ``task_knowledge_sync``.)
+
+    ``is_protected_mirror_record`` is itself fully defensive — ``None``, a
+    non-dict, and unexpected value types all return ``False`` without
+    raising — so a weird Mem0 payload can never crash the sweep from inside
+    the guard that exists to make it safer.
+
+    Pure, sync, no I/O.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+
+    Returns:
+        Subset of *members* whose metadata declares ``kind ==
+        'cycle_summary'`` OR ``record_type == 'ledger_stamp'``. Order is
+        preserved. An unprotected input returns ``[]``.
+    """
+    return [m for m in members if is_protected_mirror_record(m.get('metadata'))]
 
 
 # ---------------------------------------------------------------------------
