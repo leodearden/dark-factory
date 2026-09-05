@@ -5841,7 +5841,9 @@ class TestDedupFlagsCrossProjectDiscovery:
 
         own = {'project_id': self.PROJECT, 'task_id': '601', 'title': 'The subject'}
         flag = self._flag(cited_tasks=[own])
-        tid, ftype = compute_flag_signature(flag)
+        sig = compute_flag_signature(flag)
+        assert sig is not None, f'the flag must have a signature; got {flag!r}'
+        tid, ftype = sig
         assert tid == '598,601', (
             'fixture drift: this flag must key to a CITATION-FOLDED signature '
             f'— that is the branch under test; got {tid!r}'
@@ -5898,7 +5900,9 @@ class TestDedupFlagsCrossProjectDiscovery:
 
         stale = {'project_id': 'dark_factory', 'task_id': '404', 'title': 'Gone'}
         flag = self._flag(cited_tasks=[stale])
-        tid, ftype = compute_flag_signature(flag)
+        sig = compute_flag_signature(flag)
+        assert sig is not None, f'the flag must have a signature; got {flag!r}'
+        tid, ftype = sig
         await _seed_marker(
             ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
             run_id='r1',
