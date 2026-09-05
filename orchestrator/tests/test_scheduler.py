@@ -2160,6 +2160,7 @@ class TestRequeueCooldown:
 class TestDispatchCooldownConfig:
     """Validate the dispatch_cooldown_secs config field defaults and constraints."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_dispatch_cooldown_secs(self):
         """OrchestratorConfig() defaults dispatch_cooldown_secs to 1800.0."""
         config = OrchestratorConfig()
@@ -6019,6 +6020,7 @@ class TestFairnessConfigSchema:
             'scheduler_v2 field must be removed from FairnessConfig'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_skip_threshold_is_per_tier_dict(self):
         """Default skip_threshold is a per-tier dict."""
         cfg = OrchestratorConfig()

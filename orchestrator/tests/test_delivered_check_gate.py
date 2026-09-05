@@ -1033,6 +1033,7 @@ class TestDeliveredChecksConfig:
     sub-model.
     """
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_max_checks_per_tick_is_50(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.max_checks_per_tick == 50
@@ -1052,12 +1053,14 @@ class TestDeliveredChecksConfig:
 
     # --- task 2583 (epsilon) knobs: enabled / grace_cycles / check_timeout_secs -
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_enabled_is_true(self):
         """The gate is inert without metadata.delivered_checks on any dep, so
         it defaults ON — an operator must opt OUT explicitly."""
         config = OrchestratorConfig()
         assert config.delivered_checks.enabled is True
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_grace_cycles_is_3(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.grace_cycles == 3
@@ -1070,6 +1073,7 @@ class TestDeliveredChecksConfig:
         with pytest.raises(ValidationError):
             DeliveredChecksConfig(grace_cycles=-1)
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_check_timeout_secs_is_120(self):
         config = OrchestratorConfig()
         assert config.delivered_checks.check_timeout_secs == 120
