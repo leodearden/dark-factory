@@ -373,14 +373,25 @@ class TestFileSizeMeasures:
             measures.lines = 99  # type: ignore[misc]
 
     def test_real_merge_queue_line_count_anchor(self) -> None:
-        # Anti-vacuity anchor: the PRD Background table's 21,550. Not a
-        # definition of the measure -- if this drifts, merge_queue.py changed
-        # (which the ratchet itself will report against the baseline).
+        # Anti-vacuity anchor: proves the measure is wired to the REAL tree
+        # and returns a real number. It deliberately does NOT pin the tree's
+        # current state -- shrinking this file is the whole point of
+        # plans/merge-lane-quality-prd.md, so the floor sits far below the
+        # 21,550 measured on the introducing commit (the PRD Background
+        # table's figure).
+        #
+        # A FALL is not a ratchet violation: the ratchet reports RISES only and
+        # stays green. What reports a fall is
+        # test_baseline_matches_a_fresh_measurement, which asserts the committed
+        # baseline is byte-identical to a fresh measurement -- and its remedy,
+        # regenerating the baseline with --write-baseline in the same commit,
+        # actually applies. That is where exactness lives; here, only the
+        # anti-vacuity property.
         source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py').read_text(
             encoding='utf-8'
         )
         measures = metrics.file_size_measures(source, path='merge_queue.py')
-        assert measures.lines == 21550
+        assert measures.lines >= 10000
         assert measures.prose_lines > 0
 
 
@@ -620,16 +631,31 @@ class TestCognitiveComplexity:
         assert 'broken.py' in str(excinfo.value)
 
     def test_merge_queue_anchor_reproduces_the_prd_background_numbers(self) -> None:
-        # Anti-vacuity anchor. These are the exact figures the PRD Background
-        # table quotes. complexipy majors 3/4/5 compute DIFFERENT numbers for
-        # this same file (2031 / 2124 / 2092), so a silent algorithm change in a
-        # future release is caught here by a named failure rather than by every
-        # baseline number quietly shifting underneath the ratchet.
+        # Anti-vacuity anchor: complexipy really ran over the real file and
+        # attributed scores to real qualnames. Measured on the introducing
+        # commit, and the exact figures the PRD Background table quotes:
+        # _verifier_loop 245, stop 109, file total 2133.
+        #
+        # FLOORS, not equalities. Lowering exactly these numbers is what the
+        # gamma/theta-pi tasks in plans/merge-lane-quality-prd.md exist to do,
+        # and a fall is permitted by the ratchet contract in this module's
+        # docstring. Exactness is preserved by
+        # test_baseline_matches_a_fresh_measurement (byte-identity against the
+        # committed baseline), whose --write-baseline remedy actually applies.
+        #
+        # A complexipy algorithm change would also shift these (this file
+        # measures 2031 at 3.0.0, 2124 at 4.0.0, 2092 at 5.0.0, and 2133 at both
+        # 6.x and 7.0.1). Catching THAT here would be a redundant backstop, so
+        # these floors are deliberately not sized for it: COMPLEXIPY_REQUIRED
+        # ('>=6.2,<7'), require_complexipy(),
+        # test_pyproject_pin_matches_the_scripts_requirement and the
+        # comparator's params.complexipy_version check already hard-block every
+        # other major with a named failure.
         target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
         scores = metrics.cognitive_complexity(target)
-        assert scores['SpeculativeMergeWorker::_verifier_loop'] == 245
-        assert scores['SpeculativeMergeWorker::stop'] == 109
-        assert metrics.file_cognitive_total(target) == 2133
+        assert scores['SpeculativeMergeWorker::_verifier_loop'] >= 100
+        assert scores['SpeculativeMergeWorker::stop'] >= 50
+        assert metrics.file_cognitive_total(target) >= 1000
 
 
 class TestComplexipyVersionContract:
@@ -1126,12 +1152,18 @@ class TestBuildReport:
             'function_local_imports',
             'reexport_names',
         }
-        assert entry['lines'] == 21550
-        assert entry['cognitive'] == 2133
+        # Floors, not equalities -- same reasoning as
+        # test_real_merge_queue_line_count_anchor, on the same two numbers
+        # (21,550 lines / cognitive 2,133 when this landed). Byte-exactness is
+        # asserted by test_baseline_matches_a_fresh_measurement.
+        assert entry['lines'] >= 10000
+        assert entry['cognitive'] >= 1000
 
     def test_functions_is_a_flat_path_qualname_map(self, report: dict) -> None:
         key = 'orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_verifier_loop'
-        assert report['functions'][key] == 245
+        # Floor, not equality (measured 245): a fall is permitted by the
+        # ratchet contract -- see test_real_merge_queue_line_count_anchor.
+        assert report['functions'][key] >= 100
         assert all(isinstance(value, int) for value in report['functions'].values())
 
     def test_tests_entries_carry_both_measures_and_only_lane_files(
