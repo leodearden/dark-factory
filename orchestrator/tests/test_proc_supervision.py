@@ -104,6 +104,33 @@ def read_escalations(
     )
 
 
+def _build_cross_unit_verify_plan(*, on_failure_escalation):
+    """Build the shared cross-unit ``RestartPlan`` shape used across
+    RESTART_FAILED/VERIFY_FAILED coverage: ``script=/proj/scripts/deploy.sh``,
+    ``target_unit='fused-memory.service'``, ``own_unit='orch.service'``,
+    ``FreshPidVerify(baseline_active_enter_monotonic=1000,
+    baseline_main_pid=42, inspect_timeout_secs=10.0)``. Parametrized only on
+    ``on_failure_escalation`` so ``TestCrossUnitBlockingVerifyFail`` and
+    ``TestUnconfiguredEscalationWarningIsPlanScoped`` share one fixture
+    instead of hand-duplicating it (task 4047 amendment).
+    """
+    from orchestrator.proc_supervision import FreshPidVerify, RestartPlan
+
+    return RestartPlan(
+        script=Path('/proj/scripts/deploy.sh'),
+        args=[],
+        cwd=Path('/proj'),
+        target_unit='fused-memory.service',
+        own_unit='orch.service',
+        on_failure_escalation=on_failure_escalation,
+        verify=FreshPidVerify(
+            baseline_active_enter_monotonic=1000,
+            baseline_main_pid=42,
+            inspect_timeout_secs=10.0,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-1: RED — types + construction
 # ---------------------------------------------------------------------------
@@ -753,31 +780,14 @@ class TestCrossUnitBlockingVerifyFail:
         inspector_called: bool,
         expected_disposition,
     ) -> None:
-        from orchestrator.proc_supervision import (
-            EscalationSpec,
-            FreshPidVerify,
-            RestartDisposition,
-            RestartPlan,
-        )
+        from orchestrator.proc_supervision import EscalationSpec, RestartDisposition
 
         spec = EscalationSpec(
             queue_dir=str(tmp_queue_dir),
             task_id=task_id,
             summary='Cross-unit deploy verify failed',
         )
-        plan = RestartPlan(
-            script=Path('/proj/scripts/deploy.sh'),
-            args=[],
-            cwd=Path('/proj'),
-            target_unit='fused-memory.service',
-            own_unit='orch.service',
-            on_failure_escalation=spec,
-            verify=FreshPidVerify(
-                baseline_active_enter_monotonic=1000,
-                baseline_main_pid=42,
-                inspect_timeout_secs=10.0,
-            ),
-        )
+        plan = _build_cross_unit_verify_plan(on_failure_escalation=spec)
 
         outcome = await plan.execute(runner=runner, inspector=inspector)
 
@@ -796,6 +806,166 @@ class TestCrossUnitBlockingVerifyFail:
         assert esc.level == 2
         assert esc.severity == 'critical'
         assert esc.category == 'infra_issue'
+
+
+# ---------------------------------------------------------------------------
+# task 4047: RED — the unconfigured-escalation warning must be plan-scoped,
+# not a flat "no L2 escalation filed" claim
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestUnconfiguredEscalationWarningIsPlanScoped:
+    """A cross-unit deploy failure on a plan with ``on_failure_escalation=None``
+    must not tell an operator that NO L2 escalation was filed. The claim is
+    plan-scoped: ``deterministic_runner``'s cross-unit deploy path passes
+    ``on_failure_escalation=None`` deliberately and files its own L2
+    ``infra_issue`` for the SAME failure, so the flat wording reads as a
+    dropped-escalation bug mid-incident (task 4047)."""
+
+    async def test_restart_failed_warning_is_plan_scoped(
+        self, tmp_queue_dir: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.proc_supervision import RestartDisposition
+
+        outcome, warnings = await self._drive_unconfigured(
+            tmp_queue_dir,
+            task_id='task-4047-restart-failed',
+            runner=FakeRunner(returncode=1),
+            inspector=make_fake_inspector({
+                'MainPID': 99,
+                'ActiveState': 'active',
+                'ActiveEnterTimestampMonotonic': 2000,
+            }),
+            caplog=caplog,
+        )
+
+        assert outcome.disposition == RestartDisposition.RESTART_FAILED
+        assert outcome.escalated is False
+        self._assert_plan_scoped_warning(warnings)
+        assert read_escalations(
+            tmp_queue_dir, 'task-4047-restart-failed',
+            agent_role='orchestrator-deterministic',
+        ) == []
+
+    async def test_verify_failed_warning_is_plan_scoped(
+        self, tmp_queue_dir: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.proc_supervision import RestartDisposition
+
+        outcome, warnings = await self._drive_unconfigured(
+            tmp_queue_dir,
+            task_id='task-4047-verify-failed',
+            runner=FakeRunner(returncode=0),
+            inspector=make_fake_inspector({
+                'MainPID': 0,
+                'ActiveState': 'active',
+                'ActiveEnterTimestampMonotonic': 2000,
+            }),
+            caplog=caplog,
+        )
+
+        assert outcome.disposition == RestartDisposition.VERIFY_FAILED
+        assert outcome.escalated is False
+        self._assert_plan_scoped_warning(warnings)
+        assert read_escalations(
+            tmp_queue_dir, 'task-4047-verify-failed',
+            agent_role='orchestrator-deterministic',
+        ) == []
+
+    async def test_configured_spec_emits_no_unconfigured_warning(
+        self, tmp_queue_dir: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Guards step-2 against widening the branch: with a real
+        ``EscalationSpec`` configured, the plan files instead of warning, so
+        no message mentioning ``on_failure_escalation`` may be emitted at
+        all — the reword must not become unconditional."""
+        import logging
+
+        from orchestrator.proc_supervision import EscalationSpec, RestartDisposition
+
+        spec = EscalationSpec(
+            queue_dir=str(tmp_queue_dir),
+            task_id='task-4047-configured',
+            summary='Cross-unit deploy verify failed',
+        )
+        plan = _build_cross_unit_verify_plan(on_failure_escalation=spec)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
+            outcome = await plan.execute(
+                runner=FakeRunner(returncode=0),
+                inspector=make_fake_inspector({
+                    'MainPID': 0,
+                    'ActiveState': 'active',
+                    'ActiveEnterTimestampMonotonic': 2000,
+                }),
+            )
+
+        assert outcome.disposition == RestartDisposition.VERIFY_FAILED
+        assert outcome.escalated is True
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        unconfigured = [
+            r.getMessage() for r in warnings if 'on_failure_escalation' in r.getMessage()
+        ]
+        assert not unconfigured, (
+            'a configured on_failure_escalation must file, not warn — the '
+            f'reword must not become unconditional: {unconfigured!r}'
+        )
+
+        escalations = read_escalations(
+            tmp_queue_dir, 'task-4047-configured',
+            agent_role='orchestrator-deterministic',
+        )
+        assert len(escalations) == 1, (
+            'the configured leg must be verified through the same product '
+            f'read path as its siblings (TestCrossUnitBlockingVerifyFail, '
+            f'TestCrossUnitBlockingEmptyBaselineFreshness): {escalations!r}'
+        )
+
+    async def _drive_unconfigured(
+        self,
+        tmp_queue_dir: Path,
+        *,
+        task_id: str,
+        runner,
+        inspector,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Build an ``on_failure_escalation=None`` cross-unit plan and drive
+        it once, returning ``(outcome, warnings)`` for the caller to assert
+        on. Shared by both disposition tests below."""
+        import logging
+
+        plan = _build_cross_unit_verify_plan(on_failure_escalation=None)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
+            outcome = await plan.execute(runner=runner, inspector=inspector)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        return outcome, warnings
+
+    @staticmethod
+    def _assert_plan_scoped_warning(warnings: list) -> None:
+        import logging
+
+        candidates = [r for r in warnings if 'on_failure_escalation' in r.getMessage()]
+        assert len(candidates) == 1, (
+            f'expected exactly one on_failure_escalation warning: '
+            f'{[r.getMessage() for r in warnings]!r}'
+        )
+        record = candidates[0]
+        msg = record.getMessage()
+
+        assert 'no L2 escalation filed' not in msg, (
+            f'the retired flat claim must not appear: {msg!r}'
+        )
+        assert 'on_failure_escalation' in msg, (
+            f'the message must still name the missing config: {msg!r}'
+        )
+        assert record.levelno == logging.WARNING, (
+            f'level must stay WARNING (no downgrade): {record.levelno!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
