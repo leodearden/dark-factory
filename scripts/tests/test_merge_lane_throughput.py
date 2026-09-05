@@ -1616,3 +1616,219 @@ def test_collect_projects_flags_that_some_bundle_errored(tmp_path, corpus_roots)
         [root_a, tmp_path / 'nope'], CORPUS_LO_DT, CORPUS_HI_DT
     )
     assert mlt.any_bundle_failed(mixed) is True
+
+
+# ---------------------------------------------------------------------------
+# End-to-end CLI — main(argv) over the two fixture roots.
+#
+# ALWAYS-ON vs FLAGGED. The always-on sections are landings/day, the lead-time
+# split, verify by runner, occupancy, queue depth and the outcome mixes;
+# `--chains` and `--speculation` are OFF by default and add theirs when passed.
+# (The step text lists speculation in both places; the explicit "off by
+# default" clause governs, and it agrees with the module docstring and with
+# collect_project's keyword defaults.)
+#
+# Every section header carries the CONCRETE RESOLVED window it was computed
+# over (plan decision 3). The PRD's § Background table is not single-windowed
+# — seven rows are 14d and four are 30d — so a header without its window lets
+# a 14d row and a 30d row be read as if they were the same measurement.
+# ---------------------------------------------------------------------------
+
+CORPUS_WINDOW_LABEL = f'{CORPUS_LO} .. {CORPUS_HI}'
+
+ALWAYS_ON = (
+    'landings_per_day', 'lead_time', 'verify_by_runner',
+    'occupancy', 'queue_depth', 'mixes',
+)
+
+
+def _run(capsys, *argv) -> tuple[int, str, str]:
+    """Run main(argv) and return (exit code, stdout, stderr)."""
+    code = mlt.main(list(argv))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def _both(corpus_roots) -> list[str]:
+    root_a, root_b = corpus_roots
+    return [
+        '--project-root', str(root_a), '--project-root', str(root_b),
+        '--window', CORPUS_WINDOW,
+    ]
+
+
+def test_main_returns_zero_and_prints_every_always_on_section(capsys, corpus_roots):
+    code, out, _ = _run(capsys, *_both(corpus_roots))
+    assert code == 0
+    for key in ALWAYS_ON:
+        assert mlt.SECTION_TITLES[key] in out
+
+
+def test_main_labels_each_project_and_never_merges_them(capsys, corpus_roots):
+    root_a, root_b = corpus_roots
+    _, out, _ = _run(capsys, *_both(corpus_roots))
+    assert str(root_a) in out
+    assert str(root_b) in out
+    # Root A's landings median is 2.0 and root B's is 1.5; a merged tally would
+    # print one median of 3.5 and neither of these.
+    assert 'median 2.0' in out
+    assert 'median 1.5' in out
+    assert '3.5' not in out
+
+
+def test_main_chains_and_speculation_are_off_by_default(capsys, corpus_roots):
+    _, out, _ = _run(capsys, *_both(corpus_roots))
+    assert mlt.SECTION_TITLES['chains'] not in out
+    assert mlt.SECTION_TITLES['speculation'] not in out
+
+
+def test_main_chains_flag_adds_the_chain_section(capsys, corpus_roots):
+    _, out, _ = _run(capsys, *_both(corpus_roots), '--chains')
+    assert mlt.SECTION_TITLES['chains'] in out
+    assert mlt.SECTION_TITLES['speculation'] not in out
+
+
+def test_main_speculation_flag_adds_the_section_and_the_by_project_spread(
+    capsys, corpus_roots
+):
+    root_a, root_b = corpus_roots
+    _, out, _ = _run(capsys, *_both(corpus_roots), '--speculation')
+    assert mlt.SECTION_TITLES['speculation'] in out
+    assert mlt.SECTION_TITLES['chains'] not in out
+    # Root A 3/10 = 0.300, root B 7/12 = 0.583 — printed per project, in one
+    # invocation, never pooled into 10/22 = 0.455.
+    assert '0.300' in out
+    assert '0.583' in out
+    assert '0.455' not in out
+    # And the cross-project block names both roots.
+    tail = out[out.index(mlt.VOID_RATE_BY_PROJECT_TITLE):]
+    assert str(root_a) in tail and str(root_b) in tail
+
+
+def test_main_every_section_header_carries_the_resolved_window(capsys, corpus_roots):
+    _, out, _ = _run(capsys, *_both(corpus_roots), '--chains', '--speculation')
+    headers = [ln for ln in out.splitlines() if ln.startswith(mlt.SECTION_PREFIX)]
+    # Eight sections per project across two projects.
+    assert len(headers) == 16
+    for header in headers:
+        assert CORPUS_WINDOW_LABEL in header, header
+
+
+def test_main_stamps_the_window_it_actually_resolved_not_the_spec(
+    capsys, corpus_roots
+):
+    root_a, _ = corpus_roots
+    _, out, _ = _run(
+        capsys, '--project-root', str(root_a), '--window', '2026-08-10..2026-08-15'
+    )
+    # The bare-date spec resolves to midnight UTC on both ends; the header must
+    # show the resolved instants, so a 14d row and a 30d row can never be
+    # confused for one another.
+    assert '2026-08-10T00:00:00+00:00 .. 2026-08-15T00:00:00+00:00' in out
+    assert '--window' not in out
+
+
+def test_main_occupancy_prints_all_three_estimators(capsys, corpus_roots):
+    _, out, _ = _run(capsys, *_both(corpus_roots))
+    lowered = out.lower()
+    # They disagree by design; suppressing any one of them destroys the signal.
+    assert 'locf' in lowered
+    assert 'raw-sample' in lowered
+    assert 'verify-duration' in lowered
+
+
+def test_main_json_is_parseable_and_keyed_by_project_root(capsys, corpus_roots):
+    root_a, root_b = corpus_roots
+    code, out, _ = _run(capsys, *_both(corpus_roots), '--json')
+    assert code == 0
+    payload = json.loads(out)
+    assert list(payload['projects']) == [str(root_a), str(root_b)]
+    assert payload['window'] == [CORPUS_LO, CORPUS_HI]
+
+
+def test_main_json_carries_the_same_numbers_as_the_text_report(capsys, corpus_roots):
+    root_a, root_b = corpus_roots
+    _, text, _ = _run(capsys, *_both(corpus_roots), '--speculation')
+    _, raw, _ = _run(capsys, *_both(corpus_roots), '--speculation', '--json')
+    payload = json.loads(raw)
+
+    landings_a = payload['projects'][str(root_a)]['sections']['landings_per_day']
+    landings_b = payload['projects'][str(root_b)]['sections']['landings_per_day']
+    assert (landings_a['median'], landings_a['max']) == (2.0, 4)
+    assert (landings_b['median'], landings_b['max']) == (1.5, 2)
+    assert 'median 2.0' in text and 'median 1.5' in text
+
+    spec_a = payload['projects'][str(root_a)]['sections']['speculation']
+    assert spec_a['void_rate'] == pytest.approx(0.30)
+    assert payload['void_rate_by_project'][str(root_b)]['void_rate'] == (
+        pytest.approx(7 / 12)
+    )
+
+
+def test_main_json_prints_no_human_prose_to_stdout(capsys, corpus_roots):
+    _, out, _ = _run(capsys, *_both(corpus_roots), '--json')
+    # json.loads over the WHOLE stream: a single line of prose before or after
+    # the payload would make this raise.
+    json.loads(out)
+    assert mlt.SECTION_TITLES['landings_per_day'] not in out
+
+
+def test_main_returns_nonzero_when_a_projects_db_is_unreadable(
+    capsys, tmp_path, corpus_roots
+):
+    root_a, _ = corpus_roots
+    missing = tmp_path / 'no_such_project'
+    code, out, err = _run(
+        capsys, '--project-root', str(root_a), '--project-root', str(missing),
+        '--window', CORPUS_WINDOW,
+    )
+    assert code != 0
+    # Loud on stderr, naming the path actually looked for...
+    assert str(mlt.resolve_runs_db(missing)) in err
+    # ...and the healthy project's rows are still printed.
+    assert 'median 2.0' in out
+    assert str(root_a) in out
+
+
+def test_main_json_still_reports_the_failed_project_in_the_payload(
+    capsys, tmp_path, corpus_roots
+):
+    root_a, _ = corpus_roots
+    missing = tmp_path / 'no_such_project'
+    code, out, _ = _run(
+        capsys, '--project-root', str(root_a), '--project-root', str(missing),
+        '--window', CORPUS_WINDOW, '--json',
+    )
+    assert code != 0
+    payload = json.loads(out)
+    failed = payload['projects'][str(missing)]
+    assert failed['error'] is not None
+    # Empty, not zeros: an unreadable store is not a quiet fortnight.
+    assert failed['sections'] == {}
+
+
+def test_main_default_window_is_14d_relative_to_the_injected_now(
+    capsys, corpus_roots
+):
+    root_a, _ = corpus_roots
+    now = datetime(2026, 8, 15, 0, 0, tzinfo=UTC)
+    code = mlt.main(['--project-root', str(root_a)], now=now)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert '2026-08-01T00:00:00+00:00 .. 2026-08-15T00:00:00+00:00' in out
+
+
+def test_main_rejects_a_malformed_window_loudly_without_a_traceback(capsys):
+    code, out, err = _run(capsys, '--window', '14x')
+    assert code != 0
+    assert "'14x'" in err
+    assert out == ''
+
+
+def test_main_defaults_to_this_checkout_when_no_project_root_is_given(capsys):
+    # Read-only against the real store; assert only the LABEL, never a number
+    # (runs.db is mutated continuously by the running orchestrator).
+    code, out, _ = _run(capsys, '--window', '2026-01-01..2026-01-02', '--json')
+    assert code == 0
+    payload = json.loads(out)
+    assert list(payload['projects']) == [str(mlt.DEFAULT_PROJECT_ROOT)]
