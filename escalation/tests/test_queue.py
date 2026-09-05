@@ -1917,6 +1917,67 @@ class TestScanSurvivesRecordArchivedMidScan:
         )
 
 
+    def test_get_pending_survives_a_record_archived_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """get_pending() carries the identical gap and is pinned independently.
+
+        This scan also backs ``dismiss_all_pending``, so the startup L0 sweep
+        inherits the fix.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-3517-5', task_id='3517'))
+
+        doomed = queue.queue_dir / 'esc-3517-5.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = self._relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            results = queue.get_pending()
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record, got {[e.id for e in results]}'
+        )
+
+    def test_find_terminal_by_citation_survives_a_record_archived_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """The targeted ``esc-{task_id}-*.json`` glob has the same shape.
+
+        Both records are terminal and both match the glob, so both are read —
+        and the one the caller is NOT looking for is the one relocated, again
+        pinning that the blast radius is the whole listing rather than the
+        record that moved.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        citation = 'b' * 40
+        category = 'provenance_unattributed'
+
+        # Written directly rather than submit+resolve()'d: resolve() archives
+        # the record, and this test needs BOTH terminal records sitting in the
+        # queue root where the concurrent sweep would find them.
+        for esc_id, sha in (('esc-4176-1', citation), ('esc-4176-2', 'c' * 40)):
+            esc = _make_escalation(esc_id, task_id='4176', status='resolved', level=1)
+            esc.category = category
+            esc.citation_sha = sha
+            esc.resolved_at = datetime.now(UTC).isoformat()
+            (queue.queue_dir / f'{esc_id}.json').write_text(esc.to_json())
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = self._relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            found = queue.find_terminal_by_citation('4176', category, citation)
+
+        assert found is not None, (
+            'the surviving terminal record must still be found when an '
+            'unrelated sibling is archived mid-scan'
+        )
+        assert found.id == 'esc-4176-1', f'wrong record returned: {found.id!r}'
+
+
 class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
