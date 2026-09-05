@@ -39,6 +39,7 @@ worktree holds REAL files.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Literal
 from unittest.mock import AsyncMock, patch
@@ -52,11 +53,18 @@ from test_verify_merge_flake_suppression import (
     _module_config,
 )
 
-from orchestrator import flake_recorder, verify
-from orchestrator.config import ModuleConfig
+from orchestrator import flake_recorder, verify, verify_plan
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.merge_gates import PostMergePyrightResult
-from orchestrator.merge_queue import MergeOutcome, _run_post_merge_verify
+from orchestrator.merge_queue import (
+    MergeOutcome,
+    MergeRequest,
+    _merge_boundary_module_configs,
+    _run_post_merge_verify,
+)
+from orchestrator.merge_queue_store import MergeQueueStore, reconstruct_merge_request
+from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 
 _MERGE_SHA = 'd' * 40
@@ -829,3 +837,216 @@ class TestMergeBoundaryModuleConfigsWrapper:
 
         assert result is passed
         assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# task-5063 — a restart-rehydrated merge request must verify as WIDE as the
+# original it was rehydrated from.
+#
+# reconstruct_merge_request used to hardcode ``module_configs=[]`` on the
+# belief (stated in its docstring) that "[] means all configured modules" and
+# that this "errs on the side of verifying more than the original, never
+# less".  Both claims were FALSE: the class directly above pins that
+# ``_merge_boundary_module_configs`` deliberately NEVER widens an empty set,
+# so the empty set routes to ``verify_plan._derive_fallback_runs`` and the
+# recovered merge is verified FILE-SCOPED — narrower than its original, and
+# silently so (a file-scoped verify runs, and passes fast).
+#
+# These assert on the RESOLVED module set and the PLANNED runs rather than on
+# "verify ran", because "verify ran" is exactly what stayed true through the
+# defect.
+# ---------------------------------------------------------------------------
+
+
+def _merge_plan_full_suite_prefixes(
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    files: list[str],
+) -> list[str]:
+    """The module prefixes a merge-role verify would run FULL_SUITE for.
+
+    Drives the real chain — the merge boundary's effective set, then
+    ``verify_plan.derive_verify_plan`` at ``role='merge'`` — so the assertion
+    lands on the planned runs rather than on an intermediate.
+
+    *files* must contain a ``.py``/``.rs`` path or ``derive_verify_plan``
+    short-circuits to TRIVIAL before any module branch is reached.
+    ``worktree_reader`` can be a constant ``None``: the FULL_SUITE branch
+    (``_derive_full_suite_runs``) never consults file contents.
+    """
+    effective = _merge_boundary_module_configs(config, module_configs)
+    plan = verify_plan.derive_verify_plan(
+        files, effective, config, lambda _f: None, role='merge',
+    )
+    return sorted({
+        run.module_prefix
+        for run in plan.runs
+        if run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
+    })
+
+
+class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
+    """A merge request recovered from the journal plans the SAME merge-role
+    module set its original would have.
+
+    The ORIGINAL request is the oracle, so what is pinned is the invariant
+    ("never narrower than its original") rather than a transcribed literal
+    that rots when the registry fixture changes.  An oracle alone could pass
+    vacuously if the oracle itself regressed to empty — which is precisely the
+    failure mode under test — so each test also pins the concrete expected set
+    as a non-vacuity guard.
+    """
+
+    _NINE_PREFIXES = [
+        'cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
+        'sampler', 'scripts', 'shared', 'tests/scripts',
+    ]
+    # Must carry a .py path — see _merge_plan_full_suite_prefixes.
+    _TASK_FILES = ['orchestrator/src/orchestrator/merge_queue_store.py']
+
+    @staticmethod
+    def _nine_module_registry() -> dict[str, ModuleConfig]:
+        """dark_factory's live nine-module registry shape.
+
+        Follows the file's existing ``_N_module_registry`` staticmethod idiom;
+        ``tests/scripts`` is included deliberately because it is multi-segment
+        and so exercises ``OrchestratorConfig.for_module``'s inward walk.
+        """
+        return {
+            prefix: _module_config(prefix)
+            for prefix in TestRehydratedRequestVerifiesAsWideAsItsOriginal._NINE_PREFIXES
+        }
+
+    @staticmethod
+    def _config(tmp_path: Path, breadth: Literal['scoped', 'full']) -> OrchestratorConfig:
+        config = _make_config(tmp_path, merge_verify_breadth=breadth)
+        config._module_configs = (
+            TestRehydratedRequestVerifiesAsWideAsItsOriginal._nine_module_registry()
+        )
+        return config
+
+    @staticmethod
+    def _original(
+        tmp_path: Path,
+        config: OrchestratorConfig,
+        *,
+        module_configs: list[ModuleConfig],
+        task_files: list[str],
+    ) -> MergeRequest:
+        """A live MergeRequest, built inline.
+
+        Deliberately not aliased from ``test_merge_queue_store._make_req``:
+        this module already imports a DIFFERENT ``_make_req`` (from
+        ``test_merge_queue_main_health``), so a second import under that name
+        would shadow it.
+        """
+        worktree = tmp_path / 'wt'
+        worktree.mkdir(exist_ok=True)
+        return MergeRequest(
+            task_id='5063',
+            branch=QueuedBranch.parse('5063', config.git.branch_prefix),
+            worktree=worktree,
+            pre_rebased=False,
+            task_files=task_files,
+            module_configs=module_configs,
+            config=config,
+            result=asyncio.get_running_loop().create_future(),
+        )
+
+    @staticmethod
+    def _rehydrate(
+        tmp_path: Path, config: OrchestratorConfig, original: MergeRequest,
+    ) -> MergeRequest:
+        """Round-trip *original* through the real journal and back."""
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+        store.record(original)
+        [persisted] = store.load()
+        return reconstruct_merge_request(persisted, config)
+
+    @pytest.mark.asyncio
+    async def test_rehydrated_request_plans_the_same_full_suite_set_as_its_original(
+        self, tmp_path: Path,
+    ) -> None:
+        """breadth='full': the recovered request's FULL_SUITE set EQUALS the
+        original's — and both are the whole nine-module registry."""
+        config = self._config(tmp_path, 'full')
+        registry = config.module_configs_or_empty
+        original = self._original(
+            tmp_path, config,
+            module_configs=[registry['orchestrator']],
+            task_files=self._TASK_FILES,
+        )
+        rehydrated = self._rehydrate(tmp_path, config, original)
+
+        original_plan = _merge_plan_full_suite_prefixes(
+            config, original.module_configs, self._TASK_FILES,
+        )
+        rehydrated_plan = _merge_plan_full_suite_prefixes(
+            config, rehydrated.module_configs, self._TASK_FILES,
+        )
+
+        assert rehydrated_plan == original_plan, (
+            f'a rehydrated request must never verify NARROWER than the '
+            f'original it was rehydrated from; original planned FULL_SUITE '
+            f'for {original_plan!r}, rehydrated for {rehydrated_plan!r}'
+        )
+        # Non-vacuity: an oracle that itself regressed to empty must not make
+        # the equality above pass trivially.
+        assert original_plan == sorted(self._NINE_PREFIXES)
+
+    @pytest.mark.asyncio
+    async def test_rehydrated_request_under_scoped_breadth_keeps_the_tasks_own_modules(
+        self, tmp_path: Path,
+    ) -> None:
+        """breadth='scoped': the recovered request keeps the task's OWN
+        modules, which under this breadth is what the boundary passes through
+        unchanged."""
+        config = self._config(tmp_path, 'scoped')
+        registry = config.module_configs_or_empty
+        original = self._original(
+            tmp_path, config,
+            module_configs=[registry['orchestrator']],
+            task_files=self._TASK_FILES,
+        )
+        rehydrated = self._rehydrate(tmp_path, config, original)
+
+        original_effective = _prefixes(
+            _merge_boundary_module_configs(config, original.module_configs)
+        )
+        rehydrated_effective = _prefixes(
+            _merge_boundary_module_configs(config, rehydrated.module_configs)
+        )
+
+        assert rehydrated_effective == original_effective, (
+            f'original resolved to {original_effective!r}, '
+            f'rehydrated to {rehydrated_effective!r}'
+        )
+        assert original_effective == ['orchestrator']
+
+    @pytest.mark.asyncio
+    async def test_zero_module_task_still_reconstructs_empty_and_takes_the_global_fallback(
+        self, tmp_path: Path,
+    ) -> None:
+        """CONTROL — the MUST-PRESERVE, and what distinguishes this fix from
+        unconditionally widening ``[]`` at the boundary.
+
+        GREEN today and must STAY green.  A task that genuinely has no
+        assigned modules reconstructs to ``[]``, the boundary leaves it ``[]``
+        (task 3787 γ's deliberate no-widen guard), and the plan takes
+        ``_derive_fallback_runs`` — no FULL_SUITE run at all — even though the
+        SAME nine-module registry is configured and breadth is 'full'.
+        """
+        config = self._config(tmp_path, 'full')
+        original = self._original(
+            tmp_path, config, module_configs=[], task_files=self._TASK_FILES,
+        )
+        rehydrated = self._rehydrate(tmp_path, config, original)
+
+        assert rehydrated.module_configs == [], (
+            f'a genuinely zero-module task must NOT be widened by the fix; '
+            f'got {_prefixes(rehydrated.module_configs)!r}'
+        )
+        assert _merge_boundary_module_configs(config, rehydrated.module_configs) == []
+        assert _merge_plan_full_suite_prefixes(
+            config, rehydrated.module_configs, self._TASK_FILES,
+        ) == [], 'the zero-module task must still take the global-fallback path'
