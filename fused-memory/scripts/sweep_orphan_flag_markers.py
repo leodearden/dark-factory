@@ -1157,26 +1157,25 @@ async def run(
         # enumeration-scoped like `undated_kept`'s directly above it, and
         # says the same class of thing — a permanent floor under
         # ``--check --max-backlog`` that draining cannot reach below.
-        rendered = ', '.join(
-            '{}(kind={!r} record_type={!r})'.format(
-                m.get('id'),
-                _member_metadata(m).get('kind'),
-                _member_metadata(m).get('record_type'),
+        rendered: list[str] = []
+        for member in protected:
+            metadata = _member_metadata(member)
+            rendered.append(
+                f"{member.get('id')}(kind={metadata.get('kind')!r} "
+                f"record_type={metadata.get('record_type')!r})"
             )
-            for m in protected
-        )
         logger.warning(
             'sweep_orphan_flag_markers: %d of %d enumerated markers are '
             'protected records that must never be deleted by a marker sweep '
             'and are excluded from the delete set: %s. Reaching this means '
-            "this run's ``source`` enumeration matched a record from another "
-            'pool (mem0_tombstone: the enumeration filter is over-broad for '
-            'this pool), so the filter — or the --delete-ids that named one — '
-            'should be tightened. These records also floor the residual '
-            'backlog permanently: no amount of draining removes them, so a '
-            '--check/--max-backlog gate at or below that floor can never '
-            'pass (task 3041/4435).',
-            len(protected), len(members), rendered,
+            "this run's source enumeration matched a record belonging to "
+            'another pool (mem0_tombstone: the enumeration filter is '
+            'over-broad for this pool), so that filter — or the --delete-ids '
+            'that named one — should be tightened. These records also floor '
+            'the residual backlog permanently: no amount of draining removes '
+            'them, so a --check/--max-backlog gate set below that floor can '
+            'never pass (task 3041/4435).',
+            len(protected), len(members), ', '.join(rendered),
             extra={'project_id': project_id},
         )
         protected_obj_ids = {id(m) for m in protected}  # builtin id(), not the key
