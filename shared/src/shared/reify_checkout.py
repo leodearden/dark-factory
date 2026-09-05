@@ -161,7 +161,8 @@ def reify_skip_reason(
     set between the two calls.
 
     The two non-None arms are deliberately distinct (carried over from task
-    3843's ``_skip_unless_checkout``), and conflating them is the failure this
+    3843's ``_skip_unless_checkout``, whose own two arms now live in
+    `checkout_skip_reason` below), and conflating them is the failure this
     exists to prevent:
 
       * ``root is None`` is the legitimate standalone-checkout discovery MISS —

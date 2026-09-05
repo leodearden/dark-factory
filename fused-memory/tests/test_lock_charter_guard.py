@@ -719,50 +719,38 @@ _DF_REPO_ROOT = Path(__file__).parents[2]
 # _REIFY_REPO_ROOT used to be defined here as `Path(__file__).parents[5] / 'reify'`
 # (a bare-checkout regression — task 3843). It now lives beside
 # _REIFY_GUARD_SCRIPT, above, resolved once via _resolve_reify_checkout() so both
-# reify call sites share one layout-independent resolution.
+# reify call sites share one layout-independent resolution.  The reachability
+# precondition that guards the sweeps below, `_skip_unless_checkout`, likewise
+# keeps only its local binding here: both its arms' wording lives in
+# `shared.reify_checkout.checkout_skip_reason` (task 4259).
 
 
 def _skip_unless_checkout(repo: str, repo_root: Path | None) -> Path:
     """Skip unless *repo_root* names a real checkout directory; else return it.
 
-    ONE reachability precondition for all three reify-parametrized sweeps
-    below, for the same reason ``_tracked_entries`` is one parse: three copies
-    of this guard would let the sweeps drift on what "the reify checkout is
-    missing" means, and a sweep that forgot the ``None`` arm would raise
-    ``AttributeError`` at the point it was supposed to skip.
+    Marker-bound adapter over `shared.reify_checkout.checkout_skip_reason`,
+    which owns BOTH arms' wording — why a discovery MISS is not an operator's
+    REIFY_ROOT typo, why the set-but-absent arm names the path verbatim, and why
+    it does not borrow the stronger marker-based reason.  Do not restate or
+    re-derive them here, and do not reintroduce a local copy of either arm; the
+    same helper in shared/tests/test_locking.py delegates to the identical
+    builder, which is the point (task 4259, consolidating what task 3843
+    established here).
 
-    The two arms are deliberately distinct, and the distinction is the whole
-    point of task 3843:
+    What is LOCAL is only the binding: this call site's guard-script marker, and
+    turning the reason into a ``pytest.skip`` — the shared module is pytest-free.
 
-    ``None`` — discovery MISS.  ``_resolve_reify_checkout`` walked every
-    ancestor and none carried ``reify/scripts/lock-charter-guard.sh``, with
-    REIFY_ROOT unset.  That is the legitimate standalone-checkout case, and its
-    WORDING comes from ``shared.reify_checkout`` so it cannot drift from what
-    the Tier-2 skipifs above (or orchestrator's verify gate) say about the same
-    condition.
-
-    set-but-absent — an operator's REIFY_ROOT names a path that is not there.
-    Honored verbatim rather than silently falling back to discovery, so the
-    skip reason NAMES the bad path and a typo is self-evident instead of
-    resolving to a different repo than the operator asked for.  That arm is the
-    ``is_dir()`` check below, kept local on purpose: these sweeps need a git
-    CHECKOUT, which is a weaker requirement than the guard script the Tier-2
-    gates need, so they must not borrow the shared marker-based reason.
+    Called through the module attribute on purpose, for the same reason
+    `_resolve_reify_checkout` notes above: the delegation pin in
+    TestSkipUnlessCheckout patches `reify_checkout.checkout_skip_reason`, which
+    a ``from ... import`` binding would put out of its reach.
     """
-    if repo_root is None:
-        # Only the reify parametrization can be None — _DF_REPO_ROOT is derived
-        # from __file__ and is always a path — and a None root is by
-        # construction the shared builder's discovery-miss arm.
-        reason = reify_checkout.reify_skip_reason(
-            _REIFY_GUARD_RELPATH, None, named_by_env=False
-        )
-        assert reason is not None, (
-            f'a None {repo} root is the discovery-miss arm, which always yields '
-            f'a reason — a falsy one here would turn this skip into a phantom pass'
-        )
+    reason = reify_checkout.checkout_skip_reason(
+        repo, repo_root, marker=_REIFY_GUARD_RELPATH
+    )
+    if reason is not None:
         pytest.skip(reason)
-    if not repo_root.is_dir():
-        pytest.skip(f'{repo} checkout not present at {repo_root}')
+    assert repo_root is not None  # narrows for the return
     return repo_root
 
 
