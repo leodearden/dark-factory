@@ -40,6 +40,7 @@ __all__ = [
     'extract_gate_subject',
     'find_open_gate',
     'is_gate_submission',
+    'recurring_gate_error',
 ]
 
 # The canonical metadata key a recon-filed human gate uses to name the
@@ -200,3 +201,53 @@ def find_open_gate(tasks: Any, subject: str) -> dict[str, Any] | None:
             'status': str(row.get('status', '') or ''),
         }
     return None
+
+
+# ---------------------------------------------------------------------------
+# Rejection payload
+# ---------------------------------------------------------------------------
+
+
+def recurring_gate_error(
+    existing: Mapping[str, Any],
+    subject: str,
+) -> dict[str, Any]:
+    """Return a structured RecurringGateViolation error dict.
+
+    Shape mirrors ``lock_charter_guard.lock_charter_error`` (structured
+    ``error`` + ``error_type`` + a domain-specific machine-readable field +
+    ``hint``) so MCP callers handle this rejection uniformly with the
+    existing ones. ``existing_gate_task_id`` and ``gate_subject`` are what
+    ``directory_paths`` is there — the machine-readable half, so no consumer
+    has to regex the prose to learn which carrier to amend.
+
+    Total: a carrier mapping missing its ``title`` still yields a
+    well-formed error naming the id.
+    """
+    task_id = str(existing.get('id', '') or '')
+    title = str(existing.get('title', '') or '')
+    title_clause = f' ({title!r})' if title else ''
+    return {
+        'error': (
+            f'a non-terminal human gate for gate_subject={subject!r} already '
+            f'exists: task {task_id}{title_clause}. Filing a second carrier '
+            f'for the same subject is what produced the 5902 -> 5916 -> 5929 '
+            f'chain this guard exists to bound.'
+        ),
+        'error_type': 'RecurringGateViolation',
+        'existing_gate_task_id': task_id,
+        'gate_subject': subject,
+        'hint': (
+            f'Do not file a new gate. Amend the existing one: call '
+            f'update_task on task {task_id} to refresh its evidence and bump '
+            f'metadata.recurrence_count. '
+            f'CAUTION: update_task\'s append=True governs only details and '
+            f'prompt — it does NOT append description, which always '
+            f'overwrites. To amend the description, read the current text '
+            f'first, write the full merged text, and verify the echoed '
+            f'updated_task reflects what you intended. '
+            f'If the subject genuinely needs a fresh gate, close the existing '
+            f'carrier first (done or cancelled) — terminal carriers do not '
+            f'block.'
+        ),
+    }
