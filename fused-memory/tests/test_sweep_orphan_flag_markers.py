@@ -825,6 +825,111 @@ class TestDeleteOrphanMarkers:
 
 
 # ===========================================================================
+# Tests: delete_orphan_markers protected-mirror guard (task 4435)
+# ===========================================================================
+
+class TestDeleteOrphanMarkersProtectedMirrorGuard:
+    """The protected-mirror guard at the DELETE CHOKE POINT (task 3041/4435).
+
+    Exercised through ``delete_orphan_markers`` called DIRECTLY, never via
+    ``run``. That is the whole point: ``run`` pre-partitions the union for
+    REPORTING, but the enforcement has to sit here, where every current and
+    future caller inherits it — including any caller that never consults
+    ``find_protected_markers`` at all. ``delete_orphan_markers`` is a public
+    module-level coroutine with its own direct tests, so a guard that lived
+    only in ``run`` would leave it able to destroy a mirror.
+    """
+
+    @pytest.mark.asyncio
+    async def test_protected_members_are_never_deleted(self):
+        """Only the unprotected members reach delete_memory."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        orphans = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1'), _orphan('o2')]
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', orphans,
+        )
+
+        assert memory_service.delete_memory.await_count == 2, (
+            'Expected exactly two deletes (o1, o2), got: '
+            f'{memory_service.delete_memory.call_args_list!r}'
+        )
+        called_ids = {
+            c.kwargs.get('memory_id')
+            for c in memory_service.delete_memory.call_args_list
+        }
+        assert called_ids == {'o1', 'o2'}, f'Unexpected delete set: {called_ids!r}'
+        # Belt and braces: the protected ids appear in NO call at all.
+        assert 'm1' not in repr(memory_service.delete_memory.call_args_list)
+        assert 'l1' not in repr(memory_service.delete_memory.call_args_list)
+
+        assert result['deleted'] == 2
+        assert result['failed'] == []
+        assert result['protected_skipped'] == ['m1', 'l1'], (
+            'protected_skipped must be order-preserving per the input, got: '
+            f"{result['protected_skipped']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_skip_is_logged_at_warning(self, caplog):
+        """A skip is never silent: one WARNING per protected member, naming it.
+
+        Reaching this guard means the caller's delete set was over-broad, so
+        an operator must be able to see WHICH record was refused.
+        """
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        orphans = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.delete_orphan_markers(
+                memory_service, 'dark_factory', orphans,
+            )
+
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+        for protected_id in ('m1', 'l1'):
+            matching = [r for r in warnings if protected_id in r.getMessage()]
+            assert len(matching) == 1, (
+                f'Expected exactly one WARNING naming {protected_id!r}, got: '
+                f'{[r.getMessage() for r in warnings]!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_all_protected_input_performs_zero_deletes(self):
+        """An entirely-protected delete set deletes nothing and does not raise."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_mirror('m1')],
+        )
+
+        memory_service.delete_memory.assert_not_awaited()
+        assert result['deleted'] == 0
+        assert result['failed'] == []
+        assert result['protected_skipped'] == ['m1']
+
+    @pytest.mark.asyncio
+    async def test_protected_skipped_key_is_always_present(self):
+        """Callers must never need a .get fallback — including on the
+        empty-input fast path, which returns before the guard runs."""
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        empty = await _mod.delete_orphan_markers(memory_service, 'dark_factory', [])
+        assert empty['protected_skipped'] == []
+
+        unprotected = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1')],
+        )
+        assert unprotected['protected_skipped'] == []
+
+
+# ===========================================================================
 # Tests: run()
 # ===========================================================================
 
