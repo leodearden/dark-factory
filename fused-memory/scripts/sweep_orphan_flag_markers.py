@@ -569,6 +569,21 @@ async def delete_orphan_markers(
     asyncio.gather with return_exceptions=True, per-item WARNING on failure,
     count only successes.
 
+    Protected-mirror guard (task 3041/4435)
+    ---------------------------------------
+    This is the sweep's DELETE CHOKE POINT, so the guard lives here: every
+    current and future caller inherits it, including one that never consults
+    :func:`find_protected_markers` itself. It is UNCONDITIONAL — it overrides
+    ``--delete-ids``, the operator's targeted-correction lever, exactly as
+    ``_sweep_stale_mem0_pool``'s guard is a ``continue`` no caller can opt out
+    of. The asymmetry that settles it is the one ``mem0_tombstone`` states:
+    over-protecting a marker costs one loudly-logged skipped GC, while
+    under-protecting a mirror costs the audit anchor an auditor is about to
+    look for — and here that loss is unrecoverable, since "deletion here is
+    permanent, not self-healing" (module docstring). An operator who genuinely
+    needs a specific protected record gone has the unguarded, individually
+    authorised fused-memory MCP ``delete_memory`` tool.
+
     Args:
         memory_service: Live (or mock) MemoryService instance.
         project_id: Project scope passed to each delete_memory call.
@@ -576,10 +591,43 @@ async def delete_orphan_markers(
         causation_id: Optional causation id forwarded to each delete_memory call.
 
     Returns:
-        ``{'deleted': int, 'failed': [ids]}``
+        ``{'deleted': int, 'failed': [ids], 'protected_skipped': [ids]}``.
+        ``protected_skipped`` lists the members refused by the guard above, in
+        input order. All three keys are present unconditionally, including on
+        the empty-input fast path, so no caller needs a ``.get`` fallback.
     """
     if not orphans:
-        return {'deleted': 0, 'failed': []}
+        return {'deleted': 0, 'failed': [], 'protected_skipped': []}
+
+    # Enforcement, checked BEFORE the gather so an over-broad delete set
+    # degrades to a loud skip rather than collateral mirror loss. One WARNING
+    # per member, naming both discriminators — modelled on the message
+    # ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` emits, so an
+    # operator grepping the journal recognises the two skips as one guard.
+    protected = find_protected_markers(orphans)
+    if protected:
+        protected_ids = {id(m) for m in protected}  # builtin id(), see NOTE below
+        for member in protected:
+            metadata = member.get('metadata')
+            metadata = metadata if isinstance(metadata, dict) else {}
+            logger.warning(
+                'sweep_orphan_flag_markers: SKIPPING protected cycle_summary '
+                'mirror memory_id=%s (kind=%s record_type=%s) — this record '
+                'must never be deleted by a marker sweep; reaching this guard '
+                "means this run's delete set was over-broad and the predicate "
+                'or --delete-ids that produced it should be tightened '
+                '(task 3041/4435).',
+                member.get('id'), metadata.get('kind'), metadata.get('record_type'),
+                extra={'project_id': project_id, 'memory_id': member.get('id')},
+            )
+        orphans = [m for m in orphans if id(m) not in protected_ids]
+    # NOTE ``id(m)`` above is the BUILTIN object identity, not the member's
+    # ``'id'`` payload key. find_protected_markers returns the very objects it
+    # was handed, so object identity is the exact complement of the protected
+    # subset and needs no assumption that memory uuids are unique within one
+    # delete set (they are, but that is the caller's invariant, not this
+    # function's).
+    protected_skipped = [m.get('id') for m in protected]
 
     async def _delete_one(orphan: dict):
         return await memory_service.delete_memory(
@@ -607,7 +655,11 @@ async def delete_orphan_markers(
         else:
             deleted += 1
 
-    return {'deleted': deleted, 'failed': failed}
+    return {
+        'deleted': deleted,
+        'failed': failed,
+        'protected_skipped': protected_skipped,
+    }
 
 
 # ---------------------------------------------------------------------------
