@@ -89,3 +89,87 @@ class TestSourceCompletionDeclaresGateSubject:
         assert "metadata.operational_mode='gate'" in text
         assert "execution_class='operational'" in text
         assert '## Consolidation Gate' in text
+
+
+# --------------------------------------------------------------------------- #
+# Stage 2 `## Live-Workflow Authority` — amend, never cancel-and-remint
+# --------------------------------------------------------------------------- #
+
+_REGION_HEADER = '## Live-Workflow Authority'
+
+
+def _live_workflow_region(prompt: str) -> str:
+    """Return the `## Live-Workflow Authority` region only.
+
+    Sliced between its header and the next `## ` header so every assertion
+    below is scoped to the region — a literal appearing somewhere else in
+    the (very long) Stage 2 prompt must not satisfy them.
+    """
+    _, _, after = prompt.partition(_REGION_HEADER)
+    end = after.find('\n## ')
+    return after if end == -1 else after[:end]
+
+
+class TestStage2AmendDontRemintRule:
+    """A liveness flicker on a gate's subject must never cancel the carrier.
+
+    Cancel-and-remint is what orphaned esc-5881-1 / esc-5902-1 / esc-5916-1
+    as permanently-pending L2 escalations, and what produced three carriers
+    (5902 -> 5916 -> 5929) for the single subject 5879.
+    """
+
+    def test_region_header_appears_exactly_once(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        assert STAGE2_SYSTEM_PROMPT.count(_REGION_HEADER) == 1
+
+    def test_region_forbids_cancelling_a_gate_carrier(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        region = _live_workflow_region(STAGE2_SYSTEM_PROMPT)
+        assert 'gate_subject' in region, (
+            'the region must identify the carrier by its canonical key'
+        )
+        assert 'cancel' in region.lower(), (
+            'the region must state the cancel prohibition'
+        )
+
+    def test_region_directs_amend_in_place(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        region = _live_workflow_region(STAGE2_SYSTEM_PROMPT)
+        assert 'update_task' in region, 'the region must name the amend tool'
+        assert 'AMEND' in region, 'the region must direct amend-in-place'
+        assert 'recurrence_count' in region, (
+            'the region must name the counter to bump'
+        )
+
+    def test_region_warns_about_the_append_description_hazard(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        region = _live_workflow_region(STAGE2_SYSTEM_PROMPT)
+        assert 'append=True' in region
+        assert 'description' in region
+        assert 'updated_task' in region, (
+            'the region must tell the agent to verify the echoed updated_task'
+        )
+
+    def test_preexisting_rules_survive(self):
+        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
+
+        region = _live_workflow_region(STAGE2_SYSTEM_PROMPT)
+        # Rule 1 and the payload-section pointer must be untouched — this
+        # change is additive.
+        assert 'set_task_status' in region
+        assert '### Live-Workflow Signals' in region
+
+    def test_rule_reaches_the_real_consumer(self):
+        from fused_memory.reconciliation.prompts.stage2 import (
+            build_stage2_system_prompt,
+        )
+
+        # The non-autopilot passthrough is what the CLI stage runner
+        # actually hands the agent.
+        region = _live_workflow_region(build_stage2_system_prompt('dark_factory'))
+        assert 'gate_subject' in region
+        assert 'update_task' in region
