@@ -750,6 +750,13 @@ async def run(
           composite id) that no automatic predicate can catch.
     A member matched by more than one predicate/list is deleted exactly once.
 
+    Protected ``cycle_summary``/``ledger_stamp`` mirrors are then SUBTRACTED
+    from that union (:func:`find_protected_markers`, task 3041/4435) before
+    any count is taken, so ``orphan_count``/``orphan_ids``/``bucket_counts``
+    all describe the delete set actually taken. The subtraction is
+    unconditional and overrides the targeted correction list too — see
+    :func:`delete_orphan_markers` for why.
+
     Args:
         args: argparse.Namespace (or SimpleNamespace) with at least:
             - apply (bool): commit deletions if True, dry-run otherwise
@@ -794,6 +801,23 @@ async def run(
             - targeted_correction_ids (list[str]): the subset of
               ``args.delete_ids`` actually found among the enumerated
               members (the found-intersection, not the raw input list).
+              Deliberately NOT narrowed by the protected-mirror subtraction:
+              it records what the operator's ids MATCHED, which must stay
+              visible even when the guard then refuses them, so a refused
+              request reads as refused rather than as silently lost.
+            - protected_skipped_count (int) / protected_skipped_ids
+              (list[str]): every ENUMERATED member matched by
+              :func:`find_protected_markers` — records this sweep must never
+              delete — in scroll order. Scoped to the enumeration rather than
+              to the delete set on purpose: the finding is that this script's
+              filter matched a protected record at all, and a member no
+              predicate happens to catch today is precisely the one a
+              union-scoped count would hide until an operator's
+              ``--delete-ids`` named it. Every id listed here is absent from
+              ``orphan_ids``. Present unconditionally in BOTH modes
+              (``0``/``[]`` when nothing was protected), so the skip is a
+              first-class, greppable fact in the nightly JSON rather than
+              something visible only in the journal.
             - cross_check (dict): adjacent-population census (task 3897) —
               ``{'source_total', 'flag_for_stage2_total', 'blind_spot',
               'probe_failed'}``. Diagnostic only, NEVER part of the delete
@@ -1020,6 +1044,38 @@ async def run(
             seen_ids.add(m['id'])
             orphans.append(m)
 
+    # Protected-mirror subtraction (task 3041/4435), applied BEFORE
+    # orphan_ids/targeted_correction_ids/bucket_counts are computed, so all
+    # three stay consistent with the delete set actually taken.
+    #
+    # The predicate runs over the whole ENUMERATED population, not just the
+    # union, and the delete set is then narrowed by object identity. Since
+    # `orphans` is a subset of `members`, that removes exactly the same
+    # members from the delete set either way — what widens is only what gets
+    # REPORTED. That is deliberate: the finding this guard exists to surface
+    # is that the enumeration filter matched a record it must never delete
+    # (mem0_tombstone's "the enumeration filter is over-broad for this pool"),
+    # which is a property of the enumeration, not of whichever predicate
+    # happened to also catch it. A ledger_stamp that no automatic predicate
+    # catches is exactly the case a union-scoped count would hide until the
+    # night an operator's --delete-ids named it.
+    #
+    # This partition exists ALONGSIDE the choke-point guard inside
+    # delete_orphan_markers, not instead of it, because the two have different
+    # jobs. This one is REPORTING: a DRY RUN never reaches
+    # delete_orphan_markers at all, so it is the only thing that keeps
+    # `orphan_count`'s documented meaning ("the actual number of records
+    # deleted (or that would be deleted)") true in the mode an operator reads
+    # before deciding to --apply. The choke-point guard is ENFORCEMENT, and is
+    # inherited by every current and future caller of delete_orphan_markers,
+    # including ones that never consult this predicate. Called from here the
+    # choke-point guard therefore never fires; it stays as defence in depth
+    # and is pinned directly by its own tests.
+    protected = find_protected_markers(members)
+    if protected:
+        protected_obj_ids = {id(m) for m in protected}  # builtin id(), not the key
+        orphans = [m for m in orphans if id(m) not in protected_obj_ids]
+
     orphan_ids = [o['id'] for o in orphans]
     # The found-intersection of args.delete_ids with the enumerated members
     # (not the raw input list) — order-preserving per `members`.
@@ -1050,6 +1106,8 @@ async def run(
         'undated_kept_count': len(undated_kept),
         'bucket_counts': bucket_counts,
         'targeted_correction_ids': targeted_correction_ids,
+        'protected_skipped_count': len(protected),
+        'protected_skipped_ids': [m['id'] for m in protected],
         'cross_check': cross_check,
     }
 
