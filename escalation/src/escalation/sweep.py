@@ -65,10 +65,14 @@ class SweepReport:
     # distinguishes the two even though the tally does not — do not read a
     # nonzero count as proof of corrupt JSON.
     skipped_unparsable: int = 0
-    # Counts records relocated OUT of the root by a CONCURRENT actor between
-    # the glob and the read — a resolve() in another process, or a second
+    # Counts records relocated OUT of the root by a CONCURRENT actor before
+    # this pass could act on them — a resolve() in another process, or a second
     # startup sweep during a fleet redeploy, when several orchestrators
-    # restart together.  Deliberately NOT skipped_unparsable: that counter
+    # restart together.  Covers BOTH halves of the exposure: between the glob
+    # and the read, and between the read and this pass's own move/unlink (the
+    # record is read outside the per-id lock, so taking that lock later does
+    # not make the parsed record fresh).  Deliberately NOT skipped_unparsable:
+    # that counter
     # means "left IN root for an operator-actionable reason", and a vanished
     # file is neither.  Logged at DEBUG, not WARNING — this is expected
     # concurrency, not corruption.
@@ -153,13 +157,36 @@ def _atomic_move(src: Path, dst: Path) -> None:
             raise
 
 
+def _source_vanished(path: Path) -> bool:
+    """True iff an ENOENT just raised by a move/unlink was about *path* itself.
+
+    Guarding the unlocked READ closes only half of sweep()'s exposure: the
+    record is read outside any lock and moved a few lines later, so a
+    concurrent ``resolve()`` — which takes the SAME per-id sidecar lock around
+    ``_archive_resolved``, and therefore need only complete and release before
+    this pass acquires — can leave the source gone by the time
+    ``os.replace``/``os.unlink`` runs.  ``_atomic_move`` re-raises every
+    ``OSError`` whose errno is not EXDEV, ENOENT included, so that would abort
+    the whole pass exactly as the read fault used to.
+
+    The discrimination matters because ``os.replace`` raises the SAME
+    ``FileNotFoundError`` for a missing DESTINATION parent (a dated subdir
+    pruned between our ``mkdir`` and our ``replace``).  That is a different
+    fault — the target tree is disappearing under us, not a routine record
+    relocation — so callers re-raise it rather than counting it as a benign
+    race.  Checked by probing the source, which is the only thing that
+    distinguishes the two after the fact.
+    """
+    return not path.exists()
+
+
 def _relocate_terminal(
     queue_dir: Path,
     path: Path,
     esc: Escalation,
     *,
     apply: bool = True,
-) -> bool:
+) -> str:
     """Relocate a terminal esc file to its dated archive subdir.
 
     Shared by ``sweep()``'s archive-missing branch and ``reap_loose_archive_files()``
@@ -179,8 +206,13 @@ def _relocate_terminal(
         apply: If True, actually move the file; if False, only check (dry-run).
 
     Returns:
-        ``True`` if the file was (or would be) moved; ``False`` if skipped due
-        to a collision — the existing target is left untouched.
+        ``'moved'``     -- the file was (or would be) relocated.
+        ``'collision'`` -- skipped; the existing target is left untouched.
+        ``'vanished'``  -- a concurrent actor relocated the SOURCE between this
+        pass's unlocked read and the move.  A tag rather than a bool for the
+        same reason ``read_escalation_for_scan`` returns one: the caller must
+        be able to count a benign race into a different report field than work
+        it actually performed.  See :func:`_source_vanished`.
     """
     assert esc.resolved_at is not None  # pre-condition: caller ensures terminal status
     target_dir = archive.archive_dir_for_date(queue_dir, esc.resolved_at)
@@ -196,15 +228,24 @@ def _relocate_terminal(
                     'skipping %s: target already exists at %s (not overwriting)',
                     path.name, target_path,
                 )
-                return False
+                return 'collision'
             target_dir.mkdir(parents=True, exist_ok=True)
-            _atomic_move(path, target_path)
+            try:
+                _atomic_move(path, target_path)
+            except FileNotFoundError:
+                if not _source_vanished(path):
+                    raise
+                logger.debug(
+                    '%s vanished before its move (relocated concurrently); skipping',
+                    path.name,
+                )
+                return 'vanished'
     else:
         # Dry-run: check for collisions without acquiring the lock.
         if target_path.exists():
-            return False
+            return 'collision'
 
-    return True
+    return 'moved'
 
 
 def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
@@ -259,28 +300,84 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
                 report.skipped_unparsable += 1
                 continue
             existing_archive = archive_index.get(path.stem)
+            archive_esc: Escalation | None = None
 
-            if existing_archive is None:
+            if existing_archive is not None:
+                # The ARCHIVE copy is read just as unlocked as the root one:
+                # archive_index is an rglob SNAPSHOT taken before this loop, so
+                # a concurrent archive.prune_archive — run_startup_sweep's own
+                # pass 3, hence a second orchestrator's startup sweep during a
+                # fleet redeploy — can rmtree the dated subdir holding it in
+                # between.  Its own context tag so a warning names this read
+                # rather than the root one.
+                archive_esc, archive_reason = read_escalation_for_scan(
+                    existing_archive, context='sweep.archive_copy',
+                    parse_errors=_SWEEP_PARSE_ERRORS,
+                )
+                if archive_reason == 'vanished':
+                    # No archive copy after all — treat exactly as absent and
+                    # fall through to the relocation below.  Not counted in
+                    # skipped_vanished: that counter tracks ROOT files leaving
+                    # the root, and this root file is about to be moved by us.
+                    existing_archive = None
+                elif archive_reason != 'ok' or archive_esc is None:
+                    # Unparsable or unreadable archive copy: richness cannot be
+                    # compared, and overwriting it blind could destroy the only
+                    # good record.  Leave BOTH copies on disk for the operator
+                    # — which is precisely what skipped_unparsable counts.
+                    report.skipped_unparsable += 1
+                    continue
+
+            if existing_archive is None or archive_esc is None:
                 # No archive copy: move to dated subdir via shared helper.
                 # The helper re-checks for collisions inside the per-id lock so
                 # a file that appeared between index-build and lock-acquire is
                 # detected atomically (TOCTOU safe).
-                if _relocate_terminal(queue_dir, path, esc, apply=apply):
+                outcome = _relocate_terminal(queue_dir, path, esc, apply=apply)
+                if outcome == 'moved':
                     report.archived += 1
+                elif outcome == 'vanished':
+                    report.skipped_vanished += 1
             else:
                 # Archive copy exists: compare richness
-                archive_esc = Escalation.from_json(existing_archive.read_text())
                 if _pick_richer(esc, archive_esc):
                     # Root wins: atomically overwrite the archive slot
                     if apply:
                         with escalation_id_lock(queue_dir, path.stem):
-                            _atomic_move(path, existing_archive)
+                            try:
+                                _atomic_move(path, existing_archive)
+                            except FileNotFoundError:
+                                # Same move-window race as _relocate_terminal's;
+                                # see _source_vanished for why the destination
+                                # case is re-raised instead.
+                                if not _source_vanished(path):
+                                    raise
+                                logger.debug(
+                                    '%s vanished before its reconciling move '
+                                    '(relocated concurrently); skipping',
+                                    path.name,
+                                )
+                                report.skipped_vanished += 1
+                                continue
                     report.reconciled_root_wins += 1
                 else:
                     # Archive wins: drop the duplicate root copy
                     if apply:
                         with escalation_id_lock(queue_dir, path.stem):
-                            os.unlink(path)
+                            try:
+                                os.unlink(path)
+                            except FileNotFoundError:
+                                # No destination to be ambiguous about here:
+                                # an unlink ENOENT means the root copy is
+                                # already gone, so this pass performed no
+                                # reconciliation and must not claim one.
+                                logger.debug(
+                                    '%s vanished before its duplicate-drop '
+                                    '(relocated concurrently); skipping',
+                                    path.name,
+                                )
+                                report.skipped_vanished += 1
+                                continue
                     report.reconciled_archive_wins += 1
             continue
 
@@ -452,8 +549,10 @@ def reap_loose_archive_files(queue_dir: Path, *, apply: bool = True) -> int:
             continue
 
         # _relocate_terminal handles the collision guard inside the per-id lock
-        # (closing the TOCTOU window) and performs the atomic move.
-        if _relocate_terminal(queue_dir, path, esc, apply=apply):
+        # (closing the TOCTOU window) and performs the atomic move.  Only
+        # 'moved' counts: a 'vanished' outcome means a concurrent sweep already
+        # filed this record, which is not a relocation THIS pass performed.
+        if _relocate_terminal(queue_dir, path, esc, apply=apply) == 'moved':
             moved += 1
 
     return moved

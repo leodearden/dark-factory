@@ -490,12 +490,28 @@ def read_escalation_for_scan(
     file in this package was audited when this helper was introduced; the
     asymmetry below is deliberate, not an oversight.
 
-    FIXED -- the unlocked ``glob``-then-read scans, all five routed through
-    this helper: ``queue.py::EscalationQueue.get_by_task``,
+    FIXED -- the unlocked scans, all six reads routed through this helper:
+    ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
     ``queue.py::EscalationQueue.find_terminal_by_citation``,
-    ``sweep.py::sweep`` and ``sweep.py::reap_loose_archive_files``.
+    ``sweep.py::reap_loose_archive_files``, and BOTH of ``sweep.py::sweep``'s
+    reads -- the root file, and the ARCHIVE copy its reconciliation branch
+    compares that file against.  The second one is not a glob-then-read but an
+    INDEX-then-read, and exposed for the same reason: ``_build_archive_index``
+    is an rglob snapshot taken before the loop, which a concurrent
+    ``archive.prune_archive`` invalidates wholesale by rmtree-ing a dated
+    subdir -- and ``run_startup_sweep`` runs prune as its own pass 3, so the
+    concurrent runner is a second orchestrator's startup sweep during a fleet
+    redeploy.
+
+    NOT THE WHOLE WINDOW, for sweep.py.  Guarding the READ leaves the MOVE
+    exposed: the record is read outside any lock and relocated a few lines
+    later, and ``os.replace``/``os.unlink`` raise ENOENT just as readily when a
+    concurrent ``resolve()`` gets there first.  That half is guarded in
+    sweep.py itself -- ``_source_vanished`` plus a ``FileNotFoundError`` catch
+    around each of the three movers -- rather than here, because it is not a
+    read at all.  Both halves feed the same ``SweepReport.skipped_vanished``.
 
     NOT NEEDED -- protected by the LOCK rather than by exception handling.
     The single-id read-modify-write methods in this module
