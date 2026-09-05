@@ -191,7 +191,10 @@ from functools import partial
 from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
-from fused_memory.reconciliation.mem0_tombstone import is_protected_mirror_record
+from fused_memory.reconciliation.mem0_tombstone import (
+    is_protected_mirror_record,
+    record_mem0_deletion_tombstones,
+)
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
@@ -591,13 +594,18 @@ async def delete_orphan_markers(
         causation_id: Optional causation id forwarded to each delete_memory call.
 
     Returns:
-        ``{'deleted': int, 'failed': [ids], 'protected_skipped': [ids]}``.
-        ``protected_skipped`` lists the members refused by the guard above, in
-        input order. All three keys are present unconditionally, including on
-        the empty-input fast path, so no caller needs a ``.get`` fallback.
+        ``{'deleted': int, 'failed': [ids], 'protected_skipped': [ids],
+        'tombstoned': int}``. ``protected_skipped`` lists the members refused
+        by the guard above, in input order. ``tombstoned`` is the number of
+        task-3041 ledger rows written for this sweep's confirmed deletes — a
+        value below ``deleted`` means records were destroyed with an
+        incomplete audit trail (no ``recon_ledger`` wired, or a failed batch
+        write; both logged at WARNING), never that a delete failed. All four
+        keys are present unconditionally, including on the empty-input fast
+        path, so no caller needs a ``.get`` fallback.
     """
     if not orphans:
-        return {'deleted': 0, 'failed': [], 'protected_skipped': []}
+        return {'deleted': 0, 'failed': [], 'protected_skipped': [], 'tombstoned': 0}
 
     # Enforcement, checked BEFORE the gather so an over-broad delete set
     # degrades to a loud skip rather than collateral mirror loss. One WARNING
@@ -645,6 +653,7 @@ async def delete_orphan_markers(
 
     deleted = 0
     failed: list[str] = []
+    tombstone_victims: list[dict] = []
     for orphan, result in zip(orphans, results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(
@@ -654,11 +663,42 @@ async def delete_orphan_markers(
             failed.append(orphan['id'])
         else:
             deleted += 1
+            # Success branch ONLY (task 3041): a tombstone must never claim a
+            # record that is still alive, so the failure branch above is
+            # deliberately left untouched. `deleted`/`failed` are therefore
+            # fully computed before the tombstone block below, and no path
+            # through it can perturb them.
+            tombstone_victims.append(orphan)
+
+    tombstoned = 0
+    if tombstone_victims:
+        # ONE ledger transaction for the whole sweep, not one per victim: each
+        # `upsert` is its own commit — hence its own fsync, serialized on the
+        # single aiosqlite worker thread — so a per-victim loop would cost N
+        # sequential fsyncs on a backlog sweep (task-3041 amendment finding).
+        #
+        # `deleter` is deliberately the same literal already passed to
+        # delete_memory as `_source`, per record_mem0_deletion_tombstone's
+        # documented contract for the field ("the delete's `_source` audit
+        # tag, i.e. WHICH sweep took it") — so the write journal and the
+        # tombstone name this sweep identically.
+        tombstoned = await record_mem0_deletion_tombstones(
+            memory_service,
+            project_id,
+            tombstone_victims,
+            deleter='sweep_orphan_flag_markers',
+            # Same id the deletes above were journaled under, which is what
+            # makes the two cross-referenceable. A manual/nightly sweep has no
+            # reconciliation run, so '' is the honest value (and matches the
+            # ledger row's own run_id default).
+            deleting_run_id=causation_id or '',
+        )
 
     return {
         'deleted': deleted,
         'failed': failed,
         'protected_skipped': protected_skipped,
+        'tombstoned': tombstoned,
     }
 
 
