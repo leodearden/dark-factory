@@ -753,6 +753,22 @@ lifecycle.
    instruction competes with the live pipeline and can produce a race condition or a \
    double-merge.
 
+4. **Never CANCEL an existing human-gate carrier because its subject showed a live \
+   signal.** A liveness flicker is transient; cancelling the carrier and re-minting one \
+   next cycle is what orphaned esc-5881-1 / esc-5902-1 / esc-5916-1 as \
+   permanently-pending L2 escalations, and what produced three carriers \
+   (5902 -> 5916 -> 5929) for the single subject 5879. Instead, AMEND the carrier in \
+   place with `update_task` — refresh its evidence and bump \
+   `metadata.recurrence_count` — or leave it entirely alone. Either is correct; \
+   cancel-and-remint never is. Identify the carrier by `metadata.gate_subject` (the \
+   "## Source-Completion" section is the authority for that canonical key and its \
+   read-side aliases). AMEND HAZARD: `update_task`'s `append=True` governs only \
+   `details` / `prompt` and does NOT append `description`, which always overwrites — \
+   so to extend a description, READ the current text first, write the full merged \
+   text, and verify the echoed `updated_task` reflects it. Re-filing is not an escape \
+   from this rule: the `submit_task` boundary now REJECTS a second gate for a subject \
+   whose carrier is still non-terminal.
+
 **Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
 — i.e., the task is absent from `### Live-Workflow Signals` (all three signals are \
 False: no worktree, no recent commits, no active orchestrator). That is the genuinely \
