@@ -11,9 +11,8 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 import merge_lane_throughput as mlt
+import pytest
 
 # ---------------------------------------------------------------------------
 # parse_window — clock-free: ``now`` is always injected, never read inside.
