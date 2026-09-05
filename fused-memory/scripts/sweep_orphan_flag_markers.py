@@ -830,6 +830,12 @@ async def run(
               unobserved population must never be asserted as a blind spot.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
+            - tombstoned (int, only when apply=True): task-3041 ledger rows
+              written for this sweep's confirmed deletes. A value below
+              ``deleted`` means records were destroyed with an incomplete
+              audit trail (typically no ``recon_ledger`` wired, or a failed
+              batch write — both logged at WARNING); it never indicates a
+              failed delete, which is reported by ``failed`` instead.
             - after (dict with counts, only when apply=True)
     """
     project_id: str = getattr(args, 'project_id', 'dark_factory')
@@ -1117,6 +1123,7 @@ async def run(
         )
         report['deleted'] = delete_result['deleted']
         report['failed'] = delete_result['failed']
+        report['tombstoned'] = delete_result['tombstoned']
 
         # After counts
         after_source = await memory_service.count_memories_by_metadata(
