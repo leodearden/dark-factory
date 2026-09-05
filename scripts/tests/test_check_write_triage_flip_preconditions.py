@@ -1565,7 +1565,8 @@ def _make_gate_repo(
     tmp_path: Path,
     *,
     judge: str = 'flat',
-    eval_src: str = 'failing',
+    eval_src: str | None = None,
+    eval_text: str | None = None,
     repo_name: str = 'gate-repo',
 ) -> Path:
     """A throwaway git repo the gate script can be run from.
@@ -1574,7 +1575,16 @@ def _make_gate_repo(
     so BOTH scripts are copied into ``<repo>/scripts/`` — that is what makes
     the fixture repo, rather than the real checkout, the thing item 1's
     ``git archive`` reads.
+
+    ``eval_text`` and ``eval_src`` are mutually exclusive: pass at most one.
+    When ``eval_text`` is given, it is written VERBATIM as the fixture's
+    ``eval_write_triage_judge.py`` instead of the ``_EVAL_FIXED``/
+    ``_EVAL_FAILING`` constants ``eval_src`` selects between (default
+    ``'failing'`` when neither is given, matching the historical default).
     """
+    assert eval_text is None or eval_src is None, (
+        'eval_text and eval_src are mutually exclusive'
+    )
     repo = tmp_path / repo_name
     (repo / 'scripts').mkdir(parents=True)
     for script in (_GATE_SCRIPT, _PROBE):
@@ -1584,8 +1594,12 @@ def _make_gate_repo(
 
     _write_fake_judge(repo / 'fused-memory' / 'src', variant=judge)
     (repo / 'fused-memory' / 'scripts').mkdir(parents=True)
+    if eval_text is not None:
+        eval_source = eval_text
+    else:
+        eval_source = _EVAL_FIXED if eval_src == 'fixed' else _EVAL_FAILING
     (repo / 'fused-memory' / 'scripts' / 'eval_write_triage_judge.py').write_text(
-        _EVAL_FIXED if eval_src == 'fixed' else _EVAL_FAILING,
+        eval_source,
     )
     (repo / 'fused-memory' / 'config').mkdir(parents=True)
     (repo / 'fused-memory' / 'config' / 'config.yaml').write_text(_CONFIG_YAML)
