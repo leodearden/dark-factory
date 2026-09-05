@@ -1826,9 +1826,18 @@ def test_main_rejects_a_malformed_window_loudly_without_a_traceback(capsys):
 
 
 def test_main_defaults_to_this_checkout_when_no_project_root_is_given(capsys):
-    # Read-only against the real store; assert only the LABEL, never a number
+    # Read-only against the real store; asserts only the LABEL, never a number
     # (runs.db is mutated continuously by the running orchestrator).
     code, out, _ = _run(capsys, '--window', '2026-01-01..2026-01-02', '--json')
-    assert code == 0
     payload = json.loads(out)
     assert list(payload['projects']) == [str(mlt.DEFAULT_PROJECT_ROOT)]
+    # The exit code is derived rather than hardcoded: a task worktree carries
+    # no data/orchestrator/runs.db (only the main checkout does), so a bare
+    # `assert code == 0` would pass in one tree and fail in the other — the
+    # non-hermeticity this module's docstring forbids. Deriving it pins the
+    # contract in BOTH trees: readable store -> 0, unreadable -> 1.
+    has_store = mlt.resolve_runs_db(mlt.DEFAULT_PROJECT_ROOT).is_file()
+    assert code == (0 if has_store else 1)
+    assert (payload['projects'][str(mlt.DEFAULT_PROJECT_ROOT)]['error'] is None) is (
+        has_store
+    )

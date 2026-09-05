@@ -33,6 +33,7 @@ import json
 import math
 import re
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, time, timedelta
@@ -1224,3 +1225,354 @@ def build_parser() -> argparse.ArgumentParser:
         help='Add the speculation section, incl. void rate by project (off by default).',
     )
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Rendering and CLI entry point.
+# ---------------------------------------------------------------------------
+
+# Every section header starts with this prefix and carries the CONCRETE
+# RESOLVED window it was computed over. The PRD's § Background table is NOT
+# single-windowed — seven rows are 14d and four are 30d — so a header without
+# its window lets two rows measured over different spans be read as one
+# measurement (plan decision 3).
+SECTION_PREFIX = '-- '
+
+SECTION_TITLES = {
+    'landings_per_day': 'landings/day',
+    'lead_time': 'lead-time split',
+    'verify_by_runner': 'verify duration by runner',
+    'occupancy': 'host occupancy',
+    'queue_depth': 'queue depth',
+    'mixes': 'outcome mixes',
+    'speculation': 'speculation',
+    'chains': 'merge-ahead chains',
+}
+
+VOID_RATE_BY_PROJECT_TITLE = 'void rate by project'
+
+
+def _section(title: str, window: tuple[str, str] | list[str]) -> str:
+    """A section header stamped with the window the section was computed over."""
+    lo, hi = window
+    return f'{SECTION_PREFIX}{title}  [{lo} .. {hi}] --'
+
+
+def _num(value: float | None, digits: int = 1) -> str:
+    """A float, or ``n/a`` — never ``0.0`` — when the series was empty."""
+    return 'n/a' if value is None else f'{value:.{digits}f}'
+
+
+def _count(value: int | None) -> str:
+    return 'n/a' if value is None else str(value)
+
+
+def _pct(value: float | None, digits: int = 1) -> str:
+    return 'n/a' if value is None else f'{value * 100:.{digits}f}%'
+
+
+def _rate(value: float | None) -> str:
+    return 'n/a' if value is None else f'{value:.3f}'
+
+
+def _format_landings(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    lines = [_section(SECTION_TITLES['landings_per_day'], window)]
+    lines.append(
+        f"  median {_num(section['median'])}  max {_count(section['max'])}"
+        f"  over {section['n_days']} complete UTC day bucket(s)"
+    )
+    if section['partial_trailing_day']:
+        lines.append(
+            f"  NOTE {section['partial_trailing_day']} is a PARTIAL trailing "
+            f'bucket (the window ends mid-day), so its count under-reports'
+        )
+    lines += [f'    {day}: {count}' for day, count in section['per_day'].items()]
+    return lines
+
+
+def _format_lead_time(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    lines = [_section(SECTION_TITLES['lead_time'], window)]
+    lines.append(
+        f"  {section['matched']} landing(s) joined to the last merge_queued "
+        f"strictly before them; {section['unmatched']} unmatched (queued "
+        f'before the window opened)'
+    )
+    lines.append(
+        '    segment           p50      p90      min      max      n  (minutes)'
+    )
+    for label, key in (
+        ('lead', 'lead'), ('queue wait', 'wait'),
+        ('verify', 'verify'), ('finalize+CAS', 'residual'),
+    ):
+        series = section[key]
+        lines.append(
+            f"    {label:<14}{_num(series['p50']):>7}  {_num(series['p90']):>7}"
+            f"  {_num(series['min']):>7}  {_num(series['max']):>7}"
+            f"  {series['n']:>5}"
+        )
+    return lines
+
+
+def _format_verify_by_runner(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    lines = [_section(SECTION_TITLES['verify_by_runner'], window)]
+    if not section['runners']:
+        lines.append('  no merge_verify rows in this window')
+    for name in sorted(section['runners']):
+        runner = section['runners'][name]
+        lines.append(
+            f"    {name:<12} p50 {_num(runner['p50']):>7}"
+            f"  p90 {_num(runner['p90']):>7}  n {runner['n']}"
+            f" (with a duration: {runner['n_durations']})"
+            f"  pass {_rate(runner['pass_rate'])}"
+        )
+    if section['fallback_key_present']:
+        for name in sorted(section['runners']):
+            reasons = section['runners'][name]['fallback_reasons']
+            if reasons:
+                lines.append(f'      {name} fallback_reason: {reasons}')
+    else:
+        # NOT "0 fallbacks": no row in this window carried the key at all, so
+        # this window is no evidence either way about busy-fallback dispatch.
+        lines.append(
+            '      fallback_reason: key not present on any row in this window'
+        )
+    return lines
+
+
+def _format_occupancy(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    lines = [_section(SECTION_TITLES['occupancy'], window)]
+    lines.append(
+        '  three estimators, deliberately unreconciled — none is authoritative'
+    )
+    if not section['hosts']:
+        lines.append(
+            f"  no merge_heartbeat host samples in this window "
+            f"({section['n_heartbeats']} heartbeat(s))"
+        )
+    for name in sorted(section['hosts']):
+        host = section['hosts'][name]
+        lines.append(
+            f"    {name:<12} LOCF {_pct(host['locf_busy_fraction']):>7}"
+            f"  raw-sample {_pct(host['raw_sample_fraction']):>7}"
+            f"  verify-duration {_pct(host['verify_duration_fraction']):>7}"
+        )
+        lines.append(
+            f"      {host['n_samples']} sample(s), {host['n_busy_samples']} busy;"
+            f" slot states {host['slot_states']}"
+        )
+    return lines
+
+
+def _format_queue_depth(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    return [
+        _section(SECTION_TITLES['queue_depth'], window),
+        f"  p50 {_num(section['p50'])}  p90 {_num(section['p90'])}"
+        f"  min {_count(section['min'])}  max {_count(section['max'])}"
+        f"  over {section['n']} heartbeat(s)",
+    ]
+
+
+def _format_tally(tally: dict[str, Any], indent: str = '      ') -> list[str]:
+    return [
+        f"{indent}{name} {count} ({_rate(tally['shares'][name])})"
+        for name, count in sorted(
+            tally['counts'].items(), key=lambda kv: (-kv[1], kv[0])
+        )
+    ]
+
+
+def _format_mixes(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    outcomes = section['attempt_outcomes']
+    states = section['finalize_states']
+    lines = [_section(SECTION_TITLES['mixes'], window)]
+    lines.append(
+        f"    merge_attempt outcomes (n={outcomes['total']}): "
+        f"{outcomes['n_terminal']} terminal, {outcomes['n_non_terminal']} "
+        f'non-terminal (still live — NOT landings)'
+    )
+    lines += _format_tally(outcomes)
+    lines.append(f"    merge_finalized states (n={states['total']}):")
+    lines += _format_tally(states)
+    return lines
+
+
+def _format_speculation(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    ahead = section['speculative_ahead']
+    lines = [_section(SECTION_TITLES['speculation'], window)]
+    lines.append(
+        f"    speculative_merge {section['n_speculative']}, chain_dead voids "
+        f"{section['n_voided_chain_dead']}, void rate "
+        f"{_rate(section['void_rate'])}"
+    )
+    lines.append(f"      void points: {section['void_points']}")
+    lines.append(
+        f"      landed with speculation ahead: {ahead['matched']}/"
+        f"{ahead['total']} ({_rate(ahead['share'])})"
+    )
+    # Two distributions, never pooled: speculative_merge.depth is a STR and
+    # merge_verify.depth is a native int (see compute_speculation).
+    lines.append(
+        f"      speculative_merge depth (str-coerced): "
+        f"{section['speculative_depth']['distribution']}"
+        f" (skipped {section['speculative_depth']['n_skipped']})"
+    )
+    lines.append(
+        f"      merge_verify depth (int): "
+        f"{section['verify_depth']['distribution']}"
+        f" (skipped {section['verify_depth']['n_skipped']})"
+    )
+    return lines
+
+
+def _format_chains(
+    section: dict[str, Any], window: tuple[str, str] | list[str]
+) -> list[str]:
+    items = section['chain_items']
+    lines = [_section(SECTION_TITLES['chains'], window)]
+    lines.append(
+        f"    items landed via chain (SUM of landed_via_chain): "
+        f"{section['items_landed_via_chain']} over "
+        f"{section['n_chain_landings']} chain landing(s) of "
+        f"{section['n_landings']} ({_rate(section['chain_landed_share'])})"
+    )
+    if section['n_unusable_landed_via_chain']:
+        lines.append(
+            f"      {section['n_unusable_landed_via_chain']} row(s) carried a "
+            f'non-numeric landed_via_chain and were not coerced'
+        )
+    lines.append(
+        f"      chain_items distribution: {items['distribution']};"
+        f" items per deep verify: {_num(items['items_per_deep_verify'], 2)}"
+        f" over {items['n_deep']} deep verify(s)"
+    )
+    return lines
+
+
+_SECTION_FORMATTERS = {
+    'landings_per_day': _format_landings,
+    'lead_time': _format_lead_time,
+    'verify_by_runner': _format_verify_by_runner,
+    'occupancy': _format_occupancy,
+    'queue_depth': _format_queue_depth,
+    'mixes': _format_mixes,
+    'speculation': _format_speculation,
+    'chains': _format_chains,
+}
+
+# Report order. A bundle only renders the sections it actually carries, so the
+# flagged ones simply do not appear unless they were requested.
+_SECTION_ORDER = (*_ALWAYS_ON_SECTIONS, 'speculation', 'chains')
+
+
+def format_report(bundles: Sequence[dict[str, Any]]) -> str:
+    """Render collected bundles as the human-readable report.
+
+    One block per project, labelled with the project root it was read from,
+    and never pooled: the projects are separate measurements of separate merge
+    lanes, and the between-project spread is a finding in its own right.
+
+    Every section header carries the concrete resolved window (see
+    :data:`SECTION_PREFIX`).  A bundle that failed renders its error where its
+    sections would have been — an unreadable store must not render as a quiet
+    fortnight.
+    """
+    if not bundles:
+        return ''
+    lines: list[str] = []
+    for bundle in bundles:
+        lines.append(f"=== project: {bundle['project_root']} ===")
+        lines.append(f"runs.db: {bundle['runs_db']}")
+        if bundle['error'] is not None:
+            lines.append(f"ERROR: {bundle['error']}")
+            lines.append('')
+            continue
+        for key in _SECTION_ORDER:
+            section = bundle['sections'].get(key)
+            if section is None:
+                continue
+            lines.append('')
+            lines += _SECTION_FORMATTERS[key](section, bundle['window'])
+        lines.append('')
+
+    by_project = void_rate_by_project(bundles)
+    if by_project:
+        window = bundles[0]['window']
+        lines.append(
+            f'=== {VOID_RATE_BY_PROJECT_TITLE}  '
+            f'[{window[0]} .. {window[1]}] ==='
+        )
+        for root, entry in by_project.items():
+            lines.append(
+                f"  {root}: {entry['n_voided_chain_dead']}/"
+                f"{entry['n_speculative']} = {_rate(entry['void_rate'])}"
+            )
+        lines.append(
+            '  (side by side, never pooled: the spread between projects is '
+            'the finding)'
+        )
+    return '\n'.join(lines).rstrip('\n')
+
+
+def main(argv: Sequence[str], now: datetime | None = None) -> int:
+    """CLI entry point. Returns 0, or non-zero when a project could not be read.
+
+    *now* is injectable so a caller (and every test) can fix the clock that
+    ``--window <N>d`` resolves against; production passes nothing and gets
+    ``datetime.now(UTC)``.
+
+    Exit codes: ``2`` for a malformed ``--window`` (nothing is printed to
+    stdout), ``1`` when at least one project's store could not be read — the
+    other projects still report, on stdout, and every failure is named on
+    stderr — and ``0`` otherwise.
+    """
+    args = build_parser().parse_args(list(argv))
+    resolved_now = now if now is not None else datetime.now(UTC)
+    try:
+        lo, hi = parse_window(args.window, resolved_now)
+    except argparse.ArgumentTypeError as exc:
+        print(f'merge_lane_throughput: {exc}', file=sys.stderr)
+        return 2
+
+    roots = resolve_project_roots(args.project_root)
+    bundles = collect_projects(
+        roots, lo, hi, chains=args.chains, speculation=args.speculation
+    )
+    for bundle in bundles:
+        if bundle['error'] is not None:
+            print(
+                f"merge_lane_throughput: {bundle['project_root']}: "
+                f"{bundle['error']}",
+                file=sys.stderr,
+            )
+
+    if args.json:
+        # Keyed by project root, and carrying `void_rate_by_project` on every
+        # run (empty without --speculation) so the schema is stable for the
+        # downstream decompositions that consume this.
+        print(json.dumps({
+            'window': [_iso(lo), _iso(hi)],
+            'projects': {b['project_root']: b for b in bundles},
+            'void_rate_by_project': void_rate_by_project(bundles),
+        }, indent=2, default=str))
+    else:
+        print(format_report(bundles))
+
+    return 1 if any_bundle_failed(bundles) else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
