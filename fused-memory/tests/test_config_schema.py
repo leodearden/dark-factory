@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings
 from fused_memory.config.schema import (
     CuratorConfig,
     EmbedderConfig,
+    EntityMintConfig,
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
@@ -967,6 +968,119 @@ class TestMem0UpdateConfig:
     def test_two_configs_do_not_share_the_submodel(self):
         a, b = FusedMemoryConfig(), FusedMemoryConfig()
         assert a.mem0_update is not b.mem0_update
+
+
+class TestEntityMintConfig:
+    """Authorization + storm knobs for the ensure_entity_node MCP tool (task 4932).
+
+    Shape copied from the ``TestMem0UpdateConfig`` trio above — the same
+    kill-switch + self-reported-agent-prefix-allowlist + storm-knob posture,
+    for the same reason: minting a Graphiti Entity node from MCP is a
+    write-time-identity primitive, so it ships behind a narrow allowlist and a
+    kill switch rather than open on the tool surface.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig or Mem0UpdateConfig: recon Stage 1 and the curator are
+    this gate's first sanctioned CALLERS, not its owners, and the gate is about
+    the graph's identity surface rather than about mem0 in-place updates.
+    """
+
+    # --- fail-safe defaults ---
+
+    def test_default_enabled_is_true(self):
+        """A named kill switch, defaulting ON — the tool ships usable.
+
+        Mirrors ``Mem0UpdateConfig.enabled = True`` exactly: the narrow prefix
+        allowlist is the real bar, and this tool is strictly more careful than
+        merge_entities / delete_entity(force=True) / rename_entity, all already
+        on the MCP surface with no locking at all.
+        """
+        assert EntityMintConfig().enabled is True
+
+    def test_default_allowlist_is_recon_stage_and_curator(self):
+        """Same two prefixes as the mem0_update bars, for the same reasons:
+        recon-stage- admits every reconciliation stage agent, curator- admits
+        the interactive consolidation sitting."""
+        assert EntityMintConfig().allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
+
+    def test_default_lock_timeout_is_5s(self):
+        assert EntityMintConfig().lock_timeout_seconds == 5.0
+
+    def test_default_storm_threshold_is_10(self):
+        assert EntityMintConfig().storm_threshold == 10
+
+    def test_default_storm_window_is_3600(self):
+        assert EntityMintConfig().storm_window_seconds == 3600.0
+
+    def test_separate_instances_do_not_share_lists(self):
+        """A shared default_factory list would let one config's widening leak
+        into every other instance."""
+        a, b = EntityMintConfig(), EntityMintConfig()
+        a.allowed_agent_prefixes.append('x-')
+        assert b.allowed_agent_prefixes == ['recon-stage-', 'curator-']
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = EntityMintConfig(
+            enabled=False,
+            allowed_agent_prefixes=['recon-stage-', 'auditor-'],
+            lock_timeout_seconds=0.25,
+            storm_threshold=3,
+            storm_window_seconds=600.0,
+        )
+        assert cfg.enabled is False
+        assert cfg.allowed_agent_prefixes == ['recon-stage-', 'auditor-']
+        assert cfg.lock_timeout_seconds == 0.25
+        assert cfg.storm_threshold == 3
+        assert cfg.storm_window_seconds == 600.0
+
+    # --- validation bounds: all three numeric leaves reject <= 0 ---
+
+    @pytest.mark.parametrize('field', [
+        'lock_timeout_seconds', 'storm_threshold', 'storm_window_seconds',
+    ])
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_numeric_leaves_reject_non_positive(self, field, bad):
+        with pytest.raises(ValidationError):
+            EntityMintConfig(**{field: bad})
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the narrow allowlist.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which would silently assert
+        on the shipped YAML rather than the schema default (the 65b011ed8c
+        tripwire casualties)."""
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.entity_mint, EntityMintConfig)
+        assert cfg.entity_mint.enabled is True
+        assert cfg.entity_mint.allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
+        assert cfg.entity_mint.lock_timeout_seconds == 5.0
+        assert cfg.entity_mint.storm_threshold == 10
+        assert cfg.entity_mint.storm_window_seconds == 3600.0
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1), which would cost every leaf
+        here its green-tier hot-reload."""
+        annotation = FusedMemoryConfig.model_fields['entity_mint'].annotation
+        assert annotation is EntityMintConfig, (
+            f'expected a bare EntityMintConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.entity_mint is not b.entity_mint
 
 
 class TestReconciliationConfigStormKnobs:

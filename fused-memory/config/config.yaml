@@ -378,6 +378,49 @@ summary_rebuild:
 #   storm_threshold: 20
 #   storm_window_seconds: 3600.0
 
+# Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
+# CREATES a Graphiti Entity node so a dangling referent has something to point
+# at. All five leaves are green-tier hot-reloadable: they are registered in
+# `config/reload.py::RELOADABLE_FIELDS`, which is the authoritative list, and
+# `mcp__escalation__reload_config` applies a change to any of them to a RUNNING
+# server with no restart. During a runaway-mint incident the knob you want is
+# `entity_mint.enabled: false` immediately below — it denies every caller on the
+# very next call. (Deliberately not cross-referenced to OPERATIONS.md §6: that
+# section's fused-memory enumeration is explicitly non-exhaustive and does not
+# yet name these leaves, so pointing an operator at it during an incident would
+# send them somewhere that answers "no such knob".)
+# Every value below is the shipped default, shown so the knobs are discoverable
+# without reading the schema. Uncomment to change one.
+# entity_mint:
+#   # Kill switch. false denies EVERY caller on the very next call, allowlisted
+#   # or not, with NO restart — this is the knob to flip during a runaway-mint
+#   # incident. It is green-tier precisely so that is true: a restart-only kill
+#   # switch is no kill switch, because the operator believes they turned it off.
+#   enabled: true
+#   # agent_id-prefix allowlist. Narrow by design: a node minted under a
+#   # non-canonical name SPLITS a referent instead of resolving it, and nothing
+#   # sweeps orphan minted nodes, so the damage is quiet and cumulative.
+#   # recon-stage- admits every reconciliation stage agent; curator- admits the
+#   # interactive memory-consolidation sitting, which is the flow that discovers
+#   # a dangling referent in the first place. agent_id is SELF-REPORTED, so this
+#   # deters misuse by cooperating callers rather than enforcing a security
+#   # boundary — a determined caller can claim any prefix.
+#   allowed_agent_prefixes: ['recon-stage-', 'curator-']
+#   # Bound on the wait for the per-group_id write-time-identity lock, which the
+#   # mint holds across its exact-name pre-read and the mint itself. Bounded
+#   # because the other holder (the episode-ingest write path) keeps that lock
+#   # across a full LLM extraction, so an unbounded wait would block an MCP
+#   # request for tens of seconds. On expiry the tool returns an
+#   # EntityMintLockBusy refusal and mints nothing. Raise it if you see that
+#   # refusal under heavy ingest; lower it to fail faster.
+#   lock_timeout_seconds: 5.0
+#   # Mint burst alarm: escalates, never blocks — the node it is complaining
+#   # about has already landed. Resolves (the idempotent re-call this primitive
+#   # is designed to make cheap) and refusals do not count toward it, or a
+#   # runaway minter would drown in ordinary traffic.
+#   storm_threshold: 10
+#   storm_window_seconds: 3600.0
+
 write_triage:
   # OPERATOR KNOBS — hand-set, NOT calibration outputs. These two are the only
   # keys in this block a human is meant to edit; everything below the fence is

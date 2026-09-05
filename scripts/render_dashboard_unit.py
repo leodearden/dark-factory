@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Render dark-factory-dashboard.service, PRESERVING this host's local Environment= values.
+"""Render a systemd unit, PRESERVING this host's local Environment= values.
+
+TWO UNITS, ONE RENDERER, selected by ``--unit`` off the ``UNITS`` registry
+below: dark-factory-dashboard.service (task 4793) and fused-memory.service
+(task 4796). The preservation core here was already unit-neutral — only the
+operator-facing log tag and the preserve set were dashboard-specific — so the
+second unit is a registry entry rather than a forked near-copy.
+
+The file keeps its dashboard-era NAME on purpose. ``render_dashboard_unit`` is
+referenced at ~35 sites across 8 tracked files, two of which (in
+tests/scripts/test_check_dashboard_unit_parity.py) WRITE and UNLINK
+``scripts/render_dashboard_unit.py`` by literal path to build setup-host.sh's
+section-8 tmp repo; a rename is filed as separate follow-up work rather than
+smuggled into the task that fixes the defect. The half of that naming problem
+that actually costs anything at 3am is OPERATOR-facing — one shared tag would
+print ``[dashboard_unit_render]`` lines describing the fused-memory unit in a
+long bring-up log — and that half IS fixed here: the tag is per-unit.
 
 WHAT THIS EXISTS TO PREVENT, measured rather than hypothetical. setup-host.sh
 used to install the dashboard unit with a plain truncating redirect::
@@ -24,6 +40,18 @@ scripts/setup-host.sh — so following the gate's advice was what caused the los
 
 This renderer closes that: it reads the values off the unit that is already
 installed and puts the host-local ones back into the freshly rendered text.
+
+THE SECOND UNIT IS THE HIGHER-STAKES ONE (task 4796). Section 4 of the same
+script installed fused-memory.service the same truncating way, and
+scripts/fused-memory.service.template carries the same
+``Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`` line — but on THAT
+unit the variable is not a dashboard view setting. fused_memory/models/scope.py
+reads it as ``KNOWN_PROJECT_ROOTS_ENV``, and reconciliation/harness.py raises
+``UnknownProjectError`` for a project absent from the resulting set. Collapsing
+it therefore de-registers every other project from RECONCILIATION, and the loss
+is again invisible: the post-install gate (check_fused_memory_unit_parity.py)
+checks only host-invariant safety directives and is structurally incapable of
+saying anything about this variable's value.
 
 WHY A SEPARATE SCRIPT RATHER THAN A ``--fix`` ON THE PARITY CHECKER. That
 module's docstring argues at length for staying READ-ONLY, and names the
@@ -51,6 +79,7 @@ hard requirement for something setup-host.sh calls before any venv exists.
 
 import argparse
 import contextlib
+import dataclasses
 import os
 import pathlib
 import shlex
@@ -64,6 +93,11 @@ from collections.abc import Sequence
 # check_*_unit_parity.py family: setup-host.sh's parity gates believe no status
 # unless the checker's own tag appears in the output it produced, because an
 # exit code alone cannot distinguish "ran and reported" from "never ran".
+#
+# This is the DASHBOARD's tag and `_log`'s default. Since task 4796 the tag is
+# per-unit (UNITS below) and `main` threads the selected spec's tag through
+# `_log(..., log_tag=...)` explicitly. Kept as a module-level name because
+# task 4793's suite asserts on it and the dashboard call site passes no --unit.
 LOG_TAG = "dashboard_unit_render"
 
 # The bare sibling import resolves in both contexts this script runs in: as a
@@ -142,10 +176,130 @@ def render_template(template_text: str, *, repo_root: str, uv_path: str) -> str:
 # registry has with setup-host.sh's _orch_units array.
 HOST_LOCAL_ENVIRONMENT: tuple[str, ...] = ("DASHBOARD_KNOWN_PROJECT_ROOTS",)
 
-# The section every dashboard Environment= directive lives in. Named rather
+# The fused-memory unit's preserve set (task 4796). ONE NAME, and the exclusions
+# are the design rather than an oversight — "preserve the host's Environment=
+# values" is the wrong generalisation and would break the unit it is protecting.
+# scripts/fused-memory.service.template declares five other Environment= names,
+# every one of them deliberately absent from here:
+#
+#   * CONFIG_PATH, PROJECT_ROOT, TASKMASTER_DIR are RENDERED from __REPO_ROOT__.
+#     Preserving them across a re-render would pin the fused-memory server's
+#     config and project root at the OLD checkout while WorkingDirectory= moved
+#     to the new one — the identical hazard the DASHBOARD_PROJECT_ROOT paragraph
+#     above describes, and the reason that name is on the dashboard checker's
+#     DIVERGENCE_ALLOWLIST yet still not preserved.
+#   * MEM0_TELEMETRY=false is host-INVARIANT, and it is on
+#     check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES — which that
+#     checker exact-matches and --fix synthesizes. Preserving it would put a
+#     preserved name on the checker's exact-match list, the disjointness
+#     violation described in the WARNING below.
+#   * FUSED_MEMORY_PREDONE_HOOK_REIFY is the interesting near-miss: it carries a
+#     literal host path (/home/leo/.cargo/bin/reify-audit), which makes it LOOK
+#     host-local. But it is committed VERBATIM in the template with no sentinel,
+#     so a re-render reproduces it byte-identically and there is nothing to lose.
+#     Adding it would start pinning whatever a host happened to have — including
+#     a stale hook path — over the committed one: an unrequested behaviour
+#     change, not a safety improvement.
+#
+# WARNING — THE DISJOINTNESS INVARIANT, and the one edit that would invert it.
+# No name preserved here may ever appear as the variable of an exact
+# `Environment=<NAME>=...` entry in
+# check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES. That constant's own
+# comment invites the edit ("Extend this list to guard additional safety flags"),
+# and adding DASHBOARD_KNOWN_PROJECT_ROOTS there would make `find_drift` — which
+# tests exact WHOLE-LINE membership — report a correctly-preserved MULTI-root
+# line as missing, so `--fix` appends the single-root line after the last
+# [Service] line, where systemd's LAST-WINS silently beats the value this
+# renderer had just preserved. Invisibly, since the checker then exits 0.
+# Held by tests/scripts/test_check_fused_memory_unit_parity.py::
+# test_preserved_names_are_disjoint_from_required_service_directives, with the
+# hazard demonstrated by ::test_a_required_known_project_roots_line_would_reclobber.
+FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT: tuple[str, ...] = ("DASHBOARD_KNOWN_PROJECT_ROOTS",)
+
+
+@dataclasses.dataclass(frozen=True)
+class UnitRenderSpec:
+    """Everything about rendering ONE unit that is not shared by both.
+
+    The preservation core (``render_template`` / ``preserved_values`` /
+    ``_environment_token`` / ``apply_preserved`` / ``render_unit``) is already
+    unit-neutral: it is parameterised by ``names``, and --template/--output are
+    CLI flags. Exactly two things were dashboard-specific, and they are the two
+    fields here. Adding a third unit is therefore a registry entry, not a fork.
+
+    FROZEN: the preserve set is POLICY, pinned by tests and reasoned about in the
+    comments above. A spec mutated per invocation would make "which names does
+    this host preserve?" depend on argument-parsing order.
+    """
+
+    log_tag: str
+    host_local_environment: tuple[str, ...]
+
+    # The committed template this unit is rendered FROM, REPO-RELATIVE. It is
+    # what makes the registry self-describing rather than a bare tag/preserve-set
+    # pair, and it is what the staleness guard reads to pair a preserve set with
+    # the template that must actually declare it
+    # (tests/scripts/test_render_dashboard_unit.py::
+    # test_every_preserved_name_is_declared_exactly_once_in_its_units_template).
+    # A preserve set checked against the WRONG unit's template would pass while
+    # preserving nothing on the host, since the two templates declare overlapping
+    # but not identical Environment= sets. MEASURED: pointing this field at the
+    # other unit's template leaves that staleness guard GREEN — which is why the
+    # field is also pinned to what setup-host.sh actually passes as --template
+    # for this --unit, by ::test_setup_host_renders_each_unit_from_the_template_
+    # its_spec_names in the same module. No production code reads this field, so
+    # that pairing is the whole of its meaning.
+    #
+    # --template STAYS A REQUIRED CLI FLAG and is deliberately NOT defaulted from
+    # this field. Do not "tidy" that into a default: setup-host.sh passes an
+    # absolute path built from $REPO_ROOT, so defaulting would introduce a SECOND
+    # path-resolution rule (script-relative vs caller-supplied) for no caller that
+    # wants one — and it would silently resolve against the checkout this file
+    # happens to live in rather than the one being installed, which is the exact
+    # class of wrong-checkout bug the preserve set excludes PROJECT_ROOT to avoid.
+    template: str
+
+
+# The registry --unit selects from. Keys are the operator-facing unit NAMES as
+# setup-host.sh spells them on the command line.
+#
+# The "dashboard" entry is built FROM the module-level constants rather than
+# duplicating their values, so the registry is an ADDITION to this module's
+# public surface rather than a rename of it: task 4793's suite asserts on
+# LOG_TAG and HOST_LOCAL_ENVIRONMENT directly, and setup-host.sh section 8
+# passes no --unit at all. Identity is pinned by
+# tests/scripts/test_render_dashboard_unit.py::
+# test_dashboard_spec_is_the_modules_existing_public_surface.
+#
+# THE TAGS MUST STAY DISTINCT. Both units are rendered by this same script in
+# the same bring-up run, and setup-host.sh routes an operator to a report BY TAG
+# — a shared tag would attribute the fused-memory unit's preserved/skipped lines
+# to the dashboard, on the unit where mis-attribution costs the most.
+UNITS: "dict[str, UnitRenderSpec]" = {
+    "dashboard": UnitRenderSpec(
+        log_tag=LOG_TAG,
+        host_local_environment=HOST_LOCAL_ENVIRONMENT,
+        template="scripts/dashboard.service.template",
+    ),
+    # RECIPROCAL POINTER: this unit's preserve set and
+    # check_fused_memory_unit_parity.REQUIRED_SERVICE_DIRECTIVES must stay
+    # DISJOINT by variable name. That checker's --fix appends a missing required
+    # line after the last [Service] line, where systemd's last-wins would beat
+    # anything preserved here — see the WARNING above
+    # FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT, and the matching warning at the point
+    # of the edit in check_fused_memory_unit_parity.py.
+    "fused-memory": UnitRenderSpec(
+        log_tag="fused_memory_unit_render",
+        host_local_environment=FUSED_MEMORY_HOST_LOCAL_ENVIRONMENT,
+        template="scripts/fused-memory.service.template",
+    ),
+}
+
+# The section every Environment= directive of BOTH units lives in. Named rather
 # than searched: check_dashboard_unit_parity's UnitSpec pins the same
 # `environment_section="Service"`, and the two must agree or the installer
-# preserves out of a section the gate does not read.
+# preserves out of a section the gate does not read. The fused-memory template
+# puts its Environment= lines in [Service] too, so one constant still serves.
 _ENVIRONMENT_SECTION = "Service"
 
 # Reasons a name in the preserve set did NOT survive into the render. Both are
@@ -350,18 +504,34 @@ def render_unit(
     return apply_preserved(rendered, preserved), preserved, skipped
 
 
-def _log(message: str, *, stream=None) -> None:
+def _log(message: str, *, stream=None, log_tag: str = LOG_TAG) -> None:
     """Print *message* prefixed with the log tag.
 
     Every line this script emits goes through here, on stdout and stderr alike
     — pinned by test_main_every_emitted_line_carries_the_log_tag. Same shape
     and same reason as check_dashboard_unit_parity._log.
+
+    *log_tag* IS THREADED, NOT GLOBAL (task 4796). Since one script now renders
+    two units, the tag varies per invocation — but rebinding the module-global
+    ``LOG_TAG`` from ``main`` would make every call site's output depend on
+    argument-parsing order, invisibly at the call site, and would leak across an
+    in-process second call (which is exactly how this module's suite invokes the
+    CLI). An explicit parameter defaulting to ``LOG_TAG`` keeps the dashboard's
+    behaviour and every existing call site unchanged.
     """
-    print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
+    print(f"[{log_tag}] {message}", file=stream if stream is not None else sys.stdout)
 
 
 def main(argv: "Sequence[str] | None" = None) -> int:
-    """Render the dashboard unit into --output, preserving host-local values.
+    """Render the --unit's template into --output, preserving host-local values.
+
+    WHICH UNIT is chosen by ``--unit`` off the ``UNITS`` registry, defaulting to
+    ``dashboard`` so the call site that predates the flag (setup-host.sh section
+    8) is unchanged. The unit decides exactly two things — the preserve set and
+    the log tag — and both are read off the spec here rather than from module
+    state: the tag is passed to every ``_log`` call explicitly, never by
+    rebinding the global, so a second in-process call cannot inherit the first
+    one's tag. Everything else below is unit-neutral.
 
     READING AND WRITING THE SAME PATH IS THE INTENDED PRODUCTION CALL:
     setup-host.sh passes the installed unit as --output, and this reads that
@@ -384,7 +554,9 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     NamedTemporaryFile is 0600, so replacing without restoring would silently
     re-permission a unit this tool exists to leave alone.
 
-    ``--no-preserve`` renders the template and nothing else. It is for
+    ``--no-preserve`` renders the template and nothing else — it empties the
+    preserve SET rather than merely skipping the read, so the names are not then
+    reported as absent from a file this run never opened. It is for
     REGENERATING THE REPO-SIDE committed copy, where preserving is exactly
     wrong: there the --output being read is the artifact under regeneration, so
     a stale committed value would be carried straight back into the "fresh"
@@ -396,10 +568,23 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Render dark-factory-dashboard.service from its template, "
-            "preserving host-local Environment= values already present in "
-            "--output."
+            "Render a dark-factory systemd unit from its template, preserving "
+            "host-local Environment= values already present in --output. "
+            "--unit selects WHICH unit (and therefore which values are "
+            "host-local): dark-factory-dashboard.service or fused-memory.service."
         )
+    )
+    parser.add_argument(
+        "--unit",
+        choices=sorted(UNITS),
+        default="dashboard",
+        help=(
+            "Which unit is being rendered. Selects the preserve set and the log "
+            "tag from the UNITS registry. Defaults to the dashboard, so the "
+            "call site that predates this flag is unchanged. `choices` is what "
+            "makes an unknown value a USAGE ERROR rather than a silent fallback "
+            "to a preserve set that does not match the unit being written."
+        ),
     )
     parser.add_argument("--template", required=True, help="Path to the .template file")
     parser.add_argument("--repo-root", required=True, help="Value for __REPO_ROOT__")
@@ -423,24 +608,34 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # The whole of what is unit-specific, resolved once. Everything below is
+    # unit-neutral and reads only `spec`.
+    spec = UNITS[args.unit]
+    log_tag = spec.log_tag
+
     template_path = pathlib.Path(args.template)
     output_path = pathlib.Path(args.output)
 
     try:
         template_text = template_path.read_text(encoding="utf-8")
     except OSError as exc:
-        _log(f"FAILED: cannot read template {template_path}: {exc}", stream=sys.stderr)
+        _log(
+            f"FAILED: cannot read template {template_path}: {exc}",
+            stream=sys.stderr,
+            log_tag=log_tag,
+        )
         _log(
             f"  {output_path} was NOT modified — it keeps whatever this host "
             "already had.",
             stream=sys.stderr,
+            log_tag=log_tag,
         )
         return 1
 
     # The installed side. An absent --output is the greenfield case, not an
     # error: there is simply nothing to preserve.
     installed_text = ""
-    names: tuple[str, ...] = HOST_LOCAL_ENVIRONMENT
+    names: tuple[str, ...] = spec.host_local_environment
     if args.no_preserve:
         # Not merely "read nothing": the preserve SET is emptied too, so the
         # names do not then get reported as absent-from-the-installed-unit,
@@ -448,7 +643,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         names = ()
         _log(
             f"--no-preserve: rendering the template as-is; no host-local "
-            f"Environment= values were read from {output_path}"
+            f"Environment= values were read from {output_path}",
+            log_tag=log_tag,
         )
     elif output_path.is_file():
         try:
@@ -457,11 +653,13 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             _log(
                 f"FAILED: cannot read the installed unit {output_path}: {exc}",
                 stream=sys.stderr,
+                log_tag=log_tag,
             )
             _log(
                 "  Refusing to render over a unit whose host-local values "
                 "could not be read.",
                 stream=sys.stderr,
+                log_tag=log_tag,
             )
             return 1
 
@@ -474,11 +672,12 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             names=names,
         )
     except ValueError as exc:
-        _log(f"FAILED: {exc}", stream=sys.stderr)
+        _log(f"FAILED: {exc}", stream=sys.stderr, log_tag=log_tag)
         _log(
             f"  {output_path} was NOT modified — its host-local values are "
             "intact and the unit may simply be stale.",
             stream=sys.stderr,
+            log_tag=log_tag,
         )
         return 1
 
@@ -487,11 +686,14 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     # structurally incapable of saying anything about its value: these lines are
     # the only record that the variable was handled at all.
     for name, value in preserved.items():
-        _log(f"preserved host-local Environment={name}={value}")
+        _log(f"preserved host-local Environment={name}={value}", log_tag=log_tag)
     for name, code in skipped.items():
         # The CODE is emitted as a bracketed token beside the sentence: stable
         # for anything matching on it, while the prose stays free to change.
-        _log(f"default used for Environment={name} [{code}]: {_SKIP_SENTENCE[code]}")
+        _log(
+            f"default used for Environment={name} [{code}]: {_SKIP_SENTENCE[code]}",
+            log_tag=log_tag,
+        )
 
     # `temp_name` is bound INSIDE the `with` but read in the `except`, so it is
     # declared here and assigned before the write: a failing `handle.write`
@@ -527,15 +729,20 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         if temp_name is not None:
             with contextlib.suppress(OSError):
                 os.unlink(temp_name)
-        _log(f"FAILED: cannot write {output_path}: {exc}", stream=sys.stderr)
+        _log(
+            f"FAILED: cannot write {output_path}: {exc}",
+            stream=sys.stderr,
+            log_tag=log_tag,
+        )
         _log(
             f"  {output_path} was NOT modified — the write goes through a temp "
             "file and a rename, so it is byte-unchanged.",
             stream=sys.stderr,
+            log_tag=log_tag,
         )
         return 1
 
-    _log(f"rendered {output_path}")
+    _log(f"rendered {output_path}", log_tag=log_tag)
     return 0
 
 
