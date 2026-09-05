@@ -821,3 +821,95 @@ def compute_speculation(
             'share': matched_landings / total_landings if total_landings else None,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Section: queue depth and the outcome/state mixes.
+# ---------------------------------------------------------------------------
+
+# Mirrors `merge_types.py::_NON_TERMINAL_OUTCOMES` — the OutcomeKind members
+# for which the attempt/merge is still live. Copied as literal strings, NOT
+# imported: scripts/ must stay importable without the orchestrator package
+# (this module's test gate runs under `uv run --project shared`). The set is
+# documented there as a FROZEN CONTRACT, already mirrored by the dashboard.
+_NON_TERMINAL_OUTCOMES = frozenset({
+    'cas_retry', 'gate_retry', 'post_merge_generation_chained',
+    'plan_files_narrowed',
+})
+
+
+def compute_queue_depth(
+    heartbeat_events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """p50/p90/min/max/n over `merge_heartbeat`'s ``data['depth']``.
+
+    ``depth`` is a native int (unlike `speculative_merge`'s str depth — see
+    :func:`compute_speculation`).  A heartbeat with no usable depth is skipped;
+    an empty window yields ``None`` percentiles rather than a depth of 0, which
+    would read as "the queue was empty" instead of "nobody was looking".
+    """
+    depths: list[float] = []
+    for event in heartbeat_events:
+        raw = event.get('data', {}).get('depth')
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        depths.append(float(raw))
+    series = _series(depths)
+    if depths:
+        series['max'] = int(max(depths))
+        series['min'] = int(min(depths))
+    return series
+
+
+def _tally(values: Iterable[str]) -> dict[str, Any]:
+    """Counter plus shares over observed strings, with a ``total``."""
+    counts = Counter(values)
+    total = sum(counts.values())
+    return {
+        'counts': dict(counts),
+        'total': total,
+        'shares': {k: v / total for k, v in counts.items()} if total else {},
+    }
+
+
+def compute_mixes(
+    attempt_events: Sequence[dict[str, Any]],
+    finalized_events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Tally `merge_attempt` outcomes and `merge_finalized` states.
+
+    Values are tallied AS OBSERVED, never validated against an imported
+    vocabulary.  Two reasons: `scripts/` must import without the orchestrator
+    package, and — more importantly — the vocabularies are not closed in
+    practice.  `merge_types.py::OutcomeKind` is the documented outcome
+    vocabulary, but `workflow.py` emits ``'superseded'`` deliberately OUTSIDE
+    it; `MergeOutcome.status` is the finalize-state Literal, to which
+    `event_store.py` documents ``'abandoned'`` as an addition.  A value this
+    script has never seen must appear in the report, not vanish from it.  A
+    row with the key missing buckets under :data:`UNKNOWN`.
+
+    Outcomes are additionally split terminal / non-terminal (see
+    :data:`_NON_TERMINAL_OUTCOMES`): ``gate_retry`` and ``cas_retry`` mean the
+    attempt is still live, so folding them in with terminal outcomes makes the
+    mix read as a landing tally when it is not.
+
+    Returns ``{'attempt_outcomes': {...}, 'finalize_states': {...}}``.
+    """
+    outcomes = _tally(
+        str(e.get('data', {}).get('outcome') or UNKNOWN) for e in attempt_events
+    )
+    counts: dict[str, int] = outcomes['counts']
+    non_terminal = {
+        k: v for k, v in counts.items() if k in _NON_TERMINAL_OUTCOMES
+    }
+    terminal = {k: v for k, v in counts.items() if k not in _NON_TERMINAL_OUTCOMES}
+    outcomes.update({
+        'non_terminal': non_terminal,
+        'terminal': terminal,
+        'n_non_terminal': sum(non_terminal.values()),
+        'n_terminal': sum(terminal.values()),
+    })
+    states = _tally(
+        str(e.get('data', {}).get('state') or UNKNOWN) for e in finalized_events
+    )
+    return {'attempt_outcomes': outcomes, 'finalize_states': states}
