@@ -100,6 +100,14 @@ def _make_harness() -> Harness:
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
     h.config = OrchestratorConfig()
+    # Pin the sweep flag rather than inheriting it from
+    # dark-factory-orchestrator.yaml, which does not declare it today — so a
+    # bare config picks up the code default True by accident, and an operator
+    # declaring it false would silently disarm 13 tests here (task 4481,
+    # measured).  Every OTHER key still reads the operational config, which is
+    # why this is a pin and not the code_default_config hatch.  Tests that are
+    # ABOUT the kill-switch flip it back off with the same model_copy idiom.
+    h.config = h.config.model_copy(update={'escalation_revalidation_enabled': True})
     h.scheduler = MagicMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.make_id = MagicMock(return_value='esc-revalidation-1')
