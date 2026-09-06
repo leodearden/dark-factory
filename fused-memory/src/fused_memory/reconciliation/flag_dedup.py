@@ -419,6 +419,9 @@ def _decompose_suppression_task_id(tid: str) -> list[str]:
 
     Only the SUPPRESSION row's task_id is ever decomposed by this helper --
     a flag's own task_id is never split (see :func:`filter_suppressed`).
+    :func:`_cluster_growth_candidate_task_ids` (task 3476) is the separate
+    splitter that DOES decompose a flag's own composite task_id, for its own
+    task-resolution purposes; that claim above stays true of this helper.
 
     Pure, sync, no I/O.
     """
@@ -5126,3 +5129,90 @@ def _is_cluster_growth_flag_type(flag_type: Any) -> bool:
         return True
     tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
     return 'cluster' in tokens and 'growth' in tokens
+
+
+def _cluster_growth_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
+    """Return the memory ids *flag* structurally cites, in citation order (task 3476).
+
+    Reads ONLY ``flag['cited_memories'][].memory_id`` -- the schema-required,
+    server-verified citation channel (``cli_stage_runner``'s finding schema
+    requires ``memory_id`` + ``store``; the ids are re-resolved by
+    ``verify_cited_memories``).  Deliberately NOT a UUID regex over the
+    finding's free text: Stage-1 prose routinely embeds NON-memory uuids (run
+    ids, finding ids, causation ids) that will never appear in a gate task's
+    cluster list, so a prose extractor would make the caller's all-present test
+    permanently unsatisfiable and the guard a silent no-op.
+
+    Entries whose ``store`` is not ``'mem0'`` are INCLUDED, conservatively: an
+    unmatched graph-edge uuid can only fail the all-present test and force a
+    KEEP, which is the fail-safe direction.
+
+    Total over malformed LLM-authored input -- a non-list ``cited_memories``, a
+    non-dict entry, or a missing/non-``str``/blank ``memory_id`` is skipped
+    rather than raised on.  Results are deduped, keeping first position.
+
+    Pure, sync, no I/O.
+    """
+    entries = flag.get('cited_memories')
+    if not isinstance(entries, list):
+        return []
+    seen: set[str] = set()
+    ids: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        memory_id = entry.get('memory_id')
+        if not isinstance(memory_id, str):
+            continue
+        memory_id = memory_id.strip()
+        if not memory_id or memory_id in seen:
+            continue
+        seen.add(memory_id)
+        ids.append(memory_id)
+    return ids
+
+
+def _cluster_growth_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
+    """Return every task id *flag* points at, in resolution order (task 3476).
+
+    Two channels, top-level first:
+
+    1. ``flag['task_id']`` -- coerced to ``str`` (an int ``3417`` yields
+       ``'3417'``) and split on ``','`` to handle the composite shape
+       (``'3417,3468'``), each component stripped.
+    2. ``flag['cited_tasks'][].task_id`` -- coerced to ``str``, blanks and
+       non-dict entries skipped.  ``project_id`` is deliberately NOT filtered
+       on; see :func:`filter_accounted_cluster_growth_flags`' docstring.
+
+    NOT :func:`_decompose_suppression_task_id`: that helper's contract reserves
+    comma-decomposition for suppression LEDGER rows and states that a flag's
+    own task_id is never split by it.  This is the separate, task-3476-owned
+    splitter for a flag's own task_id.
+
+    Total over malformed LLM-authored input.  Results are deduped, keeping
+    first position; returns ``[]`` when nothing resolvable is present.
+
+    Pure, sync, no I/O.
+    """
+    seen: set[str] = set()
+    ids: list[str] = []
+
+    def _add(raw: Any) -> None:
+        if raw is None or isinstance(raw, bool):
+            return
+        if not isinstance(raw, (str, int)):
+            return
+        for part in str(raw).split(','):
+            part = part.strip()
+            if not part or part in seen:
+                continue
+            seen.add(part)
+            ids.append(part)
+
+    _add(flag.get('task_id'))
+    cited_tasks = flag.get('cited_tasks')
+    if isinstance(cited_tasks, list):
+        for entry in cited_tasks:
+            if isinstance(entry, dict):
+                _add(entry.get('task_id'))
+    return ids
