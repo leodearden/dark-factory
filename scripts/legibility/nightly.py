@@ -486,6 +486,13 @@ def post_escalation(
     """Best-effort escalate_info POST for a fail-loud trigger (PRD decision
     8): extractor crash, coder storm, or commit failure.
 
+    Also used by the exit-0 notices that are NOT fail-loud triggers, which
+    pass ``level=logging.WARNING``: budget suppression, the barren streak,
+    the deletion directive, and (task 4736) the CAPPED-night deferral. The
+    level rule is exactly that — ERROR iff this escalation is itself the
+    fail-loud trigger returning ``exit_code=1``, WARNING iff it deliberately
+    leaves the exit code untouched.
+
     JOURNALS THE PAIR FIRST, AT *level*, BEFORE ANYTHING ELSE HAPPENS.
     That single line is the contract this function now carries: EVERY
     escalation this module posts is written to the journal here, at the
@@ -772,6 +779,35 @@ class NightlyResult:
     live trickle's 14 fully-suppressed nights (2026-07-16..29) went
     unnoticed. ``exit_code`` deliberately stays 0 -- see
     :func:`_report_sample_outcome`."""
+
+    capped: bool = False
+    """True when this night's coding was DEFERRED by a usage/auth cap rather
+    than failing (``coder.is_cap_deferral(run)``) — task 4736.
+
+    A structured fact rather than a log line to scrape, in the shape of
+    ``budget_suppressed`` above and for the same reason: without it a
+    deferred night and a genuine coder storm are indistinguishable in every
+    observable a caller has beyond the exit code.
+
+    ``exit_code`` is deliberately 0. An all-accounts-capped night is a NORMAL
+    operating condition, not an incident (Leo's directive; sibling task
+    4503): the systemd unit must not fail, no L0/L2 promotion should fire,
+    and nothing is fabricated to fill the gap. On 2026-08-24 the absence of
+    this branch turned expected weather into ``exit_code=1`` plus an
+    ERROR-level escalation.
+
+    VOCABULARY RESERVATION for task 4514. This task lands the token ``capped``
+    for a run whose coding was deferred by a usage cap. 4514's fourth
+    ``classify_run`` outcome must ACCOUNT for it rather than collapsing
+    ``capped`` into ``failed``: the two warrant different operator responses —
+    a capped night needs no action and self-clears at the reset, a failed
+    night does not. ``trickle_state.py`` and ``check_trickle_progress.py`` are
+    deliberately NOT touched here so 4514 owns those files uncontended (which
+    is also why this night still recorded ``outcome=productive``:
+    ``classify_run`` keys only on ``selected_count > 0``). What this task does
+    change is the input 4514 will read — the exit code recorded into
+    trickle-state.json for a capped night is now an honest 0 rather than a
+    misleading 1."""
 
     barren_escalated: bool = False
     """True when THIS run crossed the barren-streak threshold and posted the
@@ -1257,6 +1293,42 @@ def run_nightly(
         run = coder.code_digests(
             digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
         )
+
+        if coder.is_cap_deferral(run):
+            # A capped night is a DEFERRAL, not a failure (task 4736).
+            # Placed immediately above the storm branch because it is a
+            # refinement of it: the batch really did exceed the storm
+            # threshold, but its failures are majority CAPS -- digests the
+            # CLI never actually looked at. Charging those to the coder made
+            # 2026-08-24 read as an infra incident for a condition ruled
+            # normal (Leo's directive; sibling task 4503).
+            #
+            # Same skip-everything discipline as the storm branch below --
+            # no merge, no dump, no commit, nothing fabricated -- but
+            # exit_code 0, and the escalation journalled at WARNING rather
+            # than ERROR, per post_escalation's level rule: ERROR iff the
+            # escalation is itself the fail-loud trigger returning
+            # exit_code=1.
+            summary = (
+                f'legibility trickle coder DEFERRED: all accounts capped, '
+                f'{run.capped}/{run.total} digests returned a usage-limit '
+                f'banner instead of a model turn'
+            )
+            # Joined exactly as the storm branch does, so the marker text
+            # reaches BOTH the journal and the escalation detail. Without it
+            # the operator reads a deferral with no stated cause.
+            detail = '; '.join(f'{session}: {reason}' for session, reason in run.failures)
+            escalated = post_escalation(
+                cfg, summary, detail, poster=poster, level=logging.WARNING,
+            )
+            return NightlyResult(
+                exit_code=0,
+                coder_status=run.status,
+                capped=True,
+                escalated=escalated or suppression_escalated,
+                budget_suppressed=budget_suppressed,
+                reason=summary,
+            )
 
         if run.status == 'failure':
             # >50% of digests failed to code (PRD §5.3/§6.8 storm threshold):

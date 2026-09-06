@@ -26,6 +26,7 @@ import pytest
 from legibility import (
     census_trigger,
     codebook,
+    coder,
     digest,
     nightly,
     trickle_state,
@@ -1750,8 +1751,157 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
 # step-15/16: run_nightly -- fail-loud on coder storm (decision 8, §8.6)
 # ---------------------------------------------------------------------------
 
+_CAP_BANNER_4736 = "You've hit your weekly limit - resets 2pm (Europe/London)"
+"""The verbatim line observed on 2026-08-24, from the shared corpus entry.
+
+Spelled here rather than imported so the unit tests read as the incident
+replay they are; the CORPUS is the authority, and the end-to-end replay below
+asserts this exact text survives the whole chain."""
+
+
+def _fake_invoke_capped(prompt: str, model: str):
+    """Every digest hits a usage cap -- the 2026-08-24 shape."""
+    raise coder.CoderCapExhausted(
+        "claude CLI exited 1 (model='haiku', claude_bin='claude', cwd=None): "
+        f'stdout="{_CAP_BANNER_4736}" stderr=\'\'',
+        marker="you've hit your",
+    )
+
+
 def _fake_invoke_unparseable(prompt: str, model: str) -> str:
     return 'not valid json at all'
+
+
+# ---------------------------------------------------------------------------
+# task 4736: run_nightly's capped night -- a DEFERRAL, not a fail-loud branch
+# ---------------------------------------------------------------------------
+
+def test_run_nightly_defers_an_all_capped_night(tmp_path, caplog):
+    """An all-accounts-capped night exits 0 and leaves the codebook alone.
+
+    The 2026-08-24 shape.  Before this, the same night exited 1 with an
+    ERROR-level escalation -- an operator paged for a condition ruled normal
+    (Leo's directive; sibling task 4503).
+    """
+    codebook_path_holder = {}
+
+    def _poster(url, envelope):
+        escalation_calls.append((url, envelope))
+
+    escalation_calls = []
+    with caplog.at_level(logging.DEBUG):
+        result, repo = _run_e2e_nightly(
+            tmp_path, branch='capped', poster=_poster,
+        )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    codebook_path_holder['p'] = codebook_path
+
+    # (a) A capped night is not a failed night.
+    assert result.exit_code == 0, (
+        "a capped night must not fail the systemd unit -- that is what turned "
+        "2026-08-24 into an infra incident"
+    )
+    # (b) The new structured fact.
+    assert result.capped is True
+    # (c) The batch really did storm; only the DISPOSITION differs.  status's
+    # vocabulary is deliberately unchanged, because census reads it.
+    assert result.coder_status == 'failure'
+    # (f) Nothing merged, nothing dumped, nothing committed, nothing made up.
+    assert result.commit_made is False
+    assert result.applied == 0
+
+    # (d) Exactly ONE escalation, naming the deferral rather than a storm, and
+    # carrying the cap text so the journal names the cause on first read.
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    summary = arguments['summary'].lower()
+    assert 'storm' not in summary, (
+        f"a deferral must not be announced as a storm; got {summary!r}"
+    )
+    assert 'cap' in summary or 'defer' in summary, summary
+    assert 'weekly limit' in arguments['detail'].lower(), (
+        f"the cap banner must reach the escalation detail, or the operator "
+        f"reads a deferral with no stated cause; got {arguments['detail']!r}"
+    )
+
+    # (e) WARNING, not ERROR: post_escalation's own level rule is ERROR iff
+    # this escalation is itself the fail-loud trigger returning exit_code=1.
+    errors = [r for r in caplog.records
+              if r.name == 'legibility.nightly' and r.levelno >= logging.ERROR]
+    assert not errors, (
+        f"a deferred night must not journal at ERROR -- exit_code is 0, so "
+        f"this escalation is not a fail-loud trigger; got "
+        f"{[r.getMessage() for r in errors]!r}"
+    )
+    warnings = [r.getMessage() for r in caplog.records
+                if r.name == 'legibility.nightly' and r.levelno == logging.WARNING]
+    assert any('weekly limit' in w.lower() for w in warnings), (
+        f"the aggregate journal line must carry the cap text; got {warnings!r}"
+    )
+
+
+def test_run_nightly_capped_leaves_the_codebook_byte_identical(tmp_path):
+    """No dump, no commit, no fabricated records -- the file on disk is
+    unchanged."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=_fake_invoke_capped,
+        status_fetcher=None,
+        poster=lambda url, envelope: None,
+    )
+
+    assert result.exit_code == 0
+    assert result.capped is True
+    assert codebook_path.read_bytes() == before_bytes, (
+        "a deferred night must leave the codebook byte-identical -- nothing "
+        "was ever coded"
+    )
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log, "a deferred night makes no commit"
+
+
+def test_run_nightly_capped_is_false_on_the_other_branches(tmp_path):
+    """`capped` is never ambiguous: it is False on a healthy night and False
+    on a GENUINE storm.
+
+    The storm half is the regression guard -- if capped ever leaked onto a
+    real storm, every coder regression would defer silently.
+    """
+    happy_dir = tmp_path / 'happy'
+    storm_dir = tmp_path / 'storm'
+    happy_dir.mkdir()
+    storm_dir.mkdir()
+
+    happy, _repo = _run_e2e_nightly(happy_dir)
+    assert happy.capped is False
+    assert happy.exit_code == 0
+
+    storm, _repo2 = _run_e2e_nightly(storm_dir, branch='storm')
+    assert storm.capped is False
+    assert storm.exit_code == 1, "a genuine storm must still fail loudly"
+    assert storm.coder_status == 'failure'
 
 
 def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
@@ -2698,6 +2848,10 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
 
     * ``'extractor'``  — ``build_digests`` raises (needs *monkeypatch*)
     * ``'storm'``      — every digest's coding output is unparseable
+    * ``'capped'``     — every digest hits a usage cap (task 4736).  Not a
+      fail-loud branch: it returns ``exit_code=0``.  Wired here anyway so
+      the recorder and journaling parametrizations can reach it, since this
+      is the one place branch knowledge lives.
     * ``'validation'`` — the merged codebook fails ``codebook.validate``
       (needs *monkeypatch*)
     * ``'commit'``     — the committer fails
@@ -2748,6 +2902,8 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
     elif branch == 'storm':
         kwargs['invoke'] = _fake_invoke_unparseable
+    elif branch == 'capped':
+        kwargs['invoke'] = _fake_invoke_capped
     elif branch == 'validation':
         assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
         monkeypatch.setattr(
@@ -3892,3 +4048,203 @@ def test_missing_claude_binary_journals_both_halves_end_to_end(
         f'"1/1 digests failed" is what the incident already had. got '
         f'{aggregate!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 4736 step-15/16: THE 2026-08-24 INCIDENT REPLAY, end to end.
+#
+# On 2026-08-24 every account was capped. The claude CLI wrote
+# `You've hit your weekly limit - resets 2pm (Europe/London)` to STDOUT and
+# exited 1 for 17 of 20 digests; `_invoke_cli` embedded only the (empty)
+# stderr tail, so the reason that reached the journal, the escalation and
+# `run.failures` was the bare `claude CLI exited 1 (model='haiku', ...,
+# cwd=None): ` with nothing after the colon. The batch tripped the storm
+# threshold, `run_nightly` exited 1, and an operator was paged at
+# ERROR for a condition Leo has ruled NORMAL (sibling task 4503).
+#
+# This is that failure turned into an automated test, and it is the second
+# test in this module that runs `run_nightly` with NO `invoke=` override --
+# so it, like the 2026-08-18 ENOENT replay above, exercises the production
+# wiring `run_nightly -> coder.code_digests -> coder._invoke_cli` end to end.
+# It stays hermetic and free: LEGIBILITY_CLAUDE_BIN points at a fake shell
+# script, so there is no LLM call, no network and no spend.
+# ---------------------------------------------------------------------------
+
+_GITKRAKEN_HOOK_NOISE = (
+    'SessionEnd hook [/home/leo/.gk/gk_3_1_68 ai hook run --host claude-code] '
+    'failed: Hook cancelled'
+)
+"""A benign teardown race that also appears on SUCCESSFUL exit-0 runs.
+
+Present in this replay only as a DECOY: it shares the incident's transcripts
+and would be the first thing an operator's eye lands on, but it is not the
+cause of anything and must never be mistaken for one. Do not file or fix
+anything against it.
+"""
+
+
+def _write_fake_claude_streams(
+    bin_dir, *, stdout_text='', stderr_text='', exit_code=1,
+):
+    """Fake `claude`: emit *stdout_text* on STDOUT, *stderr_text* on STDERR,
+    exit *exit_code*.
+
+    Payloads travel through sidecar FILES the script ``cat``s, never
+    interpolated into the shell source -- the same discipline as
+    test_legibility_coder.py::_write_fake_claude_failing_on_both_streams, and
+    for the same reason: the verbatim 2026-08-24 banner carries an apostrophe
+    (``You've``), and the bytes the fake CLI emits have to be the incident's
+    bytes or a green test proves something other than what the CLI said.
+    """
+    out_file = bin_dir / 'fake_stdout.txt'
+    err_file = bin_dir / 'fake_stderr.txt'
+    out_file.write_text(stdout_text, encoding='utf-8')
+    err_file.write_text(stderr_text, encoding='utf-8')
+    script = bin_dir / 'claude'
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        # Drain the prompt so a large stdin can never EPIPE the fake before
+        # it has emitted its payloads.
+        'cat > /dev/null\n'
+        f'cat "{out_file}"\n'
+        f'cat "{err_file}" >&2\n'
+        f'exit {exit_code}\n'
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _replay_capped_night(tmp_path, monkeypatch, *, stdout_text, stderr_text):
+    """Run the real `run_nightly -> code_digests -> _invoke_cli` chain against
+    a fake `claude` that answers with a cap banner and exits 1."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    bin_dir = tmp_path / 'fake-bin'
+    bin_dir.mkdir()
+    fake = _write_fake_claude_streams(
+        bin_dir, stdout_text=stdout_text, stderr_text=stderr_text, exit_code=1,
+    )
+    # MANDATORY, not tidiness: with a real `claude` still on PATH, a
+    # regression in _invoke_cli's env-var branch would fall through to the
+    # bare name and spawn GENUINE billable Haiku calls. See the helper.
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    monkeypatch.setenv('LEGIBILITY_CLAUDE_BIN', str(fake))
+
+    escalations = []
+    # NO invoke= override: the real coder._invoke_cli seam runs.
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        status_fetcher=None,
+        poster=lambda url, envelope: escalations.append((url, envelope)),
+    )
+    return result, repo, escalations
+
+
+def test_capped_cli_defers_and_journals_both_halves_end_to_end(
+    tmp_path, monkeypatch, caplog,
+):
+    """The 2026-08-24 shape exactly: banner on STDOUT, stderr EMPTY, exit 1.
+
+    Both journal halves must name the cause -- where the incident's per-digest
+    line ended in a bare `...cwd=None): ` with nothing after the colon -- and
+    the run must DEFER (exit 0) rather than page an operator.
+    """
+    with caplog.at_level(logging.DEBUG):
+        result, repo, escalations = _replay_capped_night(
+            tmp_path, monkeypatch,
+            stdout_text=_CAP_BANNER_4736,
+            stderr_text='',
+        )
+
+    # (c) A capped night is a deferred night.
+    assert result.exit_code == 0, (
+        'an all-accounts-capped night must not fail the systemd unit -- that '
+        'is what turned 2026-08-24 into an infra incident'
+    )
+    assert result.capped is True
+    assert result.commit_made is False
+
+    # (a) Half one: the coder announced the cap for that specific digest,
+    # VERBATIM. This is the assertion the incident would have failed.
+    coder_warnings = [
+        r for r in caplog.records
+        if r.name == 'legibility.coder' and r.levelno >= logging.WARNING
+    ]
+    assert len(coder_warnings) == 1, (
+        f'expected one per-digest WARNING; got '
+        f'{[r.getMessage() for r in coder_warnings]}'
+    )
+    coder_message = coder_warnings[0].getMessage()
+    assert _CAP_BANNER_4736 in coder_message, (
+        'the CLI SAID what was wrong on stdout; a per-digest reason that '
+        f'drops it is the 17-of-20 empty-tail shape. got {coder_message!r}'
+    )
+
+    # (b) Half two: the aggregate carries it too, at WARNING, with no ERROR.
+    loud = _nightly_warnings(caplog)
+    assert [r for r in loud if r.levelno >= logging.ERROR] == [], (
+        'exit_code is 0, so this escalation is not a fail-loud trigger and '
+        'nothing here belongs in `journalctl -p err`; got '
+        f'{[r.getMessage() for r in loud if r.levelno >= logging.ERROR]}'
+    )
+    aggregates = [r for r in loud if _CAP_BANNER_4736 in r.getMessage()]
+    assert aggregates, (
+        'the aggregate must carry the REASON, not just the count -- a bare '
+        f'"1/1 digests failed" is what the incident already had. got '
+        f'{[r.getMessage() for r in loud]}'
+    )
+    assert all(r.levelno == logging.WARNING for r in aggregates)
+
+    # (d) One escalation, and its detail names the cause on first read.
+    assert len(escalations) == 1
+    _url, envelope = escalations[0]
+    detail = envelope['params']['arguments']['detail']
+    assert _CAP_BANNER_4736 in detail, (
+        f'the cap banner must survive into the escalation detail; got '
+        f'{detail!r}'
+    )
+
+
+def test_capped_cli_on_stderr_under_hook_noise_still_defers_end_to_end(
+    tmp_path, monkeypatch, caplog,
+):
+    """Same night, the other stream split -- and a decoy on the one left over.
+
+    The cap banner lands on STDERR while STDOUT carries only the benign
+    GitKraken SessionEnd hook line, which also appears on SUCCESSFUL exit-0
+    runs. The run must still defer, and the journal must still name the CAP:
+    a classifier that keyed on whichever stream happened to be non-empty
+    would report the hook race as the cause of a capped night.
+    """
+    with caplog.at_level(logging.DEBUG):
+        result, repo, escalations = _replay_capped_night(
+            tmp_path, monkeypatch,
+            stdout_text=_GITKRAKEN_HOOK_NOISE,
+            stderr_text=_CAP_BANNER_4736,
+        )
+
+    assert result.exit_code == 0
+    assert result.capped is True
+    assert result.commit_made is False
+
+    coder_warnings = [
+        r for r in caplog.records
+        if r.name == 'legibility.coder' and r.levelno >= logging.WARNING
+    ]
+    assert len(coder_warnings) == 1
+    coder_message = coder_warnings[0].getMessage()
+    assert _CAP_BANNER_4736 in coder_message, coder_message
+
+    assert [r for r in _nightly_warnings(caplog) if r.levelno >= logging.ERROR] == []
+    assert len(escalations) == 1
+    detail = escalations[0][1]['params']['arguments']['detail']
+    assert _CAP_BANNER_4736 in detail, detail

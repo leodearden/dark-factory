@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -26,6 +27,15 @@ import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
 import pytest
+
+# Imported AFTER `coder`, deliberately: it is coder.py's own module-level
+# sys.path bootstrap that puts this checkout's shared/src on the path, so this
+# line doubles as proof the bootstrap works under the scripts test harness.
+# The corpus is imported, never restated -- a second hand-maintained copy of a
+# verbatim transcript is the drift trap that let a weekly cap through the
+# census preflight (task 3645), and deriving from the one home means a CLI
+# rewording the markers stop covering turns THIS suite red too.
+from shared.cap_markers import REAL_CLI_CAP_MESSAGES
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
@@ -485,8 +495,403 @@ def _make_batch_invoke(fail_sessions):
     return fake_invoke
 
 
+# ---------------------------------------------------------------------------
+# task 4736 / GAP 1: a capped digest is a DISTINGUISHABLE per-digest outcome
+#
+# It is a strict refinement of ok=False, never a third success state: the
+# never-fabricate contract is untouched and `record` stays None.  What the
+# label buys is that the night's storm arithmetic can tell "the account had no
+# headroom" from "the coder is broken" -- the distinction whose absence made
+# 2026-08-24 read as 17 of 20 hard failures and page an operator for expected
+# weather.
+# ---------------------------------------------------------------------------
+
+def test_code_digest_cap_exhausted_is_a_labelled_failure_not_fabricated():
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    codebook = _tiny_codebook()
+
+    def fake_invoke(prompt, model):
+        raise mod.CoderCapExhausted(
+            "claude CLI exited 1 (model='haiku', ...): "
+            "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
+            marker="you've hit your",
+        )
+
+    result = mod.code_digest(
+        digest_text, codebook, project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.capped is True, (
+        "a cap must be DISTINGUISHABLE from a coder failure; without the "
+        "label the night's storm arithmetic cannot tell an account with no "
+        "headroom from a broken coder"
+    )
+    # Still a failure, and still never fabricated -- capped REFINES ok=False,
+    # it does not soften it into a success.
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a capped digest must still record WHY"
+    assert "weekly limit" in result.reason, (
+        f"the reason must carry the banner the CLI actually printed, or the "
+        f"morning journal says 'deferred' and nothing else; got "
+        f"{result.reason!r}"
+    )
+    # The digest is still attributable: session comes from the frontmatter,
+    # which was parsed long before the invocation was attempted.
+    assert result.session == _SESSION_ID
+
+
+def _capped_flag_for(invoke):
+    digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
+    return mod.code_digest(
+        digest_text, _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=invoke,
+    )
+
+
+def _raise_ordinary_invocation_error(prompt, model):
+    raise mod.CoderInvocationError(
+        "claude CLI exited 1 (model='haiku'): simulated backend outage"
+    )
+
+
+def _return_unparseable(prompt, model):
+    return "I'm sorry, I cannot help with that request."
+
+
+def _return_schema_invalid(prompt, model):
+    return json.dumps({
+        "matches": [{"entry_id": "x", "confidence": "high", "origin_phase": "NOT_A_PHASE"}],
+        "candidates": [],
+    })
+
+
+def _return_empty_judgment(prompt, model):
+    return json.dumps({"matches": [], "candidates": []})
+
+
+@pytest.mark.parametrize(
+    "invoke, label",
+    [
+        (_raise_ordinary_invocation_error, "an ordinary backend outage"),
+        (_return_unparseable, "unparseable model output"),
+        (_return_schema_invalid, "a schema-invalid record"),
+        (_return_empty_judgment, "a legitimately empty SUCCESS"),
+    ],
+)
+def test_code_digest_non_cap_outcomes_are_never_labelled_capped(invoke, label):
+    """The label must not spread.  Every other outcome -- three failure modes
+    and a success -- reports capped=False.
+
+    This is the guard on the deferral branch downstream: a capped label is
+    what buys exit_code=0 and a WARNING instead of a red night, so a label
+    that leaked onto ordinary failures would silently convert a real coder
+    regression into "we were capped, nothing to see here" -- fail-quiet, which
+    is exactly what this module's never-fabricate contract forbids.
+    """
+    result = _capped_flag_for(invoke)
+    assert result.capped is False, (
+        f"{label} was labelled as a usage cap; that silently converts a real "
+        f"regression into a deferred night"
+    )
+
+
+def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
+    """The pre-invocation failure path too -- it returns before `invoke` is
+    ever called, so it has its own construction site to keep honest."""
+    def fake_invoke(prompt, model):
+        raise AssertionError("invoke must never be reached")
+
+    result = mod.code_digest(
+        "no frontmatter here, just prose", _tiny_codebook(),
+        project="dark_factory", model="haiku", invoke=fake_invoke,
+    )
+    assert result.ok is False
+    assert result.capped is False
+    assert result.session is None
+
+
+# ---------------------------------------------------------------------------
+# task 4736: the EXIT-0 banner, and the guard that bounds where it is scanned
+#
+# The CLI does not always exit non-zero when it declines to answer -- it can
+# print the banner and exit 0, at which point the "reply" is prose that
+# parse_coder_output cannot turn into a verdict.  That is the second scan
+# site, and it is reached ONLY after the parse has already failed.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
+    """A banner that arrives as a successful-looking reply is still a cap.
+
+    Every corpus message is plain prose, so parse_coder_output cannot parse
+    it -- the same premise the census side already pins in
+    test_every_real_cli_cap_message_fails_to_parse_as_a_verdict.  Without
+    this, an exit-0 capped night looks like twenty digests of garbled model
+    output: a coder defect, investigated as one.
+    """
+    def fake_invoke(prompt, model):
+        return message
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.capped is True, (
+        f"an exit-0 reply that is nothing but a cap banner must be labelled "
+        f"a cap, not filed as garbled model output; got {result.reason!r}"
+    )
+    assert result.ok is False
+    assert result.record is None
+    assert result.reason, "a capped digest must still record WHY"
+
+
+def test_code_digest_exit_zero_cap_reason_names_the_marker():
+    def fake_invoke(prompt, model):
+        return "You've hit your weekly limit - resets 2pm (Europe/London)"
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+    assert result.capped is True
+    assert result.reason is not None, "a capped digest must still record WHY"
+    assert "weekly limit" in result.reason.lower(), (
+        f"the reason must quote WHICH signal fired -- 'deferred: weekly "
+        f"limit' and 'deferred' are different messages to the operator "
+        f"reading the morning journal; got {result.reason!r}"
+    )
+
+
+def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
+    """THE load-bearing guard.  A reply that parses into a verdict IS a
+    verdict.
+
+    This is census.py's own recorded defect, adopted as a rule rather than
+    rediscovered: scanning arbitrary model output with the loose marker list
+    aborted the census on cap-THEMED clusters, because this repo's codebook is
+    dominated by clusters ABOUT usage and weekly limits, so the markers match
+    ordinary HEALTHY content.  The coder is exposed to exactly the same
+    hazard -- its judgments carry model-authored title/cause/evidence_quote
+    fields that legitimately quote capped sessions, since "an agent stalled on
+    a usage limit" is a real confusion worth coding.
+
+    A pre-parse scan here would silently discard genuine findings about
+    capped-agent confusions -- the one cluster class this codebook most needs
+    -- and would do it quietly, labelled as a cap.
+    """
+    judgment = {
+        "matches": [],
+        "candidates": [{
+            "title": "agent stalled on a usage limit",
+            "cause": "You've hit your weekly limit - resets 2pm (Europe/London)",
+            "area": "orchestrator",
+            "origin_phase": "unknown",
+            "manifested_phase": "unknown",
+            "evidence_quote": "You've hit your usage limit for Claude Pro.",
+        }],
+    }
+
+    def fake_invoke(prompt, model):
+        return json.dumps(judgment)
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+
+    assert result.capped is False, (
+        "a WELL-FORMED judgment that merely QUOTES cap text was read as a cap "
+        "banner -- that discards a genuine finding about a capped-agent "
+        "confusion and labels the loss a deferral.  Split on parse success: a "
+        "reply that parses into a verdict is a verdict."
+    )
+    # Whether it codes cleanly or trips schema validation is not this test's
+    # business -- either is an honest disposition.  What must not happen is
+    # the cap label, and the record must not silently vanish into a deferral.
+    assert result.ok is True or result.reason, (
+        "a parsed verdict must end up either coded or explicitly rejected, "
+        "never quietly dropped"
+    )
+
+
+def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
+    """NEGATIVE.  Unparseable output carrying no marker keeps its existing
+    disposition: a plain parse failure, capped=False."""
+    def fake_invoke(prompt, model):
+        return "I'm sorry, I cannot help with that request."
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "a confusing correction happened here"),
+        _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=fake_invoke,
+    )
+    assert result.ok is False
+    assert result.capped is False
+    assert result.reason
+
+
 def _batch_digests(n):
     return [_hand_digest(f"batch-sess-{i}", f"body marker {i}") for i in range(n)]
+
+
+# ---------------------------------------------------------------------------
+# task 4736: the batch tally and the deferral predicate
+#
+# `status` stays a two-value vocabulary, {"ok","failure"}, and the cap arrives
+# as a COUNT plus one predicate.  That is not squeamishness about enums:
+# census.py computes `saturated = dup_rate >= config.dup_rate and
+# run_result.status != "failure"` and selects storm batches with
+# `s.status == "failure"`, so a third status value would silently make a
+# capped mining batch count as saturated and stop the census early.
+# ---------------------------------------------------------------------------
+
+def _mixed_batch_invoke(*, capped, failed):
+    """Return an *invoke* for a batch whose first *capped* digests hit a cap,
+    the next *failed* return unparseable garbage, and the rest code cleanly.
+
+    Dispatch matches the QUOTED session as it appears in the frontmatter
+    (`session: "batch-sess-7"`), not the bare id.  A bare-substring match is
+    ambiguous the moment a batch reaches ten digests -- "batch-sess-1" is a
+    prefix of "batch-sess-19" -- and these batches deliberately run to twenty
+    to exercise the storm threshold.
+    """
+    def fake_invoke(prompt, model):
+        for i in range(capped):
+            if f'"batch-sess-{i}"' in prompt:
+                raise mod.CoderCapExhausted(
+                    "claude CLI exited 1 (model='haiku', ...): "
+                    "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
+                    marker="you've hit your",
+                )
+        for i in range(capped, capped + failed):
+            if f'"batch-sess-{i}"' in prompt:
+                return "not parseable as json, sorry"
+        return json.dumps({"matches": [], "candidates": []})
+    return fake_invoke
+
+
+def _run_mixed(*, capped, failed, ok):
+    digests = _batch_digests(capped + failed + ok)
+    return mod.code_digests(
+        digests, _tiny_codebook(), project="dark_factory", model="haiku",
+        invoke=_mixed_batch_invoke(capped=capped, failed=failed),
+    )
+
+
+def test_code_digests_tallies_capped_alongside_the_existing_counts():
+    result = _run_mixed(capped=3, failed=2, ok=5)
+    assert result.total == 10
+    assert result.succeeded == 5
+    # A cap is still a FAILURE of coding this digest -- capped refines the
+    # failure count, it does not carve digests out of it.
+    assert result.failed == 5
+    assert result.capped == 3
+
+
+def test_code_digests_with_no_caps_reports_zero_capped():
+    result = _run_mixed(capped=0, failed=1, ok=3)
+    assert result.capped == 0
+    assert result.status == "ok"
+
+
+@pytest.mark.parametrize(
+    "capped, failed, ok, expected, why",
+    [
+        # The 2026-08-24 shape: every digest capped.
+        (20, 0, 0, True, "an all-accounts-capped night is a deferral"),
+        # A storm whose failures are MAJORITY capped, with genuine failures
+        # mixed in -- still a deferral: 8 of 11 failures were never coded at
+        # all.
+        (8, 3, 0, True, "a majority-capped storm is still a deferral"),
+        # A storm that is majority GENUINE failure.  A coder regression that
+        # merely coincides with a cap must still read as a storm and still
+        # exit non-zero, or the deferral branch becomes a place for real bugs
+        # to hide.
+        (3, 8, 0, False, "a majority-genuine storm is a storm"),
+        # Non-storm: failed/total == 0.1.  Not a deferral, because the night
+        # was overwhelmingly productive.
+        (2, 0, 18, False, "a minority of caps in a healthy run is not a deferral"),
+        (0, 0, 5, False, "an all-ok run is not a deferral"),
+        (0, 5, 0, False, "an all-genuine-failure storm is not a deferral"),
+        # Empty batch: total == 0, and must not ZeroDivisionError anywhere.
+        (0, 0, 0, False, "an empty batch is not a deferral"),
+    ],
+)
+def test_is_cap_deferral_truth_table(capped, failed, ok, expected, why):
+    result = _run_mixed(capped=capped, failed=failed, ok=ok)
+    assert mod.is_cap_deferral(result) is expected, (
+        f"{why} (capped={capped} failed={failed} ok={ok} -> "
+        f"status={result.status!r} capped={result.capped} "
+        f"failed={result.failed})"
+    )
+
+
+def test_code_digests_sub_storm_cap_taints_and_excludes_but_still_merges():
+    """TAINT-AND-EXCLUDE, the shape evals/runner.py already uses for a capped
+    cell: label it and drop it from the reported result, never score it zero
+    and never discard its healthy siblings.
+
+    2 capped of 20 leaves 18 genuine records that cost real tokens to produce.
+    Throwing them away because two digests found no headroom would be its own
+    kind of fabrication -- reporting less than was actually learned.
+    """
+    result = _run_mixed(capped=2, failed=0, ok=18)
+
+    assert result.status == "ok", "2 of 20 is not a storm"
+    assert mod.is_cap_deferral(result) is False
+    assert result.capped == 2
+    assert len(result.records) == 18, (
+        "the 18 genuinely coded records must still merge -- a capped digest is "
+        "excluded from the output, not a reason to discard the batch"
+    )
+    # And the excluded two are not silently gone: they are in `failures`.
+    assert len(result.failures) == 2
+
+
+def test_code_digests_announces_each_cap_through_the_existing_funnel(caplog):
+    """Every capped digest is still announced at WARNING through the ONE
+    append+log funnel, and the line NAMES the cap.
+
+    Naming it is the point: 20 identical cap lines must stay distinguishable
+    from 20 distinct model errors, which is the same property task 4511 added
+    per-digest lines to preserve.  The 2026-08-24 journal had 17 lines that
+    named nothing at all.
+    """
+    with caplog.at_level(logging.WARNING, logger="legibility.coder"):
+        result = _run_mixed(capped=3, failed=0, ok=1)
+
+    assert result.capped == 3
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "legibility.coder"]
+    assert len(lines) == 3, (
+        f"one WARNING per failed digest, through the single funnel; got "
+        f"{lines!r}"
+    )
+    for line in lines:
+        assert "weekly limit" in line.lower(), (
+            f"the announcement must NAME the cap, or the journal reads like "
+            f"three anonymous failures; got {line!r}"
+        )
+
+
+def test_run_result_failures_stay_two_tuples():
+    """`failures` keeps its (session, reason) shape.
+
+    nightly and epsilon both unpack these pairs; widening the tuple to carry
+    the cap flag would break every consumer for a fact the batch-level
+    `capped` count already reports.
+    """
+    result = _run_mixed(capped=2, failed=1, ok=1)
+    for failure in result.failures:
+        assert len(failure) == 2, failure
+        session, reason = failure
+        assert reason
 
 
 def test_code_digests_all_succeed_batch_status_ok():
@@ -786,6 +1191,317 @@ def test_invoke_cli_nonzero_exit_raises_invocation_error(tmp_path):
         )
 
 
+# ---------------------------------------------------------------------------
+# task 4736 / GAP 2: a non-zero exit must carry BOTH streams, each labelled
+#
+# The 2026-08-24 incident: the claude CLI wrote its cap banner to STDOUT and
+# exited 1, and _invoke_cli embedded only `(proc.stderr or "")[-2000:]`.  With
+# stderr empty, the reason string that reached the journal, the escalation and
+# `run.failures` was the bare `claude CLI exited 1 (model='haiku', ...): ` on
+# 17 of 20 digests -- the CLI had SAID exactly what was wrong and the coder
+# discarded it.
+# ---------------------------------------------------------------------------
+
+def _write_fake_claude_failing_on_both_streams(
+    bin_dir, *, stdout_text="", stderr_text="", exit_code=1,
+):
+    """Fake `claude` binary: emit *stdout_text* on STDOUT and *stderr_text* on
+    STDERR, then exit *exit_code*.
+
+    Payloads travel through sidecar FILES that the script ``cat``s, never
+    interpolated into the shell source the way _write_fake_claude_failing
+    does it.  Not fastidiousness: the task-4736 cap tests parametrize this
+    writer over ``shared.cap_markers.REAL_CLI_CAP_MESSAGES``, whose entries
+    already carry apostrophes and a U+00B7, and the next transcript-cited
+    entry may carry a ``"``, a ``$`` or a backtick that the shell would eat
+    or that would split the script outright.  The bytes the fake CLI emits
+    have to be the corpus's bytes, or a green test would be proving something
+    other than what the CLI actually said.
+    """
+    out_file = bin_dir / "fake_stdout.txt"
+    err_file = bin_dir / "fake_stderr.txt"
+    out_file.write_text(stdout_text, encoding="utf-8")
+    err_file.write_text(stderr_text, encoding="utf-8")
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        # Drain the prompt so a large stdin can never EPIPE the fake before
+        # it has emitted its payloads.
+        "cat > /dev/null\n"
+        f'cat "{out_file}"\n'
+        f'cat "{err_file}" >&2\n'
+        f"exit {exit_code}\n"
+    )
+    p.chmod(0o755)
+
+
+def test_invoke_cli_nonzero_exit_carries_both_streams_labelled(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir,
+        stdout_text="STDOUT_MARKER_SO7412 the CLI's own diagnostic",
+        stderr_text="STDERR_MARKER_SE7412 the backend's complaint",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
+        )
+
+    message = str(excinfo.value)
+
+    # (a) BOTH streams reach the reader.  Dropping either one is the defect.
+    assert "STDOUT_MARKER_SO7412" in message, (
+        f"the CLI's stdout must reach the error text -- this is the exact "
+        f"byte the 2026-08-24 incident discarded; got {message!r}"
+    )
+    assert "STDERR_MARKER_SE7412" in message, message
+
+    # (b) Each stream is LABELLED, so a reader can tell which stream said
+    # what.  Two unlabelled blobs concatenated would carry the bytes but not
+    # the provenance, and "the CLI wrote its banner to STDOUT" is precisely
+    # the fact this incident turned on.
+    assert "stdout=" in message, (
+        f"each stream must be labelled so the reader knows which one carried "
+        f"the diagnostic; got {message!r}"
+    )
+    assert "stderr=" in message, message
+
+    # (c) The pre-existing invocation context is still there -- this change
+    # ADDS a stream, it does not trade one diagnostic for another.
+    assert "model='haiku'" in message, message
+    assert "claude_bin=" in message, message
+    assert "cwd=" in message, message
+    assert "exited 1" in message, message
+
+
+def test_invoke_cli_nonzero_exit_with_empty_stderr_still_says_why(tmp_path):
+    """The exact 17-of-20 shape from 2026-08-24: everything on stdout,
+    stderr EMPTY, exit 1.  Before this change the operator-visible reason was
+    the empty-tailed `...cwd=None): ` -- a failure that named no cause."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir,
+        stdout_text="ONLY_ON_STDOUT_OS7412",
+        stderr_text="",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+
+    message = str(excinfo.value)
+    assert "ONLY_ON_STDOUT_OS7412" in message, (
+        f"with stderr empty the stdout text is the ONLY diagnostic the CLI "
+        f"produced; an error that omits it names no cause at all -- which is "
+        f"what reached the journal on 17 of 20 digests; got {message!r}"
+    )
+    # And the reason is no longer effectively empty after the colon.
+    assert not message.rstrip().endswith(":"), message
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_invoke_cli_nonzero_exit_tail_bounds_each_stream_keeping_the_tail(
+    tmp_path, stream,
+):
+    """Each stream is bounded, to the SAME constant, keeping its TAIL.
+
+    Parametrized over both streams rather than source-grepping for a stray
+    ``[-2000:]``: the bound that matters is the one the code APPLIES, and a
+    grep cannot tell a live literal from the docstrings that deliberately
+    cite the old one-stream slice as the incident's provenance.  Asserting
+    the behaviour on both streams pins "one shared bound, symmetrically
+    applied" directly -- an unbounded stream or a head-truncated one fails
+    here whatever the source happens to spell.
+    """
+    bound = mod._ERROR_STREAM_TAIL_CHARS
+    assert isinstance(bound, int) and bound > 0
+
+    payload = "HEAD_MARKER_HM7412" + ("x" * (bound * 2)) + "TAIL_MARKER_TM7412"
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir,
+        stdout_text=payload if stream == "stdout" else "",
+        stderr_text=payload if stream == "stderr" else "",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+
+    message = str(excinfo.value)
+    assert "TAIL_MARKER_TM7412" in message, (
+        f"{stream} must be truncated to its TAIL, not its head -- a CLI's "
+        f"last words are its diagnostic ones; got {message!r}"
+    )
+    assert "HEAD_MARKER_HM7412" not in message, (
+        f"an unbounded {stream} would blow up every journal line, "
+        f"run.failures entry and escalation body it lands in; the bound must "
+        f"actually bind"
+    )
+    # The bound BINDS, and binds to the shared constant: the surviving run of
+    # x's cannot exceed it.  (The message also carries the invocation context
+    # and the other, empty stream, so an exact length check would be pinning
+    # the prose rather than the bound.)
+    runs = [len(m) for m in re.findall(r"x+", message)]
+    assert runs, message
+    assert max(runs) <= bound, (
+        f"{stream}'s surviving payload ({max(runs)} chars) exceeds the shared "
+        f"bound of {bound}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 4736 / GAP 1: a non-zero exit whose output is a cap banner is TYPED
+#
+# The corpus is imported, never restated.  shared.cap_markers is the single
+# home for these strings precisely because a second hand-maintained copy is
+# the drift trap that let a weekly cap through the census preflight (task
+# 3645).  Parametrizing over it also means a future CLI rewording that the
+# markers stop covering turns THIS suite red alongside the two that already
+# derive from it.
+#
+# Importing it here has a second job: it proves coder.py's sys.path bootstrap
+# actually makes `shared` importable under the scripts test harness, which has
+# no orchestrator/shared install of its own.
+# ---------------------------------------------------------------------------
+
+
+def test_cap_exhausted_is_a_subclass_of_invocation_error():
+    """Every existing `except CoderInvocationError` site keeps working.
+
+    There are three -- code_digest, census._build_default_verify_fn and
+    census.preflight_headroom -- and none of them is touched by this task.  A
+    sibling exception type would have silently escaped all three, converting a
+    typed per-digest failure into an uncaught crash that takes down the whole
+    batch: strictly worse than the storm this task exists to prevent.
+    """
+    assert issubclass(mod.CoderCapExhausted, mod.CoderInvocationError)
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_invoke_cli_nonzero_exit_with_cap_banner_on_stdout_is_typed(
+    tmp_path, message,
+):
+    """STDOUT first-class: it is the stream the incident actually used."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text=message, stderr_text="", exit_code=1,
+    )
+
+    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
+        )
+
+    exc = excinfo.value
+
+    # (d) The matched marker is NAMED, so a deferral reason can quote which
+    # signal fired -- mirroring preflight_headroom's "...carries a banner
+    # marker: {marker!r}".  "deferred: weekly limit" and "deferred" are
+    # different messages to the operator reading the morning journal.
+    assert exc.marker, "the matched marker must be carried, not just the type"
+    assert exc.marker in message.lower(), (
+        f"marker {exc.marker!r} is not actually present in the banner "
+        f"{message!r} it claims to have matched"
+    )
+
+    # (e) Typing the error does not cost the diagnostic: the full step-1/2
+    # context is still there.
+    text = str(exc)
+    assert message in text, text
+    assert "stdout=" in text and "stderr=" in text, text
+    assert "model='haiku'" in text, text
+    assert "cwd=" in text, text
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_invoke_cli_nonzero_exit_with_cap_banner_on_stderr_is_typed(
+    tmp_path, message,
+):
+    """The other stream too -- the classification is about what the CLI SAID,
+    not about which pipe it happened to say it on."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text="", stderr_text=message, exit_code=1,
+    )
+
+    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+    assert excinfo.value.marker
+
+
+def test_invoke_cli_ordinary_failure_is_not_typed_as_a_cap(tmp_path):
+    """NEGATIVE.  A genuine backend failure must stay an ordinary invocation
+    error, or the deferral branch would launder real regressions into "we were
+    capped, nothing to see here" -- fail-quiet, exactly what this module's
+    never-fabricate contract forbids."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing(
+        bin_dir, exit_code=1, stderr_text="boom, the model backend is down",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+
+    assert not isinstance(excinfo.value, mod.CoderCapExhausted), (
+        "an ordinary backend failure was classified as a usage cap; that "
+        "silently converts a real regression into a deferred night"
+    )
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_invoke_cli_cap_text_on_a_ZERO_exit_is_returned_verbatim(
+    tmp_path, message,
+):
+    """NEGATIVE, and the load-bearing one: census's split-on-parse-success
+    rule.
+
+    census._build_default_verify_fn records a live defect from scanning
+    arbitrary model output with this loose marker list -- this repo's codebook
+    is dominated by clusters ABOUT usage and weekly limits, so the markers
+    match ordinary HEALTHY content, and the census aborted on cap-THEMED
+    clusters.  A zero-exit reply is a model turn, not a banner; classifying it
+    here would re-open that defect, and would also break
+    census.preflight_headroom, whose entire probe is "call _invoke_cli and
+    scan what comes BACK".
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text=message, stderr_text="", exit_code=0,
+    )
+
+    raw = mod._invoke_cli(
+        "prompt text", "haiku",
+        claude_bin=str(bin_dir / "claude"), timeout=10,
+    )
+    assert raw == message, (
+        "a zero-exit reply must come back verbatim; preflight_headroom scans "
+        "the RETURNED text itself, so raising here would break the very probe "
+        "that gates the census"
+    )
+
+
 def test_invoke_cli_timeout_raises_invocation_error(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1039,6 +1755,146 @@ def test_main_happy_path_writes_valid_jsonl_and_returns_0(tmp_path, monkeypatch,
     captured = capsys.readouterr()
     assert "total=2" in captured.err
     assert "failed=0" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# task 4736: main()'s third run-level disposition -- the DEFERRAL
+#
+# Mirrors census.main, which prints "census: deferred -- stage=... -- <reason>"
+# and returns 0 for its own headroom defer.  An operator should read the same
+# shape from both legibility CLIs, and a non-zero exit here would make
+# check_trickle_liveness.sh report a failure for a timer behaving exactly as
+# designed.
+# ---------------------------------------------------------------------------
+
+def _capping_invoke_cli(prompt, model, **kwargs):
+    raise mod.CoderCapExhausted(
+        "claude CLI exited 1 (model='haiku', claude_bin='claude', cwd=None): "
+        "stdout=\"You've hit your weekly limit - resets 2pm (Europe/London)\" "
+        "stderr=''",
+        marker="you've hit your",
+    )
+
+
+def test_main_all_capped_defers_with_exit_zero(tmp_path, monkeypatch, capsys):
+    """A capped night is not a failed night.
+
+    Exit 0, because an all-accounts-capped night is a normal operating
+    condition (Leo's directive; sibling task 4503).  Before this, the same
+    night exited 1 and epsilon turned that into an ERROR-level escalation --
+    an infra page for expected weather.
+    """
+    digests = [
+        _write_main_digest(tmp_path, f"main-capped-{i}", f"session {i} confusion", f"capped{i}")
+        for i in range(3)
+    ]
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+    monkeypatch.setattr(mod, "_invoke_cli", _capping_invoke_cli)
+
+    out_path = tmp_path / "out.jsonl"
+    rc = mod.main([
+        *[str(d) for d in digests],
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+        "--out", str(out_path),
+    ])
+
+    assert rc == 0, (
+        "a capped night must not exit non-zero -- that is what turned "
+        "2026-08-24 into an infra incident for a condition ruled normal"
+    )
+
+    # Zero records, and the --out truncated: exactly the storm arm's
+    # discipline.  A stale file from a prior successful run must never be
+    # left looking like tonight's output.
+    assert out_path.exists()
+    assert out_path.read_text(encoding="utf-8").strip() == "", (
+        "a deferred night writes ZERO records -- nothing was ever coded"
+    )
+
+    err = capsys.readouterr().err
+    assert "DEFERRED" in err, (
+        f"the deferral must be distinguishable AT A GLANCE from the storm "
+        f"branch's 'coder: FAILURE'; got {err!r}"
+    )
+    assert "FAILURE" not in err, (
+        f"a deferral must not be announced as a failure; got {err!r}"
+    )
+    assert "weekly limit" in err.lower(), (
+        f"the banner the CLI actually printed must reach the operator -- "
+        f"'deferred: weekly limit' and 'deferred' are different messages; "
+        f"got {err!r}"
+    )
+
+
+def test_main_deferral_summary_stays_honest_about_the_tally(tmp_path, monkeypatch, capsys):
+    """Exit 0 must not launder the counts.
+
+    The one-line summary still reports status=failure with the true
+    total/succeeded/failed, plus the new capped= count.  "Deferred, nothing
+    coded" must never be readable as "coded fine, found nothing" -- that is
+    the same conflation the never-fabricate contract exists to prevent, just
+    at the run level.
+    """
+    digests = [
+        _write_main_digest(tmp_path, f"main-honest-{i}", f"session {i} confusion", f"honest{i}")
+        for i in range(3)
+    ]
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+    monkeypatch.setattr(mod, "_invoke_cli", _capping_invoke_cli)
+
+    rc = mod.main([
+        *[str(d) for d in digests],
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+    ])
+    assert rc == 0
+
+    err = capsys.readouterr().err
+    assert "status=failure" in err, (
+        f"the summary must stay honest: nothing was coded tonight; got {err!r}"
+    )
+    assert "total=3" in err, err
+    assert "succeeded=0" in err, err
+    assert "failed=3" in err, err
+    assert "capped=3" in err, (
+        f"the summary must report the cap count, or the tally cannot be "
+        f"reconciled with the exit code; got {err!r}"
+    )
+
+
+def test_main_storm_with_no_caps_still_fails_loudly(tmp_path, monkeypatch, capsys):
+    """REGRESSION guard.  A genuine storm carrying zero caps keeps exiting 1
+    with the existing FAILURE output.
+
+    This is the boundary the whole deferral rests on: if it ever slipped, real
+    coder regressions would exit 0 and be silently deferred forever.
+    """
+    digests = [
+        _write_main_digest(tmp_path, f"main-real-{i}", f"session {i} confusion", f"real{i}")
+        for i in range(3)
+    ]
+    codebook_path = tmp_path / "codebook.yaml"
+    codebook_mod.dump(_tiny_codebook(), codebook_path)
+
+    def fake_invoke_cli(prompt, model, **kwargs):
+        return "not parseable as json, sorry"
+
+    monkeypatch.setattr(mod, "_invoke_cli", fake_invoke_cli)
+
+    rc = mod.main([
+        *[str(d) for d in digests],
+        "--codebook", str(codebook_path),
+        "--project", "dark_factory",
+    ])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "FAILURE" in err
+    assert "DEFERRED" not in err
+    assert "capped=0" in err
 
 
 def test_main_storm_writes_zero_records_and_returns_nonzero(tmp_path, monkeypatch, capsys):
