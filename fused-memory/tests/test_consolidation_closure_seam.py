@@ -653,25 +653,146 @@ class TestProductionProbeWiring:
         with pytest.raises(TimeoutError):
             await probe(_uuid(42), project_id='dark_factory')
 
-    def test_both_production_call_sites_pass_exists(self):
-        """A probe wired at only ONE ``set_consolidation_scroll`` site would
-        leave the closure gate half-armed depending on config — the same class
-        of silent half-wiring this task fixes. The comment above each site
-        already records why both exist (defining the collaborators inside the
-        enabled arm left the disabled arm raising NameError at startup)."""
-        import inspect  # noqa: PLC0415
 
-        from fused_memory.server import main as server_main
+class _RecordingInterceptor:
+    """Records what ``set_consolidation_scroll`` was handed.
 
-        src = inspect.getsource(server_main)
-        sites = [
-            block
-            for block in src.split('task_interceptor.set_consolidation_scroll(')[1:]
+    Deliberately mirrors the REAL signature
+    (``middleware/task_interceptor.py::TaskInterceptor.set_consolidation_scroll``)
+    rather than being a ``MagicMock``: the assertions below await the captured
+    collaborators to prove they actually work, which a call-args assertion on
+    the wiring call could never show.
+    """
+
+    def __init__(self):
+        self.wire_calls = 0
+        self.scroll = None
+        self.count = None
+        self.exists = None
+
+    def set_consolidation_scroll(self, scroll, count=None, exists=None):
+        self.wire_calls += 1
+        self.scroll = scroll
+        self.count = count
+        self.exists = exists
+
+
+class _RecordingMemoryService:
+    """All three collaborator methods, recording ``(method, args, kwargs)``.
+
+    Every one of these ``MemoryService`` methods takes ``project_id`` FIRST
+    positionally while the interceptor passes it by keyword, so a
+    transposition in the adapter is silent: it scopes the gate to the wrong
+    project and reads as "nothing found" rather than as an error.
+    """
+
+    def __init__(self, *, by_id=None, by_metadata=None, total=0, by_id_raises=None):
+        self.by_id = by_id
+        self.by_metadata = by_metadata if by_metadata is not None else []
+        self.total = total
+        self.by_id_raises = by_id_raises
+        self.calls = []
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        self.calls.append(('get_memory_by_id', (project_id, memory_id), {}))
+        if self.by_id_raises is not None:
+            raise self.by_id_raises
+        return self.by_id
+
+    async def get_memories_by_metadata(self, project_id, filters, limit=None):
+        self.calls.append(
+            ('get_memories_by_metadata', (project_id, filters), {'limit': limit})
+        )
+        return self.by_metadata
+
+    async def count_memories_by_metadata(self, project_id, filters):
+        self.calls.append(('count_memories_by_metadata', (project_id, filters), {}))
+        return self.total
+
+
+class TestClosureCollaboratorWiring:
+    """``server/main.py::_wire_closure_collaborators`` hands the interceptor
+    all three closure collaborators, each a working, correctly-scoped adapter.
+
+    This replaces a source-text pin that split ``inspect.getsource`` on the
+    literal call and asserted ``'exists=' in call``. That check could not tell
+    an ARMED probe from ``exists=None`` — the exact regression it claimed to
+    guard — and broke on behaviour-preserving argument reordering. Arming is
+    now proved by awaiting each collaborator against a recording stub.
+    """
+
+    @staticmethod
+    def _wire(memory_service):
+        from fused_memory.server.main import (  # noqa: PLC0415
+            _wire_closure_collaborators,
+        )
+
+        interceptor = _RecordingInterceptor()
+        _wire_closure_collaborators(interceptor, memory_service)
+        return interceptor
+
+    def test_all_three_collaborators_land_non_none(self):
+        """The arming property the deleted test only pretended to check: an
+        ``exists=None`` regression ships the ``unstamped_cluster_member``
+        derivation dormant, and must fail HERE."""
+        interceptor = self._wire(_RecordingMemoryService())
+        assert interceptor.wire_calls == 1
+        assert interceptor.scroll is not None
+        assert interceptor.count is not None
+        assert interceptor.exists is not None
+
+    @pytest.mark.asyncio
+    async def test_the_wired_exists_probes_the_right_scope_and_maps_a_payload(self):
+        svc = _RecordingMemoryService(
+            by_id={'id': _uuid(42), 'content': 'x', 'metadata': {}}
+        )
+        interceptor = self._wire(svc)
+        assert await interceptor.exists(_uuid(42), project_id='dark_factory') is True
+        assert svc.calls == [
+            ('get_memory_by_id', ('dark_factory', _uuid(42)), {}),
         ]
-        assert len(sites) == 2
-        for site in sites:
-            call = site.split(')')[0]
-            assert 'exists=' in call, call
+
+    @pytest.mark.asyncio
+    async def test_the_wired_exists_maps_none_to_absent(self):
+        interceptor = self._wire(_RecordingMemoryService(by_id=None))
+        assert await interceptor.exists(_uuid(42), project_id='dark_factory') is False
+
+    @pytest.mark.asyncio
+    async def test_the_wired_scroll_forwards_scope_filters_and_limit(self):
+        members = [_member(_uuid(1), canonical=True)]
+        svc = _RecordingMemoryService(by_metadata=members)
+        interceptor = self._wire(svc)
+        got = await interceptor.scroll(
+            {'topic': _TOPIC}, limit=250, project_id='dark_factory'
+        )
+        assert got == members
+        assert svc.calls == [
+            (
+                'get_memories_by_metadata',
+                ('dark_factory', {'topic': _TOPIC}),
+                {'limit': 250},
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_wired_count_forwards_scope_and_filters(self):
+        svc = _RecordingMemoryService(total=7)
+        interceptor = self._wire(svc)
+        assert await interceptor.count({'topic': _TOPIC}, project_id='dark_factory') == 7
+        assert svc.calls == [
+            ('count_memories_by_metadata', ('dark_factory', {'topic': _TOPIC}), {}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_still_propagates_through_the_wired_probe(self):
+        """The fail-closed contract survives the extraction, so
+        ``TaskInterceptor._consolidation_closure_error``'s handler still sees
+        the timeout instead of a store-wide "no strays"."""
+        interceptor = self._wire(
+            _RecordingMemoryService(by_id_raises=TimeoutError('qdrant point read'))
+        )
+        with pytest.raises(TimeoutError):
+            await interceptor.exists(_uuid(42), project_id='dark_factory')
 
 
 class TestSeamFlagsABlockLessGate:
