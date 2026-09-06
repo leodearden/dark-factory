@@ -39,32 +39,30 @@ def test_offline_lane_qdrant_config_round_trips_through_config_model(
 
     Other lane entries may coexist; this asserts only the qdrant one.
     """
-    config = root_config
-
-    assert config.git.offline_lane_enabled is True, (
-        "config.git.offline_lane_enabled did not bind to True from the "
+    assert root_config.git.offline_lane_enabled is True, (
+        "root_config.git.offline_lane_enabled did not bind to True from the "
         "committed YAML — check for a field rename/typo in config.py "
         "(OrchestratorConfig uses extra='ignore', so a mismatch silently "
         "reverts to the disabled-by-default default instead of raising)"
     )
-    assert config.git.persistent_offline_deep_worktree is True, (
-        "config.git.persistent_offline_deep_worktree did not bind to True "
+    assert root_config.git.persistent_offline_deep_worktree is True, (
+        "root_config.git.persistent_offline_deep_worktree did not bind to True "
         "from the committed YAML — the offline-deep lane worker cannot run "
         "without its dedicated worktree even if offline_lane_enabled is True "
         "(check for a field rename/typo in config.py)"
     )
-    assert config.git.offline_lane_legacy_numeric_enabled is False, (
-        "config.git.offline_lane_legacy_numeric_enabled did not bind to "
+    assert root_config.git.offline_lane_legacy_numeric_enabled is False, (
+        "root_config.git.offline_lane_legacy_numeric_enabled did not bind to "
         "False from the committed YAML — dark-factory has no "
         "scripts/run-offline-deep.sh, so leaving this at its True default "
         "would make the offline-deep worker attempt a nonexistent script "
         "(check for a field rename/typo in config.py)"
     )
 
-    commands = config.git.offline_lane_commands
+    commands = root_config.git.offline_lane_commands
     matches = [c for c in commands if getattr(c, "name", None) == "qdrant-integration"]
     assert len(matches) == 1, (
-        "config.git.offline_lane_commands did not round-trip exactly one "
+        "root_config.git.offline_lane_commands did not round-trip exactly one "
         f"'qdrant-integration' entry from the committed YAML (got "
         f"{len(matches)}; all entries: "
         f"{[getattr(c, 'name', None) for c in commands]!r}) — check for a "
