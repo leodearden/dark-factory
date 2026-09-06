@@ -46,7 +46,11 @@ if str(REPO_ROOT) not in sys.path:
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    CLOCK_PROVENANCE_SESSION_KEY,
+    CLOCK_PROVENANCE_SOURCE_KEY,
     PROTECTED_DEPLOY_CLOCK_RELPATHS,
+    PYTEST_SESSION_TOKEN_ENV,
+    clock_stamp_provenance,
     deploy_clock_guard_roots,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
@@ -221,6 +225,141 @@ class TestDeployClockSnapshot:
 
         assert snapshot[_FLEET_RELPATH] is not None
         assert snapshot[_FM_RELPATH] is None
+
+
+def _entry(body: bytes, mtime_ns: int = 1_700_000_000_000_000_000) -> tuple[bytes, int]:
+    """A snapshot entry built from a literal body — no I/O, no real clock."""
+    return (body, mtime_ns)
+
+
+# A genuine machine-operated stamp: a provenance-aware writer with no pytest
+# ancestor, hence an EMPTY session token. This is the one shape the guard is
+# allowed to forgive, so it is spelled out once and reused.
+_EXTERNAL_BODY = (
+    b'{"ts": 1787849070, "iso": "2026-08-28T09:24:30+00:00", '
+    b'"source": "restart-all-orchestrators.sh", "pytest_session": ""}\n'
+)
+# The pre-4823 shape. MUST stay unattributable: a writer that has not been
+# taught provenance cannot buy itself an exemption by omission.
+_LEGACY_BODY = b'{"ts": 1787849070, "iso": "2026-08-28T09:24:30+00:00"}\n'
+
+
+class TestClockStampProvenance:
+    """Who wrote the stamp — the whole discriminator, parsed from the body alone.
+
+    Task 4823. The pre-existing guard could see only that the bytes moved, so a
+    REAL fleet redeploy straddling a suite was indistinguishable from a test
+    falsifying the clock; it failed closed and blocked four innocent branches.
+    This parser is the attribution half of the fix. Every case here is built
+    from a LITERAL body so the parser's contract is pinned independently of any
+    writer, in either direction: a writer that stops emitting provenance must
+    fail these, not silently degrade the guard.
+    """
+
+    def test_the_env_var_and_key_names_are_the_cross_tier_contract(self) -> None:
+        """Named constants, never inlined literals.
+
+        Four tiers must agree on these spellings and none can import another's
+        (the module docstring's stdlib+pytest import constraint): the two
+        production writers emit them, this parser reads them, and the writer
+        tests assert against THESE objects rather than against strings — which
+        is what makes those tests drift pins rather than tautologies.
+        """
+        assert PYTEST_SESSION_TOKEN_ENV == 'DF_PYTEST_SESSION_TOKEN'
+        assert CLOCK_PROVENANCE_SOURCE_KEY == 'source'
+        assert CLOCK_PROVENANCE_SESSION_KEY == 'pytest_session'
+
+    def test_an_absent_file_has_no_provenance(self) -> None:
+        """``None`` in, ``None`` out — a DELETED clock has no body to attribute."""
+        assert clock_stamp_provenance(None) is None
+
+    @pytest.mark.parametrize('body', [b'not json', b'{"ts": 1', b'', b'\xff\xfe'])
+    def test_an_unparseable_body_is_unattributable_and_never_raises(
+        self, body: bytes,
+    ) -> None:
+        """A parse error must fail CLOSED, not propagate.
+
+        This runs in a session-teardown fixture: an exception here would replace
+        the guard's own message with a traceback about JSON, hiding whichever
+        clock actually moved.
+        """
+        assert clock_stamp_provenance(_entry(body)) is None
+
+    @pytest.mark.parametrize('body', [b'[1, 2]', b'"x"', b'null', b'3'])
+    def test_a_non_object_body_is_unattributable(self, body: bytes) -> None:
+        """Valid JSON is not enough — provenance lives in named keys."""
+        assert clock_stamp_provenance(_entry(body)) is None
+
+    def test_the_legacy_ts_iso_body_is_unattributable(self) -> None:
+        """The pre-4823 shape stays a violation.
+
+        Any stamp written by a writer that predates (or forgets) provenance is
+        indistinguishable from a test's, so it must keep failing the run exactly
+        as it does today. This is what makes the change safe to land with no
+        coordinated writer rollout.
+        """
+        assert clock_stamp_provenance(_entry(_LEGACY_BODY)) is None
+
+    def test_a_half_provenance_body_is_unattributable(self) -> None:
+        """``pytest_session`` alone does not clear a stamp.
+
+        A writer emitting one key of the pair is a broken writer, and trusting
+        it would let a partially-migrated writer grant itself the exemption.
+        """
+        body = b'{"ts": 1, "iso": "x", "pytest_session": ""}'
+
+        assert clock_stamp_provenance(_entry(body)) is None
+
+    def test_a_source_without_a_session_key_is_unattributable(self) -> None:
+        """The mirror case: ``source`` is triage prose, never the discriminator."""
+        body = b'{"ts": 1, "iso": "x", "source": "restart-all-orchestrators.sh"}'
+
+        assert clock_stamp_provenance(_entry(body)) is None
+
+    def test_a_full_external_stamp_parses_to_its_two_strings(self) -> None:
+        provenance = clock_stamp_provenance(_entry(_EXTERNAL_BODY))
+
+        assert provenance == {
+            CLOCK_PROVENANCE_SOURCE_KEY: 'restart-all-orchestrators.sh',
+            CLOCK_PROVENANCE_SESSION_KEY: '',
+        }
+
+    def test_a_session_token_is_returned_verbatim(self) -> None:
+        """Verbatim, because the caller compares it for EQUALITY with its own.
+
+        Any normalisation here (case, strip, truncation) would silently turn a
+        foreign token into a match or a match into a miss.
+        """
+        token = '0f1e2d3c4b5a69788796a5b4c3d2e1f0'
+        body = (
+            b'{"ts": 1, "iso": "x", "source": "orchestrator-watchdog.py", '
+            b'"pytest_session": "' + token.encode() + b'"}'
+        )
+
+        provenance = clock_stamp_provenance(_entry(body))
+
+        assert provenance is not None
+        assert provenance[CLOCK_PROVENANCE_SESSION_KEY] == token
+        assert provenance[CLOCK_PROVENANCE_SOURCE_KEY] == 'orchestrator-watchdog.py'
+
+    @pytest.mark.parametrize(
+        'body',
+        [
+            b'{"ts": 1, "source": 123, "pytest_session": ""}',
+            b'{"ts": 1, "source": null, "pytest_session": ""}',
+            b'{"ts": 1, "source": "x", "pytest_session": 123}',
+            b'{"ts": 1, "source": "x", "pytest_session": null}',
+            b'{"ts": 1, "source": "x", "pytest_session": []}',
+        ],
+    )
+    def test_a_wrong_typed_provenance_field_is_unattributable(self, body: bytes) -> None:
+        """No coercion. A non-string field is a broken writer, not provenance.
+
+        Coercing ``None`` to ``''`` would be actively dangerous: the empty
+        string is the POSITIVE assertion "no pytest session was an ancestor of
+        this write", i.e. the one value that forgives a change.
+        """
+        assert clock_stamp_provenance(_entry(body)) is None
 
 
 class TestDeployClockViolationReason:
