@@ -26,6 +26,8 @@ from escalation.queue import (
     _MAX_AMENDMENT_LINE_CHARS,
     _MAX_AMENDMENT_OPTIONS,
     _MAX_AMENDMENTS,
+    _MAX_LATE_RESOLUTION_CHARS,
+    _MAX_LATE_RESOLUTIONS,
     _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
@@ -7711,3 +7713,125 @@ class TestLateResolutionCorrectsResolutionClass:
         assert record is not None
         assert len(record.late_resolutions) == 1
         assert record.resolution_class == 'actionable'
+
+
+class TestLateResolutionBounds:
+    """`late_resolutions` is SIZE-bounded, and every loss is a durable fact.
+
+    The same no-silent-cap policy `_MAX_AMENDMENTS` already models: the oldest
+    entries are shed, each drop is counted ON THE RECORD (not merely logged), an
+    over-long entry is elided with an in-band marker naming what was dropped, and
+    the dropped character total is likewise durable — so `len(list) + truncated`
+    never plateaus and INV-8 (loss is assertable from the record) holds.
+    """
+
+    def _auto_dismissed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return queue
+
+    def test_oldest_entries_are_shed_at_the_cap_and_counted(self, tmp_path: Path, caplog):
+        """(a)(c) Past the cap the OLDEST go, each drop counted, and it is loud.
+
+        The list is read from DISK after every single call, so an
+        over-cap list that existed durably even momentarily — a trim in a
+        second write rather than the same one as the append — would be caught.
+        """
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 3
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            for i in range(_MAX_LATE_RESOLUTIONS + overshoot):
+                queue.resolve(
+                    'esc-3902-1', f'finding number {i}',
+                    resolved_by='claude-task-3902-steward',
+                )
+                on_disk = queue.get('esc-3902-1')
+                assert on_disk is not None
+                assert len(on_disk.late_resolutions) <= _MAX_LATE_RESOLUTIONS, (
+                    f'an over-cap list existed on disk after call {i}: '
+                    f'{len(on_disk.late_resolutions)} > {_MAX_LATE_RESOLUTIONS} — '
+                    'the trim must share the append\'s single write'
+                )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert len(record.late_resolutions) == _MAX_LATE_RESOLUTIONS
+        assert record.late_resolutions_truncated == overshoot, (
+            f'every drop must be counted on the record: '
+            f'{record.late_resolutions_truncated!r} != {overshoot}'
+        )
+        # OLDEST-shed: the survivors are the most recent window, and the true
+        # total (kept + truncated) never plateaus.
+        kept = [e['resolution'] for e in record.late_resolutions]
+        assert kept == [
+            f'finding number {i}'
+            for i in range(overshoot, _MAX_LATE_RESOLUTIONS + overshoot)
+        ], f'expected the most-recent window, got {kept}'
+        assert len(record.late_resolutions) + record.late_resolutions_truncated == (
+            _MAX_LATE_RESOLUTIONS + overshoot
+        ), 'the TRUE total must keep climbing past the cap'
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('shed' in m and 'esc-3902-1' in m for m in warnings), (
+            f'the shed must be LOUD as well as counted; got: {warnings}'
+        )
+
+    def test_over_long_resolution_is_elided_in_band_and_the_loss_is_durable(
+        self, tmp_path: Path, caplog,
+    ):
+        """(b)(c) Elision is MARKED, and the dropped characters land on the record.
+
+        A silently truncated finding is worse than a dropped one: a reader
+        cannot tell "this is all of it" from "this is the head of it".
+        """
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 250
+        long_text = 'x' * (_MAX_LATE_RESOLUTION_CHARS + overshoot)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-1', long_text, resolved_by='claude-task-3902-steward',
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        stored = record.late_resolutions[0]['resolution']
+        assert stored != long_text, 'an over-long resolution must be elided'
+        assert stored.startswith('x' * _MAX_LATE_RESOLUTION_CHARS), (
+            'the HEAD of the finding must be what is kept'
+        )
+        assert 'elided' in stored, (
+            f'elision must be MARKED IN-BAND, not silent: {stored[-120:]!r}'
+        )
+        # INV-8: the loss is assertable FROM THE RECORD, never log-only.
+        assert record.late_resolutions_chars_elided == overshoot, (
+            f'dropped characters must be counted on the record: '
+            f'{record.late_resolutions_chars_elided!r} != {overshoot}'
+        )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('elid' in m and 'esc-3902-1' in m for m in warnings), (
+            f'the elision must be LOUD as well as counted; got: {warnings}'
+        )
+
+    def test_chars_elided_accumulates_across_captures(self, tmp_path: Path):
+        """(b cont.) The counter is a RUNNING total, not the last call's loss."""
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 100
+
+        for i in range(3):
+            queue.resolve(
+                'esc-3902-1', f'{i}' + 'y' * (_MAX_LATE_RESOLUTION_CHARS + overshoot - 1),
+                resolved_by='claude-task-3902-steward',
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.late_resolutions_chars_elided == 3 * overshoot, (
+            f'expected a running total: {record.late_resolutions_chars_elided!r}'
+        )
