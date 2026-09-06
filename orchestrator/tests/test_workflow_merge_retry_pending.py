@@ -755,6 +755,71 @@ class TestResumeGuard:
         spies.merge_and_finalise.assert_not_awaited()
         spies.clear_merge_retry_pending.assert_not_awaited()
 
+    # -- esc-3388-9: the fast path must populate self.plan before merging --
+
+    @pytest.mark.asyncio
+    async def test_head_match_populates_self_plan_before_delegating(self, monkeypatch):
+        """The fast path must read plan.json into ``self.plan`` before merging.
+
+        Regression for esc-3388-9. This path skips plan/execute/verify/review,
+        and every ``self.plan = self.artifacts.read_plan()`` call site lives in
+        the pipeline it skips — so before the fix ``self.plan`` was still the
+        ``__init__`` default ``{}`` at merge entry. ``_check_scope_invariant``
+        then saw an EMPTY plan.files against a non-empty metadata.files, which
+        is the task-3429 "an empty plan cannot be verified as a safe superset"
+        arm, and filed a blocking L0 on EVERY dispatch. Resolving that L0 via
+        ``resume`` re-stamps ``merge_retry_pending`` and lands right back here,
+        so it was an unbreakable loop rather than a one-off.
+
+        Asserting on ``wf.plan`` AFTER the call would not catch the regression
+        the fix targets: what matters is that the plan is populated by the time
+        the merge phase reads it, so the assertion is made from inside the
+        delegate.
+        """
+        f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
+        plan = {'task_id': '77', 'files': ['pkg/src/pkg/mod.py'], 'steps': []}
+        f.wf.artifacts = MagicMock(read_plan=MagicMock(return_value=plan))
+
+        seen: list[dict] = []
+
+        async def _capture(branch_name):  # noqa: ARG001
+            seen.append(f.wf.plan)
+            return WorkflowOutcome.DONE
+
+        f.wf._merge_and_finalise = AsyncMock(side_effect=_capture)  # type: ignore[method-assign]
+        f.wf._clear_merge_retry_pending = AsyncMock()  # type: ignore[method-assign]
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome == WorkflowOutcome.DONE
+        assert seen == [plan], (
+            'self.plan must be populated from artifacts BEFORE _merge_and_finalise'
+        )
+        assert seen[0]['files'] == ['pkg/src/pkg/mod.py']
+
+    @pytest.mark.asyncio
+    async def test_plan_without_files_clears_stamp_and_falls_back(self, monkeypatch):
+        """A plan with no files voids the obligation instead of merging blind.
+
+        Honouring the fast path here would hand an empty ``plan.files`` to the
+        merge-entry scope invariant and re-enter the loop described above, so
+        the stamp is cleared and the full pipeline runs (which re-plans and
+        regenerates plan.json). Mirrors the confirmed-conflict arm: an
+        obligation that can never be satisfied as stamped is cleared, not
+        preserved.
+        """
+        f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
+        f.wf.artifacts = MagicMock(read_plan=MagicMock(return_value={}))
+        spies = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome is None
+        spies.merge_and_finalise.assert_not_awaited()
+        spies.clear_merge_retry_pending.assert_awaited_once()
+
 
 class TestDrivePlacement:
     @pytest.mark.asyncio
