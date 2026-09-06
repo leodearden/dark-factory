@@ -4300,3 +4300,87 @@ def test_zero_length_sentinel_never_yields_empty_code_or_nonnumeric_exit(
         f"the session record must carry a well-formed integer exit code, got "
         f"{record.exit_code!r} (status {record.status}).\n{observed}"
     )
+
+
+# The counterpart to the test above, and the reason step-2's fallback alone
+# is not the whole fix: degrading EVERY racing spawn to 127 would silently
+# destroy the session's real exit code -- a liveness-signal regression traded
+# for the crash. This is the faithful reproduction of the production race:
+# the code IS on its way, and a reader that gives up on the first empty read
+# throws it away. MEASURED against the pre-fix script this exits 2; against
+# the content-aware read alone it exits 127; only a bounded re-poll recovers 3.
+
+
+def test_late_settling_sentinel_recovers_the_sessions_own_code_not_127(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sentinel that settles late must yield the session's OWN code.
+
+    Same deterministic `custom-term` path as the test above, but the planting
+    terminal backgrounds a delayed `echo 3 > "$s"` after creating the file
+    empty -- so finish() observes exactly the production window (sentinel
+    exists, content not yet there) with a real code arriving shortly after.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+
+    # Timing budget -- DERIVED, not guessed, and deliberately not inherited.
+    #
+    # WRITE_DELAY is a *deliberately injected* wall-clock sleep inside the
+    # fake terminal: it does NOT stretch with host load, which is exactly the
+    # situation _wait_for_path_scaled's `extra_secs` parameter documents. The
+    # grace it must fit inside DOES need to stretch, so it is set explicitly
+    # via _load_scaled_grace(5) rather than inheriting _base_env's fixed
+    # SPAWN_LAUNCH_GRACE_SECS="2" pin. On an idle host that floor gives 5s
+    # against a 0.5s write -- 10x margin -- and it only grows under load.
+    WRITE_DELAY = 0.5
+    SESSION_EXIT_CODE = 3
+
+    _write_sentinel_planting_terminal(
+        bin_dir, "custom-term", delay=WRITE_DELAY, code=SESSION_EXIT_CODE
+    )
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+    grace = _load_scaled_grace(5)
+    env["SPAWN_LAUNCH_GRACE_SECS"] = str(grace)
+
+    # `grace` is ALREADY load-scaled, so per _run_spawn's docstring this must
+    # be passed with scale_timeout=False -- scaling it a second time would
+    # discard this site's own derivation instead of honoring it. The margin
+    # covers the grace the script may spend re-polling plus the injected
+    # sleep plus normal subprocess startup.
+    result = _run_spawn(
+        env,
+        tmp_path,
+        timeout=int(grace + WRITE_DELAY + _spawn_run_budget(20)),
+        scale_timeout=False,
+    )
+
+    stderr = result.stderr.decode()
+    context = (
+        f"rc={result.returncode}, grace={grace}s, injected write delay="
+        f"{WRITE_DELAY}s\nstderr:\n{stderr}"
+    )
+
+    # Same guards as the never-settling test: neither consumer may ever see
+    # the empty string, whatever else this run does.
+    assert b"numeric argument required" not in result.stderr, (
+        f"finish() must never run `exit \"\"`.\n{context}"
+    )
+    assert b"invalid int value: ''" not in result.stderr, (
+        f"session_registry must never be handed an empty --code.\n{context}"
+    )
+
+    assert result.returncode == SESSION_EXIT_CODE, (
+        f"a sentinel that settles within the launch grace must yield the "
+        f"session's OWN exit code {SESSION_EXIT_CODE} -- not 127 (the "
+        f"content-aware read giving up on the first empty poll, destroying a "
+        f"live exit code) and not 2 (the pre-fix empty-string crash).\n"
+        f"{context}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.exit_code == SESSION_EXIT_CODE, (
+        f"the session record must carry the session's own exit code, got "
+        f"{record.exit_code!r} (status {record.status}).\n{context}"
+    )
