@@ -4067,18 +4067,37 @@ class GitOps:
         # future worktree-create.  --replace-all instead CONVERGES from
         # any prior state — absent, single, or duplicated — to exactly
         # one value, so this call is safe to run every time.
-        await _run(
+        #
+        # Best-effort but LOUD (loud-over-silent-degradation, same shape as
+        # disable_shared_repo_auto_maintenance below): --replace-all converges
+        # from a duplicated key but NOT from every failure mode — e.g.
+        # .git/config.lock contention with a concurrent orchestrator/merge
+        # worker, or a read-only shared .git under the OS-sandbox write-set.
+        # Discarding the rc is precisely what let the exit-5 duplicate-value
+        # jam run unnoticed on every worktree-create, so log a non-zero rc
+        # rather than raising (a wrong hooksPath must not block dispatch).
+        rc, _, stderr = await _run(
             ['git', 'config', '--replace-all', 'core.hooksPath', 'hooks'],
             cwd=self.project_root,
         )
+        if rc != 0:
+            logger.warning(
+                'create_worktree: failed to set core.hooksPath on %s '
+                '(rc=%s): %s',
+                self.project_root, rc, stderr.strip(),
+            )
 
         # ── Disable auto-gc/maintenance on the shared repo ─────────────
         # PRD os-sandbox α5 (D2 corollary): reassert gc.auto=0 /
         # maintenance.auto=false on every worktree-create so background
         # auto-gc never fires under the narrow shared-.git write-set (and
         # any config drift/re-clone is re-covered).  Idempotent & best-effort
-        # (never raises) — same "safe to run every time from any prior
-        # state" shape as the core.hooksPath block above.
+        # (never raises) — safe to run every time.  NOTE it does NOT share the
+        # core.hooksPath block's convergence property: it sets gc.auto /
+        # maintenance.auto with a plain single-value `git config`, which git
+        # refuses (exit 5) on an already-multivalued key.  Don't copy this as
+        # the model for a self-heal; the rc is logged at WARNING and the only
+        # consequence here is that auto-gc stays enabled.
         await self.disable_shared_repo_auto_maintenance()
 
         # ── Resolve start-ref: train-predecessor tip or freshened main ──
