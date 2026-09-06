@@ -572,3 +572,12 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    The drain gate defers a unit whose merge-idle heartbeat says mid-merge, then
    forces; a stale/absent heartbeat gets a short grace and proceeds. It protects
    in-flight merges only; in-flight task agents are still soft-cancelled.
+7. **σ gains a runtime ceiling** (Leo, 2026-09-06): the ratchet module must complete
+   in ≤ 60s wall on an idle box. α measured 147–251s per run (esc-5021-1); a
+   single full measurement is 72.7s, of which 13s is 22 separate complexipy
+   subprocesses, and the module then re-walks the 559-file test tree twice more
+   and recomputes radon MI five times. The fix is one measurement per session and
+   one complexipy invocation, with the CLI tests on a fixture tree — never a
+   "skip when nothing changed" gate (INV-10/INV-11) and never a narrower domain.
+   Until σ lands the per-verify-leg tax is accepted as measured. Task 5048's
+   details carry the constraints.
