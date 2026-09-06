@@ -327,6 +327,30 @@ def _registered_plan_tool_names() -> frozenset[str]:
         return frozenset(tool.name for tool in asyncio.run(server.list_tools()))
 
 
+def _attribute_calls_in(fn) -> frozenset[str]:
+    """Every ATTRIBUTE call made in *fn*'s own body: ``x.foo()`` yields ``'foo'``.
+
+    The single spelling of this walk, shared by :func:`_plan_writing_tool_names`
+    (which asks whether a candidate calls a plan-mutating ``TaskArtifacts``
+    method) and by the ``report_*`` exclusion pin (which asks whether a report
+    tool calls a separate-artifact one), so the two cannot drift into
+    disagreeing about what "calls" means.
+
+    Reads *fn*'s source off the LIVE function object, never by parsing
+    plan_tools.py as a file — see :func:`_plan_writing_tool_names` for why that
+    distinction is load-bearing rather than stylistic. ``textwrap.dedent`` is
+    required before the parse: ``inspect.getsource`` on a nested or
+    method-level function returns indented source and ``ast.parse`` would
+    raise ``IndentationError``.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    return frozenset(
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    )
+
+
 def _plan_writing_tool_names(registered: frozenset[str] | None = None) -> tuple[str, ...]:
     """Derive the plan-writer candidate set from plan_tools' LIVE module surface.
 
@@ -402,12 +426,7 @@ def _plan_writing_tool_names(registered: frozenset[str] | None = None) -> tuple[
         params = tuple(inspect.signature(obj).parameters)
         if params[:1] != ('artifacts',):
             continue
-        tree = ast.parse(textwrap.dedent(inspect.getsource(obj)))
-        called = {
-            node.func.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        }
+        called = _attribute_calls_in(obj)
         if called & _PLAN_MUTATING_ARTIFACT_METHODS and name[1:] in registered:
             names.append(name[1:])
     return tuple(sorted(names))
@@ -909,54 +928,138 @@ class TestRepairableFieldTable:
         loudly, and the completeness sweep would then pass over fewer tools
         while still reporting green — the exact silent-vacuity failure mode
         this guards against.
+
+        REFERENTIAL INTEGRITY ONLY. Assertions that the constant is a
+        ``frozenset``, that it is non-empty, or that it excludes a second
+        hardcoded set of ``report_*`` writers spelled out in this same file
+        used to stand here and were removed: each restated the literal's own
+        spelling, so it could only fail when someone edited the literal, with
+        the contradicting text directly visible. What they were standing in
+        for is covered for real elsewhere — an emptied constant collapses the
+        derived candidate set, which
+        :meth:`test_the_derived_candidate_set_cannot_silently_collapse` floors
+        against the live registered surface, and the ``report_*`` exclusion is
+        pinned against live behaviour by
+        :meth:`test_the_report_family_is_excluded_because_it_writes_separate_artifacts`.
         """
-        assert isinstance(_PLAN_MUTATING_ARTIFACT_METHODS, frozenset)
-        assert _PLAN_MUTATING_ARTIFACT_METHODS, (
-            'the set of plan-mutating TaskArtifacts methods must not be empty'
-        )
-        for name in _PLAN_MUTATING_ARTIFACT_METHODS:
+        for name in sorted(_PLAN_MUTATING_ARTIFACT_METHODS):
             attr = getattr(TaskArtifacts, name, None)
             assert callable(attr), (
                 f'{name!r} is not a real callable attribute of TaskArtifacts — '
                 'the derivation would silently lose this writer'
             )
-        separate_artifact_writers = {
-            'write_blocking_dependency',
-            'write_already_done',
-            'write_ready_to_merge',
-            'write_unactionable_task',
-            'write_false_premise',
-        }
-        assert _PLAN_MUTATING_ARTIFACT_METHODS.isdisjoint(separate_artifact_writers), (
-            'admitting a report_* separate-artifact writer here would wrongly '
-            'pull the whole report_* family into the plan-writer sweep — each '
-            'persists to its own artifact file and never touches plan.json'
+
+    def test_the_report_family_is_excluded_because_it_writes_separate_artifacts(self):
+        """The ``report_*`` exclusion is a machine-checked consequence, not a prefix.
+
+        Two surfaces lean on "``report_*`` tools never write plan.json": the
+        derivation's docstring, which claims their absence from the candidate
+        set is a CONSEQUENCE rather than a hand-exclusion, and the
+        ``not n.startswith('report_')`` exclusion in the floor above. A prefix
+        is a naming convention; this pins the BEHAVIOUR it stands for, on both
+        live surfaces at once — the module's own function bodies, and the real
+        ``TaskArtifacts`` class.
+
+        Each ``report_*`` impl must persist through at least one ``write_*``
+        method that is NOT plan-mutating (its own separate artifact) and must
+        call no plan-mutating method at all. A ``report_*`` tool that grew a
+        plan write would be a genuine sweep candidate, and both the exclusion
+        and the derivation's docstring would need revisiting — that is the
+        finding, and it fails here rather than passing silently.
+        """
+        report_tools = sorted(
+            name for name in _registered_plan_tool_names() if name.startswith('report_')
         )
+        assert report_tools, (
+            'no report_* tool is registered at all — the exclusion the floor '
+            'and the derivation both rely on has nothing left to describe, so '
+            'one of them is now stale'
+        )
+        for name in report_tools:
+            called = _attribute_calls_in(getattr(plan_tools, '_' + name))
+            plan_writes = called & _PLAN_MUTATING_ARTIFACT_METHODS
+            assert not plan_writes, (
+                f'_{name} calls {sorted(plan_writes)!r} — a report_* tool that '
+                'mutates plan.json IS a sweep candidate, so excluding the '
+                'family by prefix now hides a real writer'
+            )
+            separate = {
+                method for method in called if method.startswith('write_')
+            } - _PLAN_MUTATING_ARTIFACT_METHODS
+            assert separate, (
+                f'_{name} calls no separate-artifact writer at all — the '
+                'exclusion assumes each report_* tool persists to its own '
+                'artifact file; this one now persists somewhere unaudited'
+            )
+            for method in sorted(separate):
+                assert callable(getattr(TaskArtifacts, method, None)), (
+                    f'_{name} persists through {method!r}, which is not a real '
+                    'callable attribute of TaskArtifacts'
+                )
 
     def test_the_derived_candidate_set_cannot_silently_collapse(self):
-        """Non-vacuity floor for the derivation: production's own claims.
+        """Non-vacuity floor for the derivation: every registered plan tool.
 
-        The floor is computed from the PRODUCTION table itself — every
-        collection's schema-owner tool name, plus every name any row already
-        declares in ``also_written_by`` — so this check adds no new
-        hardcoded list of its own; it merely proves the derivation cannot
-        lose a tool the module already claims writes a repairable cell. If
-        the derivation silently collapsed (e.g. a broken AST walk), the
-        completeness sweep would then pass vacuously over a shrunken
-        candidate set while still reporting green — the dangerous failure
-        mode a derived set is exposed to that a hardcoded list is not.
+        If the derivation silently collapsed (e.g. a broken AST walk), the
+        completeness sweep would pass vacuously over a shrunken candidate set
+        while still reporting green — the dangerous failure mode a derived set
+        is exposed to that a hardcoded list is not. The floor is what makes
+        that loud, and it is computed, never hand-listed.
+
+        TWO HALVES, both derived:
+
+        (a) Every REGISTERED tool that is not a ``report_*`` separate-artifact
+            writer. Measured, production's own claims alone (half (b)) floor
+            only 8 of the 11 — ``confirm_plan``, ``mark_step_done`` and
+            ``remove_plan_step`` are declared as no row's alternate, so all
+            three could vanish from the sweep and every test here would still
+            report green, which is exactly what this test's name claims to
+            rule out. The ``report_*`` exclusion is not a prefix guess: the
+            behaviour it stands for is pinned against the live module by
+            :meth:`test_the_report_family_is_excluded_because_it_writes_separate_artifacts`.
+
+        (b) Every schema owner and every declared ``also_written_by`` name in
+            the PRODUCTION table. Redundant with (a) today, but it is not
+            implied by it: a row naming an alternate the server never
+            registered would escape (a) entirely.
+
+        Half (a) also closes the derivation's one structural blind spot, which
+        no amount of tightening the AST walk would. Guard (d) of
+        :func:`_plan_writing_tool_names` matches ATTRIBUTE calls only, so a
+        registered tool that persisted a plan through a bare-NAME module-level
+        helper — plan_tools still carries one on this branch,
+        ``_atomic_write_plan(path, plan)``, used by ``_read_plan_repaired`` —
+        is invisible to the walk twice over: wrong call shape, and not a
+        ``TaskArtifacts`` method at all. This floor does not care HOW a tool
+        writes, so such a tool fails HERE instead of being silently skipped by
+        the completeness sweep it was supposed to be caught by. The helper is
+        deliberately not named in an assertion: main deleted it in c005fabb00
+        (task 3957) and this branch has not yet taken that change, so a test
+        pinning its call sites would break on the rebase — the floor needs no
+        such name.
+
+        ON FAILURE there are exactly two remedies, and picking between them is
+        required work, not a nuisance: either the derivation missed a real
+        plan writer (fix the derivation — this is the bug the floor exists to
+        catch), or a newly registered tool genuinely writes no plan cell, in
+        which case teach the exclusion about it. A stale EXCLUSION fails loudly
+        until someone classifies the new tool; the hand-maintained INCLUSION
+        list this whole surface replaced failed silently.
         """
-        derived = _plan_writing_tool_names()
+        derived = set(_plan_writing_tool_names())
         assert derived, 'the derived candidate set must not be empty'
 
-        floor = set(plan_tools._COLLECTION_SCHEMA_TOOL.values())
+        floor = {n for n in _registered_plan_tool_names() if not n.startswith('report_')}
+        floor.update(plan_tools._COLLECTION_SCHEMA_TOOL.values())
         for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
             floor.update(record.also_written_by)
 
-        assert floor <= set(derived), (
+        assert floor <= derived, (
             f'the derived candidate set {sorted(derived)!r} is missing '
-            f'{sorted(floor - set(derived))!r} — tool(s) the production table '
-            'itself already claims write a repairable cell'
+            f'{sorted(floor - derived)!r} — tool(s) the server registers as '
+            'non-report tools, or that the production table itself claims '
+            'write a repairable cell, and that the completeness sweep would '
+            'therefore never probe'
         )
 
     def test_a_plan_writing_non_tool_is_never_a_sweep_candidate(self, monkeypatch):
@@ -1004,6 +1107,26 @@ class TestRepairableFieldTable:
             'registered tool — if it ever becomes one, the probe must learn '
             'to call it'
         )
+
+        # The intersection cuts BOTH ways, and only one direction was checked.
+        # Every surface here keys on the `_<tool_name>` impl convention — the
+        # derivation walks `_`-prefixed module-level functions, the probe calls
+        # `getattr(plan_tools, '_' + tool_name)`, and plan_tools' own comment
+        # claims a new plan-writing TOOL is swept automatically. A tool
+        # registered OUTSIDE that convention (written inline inside
+        # `create_server`, or delegating to a differently-named helper) would
+        # not fail — it would silently be no candidate at all, which is the
+        # under-reporting this whole surface exists to end. Measured: all 16
+        # registered tools follow it today.
+        for name in sorted(registered):
+            impl = getattr(plan_tools, '_' + name, None)
+            assert inspect.isfunction(impl) and impl.__module__ == plan_tools.__name__, (
+                f'registered tool {name!r} has no module-level _{name} function '
+                'in plan_tools — the derivation and the probe both key on that '
+                'convention, so this tool is invisible to the completeness '
+                f'sweep; either give it a _{name} impl or teach '
+                '_plan_writing_tool_names how to find it'
+            )
 
         def _internal_plan_rewriter(artifacts):
             """Exactly main's post-c005fabb00 ``_read_plan_repaired`` shape."""

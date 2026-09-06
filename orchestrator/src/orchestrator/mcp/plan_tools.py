@@ -318,6 +318,17 @@ _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
 #: automatically and that test fails until its impact on ``also_written_by``
 #: is audited. Hand-adding a name here is therefore never required to be
 #: *seen* by the sweep — only to make it pass once seen.
+#:
+#: "Automatically" holds for a tool that follows this module's own conventions
+#: — a module-level ``_<tool_name>`` impl that persists through a
+#: ``TaskArtifacts`` method — and BOTH conventions are themselves pinned, so
+#: a tool that follows neither still cannot pass unnoticed: it fails the
+#: non-vacuity floor in
+#: ``TestRepairableFieldTable::test_the_derived_candidate_set_cannot_silently_collapse``,
+#: which requires every registered non-``report_*`` tool to be a sweep
+#: candidate and does not care HOW a tool writes. The outcome is loud in
+#: every case; only the remedy differs (audit the row, or teach the
+#: derivation about the new shape).
 _DESCRIPTION_ALSO: tuple[str, ...] = ('replace_plan_step', 'mark_step_committed')
 _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 
