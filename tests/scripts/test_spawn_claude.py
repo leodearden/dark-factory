@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -4383,4 +4384,97 @@ def test_late_settling_sentinel_recovers_the_sessions_own_code_not_127(
     assert record.exit_code == SESSION_EXIT_CODE, (
         f"the session record must carry the session's own exit code, got "
         f"{record.exit_code!r} (status {record.status}).\n{context}"
+    )
+
+
+# The WRITER half of task 5137. The two tests above harden the READER against
+# any writer we do not control; this one closes the window at the source for
+# OUR payload, which is what makes it correct to leave all eight `-f`
+# existence gates in spawn-claude.sh untouched: a same-directory rename means
+# the sentinel PATH only ever appears fully written, so every one of them is
+# content-correct without being rewritten.
+#
+# Asserted at RUNTIME via a PATH-shadowed `mv` recorder, not by grepping the
+# script. The two obvious alternatives both fail: grepping the source for
+# `mv`/`.tmp` pins the author's wording rather than the program's behaviour
+# and would pass against a commented-out line; polling the sentinel path
+# during a real spawn hoping to catch it existing-and-empty can only fail
+# probabilistically, so it could never go reliably RED -- a flaky test
+# shipped to fix a flake. The recorder observes an actual runtime fact and is
+# deterministic in both directions.
+
+
+def _write_mv_recorder(bin_dir: pathlib.Path, log: pathlib.Path) -> None:
+    """Shadow `mv` on the payload's PATH, recording argv then renaming for real.
+
+    _base_env already puts *bin_dir* first on PATH and the payload inherits
+    it, so this shim sees every rename the payload performs. PATH is reset
+    before the exec so the shim cannot recurse into itself.
+    """
+    p = bin_dir / "mv"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {log}\n"
+        'PATH=/usr/bin:/bin exec mv "$@"\n'
+    )
+    p.chmod(0o755)
+
+
+def test_payload_publishes_sentinel_by_atomic_rename(tmp_path: pathlib.Path) -> None:
+    """The payload must publish the sentinel by rename, never by a direct `>`.
+
+    A NORMAL happy-path spawn -- the real foreground terminal and a fake
+    claude exiting 3 -- so the genuine $inner EXIT trap runs and the assertion
+    is about the shipped payload, not a stand-in.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    SESSION_EXIT_CODE = 3
+    _write_fake_claude(bin_dir, exit_code=SESSION_EXIT_CODE)
+    _write_foreground_terminal(bin_dir, "xterm")
+    mv_log = tmp_path / "mv_argv"
+    _write_mv_recorder(bin_dir, mv_log)
+    env = _sentinel_test_env(bin_dir, "xterm", tmp_path)
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == SESSION_EXIT_CODE, (
+        f"the atomic publish must be additive to the exit-code contract: "
+        f"expected {SESSION_EXIT_CODE}, got {result.returncode}\n"
+        f"stderr: {result.stderr.decode()}"
+    )
+
+    recorded = mv_log.read_text().splitlines() if mv_log.exists() else []
+    sentinel_renames = [
+        line for line in recorded if re.search(r"spawn-claude-\w+\.done(\s|$)", line)
+    ]
+    assert len(sentinel_renames) == 1, (
+        f"the payload must publish the sentinel with exactly one rename; "
+        f"recorded mv calls: {recorded!r}\n"
+        f"an EMPTY log is the pre-fix state: the payload wrote the sentinel "
+        f"directly with `>`, which creates and truncates before the write "
+        f"lands, so any `-f` gate can observe it existing and zero-length."
+    )
+
+    # Source and destination must be the tmp path and the sentinel itself --
+    # i.e. the sentinel appears via rename, never via a direct write to its
+    # own path, and the rename is same-directory (hence atomic).
+    fields = sentinel_renames[0].split()
+    dest = fields[-1]
+    source = fields[-2]
+    assert dest.endswith(".done"), (
+        f"the rename DESTINATION must be the sentinel path, got {dest!r} "
+        f"(full argv: {sentinel_renames[0]!r})"
+    )
+    assert source != dest and source.startswith(dest), (
+        f"the rename SOURCE must be a different path prefixed by the "
+        f"sentinel (a same-directory temp), got source={source!r} "
+        f"dest={dest!r}"
+    )
+
+    # A failed or half-done publish must not leak: nothing may survive.
+    spawn_tmp = pathlib.Path(env["TMPDIR"])
+    leftovers = list(spawn_tmp.glob("spawn-claude-*.done.tmp"))
+    assert not leftovers, (
+        f"the two-step publish must leave no temp file behind, found "
+        f"{leftovers!r}"
     )
