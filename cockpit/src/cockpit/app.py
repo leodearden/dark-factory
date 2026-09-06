@@ -34,6 +34,7 @@ from orchestrator.session_registry import (
     DecisionRecord,
     DecisionState,
     SessionRecord,
+    Status,
     list_decisions,
     set_manual_boost,
     update_decision_state,
@@ -254,12 +255,24 @@ class CockpitApp(App):
         self._attention_targets: set[DisplayTarget] = set()
         self._queue_items_by_key: dict[str, QueueItem] = {}
         # In-memory "already acted on" marker, set by action_focus_selected.
-        # Pruned to the live queue on every rebuild (_rebuild_queue) so a
-        # key never keeps reporting "handling" past the ask it was set for.
+        # Pruned to the live QUEUE on every rebuild (_rebuild_queue) -- NOT
+        # to the live ASK, unlike the overlays below: a same-session re-ask
+        # that never leaves the queue keeps the mark. See _rebuild_queue.
         self._handling: set[str] = set()
+        # Ephemeral in-memory overlays, keyed the same way (a session key is
+        # stable for the session's whole lifetime). These ARE pruned on every
+        # rebuild -- by ASK LIVENESS (_prune_overlays), NOT by queue
+        # membership: a dropped item is by construction absent from the
+        # rebuilt queue, so _handling's `&= queue keys` predicate would clear
+        # every drop on the very rebuild action_drop itself triggers.
         self._boosts: dict[str, int] = {}
         self._dropped: set[str] = set()
         self._deferred: dict[str, datetime] = {}
+        # The ask identity each overlaid key was recorded against, written by
+        # _record_overlay before the overlay's own rebuild and compared by
+        # _prune_overlays. Garbage-collected there too, so this bookkeeping
+        # side-table cannot itself become the next unbounded-growth leak.
+        self._overlay_asks: dict[str, tuple] = {}
         # Ephemeral, defaults OFF on every launch -- see _rebuild_session_table
         # and action_toggle_history. Never persisted to cockpit-ui.json: the
         # user-observable "on launch: tens, not 10k" signal (FINDING F2,
@@ -520,6 +533,178 @@ class CockpitApp(App):
         """
         self._scan_in_flight = False
 
+    def _ask_identity(
+        self,
+        key: str,
+        *,
+        sessions_by_slug: dict[str, SessionRecord] | None = None,
+        decisions_by_id: dict[str, DecisionRecord] | None = None,
+    ) -> tuple | None:
+        """The identity of the live ask *key* currently names, or None if there is none.
+
+        None means "no live ask under this key" -- either nothing in the
+        registries answers to it, or what does is no longer asking. A
+        'session:<slug>' key is live only while that session is
+        AWAITING_INPUT, and its identity is that ask's (question.text,
+        question.asked_at). A 'decision:<id>' key is live only while that
+        decision is OPEN. Any other key shape is not live (fail-soft: an
+        unrecognized key expires its overlay rather than pinning it
+        forever).
+
+        *sessions_by_slug*/*decisions_by_id*, when given, replace the
+        linear scans below with an O(1) lookup -- _live_overlay_keys builds
+        them once per prune (see there). Omitted, this falls back to
+        scanning, which is what the single-key _record_overlay call site
+        (once per keypress) wants.
+
+        A QUESTION-LESS awaiting session identifies as (None,
+        record.start_ts) rather than a bare constant, so two records that
+        merely happen to share a slug (one reaped, one recreated) do not
+        collide -- a recreated record carries a fresh start_ts and so
+        expires the earlier record's overlay. `None` (not '') keeps it
+        unambiguously distinct from a real ask whose text is empty. What
+        this deliberately does NOT claim to distinguish is two SUCCESSIVE
+        question-less asks on the SAME record: a question-less ask leaves
+        no on-disk stamp of its own (that is exactly what asked_at is for),
+        and start_ts is immutable for a record's whole life, so no identity
+        derivable from the record can tell them apart. The normal path is
+        unaffected -- any tick that OBSERVES the intervening non-awaiting
+        status returns None here and expires the overlay then and there;
+        only a round trip completed entirely between two polls survives it,
+        and closing that would need a durable stamp the record does not
+        carry. See TestDroppedOverlayExpiresWithTheAsk's question-less case.
+
+        Both liveness gates compare by VALUE (==), never by identity (is),
+        exactly as order_queue's own state/status filters do.
+        DecisionRecord.state is documented as a plain str field with NO
+        from_dict coercion through DecisionState (additive-safe: an
+        unrecognized wire value must round-trip rather than raise), so
+        `state is DecisionState.OPEN` would be False for every record read
+        back off disk and would silently expire every decision overlay on
+        the very rebuild that set it.
+
+        Keying the session case on the QUESTION rather than on bare status
+        is strictly stronger, and the difference is reachable:
+        orchestrator.session_hooks.run_notification writes
+        status=AWAITING_INPUT plus a fresh Question on every Notification
+        hook, with no required intervening Stop hook (-> IDLE). So
+        AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) really happens, and a
+        status-only rule would still silently suppress Q2.
+
+        The DECISION identity is (text, filed_at) and deliberately excludes
+        manual_boost and state: _apply_boost's decision path calls
+        set_manual_boost and then re-scans self._decisions, so an identity
+        sensitive to manual_boost would spuriously expire a live overlay on
+        the operator's own keypress. OPEN-ness is already the liveness
+        gate, so state is not part of the identity either.
+
+        KEEP IN LOCKSTEP WITH THE SNAPSHOTS. This identity is only ever
+        consulted from a rebuild, and a rebuild only happens when the tick
+        diff sees a change (_apply_scan short-circuits otherwise), so each
+        snapshot must be at least as strong as the identity above or a real
+        identity change never wakes the prune at all:
+          - session -> registry_reader.build_snapshot, which appends
+            question.text AND question.asked_at for precisely this reason.
+          - decision -> _DECISION_SNAPSHOT_FIELDS, which already carries
+            text, filed_at and state -- a strict superset of (text,
+            filed_at) plus its OPEN gate, so there is no hole on that side.
+        """
+        kind, _, ident = key.partition(':')
+        if kind == 'session':
+            record = (
+                sessions_by_slug.get(ident)
+                if sessions_by_slug is not None
+                else next((r for r in self._records if r.session_slug == ident), None)
+            )
+            if record is None or record.status != Status.AWAITING_INPUT:
+                return None
+            question = record.question
+            if question is None:
+                return (None, record.start_ts)
+            return (question.text, question.asked_at)
+        if kind == 'decision':
+            decision = (
+                decisions_by_id.get(ident)
+                if decisions_by_id is not None
+                else self._decision_by_id(ident)
+            )
+            if decision is None or decision.state != DecisionState.OPEN:
+                return None
+            return (decision.text, decision.filed_at)
+        return None
+
+    def _record_overlay(self, key: str) -> None:
+        """Record the ask identity *key*'s overlay is being set against.
+
+        Every overlay-writing action handler must call this BEFORE its
+        trailing _rebuild_queue() -- _prune_overlays runs first inside that
+        rebuild, and without the pre-recorded identity it would clear the
+        operator's own keypress before the queue was ever re-rendered.
+
+        When _ask_identity returns None the identity is deliberately NOT
+        recorded, so the overlay expires on the very next rebuild. That is
+        the fail-soft direction (PRD §2): an overlay that expires too early
+        merely re-shows an ask the operator can re-drop, whereas one that
+        lingers silently suppresses a real ask -- the whole defect this
+        machinery exists to kill.
+        """
+        identity = self._ask_identity(key)
+        if identity is not None:
+            self._overlay_asks[key] = identity
+
+    def _prune_overlays(self) -> None:
+        """Expire every overlay entry whose ask is gone or has been replaced.
+
+        Covers all three ephemeral overlays -- self._dropped, self._boosts
+        and self._deferred -- under one shared predicate
+        (_live_overlay_keys): an entry survives only while the ask it was
+        recorded against is still the same live ask, i.e. the identity
+        stored in self._overlay_asks still equals the CURRENT
+        _ask_identity(key). Then garbage-collects self._overlay_asks down
+        to the keys still referenced by SOME overlay, so the bookkeeping
+        side-table cannot become the next leak. `live` IS that set: it is
+        by construction the subset of the pre-prune union that survives, so
+        the three overlays below sum to exactly it afterwards.
+        """
+        live = self._live_overlay_keys(self._dropped | self._boosts.keys() | self._deferred.keys())
+        self._dropped = {key for key in self._dropped if key in live}
+        self._boosts = {key: boost for key, boost in self._boosts.items() if key in live}
+        self._deferred = {key: stamp for key, stamp in self._deferred.items() if key in live}
+        self._overlay_asks = {
+            key: identity for key, identity in self._overlay_asks.items() if key in live
+        }
+
+    def _live_overlay_keys(self, keys: set[str]) -> set[str]:
+        """The subset of *keys* whose overlay is still live -- the expiry rule, stated once.
+
+        A key survives only when it still names a live ask
+        (_ask_identity is not None) AND that ask is the same one the overlay
+        was recorded against (self._overlay_asks still matches it).
+
+        Resolved for the WHOLE key set in one pass, against a single
+        slug->record and id->decision index built here, rather than by
+        calling _ask_identity per key per overlay. This runs at the head of
+        every _rebuild_queue -- i.e. on every poll tick that diffs as
+        changed -- and _ask_identity's index-less fallback scans
+        self._records linearly, so a key overlaid in all three collections
+        would cost three full scans of a registry the cockpit explicitly
+        sizes for 10k+ sessions (see _scan_registry_worker). order_queue
+        builds the same slug index immediately afterwards for exactly this
+        reason.
+        """
+        if not keys:
+            return set()
+        sessions_by_slug = {record.session_slug: record for record in self._records}
+        decisions_by_id = {decision.id: decision for decision in self._decisions}
+        live: set[str] = set()
+        for key in keys:
+            identity = self._ask_identity(
+                key, sessions_by_slug=sessions_by_slug, decisions_by_id=decisions_by_id
+            )
+            if identity is not None and self._overlay_asks.get(key) == identity:
+                live.add(key)
+        return live
+
     def _rebuild_queue(self) -> None:
         """Re-score and re-render the DecisionQueue from current in-memory state, right now.
 
@@ -536,11 +721,41 @@ class CockpitApp(App):
         next poll tick.
 
         Also prunes self._handling down to the keys still present in the
-        freshly-built queue: a key whose item left (resolved/dropped, or a
-        session moved off AWAITING_INPUT) stops being "handling" so a later,
-        unrelated ask that happens to reuse the same key (e.g. the same
-        session asking a brand new question) starts out unmarked.
+        freshly-built queue: a key whose item LEFT the queue (resolved/
+        dropped, or a session moved off AWAITING_INPUT) stops being
+        "handling", so an ask that later reuses that key starts out
+        unmarked.
+
+        That predicate is strictly WEAKER than the overlays' below, and the
+        residual gap is known, not an oversight. AWAITING_INPUT(Q1) ->
+        AWAITING_INPUT(Q2) never removes 'session:<slug>' from the queue --
+        session_hooks.run_notification writes status=AWAITING_INPUT plus a
+        fresh Question with no required intervening Stop hook (-> IDLE) --
+        so an operator who pressed Enter on Q1 sees Q2 already rendered as
+        "handling". That is the same family as the overlay leak this method
+        prunes, with a much weaker consequence: "handling" only tints the
+        row and nudges its score, it never HIDES the row, so the new ask
+        stays visible either way. Kept as-is deliberately (this task's plan
+        pins the predicate, and TestHandlingPrunedOnQueueExit pins its
+        behaviour); tightening it to ask liveness would mean calling
+        _record_overlay from action_focus_selected and folding _handling
+        into _prune_overlays' garbage collection.
+
+        The ephemeral overlays (self._dropped, and later self._boosts/
+        self._deferred) get the same treatment for the same reason, but
+        under a deliberately DIFFERENT predicate -- _prune_overlays' ask
+        liveness, run as the first statement below so the queue is always
+        built from already-pruned state. _handling's queue-membership
+        predicate cannot be reused for them: a dropped item is by
+        construction absent from the rebuilt queue, so `&= queue keys`
+        would clear every drop on the very rebuild action_drop itself
+        triggers. Conversely _handling means "the operator has acted on the
+        item currently in the queue", which queue membership answers
+        directly and cheaply -- for every key that actually leaves, with
+        the same-key re-ask caveat noted above. The two rules stay separate
+        on purpose.
         """
+        self._prune_overlays()
         now = self._now_fn()
         queue_items = order_queue(
             self._decisions,
@@ -591,7 +806,19 @@ class CockpitApp(App):
         queue, even though the other (the session) is still asking. Then
         reorders each backend's own targets -- grouped by kind so a wm
         target never pollutes a tmux backend's positional reorder (whose
-        index IS the destination window position) and vice versa. This
+        index IS the destination window position) and vice versa.
+
+        That same decision/session target collision means the REORDER list
+        must be deduped too, keeping the FIRST occurrence: queue_items is
+        score-descending, so the first occurrence is the highest-scoring
+        item and its position is the priority position the target should
+        land at. Passing a target twice is actively destructive, not merely
+        redundant -- TmuxBackend.reorder assigns a running per-session
+        index, so a duplicate consumes two indices, its second park then
+        fails against the source window it just vacated (a warning), and
+        the final compacted 0..N-1 range is left with a gap. A single
+        global `seen` set is equivalent to a per-kind one because a
+        DisplayTarget carries exactly one kind. This
         method and its caller are the ONLY place the refresh path may call
         backend.*; it calls ONLY set_urgency/reorder, NEVER focus/tile
         (those live exclusively in explicit-action handlers, e.g.
@@ -605,9 +832,12 @@ class CockpitApp(App):
         self._attention_targets = new_targets
 
         targets_by_kind: dict[str, list[DisplayTarget]] = {}
+        seen: set[DisplayTarget] = set()
         for item in queue_items:
-            if item.target is not None:
-                targets_by_kind.setdefault(item.target.kind, []).append(item.target)
+            if item.target is None or item.target in seen:
+                continue
+            seen.add(item.target)
+            targets_by_kind.setdefault(item.target.kind, []).append(item.target)
         for kind, targets in targets_by_kind.items():
             self._backend_for(kind).reorder(targets)
 
@@ -629,10 +859,12 @@ class CockpitApp(App):
         resolved, since the operator's acknowledgement is real regardless
         of whether a live window was found. This mark is not permanent:
         _rebuild_queue prunes self._handling down to whatever is still in
-        the queue on every rebuild, so the flag tracks the CURRENT ask, not
-        any historical acknowledgement -- a key that later leaves the queue
-        and resurfaces (e.g. the same session filing a brand new question)
-        starts unmarked again. Fail-soft: an empty queue (no highlighted
+        the queue on every rebuild, so a key whose item LEAVES the queue and
+        later resurfaces starts unmarked again. It is deliberately not keyed
+        on the ask itself, the way the _dropped/_boosts/_deferred overlays
+        are: a session going AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) never
+        leaves the queue, so Q2 does render as already-handled. Known and
+        kept -- see _rebuild_queue's docstring for why. Fail-soft: an empty queue (no highlighted
         key) or a key not present in the last-built queue no-ops without
         raising -- a gone/unlinked lead is simply not focusable, never a
         crash.
@@ -663,10 +895,18 @@ class CockpitApp(App):
         decision's boost is on disk. A SESSION-backed row has no
         persisted priority field at all (PRD §2 design decisions), so its
         boost lives ONLY in self._boosts, an ephemeral overlay order_queue
-        layers on top of the item's base (always-0) manual_boost. Either
-        way, the queue is re-scored and re-rendered immediately after --
-        never waits for the next poll tick. Fail-soft: no highlighted row,
-        or a key not present in the last-built queue, no-ops.
+        layers on top of the item's base (always-0) manual_boost. That
+        overlay expires with the ask it was set against (see
+        _prune_overlays) -- a session key is stable for the session's whole
+        lifetime, so a permanent boost would mis-rank a brand-new,
+        unrelated question from the same session -- which is why the
+        session branch records the identity BEFORE the rebuild below; the
+        prune inside it would otherwise clear the operator's own keypress.
+        The DECISION branch records nothing: it persists to disk and writes
+        no overlay at all. Either way, the queue is re-scored and
+        re-rendered immediately after -- never waits for the next poll
+        tick. Fail-soft: no highlighted row, or a key not present in the
+        last-built queue, no-ops.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
@@ -693,6 +933,7 @@ class CockpitApp(App):
             else:
                 assert delta is not None, 'exactly one of delta/absolute must be given'
                 new_boost = current_boost + delta
+            self._record_overlay(key)
             self._boosts[key] = new_boost
         self._rebuild_queue()
 
@@ -728,10 +969,16 @@ class CockpitApp(App):
         SESSION-backed row has no cockpit-writable state field at all
         (PRD §2 design decisions), so it is instead added to
         self._dropped, an in-memory overlay order_queue filters out by
-        key -- never written to the session's own record. Either way the
-        queue is re-scored and re-rendered immediately -- never waits for
-        the next poll tick. Fail-soft: no highlighted row, or a key not
-        present in the last-built queue, no-ops.
+        key -- never written to the session's own record. That drop
+        expires with the ask it was set against (see _prune_overlays): a
+        session key is stable for the session's whole lifetime, so a
+        permanent drop would silently suppress a brand-new, unrelated
+        question from the same session forever. The identity must be
+        recorded BEFORE the rebuild below, or the prune inside it would
+        clear the operator's own keypress. Either way the queue is
+        re-scored and re-rendered immediately -- never waits for the next
+        poll tick. Fail-soft: no highlighted row, or a key not present in
+        the last-built queue, no-ops.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
@@ -745,6 +992,7 @@ class CockpitApp(App):
             self._decisions = list_decisions(self.fleet_root)
             self._decisions_snapshot = _decisions_snapshot(self._decisions)
         else:
+            self._record_overlay(key)
             self._dropped.add(key)
         self._rebuild_queue()
 
@@ -760,9 +1008,14 @@ class CockpitApp(App):
         registry nor a session record has a cockpit-writable "deferred"
         field (PRD §2 design decisions): a defer is a pure, ephemeral
         "sink this for now" applied on top of whatever order_queue reads.
-        Re-scores and re-renders the queue immediately -- never waits for
-        the next poll tick. Fail-soft: no highlighted row, or a key not
-        present in the last-built queue, no-ops.
+        Uniformly for both kinds, that stamp expires with the ask it was
+        set against (see _prune_overlays), so it can never sink a later,
+        unrelated ask that happens to reuse the same key -- which is why
+        the identity is recorded BEFORE the rebuild below; the prune inside
+        it would otherwise clear the operator's own keypress. Re-scores and
+        re-renders the queue immediately -- never waits for the next poll
+        tick. Fail-soft: no highlighted row, or a key not present in the
+        last-built queue, no-ops.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
@@ -770,6 +1023,7 @@ class CockpitApp(App):
             return
         if key not in self._queue_items_by_key:
             return
+        self._record_overlay(key)
         self._deferred[key] = self._now_fn()
         self._rebuild_queue()
 

@@ -86,7 +86,15 @@ extra roots back out of the installed unit. That destructive path is
 exactly what scripts/check_fused_memory_unit_parity.py's --fix flag is
 documented to avoid ("--fix only APPENDS missing directives; it never
 removes or reorders existing lines"), and is why step-2 of this task's plan
-uses that flag rather than re-rendering the unit from the template. Also
+uses that flag rather than re-rendering the unit from the template.
+
+(That last clause is a HISTORICAL record of task 3868's reasoning, kept as
+written. It was true when it was written: re-rendering then meant a truncating
+`sed` redirect. Since task 4796 setup-host.sh renders this unit through
+scripts/render_dashboard_unit.py, which preserves DASHBOARD_KNOWN_PROJECT_ROOTS
+across the render, so the destructive premise no longer holds for the
+sanctioned install path — `--fix` remains the recommendation because it is
+narrower, not because a re-render would now destroy anything.) Also
 deliberately NOT asserted: ActiveState — liveness is the watchdog's job, and
 pinning it here would make this suite fail during any legitimate restart
 window.
@@ -208,9 +216,17 @@ COMMITTED_UNIT_PATH = (
 # sentinel" is.
 _NO_CAP_SENTINEL = "infinity"
 
-# Remediation for either layer below. Names the APPEND-ONLY fixer, never a
-# `sed` re-render or setup-host.sh re-run: both would silently strip the
-# host's extra DASHBOARD_KNOWN_PROJECT_ROOTS entries (see module docstring).
+# Remediation for either layer below. Names the APPEND-ONLY fixer because it is
+# the NARROWEST fix — it appends the missing directive and nothing else, needing
+# no re-provision of the host.
+#
+# It is no longer named because the alternatives are destructive. Task 4796
+# made setup-host.sh install this unit through scripts/render_dashboard_unit.py,
+# which reads this host's DASHBOARD_KNOWN_PROJECT_ROOTS off the installed unit
+# and puts it back, so a setup-host.sh re-run now PRESERVES those entries (task
+# 4793 did the same for the dashboard unit). A hand-rolled `sed` re-render is
+# still wrong — it truncates the value AND, if partial, leaves __UV_PATH__
+# literal — but that is a different claim from the one this comment used to make.
 # The second command is not optional — without the reload the manager keeps
 # serving the stale unit and only the FILE-layer test goes green. Both
 # layers really do interpolate it: the FILE layer delegates its assertion to
@@ -218,9 +234,10 @@ _NO_CAP_SENTINEL = "infinity"
 # so it re-raises with this appended rather than leaving the operator the
 # one message that never mentions re-installing THIS unit.
 _REMEDIATION = (
-    "To reconcile (append-only — never re-render or re-run setup-host.sh, "
-    "which would strip this host's extra DASHBOARD_KNOWN_PROJECT_ROOTS "
-    "entries): `python3 scripts/check_fused_memory_unit_parity.py "
+    "To reconcile (append-only, and the narrowest fix — it needs no host "
+    "re-provision; a setup-host.sh re-run also preserves this host's extra "
+    "DASHBOARD_KNOWN_PROJECT_ROOTS entries since task 4796, but does far more): "
+    "`python3 scripts/check_fused_memory_unit_parity.py "
     f"--installed {INSTALLED_UNIT_PATH} --template "
     "scripts/fused-memory.service.template --fix` then `systemctl --user "
     "daemon-reload`."

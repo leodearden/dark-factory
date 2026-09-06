@@ -167,10 +167,17 @@ ARTIFACTS=(
 )
 
 commit_rc=0
+# `commit_step` names, in ONE stable machine-readable token, which of the
+# branches below actually ran -- appended to the `done (...)` line so an
+# operator (or a test) can tell "declined" from "committed" without parsing
+# prose. See the exit-0 comment at the bottom of this block for why the
+# token exists instead of a non-zero exit.
 if [ "${CENSUS_COMMIT:-1}" != "1" ]; then
+    commit_step="skipped:disabled"
     echo "memory-metadata-coverage-census: CENSUS_COMMIT=0 — leaving the" \
          "regenerated artifacts uncommitted"
 elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    commit_step="skipped:not-a-git-repo"
     echo "memory-metadata-coverage-census: $REPO is not a git repository —" \
          "skipping the artifact commit" >&2
 elif ! repo_toplevel=$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null) || \
@@ -186,18 +193,32 @@ elif ! repo_toplevel=$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null) || 
          "is not the root of the repository git resolves for it" \
          "(${repo_toplevel:-<none>}); leaving the artifacts uncommitted" >&2
     commit_rc=1
+    commit_step="refused:repo-not-toplevel"
 elif [ -z "$(git -C "$REPO" status --porcelain -- "${ARTIFACTS[@]}" 2>/dev/null)" ]; then
     # The ordinary quiet-night outcome. Checked BEFORE committing so that
     # "nothing to commit" -- which git reports with a NON-ZERO code -- is never
     # narrated as a failure.
+    commit_step="skipped:no-drift"
     echo "memory-metadata-coverage-census: artifacts unchanged — nothing to commit"
 else
     commit_msg="chore(census): nightly canonical/topic coverage census $(date -u +%Y-%m-%d)"
     commit_out=$(git -C "$REPO" commit --only "${ARTIFACTS[@]}" \
         -m "$commit_msg" 2>&1)
     commit_rc=$?
+    # NEVER `printf '%s' "$commit_out" | grep -qi ...` here. `grep -q` exits
+    # the instant it matches, and the match is on line 1 of git's own error
+    # message; the `printf` writer can then die of SIGPIPE, `set -o pipefail`
+    # (line 68) promotes the pipeline's status to 141, and a TRUE predicate
+    # reads FALSE — silently skipping the retry below on the very first night
+    # this path is ever committed. Measured: 0.6% (25/4000) at git's natural
+    # ~270-byte message under fleet load, 100% once the message passes the
+    # ~64KB pipe buffer. `${commit_out,,}` is a pure parameter expansion: it
+    # forks nothing, so the predicate is a function of the message, not of how
+    # much of it a subprocess got to read before another one hung up on it.
+    # scripts/setup-host.sh::_parity_verdict already reached this same
+    # conclusion at a sibling site; this adopts its settled remedy.
     if [ "$commit_rc" -ne 0 ] && \
-       printf '%s' "$commit_out" | grep -qi 'did not match any file'; then
+       [[ "${commit_out,,}" == *'did not match any file'* ]]; then
         # First-ever run for a path git has never tracked — stage just those
         # paths and retry once.
         git -C "$REPO" add -- "${ARTIFACTS[@]}" >/dev/null 2>&1
@@ -206,14 +227,29 @@ else
         commit_rc=$?
     fi
     if [ "$commit_rc" -ne 0 ]; then
+        commit_step="failed"
         echo "memory-metadata-coverage-census: artifact commit exited" \
              "$commit_rc — the regenerated files are still on disk, but" \
              "UNCOMMITTED in a machine-operated checkout: $commit_out" >&2
     else
+        commit_step="committed"
         echo "memory-metadata-coverage-census: committed the regenerated artifacts"
     fi
 fi
 
-echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc commit=$commit_rc)"
-# Always 0 — see the oneshot rationale in the header.
+# `commit-step=` is appended AFTER `commit=$commit_rc` so every existing
+# `'commit=0' in ...` / `'commit=1' in ...` substring check keeps matching.
+# `commit_rc` keeps its own meaning ("did the commit step fail?"); the token
+# is orthogonal ("which branch ran?") -- four of the six tokens narrate
+# commit=0, which is exactly what made "declined" and "committed" ambiguous
+# in the journal before this field existed.
+echo "memory-metadata-coverage-census: done (census=$census_rc stamp=$stamp_rc commit=$commit_rc commit-step=$commit_step)"
+# Always 0 — a recurring systemd oneshot that exits non-zero enters `failed`
+# state and STAYS there, silently ending the append-only trend this job
+# exists to build (see the header, and scripts/reify-closure-staleness-sweep.sh).
+# That is a strictly worse outcome than the one missed nightly row a refusal
+# costs -- the next run's append restores it. The loud-over-silent-
+# degradation norm this invokes is satisfied by LEGIBILITY, not by a wedged
+# timer: commit-step= above names exactly which branch declined and why, so
+# `commit=0` can no longer read as "committed" when it was not.
 exit 0

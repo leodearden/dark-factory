@@ -4803,10 +4803,11 @@ class TestBackendForwarding:
     async def test_claude_default_shape_unchanged_and_no_backend_kwarg_with_gate(self):
         """Gated-path variant: invoke_claude_agent still gets no `backend` kwarg.
 
-        The forwarding guard (:895-896) sits once, before the no-gate/gate
-        branch, so it should cover both dispatch sites. This confirms the
-        gated cap-retry call site (:928) — not just the no-gate fast path
-        (:907) — actually honors it, and pins the gated call shape (adds
+        The forwarding guard (``if invoke_fn is not None:`` followed by
+        ``invoke_kwargs.setdefault('backend', backend)``) sits once, before
+        the no-gate/gate branch, so it should cover both dispatch sites. This
+        confirms the gated cap-retry call site — not just the no-gate fast
+        path — actually honors it, and pins the gated call shape (adds
         `oauth_token` from the leased slot) so a future change can't silently
         smuggle `backend` in alongside it.
         """

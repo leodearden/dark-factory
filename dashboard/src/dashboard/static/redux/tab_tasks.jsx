@@ -8,7 +8,7 @@ const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focus
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
 const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
-const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
 
 // Dot colour per activity pip. activityPips is pure and owns ORDER and
@@ -19,6 +19,15 @@ const PIP_DOT_COLOR_T = {
   running: CP_T.accent,
   blocked: CP_T.bad,
   'merge-deferred': 'var(--merge-deferred)',
+};
+
+// CSS accent per probe-status tone (runtime_format.js owns which tone each
+// status gets; this only translates a tone into a colour for the banner's
+// left rule). 'muted' means "expected, not a fault" — no accent at all.
+const PROBE_TONE_ACCENT_T = {
+  muted: 'var(--line)',
+  warn: 'var(--warn)',
+  bad: 'var(--bad)',
 };
 
 // Persisted-state hook (same shape as elsewhere)
@@ -524,6 +533,12 @@ function TaskDetail({ task, allTasks }) {
   }
   const deps = task.deps || [];
   const dependents = allTasks.filter(t => (t.deps || []).some(d => d.id === task.id));
+  // Why the runtime cells below are dashed. Three separable cases the operator
+  // must not confuse: the orchestrator is unreachable, OUR probe deadline fired
+  // (a starved dashboard event loop looks exactly like this), or no runtime
+  // endpoint is configured at all. Produced by task_runtime._probe_one ->
+  // active_tasks._probe_status. null on the healthy path — nothing renders.
+  const probe = rtProbe(task.runtime_status);
   return (
     <div className="task-detail">
       <h4>{task.title}</h4>
@@ -542,6 +557,15 @@ function TaskDetail({ task, allTasks }) {
         <span className="k">lane</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane)}</span>
         <span className="k">phase</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.phase)}</span>
         <span className="k">state</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane_state)}</span>
+        {probe && (
+          <React.Fragment>
+            <span className="k">runtime</span>
+            <span data-testid="task-runtime-probe" title={probe.hint}>
+              <span className={`badge ${probe.tone}`}>{probe.label}</span>
+              <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 6 }}>{probe.hint}</span>
+            </span>
+          </React.Fragment>
+        )}
       </div>
 
       <div className="section-lbl">Description</div>
@@ -695,6 +719,46 @@ function TasksTab({ projectFilter, search }) {
     'count-unknown': 'tasks-count-unknown-banner',
   };
 
+  // Runtime-probe health, derived frontend-side from the ACTIVE_TASKS rows
+  // (deliberately not a new top-level payload key — the per-project fact is
+  // already fully recoverable from `runtime_status`, so a new key would carry
+  // zero extra information). `runtime_status` is produced by
+  // task_runtime._probe_one (which names the fault domain) and mapped to the
+  // row vocabulary by active_tasks._probe_status — grep either end to find
+  // the other.
+  //
+  // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
+  // answer different questions: tasksBannerNotices reports whether TASK DATA
+  // is available, a distinction decided server-side in app.api_tasks, while
+  // rtProbeSummary is a client-side derivation over the ACTIVE_TASKS rows
+  // reporting whether we could reach the ORCHESTRATORS. Those are independent
+  // — fused-memory being down says nothing about orchestrator reachability —
+  // so both banners can show at once, and neither gates the other.
+  //
+  // Folding this into tasksBannerNotices would not merely blur that: it would
+  // SUPPRESS the probe verdict. That function short-circuits
+  // (tasks_offline_banner.js:112-115) — when `offline` is true it returns a
+  // single global notice and never evaluates the other kinds — so a probe
+  // notice routed through it would vanish during precisely the fused-memory
+  // outage we must not gate on, which is when an operator is already
+  // mid-triage and least able to afford a missing signal. Pinned by
+  // test_tab_tasks_runtime.py::test_probe_banner_is_not_a_tasksbannernotices_kind.
+  //
+  // Computed over the UNFILTERED rows, and deliberately NOT narrowable.
+  // `selfInflicted` is an assertion about the DASHBOARD's own health — that it
+  // finished none of the probes it started — so its denominator must be every
+  // probed project. This was previously scoped to the projectFilter-visible
+  // rows, which let an operator narrowed to two timed-out projects manufacture
+  // an all-at-once verdict and blame the dashboard for what was actually a
+  // per-project outage: the precise misdiagnosis this banner exists to prevent.
+  // The banner is therefore a global fact.
+  //
+  // Accepted tradeoff, so a future reader does not "fix" this back: an
+  // operator filtered down to one healthy project may still see a banner about
+  // a project they cannot see. That is strictly less harmful than a false "the
+  // orchestrators may be healthy — check the dashboard first" shown mid-triage.
+  const probeSummary = rtProbeSummary(allTasks);
+
   function statusMatches(s) {
     if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
     if (filters.pending   && s === 'pending')    return true;
@@ -730,6 +794,25 @@ function TasksTab({ projectFilter, search }) {
           {notice.text}
         </div>
       ))}
+      {probeSummary && (
+        <div className="col-span-12" data-testid="tasks-runtime-probe-banner"
+             style={{
+               padding: '8px 12px',
+               border: '1px solid var(--line)',
+               // Accent by the WORST tone present, not by selfInflicted: a
+               // lone timed-out project is a 'warn' (quite possibly our own
+               // starved loop) and must not wear the same alarm colour as a
+               // confirmed orchestrator outage. rtProbe owns the mapping.
+               borderLeft: `3px solid ${PROBE_TONE_ACCENT_T[probeSummary.tone] || 'var(--warn)'}`,
+               borderRadius: 4,
+               background: 'var(--bg-2)',
+               color: 'var(--fg-2)',
+               fontFamily: 'var(--mono)',
+               fontSize: 11,
+             }}>
+          {probeSummary.text}
+        </div>
+      )}
       {/* Filter bar */}
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>show</span>

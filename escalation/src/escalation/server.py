@@ -665,12 +665,12 @@ _RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
 
 
 async def _annotate_pins_recovery(
-    queue: EscalationQueue,
     harness: Any,
     escalations: Sequence[Any],
     dicts: list[dict[str, Any]],
     *,
     level: int | None,
+    all_pending: Sequence[Any],
 ) -> None:
     """Stamp ``pins_recovery`` on *dicts* in place, or leave the key ABSENT.
 
@@ -678,6 +678,12 @@ async def _annotate_pins_recovery(
     omitted rather than defaulted to ``[]`` on every path where the answer is
     unknown, because ``[]`` reads as "nothing pins this task" — the esc-3163
     collapse that routes a genuinely-pinned strand down the wrong branch.
+
+    *escalations* is the caller's (possibly ``level``-filtered) VIEW, paired
+    positionally with *dicts*.  *all_pending* is the caller's UNFILTERED
+    pending read, from which the classification's per-task open set is grouped.
+    This function performs NO queue I/O of its own: the caller already read
+    every pending record, so re-reading is pure waste (see the group-by below).
     """
     if not dicts:
         return
@@ -719,23 +725,34 @@ async def _annotate_pins_recovery(
         for esc in escalations:
             open_by_task.setdefault(esc.task_id, []).append(esc)
     else:
+        # The full open set, recovered from the read the CALLER already made
+        # rather than re-read here.  `all_pending` is the unfiltered pending
+        # list `get_pending_escalations` holds before it narrows to `level`, so
+        # this costs zero additional scans — where the loop it replaces cost
+        # one full-directory scan per distinct task id, on a dashboard poll.
+        #
+        # Grouped on the PARSED `esc.task_id` only, never on a filename stem:
+        # task_ids may contain hyphens, and queue.py:1266-1272 records that the
+        # retired parse-after-last-hyphen derivation was a real bug (task 3238).
+        #
+        # No try/except here any more, and that is not an oversight.  The guard
+        # this replaces wrapped `queue.get_by_task`; with no queue I/O left
+        # inside this function there is nothing for it to catch.  Its advertised
+        # per-task granularity was also nominal for the only failure that could
+        # ever reach it: get_by_task swallows per-file (JSONDecodeError,
+        # KeyError, TypeError) at queue.py:485-487, so a corrupt record never
+        # raised out of it, while an OSError from read_text() did — and since
+        # get_by_task(tid) scanned the WHOLE root for EVERY tid, one unreadable
+        # file already degraded every task rather than one.  The single read now
+        # backing this is `queue.get_pending()`, which globs the same root with
+        # the identical per-file swallow, so it degrades identically; it sits in
+        # the caller, where it was already unguarded, and the seam guard at the
+        # call site still blankets every line in here.
+        wanted = set(task_ids)
         open_by_task = {}
-        for tid in task_ids:
-            try:
-                open_by_task[tid] = queue.get_by_task(tid, status='pending')
-            except Exception as exc:  # noqa: BLE001 — real I/O, see below
-                # The ONE genuinely-reachable failure in this function (a
-                # filesystem scan plus JSON parse over esc-*.json), and the one
-                # place per-task recovery is real rather than nominal: a single
-                # unreadable file degrades exactly one task.  Leaving `tid` out
-                # of open_by_task makes the loop below skip it, so its key stays
-                # ABSENT (= UNKNOWN) instead of becoming a false [].  WARNING
-                # because a queue directory this process cannot read is
-                # operator-actionable and otherwise invisible on this surface.
-                logger.warning(
-                    'pins_recovery UNKNOWN for task %s: pending re-read failed: %s',
-                    tid, exc,
-                )
+        for esc in all_pending:
+            if esc.task_id in wanted:
+                open_by_task.setdefault(esc.task_id, []).append(esc)
 
     reports: dict[str, Any] = {}
     live_by_task: dict[str, bool] = {}
@@ -2059,16 +2076,27 @@ def create_server(
         prevent, so callers must treat an absent key as UNKNOWN and render
         nothing rather than "not pinning".
         """
+        # Read the pending set ONCE, unfiltered, and narrow it in memory.  The
+        # `level` filter is applied here rather than pushed into the queue
+        # because `_annotate_pins_recovery` needs the UNFILTERED set to classify
+        # each record against its task's whole open set (a filtered VIEW must
+        # not become a filtered CLASSIFICATION).  Reading with `level=` and then
+        # re-reading per task to recover what was just discarded is what made
+        # this O(T) full-directory scans.
         if task_id:
-            escalations = queue.get_by_task(task_id, status='pending', level=level)
+            all_pending = queue.get_by_task(task_id, status='pending')
         else:
-            escalations = queue.get_pending()
-            if level is not None:
-                escalations = [e for e in escalations if e.level == level]
+            all_pending = queue.get_pending()
+        escalations = (
+            all_pending if level is None
+            else [e for e in all_pending if e.level == level]
+        )
 
         dicts = [e.to_dict() for e in escalations]
         try:
-            await _annotate_pins_recovery(queue, harness, escalations, dicts, level=level)
+            await _annotate_pins_recovery(
+                harness, escalations, dicts, level=level, all_pending=all_pending,
+            )
         except Exception:
             # THE seam guard.  `harness` is duck-typed Any because this package
             # deliberately does not import orchestrator, so the annotation can

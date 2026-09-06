@@ -54,10 +54,10 @@ No candidate in the census is an adversarial/red-team fixture — all 41 are rea
 | 2325 | reify | 137 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2330 | reify | 750 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2336 | reify | 119 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
-| 2379 | reify | 139 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
+| 2379 | reify | 139 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2384 | reify | 285 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2531 | reify | 116 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
-| 2573 | reify | 299 | done | include | planrate_only | INCLUDE. The brief states an implementable goal, and although the architect raised unactionable escalation(s) on this task it reached status `done` — the unactionability was resolved, so this is a genuinely hard task that landed, not an ill-posed one. Terminal status is the discriminator (cf. reify 3378, cancelled AND unactionable, which is excluded). |
+| 2573 | reify | 299 | done | include | referenced | INCLUDE. The brief states an implementable goal, and although the architect raised unactionable escalation(s) on this task it reached status `done` — the unactionability was resolved, so this is a genuinely hard task that landed, not an ill-posed one. Terminal status is the discriminator (cf. reify 3378, cancelled AND unactionable, which is excluded). |
 | 2654 | reify | 195 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2655 | reify | 162 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 2656 | reify | 100 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
@@ -80,7 +80,7 @@ No candidate in the census is an adversarial/red-team fixture — all 41 are rea
 | 3834 | reify | 3862 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 3845 | reify | 2201 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 3883 | reify | 2631 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
-| 4026 | reify | 1577 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
+| 4026 | reify | 1577 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 4086 | reify | 1298 | done | include | planrate_only | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
 | 4370 | reify | 9422 | done | include | referenced | INCLUDE. The brief states an implementable goal, and although the architect raised unactionable escalation(s) on this task it reached status `done` — the unactionability was resolved, so this is a genuinely hard task that landed, not an ill-posed one. Terminal status is the discriminator (cf. reify 3378, cancelled AND unactionable, which is excluded). |
 | 4832 | reify | 2627 | done | include | referenced | INCLUDE. The brief states an implementable goal: it names the deliverable and enough of its surface for an architect to locate the work at the baseline commit. |
@@ -105,14 +105,26 @@ No candidate in the census is an adversarial/red-team fixture — all 41 are rea
 - **Headroom**: 180 min is 6.4x the observed max-at-exhaustion (28.1 min, n=46) and 1.7x the all-time architect max (106.3 min), so the timeout provably cannot bind before the 120-turn or budget ceiling.
 - **Why it matters**: runner.py raises the eval to outcome="timeout" on asyncio.TimeoutError and deliberately does NOT taint-exclude it, so a binding timeout scores a kept 0.0 — manufacturing an artificial failure on a set already selected for being hard.
 
-## Merge-SHA availability — the SPLIT majority
+## Merge-SHA availability — how many fixtures can carry a reference
 
-SPLIT / direct-landed candidates are a MAJORITY (22/41), not the minority the trial manifest assumed. Only 17 of 41 have a single clean "Merge task/<id> into main" commit, so only those can carry a reference block. This caps the downstream plan_quality population and is a material fact for γ1, though it does not block β1 — D9's planRate-only mechanism handles it.
+Candidates that CAN carry a reference are a MAJORITY (20 of 39): each has a single landing merge under one of the two accepted subject spellings (`Merge task/<id> into main` or `Merge task/<id>: <subject>`). The other 19 of 39 landed SPLIT/direct and are planRate-only. planRate-only caps the downstream plan_quality population and is a material fact for γ1, though it does not block β1 — D9's planRate-only mechanism handles it.
 
-- `referenced` (single clean merge commit): **17**
-- `planrate_only` (SPLIT / direct-landed): **22**
+- `referenced` (single clean merge commit): **20**
+- `planrate_only` (SPLIT / direct-landed): **19**
 
 A `planrate_only` fixture carries NO `reference` key at all and instead stamps `provenance.reference_unavailable` with the cause plus `provenance.baseline_source` with the ladder rung that produced its `pre_task_commit`. An empty `reference: {}` block would be indistinguishable from a capture that silently failed; omitting the key and recording why makes it a positive, auditable fact.
+
+A landing merge is accepted under EITHER subject spelling — `Merge task/<id> into main` or `Merge task/<id>: <subject>` — so `reference_unavailable` means no single landing merge exists under either. Both spellings are in live use (censused over reify's `main`: 2741 of the first, 74 of the second) and both are derived in one place, `mint_hard_v2_fixtures.py::_merge_subject_patterns`, mirroring `git_ops.py::_merge_subject`.
+
+## Is the base a true branch point, or an approximation?
+
+Every fixture carries a bool `provenance.base_is_approximated`; the rule, the rationale and what a readout should do about it are stated once, in `README.md` under the same heading. Derived from the rows in this manifest:
+
+- ladder-resolved bases that ARE the true branch point (`baseline_source: merge_first_parent`, i.e. `M^1` of the landing merge): **20**
+- ladder-resolved bases that are an APPROXIMATION (any weaker rung): **19**
+- continuity fixtures, whose inherited base is outside the rung table and is MEASURED against the landing merge at mint time rather than read off a label: **3** (see `provenance.base_verified_against_merge` in each fixture)
+
+Per-fixture distances from the true branch point: `_meta/base-distance-report.md`, regenerable with `--base-distance-report`.
 
 ## Continuity back-fill
 

@@ -144,6 +144,112 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 
 ### Changed
 
+#### `related_tasks` blessed into Tier-A, and every Tier-B canonical key is now machine-checked (task 4303)
+
+`related_tasks` was the **largest single `unknown_key` contributor in the
+corpus** — and, unusually, the *canonical* Tier-B spelling that
+`docs/task-authoring.md` §8 tells authors to migrate **toward**. So an author
+who followed the documentation exactly still minted a census line, and the
+drift signal could not distinguish "used a deprecated alias" from "used the
+canonical spelling". It was the sole violation of an invariant the Tier-B
+table already depended on: measured on the base tree, `prd_path`,
+`prd_task_label`, `invariants` and `source_finding_id` — every other key in
+the table's Canonical column — were already blessed.
+
+**The reader trace came back NEGATIVE, and the key is blessed anyway. This is
+the fact most likely to be misread later, so it is stated plainly.** There is
+no code reader, no code writer, and `git log -S` across `orchestrator/src`,
+`fused-memory/src`, `escalation/src`, `shared/src`, `dashboard`, `scripts`,
+`hooks`, `skills` and `.claude` shows the key has **never existed in code** in
+this repo's history. Unlike `related_memory_ids`, no live prompt instructs it
+either — the empirical writer is an LLM prose convention. The blessing rests on
+the **`esc-3796-1` corpus-dominance precedent**, under which the
+finding-provenance family is Tier-A with no reader and no writer because *the
+corpus is the usage*; `source_finding_id` was blessed at 120 tasks, this key at
+469. A future reader who greps for a writer, finds none, and prunes the entry
+as dead would be wrong.
+
+**Retirement was measured, not assumed, to be impossible today.** 326 of the
+469 carriers (69.5%) hold `done_provenance` and are unwritable under the
+presence-only write-authority floor until task 3777 lands. Sweeping only the
+writable ~30% is exactly the "fifth of the benefit" vocabulary fork §8 already
+rules out for task 4302 — so retiring would have converted this task into a
+block on 3777 while leaving live authoring guidance inverted for four spellings
+in the meantime. Typing was ruled out on the same grounds that decided
+`execution_class`: the corpus values are heterogeneous (432 list, 37 bare str),
+so a `list[str]` field would raise on every metadata write to those 37 under
+`direction='write', enforce=True`, permanently.
+
+**A new structural guard closes the class of bug, not just this instance.**
+`tests/scripts/test_task_authoring_tier_b_canonical_keys.py` pins the general
+invariant *every key in the Tier-B Canonical column is Tier-A blessed*, so a
+future table row whose canonical is unblessed fails the suite instead of
+silently recreating this defect. It is a new file rather than an extension of
+`test_task_authoring_blessed_keys_drift.py`, whose docstring explicitly forbids
+extending that guard to the surrounding prose. Non-vacuity was measured by
+hand, since its own RED was scaffolding-shaped: removing `'related_tasks'` from
+the frozenset makes it fail naming the key.
+
+**Two coverage holes in that guard were then closed, both falsified by hand.**
+(1) The row filter keeps any row with a backtick *anywhere* in it, but names are
+read out of the first cell only — so a row whose Canonical cell was written as
+bare prose passed the filter, contributed zero names and was **silently
+unpinned**. Measured on the live document: rewriting the real ``| `invariants` |
+`inv` |`` row as `| the invariants key | `inv` |` left the guard reporting
+**11 passed**; with the new per-row assertion the same edit fails **3 tests**
+naming the offending row. That is the identical silent-narrowing shape as the
+`` ` + ` ``-joined cell the file already guards against — one loses a key, this
+lost a whole row. (2) The parser suite exercised only `direction='read'` with a
+list value, so the **bless-not-type** ruling — which rests entirely on 37 corpus
+carriers holding a bare `str` — was defended by prose alone. A parametrized
+write leg now pins both shapes under `direction='write', enforce=True`, asserting
+neither raises *and* neither is coerced. Falsified by adding
+`related_tasks: list[str]` to `TaskMetadata`: exactly one case failed,
+`[bare_str_value]`, with `Input should be a valid list [input_value='task-1']`,
+while `[list_value]` stayed green. Neither mutation was committed.
+
+**Deliberately deferred:** the marker-span extraction (`begin`/`end` counting,
+inversion check, slice) is now duplicated between this guard and
+`tests/scripts/test_task_authoring_blessed_keys_drift.py`. Extracting it to a
+shared helper is only worth doing if *both* callers migrate, and the task-3780
+guard is outside this task's lock set, so it is filed as follow-up rather than
+half-done here.
+
+The frozenset header comment's `related_task*` **wildcard** is narrowed to the
+three literal aliases. It went false the moment the key was blessed, and was
+independently hazardous: the glob sweeps in `related_task_ids`, a different key
+— memory metadata, not task metadata — with a live reader in
+`fused-memory/scripts/audit_duplicate_memories.py`.
+
+**This does NOT empty the census, and should not be read as if it had.**
+Measured before and after against the live store (4748 dict-metadata tasks,
+2026-08-31): **1516 tasks → 1215** carrying at least one unknown key, **3130 →
+2661** warning lines, **1028 → 1027** distinct spellings. The blessing removes
+469 warning *lines* but clears only **301 tasks entirely**, because most
+carriers also hold other unknown keys. `related_tasks` is now absent from the
+census; the new #1 contributor is `merge_first_enqueued_at` at 209. The
+remaining tail is deliberately left warning as a drift signal.
+
+**`delivered_checks` (313 in a raw census) was investigated and is a
+non-finding** — a measurement artifact, not a leak, and no code changed. It is
+a registered submodel (`shared/src/shared/capability_manifest.py`) whose
+registration is an **import-order side effect**, so a standalone script that
+never imported `shared.capability_manifest` counts it as unknown. The live
+write path does reach the registration, so no real write emits the warning.
+Recorded in §8 with the operational corollary: import the submodel
+registrations before running a task-metadata census, or you will measure
+phantom leaks.
+
+**Operator note:**
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` now **refuses**
+`related_tasks` as a Tier-A blessed key (`--force` overrides) — verified by
+hand. That closes the retirement path in code, not merely in prose.
+
+The historical task-4372 entry below, which reads "The largest single
+contributor is `related_tasks` at 445 tasks — which is the *canonical* Tier-B
+spelling, not drift", is left as written: it was true when written and is the
+record of how this task was found. This entry supersedes it.
+
 #### `execution_class` blessed into Tier-A, and the Tier-A listing is now machine-checked (task 3780)
 
 **Two changes, and the second matters more than the first.**

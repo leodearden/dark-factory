@@ -307,8 +307,11 @@ def _ruff_targets(cmd: str, label: str) -> list[str]:
 
     Returns whole path TOKENS. Callers must compare against them by exact element
     and never substring-match the raw command — the contract documented on
-    ``_lint_leg_targets`` in ``test_fallback_verify_config.py`` and restated on
-    ``_ruff_targets`` in ``test_root_lint_covers_nonmember_py.py``.
+    ``tests/scripts/verify_command_invariants.py::positional_targets`` (its
+    canonical home since task 3883, when ``_lint_leg_targets`` in
+    ``test_fallback_verify_config.py`` stopped implementing the rule and started
+    delegating) and restated on ``_ruff_targets`` in
+    ``test_root_lint_covers_nonmember_py.py``.
 
     That rule is backed by a MEASURED counterexample, not a hypothetical:
     ``'shared' in cmd`` is ALREADY TRUE of the live ``lint_command`` via the

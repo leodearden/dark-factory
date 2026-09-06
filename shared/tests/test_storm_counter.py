@@ -639,6 +639,279 @@ class TestDistinctKeyOffByDefault:
         }
 
 
+class TestLatchedFireMode:
+    """``fire_mode='latched'`` — fire once on the CROSSING, not once per window.
+
+    The default ``rate_limited`` mode answers "this burst is still going" once
+    per window, which is right for a counter whose consumer logs or escalates
+    a standing condition. It is NOT right for
+    ``fused_memory/services/memory_metadata_census.py::UnknownKeyStormDetector``,
+    which sits on the live memory-write path: its filer does an
+    open-escalation ``queue.get_by_task`` read per invocation, so re-answering
+    once per window would buy a queue read for a condition already filed. Its
+    docstring states the contract as "the crossing is the event — not the
+    state", and it re-arms only once the window drains back below the
+    threshold, so a writer that drifts, is fixed, and later drifts again is
+    heard both times.
+
+    The two policies are genuinely different, not two spellings of one thing —
+    see ``test_latched_does_not_re_fire_across_a_full_window``, which drives
+    one trace through both modes and gets different answers.
+    """
+
+    def test_fire_mode_defaults_to_rate_limited(self, counter):
+        """Every pre-existing consumer keeps the mode it was written against."""
+        assert counter.fire_mode == 'rate_limited'
+        assert StormCounter().fire_mode == 'rate_limited'
+
+    def test_fire_mode_is_readable_back(self):
+        """Exposed for the reason ``count_distinct`` is (task 3259's amendment).
+
+        A consumer whose correctness depends on the policy must be able to pin
+        it through a supported surface instead of reaching into another
+        package's private attributes.
+        """
+        assert StormCounter(fire_mode='latched').fire_mode == 'latched'
+
+    def test_an_unknown_fire_mode_raises(self):
+        """A mode mismatch is a deterministic wiring bug in the call site.
+
+        Defaulting a misspelled mode to ``rate_limited`` would silently degrade
+        a latched consumer to per-window re-firing — invisible in the return
+        value, the summary and the logs alike, exactly like the ``key``-on-a-
+        default-mode-counter case this class's sibling covers (INV
+        no-silent-fail-soft).
+
+        The pyright suppression is the POINT, not a workaround: ``fire_mode``
+        is a ``Literal`` (:data:`shared.storm_counter.FireMode`), so a typed
+        caller is caught statically and this runtime backstop only has to cover
+        the untyped ones (a dict-splatted kwarg, a plain-script import). Same
+        shape as ``test_startup_completion_probe.py::
+        test_an_unknown_kind_is_rejected_loudly``.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            StormCounter(fire_mode='latch')  # pyright: ignore[reportArgumentType]
+
+        message = str(excinfo.value)
+        # The closing quote is load-bearing. A bare ``'latch' in message`` is
+        # VACUOUS: the accepted spelling ``'latched'`` — which the next
+        # assertion requires the message to list — contains ``latch`` as a
+        # substring, so the check would stay green even if the message never
+        # interpolated the offending value at all, which is the exact
+        # regression it claims to guard. ``"'latch'"`` cannot occur inside
+        # ``'latched'``.
+        assert "fire_mode='latch'" in message, 'the offending value must be named'
+        assert 'rate_limited' in message and 'latched' in message, (
+            'both accepted spellings must be named, so the fix is in the error'
+        )
+
+    def test_latched_fires_exactly_on_the_crossing_call(self, clock):
+        """The return SHAPE is mode-independent; only the fire policy differs."""
+        counter = StormCounter(time_provider=clock, fire_mode='latched')
+
+        results = [
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+            for _ in range(3)
+        ]
+
+        assert [r is None for r in results] == [True, True, False]
+        assert results[-1] == {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 300.0,
+            'labels': ['p'],
+        }
+
+    def test_latched_does_not_re_fire_across_a_full_window(self, clock):
+        """THE DISCRIMINATOR between the latch and the per-window rate limit.
+
+        A writer that stays continuously over the line fires ONCE under the
+        latch and once PER WINDOW under the rate limit. The identical trace is
+        driven through both modes here so the difference is executable rather
+        than asserted in prose: at t=400 the default counter's last fire is
+        398s old (>= the 300s window) while its sliding window still holds
+        three events, so it fires again — and the latched one, never having
+        dropped below the threshold, stays silent.
+
+        Without this trace a per-window rate limit would pass the census's own
+        ``test_does_not_re_fire_after_crossing``, which never advances the
+        clock.
+        """
+        latched = StormCounter(time_provider=clock, fire_mode='latched')
+        rate_limited = StormCounter(time_provider=clock)
+
+        def drive(offset):
+            clock.now = 1000.0 + offset
+            return (
+                latched.record(threshold=3, window_seconds=300.0, label='p'),
+                rate_limited.record(threshold=3, window_seconds=300.0, label='p'),
+            )
+
+        assert [r is not None for r in drive(0)] == [False, False]
+        assert [r is not None for r in drive(1)] == [False, False]
+        assert [r is not None for r in drive(2)] == [True, True], 'both cross here'
+
+        for offset in (100, 200, 300):
+            assert [r is not None for r in drive(offset)] == [False, False], (
+                f'still inside the rate limit at t={offset}'
+            )
+
+        latched_at_400, rate_limited_at_400 = drive(400)
+        assert rate_limited_at_400 is not None, (
+            'the rate limit re-arms a full window after its fire'
+        )
+        assert latched_at_400 is None, (
+            'the latch reports the crossing, not the standing state'
+        )
+
+    def test_latched_re_arms_once_the_window_drains_below_the_threshold(self, clock):
+        """Drift, fix, drift again — heard both times."""
+        counter = StormCounter(time_provider=clock, fire_mode='latched')
+
+        first = [
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+            for _ in range(3)
+        ]
+        assert [r is not None for r in first] == [False, False, True]
+
+        clock.advance(301.0)
+        second = [
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+            for _ in range(3)
+        ]
+
+        assert [r is not None for r in second] == [False, False, True]
+
+    def test_latched_and_count_distinct_are_orthogonal(self, clock):
+        """Two independent dimensions, not one mode enum.
+
+        ``count_distinct`` decides WHAT is counted; ``fire_mode`` decides WHEN
+        the count is reported. A consumer may need either, both or neither.
+        """
+        counter = StormCounter(
+            time_provider=clock, count_distinct=True, fire_mode='latched'
+        )
+
+        for _ in range(5):
+            assert counter.record(
+                threshold=3, window_seconds=300.0, label='p', key='same'
+            ) is None, 'one repeated key is one distinct key, however many events'
+
+        assert counter.record(
+            threshold=3, window_seconds=300.0, label='p', key='second'
+        ) is None
+        summary = counter.record(
+            threshold=3, window_seconds=300.0, label='p', key='third'
+        )
+
+        assert summary is not None, 'the third DISTINCT key crosses'
+        assert summary['count'] == 3, 'distinct keys, not the 7 raw events'
+        assert counter.record(
+            threshold=3, window_seconds=300.0, label='p', key='fourth'
+        ) is None, 'and the latch still suppresses the follow-up'
+
+
+class TestLatchedState:
+    """The read-only ``latched`` property, and what it licenses a sweeper to do.
+
+    Exposed for the reason :attr:`count_distinct` and :attr:`fire_mode` are —
+    the ruling task 3259's amendment (3d4418c777) made when it replaced
+    ``harness._dead_owner_storm._count_distinct`` with the public property: a
+    consumer whose correctness depends on another package's counter state must
+    read it through a supported surface instead of coupling to private
+    attributes. Here that consumer is
+    ``fused_memory/services/memory_metadata_census.py::UnknownKeyStormDetector``,
+    whose eviction test needs to pin the latch after task 4519's migration.
+    """
+
+    def test_latched_is_false_before_the_crossing(self, clock):
+        counter = StormCounter(time_provider=clock, fire_mode='latched')
+
+        assert counter.latched is False, 'a fresh counter is armed, not fired'
+        counter.record(threshold=3, window_seconds=300.0, label='p')
+        assert counter.latched is False, 'below the line is still armed'
+
+    def test_latched_is_true_after_the_crossing(self, clock):
+        counter = StormCounter(time_provider=clock, fire_mode='latched')
+
+        for _ in range(3):
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+
+        assert counter.latched is True
+
+    def test_latched_is_false_again_after_the_window_drains(self, clock):
+        """Drift -> fix -> drift, read off the property this time.
+
+        The latch is cleared by the next SUB-THRESHOLD record, not by the
+        passage of time: nothing runs in the background, so a counter whose
+        writer falls silent forever stays latched until something touches it.
+        That is precisely why a per-key consumer sweeps and DROPS dormant
+        counter objects — see
+        ``test_a_latched_drained_counter_decides_like_a_fresh_one``.
+        """
+        counter = StormCounter(time_provider=clock, fire_mode='latched')
+        for _ in range(3):
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+        assert counter.latched is True
+
+        clock.advance(301.0)
+        assert counter.latched is True, 'time alone does not re-arm; a record does'
+
+        counter.record(threshold=3, window_seconds=300.0, label='p')
+
+        assert counter.latched is False, 'the drained window re-armed the latch'
+
+    def test_latched_is_always_false_in_rate_limited_mode(self, counter):
+        """The default mode has no latch, and must not start pretending it does."""
+        assert counter.latched is False
+        for _ in range(10):
+            counter.record(threshold=3, window_seconds=300.0, label='p')
+
+        assert counter.latched is False, (
+            'rate_limited suppresses on the elapsed window, not on a latch'
+        )
+
+    def test_a_latched_drained_counter_decides_like_a_fresh_one(self, clock):
+        """Why a sweeper may still evict on ``prune() == 0`` in latched mode.
+
+        The LATCHED analogue of
+        ``TestPruneSweepHook::test_a_pruned_counter_decides_like_a_fresh_one``,
+        which licenses eviction for ``_last_fire_ts`` only. Once ``_latched``
+        also lives inside the counter there is a second piece of state a
+        dropped-and-reconstructed object would lose, so the same claim has to
+        be re-proved rather than assumed.
+
+        It holds because an empty window is below any threshold >= 1: the next
+        event lands under the line and re-arms a KEPT counter before it could
+        ever suppress, so it decides exactly as a fresh one would. That is what
+        ``fused-memory/tests/test_memory_metadata_census.py::
+        test_eviction_clears_the_firing_latch_so_a_recurrence_is_heard``
+        depends on after task 4519 moves the latch inside the counter — its
+        sweep clears the latch by deleting the object that holds it.
+        """
+        kept_counter = StormCounter(time_provider=clock, fire_mode='latched')
+        for _ in range(3):
+            kept_counter.record(threshold=3, window_seconds=100.0, label='p')
+        assert kept_counter.latched is True, 'the counter is latched when drained'
+
+        clock.advance(101.0)
+        assert kept_counter.prune(100.0) == 0, 'a sweeper would evict this one'
+
+        kept = [
+            kept_counter.record(threshold=3, window_seconds=100.0, label='p')
+            for _ in range(3)
+        ]
+        fresh_counter = StormCounter(time_provider=clock, fire_mode='latched')
+        fresh = [
+            fresh_counter.record(threshold=3, window_seconds=100.0, label='p')
+            for _ in range(3)
+        ]
+
+        assert [f is not None for f in kept] == [f is not None for f in fresh]
+        assert kept[-1] == fresh[-1]
+        assert kept_counter.latched == fresh_counter.latched
+
+
 class TestPruneReturnsRawCountInDistinctMode:
     """``prune()`` keeps reporting REMAINING EVENTS, never distinct keys.
 

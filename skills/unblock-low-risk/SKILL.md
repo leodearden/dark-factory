@@ -308,8 +308,8 @@ eyeballed listing.
 
 - **A stampable sha** — the ladder yields one on exactly four outcomes: a non-empty marker with
   the branch ref **gone**; a marker that passes **containment rc=0**; a group/train merge
-  confirmed by **contained-before rc=1**; and a fast-forward landing confirmed by a
-  **subject-matching task citation** on main. Use the sha and the `note` the ladder specifies for
+  confirmed by **contained-before rc=1**; and a landing — fast-forward *or* sibling-covered —
+  confirmed by a **subject-matching task citation** on main. Use the sha and the `note` the ladder specifies for
   that outcome, and proceed with the calling arm's sub-steps a–d above.
 - **A genuine not-landed outcome** — the ladder's three: rc=0's **phantom-branch** exit (nothing
   on main cites this task), and — both **outside** the `coalesce-*` arm — rc=1, and rc=128 with

@@ -528,6 +528,7 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
             <C.LineChart
               series={[{ key: 'churn', color: C.PALETTE.bad, values: churnDates.map(d => churnDaily[d] || 0) }]}
               labels={churnDates}
+              formatY={C.formatCountTick}
               formatX={fmtDateTime}
             />
           </TimeChart>

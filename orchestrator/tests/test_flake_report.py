@@ -921,7 +921,9 @@ class TestReadAmplification:
     the open rows it would re-fetch are already in hand from ``list_open_debt``.
     """
 
-    def _seeded(self, tmp_path: Path) -> Path:
+    RESOLVED = 'tests/test_resolved_00.py::test_x'
+
+    def _seeded(self, tmp_path: Path, *, between_cycles: int = 1) -> Path:
         db_path = tmp_path / 'runs.db'
         ensure_schema(db_path)
         for name in ('a', 'b', 'c'):
@@ -930,41 +932,102 @@ class TestReadAmplification:
             _seed_occurrence(db_path, test_id=f'tests/test_{name}.py::test_x',
                              observed_at='2026-08-09T13:00:00+00:00')
         # BETWEEN CYCLES: resolved, so absent from list_open_debt — the one case that
-        # genuinely still needs a per-test read.
-        _seed_debt(db_path, test_id='tests/test_resolved.py::test_x',
-                   opened_at='2026-08-07T12:00:00+00:00',
-                   resolved_at='2026-08-08T12:00:00+00:00', open_count=2)
-        _seed_occurrence(db_path, test_id='tests/test_resolved.py::test_x',
-                         observed_at='2026-08-09T14:00:00+00:00')
+        # genuinely needs a debt read the open-row scan cannot serve.  Parametrized by
+        # COUNT because the acceptance is precisely that the ledger connection count
+        # does NOT move with it.
+        for i in range(between_cycles):
+            test_id = f'tests/test_resolved_{i:02d}.py::test_x'
+            _seed_debt(db_path, test_id=test_id,
+                       opened_at='2026-08-07T12:00:00+00:00',
+                       resolved_at='2026-08-08T12:00:00+00:00', open_count=2,
+                       prior_resolved_at='2026-08-01T12:00:00+00:00',
+                       prior_resolving_commit='c0ffee')
+            _seed_occurrence(db_path, test_id=test_id,
+                             observed_at='2026-08-09T14:00:00+00:00')
         return db_path
 
     def test_open_debt_rows_are_not_re_read_per_test(self, tmp_path, monkeypatch):
+        """ONE batched call, carrying exactly the between-cycles remainder.
+
+        Two claims in one assertion: the three OPEN rows are still served from the
+        single ``list_open_debt`` scan (so they never reach the ledger a second time),
+        and what is left over is fetched as ONE batch rather than N lookups.
+        """
         import orchestrator.flake_report as report_module
 
-        seen: list[str] = []
-        real = report_module.read_debt
+        calls: list[list[str]] = []
+        real = report_module.read_debt_many
 
-        def _counting(db_path, test_id):
-            seen.append(test_id)
-            return real(db_path, test_id)
+        def _counting(db_path, test_ids):
+            ids = list(test_ids)
+            calls.append(ids)
+            return real(db_path, ids)
 
-        # Patched on flake_report, not flake_ledger: this module binds read_debt at
+        # Patched on flake_report, not flake_ledger: this module binds the name at
         # import time, so patching the source module would not intercept the call.
-        monkeypatch.setattr(report_module, 'read_debt', _counting)
+        monkeypatch.setattr(report_module, 'read_debt_many', _counting)
 
         build_report(self._seeded(tmp_path), now=_NOW)
 
-        assert seen == ['tests/test_resolved.py::test_x'], seen
+        assert len(calls) == 1, f'expected one batched read, got {len(calls)}: {calls}'
+        assert sorted(calls[0]) == [self.RESOLVED], calls[0]
+
+    def test_ledger_connection_count_is_constant_in_test_count(self, tmp_path, monkeypatch):
+        """THE ACCEPTANCE, pinned as an integer: O(1) ledger connections, not O(N).
+
+        Deliberately NOT a wall-clock threshold.  The evidence behind this task is a
+        timing measurement (0.187s vs 0.029s over 400 tests), but any duration bound
+        would be flaky under CI load and tuned to one observed output rather than
+        derived.  The connection COUNT is the mechanism that timing measures, it is
+        deterministic, and it states the acceptance literally.
+
+        Two fixture sizes are compared rather than an absolute number asserted, so the
+        test survives a reader being added to or removed from ``build_report``.
+        """
+        counts: list[int] = []
+        sizes = (3, 30)
+        for n in sizes:
+            db_path = self._seeded(tmp_path / f'n{n}', between_cycles=n)
+
+            opened: list = []
+            real_connect = sqlite3.connect
+
+            def _recording(*args, _opened=opened, _real=real_connect, **kwargs):
+                _opened.append(args)
+                return _real(*args, **kwargs)
+
+            monkeypatch.setattr(sqlite3, 'connect', _recording)
+            report = build_report(db_path, now=_NOW)
+            monkeypatch.undo()
+
+            # The fixture really does differ in test count — otherwise the two counts
+            # would agree trivially and the assertion below would prove nothing.
+            assert len(report.chains) == 3 + n
+            counts.append(len(opened))
+
+        assert counts[0] == counts[1], (
+            f'ledger connections scale with test count: {sizes[0]} tests -> {counts[0]}, '
+            f'{sizes[1]} tests -> {counts[1]}'
+        )
+        # ...and the constant is genuinely a constant, not merely equal: fewer
+        # connections than there are between-cycles tests is the "not O(N)" claim
+        # itself, so the bound is derived rather than tuned.
+        assert counts[1] < sizes[1], counts
 
     def test_the_between_cycles_chain_is_still_complete(self, tmp_path):
-        # The reuse must not cost the resolved-row lookup that makes a chain readable
+        # The batching must not cost the resolved-row lookup that makes a chain readable
         # across cycles — the PRD's motivating case is a test between de-flake tasks.
+        # Every prior-cycle field is checked, not just `resolved_at`: the report prints
+        # the whole cycle, and a batched reader that dropped one would still satisfy a
+        # `resolved_at`-only assertion.
         report = build_report(self._seeded(tmp_path), now=_NOW)
         by_id = {c.test_id: c for c in report.chains}
-        resolved = by_id['tests/test_resolved.py::test_x']
+        resolved = by_id[self.RESOLVED]
         assert resolved.debt is not None
         assert resolved.debt.resolved_at == '2026-08-08T12:00:00+00:00'
         assert resolved.debt.open_count == 2
+        assert resolved.debt.prior_resolved_at == '2026-08-01T12:00:00+00:00'
+        assert resolved.debt.prior_resolving_commit == 'c0ffee'
         # ...and the open rows still resolve to their own debt, from the list already read.
         assert by_id['tests/test_a.py::test_x'].debt is not None
         assert by_id['tests/test_a.py::test_x'].debt.resolved_at is None

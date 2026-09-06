@@ -5,7 +5,7 @@ This module holds NO test functions of its own. Its own unit tests live in
 
 WHY IT EXISTS. A trio of command-parsing helpers — pick the ``&&`` segment that
 invokes the checker, extract that checker's positional targets, decide whether a
-path is covered by one of them — was hand-maintained in FOUR copies:
+path is covered by one of them — was hand-maintained in FIVE copies:
 
   * ``test_root_lint_covers_nonmember_py.py`` (``_ruff_segment`` /
     ``_ruff_targets`` / ``_ruff_exclude_flags`` / ``_is_covered``),
@@ -14,7 +14,8 @@ path is covered by one of them — was hand-maintained in FOUR copies:
   * ``test_contributing_lint_command_drift.py`` (``_ruff_segment`` /
     ``_ruff_targets``),
   * ``test_skills_module_config_decision.py`` (``_pytest_segment`` /
-    ``_pytest_collected_dirs`` / ``_is_collected``).
+    ``_pytest_collected_dirs`` / ``_is_collected``),
+  * ``test_fallback_verify_config.py`` (``_lint_leg_targets``).
 
 They had ALREADY DRIFTED, which is the point: the skills guard's own module
 docstring named the drift (``_is_covered`` normalising trailing slashes with
@@ -22,24 +23,38 @@ docstring named the drift (``_is_covered`` normalising trailing slashes with
 the extraction as [tkt_0RS47G1QXJ5XDPH4T0HKKA1A9S], deferring it only because it
 needed edits to sibling guards. Task 4358 then paid for the same defect class a
 second time INSIDE one file, where ``_narrowing_flag_args`` had missed a slice
-``_targets`` had held from the start. Task 3745 is that extraction.
+``_targets`` had held from the start. Task 3745 is that extraction, over the
+first four; the fifth was outside its fixed scope and was closed separately by
+task 3883.
 
-IMPORT ME, DO NOT COPY ME. A fifth copy is not a shortcut, it is the next
+THAT FIFTH COPY IS THE CAUTIONARY ONE. ``_lint_leg_targets`` was the copy whose
+prose the OTHER guards cited as canonical for the whole-path-TOKENS rule — so
+the file DEFINING the convention was the last one still implementing it
+privately, and had drifted from it: its anchor fallback was a raw
+``str.endswith``, which is the substring match this module's contract forbids.
+Being the documentation home is not the same as being the implementation home,
+and the citations now point at :func:`positional_targets` instead.
+
+IMPORT ME, DO NOT COPY ME. The NEXT copy is not a shortcut, it is the next
 drift — and drift here does not fail loudly. Every one of these helpers feeds a
 coverage assertion, so a copy that silently parses one token differently
 degrades to a guard that passes vacuously. If a caller needs behaviour this
-module does not have, add a PARAMETER here rather than a variant there.
+module does not have, add a PARAMETER here rather than a variant there —
+``path_anchor`` (task 3883) is what that looks like in practice.
 
-THIS MODULE PARSES; IT DOES NOT DECIDE. The four call sites deliberately do not
-agree on semantics, and unifying them would be a behaviour change at three of
+THIS MODULE PARSES; IT DOES NOT DECIDE. The five call sites deliberately do not
+agree on semantics, and unifying them would be a behaviour change at four of
 them. So everything that is POLICY stays with its caller and arrives as an
 argument: which flags consume the following token (``_RUFF_FLAGS_TAKING_A_VALUE``
-in the CONTRIBUTING guard, ``_PYTEST_VALUE_FLAGS`` in the skills guard, neither
-in the other two), which flag prefixes narrow a target set
+in the CONTRIBUTING guard, ``_PYTEST_VALUE_FLAGS`` in the skills guard, none in
+the other three), which flag prefixes narrow a target set
 (``_NARROWING_FLAGS``), whether flag scanning covers the whole segment or only
 the checker's own post-anchor arguments, and the skills guard's
 ``--directory`` base resolution / ``posixpath.normpath`` / target-EXISTS layer.
-What is shared is only the mechanics of reading a shell command.
+What is shared is only the mechanics of reading a shell command. ``path_anchor``
+is NOT an exception to this: it records how the checker was SPELLED on the
+command line, which is a fact about the text being parsed, not a policy about
+the checker.
 
 Importable from ``tests/scripts/test_*.py`` only because
 ``tests/scripts/conftest.py`` puts this directory on ``sys.path`` — pytest's
@@ -66,11 +81,13 @@ from orchestrator import verify_cmd
 # subcommand at all, so each anchors on the program name itself.
 #
 # Before task 3745's amendment pass the literal ``"ruff check"`` was spelled in
-# four files under three names. That is the same N-copy shape the rest of this
-# module exists to close: were ruff ever to spell its subcommand differently,
-# one edit here beats four coordinated ones, and a caller left behind would not
-# fail loudly — it would fail to MATCH a segment and take the exactly-one
-# assertion, or match and anchor in the wrong place.
+# four files under three names, and task 3883 brought a fifth consumer
+# (``test_fallback_verify_config.py``'s ``_RUFF_KEYWORD``) onto this constant
+# rather than letting it restate the literal. That is the same N-copy shape the
+# rest of this module exists to close: were ruff ever to spell its subcommand
+# differently, one edit here beats five coordinated ones, and a caller left
+# behind would not fail loudly — it would fail to MATCH a segment and take the
+# exactly-one assertion, or match and anchor in the wrong place.
 RUFF = "ruff check"
 PYRIGHT = "pyright"
 PYTEST = "pytest"
@@ -162,14 +179,15 @@ def optional_token_segment(cmd: str, keyword: str) -> str | None:
 
 
 def anchor_split(
-    segment: str, keyword: str, *, label: str | None = None
+    segment: str, keyword: str, *, path_anchor: bool = False, label: str | None = None
 ) -> tuple[list[str], list[str]]:
     """*segment* split at the checker anchor into ``(pre, post)`` token lists.
 
     The ANCHOR is the last whitespace-separated token of *keyword*: ``check`` for
     ``ruff check``, ``pyright`` for ``pyright``, ``pytest`` for ``pytest``. One
-    rule reproduces every anchor the four callers use, two of which spelled it as
-    a hand-rolled ``tokens.index("check")``.
+    rule reproduces every anchor the five callers use, two of which spelled it as
+    a hand-rolled ``tokens.index("check")`` and a third as a ``shlex``-tokenised
+    marker window with a raw ``str.endswith`` fallback (task 3883).
 
     THE ANCHOR BELONGS TO NEITHER HALF, and the split is the whole point.
     Everything BEFORE it is the WRAPPER's: in
@@ -202,6 +220,32 @@ def anchor_split(
     :func:`optional_token_segment`, which SKIPS such a segment: there, an
     unparseable clause is one among several and the helper has no opinion about
     it; here, the caller has already committed to this segment being the one.
+
+    *path_anchor* additionally accepts the anchor spelled as the PATH the
+    checker was INVOKED BY. It exists because a checker need not be on ``PATH``
+    at all: the live repo-root ``lint_command`` runs ``python3
+    fused-memory/scripts/check_bare_magicmock_config.py <dirs>``, so its anchor
+    ``check_bare_magicmock_config.py`` is never a bare token and the exact-token
+    rule cannot locate it. That is what kept
+    ``test_fallback_verify_config.py::_lint_leg_targets`` on a private copy of
+    this parser until task 3883.
+
+    THE DEFAULT IS False, and the four task-3745 callers therefore stay on
+    strict exact-token matching — this parameter only ever ADDS candidate
+    positions, so no existing caller's parse can change. Pinned rather than
+    claimed, by
+    ``test_verify_command_invariants.py::test_anchor_split_still_asserts_on_a_path_spelled_anchor_by_default``.
+
+    A WHOLE PATH COMPONENT, never a raw string suffix. ``token.endswith("/" +
+    anchor)`` IS the component test for a POSIX shell token, and the distinction
+    is not pedantry: a bare ``token.endswith(anchor)`` is a SUBSTRING match, so
+    ``scripts/x_check_bare_magicmock_config.py`` — a different file whose name
+    merely ends with the anchor — would match and report another program's
+    arguments as this checker's targets. "Compare by exact element, never
+    substring-match" is the contract this module exists to enforce, and
+    ``path_anchor`` must not smuggle in an exception to it. Deliberately NOT
+    ``pathlib``/``posixpath``: a normalisation layer would import ``..``
+    resolution and absolute-path semantics this parser has no opinion about.
     """
     anchor = keyword.split()[-1]
     try:
@@ -211,12 +255,16 @@ def anchor_split(
             f"cannot tokenise the `{keyword}` segment of {_where(label, segment)}: "
             f"{exc}; segment: {segment!r}"
         ) from exc
-    assert anchor in tokens, (
+    at = None
+    for i, token in enumerate(tokens):
+        if token == anchor or (path_anchor and token.endswith("/" + anchor)):
+            at = i
+            break
+    assert at is not None, (
         f"no `{anchor}` token in the `{keyword}` segment of "
         f"{_where(label, segment)}, so the checker's own arguments cannot be "
         f"located; segment: {segment!r}"
     )
-    at = tokens.index(anchor)
     return tokens[:at], tokens[at + 1:]
 
 
@@ -225,6 +273,7 @@ def positional_targets(
     keyword: str,
     *,
     value_flags: frozenset[str] = frozenset(),
+    path_anchor: bool = False,
     label: str | None = None,
 ) -> list[str]:
     """The positional path arguments *keyword* checks, as whole TOKENS.
@@ -239,13 +288,14 @@ def positional_targets(
     ``'scripts/' in cmd`` for both.
 
     *value_flags* is the caller's POLICY, and its default is the reason one
-    implementation serves four call sites unchanged. With it EMPTY, ``consume``
+    implementation serves five call sites unchanged. With it EMPTY, ``consume``
     can never become True and the loop below reduces byte-for-byte to
     ``[t for t in post if not t.startswith('-')]`` — exactly what
-    ``test_root_lint_covers_nonmember_py.py`` and ``test_scripts_module_config.py``
-    do today, phantom flag values included. Supplying a set (the CONTRIBUTING
-    guard's ``_RUFF_FLAGS_TAKING_A_VALUE``, the skills guard's
-    ``_PYTEST_VALUE_FLAGS``) drops the following token instead. The
+    ``test_root_lint_covers_nonmember_py.py``, ``test_scripts_module_config.py``
+    and ``test_fallback_verify_config.py`` do today, phantom flag values
+    included. Supplying a set (the CONTRIBUTING guard's
+    ``_RUFF_FLAGS_TAKING_A_VALUE``, the skills guard's ``_PYTEST_VALUE_FLAGS``)
+    drops the following token instead. The
     ``--flag=value`` spelling needs no entry either way: ``shlex`` keeps it as
     one token and the ``-`` prefix drops it whole.
 
@@ -260,19 +310,33 @@ def positional_targets(
     never fail. But a caller that ALSO asserts each target exists on disk reads
     the list for exactly what a phantom adds, and goes red naming a flag value as
     a missing path — a misleading diagnosis on a change that broke nothing.
-    Measured across the four callers: THREE assert existence
+    Measured across the five callers: FOUR assert existence
     (``test_root_lint_covers_nonmember_py.py``,
     ``test_contributing_lint_command_drift.py``,
-    ``test_skills_module_config_decision.py``) while only two of those three
-    supply a set; ``test_scripts_module_config.py`` supplies none and asserts no
-    existence. The remaining exposure is root_lint's, and it is recorded on that
-    guard's own ``_ruff_targets`` rather than papered over here.
+    ``test_skills_module_config_decision.py``,
+    ``test_fallback_verify_config.py``) while only two of those four supply a
+    set; ``test_scripts_module_config.py`` supplies none and asserts no
+    existence. The remaining exposure is therefore root_lint's AND fallback's,
+    and each is recorded on that guard's own extractor —
+    ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` and
+    ``test_fallback_verify_config.py::_lint_leg_targets`` — rather than papered
+    over here.
 
     Discarding unrecognised tokens instead is not an option: that would silently
     shrink the target list and re-open the false-pass hazard the parsing exists
     to close. Widening the set is the caller's call, not this module's.
+
+    *path_anchor* is passed straight through to :func:`anchor_split`, for the
+    fifth caller ``test_fallback_verify_config.py::_lint_leg_targets`` (task
+    3883), whose ``check_bare_magicmock_config.py`` leg names the checker by
+    PATH. It is ORTHOGONAL to *value_flags*, and reading it as another policy
+    knob would be a category error: *value_flags* is per-checker POLICY (which
+    flags eat the following token — a fact about the checker's CLI), while
+    *path_anchor* is a fact about how the checker was SPELLED on this particular
+    command line. The same checker invoked by bare name and by path wants the
+    same *value_flags* and different *path_anchor*.
     """
-    post = anchor_split(segment, keyword, label=label)[1]
+    post = anchor_split(segment, keyword, path_anchor=path_anchor, label=label)[1]
     targets: list[str] = []
     consume = False
     for token in post:

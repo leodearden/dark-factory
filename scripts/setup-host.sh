@@ -196,21 +196,130 @@ UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
 
 UV_PATH="$(command -v uv)"
-sed \
-  -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
-  -e "s|__UV_PATH__|$UV_PATH|g" \
-  "$REPO_ROOT/scripts/fused-memory.service.template" \
-  > "$UNIT_DIR/fused-memory.service"
 
-systemctl --user daemon-reload
-systemctl --user enable fused-memory
+# THE RENDER. No longer `sed ... > "$UNIT_DIR/fused-memory.service"`, and the
+# difference is not stylistic (task 4796; same fix as section 8, task 4793).
+#
+# scripts/fused-memory.service.template declares
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`, which renders to a
+# SINGLE root. Further project roots are host-LOCAL settings, appended to the
+# INSTALLED unit and deliberately not committed — the template's own comment
+# says so. A truncating redirect destroyed them on every re-run.
+#
+# AND ON THIS UNIT THAT IS WORSE THAN THE DASHBOARD CASE. Here the variable is
+# not a view setting: fused_memory/models/scope.py reads it as
+# KNOWN_PROJECT_ROOTS_ENV, and reconciliation/harness.py raises
+# UnknownProjectError for a project outside the resulting set. Collapsing it
+# de-registers every OTHER project from RECONCILIATION — and invisibly, because
+# the post-install parity gate (section 12) checks only host-invariant safety
+# directives and is structurally incapable of seeing this variable's value.
+#
+# THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
+# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# defect one level up: bash truncates the destination before python ever opens
+# it, so the installed value would be gone before it could be read and the tool
+# would preserve nothing while reporting success. --output is read FIRST as the
+# installed copy, then replaced atomically.
+#
+# AND THERE IS DELIBERATELY NO sed FALLBACK. Rendering "the old way" when the
+# renderer is missing would reinstate the exact clobber it replaced, on the one
+# path where nobody is left watching for it. A missing renderer therefore leaves
+# the unit ALONE and says so, which is the recoverable direction: stale but
+# intact is fixable on the next run; de-registered from reconciliation is not
+# noticed until projects start failing with UnknownProjectError.
+#
+# KEEP IN STEP WITH SECTION 8's `_dash_render_script=` BLOCK. The two are
+# deliberately parallel: same hoisted `_<x>_render_script=` anchor, same
+# `_<x>_rendered=0` flag, same missing-renderer / rendered / refused three-way,
+# same "daemon-reload always, enable on the unit EXISTING, the destructive step
+# on the flag" gate split. They are not factored into one helper because every
+# message differs (this unit governs reconciliation; that one governs a view)
+# and a helper would have to signal WHICH failure occurred back to the call site
+# through an exit code, reproducing the three-way at both ends. The cost of that
+# choice is drift, so: a change to the control flow or the failure modes here
+# belongs in BOTH sites. The one INTENTIONAL divergence is documented at the
+# `restart` gate below — section 8 has no equivalent because the dashboard is
+# started by hand and never restarted by this script.
+_fm_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
 
-# Only start if .env exists (needs secrets)
-if [ -f "$REPO_ROOT/fused-memory/.env" ]; then
-  systemctl --user restart fused-memory
-  ok "fused-memory unit installed and started"
+# Set to 1 only by the branch that actually rendered. `fail` here is a printf,
+# not an exit, so without this flag every degraded path still reached the
+# `restart` below and the green "installed and started" line under it — bouncing
+# the server that backs the orchestrators, the dashboard and this session's own
+# MCP tooling on the strength of an install that did not happen.
+_fm_rendered=0
+
+if [ ! -f "$_fm_render_script" ]; then
+  fail "fused-memory unit renderer missing: $_fm_render_script"
+  fail "  NOT rendering it the old way — a plain template render would strip"
+  fail "  this host's local DASHBOARD_KNOWN_PROJECT_ROOTS entries, which is what"
+  fail "  registers other projects with RECONCILIATION, and the post-install"
+  fail "  parity check cannot see that variable's value."
+  fail "  $UNIT_DIR/fused-memory.service is left AS-IS. The sections below still run."
+elif python3 "$_fm_render_script" \
+       --unit      fused-memory \
+       --template  "$REPO_ROOT/scripts/fused-memory.service.template" \
+       --repo-root "$REPO_ROOT" \
+       --uv-path   "$UV_PATH" \
+       --output    "$UNIT_DIR/fused-memory.service"; then
+  _fm_rendered=1
 else
-  warn "fused-memory unit installed but NOT started (fused-memory/.env missing)"
+  # The renderer RAN and refused. Without this branch the `elif` chain falls
+  # through with status 0 and says nothing about the unit that did not get
+  # written — reports-green-because-it-never-ran, one construct over. Leaving
+  # `_fm_rendered` at 0 is the other half: it keeps the systemctl calls and the
+  # section's closing line from claiming an install that did not happen.
+  fail "fused-memory unit render FAILED — see the [fused_memory_unit_render]"
+  fail "  report above for which step refused and why."
+  fail "  $UNIT_DIR/fused-memory.service was left UNTOUCHED: this host's local"
+  fail "  Environment= values (DASHBOARD_KNOWN_PROJECT_ROOTS) survived, and the"
+  fail "  unit is at worst STALE — which the parity check reports on the next"
+  fail "  run. Re-run this script once the cause is fixed."
+fi
+
+# UNCONDITIONAL, exactly as before this task and exactly as in section 8. It is
+# a no-op when nothing changed, and skipping it on a degraded path would leave
+# systemd reading a stale generation of whatever unit IS on disk.
+systemctl --user daemon-reload
+
+# GUARDED on the unit EXISTING, not on `_fm_rendered` — the same split section 8
+# makes, for the same reasons. (1) A failed render on a host that already HAS the
+# unit must still leave it enabled: stale but supervised is the recoverable
+# direction this whole construct chooses, and `enable` is idempotent and cheap.
+# Before this gate existed the pre-4796 code enabled unconditionally, so gating
+# `enable` on `_fm_rendered` would have been a silent REGRESSION on exactly the
+# render-refused path (renderer missing, or apply_preserved refusing a value that
+# cannot round-trip through one Environment= line). (2) The combination the guard
+# genuinely exists for is a BARE host plus a failed render — there
+# `systemctl --user enable` on a unit that does not exist exits non-zero, and
+# under this file's `set -e` that aborts the entire installer before every later
+# section. Both FAIL branches above promise "the sections below still run"; this
+# is what makes that promise true rather than true-only-when-a-unit-was-there.
+if [ -f "$UNIT_DIR/fused-memory.service" ]; then
+  systemctl --user enable fused-memory
+else
+  fail "fused-memory NOT enabled: no unit file in $UNIT_DIR."
+  fail "  The render above did not happen and this host had no previous copy,"
+  fail "  so there is nothing to enable. The sections below still run."
+fi
+
+# THE RESTART, and ONLY the restart, stays gated on `_fm_rendered`. This is the
+# one deliberate divergence from section 8 (which has no restart at all — the
+# dashboard is started by hand). `enable` is idempotent bookkeeping; `restart`
+# bounces the server backing the orchestrators, the dashboard and this session's
+# own MCP tooling. On a path where nothing was written that outage buys exactly
+# nothing: the on-disk unit is unchanged, so the running process already matches
+# it. The closing `ok` is inside the gate for the same reason it is in section 8
+# — a green "installed and started" would assert precisely what the FAIL lines
+# above it had just denied.
+if [ "$_fm_rendered" = "1" ]; then
+  # Only start if .env exists (needs secrets)
+  if [ -f "$REPO_ROOT/fused-memory/.env" ]; then
+    systemctl --user restart fused-memory
+    ok "fused-memory unit installed and started (host-local Environment= values preserved — see the [fused_memory_unit_render] lines above)"
+  else
+    warn "fused-memory unit installed but NOT started (fused-memory/.env missing)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -915,6 +1024,16 @@ fi
 # path where nobody is left watching for it — the post-install gate cannot see
 # this variable's value. A missing renderer therefore leaves the unit ALONE and
 # says so, which is the recoverable direction: stale but intact.
+#
+# KEEP IN STEP WITH SECTION 4's `_fm_render_script=` BLOCK (task 4796), which is
+# the same construct for fused-memory.service: same anchor shape, same
+# `_<x>_rendered=0` flag, same three-way, same "daemon-reload always, enable on
+# the unit EXISTING, the rest on the flag" gate split. Deliberately two copies
+# rather than one helper — every message differs and a helper would have to
+# signal WHICH failure occurred back through an exit code — so a change to the
+# control flow or the failure modes here belongs in BOTH sites. Section 4's
+# extra `restart` gate has no counterpart here on purpose: the dashboard is
+# started by hand, never restarted by this script.
 _dash_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
 
 # Set to 1 only by the branch that actually rendered. The section's closing line

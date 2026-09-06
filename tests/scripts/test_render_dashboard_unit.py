@@ -581,6 +581,126 @@ def test_apply_preserved_refuses_a_value_it_cannot_write_faithfully():
 
 
 # ---------------------------------------------------------------------------
+# The unit registry — one renderer, two units  (step-1 / step-2)
+# ---------------------------------------------------------------------------
+# Task 4796 generalised this renderer to a SECOND unit rather than forking a
+# near-copy of it: scripts/fused-memory.service.template carries the same
+# `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__` line and setup-host.sh
+# installed it with the same truncating redirect. The preservation CORE was
+# already unit-neutral (`preserved_values`/`render_unit` take `names`;
+# --template/--output are already flags), so all that was unit-specific was the
+# log tag and the preserve set. Those two become a registry keyed by --unit.
+#
+# The fused-memory instance is the higher-stakes one, which is why it is pinned
+# here rather than left to the CLI tests alone: DASHBOARD_KNOWN_PROJECT_ROOTS on
+# THAT unit is what fused_memory/models/scope.py reads as KNOWN_PROJECT_ROOTS_ENV,
+# so collapsing it de-registers every other project from RECONCILIATION
+# (UnknownProjectError), not merely from a dashboard aggregation view.
+
+_FUSED_MEMORY = "fused-memory"
+_DASHBOARD = "dashboard"
+
+
+def _units():
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit.UNITS
+
+
+def _module():
+    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+
+    return render_dashboard_unit
+
+
+def test_units_registry_holds_exactly_the_two_installed_units():
+    """(a) Both units this renderer installs are registered, and nothing else.
+
+    Asserted as EQUALITY rather than containment: a third key appearing without
+    a corresponding setup-host.sh call site is a registry nobody renders from,
+    and — more to the point — every guard below (and the staleness guard in the
+    POLICY section) iterates this mapping, so a key added without its template
+    and preserve set would silently widen what those guards claim to cover.
+    """
+    assert set(_units()) == {_DASHBOARD, _FUSED_MEMORY}, (
+        f"UNITS registers {sorted(_units())}; expected exactly "
+        f"{sorted((_DASHBOARD, _FUSED_MEMORY))}."
+    )
+
+
+def test_every_unit_spec_exposes_a_tag_and_a_preserve_set():
+    """(b) The registry's shape, checked on every entry rather than on one."""
+    for key, spec in _units().items():
+        assert hasattr(spec, "log_tag"), f"UNITS[{key!r}] exposes no log_tag"
+        assert hasattr(spec, "host_local_environment"), (
+            f"UNITS[{key!r}] exposes no host_local_environment"
+        )
+        assert isinstance(spec.log_tag, str), f"UNITS[{key!r}].log_tag is not a str"
+        assert isinstance(spec.host_local_environment, tuple), (
+            f"UNITS[{key!r}].host_local_environment is not a tuple — the preserve "
+            "set is policy and must not be mutable per invocation."
+        )
+
+
+def test_unit_log_tags_are_distinct_and_non_empty():
+    """(c) The tag is the OPERATOR's only handle on this tool's report.
+
+    Both units are rendered by the same script in the same bring-up run, and
+    setup-host.sh routes an operator to a detailed report BY TAG (the convention
+    the check_*_unit_parity.py family states and this module's `_log` follows).
+    A shared tag would attribute the fused-memory unit's preserved/skipped lines
+    to the dashboard — on the unit whose DASHBOARD_KNOWN_PROJECT_ROOTS governs
+    reconciliation, so the one where mis-attribution costs the most.
+
+    The literals are pinned, not merely their distinctness: the tag is a
+    published operator-facing string, and setup-host.sh's section-4 and
+    section-8 prose names each one.
+    """
+    tags = {key: spec.log_tag for key, spec in _units().items()}
+
+    assert tags[_DASHBOARD] == "dashboard_unit_render", tags
+    assert tags[_FUSED_MEMORY] == "fused_memory_unit_render", tags
+    assert all(tag.strip() for tag in tags.values()), (
+        f"an empty log tag makes the report unroutable: {tags}"
+    )
+    assert len(set(tags.values())) == len(tags), (
+        f"two units share a log tag, so their reports are indistinguishable: {tags}"
+    )
+
+
+def test_dashboard_spec_is_the_modules_existing_public_surface():
+    """(d) BACK-COMPAT: the registry did not move the dashboard's constants.
+
+    LOG_TAG and HOST_LOCAL_ENVIRONMENT are module-level names that task 4793's
+    suite asserts on directly and that the dashboard call site in setup-host.sh
+    section 8 depends on behaviourally (it passes no --unit at all). Pinning the
+    identity here is what lets the registry be an ADDITION rather than a rename:
+    if these ever diverge, the dashboard unit would be rendered with one preserve
+    set and reported under another tag.
+    """
+    module = _module()
+    spec = _units()[_DASHBOARD]
+
+    assert spec.host_local_environment == module.HOST_LOCAL_ENVIRONMENT, (
+        f"UNITS['dashboard'].host_local_environment {spec.host_local_environment} "
+        f"!= HOST_LOCAL_ENVIRONMENT {module.HOST_LOCAL_ENVIRONMENT}"
+    )
+    assert spec.log_tag == module.LOG_TAG, (
+        f"UNITS['dashboard'].log_tag {spec.log_tag!r} != LOG_TAG {module.LOG_TAG!r}"
+    )
+
+
+def test_fused_memory_spec_preserves_the_known_project_roots():
+    """(e) The variable task 4796 exists for, on the unit that governs recon."""
+    assert _KNOWN_ROOTS in _units()[_FUSED_MEMORY].host_local_environment, (
+        f"UNITS['fused-memory'].host_local_environment is "
+        f"{_units()[_FUSED_MEMORY].host_local_environment}, which does not "
+        f"preserve {_KNOWN_ROOTS} — the render would collapse this host's "
+        "reconciliation scope to a single project root."
+    )
+
+
+# ---------------------------------------------------------------------------
 # HOST_LOCAL_ENVIRONMENT — the POLICY  (step-7 / step-8)
 # ---------------------------------------------------------------------------
 
@@ -653,33 +773,178 @@ def test_host_local_environment_excludes_project_root():
     )
 
 
-def test_host_local_environment_names_are_declared_in_the_committed_template():
-    """(d) STALENESS GUARD: a typo must not rot into a preserve-nothing no-op.
+def test_every_unit_spec_names_a_committed_template():
+    """(d.i) The registry is self-describing: every spec names a template that EXISTS.
+
+    `template` is repo-relative, so this also pins that nobody stored an absolute
+    or host-specific path in a constant the whole fleet shares. Checked before the
+    staleness guard below, which reads these files: a missing template should fail
+    as "the registry names a file that is not there", not as an unrelated OSError
+    inside the guard.
+    """
+    for key, spec in _units().items():
+        path = REPO_ROOT / spec.template
+        assert path.is_file(), (
+            f"UNITS[{key!r}].template is {spec.template!r}, which does not resolve "
+            f"to a file under {REPO_ROOT}. Expected a repo-relative path to the "
+            "committed .template this unit is rendered from."
+        )
+
+
+def test_every_preserved_name_is_declared_exactly_once_in_its_units_template():
+    """(d.ii) STALENESS GUARD: a typo must not rot into a preserve-nothing no-op.
 
     Mirrors test_divergence_allowlist_names_are_declared_in_a_committed_unit.
-    A misspelled name here would be absent from every installed unit forever,
-    so preserved_values would skip it on every host, the render would take the
-    default every time, and the renderer would report success while doing
-    exactly what the `sed >` it replaced did.
-    """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    A misspelled name in a preserve set would be absent from every installed unit
+    forever, so preserved_values would skip it on every host, the render would
+    take the default every time, and the renderer would report success while
+    doing exactly what the `sed >` it replaced did.
 
-    declared = set(
-        systemd_unit_parity.environment_map(
-            systemd_unit_parity.parse_unit_directives(
-                TEMPLATE_PATH.read_text(encoding="utf-8")
-            ),
-            "Service",
+    ITERATES THE REGISTRY rather than checking the dashboard alone (task 4796).
+    Pairing each preserve set with its OWN template is the whole point: the two
+    templates declare overlapping but not identical Environment= sets, so a name
+    valid for one unit can be a silent no-op on the other. Registering a third
+    unit is then automatically guarded, which a per-unit copy of this test would
+    not give.
+
+    EXACTLY ONE MATCHING LINE, not merely "the reader can see the name", because
+    that is precisely `apply_preserved`'s precondition — it raises on both zero
+    (the template changed shape, so the preserved value is dropped on the floor)
+    and more than one (ambiguous; systemd's last-wins hides which was chosen).
+    The stricter line-shaped form also catches the multi-assignment spelling
+    `Environment=FOO=1 NAME=2`, which environment_map reads happily and
+    apply_preserved cannot rewrite. Without this guard that failure is discovered
+    ON A REAL HOST by an operator mid-bring-up, not by CI.
+    """
+    for key, spec in _units().items():
+        text = (REPO_ROOT / spec.template).read_text(encoding="utf-8")
+        for name in spec.host_local_environment:
+            prefix = f"Environment={name}="
+            matches = [
+                line for line in text.splitlines() if line.strip().startswith(prefix)
+            ]
+            assert len(matches) == 1, (
+                f"UNITS[{key!r}] preserves {name}, but {spec.template} has "
+                f"{len(matches)} line(s) beginning {prefix!r}. Zero means the "
+                "value is read off the host and silently dropped while the "
+                "install reports success; more than one is ambiguous under "
+                "systemd's last-wins. apply_preserved raises either way — on the "
+                "host, mid-bring-up, rather than here."
+            )
+
+
+SETUP_HOST_PATH = REPO_ROOT / "scripts" / "setup-host.sh"
+RENDERER_BASENAME = "render_dashboard_unit.py"
+
+
+def _render_invocations() -> list[dict[str, str]]:
+    """Every `python3 <renderer> …` call in scripts/setup-host.sh, as a flag map.
+
+    Backslash continuations are joined first — both call sites span six physical
+    lines — and comment lines are dropped, so a comment QUOTING an invocation is
+    prose about the code rather than a third call site. That is the same
+    markers-are-code rule tests/scripts/setup_host_sections.py._find_in_code
+    enforces, and for the same reason: setup-host.sh's own comments quote these
+    commands.
+
+    A call is identified by BOTH a command token naming the renderer (the
+    hoisted `_<x>_render_script` variable, or the basename literally) AND a
+    `--template` flag. Each half is needed: the `_<x>_render_script=` assignment
+    lines name the renderer but invoke nothing, and section 12's parity check
+    passes `--template` to a different script entirely.
+
+    Reads setup-host.sh as TEXT. This module runs no subprocess and installs
+    nothing; the file is a committed repo-side source, like the templates the
+    guards above read.
+    """
+    import shlex
+
+    joined = SETUP_HOST_PATH.read_text(encoding="utf-8").replace("\\\n", " ")
+    calls: list[dict[str, str]] = []
+    for line in joined.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        try:
+            tokens = shlex.split(line)
+        except ValueError:  # an unbalanced quote elsewhere in the installer
+            continue
+        names_renderer = any(
+            tok.endswith("_render_script") or tok.endswith(RENDERER_BASENAME)
+            for tok in tokens
         )
+        if not (names_renderer and "--template" in tokens):
+            continue
+        flags = {
+            tok: tokens[i + 1]
+            for i, tok in enumerate(tokens[:-1])
+            if tok.startswith("--")
+        }
+        calls.append(flags)
+    return calls
+
+
+def test_setup_host_renders_each_unit_from_the_template_its_spec_names():
+    """(d.iii) The COUPLING the two guards above rest on, pinned rather than assumed.
+
+    `UnitRenderSpec.template` is consumed only by tests. That is fine — it is
+    policy, like the preserve set beside it — but it makes the staleness guard's
+    value entirely conditional on `UNITS[u].template` being the same file
+    setup-host.sh actually passes as `--template` for `--unit u`. Without this
+    test the guard would happily validate a preserve set against a template the
+    installer no longer uses, and report green while the host preserved nothing.
+
+    The blast radius of the mismatch is bounded — a template that does not
+    declare the preserved name makes `apply_preserved` RAISE rather than
+    silently preserve nothing — so this closes a design gap, not a live bug. But
+    it closes it where it opens: at the pairing, not at the symptom.
+
+    ALSO PINS COVERAGE IN THE OTHER DIRECTION: every registered unit must have a
+    call site. A key added to UNITS that setup-host.sh never renders is a
+    registry entry nobody installs from, and would quietly widen what every
+    registry-iterating guard in this module claims to cover.
+
+    The absent-`--unit` default is spelled here exactly as argparse resolves it,
+    because section 8 deliberately passes no `--unit` at all — that is what keeps
+    task 4793's call site byte-unchanged, and it means the dashboard's pairing is
+    only checked if this test models the default rather than requiring the flag.
+    """
+    units = _units()
+    calls = _render_invocations()
+    assert calls, (
+        f"no renderer invocation found in {SETUP_HOST_PATH}. The installer is "
+        "the only production consumer of this registry; a slice that finds "
+        "nothing makes this test vacuously green."
     )
 
-    for name in _host_local():
-        assert name in declared, (
-            f"HOST_LOCAL_ENVIRONMENT names {name}, but "
-            f"{TEMPLATE_PATH} declares no such Environment= variable. Declared: "
-            f"{sorted(declared)}. A name nobody sets is preserved on no host, "
-            "forever, while the renderer still reports success."
+    seen: set[str] = set()
+    for flags in calls:
+        unit = flags.get("--unit", _DASHBOARD)  # argparse's default
+        assert unit in units, (
+            f"setup-host.sh renders --unit {unit!r}, which UNITS does not "
+            f"register (registered: {sorted(units)})."
         )
+        seen.add(unit)
+
+        template = flags["--template"]
+        prefix = "$REPO_ROOT/"
+        assert template.startswith(prefix), (
+            f"--template for --unit {unit!r} is {template!r}; expected a path "
+            "built from $REPO_ROOT so the render reads the checkout being "
+            "INSTALLED rather than some other tree."
+        )
+        assert template[len(prefix) :] == units[unit].template, (
+            f"setup-host.sh renders --unit {unit!r} from "
+            f"{template[len(prefix):]!r}, but UNITS[{unit!r}].template names "
+            f"{units[unit].template!r}. The staleness guard checks the preserve "
+            "set against the registry's template, so this mismatch would let it "
+            "validate a file the installer does not use."
+        )
+
+    assert seen == set(units), (
+        f"UNITS registers {sorted(units)} but setup-host.sh renders "
+        f"{sorted(seen)}. A registered unit with no call site is installed by "
+        "nobody, while still widening every guard that iterates this registry."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1170,3 +1435,249 @@ def test_main_removes_its_temp_file_when_the_write_fails(tmp_path, capsys, monke
     captured = capsys.readouterr()
     assert "was NOT modified" in captured.err, captured.err
     assert captured.err.count(_TAG) == len(captured.err.strip().splitlines())
+
+
+# ---------------------------------------------------------------------------
+# --unit fused-memory — the second unit, end to end  (step-5 / step-6)
+# ---------------------------------------------------------------------------
+# ACCEPTANCE 1 and 2 at the library/CLI layer, against the REAL committed
+# scripts/fused-memory.service.template rather than a stand-in. The installer
+# layer (setup-host.sh section 4) is covered separately in
+# tests/scripts/test_check_fused_memory_unit_parity.py, which owns the
+# subprocess harness this module deliberately does not have.
+#
+# Everything here goes through tmp_path and in-process `main(argv)` — this
+# module's docstring pins "ALL FIXTURES ARE tmp_path OR IN-MEMORY STRINGS" and
+# it contains zero subprocess calls. Keep it that way.
+
+FUSED_TEMPLATE_PATH = REPO_ROOT / "scripts" / "fused-memory.service.template"
+
+_FM_TAG = "[fused_memory_unit_render]"
+
+# The three Environment= values the fused-memory template RENDERS from
+# __REPO_ROOT__, and which must therefore be RE-DERIVED rather than preserved:
+# pinning them at a previous checkout would leave the server reading the OLD
+# config while WorkingDirectory= moved to the new one.
+_FM_RENDERED_ENV = ("PROJECT_ROOT", "CONFIG_PATH", "TASKMASTER_DIR")
+
+
+def _fm_rendered(repo_root=_OLD_ROOT, uv_path=_NEW_UV):
+    """The committed fused-memory template rendered at *repo_root*."""
+    return _render_template(
+        FUSED_TEMPLATE_PATH.read_text(encoding="utf-8"),
+        repo_root=repo_root,
+        uv_path=uv_path,
+    )
+
+
+def _fm_installed_with_nine_roots(repo_root=_OLD_ROOT):
+    """A realistic INSTALLED fused-memory unit carrying nine reconciliation roots.
+
+    Built BY RENDERING the committed template and substituting, never
+    hand-written — the same rule _installed_with_nine_roots follows, and it
+    matters more here: the multi-root value is precisely the thing whose real
+    shape is under test, and a hand-made fixture can drift into a shape the real
+    installer would never produce.
+    """
+    text = _fm_rendered(repo_root)
+    single = f"Environment={_KNOWN_ROOTS}={repo_root}"
+    assert single in text, f"fixture anchor {single!r} not found in the rendered template"
+    return text.replace(single, f"Environment={_KNOWN_ROOTS}={NINE_ROOTS}")
+
+
+def _fm_cli(tmp_path, *, output_text=None, repo_root=_NEW_ROOT, unit="fused-memory"):
+    """A tmp copy of the REAL fused-memory template (+ optional installed unit).
+
+    *tmp_path* is created if absent, so a caller can pass a SUBDIRECTORY of the
+    pytest tmp_path to get an isolated scratch area (the tag-routing test builds
+    a second, deliberately broken, one that way).
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    template = tmp_path / "fused-memory.service.template"
+    template.write_text(
+        FUSED_TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    output = tmp_path / "unit" / "fused-memory.service"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output_text is not None:
+        output.write_text(output_text, encoding="utf-8")
+    argv = []
+    if unit is not None:
+        argv += ["--unit", unit]
+    argv += [
+        "--template", str(template),
+        "--repo-root", repo_root,
+        "--uv-path", _NEW_UV,
+        "--output", str(output),
+    ]
+    return argv, output
+
+
+def test_fused_memory_render_preserves_the_nine_roots_across_a_moved_checkout(
+    tmp_path, capsys
+):
+    """(a) ACCEPTANCE 1: the reconciliation scope survives a re-provision.
+
+    The realistic case the defect destroyed: the checkout moved, and this host
+    had nine project roots registered into its INSTALLED fused-memory unit.
+    Under the old `sed ... > "$UNIT_DIR/fused-memory.service"` every one of those
+    re-runs collapsed the set to a single root — and on THIS unit that is not a
+    dashboard view setting: fused_memory/models/scope.py reads it as
+    KNOWN_PROJECT_ROOTS_ENV, so eight projects would start failing
+    reconciliation with UnknownProjectError.
+    """
+    argv, output = _fm_cli(tmp_path, output_text=_fm_installed_with_nine_roots())
+
+    assert _main(argv) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert _env_line(text, _KNOWN_ROOTS) == NINE_ROOTS
+    for root in NINE_ROOTS.split(","):
+        assert root in text, f"{root} did not survive the re-render"
+    capsys.readouterr()
+
+
+def test_fused_memory_render_re_derives_the_repo_root_bearing_values(tmp_path, capsys):
+    """(b) The preserve set is a strict SUBSET, not "keep whatever was there".
+
+    Direct analogue of test_render_unit_re_derives_project_root_rather_than
+    _preserving_it, retargeted from DASHBOARD_PROJECT_ROOT to this template's
+    three rendered values. Preserving them would pin the fused-memory server's
+    config and project root at the OLD checkout while WorkingDirectory= moved to
+    the new one — a server reading a config that no longer describes where it is
+    running, which is strictly worse than the stale unit it replaced.
+    """
+    argv, output = _fm_cli(tmp_path, output_text=_fm_installed_with_nine_roots())
+
+    assert _main(argv) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert _directive(text, "WorkingDirectory") == _NEW_ROOT
+    for name in _FM_RENDERED_ENV:
+        value = _env_line(text, name)
+        assert value.startswith(_NEW_ROOT), (
+            f"Environment={name}={value} still points at the OLD checkout; it is "
+            f"rendered from __REPO_ROOT__ and must be re-derived at {_NEW_ROOT}."
+        )
+        assert _OLD_ROOT not in value, f"Environment={name}={value}"
+    assert "__REPO_ROOT__" not in text and "__UV_PATH__" not in text
+    capsys.readouterr()
+
+
+def test_fused_memory_greenfield_matches_a_plain_render_of_the_template(
+    tmp_path, capsys
+):
+    """(c) ACCEPTANCE 2: a host with no installed unit gets the committed default.
+
+    BYTE-IDENTICAL to a plain render, which is the strongest available spelling
+    of "at parity": preservation is a strict addition on top of the render, so
+    with nothing to preserve the renderer must produce exactly what the template
+    says — no reordering, no synthesized line, no dropped comment.
+    """
+    argv, output = _fm_cli(tmp_path)
+
+    assert _main(argv) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert text == _fm_rendered(_NEW_ROOT), (
+        "the greenfield render is not byte-identical to a plain render of the "
+        "committed template"
+    )
+    assert _env_line(text, _KNOWN_ROOTS) == _NEW_ROOT
+    capsys.readouterr()
+
+
+def test_fused_memory_run_is_tagged_only_as_fused_memory(tmp_path, capsys):
+    """(d) TAG ROUTING: the operator's only handle on which unit a line is about.
+
+    Both units are rendered by this same script in the same bring-up run, and
+    setup-host.sh routes an operator to a report BY TAG. A fused-memory line
+    printed under [dashboard_unit_render] would send someone reading a long log
+    to the wrong unit — the one whose DASHBOARD_KNOWN_PROJECT_ROOTS is merely a
+    dashboard view, while the one that actually governs reconciliation went
+    unexamined.
+
+    Checked on BOTH streams: the success path's preserved/skipped report on
+    stdout, and a failure path's report on stderr.
+    """
+    argv, _output = _fm_cli(tmp_path, output_text=_fm_installed_with_nine_roots())
+    assert _main(argv) == 0
+    out = capsys.readouterr().out
+    lines = out.strip().splitlines()
+    assert lines, "the run emitted nothing to tag"
+    assert all(line.startswith(_FM_TAG) for line in lines), out
+    assert _TAG not in out, out
+
+    # The failure path prints on stderr and must route the same way.
+    bad_argv, _bad_output = _fm_cli(tmp_path / "missing-template")
+    (tmp_path / "missing-template" / "fused-memory.service.template").unlink()
+    assert _main(bad_argv) == 1
+    err = capsys.readouterr().err
+    err_lines = err.strip().splitlines()
+    assert err_lines, "the failing run emitted nothing to tag"
+    assert all(line.startswith(_FM_TAG) for line in err_lines), err
+    assert _TAG not in err, err
+
+
+def test_dashboard_run_is_still_tagged_only_as_dashboard(tmp_path, capsys):
+    """(d, converse) --unit dashboard must not leak the fused-memory tag."""
+    argv, _output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+    assert _main(["--unit", "dashboard", *argv]) == 0
+
+    out = capsys.readouterr().out
+    lines = out.strip().splitlines()
+    assert lines, "the run emitted nothing to tag"
+    assert all(line.startswith(_TAG) for line in lines), out
+    assert _FM_TAG not in out, out
+
+
+def test_omitting_unit_is_exactly_the_dashboard_behaviour(tmp_path, capsys):
+    """(e) BACK-COMPAT: setup-host.sh section 8 passes no --unit and must not change.
+
+    Task 4793's call site and its whole suite predate --unit. The default is the
+    dashboard, and "default" has to mean the dashboard's preserve set AND its
+    tag — a default that silently selected an empty preserve set would render as
+    the clobber this module exists to remove, while still exiting 0.
+    """
+    argv, output = _cli(tmp_path, output_text=_installed_with_nine_roots(_OLD_ROOT))
+
+    assert _main(argv) == 0
+
+    text = output.read_text(encoding="utf-8")
+    assert _env_line(text, _KNOWN_ROOTS) == NINE_ROOTS
+    out = capsys.readouterr().out
+    assert all(line.startswith(_TAG) for line in out.strip().splitlines()), out
+
+
+def test_an_unknown_unit_is_rejected_rather_than_defaulted(tmp_path, capsys):
+    """(f) An unrecognised --unit must NOT fall back to a mismatched preserve set.
+
+    Silently defaulting would be the worst available failure: `--unit fused_memory`
+    (underscore) would render the fused-memory template with the DASHBOARD spec,
+    report success under the dashboard tag, and — because the two specs happen to
+    share the one preserve name today — LOOK correct, right up until the sets
+    diverge. argparse `choices` makes it a usage error instead.
+    """
+    argv, output = _fm_cli(
+        tmp_path, output_text=_fm_installed_with_nine_roots(), unit="fused_memory"
+    )
+    before = output.read_bytes()
+
+    with pytest.raises(SystemExit) as excinfo:
+        _main(argv)
+
+    assert excinfo.value.code == 2, excinfo.value.code
+    assert output.read_bytes() == before, "a rejected --unit still wrote the unit"
+
+    # The rejection must be about the VALUE, not about the flag. Without this
+    # the test passes on a build that has no --unit flag at all (argparse exits
+    # 2 for an unrecognized argument too), so it would go green before the
+    # feature exists and stay green if the flag were later deleted. The phrase
+    # is argparse's, matched negatively so the assertion does not pin its
+    # wording for the passing case.
+    err = capsys.readouterr().err
+    assert "unrecognized arguments" not in err, (
+        "--unit was rejected as an unknown FLAG rather than as an unknown "
+        f"unit name: {err}"
+    )
+    assert "fused_memory" in err, err

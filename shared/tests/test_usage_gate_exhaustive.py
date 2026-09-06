@@ -29,6 +29,7 @@ from shared.invocation_outcome import (
 from shared.usage_gate import (
     AccountLease,
     AccountPhase,
+    InvokeSlot,
     SessionBudgetExhausted,
     UsageGate,
     _extract_cap_message,
@@ -2224,6 +2225,39 @@ class TestReleaseProbeSlot:
 
         assert gate._open.is_set() is False  # still closed — NOT re-opened
         assert acct.capped is True  # capped flag untouched
+
+    async def test_near_cap_via_detect_cap_hit_releases_probe(self):
+        """Near-cap detected while PROBE_IN_FLIGHT must still release the probe
+        claim: ``_handle_near_cap_warning`` is annotation-only and never
+        transitions phase, so only ``detect_cap_hit``'s explicit release
+        reopens the gate. Scoped counterpart:
+        ``test_usage_gate_scope_attribution.py::TestScopedCapHitReleasesProbeSlot``.
+        """
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        # Legacy boolean shim: bypasses _transition, so no resume-probe
+        # background task spawns (make_gate only AsyncMocks _run_probe);
+        # before_invoke() then takes the real `if acct.probing:` branch and
+        # performs the genuine PROBING -> PROBE_IN_FLIGHT claim.
+        acct.probing = True
+        lease = await gate.before_invoke(scope=None)
+        assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+        assert gate._open.is_set() is False  # single-account gate closed by the claim
+        slot = InvokeSlot(gate, lease, scope=None)
+
+        near_cap_stderr = "You're close to your usage limit. resets in 2h"
+        assert slot.detect_cap_hit(near_cap_stderr, '') is True
+
+        assert acct.near_cap is True  # annotation kept (clear_near_cap=False)
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+
+        # Bounded: in the RED state before_invoke() blocks forever, so a bare
+        # await would fail as a 60s suite timeout instead of a sub-second,
+        # legible TimeoutError.
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+        assert lease.name == 'a'
 
 
 # =========================================================================

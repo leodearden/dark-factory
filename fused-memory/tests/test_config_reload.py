@@ -27,7 +27,8 @@ from fused_memory.config.reload import (
     apply_reload,
     diff_config,
 )
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import EntityMintConfig, FusedMemoryConfig
+from fused_memory.server.entity_mint_authz import resolve_entity_mint_authorization
 from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
@@ -680,6 +681,110 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
         assert f'write_triage.{field}' in report['applied']
         # No service reconstruction: the SAME object now resolves differently.
         assert resolver(memory_service) == new_value
+
+
+class TestEntityMintLeavesAreGreenTier:
+    """The five ``entity_mint`` knobs (task 4932) are ALL green tier.
+
+    The expected leaf set is DERIVED from ``EntityMintConfig.model_fields``
+    rather than listed by hand — the ``TestWriteTriageJudgeLeavesAreGreenTier``
+    variant, deliberately NOT the hand-listed ``TestMem0UpdateLeavesAreGreenTier``
+    one — so a SIXTH ``entity_mint`` leaf added later without a reload
+    registration fails HERE instead of silently degrading to restart-only.
+    ``config/reload.py`` states the rule its own way: "anything absent from this
+    frozenset silently degrades to restart-only", and a restart-only kill switch
+    is no kill switch, because the operator believes they turned it off.
+
+    Third leg is the live-read test that EARNS the classification. Green tier is
+    not assertable on its own — a value captured at construction cannot observe
+    an in-place mutation, and would have to stay restart-only however it were
+    registered in the allowlist.
+    """
+
+    #: Every entity_mint leaf the schema declares, discovered rather than restated.
+    LEAVES = tuple(sorted(EntityMintConfig.model_fields))
+
+    def test_the_schema_actually_declares_entity_mint_leaves(self):
+        """Guards the derivation itself: an empty set would pass vacuously."""
+        assert len(self.LEAVES) >= 5, self.LEAVES
+
+    @pytest.mark.parametrize('field', LEAVES)
+    def test_every_leaf_is_allowlisted(self, field):
+        path = f'entity_mint.{field}'
+        assert path in RELOADABLE_FIELDS, (
+            f'{path} must be allowlisted for hot-reload — an unregistered leaf '
+            'silently degrades to restart-only, and a restart-only entity-mint '
+            'kill switch is no kill switch'
+        )
+
+    @pytest.mark.parametrize(
+        ('field', 'new_value'),
+        [
+            ('enabled', False),
+            ('allowed_agent_prefixes', ['recon-stage-', 'curator-', 'auditor-']),
+            ('lock_timeout_seconds', 1.5),
+            ('storm_threshold', 3),
+            ('storm_window_seconds', 600.0),
+        ],
+    )
+    def test_a_changed_leaf_lands_in_applied_candidates(self, field, new_value):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        path = f'entity_mint.{field}'
+        old = getattr(live.entity_mint, field)
+        assert old != new_value, (
+            f'{path} must actually change for this to assert anything — a value '
+            'equal to the shipped default makes the diff vacuously empty'
+        )
+        object.__setattr__(fresh.entity_mint, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    def test_an_applied_kill_switch_reload_denies_the_very_next_call(self):
+        """The live-read property that MAKES the green-tier classification honest.
+
+        No service reconstruction anywhere: the SAME SimpleNamespace holding the
+        SAME config object flips from allowed to denied.
+        """
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert resolve_entity_mint_authorization(
+            memory_service, agent_id='recon-stage-1',
+        ).allowed is True
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.entity_mint, 'enabled', False)
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'entity_mint.enabled' in report['applied']
+        decision = resolve_entity_mint_authorization(
+            memory_service, agent_id='recon-stage-1',
+        )
+        assert decision.allowed is False
+        assert decision.error_type == 'EntityMintToolDisabled', decision
+
+    def test_an_applied_allowlist_reload_admits_a_previously_denied_agent(self):
+        memory_service = types.SimpleNamespace(config=FusedMemoryConfig())
+        assert resolve_entity_mint_authorization(
+            memory_service, agent_id='auditor-x',
+        ).allowed is False, 'auditor- is not on the shipped default bar'
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(
+            fresh.entity_mint, 'allowed_agent_prefixes',
+            ['recon-stage-', 'curator-', 'auditor-'],
+        )
+
+        report = apply_reload(memory_service.config, fresh)
+
+        assert 'entity_mint.allowed_agent_prefixes' in report['applied']
+        assert resolve_entity_mint_authorization(
+            memory_service, agent_id='auditor-x',
+        ).allowed is True
 
 
 class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:

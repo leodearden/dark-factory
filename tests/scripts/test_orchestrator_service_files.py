@@ -35,9 +35,9 @@ this directory's lift trigger is a second consumer, not proximity.
 for the same reason; it is no longer imported here at all, having left with
 the installer suite that was its only consumer in this module.
 
-tests/scripts/test_orchestrator_watchdog.py's ``_unit_sections`` remains a
-third hand-copy of the section parse, and is now a straightforward de-dup
-against systemd_unit_invariants.parse_sections; filed as a follow-up.
+tests/scripts/test_orchestrator_watchdog.py's ``_unit_sections`` was the
+third hand-copy of the section parse; task 3913 retired it, and that module
+now imports systemd_unit_invariants.parse_sections just like this one.
 
 See also:
   - tests/scripts/test_setup_host_unit_installation.py — the installer and

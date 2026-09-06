@@ -2352,6 +2352,173 @@ class TestParseMetadataFailurePolicy:
             f'in the census; got warnings: {warnings}'
         )
 
+    def test_related_tasks_metadata_key_is_blessed(self):
+        """The canonical Tier-B cross-reference spelling must not census-warn (task 4303).
+
+        `related_tasks` is the CANONICAL spelling that docs/task-authoring.md
+        §8's Tier-B table tells authors to migrate TOWARD, yet it was itself
+        unblessed — so an author who followed the documentation exactly still
+        minted a `code=unknown_key` census line, and the drift signal could not
+        discriminate "used a deprecated alias" from "used the canonical
+        spelling". That is the defect: the table's preamble promises the
+        aliases warn *until the caller is fixed to use the canonical spelling*,
+        a promise only meaningful if migrating actually clears the warning.
+
+        BLESSED ON CORPUS-DOMINANCE GROUNDS, NOT ON A LIVE-READER CLAIM — say
+        this plainly, because the honest record is what keeps the entry alive.
+        The reader/writer trace came back NEGATIVE: no code reader, no code
+        writer, and `git log -S` finds the key has never existed in code in
+        this repo's history. It is blessed on the esc-3796-1 precedent, under
+        which the finding-provenance family and `related_memory_ids` are Tier-A
+        with no reader and no writer because THE CORPUS IS THE USAGE. A future
+        reader who greps for a reader, finds none, and prunes this entry as
+        dead would be wrong in exactly the way those entries already warn
+        against.
+
+        The census figures, the reader verdict and the bless-not-retire /
+        bless-not-type rulings are transcribed ONCE, beside the frozenset entry
+        in shared/src/shared/task_metadata.py, and deliberately not restated
+        here — a point-in-time measurement kept in three places ages into two
+        stale copies.
+
+        RED until 'related_tasks' is added to _BLESSED_METADATA_KEYS: on the
+        base tree parse_metadata returns unknown_key for it (measured, not
+        predicted), so legs 1 and 2 both fail.
+        """
+        # 1. Direct membership in the allowlist.
+        assert 'related_tasks' in task_metadata_module._BLESSED_METADATA_KEYS, (
+            'related_tasks is the canonical Tier-B spelling docs/task-authoring.md §8 '
+            'directs authors to; it must be Tier-A blessed so following the '
+            'documentation does not mint a census warning'
+        )
+
+        # 2. The behaviour that membership buys.
+        model, warnings = parse_metadata({'related_tasks': ['1', '2']}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'related_tasks'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for related_tasks; got: {offending}'
+        )
+
+        # 3. Value preservation (I1). Blessing suppresses the census LINE and
+        #    must not touch the stored value: it stays an extra='allow' key,
+        #    round-tripped verbatim, not coerced by a typed field.
+        assert model.model_dump()['related_tasks'] == ['1', '2']
+
+    @pytest.mark.parametrize(
+        'value', [['1', '2'], 'task-1'], ids=['list_value', 'bare_str_value']
+    )
+    def test_related_tasks_accepts_heterogeneous_values_on_write(self, value):
+        """`related_tasks` must stay untyped: BOTH corpus value shapes survive a
+        strict write (task 4303).
+
+        THIS IS THE ASSERTION THE BLESS-NOT-TYPE RULING RESTS ON. §8's
+        "Promoting a convention" fork offers two ways to stop a key warning:
+        bless it into `_BLESSED_METADATA_KEYS`, or promote it to a typed
+        `TaskMetadata` field. Task 4303 chose bless, and the whole reason was a
+        measurement about VALUES, not about readers: of the 469 corpus carriers,
+        432 hold a list and 37 hold a BARE STR. A typed `list[str]` field would
+        raise on every metadata write to those 37 under
+        ``direction='write', enforce=True`` — permanently, because most are
+        terminal and unrepairable under the presence-only write-authority floor
+        that also blocks a retire sweep (326 of 469 carry `done_provenance`).
+
+        Without this leg that ruling is defended by PROSE ALONE. The blessing
+        test above exercises only ``direction='read'`` with a list, so a later
+        change that added ``related_tasks: list[str]`` to the model would land
+        GREEN across the whole file while silently breaking writes for the
+        bare-str carriers — the identical argument that decided `execution_class`
+        (task 3780), which is why it is pinned here rather than restated.
+
+        Two properties, and both matter:
+        - NEITHER SHAPE RAISES under the strictest setting the parser has.
+          `enforce=True` is what turns a warning into an exception, so this is
+          the mode a typed field would fail in.
+        - NEITHER SHAPE IS COERCED. Blessing suppresses the census LINE only; the
+          value stays an ``extra='allow'`` passenger, round-tripped verbatim. A
+          field that quietly wrapped ``'task-1'`` into ``['task-1']`` would keep
+          this test from raising while still rewriting 37 records' data.
+
+        Parametrized so a regression names WHICH shape broke: the bare-str leg
+        is the load-bearing one (a `list[str]` field passes the list leg).
+
+        MEASURED, NOT PREDICTED — this test is born GREEN (task 4303 blessed
+        rather than typed, so nothing raises today), which proves only that it
+        RUNS. It was therefore falsified by hand against the change it exists to
+        stop: adding ``related_tasks: list[str] | None = None`` to
+        :class:`TaskMetadata` failed exactly ONE case,
+        ``...on_write[bare_str_value]``, with
+        ``ValidationError: Input should be a valid list [input_value='task-1']``,
+        while ``[list_value]`` and the other five related_tasks cases stayed
+        green. That is precisely the asymmetry the parametrization is for, and it
+        confirms the 37 bare-str carriers would have become unwritable. The
+        typed field was not committed.
+        """
+        model, warnings = parse_metadata(
+            {'related_tasks': value}, direction='write', enforce=True
+        )
+
+        assert warnings == [], (
+            f'a strict write of related_tasks={value!r} must be silent — it is the '
+            f'canonical Tier-B spelling and Tier-A blessed; got: {warnings}'
+        )
+        assert model.model_dump()['related_tasks'] == value, (
+            f'related_tasks={value!r} was coerced on write. It is deliberately NOT a '
+            f'typed field: 37 of 469 corpus carriers hold a bare str, so any typing '
+            f'that normalises or rejects a non-list rewrites or breaks those records '
+            f'(task 4303, the bless-not-type ruling)'
+        )
+
+    @pytest.mark.parametrize(
+        'alias', ['related_task', 'related_df_tasks', 'related_task_examples']
+    )
+    def test_related_tasks_aliases_still_warn(self, alias):
+        """The three cross-reference aliases must KEEP emitting unknown_key (task 4303).
+
+        The negative half of ``test_related_tasks_metadata_key_is_blessed``, and
+        the assertion the Tier-B row now actually rests on. Task 4303 blessed the
+        CANONICAL spelling, so from here the drift signal for this family lives
+        ENTIRELY in these three aliases — before that, the canonical warned too
+        and `code=unknown_key` could not discriminate "used a deprecated alias"
+        from "used the spelling docs/task-authoring.md §8 told me to use".
+
+        BORN GREEN BY DESIGN, and that is the point: this is a regression lock,
+        not a defect reproduction. Verified on the base tree — all three aliases
+        already warn correctly. Its falsifier is a FUTURE change that blesses one
+        of them (or promotes it to a typed `TaskMetadata` field), which would
+        void the Tier-B table's drift contract with no other test failing and
+        leave an operator's `grep code=unknown_key` silently returning nothing.
+        Modelled directly on `test_finding_provenance_near_miss_aliases_still_warn`
+        above, whose docstring makes exactly this argument for its own family.
+
+        Parametrized rather than looped inside one test so a single regressed
+        alias is isolated BY NAME in the failure output. Both properties were
+        measured, not assumed: temporarily blessing `related_df_tasks` failed
+        exactly one case, reported as
+        `test_related_tasks_aliases_still_warn[related_df_tasks]`, while the
+        other two stayed green. The temporary blessing was not committed.
+
+        This asserts parser BEHAVIOUR (warning emitted / not emitted), not the
+        wording of docs/task-authoring.md §8 — so it is a real contract test, not
+        a documentation meta-test.
+
+        Scoped key-exact to the three spellings the Tier-B row lists, and nothing
+        beyond them. In particular NOT `related_task_ids`: that is a different
+        key entirely, it lives in MEMORY metadata rather than task metadata, and
+        it has a live reader at
+        `fused-memory/scripts/audit_duplicate_memories.py::
+        liveness_snapshot_subject_task_ids`. Pulling it into this family is the
+        `related_task*` wildcard mistake task 4303 removed from the frozenset
+        header comment.
+        """
+        _, warnings = parse_metadata({alias: 'v'}, direction='read')
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert alias in unknown_key_fields, (
+            f'{alias} must stay unblessed so its drift line keeps appearing in '
+            f'the census; got warnings: {warnings}'
+        )
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)

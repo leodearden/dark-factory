@@ -2598,7 +2598,15 @@ class TestMem0BackendScanPayloadText:
         with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
             result = await backend.scan_payload_text(scope=Scope(project_id='p'))
 
-        assert result == {'matches': [], 'scanned': 0, 'truncated': False}
+        expected_collection = Scope(project_id='p').mem0_collection_name(
+            backend.config.mem0.collection_prefix
+        )
+        assert result == {
+            'matches': [],
+            'scanned': 0,
+            'truncated': False,
+            'collection': expected_collection,
+        }
 
     @pytest.mark.parametrize('limit', [0, -1])
     @pytest.mark.asyncio
@@ -2637,6 +2645,88 @@ class TestMem0BackendScanPayloadText:
 
         assert result['scanned'] == 1
         assert len(result['matches']) == 1
+
+
+class TestMem0BackendScanPayloadTextNamesItsCollection:
+    """The scan result must identify the collection it actually walked.
+
+    A scan result is a MEASUREMENT of a collection, and a measurement that
+    does not say what it measured cannot be audited later.  This is not
+    hypothetical: the authoritative 21,089-point 2026-08-05 incidence sweep
+    committed two reports (``docs/toolcall-xml-leak-sweep-2026-08-05/``) that
+    each carry ``"collection": ""``, because the caller read a key this
+    method never returned (task 3243).
+
+    Every assertion below compares the reported name against the
+    ``collection_name`` RECORDED on the ``client.scroll`` call rather than
+    against a re-spelled literal.  That is the load-bearing part: a literal
+    would still pass on the day the scan reports one collection while walking
+    another, which is the only failure this field exists to rule out.
+    """
+
+    @staticmethod
+    def _expected(backend) -> str:
+        return Scope(project_id='p').mem0_collection_name(backend.config.mem0.collection_prefix)
+
+    @pytest.mark.asyncio
+    async def test_default_prefilter_mode_reports_the_collection_it_scrolled(self, backend):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], None)
+        )
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        walked = mock_client.scroll.call_args.kwargs.get('collection_name')
+        assert result['collection'] == walked
+        assert result['collection'] == self._expected(backend)
+
+    @pytest.mark.asyncio
+    async def test_exhaustive_mode_reports_the_collection_it_scrolled(self, backend):
+        """Exhaustive is the mode that establishes the TRUE incidence rate, so
+        it is the mode whose provenance matters most."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], None)
+        )
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), exhaustive=True)
+
+        walked = mock_client.scroll.call_args.kwargs.get('collection_name')
+        assert result['collection'] == walked
+        assert result['collection'] == self._expected(backend)
+
+    @pytest.mark.asyncio
+    async def test_an_empty_corpus_still_reports_the_collection_it_scrolled(self, backend):
+        """A clean verdict is exactly when an operator most needs to know what
+        was swept — "zero hits" is worthless without "zero hits in WHAT"."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        walked = mock_client.scroll.call_args.kwargs.get('collection_name')
+        assert result['matches'] == []
+        assert result['collection'] == walked
+        assert result['collection'] == self._expected(backend)
+
+    @pytest.mark.asyncio
+    async def test_the_reported_name_tracks_the_scope_rather_than_a_constant(self, backend):
+        """Two different scopes must not report the same collection — the guard
+        against a hardcoded/stale name that happens to match in one test."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            first = await backend.scan_payload_text(scope=Scope(project_id='alpha'))
+            second = await backend.scan_payload_text(scope=Scope(project_id='beta'))
+
+        walked = [c.kwargs.get('collection_name') for c in mock_client.scroll.call_args_list]
+        assert [first['collection'], second['collection']] == walked
+        assert first['collection'] != second['collection']
 
 
 # ---------------------------------------------------------------------------

@@ -572,6 +572,47 @@ class TestVerdictToolsResidueChannelIsShared:
         # record under a live task id would halt the task whose verdict leaked.
         assert not spec.residue_anchor_task_id.isdigit()
 
+    def test_spec_declares_where_ITS_callers_can_be_identified(self):
+        """Task 4744: ``attribution_source`` is verdict-tools' OWN answer.
+
+        plan-tools now journals every markup fact to a durable file and its
+        storm record names that path. verdict-tools is the IDENTICAL per-agent
+        stdio subprocess with an identically ephemeral stderr and has no journal
+        yet, so it declares the only route that genuinely exists there —
+        transcript mining. Inheriting either plan-tools' journal path or the old
+        "grep the orchestrator logs" sentence would ship an instruction that is
+        false at this boundary, which is the exact defect task 4744 fixes.
+        """
+        from orchestrator.mcp import markup_journal, plan_tools, verdict_tools
+
+        spec = verdict_tools._MARKUP_SINK_SPEC
+        assert 'data/orchestrator/agent-transcripts' in spec.attribution_source
+        assert 'orchestrator logs' not in spec.attribution_source
+        assert spec.attribution_source != plan_tools._MARKUP_SINK_SPEC.attribution_source
+        assert markup_journal.MARKUP_JOURNAL_DIRNAME not in spec.attribution_source, (
+            'naming a journal this boundary does not write would send an '
+            'operator to an empty or missing file'
+        )
+
+    def test_the_field_is_required_so_a_new_server_must_decide(self):
+        """A DEFAULT is what would let the next server inherit silently.
+
+        Every other field on the spec is required for this reason; this one is
+        the axis where inheriting plan-tools' answer is actively harmful, since
+        the answer is a filesystem path only plan-tools writes.
+        """
+        from orchestrator.mcp import markup_sink
+
+        with pytest.raises(TypeError):
+            markup_sink.MarkupSinkSpec(  # type: ignore[call-arg]
+                server_label='new-server',
+                agent_role='new-server-markup-guard',
+                residue_anchor_task_id='new-server-markup-residue',
+                storm_anchor_task_id='new-server-markup-storm',
+                refusal_consequence='Nothing was written.',
+                storm_consequence='the leak keeps landing.',
+            )
+
     @pytest.mark.asyncio
     async def test_residue_is_queued_as_an_escalation_not_dropped_in_the_worktree(
         self, tmp_path,

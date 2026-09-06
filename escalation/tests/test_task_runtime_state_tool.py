@@ -171,7 +171,9 @@ class TestGetTaskRuntimeStateTool:
         the model's default-constructed empty envelope."""
         server = create_server(EscalationQueue(tmp_path / 'esc'))
         result = await _call_get_task_runtime_state(server)
-        assert result == {'offline': False, 'tasks': []}
+        # offline_reason is dashboard-synthesized (task 3517): the server
+        # itself always emits None, exactly like offline=False.
+        assert result == {'offline': False, 'offline_reason': None, 'tasks': []}
 
     async def test_projects_pooled_and_non_pooled_entries(self, tmp_path: Path):
         harness = types.SimpleNamespace(

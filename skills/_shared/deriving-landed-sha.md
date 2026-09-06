@@ -191,8 +191,8 @@ returns the **oldest** of those — the first unrelated task's merge. The contai
   into group merge; sha verified by ancestry containment"}` — `$c` is a merge commit that brought
   this branch in, so the same `kind` rule as [step 2](#step-2) applies. Carry the note here too.
 - **contained-before rc=0** (or `$c` empty) → the branch was already in main before `$c`, so
-  `$c` is an unrelated later merge. No merge commit exists for this branch. **Do not stamp the
-  tip yet** — continue to the citation gate below.
+  `$c` is an unrelated later merge. No merge commit exists for this branch. **Do not stamp
+  yet** — continue to the citation gate below, whose only stampable sha is the citing commit.
 
 **The citation gate (phantom-branch check).** rc=0 does not by itself prove this branch carries
 any work: a branch that never advanced past its creation point has main's own old base commit as
@@ -219,13 +219,34 @@ applies `^`/`$` per line, so a body line can match spuriously; the function uses
 as a coarse pre-filter and re-tests each candidate's **subject** alone. Do the same: walk the
 output most-recent-first and take the first row whose **subject** cites this task.
 
-- **A subject-matching row exists** → a genuine fast-forward / already-contained landing: real
-  work citing this task is on main. Stamp the branch tip per
-  `orchestrator/src/orchestrator/agents/briefing.py`'s fast-forward rule,
-  `{"kind": "found_on_main", "commit": "<git rev-parse task/<TASK_ID>>", "note": "fast-forward
-  merge, no separate merge commit; landing confirmed by task citation <citing sha> on main"}`
-  (rc=0 guarantees the ref still resolves). Recording the citing sha in the note is what makes
-  the stamp auditable.
+- **A subject-matching row exists** → real work citing this task is on main. Stamp **that row's
+  sha** — the citing commit — as `commit`:
+  `{"kind": "found_on_main", "commit": "<citing sha>", "note": "landing confirmed by task
+  citation on main; no separate merge commit (branch tip <git rev-parse task/<TASK_ID>>)"}`
+  (rc=0 guarantees the ref still resolves, so the tip renders for the note). The citing commit
+  is on main by construction (`git log main` found it) and cites this task by construction (that
+  is how the walk selected it) — that pairing is what makes the attribution auditable. Do **not**
+  stamp the branch tip: on a sibling-covered branch the tip is main's own old base commit,
+  carrying none of this task's work, and the server's only backstop
+  ([below](#never-from-head)) passes it. This matches
+  `escalation/src/escalation/server.py::_found_on_main_response`, whose live-branch path returns
+  exactly this citation commit, discovered by `validate_landing_evidence` (task 3103 changed it
+  from the branch tip for precisely this reason). Do **not** assert "fast-forward" in the note:
+  this arm cannot distinguish a genuine fast-forward from a sibling-covered landing — recording
+  the tip lets an auditor tell them apart at zero extra commands — and `found_on_main` is honest
+  for both.
+  **Among subject-citing rows, prefer one whose diff touches this task's declared
+  `metadata.files`** (`git show --name-only --format= --first-parent -m <sha>`); walk order
+  decides among the rows that qualify. Citing the citing commit fixes *attribution*, not
+  *deliverability*: on a sibling-covered landing that row is the sibling's commit, whose diff
+  need not touch this task's files at all, and
+  `fused-memory/scripts/audit_found_on_main_provenance.py::classify` then returns
+  `deliverable_absent` — which `check_found_on_main_spurious_rate.py` counts as spurious
+  exactly like `misattributed`. If **no** subject-citing row touches a declared file, still
+  stamp the first row and say so in the `note` (append e.g. `; no citing commit on main
+  touches this task's declared files`): the landing is real, and the honest note is what lets
+  a later `deliverable_absent` read as this known sibling-covered shape rather than as
+  fabricated evidence.
 - **No subject-matching row** → nothing on main cites this task. This is the **phantom-branch**
   case, NOT a landing. Do **not** stamp. Stop and report it as not-landed/phantom-branch. This
   is the same signal [`unblock/SKILL.md`](../unblock/SKILL.md)'s `already_merged` guidance

@@ -2171,7 +2171,25 @@ class ReconReportState:
         task's title has since changed, a re-citation is still skipped and
         the stored citation keeps the original title rather than refreshing
         it. Titles are cosmetic display text, not part of the citation's
-        identity, so this staleness is accepted rather than reconciled.
+        identity.
+
+        THE CONSUMER NOW AGREES (task 4864). That last sentence used to end
+        "so this staleness is accepted rather than reconciled", which was only
+        half true: the consumer disagreed. ``flag_dedup._cited_fix_task_live``
+        required the cited title to EQUAL the live record's, so an ordinary
+        retitle silently disabled the cross-project fix-task suppression gate
+        for that citation, permanently. That contradiction is resolved in
+        THIS side's favour — titles are cosmetic — and the consumer was
+        changed to match: it admits on live presence plus a non-abandoned
+        status, and a stale or absent title downgrades the decision to a
+        WARNING (``cross_project_fix_task_title_uncorroborated``) instead of
+        disabling suppression. A title this method cannot resolve at all is
+        likewise cited (the existence check passed) and logged at WARNING
+        here, rather than written silently as ``title=''``. Note the STRICT
+        sibling ``flag_dedup._cited_task_corroborated``, used by the phantom
+        task-creation guard, still requires title equality — a wrong drop
+        there has no bounded expiry — so a title-less citation genuinely does
+        cost corroborating power on that path.
 
         Two in-run folds anchor on this call — BOTH are CHECKED before
         EITHER registers, so a call that folds under either one always
@@ -2276,6 +2294,26 @@ class ReconReportState:
         # Guard against data=None (some get_task paths return data: null explicitly)
         data = result.get('data') if isinstance(result.get('data'), dict) else {}
         title = result.get('title') or data.get('title', '')
+        if not title:
+            # The one permanently-degraded citation this VALIDATING producer
+            # mints itself (task 4864).  The existence check above PASSED, so
+            # the citation stands — a title is cosmetic display text, not part
+            # of the citation's identity, and dropping the citation here would
+            # discard the very evidence the consumer gate needs.  But an empty
+            # title is a real loss of corroborating signal, and it used to
+            # happen in total silence: downstream,
+            # ``flag_dedup._titles_corroborate`` can never match ``''``, so
+            # every consumer that reads a title degrades to its weak path for
+            # the life of this citation (titles are never refreshed — see the
+            # first-cited-title-wins contract in the docstring above).  Say so
+            # once, here, where the project/task is still in hand.
+            logger.warning(
+                'recon_report.cite_task_title_unresolved project_id=%s task_id=%s'
+                ' — the task exists but neither the top-level record nor its'
+                ' data sub-dict carried a title; citing with title=%r, which'
+                ' downstream consumers cannot corroborate',
+                project_id, task_id, title,
+            )
         citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
 
         # In-run cited-task folds (task-2425 project-scoped; task-2432
@@ -2447,7 +2485,12 @@ class ReconReportState:
         # duplicate rows. Keyed on (project_id, task_id) only, NOT title —
         # first-cited title wins; a re-citation after the upstream title
         # changed is still skipped rather than refreshing the stored title
-        # (see cite_task's docstring).
+        # (see cite_task's docstring). Task 4864 reconciled the CONSUMER to
+        # that contract rather than the other way round: flag_dedup's
+        # cross-project fix-task gate no longer treats title equality as
+        # identity, so a title left stale here downgrades that gate to a
+        # WARNING instead of silently disabling it. The strict phantom guard
+        # (flag_dedup._cited_task_corroborated) still requires equality.
         already_cited = any(
             c['project_id'] == project_id and c['task_id'] == task_id
             for c in finding.cited_tasks

@@ -122,6 +122,26 @@ class MarkupSinkSpec:
     #: sentence, rendered into the storm alarm's body.
     storm_consequence: str
 
+    #: WHERE an operator can identify the leaking caller for THIS boundary, as
+    #: an instruction they can follow. Rendered into the storm alarm's detail
+    #: and its suggested_action.
+    #:
+    #: REQUIRED, not defaulted, and that is load-bearing (task 4744). This field
+    #: replaced a hard-coded "grep the orchestrator logs for 'markup guard:'"
+    #: sentence that was measured UNFOLLOWABLE on 2026-08-25::
+    #:
+    #:     journalctl --user --since 2026-08-22 | grep 'markup guard:'
+    #:         ->  0 plan-tools lines
+    #:
+    #: against 35 real plan-tools rejections in data/orchestrator/
+    #: agent-transcripts/ over the same span. These servers are per-agent STDIO
+    #: SUBPROCESSES whose stderr the CLI agent that spawned them consumes, so
+    #: those lines reach no durable sink; an operator following that instruction
+    #: correctly concluded "no evidence" and was wrong. A DEFAULT here would let
+    #: the next such server silently inherit the same false sentence, which is
+    #: the exact defect being fixed — so each boundary states its own answer.
+    attribution_source: str
+
     @property
     def fallback_summary(self) -> str:
         return (
@@ -170,6 +190,45 @@ def resolve_project_root(worktree: Path) -> Path | None:
         # worktree answers with the main checkout's absolute path.
         git_dir = (worktree / git_dir).resolve()
     return git_dir.parent
+
+
+def resolve_subject(
+    subject_task_id: Callable[[], str], worktree: Path, *, what: str
+) -> str:
+    """Who this record is attributed to: the site's answer, then a ladder.
+
+    ONE ladder, shared by every channel a boundary guard emits through — the
+    escalation sink below and ``markup_journal.make_fact_journal``. Kept here
+    rather than reimplemented per channel because the two channels' records are
+    asserted to name the SAME subject: two copies of an attribution ladder can
+    drift in opposite directions on one boundary, and a guard whose escalation
+    and whose journal disagree about who leaked is worse than either alone.
+    That sibling duplication is the INV-5 shape this module's own header rules
+    against.
+
+    The rungs, in order: the site's own answer (plan.json's ``task_id`` for
+    plan-tools), then the worktree directory NAME (a task worktree is named for
+    its task), then an explicit ``MARKUP_UNATTRIBUTED_SUBJECT`` — never ``None``
+    and never absent, because a consumer must be able to tell "nobody knows"
+    from "that emitter forgot the key".
+
+    A RAISING thunk falls to the same ladder rather than costing the record.
+    Attribution is what these channels are FOR, but a record that says
+    "something leaked from add_design_decision at 16:52:34" is still strictly
+    more than the nothing that was written before they existed.
+
+    *what* names the record kind in the fallback log line, so an operator
+    reading the warning knows which channel degraded.
+    """
+    try:
+        resolved = subject_task_id()
+    except Exception:
+        logger.warning(
+            'markup guard: could not attribute the %s under %s; falling back '
+            'to the worktree name', what, worktree,
+        )
+        resolved = ''
+    return resolved or worktree.name or MARKUP_UNATTRIBUTED_SUBJECT
 
 
 def open_escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
@@ -255,6 +314,12 @@ def storm_detail(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
 
     Points at ``plans/toolcall-markup-containment-prd.md`` and NOT at DF 3083,
     which is done and CLOSED to appends: nothing reads what is attached there.
+
+    The "identify the leaking caller" sentence is the SPEC's
+    (:attr:`MarkupSinkSpec.attribution_source`), not this module's, because the
+    honest answer differs per boundary — and a wrong one here is worse than
+    none, since a reader who follows it concludes "no evidence" rather than
+    "I looked in the wrong place".
     """
     return '\n'.join([
         f'count={record.get("count")!r}',
@@ -269,9 +334,9 @@ def storm_detail(record: Mapping[str, Any], spec: MarkupSinkSpec) -> str:
         'now, not that the guard is misfiring — do NOT disable it, or '
         + spec.storm_consequence,
         '',
-        'Identify the leaking caller from the guard\'s own log lines (grep the '
-        "orchestrator logs for 'markup guard:' and 'markup_guard_storm') and "
-        'report it against plans/toolcall-markup-containment-prd.md.',
+        'Identify the leaking caller: ' + spec.attribution_source,
+        '',
+        'Then report it against plans/toolcall-markup-containment-prd.md.',
     ])
 
 
@@ -384,9 +449,9 @@ def file_storm(
         ),
         detail=storm_detail(record, spec),
         suggested_action=(
-            "identify the leaking caller from the guard's log lines and report "
-            'it against plans/toolcall-markup-containment-prd.md — DF task 3083 '
-            'is done and closed to appends'
+            'identify the leaking caller — ' + spec.attribution_source +
+            ' — and report it against plans/toolcall-markup-containment-prd.md '
+            '(DF task 3083 is done and closed to appends)'
         ),
         worktree=str(worktree),
         level=MARKUP_STORM_LEVEL,
@@ -510,15 +575,7 @@ def make_escalation_sink(
             return fall_back(record, 'the escalation could not be submitted')
 
     def _subject() -> str:
-        try:
-            resolved = subject_task_id()
-        except Exception:
-            logger.warning(
-                'markup guard: could not attribute the record under %s; '
-                'falling back to the worktree name', worktree,
-            )
-            resolved = ''
-        return resolved or worktree.name or MARKUP_UNATTRIBUTED_SUBJECT
+        return resolve_subject(subject_task_id, worktree, what='record')
 
     async def sink(record: dict[str, Any]) -> str | None:
         try:

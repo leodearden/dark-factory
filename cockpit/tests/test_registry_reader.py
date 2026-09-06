@@ -6,8 +6,13 @@ contract, never re-derive it). Fail-soft is a hard constraint (PRD §2): a
 corrupt record must never abort the whole scan.
 
 build_snapshot/snapshot_changed drive the app's rebuild-only-on-change poll:
-a snapshot is keyed on substantive display fields only (never start_ts/age),
-so a purely-time-passing tick is a no-op diff.
+a snapshot is keyed on substantive display fields only -- never on values
+that move on their own (start_ts/age) -- so a purely-time-passing tick is a
+no-op diff. That is a rule about self-moving values, not about timestamps as
+such: the ask's own question.asked_at IS part of the key, because this
+snapshot is the wake-up trigger for CockpitApp._prune_overlays and must be
+at least as strong as the `(question.text, question.asked_at)` identity that
+prune keys a session overlay on.
 """
 
 from __future__ import annotations
@@ -330,6 +335,34 @@ class TestBuildSnapshot:
 
         assert build_snapshot([early]) == build_snapshot([late])
 
+    def test_distinguishes_a_new_ask_with_identical_text(self):
+        """Two asks with the SAME text but a fresh asked_at must NOT snapshot alike.
+
+        The invariant being pinned: this snapshot is the WAKE-UP TRIGGER for
+        CockpitApp._prune_overlays. _apply_scan short-circuits on an
+        unchanged snapshot, so _rebuild_queue -- and with it the overlay
+        prune -- never runs on a tick that diffs as a no-op. The trigger must
+        therefore be AT LEAST AS STRONG as the ask identity the prune keys
+        on (CockpitApp._ask_identity keys a session on
+        `(question.text, question.asked_at)`); if it is weaker, a real
+        identity change slips through the diff unnoticed and an operator's
+        stale drop suppresses a brand-new ask forever.
+        """
+        from cockpit.registry_reader import build_snapshot
+
+        first = _make_record(
+            session_slug='a-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
+        )
+        second = _make_record(
+            session_slug='a-1',
+            status=sr.Status.AWAITING_INPUT,
+            question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
+        )
+
+        assert build_snapshot([first]) != build_snapshot([second])
+
 
 class TestSnapshotChanged:
     def test_identical_record_sets_are_unchanged(self):
@@ -353,6 +386,40 @@ class TestSnapshotChanged:
         new = build_snapshot([_make_record(start_ts='2026-07-07T00:00:00+00:00')])
 
         assert snapshot_changed(old, new) is False
+
+    def test_new_ask_with_identical_text_is_changed(self):
+        """Same session, same question TEXT, fresh asked_at -> a real change.
+
+        The diff-level reciprocal of
+        TestBuildSnapshot::test_distinguishes_a_new_ask_with_identical_text:
+        this is precisely the poll tick that must reach _rebuild_queue, so
+        CockpitApp._prune_overlays gets a chance to expire the overlay the
+        PREVIOUS ask was dropped/boosted/deferred under. A False here means
+        the app never wakes up and the stale overlay is pinned for the
+        process's whole lifetime.
+        """
+        from cockpit.registry_reader import build_snapshot, snapshot_changed
+
+        old = build_snapshot(
+            [
+                _make_record(
+                    session_slug='a-1',
+                    status=sr.Status.AWAITING_INPUT,
+                    question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
+                )
+            ]
+        )
+        new = build_snapshot(
+            [
+                _make_record(
+                    session_slug='a-1',
+                    status=sr.Status.AWAITING_INPUT,
+                    question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
+                )
+            ]
+        )
+
+        assert snapshot_changed(old, new) is True
 
     def test_added_record_is_changed(self):
         from cockpit.registry_reader import build_snapshot, snapshot_changed

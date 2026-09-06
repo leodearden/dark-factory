@@ -20,6 +20,12 @@ import types
 
 import pytest  # pyright: ignore[reportMissingImports]
 
+# Importable by name only because tests/scripts/conftest.py puts this
+# directory on sys.path, which pytest's --import-mode=importlib deliberately
+# does not.  This module's private `_unit_sections` copy was the third
+# hand-copy of the section parse; task 3913 retired it.
+from systemd_unit_invariants import parse_sections
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
 
@@ -7380,27 +7386,6 @@ def test_log_never_raises_when_the_stderr_fallback_itself_fails(
 # ---------------------------------------------------------------------------
 
 
-def _unit_sections(content: str) -> dict[str, list[str]]:
-    """Split unit-file text into {section_name: [lines]} (header line excluded).
-
-    Local copy of tests/scripts/test_orchestrator_service_files.py's
-    ``_parse_sections``: that module holds the other orchestrator-watchdog.service
-    pins and is where this assertion ultimately belongs, but pytest runs here with
-    ``--import-mode=importlib`` and tests/scripts/ is not a package, so a sibling
-    test module cannot be imported. Fold this back into ``_parse_sections`` if the
-    pin ever moves next to ``test_watchdog_service_structure``.
-    """
-    sections: dict[str, list[str]] = {}
-    current: str | None = None
-    for line in content.splitlines():
-        if line.startswith("[") and line.endswith("]"):
-            current = line[1:-1]
-            sections[current] = []
-        elif current is not None:
-            sections[current].append(line)
-    return sections
-
-
 def test_service_bounds_the_whole_tick() -> None:
     """TimeoutStartSec must be present under [Service], finite, and above the
     script's own worst-case sequential subprocess bound.
@@ -7422,7 +7407,7 @@ def test_service_bounds_the_whole_tick() -> None:
     """
     service_path = REPO_ROOT / "scripts" / "orchestrator-watchdog.service"
     unit = service_path.read_text(encoding="utf-8")
-    sections = _unit_sections(unit)
+    sections = parse_sections(unit)
 
     def _values(lines: list[str]) -> list[str]:
         return [

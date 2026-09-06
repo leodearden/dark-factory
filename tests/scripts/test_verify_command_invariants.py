@@ -1,30 +1,32 @@
 """Unit tests for the shared command-parsing helpers in ``verify_command_invariants``.
 
 The trio these helpers replace was, until task 3745, exercised only INDIRECTLY —
-through whatever live config each of the four sibling guards happened to parse
+through whatever live config each of the five sibling guards happened to parse
 (``test_root_lint_covers_nonmember_py.py``, ``test_scripts_module_config.py``,
 ``test_contributing_lint_command_drift.py``,
-``test_skills_module_config_decision.py``). The single exception was
+``test_skills_module_config_decision.py``, and — migrated later, by task 3883 —
+``test_fallback_verify_config.py``). The single exception was
 ``test_ruff_targets_reads_flag_values_as_flags_not_paths``. That is a poor net
 for a parser: a live command exercises one shape, so the branches that only fire
 on a DIFFERENT shape (two matching segments, an absent anchor, an unbalanced
-quote, a value-taking flag) were unasserted, and the four copies drifted apart
+quote, a value-taking flag) were unasserted, and the five copies drifted apart
 precisely there.
 
 So the assertions below are on SYNTHETIC commands, deliberately. They pin the
 parser's contract independently of what any config currently says, which is what
-lets the four guards keep asserting about the live configs without also having to
+lets the five guards keep asserting about the live configs without also having to
 double as the parser's test suite.
 
 TWO EQUIVALENCES ARE PINNED HERE AS EXECUTABLE STATEMENTS, because they are the
-whole reason ONE implementation can serve four call sites that today have
+whole reason ONE implementation can serve five call sites that today have
 different semantics:
 
   * ``positional_targets`` with an EMPTY ``value_flags`` set is byte-for-byte the
-    naive ``-``-prefix filter that ``test_root_lint_covers_nonmember_py.py`` and
-    ``test_scripts_module_config.py`` use — phantoms included. The
+    naive ``-``-prefix filter that ``test_root_lint_covers_nonmember_py.py``,
+    ``test_scripts_module_config.py`` and (since task 3883)
+    ``test_fallback_verify_config.py`` use — phantoms included. The
     phantom-admitting expectation below is therefore an assertion about what
-    those two files do TODAY, not an aspiration.
+    those three files do TODAY, not an aspiration.
   * ``covers``' slash-tolerant name set AGREES with the slashless form on
     ``posixpath.normpath``-ed targets — the only kind
     ``test_skills_module_config_decision.py`` ever passes — while slash
@@ -37,10 +39,16 @@ in every tests directory, and ``tests/scripts/conftest.py`` puts this directory
 on ``sys.path`` for exactly this reason (pytest's ``--import-mode=importlib``
 deliberately does not).
 
-ASSERTION-MESSAGE WORDING IS NOT PINNED, on purpose. The four migrated guards
-contain no ``match=`` and exactly one ``pytest.raises``, which targets an
-unrelated Markdown extractor — so the diagnostics here are free to be reworded.
-What IS pinned is that the message carries the caller's ``label`` and the
+ASSERTION-MESSAGE WORDING IS NOT PINNED, on purpose. The five migrated guards
+contain no ``match=`` ANYWHERE — that, not the number of ``pytest.raises``, is
+the property this paragraph exists to assert, and it is what leaves the
+diagnostics here free to be reworded. Two ``pytest.raises`` do exist across the
+five: ``test_contributing_lint_command_drift.py``'s targets an unrelated
+Markdown extractor, and task 3883 added a second in
+``test_fallback_verify_config.py`` that DOES target this parser (it pins that
+``path_anchor`` matches a whole path component rather than a raw suffix). Since
+neither constrains the wording, both are compatible with rewording any message
+below. What IS pinned is that the message carries the caller's ``label`` and the
 offending command, since that is what keeps
 ``test_contributing_lint_command_drift.py``'s live-vs-documented failures
 distinguishable from each other.
@@ -80,13 +88,14 @@ _CHAINED_LINT = (
 
 
 def test_exported_keywords_are_the_strings_the_guards_parse() -> None:
-    """The four guards alias these rather than restating the literal.
+    """The five guards alias these rather than restating the literal.
 
     The keyword is not per-caller policy — it is what SELECTS the anchor
     (``keyword.split()[-1]``), so it belongs to the shared contract. Before the
     task-3745 amendment pass ``"ruff check"`` was spelled in four files under
     three names (``_RUFF_KEYWORD`` twice, ``_RUFF`` once), which is the same
-    N-copy shape this module exists to close.
+    N-copy shape this module exists to close. Task 3883 brought the fifth
+    (``test_fallback_verify_config.py``) onto the same alias.
 
     Compared against this file's own literals, which are deliberately NOT
     aliases: an edit to the exported constant that the guards silently inherit
@@ -279,6 +288,54 @@ def test_anchor_split_reports_an_untokenisable_segment_with_its_label() -> None:
     assert "uv run ruff check alpha'" in message
 
 
+def test_anchor_split_locates_a_path_spelled_anchor() -> None:
+    """``path_anchor=True`` finds an anchor spelled as the PATH it was invoked by.
+
+    This is the shape the live repo-root ``lint_command``'s tail leg actually
+    has: the magicmock checker is run as ``python3
+    fused-memory/scripts/check_bare_magicmock_config.py <dirs>``, so the anchor
+    ``check_bare_magicmock_config.py`` is never a bare token. Without this
+    parameter the exact-token rule cannot locate it at all, which is what kept
+    ``test_fallback_verify_config.py::_lint_leg_targets`` on a private copy of
+    this parser (task 3883).
+    """
+    segment = "python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
+    assert vci.anchor_split(segment, "check_bare_magicmock_config.py", path_anchor=True) == (
+        ["python3"],
+        ["shared/tests"],
+    )
+
+
+def test_anchor_split_still_asserts_on_a_path_spelled_anchor_by_default() -> None:
+    """The DEFAULT is unchanged: a path-spelled anchor is not an exact token.
+
+    Load-bearing rather than incidental. ``path_anchor`` only ever ADDS
+    candidate positions, so pinning that the default rejects the path spelling
+    is what guarantees task 3745's four callers cannot be silently widened by
+    the fifth caller's needs.
+    """
+    segment = "python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
+    with pytest.raises(AssertionError):
+        vci.anchor_split(segment, "check_bare_magicmock_config.py")
+
+
+def test_anchor_split_path_anchor_matches_a_whole_component_not_a_suffix() -> None:
+    """A whole path COMPONENT, never a raw string suffix.
+
+    ``scripts/x_check_bare_magicmock_config.py`` is a DIFFERENT file whose name
+    merely ends with the anchor, so a raw ``str.endswith`` would report another
+    program's arguments as this checker's targets. "Compare by exact element,
+    never substring-match" is the contract this whole module exists to enforce,
+    and ``path_anchor`` must not smuggle in an exception to it.
+    """
+    with pytest.raises(AssertionError):
+        vci.anchor_split(
+            "python3 scripts/x_check_bare_magicmock_config.py a b",
+            "check_bare_magicmock_config.py",
+            path_anchor=True,
+        )
+
+
 def test_positional_targets_propagates_the_tokenisation_failure() -> None:
     """The guard is at the choke point, so every caller reaching it inherits it."""
     with pytest.raises(AssertionError) as excinfo:
@@ -301,15 +358,20 @@ def test_positional_targets_excludes_everything_before_the_anchor() -> None:
 
 
 def test_positional_targets_with_no_value_flags_is_the_naive_dash_prefix_filter() -> None:
-    """THE EQUIVALENCE that lets one extractor serve all four call sites.
+    """THE EQUIVALENCE that lets one extractor serve all five call sites.
 
-    ``test_root_lint_covers_nonmember_py.py`` and ``test_scripts_module_config.py``
-    both use a bare ``[t for t in tail if not t.startswith('-')]`` today, phantoms
-    and all: ``--select E,F`` donates ``E,F`` and ``--line-length 100`` donates
-    ``100`` as though they were paths. With an empty ``value_flags`` set the
-    consume-next flag can never become True, so the loop reduces to exactly that
-    filter — and asserting the PHANTOM-ADMITTING result here is what proves the
-    migration changed nothing for those two files.
+    ``test_root_lint_covers_nonmember_py.py``, ``test_scripts_module_config.py``
+    and — since task 3883 — ``test_fallback_verify_config.py`` all use a bare
+    ``[t for t in tail if not t.startswith('-')]`` today, phantoms and all:
+    ``--select E,F`` donates ``E,F`` and ``--line-length 100`` donates ``100`` as
+    though they were paths. With an empty ``value_flags`` set the consume-next
+    flag can never become True, so the loop reduces to exactly that filter — and
+    asserting the PHANTOM-ADMITTING result here is what proves the migration
+    changed nothing for those three files. (The fifth guard is the one place
+    that equivalence is a TIGHTENING rather than a preservation: its private
+    predecessor filtered nothing at all, so the empty default is merely the
+    CLOSEST-preserving choice available — see
+    ``test_fallback_verify_config.py::test_lint_leg_targets_reads_flag_values_as_flags_not_paths``.)
 
     What a phantom then COSTS its caller does not partition by which callers
     supply a set. Against a coverage check it is inert (an extra target can only
@@ -369,6 +431,34 @@ def test_positional_targets_needs_no_entry_for_the_equals_spelling() -> None:
     """``--flag=value`` is one shlex token and the ``-`` prefix drops it whole."""
     segment = "uv run --project shared pytest tests/scripts/ --timeout=300 -q"
     assert vci.positional_targets(segment, _PYTEST) == ["tests/scripts/"]
+
+
+def test_positional_targets_threads_path_anchor_to_the_anchor_split() -> None:
+    """The fifth caller reaches ``anchor_split``'s new parameter through here.
+
+    Over ``_CHAINED_LINT``, already documented above as modelling the live
+    repo-root ``lint_command`` — a ruff leg followed by a ``python3
+    .../check_bare_magicmock_config.py <dir>`` gate whose checker is named by
+    PATH. Reusing that fixture rather than inventing one keeps the pin tied to
+    the shape the live command actually has.
+    """
+    segment = vci.required_segment(_CHAINED_LINT, "check_bare_magicmock_config.py")
+    targets = vci.positional_targets(
+        segment, "check_bare_magicmock_config.py", path_anchor=True
+    )
+    assert targets == ["shared/tests"]
+
+
+def test_positional_targets_default_still_rejects_a_path_spelled_anchor() -> None:
+    """The default is pinned at THIS layer too, not only at ``anchor_split``.
+
+    ``positional_targets`` is what the four task-3745 callers actually call, so
+    a default that leaked here would widen them even with ``anchor_split``'s own
+    default intact.
+    """
+    segment = vci.required_segment(_CHAINED_LINT, "check_bare_magicmock_config.py")
+    with pytest.raises(AssertionError):
+        vci.positional_targets(segment, "check_bare_magicmock_config.py")
 
 
 def test_positional_targets_propagates_the_anchor_assertion_with_the_label() -> None:

@@ -18,11 +18,24 @@
 # issue numbers -- payload 1/2/4 map to artifact issues #3/#6/#8, so a reader who
 # follows these numbers into reviews-cycle-2/ reads an entirely different set.
 #
-#   item 1  the judge's verdict carries no candidate id, while the attach always
-#           targets the band's top-1 -- so a verdict earned by candidate #3 is
-#           filed against candidate #1, and x_contested is stamped on a canonical
-#           the entry never contradicted. Harmless while the flag is off; it
+#   item 1  the judge path does not bind a verdict to a determinate candidate:
+#           the judge is shown several candidates while the attach always targets
+#           the band's top-1 -- so a verdict earned by candidate #3 is filed
+#           against candidate #1, and x_contested is stamped on a canonical the
+#           entry never contradicted. Harmless while the flag is off; it
 #           ACTIVATES on the flip.
+#
+#           Checked by EXECUTING the ref's judge module, via
+#           scripts/check_write_triage_attach_target.py. It used to be a grep of
+#           that module's source for `candidate_id`, which asserted which
+#           MECHANISM landed rather than whether the invariant holds: it failed a
+#           correct fix that established the invariant another way, and it passed
+#           prose that changed no behaviour at all. Task 4810 replaced it. EITHER
+#           remedy now closes item 1 -- a verdict that names its own candidate
+#           (option a, task 4798 item 7), or a prompt told which candidate the
+#           attach will touch whose rendering actually depends on it (option b,
+#           task 4762). Marking candidates[0] is NOT one of them; see the probe's
+#           own report for the measured reason.
 #   item 2  the confusion-column order is derived by iterating a frozenset, so the
 #           committed accuracy artifact is PYTHONHASHSEED-dependent. Measured
 #           2026-08-27: the committed .md and .json disagree on column order, so
@@ -62,10 +75,91 @@ JUDGE='fused-memory/src/fused_memory/server/write_triage_judge.py'
 EVAL='fused-memory/scripts/eval_write_triage_judge.py'
 CONF='fused-memory/config/config.yaml'
 
+# The item-1 probe, and the interpreter that runs it. The env seam mirrors
+# scripts/check_sandbox_soak.sh's CHECK_SANDBOX_SOAK_PY: it is what lets the
+# hermetic tests point the probe at their own interpreter instead of resolving
+# the fused-memory virtualenv.
+PROBE="$REPO/scripts/check_write_triage_attach_target.py"
+
+# The probe's own PASS line, matched literally (grep -F). Both of its PASS
+# branches -- option (a) and option (b) -- emit this prefix, and no FAIL or
+# UNVERIFIABLE path does. Pinned by the hermetic tests in
+# scripts/tests/test_check_write_triage_flip_preconditions.py so the two
+# cannot drift apart silently.
+PROBE_PASS_MARKER='PASS  the judge path binds a verdict to a determinate candidate'
+
+# The probe's marker for a pass that rests partly on a PARAMETER NAME rather
+# than on behaviour alone (it accepts a target-named parameter that echoes its
+# argument, because a real option (b) naming the target in a header is
+# structurally identical to free text that merely interpolates it). Such a pass
+# is real but unconfirmed, and a WARN buried in the probe's report is not a
+# mitigation: on a PASS this gate exits 0, DeterministicRunner files no
+# escalation, and this stdout is forwarded nowhere. So it gets its own machine
+# -detectable channel, reported on item 1's own line AND in the report's tail.
+# Pinned from both ends by the hermetic tests, like PROBE_PASS_MARKER.
+PROBE_PENDING_MARKER='PASS-NEEDS-CONFIRMATION'
+#
+# COMMAND WORD LISTS, not strings. The env seam is documented to accept a
+# multi-word command, which is why the old spelling was interpolated unquoted
+# with SC2086 disabled -- and that split every OTHER word too, so a $REPO
+# containing a space silently tore the resolved interpreter path into pieces
+# and the gate reported UNVERIFIABLE on a judge that passes. An array splits
+# exactly where the author put a boundary and nowhere else.
+if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY:-}" ]; then
+  # The ONE place word splitting is still wanted: the seam may carry
+  # `uv run --frozen --project <dir> python`. A bare interpreter path (what the
+  # hermetic tests pass) comes through as a single word unchanged.
+  read -r -a PROBE_PY_CMD <<< "$CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY"
+elif [ -x "$REPO/.venv/bin/python3" ]; then
+  PROBE_PY_CMD=("$REPO/.venv/bin/python3")
+else
+  PROBE_PY_CMD=(uv run --frozen --project "$REPO/fused-memory" python)
+fi
+
+# Bounded well inside the before_done predicate's own 120s budget. A host
+# without coreutils' `timeout` runs the probe unbounded rather than failing
+# every run on a missing binary.
+if command -v timeout >/dev/null 2>&1; then
+  PROBE_TIMEOUT_CMD=(timeout 90)
+else
+  PROBE_TIMEOUT_CMD=()
+fi
+
+#: How much of the probe's STDERR is quoted back, and only where it is the
+#: only diagnostic there is -- see the invocation below.
+PROBE_STDERR_LINES=10
+
 fail=0
 report=''
 
+#: Set when item 1 passed only with the probe's name-assisted forgiveness. Not
+#: a failure -- refusing it would re-block task 3169 against a valid
+#: header-marking fix, the false-FAIL class this gate was rewritten to remove
+#: -- but not a silent pass either.
+item1_pending=0
+
+#: The NUMBERS of the items that failed, space-separated, in check order. Read
+#: only by the compact summary line at the very end of the report — see the
+#: comment there for why the report's tail is the only part that reliably
+#: reaches an operator.
+failed_items=''
+
 note() { report="${report}$1"$'\n'; }
+
+# Set the exit status AND record which item earned it. Always called from this
+# shell, never from inside a `$(...)` — see the note above read_ref_file.
+record_fail() { fail=1; failed_items="${failed_items}${1} "; }
+
+# item 1 extracts the ref's package tree to a temp dir. `git archive` is
+# read-only and touches no .git state, unlike `git worktree add` -- which
+# matters in this repo, where refs are shared across every worktree.
+PROBE_TMP=''
+cleanup() {
+  if [ -n "${PROBE_TMP:-}" ]; then
+    rm -rf "$PROBE_TMP"
+  fi
+}
+trap cleanup EXIT
 
 # Fail closed if the ref or a file is unreadable — an unverifiable invariant is
 # not a satisfied one.
@@ -89,35 +183,120 @@ read_ref_file() {
 note "write_triage flip preconditions — checked against ref '$REF' in $REPO"
 note ""
 
-# --- item 1: the judge verdict must be able to name its candidate -------------
-if read_ref_file "$JUDGE"; then
-  judge_src="$REF_CONTENT"
-  if printf '%s' "$judge_src" | grep -q 'candidate_id'; then
-    note "PASS  item 1  candidate_id present in $JUDGE"
-  else
-    note "FAIL  item 1  candidate_id ABSENT from $JUDGE"
-    note "              The judge is shown up to judge_candidate_count candidates but"
-    note "              returns a bare verdict string, while the attach targets the"
-    note "              band's top-1. Once the flag is on, a verdict reasoned about"
-    note "              candidate #3 lands on candidate #1 and stamps x_contested on a"
-    note "              canonical the entry never contradicted."
-    note "              Fix (a) is the one that matches declared intent:"
-    note "              build_judge_prompt's own docstring says ids are rendered"
-    note "              'because the model must be able to say which candidate it"
-    note "              means'. Add candidate_id to the judge's JSON contract,"
-    note "              validate it against the slate in parse_judge_verdict, and"
-    note "              thread it through BandDecision."
-    fail=1
-  fi
+# --- item 1: the judge path must bind a verdict to a determinate candidate ----
+#
+# EVERY unverifiable outcome here calls record_fail: a missing probe, a temp dir that
+# cannot be made, a failed archive, an interpreter that will not run, a probe
+# crash or a timeout. An unverifiable invariant is not a satisfied one, and
+# note that each record_fail below runs in THIS shell and never inside a
+# `$(...)`, for the reason recorded above read_ref_file.
+if [ ! -f "$PROBE" ]; then
+  note "FAIL  item 1  UNVERIFIABLE: probe missing at $PROBE. Failing closed."
+  record_fail 1
 else
-  note "FAIL  item 1  UNVERIFIABLE: cannot read $JUDGE at ref '$REF'. Failing closed."
-  fail=1
+  PROBE_TMP="$(mktemp -d 2>/dev/null)"
+  if [ -z "$PROBE_TMP" ] || [ ! -d "$PROBE_TMP" ]; then
+    note "FAIL  item 1  UNVERIFIABLE: cannot create a temp dir to extract '$REF'. Failing closed."
+    record_fail 1
+  elif ! git -C "$REPO" archive "$REF" fused-memory/src 2>/dev/null \
+       | tar -x -C "$PROBE_TMP" 2>/dev/null; then
+    note "FAIL  item 1  UNVERIFIABLE: cannot extract fused-memory/src from ref '$REF'."
+    note "              Failing closed."
+    record_fail 1
+  else
+    # STDERR IS CAPTURED SEPARATELY, not folded in with 2>&1. The probe imports
+    # the REF's tree, so anything that tree (or a transitive dependency) writes
+    # at import time lands here -- measured on this checkout: a multi-line
+    # PydanticDeprecatedSince20 warning from graphiti_core, above the probe's
+    # own first line. Indenting that into the report spends part of the 2000
+    # characters _default_run_script forwards to an operator on chatter from a
+    # tree this gate does not control. It is quoted back only on the branches
+    # where the gate could not read a verdict from stdout, and bounded even
+    # there. The probe carries its OWN warnings on stdout for this reason.
+    probe_err="$PROBE_TMP/probe.stderr"
+    probe_out="$(${PROBE_TIMEOUT_CMD[@]+"${PROBE_TIMEOUT_CMD[@]}"} \
+      "${PROBE_PY_CMD[@]}" "$PROBE" \
+      --src-root "$PROBE_TMP/fused-memory/src" 2>"$probe_err")"
+    probe_rc=$?
+    # Set on the outcomes where stdout carried no verdict, so stderr is the
+    # only evidence of what went wrong.
+    show_probe_stderr=0
+    # BELT AND BRACES: rc 0 alone is not a PASS. The probe EXECUTES the ref's
+    # own judge module, so a SystemExit out of that code (a lazily-imported
+    # dependency's import guard calling sys.exit()) used to terminate it with
+    # THAT code, printing nothing. Measured before the fix: a judge whose only
+    # statement was `raise SystemExit(0)` produced rc 0 and an EMPTY report,
+    # and this branch declared PASS and the gate authorised the flip. The probe
+    # now fails closed on BaseException, and this second lock means the gate
+    # never again depends on the probe alone getting that right: a report that
+    # does not CLAIM a pass is not one.
+    # HERE-STRING, NOT A PIPE, and this is load-bearing under the `set -uo
+    # pipefail` at the top of this script. `printf ... | grep -q` races: grep
+    # exits the instant it matches, so printf can be killed by SIGPIPE and
+    # exit 141, and pipefail then makes the whole pipeline non-zero WITH THE
+    # MARKER PRESENT. Measured
+    # on this host: 16 spurious failures in 3000 iterations of this exact
+    # pipeline (~0.5%/call; a reviewer measured ~1.6% on a busier run), and the
+    # hermetic suite below failed 3 of 8 full runs from it alone. Both harms are
+    # silent-ish and opposite: a flake here reports item 1 UNVERIFIABLE against a
+    # judge that demonstrably passes (re-blocking 3169 on a correct fix -- the
+    # exact false-FAIL class this gate was rewritten to remove), and a flake on
+    # the PENDING check drops the name-assisted-pass channel entirely, printing
+    # an ordinary clean `PASS item 1` and silently withdrawing the eyeball
+    # confirmation on a run that authorises a production flip. A here-string has
+    # no writer process to signal, so there is no race to lose: 0 failures in
+    # 3000 iterations of both spellings. Do not "tidy" these back into pipes.
+    if [ "$probe_rc" -eq 0 ] && grep -qF "$PROBE_PASS_MARKER" <<<"$probe_out"; then
+      if grep -qF "$PROBE_PENDING_MARKER" <<<"$probe_out"; then
+        item1_pending=1
+        note "PASS  item 1  (NEEDS CONFIRMATION) the judge path binds a verdict to a"
+        note "              determinate candidate -- but the probe accepted it partly on a"
+        note "              PARAMETER NAME, not on behaviour alone. See its WARN below."
+      else
+        note "PASS  item 1  the judge path binds a verdict to a determinate candidate"
+      fi
+    elif [ "$probe_rc" -eq 0 ]; then
+      note "FAIL  item 1  UNVERIFIABLE: the probe exited 0 without reporting a PASS."
+      note "              Its report claims no verdict, so nothing was asserted about"
+      note "              the invariant. Failing closed."
+      record_fail 1
+      show_probe_stderr=1
+    elif [ "$probe_rc" -eq 1 ]; then
+      # DELIBERATELY TERSE. The harm, BOTH accepted remedies and the
+      # candidates[0] warning are all stated by the probe's own report,
+      # printed directly below this and carrying the MEASURED slate. Stating
+      # them here too cost ~1.1 KB of the 2000-char window that is all
+      # _default_run_script forwards to the operator -- budget items 2 and 4
+      # have to share. Say it once, in the copy that measured it.
+      note "FAIL  item 1  the judge path does NOT bind a verdict to a determinate candidate"
+      note "              Subject: $JUDGE at ref '$REF'."
+      note "              The harm, BOTH accepted remedies and what was measured are in"
+      note "              the probe's own report below."
+      record_fail 1
+    else
+      note "FAIL  item 1  UNVERIFIABLE: the probe could not be run (exit $probe_rc)."
+      note "              Interpreter: ${PROBE_PY_CMD[*]}. Failing closed."
+      record_fail 1
+      show_probe_stderr=1
+    fi
+    # The probe's own report, indented under the verdict. It carries the
+    # measured slate and, on an unverifiable outcome, its own UNVERIFIABLE line.
+    note "$(printf '%s\n' "$probe_out" | sed 's/^/              /')"
+    if [ "$show_probe_stderr" -ne 0 ] && [ -s "$probe_err" ]; then
+      note "              --- probe stderr, last $PROBE_STDERR_LINES lines ---"
+      note "$(tail -n "$PROBE_STDERR_LINES" "$probe_err" 2>/dev/null \
+        | sed 's/^/              /')"
+    fi
+  fi
 fi
 
 # --- item 2: the committed accuracy artifact must be reproducible -------------
 if read_ref_file "$EVAL"; then
   eval_src="$REF_CONTENT"
-  if printf '%s' "$eval_src" | grep -q 'dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)'; then
+  # Here-string, not a pipe -- same pipefail/SIGPIPE race as item 1 above, and
+  # here it fails the OTHER way: a spurious non-zero takes the else branch and
+  # prints `PASS item 2` for an eval script that still iterates the frozenset.
+  if grep -q 'dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)' <<<"$eval_src"; then
     note "FAIL  item 2  $EVAL still iterates the TRIAGE_OUTCOMES frozenset directly"
     note "              Column/key order is PYTHONHASHSEED-dependent, so the committed"
     note "              JSON and markdown churn between identical runs. Measured"
@@ -130,13 +309,14 @@ if read_ref_file "$EVAL"; then
     note "              mirroring the existing EVAL_CLASSES tuple, used in both places."
     note "              Precedent for pinning it (task 4012): assert"
     note "              MD.read_text() == render_markdown(json.loads(JSON.read_text()))."
-    fail=1
+    record_fail 2
   else
     note "PASS  item 2  $EVAL no longer iterates the frozenset directly"
   fi
 
   # --- item 4: --report-path must not destroy its own JSON --------------------
-  if printf '%s' "$eval_src" | grep -q "report_path\.with_suffix('\.md')"; then
+  # Here-string, not a pipe -- see item 2. A flake here spuriously PASSES too.
+  if grep -q "report_path\.with_suffix('\.md')" <<<"$eval_src"; then
     note "FAIL  item 4  $EVAL still derives the markdown sibling via with_suffix('.md')"
     note "              '--report-path foo.md' writes the JSON and then OVERWRITES it"
     note "              with the markdown, losing the JSON silently; 'foo.tar.gz' writes"
@@ -147,13 +327,13 @@ if read_ref_file "$EVAL"; then
     note "              NOTE the guard_committed_report guard added post-cycle-2 does"
     note "              NOT cover this — it addresses dry-run/--limit publishing and"
     note "              returns early for any non-committed path."
-    fail=1
+    record_fail 4
   else
     note "PASS  item 4  $EVAL no longer uses with_suffix('.md') for the sibling"
   fi
 else
   note "FAIL  items 2+4  UNVERIFIABLE: cannot read $EVAL at ref '$REF'. Failing closed."
-  fail=1
+  record_fail '2 4'
 fi
 
 # --- premature-flip detection -------------------------------------------------
@@ -181,8 +361,35 @@ note ""
 if [ "$fail" -eq 0 ]; then
   note "RESULT: all preconditions satisfied — the flip may proceed."
 else
-  note "RESULT: preconditions NOT satisfied. Task 4762 (priority high) owns these"
-  note "        fixes; see its description and details for the verbatim findings."
+  note "RESULT: preconditions NOT satisfied. Items 2 and 4 are task 4762's (priority"
+  note "        high); see its description and details for the verbatim findings."
+  note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
+  note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
+  note "        satisfies it. See its report above for what was measured."
+fi
+
+# LAST, deliberately. DeterministicRunner._default_run_script returns only the
+# TRAILING 2000 characters of this script's stdout, and _run_predicate feeds
+# exactly that into the milestone_check_failed escalation's detail. The all-FAIL
+# report is several times that and item 1 is emitted FIRST, so item 1's guidance
+# -- the corrected spec an implementer is meant to read -- is precisely what
+# gets truncated away. Anything that must reach the operator has to sit at the
+# tail. The detailed guidance stays where it is: read in full, the report is
+# still ordered for a human.
+if [ -n "$failed_items" ]; then
+  note "FAILING ITEMS: ${failed_items% }"
+else
+  note "FAILING ITEMS: none"
+fi
+# Same reasoning as the summary above, for the one PASS that is not a clean
+# one. It sits AFTER the failing-items line because on the run where it matters
+# there are no failing items, and this is then the last thing the report says.
+if [ "$item1_pending" -ne 0 ]; then
+  note "ITEM 1 NEEDS CONFIRMATION: it passed on a target-NAMED parameter that ECHOES"
+  note "        its argument into the prompt rather than matching it against the"
+  note "        candidates. That is what a real header-marking fix looks like too, so"
+  note "        it is accepted -- but confirm BY EYE that the judge prompt tells the"
+  note "        model which candidate the attach will touch before flipping the flag."
 fi
 
 printf '%s' "$report"

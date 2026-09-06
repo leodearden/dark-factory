@@ -69,6 +69,90 @@ _FANOUT_REWARN_EVERY = 500
 _failure_streaks: dict[tuple[str, str], int] = {}
 
 
+# ── bounded per-key lock acquisition (task 4789) ────────────────────
+#
+# TTLCache.get_or_refresh used to acquire its per-key lock with a bare
+# `async with lock:` — unbounded. On 2026-08-27 a refresh that never
+# returned (parked forever inside httpcore) held one key's lock for 19.8h
+# with 7 waiters queued behind it: because the holder never returned,
+# `cache_ok` never ran and nothing was ever stored, so every later caller
+# missed the warm fast path and queued on a latch that would only have
+# released at process exit.
+#
+# _LOCK_ACQUIRE_TIMEOUT_SECONDS bounds that wait. It must exceed every
+# observed HEALTHY refresh so happy-path single-flight is never disturbed —
+# post-restart the incident's own endpoints returned in 0.22s / 0.3s /
+# 4.2s, and tasks.fetch_tasks documents a cold-session worst case of
+# roughly 3 * DEFAULT_PER_CALL_TIMEOUT (~6s) per URL — while converting an
+# UNBOUNDED wedge (19.8h measured) into a bounded one.
+#
+# This bound is UNREACHABLE from active_tasks.collect_tasks_with_counts's
+# per-project path (the Tasks tab): _shape_one_project — which calls
+# fetch_tasks/fetch_statuses, i.e. THIS bound's own _fetch_tasks_cache /
+# _fetch_statuses_cache — runs under
+# ``asyncio.wait_for(..., timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET))``
+# with active_tasks._TASKS_PER_PROJECT_BUDGET == 7.0, itself inside
+# active_tasks._TASKS_TOTAL_BUDGET == 20.0. A caller on THAT path is
+# cancelled at <= 7s, well before this 15s bound could ever fire, so a wedge
+# there still surfaces exactly as it did before this module's fix: as a
+# per-project "degraded" WARNING (rows/done-count UNKNOWN), never as a
+# bypass. That is acceptable — collect_tasks_with_counts already has its own
+# adequate degradation story for exactly this case, and this fix does not
+# need to duplicate it; the fix is chosen for the callers below instead.
+#
+# The bound IS reachable from every OTHER live call site, because none of
+# them has an enclosing deadline: app._task_cards_cache (which also reaches
+# _fetch_tasks_cache, but via fetch_tasks called from _load_task_cards — a
+# path with no _TASKS_PER_PROJECT_BUDGET-style wrapper, so the SAME cache
+# can be bound-reachable or not depending on which caller reached it),
+# app._analytics_cache, app._memory_evals_cache, scheduler._scheduler_cache,
+# and merge_queue._task_titles_cache.
+_LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
+
+# A bypass must leave its own journal trace — reusing the SAME
+# transition-only policy as _FANOUT_REWARN_EVERY above rather than
+# inventing a second one. The dashboard's UI polls every ~2-3s across ~8
+# TTLCache-backed paths, so one WARNING per bypass would emit tens of
+# thousands of identical lines over a 19.8h wedge and bury the opening
+# (diagnostic) line — the exact flood the fan-out policy above was
+# written to prevent.
+_LOCK_BYPASS_REWARN_EVERY = 100
+
+# Cap on LIVE (started, not yet done) bypass refreshes for ONE key.
+#
+# Bounding INHERITANCE (above) fixed one failure mode and opened another
+# (second reviewer finding, task 4789): during a TRUE wedge — a refresh that
+# never returns — every bound-window produces a caller that abandons the
+# over-age tracked bypass and re-arms a fresh one, while the abandoned task
+# keeps running. Only ONE is TRACKED at a time, but the untracked ones are
+# still alive: at the 15s bound that is ~4 new parked refreshes per minute,
+# growing without bound for as long as the wedge lasts.
+#
+# That is a resource problem, not a memory one. Each parked refresh pins a
+# connection on the process-wide httpx.AsyncClient, whose pool is at least
+# _HTTP_MIN_CONNECTIONS == 100 (app.py::_build_http_limits). At ~4/min a
+# multi-hour wedge saturates the shared pool in well under an hour, at which
+# point UNRELATED endpoint families start raising httpx.PoolTimeout — turning
+# the incident's per-key outage (3 of 14 endpoints dead, the other 11 healthy
+# for the full 19.8h) into a whole-dashboard one. The amplification is worse
+# for the two to_thread-backed caches (app._analytics_cache,
+# app._memory_evals_cache): abandoned to_thread work cannot be cancelled at
+# all, so each re-arm permanently consumes a default-executor worker.
+#
+# So re-arming is capped. Once a key already has this many live bypasses, a
+# further timed-out caller joins the NEWEST live one WITHOUT a deadline
+# instead of starting another. That caller inherits the pre-existing per-key
+# hang — the exposure this task never claimed to remove, since a promoted
+# caller running its own wedged refresh hangs too — but starts no new
+# connection, so isolation for every OTHER key survives.
+#
+# 3 is chosen as "enough re-arms that a transiently slow key still gets
+# fresh attempts, few enough that a wedged key can never be a material
+# fraction of a 100-connection pool". With ~8 live TTLCache instances the
+# worst case is a low tens of connections even if every key wedged at once.
+_MAX_LIVE_BYPASSES_PER_KEY = 3
+
+
 class PreformattedFanoutError(ValueError):
     """A fan-out failure whose message is ALREADY a rendered ``'Type: message'``.
 
@@ -333,15 +417,83 @@ class TTLCache(Generic[V]):
     is intentional: a non-cacheable result must not be handed to every other
     waiter when a subsequent attempt might succeed.
 
+    **Single-flight is bounded, not guaranteed.** Lock acquisition on the cold
+    path waits at most ``_LOCK_ACQUIRE_TIMEOUT_SECONDS``; a refresh that
+    outlives the bound is bypassed — run without the lock. Concurrent
+    bypasses for the SAME key still collapse onto one shared refresh
+    (:meth:`_bypass_refresh`), but joining that shared refresh is ITSELF
+    bounded (task 4789 review fix): a caller waits at most
+    ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` again on a bypass it did not start, and
+    never on one already known to have outlived that bound — such a caller
+    is instead promoted to running its own refresh, superseding the dead one
+    for whoever comes next. A caller in that position is in exactly the
+    position of a cold caller on a healthy cache: bounded by that refresh's
+    own per-HTTP-request budgets (``mcp_tool_call`` threads ``timeout`` into
+    every httpx post). The residual is stated explicitly rather than left
+    for a reader to over-infer: a refresh whose OWN budgets fail to fire (the
+    2026-08-27 httpcore hang) still never returns, and a caller that ends up
+    running such a refresh still waits indefinitely — ``get_or_refresh`` is
+    total by contract, so there is nothing else it could return.
+
+    What IS guaranteed, and pinned by
+    :class:`TestTTLCacheBoundedBypassInheritance` and
+    :class:`TestTTLCacheBoundsLiveBypassesPerKey`, stated as three separate
+    bounds because they are not the same claim:
+
+    * *Rate* — at most one TRACKED live bypass exists per key at any
+      instant, and a sustained wedge produces new bypasses at roughly one
+      per bound-window, never one per caller.
+    * *Total* — at most ``_MAX_LIVE_BYPASSES_PER_KEY`` refreshes are ever
+      in flight for one key, however long the wedge lasts. The rate bound
+      alone does NOT give this (reviewer finding, task 4789): one-per-window
+      forever still grows without bound, and since each parked refresh pins
+      a connection on the shared httpx client, that pile-up would exhaust
+      the pool (``httpx.PoolTimeout``) for keys the wedge never touched —
+      converting a per-key outage into a whole-dashboard one, which is the
+      resource-isolation regression this cap, not the rate bound, is what
+      actually prevents.
+    * *Inheritance* — no caller inherits a stall it did not itself cause,
+      with one deliberate exception: a caller arriving when the key is
+      already AT the total cap joins the newest live refresh without a
+      deadline, and so does inherit that stall. That is the cost of the
+      total bound and is confined to the wedged key; every other key is
+      unaffected either way.
+
+    The duplicate refreshes those bounds still permit are the same
+    duplicate-concurrent-refresh trade the ``cache_ok``-is-False paragraph
+    above already accepts, now also reachable when a *cacheable* refresh
+    simply runs too long, not only when it fails outright. The
+    alternative, a permanent latch, is not acceptable: on 2026-08-27 one
+    refresh that never returned held a key's lock for 19.8h with 7 waiters
+    queued behind it, leaving 3 of 14 endpoints dead for the duration. A
+    bypass — a re-arm of one already over-age, and a declined re-arm at the
+    live cap alike — is never silent, see
+    :meth:`get_or_refresh`'s bypass-logging policy: a silent one would hide
+    the next occurrence, the same invisibility that let the incident run
+    unnoticed for as long as it did.
+
     **Key space is bounded by disuse, not by cardinality.** A key that stops
     being requested is reclaimed: :meth:`_evict_expired` drops store entries
     older than ``_EVICTION_TTL_MULTIPLE`` times the TTL, along with their
-    idle locks, and ``get_or_refresh`` runs it on the cold path — the same
-    path that mints new keys, so growth and reclamation are coupled by
-    construction. An entry past its TTL is already unservable (``get_fresh``
-    enforces the TTL and is the only reader), so eviction reclaims memory
-    with NO semantic change; the multiple is margin against a callable
-    ``ttl_seconds`` that returns a larger value later.
+    idle locks, any bypass-streak counter that has outlived both, and any
+    now-dead bypass-task entry, and ``get_or_refresh`` runs it on the cold
+    path — the same path that mints new keys, so growth and reclamation are
+    coupled by construction. An entry past its TTL is already unservable
+    (``get_fresh`` enforces the TTL and is the only reader), so eviction
+    reclaims memory with NO semantic change; the multiple is margin against a
+    callable ``ttl_seconds`` that returns a larger value later. (The
+    in-flight bypass-task map introduced below has two independent
+    reclamation paths, not one: an entry whose refresh COMPLETES is removed
+    by the task's own done-callback the instant it finishes (see
+    :meth:`_start_bypass`), while an entry whose refresh never completes is
+    removed either by supersession — the next caller to time out on it
+    re-arms a fresh one, see :meth:`_bypass_refresh` — or, for a key that
+    goes quiet before that happens, by :meth:`_evict_expired` on a later cold
+    miss for a DIFFERENT key. Its steady-state size is therefore bounded by
+    the same "keys requested within the eviction horizon" rule as ``_store``
+    and ``_locks`` above, not by the stronger claim that an entry can never
+    outlive the refresh it tracks — outliving it is exactly the case this
+    task exists to handle.)
 
     This makes a HIGH-CARDINALITY key space safe, which it previously was
     not. It used to be true that "neither ``_store`` nor ``_locks`` ever
@@ -366,6 +518,36 @@ class TTLCache(Generic[V]):
         )
         self._store: dict[str, tuple[float, V]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # Per-INSTANCE (not module-level) consecutive-bypass streaks, keyed
+        # by cache key. Per-instance because the key space is per-cache:
+        # tasks._fetch_tasks_cache and tasks._fetch_tasks_negative_cache
+        # share key strings exactly, and three more live instances key on a
+        # bare project_root — a module-level dict would collapse them.
+        self._bypass_streaks: dict[str, int] = {}
+        # The in-flight bypass task for a key, if any, stamped with the
+        # monotonic time it started. Bounds concurrent bypass refreshes to
+        # ONE per key (see _bypass_refresh) rather than one per timed-out
+        # caller. The timestamp lets a LATER caller decide whether this
+        # bypass is still safe to inherit, or has itself outlived
+        # _LOCK_ACQUIRE_TIMEOUT_SECONDS -- joining one already over-age
+        # would just trade one dead task for another, so such a caller
+        # starts a fresh bypass instead, superseding this entry (task 4789
+        # review fix). A completed entry is removed instantly by the task's
+        # own done-callback; a superseded entry is dropped by the caller
+        # that replaces it.
+        self._bypass_tasks: dict[str, tuple[float, asyncio.Task[V]]] = {}
+        # Every LIVE bypass task for a key, in creation order — not just the
+        # one currently TRACKED as "the" bypass in _bypass_tasks above.
+        # _bypass_tasks answers "who should the next caller join?", which is
+        # a liveness question and deliberately holds at most one entry; this
+        # answers "how many refreshes has this key actually got in flight
+        # right now?", which is a RESOURCE question, and a superseded task
+        # still consumes a connection long after it stops being joinable.
+        # Conflating the two is what let re-arms accumulate without bound
+        # (see _MAX_LIVE_BYPASSES_PER_KEY). Entries are removed by the
+        # task's own done-callback, and swept defensively by
+        # _live_bypasses_for / _evict_expired.
+        self._live_bypasses: dict[str, list[asyncio.Task[V]]] = {}
 
     def get_fresh(self, key: str) -> V | None:
         """Return the cached value for *key* iff still within TTL, else None."""
@@ -375,7 +557,8 @@ class TTLCache(Generic[V]):
         return None
 
     def _evict_expired(self) -> int:
-        """Drop store entries past the eviction horizon and their idle locks.
+        """Drop store entries past the eviction horizon, their idle locks,
+        and any now-dead bypass-streak counter.
 
         Returns the number of store entries dropped (for tests/observability).
 
@@ -384,13 +567,39 @@ class TTLCache(Generic[V]):
         * SEMANTICALLY — an evicted entry is older than the TTL, and
           :meth:`get_fresh` (the only reader of ``_store``) already refuses
           to serve those. Eviction therefore changes no observable value,
-          only resident memory.
+          only resident memory. Dropping an over-age ``_bypass_tasks`` entry
+          changes no observable value either: every joiner's own wait
+          deadline IS that entry's deadline (``started_at +
+          _LOCK_ACQUIRE_TIMEOUT_SECONDS``, see :meth:`_bypass_refresh`), so
+          once an entry is over-age no caller can still be parked on it —
+          dropping it strands nobody. Doing so also reclaims the last
+          reference this cache holds to a wedged refresh's task, so the
+          coroutine can be garbage-collected once it finally resolves or the
+          event loop shuts down.
         * CONCURRENTLY — this method is fully synchronous, so it runs to
           completion without yielding to another coroutine, and a lock is
           dropped only when it is neither held nor awaited. A coroutine that
           has taken a lock object from ``_locks`` reaches ``lock.acquire()``
           with no intervening await (see ``get_or_refresh``), so it cannot be
-          suspended between ``setdefault`` and entering ``acquire()``.
+          suspended between ``setdefault`` and entering ``acquire()``. This
+          invariant survives the bounded acquisition (task 4789) ON CPYTHON
+          >= 3.12: there, ``asyncio.wait_for`` is implemented as ``async with
+          timeouts.timeout(...): return await fut``, so
+          ``await asyncio.wait_for(lock.acquire(), ...)`` delegates into
+          ``lock.acquire()`` as a coroutine, and neither that preamble nor
+          ``Timeout.__aenter__`` contains an await — control never returns to
+          the event loop before ``acquire()``'s body runs. This package's
+          declared floor is lower (``requires-python = '>=3.11,<4'``), and on
+          3.11 ``wait_for`` instead unconditionally wraps its argument in a
+          ``Task`` via ``ensure_future`` and awaits a *separate* waiter
+          future — control CAN return to the loop first, so a concurrent
+          sweep could reclaim the still-idle, unwaited lock in that window,
+          leaving two callers holding different ``Lock`` objects for one
+          key. The blast radius matches the ``getattr``-fallback case just
+          below — one duplicate refresh, never corruption — and the
+          deployed interpreter is 3.13, where the invariant holds without
+          qualification; this note exists so a reader on 3.11 knows the
+          degradation is bounded, not silent.
 
           ``locked()`` alone would NOT be enough, which is why the predicate
           below also checks for waiters. ``asyncio.Lock.release()`` clears
@@ -428,7 +637,384 @@ class TTLCache(Generic[V]):
         ]
         for key in idle:
             del self._locks[key]
+        # A bypass streak for a key with no live lock and no cached value
+        # cannot be reached by anything but a fresh cold miss, so re-arming
+        # its opening WARNING on a future bypass is the desired behavior,
+        # not a regression (see _note_lock_bypass). Pruned AFTER the lock
+        # sweep above so a lock idled out in THIS same pass has its streak
+        # reclaimed in the same pass too, rather than lingering one more
+        # sweep cycle.
+        dead_streaks = [
+            k for k in self._bypass_streaks
+            if k not in self._store and k not in self._locks
+        ]
+        for key in dead_streaks:
+            del self._bypass_streaks[key]
+        # A tracked bypass entry is safe to drop once no caller can still be
+        # waiting on it: its task has already finished (belt-and-braces —
+        # _start_bypass's done-callback normally removes these itself, but
+        # one that fired while the entry was already superseded has nothing
+        # left to remove), OR it is over-age. The predicate is deliberately
+        # age-based rather than the lock sweep's "not locked() and no
+        # _waiters" above: every joiner's own wait deadline IS
+        # `started_at + _LOCK_ACQUIRE_TIMEOUT_SECONDS` (see
+        # _bypass_refresh), so once an entry passes that instant no caller
+        # can still be parked on it and dropping it strands nobody — while a
+        # WITHIN-bound entry must survive, since pruning it would silently
+        # restore one-refresh-per-caller for every later timed-out caller of
+        # this key. The abandoned task is never cancelled (see the design
+        # decision on abandon-don't-cancel): it keeps running in the
+        # background and may still store a late value.
+        dead_bypasses = [
+            k for k, (started_at, task) in self._bypass_tasks.items()
+            if task.done() or (now - started_at) >= _LOCK_ACQUIRE_TIMEOUT_SECONDS
+        ]
+        for key in dead_bypasses:
+            del self._bypass_tasks[key]
+        # The live roster is swept only for tasks that have actually
+        # FINISHED -- never by age. An over-age entry is unjoinable and so
+        # safe to drop from _bypass_tasks above, but it is still consuming a
+        # connection, and the cap is a statement about consumption; ageing
+        # entries out here would let the very re-arm pile-up
+        # _MAX_LIVE_BYPASSES_PER_KEY exists to prevent resume. A key with
+        # live bypasses therefore retains a roster entry for as long as they
+        # run -- bounded by the cap per key, and by the number of
+        # concurrently wedged keys overall.
+        for key in [k for k, tasks in self._live_bypasses.items()
+                    if all(t.done() for t in tasks)]:
+            del self._live_bypasses[key]
         return len(stale)
+
+    async def _refresh_and_store(
+        self,
+        key: str,
+        refresh: Callable[[], Awaitable[V]],
+        cache_ok: Callable[[V], bool],
+    ) -> V:
+        """Sweep, run ``refresh()``, and store the result iff ``cache_ok`` AND still newest.
+
+        Shared verbatim by the normal (locked) cold path and the bounded-
+        acquisition bypass path in :meth:`get_or_refresh`, so there is exactly
+        one definition of "sweep, refresh, store iff cache_ok" for both to
+        stay in sync with.
+
+        **Concurrent writers are possible for one key** once a bypass can run
+        alongside the still-wedged original holder (task 4789): this method
+        may be entered twice for the same *key* — once by the locked holder,
+        once by :meth:`_bypass_refresh` — before either has stored, with no
+        guarantee on which ``refresh()`` resolves first. A write is therefore
+        only committed if no FRESHER entry has landed since THIS call started
+        (tracked via ``started_at``, captured before ``refresh()`` runs) —
+        otherwise a very late-returning wedged refresh could overwrite a
+        newer bypass-produced value with a stale one, AND stamp it with a
+        fresh ``time.monotonic()``, making the stale data look maximally
+        fresh for a full TTL window. This never mattered before the bypass
+        path existed: the lock made the two cold-path callers mutually
+        exclusive, so only one writer per key was ever possible.
+        """
+        self._evict_expired()
+        started_at = time.monotonic()
+        value = await refresh()
+        if cache_ok(value):
+            current = self._store.get(key)
+            if current is None or current[0] <= started_at:
+                self._store[key] = (time.monotonic(), value)
+        return value
+
+    def _start_bypass(
+        self,
+        key: str,
+        refresh: Callable[[], Awaitable[V]],
+        cache_ok: Callable[[V], bool],
+    ) -> asyncio.Task[V]:
+        """Create, track, and return a new bypass task for *key*.
+
+        Hoisted out of :meth:`_bypass_refresh`'s loop body rather than
+        defined inline there: a done-callback defined INSIDE the loop would
+        close over the loop's own ``task`` variable, which ``ruff`` (B023)
+        correctly flags as a bug generator — MEASURED, the inline form fails
+        with "Function definition does not bind loop variable 'task'" while
+        this hoisted form is clean (``All checks passed!``).
+
+        The done-callback's identity check is against the CURRENT tuple
+        (not just the key), so a superseded task's callback can never delete
+        its successor's entry. It also consumes a non-cancelled task's
+        exception (``completed.exception()``) so an orphaned bypass — one
+        whose only awaiter was itself cancelled while joining, or was
+        abandoned by :meth:`_bypass_refresh` after outliving the bound —
+        cannot surface as an asyncio "Task exception was never retrieved"
+        error at garbage-collection time.
+        """
+        task = asyncio.create_task(self._refresh_and_store(key, refresh, cache_ok))
+        self._bypass_tasks[key] = (time.monotonic(), task)
+        self._live_bypasses.setdefault(key, []).append(task)
+
+        def _forget_if_current(completed: asyncio.Task[V]) -> None:
+            current = self._bypass_tasks.get(key)
+            if current is not None and current[1] is task:
+                del self._bypass_tasks[key]
+            # The live roster is unconditional, NOT identity-gated like the
+            # tracked entry above: a superseded task is removed from
+            # _bypass_tasks the moment it is superseded but stays live (and
+            # keeps holding a connection) until it actually finishes, so its
+            # own completion is the only correct moment to stop counting it.
+            live = self._live_bypasses.get(key)
+            if live is not None:
+                self._live_bypasses[key] = [t for t in live if t is not task]
+                if not self._live_bypasses[key]:
+                    del self._live_bypasses[key]
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(_forget_if_current)
+        return task
+
+    def _live_bypasses_for(self, key: str) -> list[asyncio.Task[V]]:
+        """Return *key*'s live bypass tasks, dropping any already finished.
+
+        ``_start_bypass``'s done-callback is the primary reclaimer, but a
+        callback runs only on the next loop iteration after its task
+        resolves, so a caller inspecting the roster in between would
+        otherwise count a finished task against the cap. Sweeping on read
+        keeps the cap a statement about genuinely in-flight work.
+        """
+        live = [t for t in self._live_bypasses.get(key, ()) if not t.done()]
+        if live:
+            self._live_bypasses[key] = live
+        else:
+            self._live_bypasses.pop(key, None)
+        return live
+
+    async def _start_or_join_at_cap(
+        self,
+        key: str,
+        refresh: Callable[[], Awaitable[V]],
+        cache_ok: Callable[[V], bool],
+    ) -> V:
+        """Start a new bypass for *key*, unless it is already at the live cap.
+
+        The single place a bypass is ever created, so the
+        ``_MAX_LIVE_BYPASSES_PER_KEY`` bound cannot be missed by one of
+        :meth:`_bypass_refresh`'s two creation branches.
+
+        At the cap the caller joins the NEWEST live task instead — newest
+        because it is the attempt with the most remaining runway, so it is
+        the one most likely to still return on its own. That join is
+        deliberately UNBOUNDED: bounding it would only send the caller back
+        around the loop to hit the same cap again, spinning. The caller
+        therefore inherits the pre-existing per-key hang, which is the
+        accepted trade — this layer never removed that exposure for a
+        promoted caller either (see the class docstring's residual
+        paragraph). What the cap buys is that the hang stays confined to
+        this key instead of consuming shared httpx-pool connections until
+        unrelated endpoints start failing.
+        """
+        live = self._live_bypasses_for(key)
+        if len(live) >= _MAX_LIVE_BYPASSES_PER_KEY:
+            self._note_lock_bypass(key, refresh, reason='bypass_cap')
+            return await asyncio.shield(live[-1])
+        return await asyncio.shield(self._start_bypass(key, refresh, cache_ok))
+
+    async def _bypass_refresh(
+        self,
+        key: str,
+        refresh: Callable[[], Awaitable[V]],
+        cache_ok: Callable[[V], bool],
+    ) -> V:
+        """Run the bypass refresh for *key*, bounding concurrency, inheritance, and total.
+
+        Every timed-out caller for *key* reaches this method (see
+        :meth:`get_or_refresh`'s ``except TimeoutError`` branch). At most one
+        refresh is ever TRACKED as "the" bypass for a key at a time: a
+        caller that finds a live, WITHIN-BOUND one joins it via
+        :func:`asyncio.shield`; a caller that finds none, or one already
+        known to have outlived ``_LOCK_ACQUIRE_TIMEOUT_SECONDS``, becomes the
+        creator of a new one instead (:meth:`_start_bypass`). Without the
+        per-key sharing, a genuinely wedged refresh (one that never returns —
+        this task's own 2026-08-27 incident) would let every subsequent
+        timed-out caller start its own independent unlocked refresh,
+        accumulating without bound at the dashboard's ~2-3s poll rate — over
+        a multi-hour wedge that is thousands of parked coroutines, each
+        pinning a connection on the shared httpx client and risking pool
+        saturation (``httpx.PoolTimeout``) for UNRELATED endpoints —
+        degrading keys the wedge never touched, the opposite of what
+        ``TestTTLCacheBoundedLockAcquisition``'s
+        ``test_a_wedged_key_degrades_only_itself`` proves (key isolation,
+        not resource isolation).
+
+        That per-key sharing bounds the RATE of new refreshes, not their
+        TOTAL, and the rate bound alone is not enough (second reviewer
+        finding): re-arming once per bound-window forever still accumulates
+        live refreshes without limit, just more slowly. The TOTAL bound is
+        ``_MAX_LIVE_BYPASSES_PER_KEY``, enforced in
+        :meth:`_start_or_join_at_cap` — the single creation site, so neither
+        branch below can skip it — against the :attr:`_live_bypasses` roster
+        rather than the one-entry :attr:`_bypass_tasks` map, because a
+        superseded task stops being joinable long before it stops holding a
+        connection.
+
+        Without ALSO bounding INHERITANCE, a second failure mode opens up
+        (reviewer finding, task 4789 review fix): if the shared bypass
+        itself never returns — the likely case, since the wedge is
+        endpoint/session-level and :func:`first_success` invalidates a
+        cached MCP session only on an *exception*, never on a hang — every
+        caller after the second would join that SAME dead task forever via
+        an unbounded ``asyncio.shield``, as ``TestTTLCacheBoundedBypassInheritance``
+        reproduces. Bounding the join means a caller instead re-evaluates
+        once its own wait expires (or immediately, if the tracked entry was
+        ALREADY over-age when it looked) and — finding the entry it would
+        have joined now provably over-age — supersedes it with a fresh
+        attempt rather than joining a task nobody can prove will ever
+        resolve. Every abandonment is logged exactly once via
+        :meth:`_note_lock_bypass`'s ``reason='inherited_bypass'``, whether
+        detected instantly or only after actually timing out on the join —
+        an abandonment is never silent, matching the class docstring's
+        bypass-logging guarantee.
+
+        Two properties worth stating because neither is obvious from the
+        loop alone. (i) The loop cannot spin: every path either returns
+        (a join succeeded, or a fresh bypass was just created and awaited),
+        or re-reads the map after establishing the previous entry is
+        over-age — and a re-read after an actual await is required, not
+        optional, because another caller may have already installed a
+        newer entry while this one was waiting; creating a second new
+        bypass on top of theirs would break the "at most one tracked live
+        bypass per key" bound. (ii) ``asyncio.wait_for`` cancels only the
+        *shield* future it was handed, never the shielded task itself, so
+        bounding the join preserves exactly the isolation
+        :func:`asyncio.shield` exists for here: one joiner timing out never
+        disturbs the shared refresh for every other joiner, or for the
+        eventual store.
+
+        ``asyncio.shield`` is kept on the CREATOR's own await too, not just
+        joiners': a creator that is itself cancelled (e.g. by its own
+        caller's outer budget) must not cancel the refresh other joiners may
+        already be riding on.
+
+        A caller promoted to running its own refresh here is in exactly the
+        position of a cold caller on a healthy cache — see the class
+        docstring's "bounded single-flight" paragraph for the residual that
+        leaves: a refresh whose own budgets never fire still never returns,
+        for whoever ends up running it.
+        """
+        while True:
+            entry = self._bypass_tasks.get(key)
+            if entry is None:
+                return await self._start_or_join_at_cap(key, refresh, cache_ok)
+
+            started_at, running = entry
+            remaining = (started_at + _LOCK_ACQUIRE_TIMEOUT_SECONDS) - time.monotonic()
+            if not running.done() and remaining > 0:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(running), remaining)
+                except TimeoutError:
+                    pass  # provably over-age now -- fall through to abandon it
+
+            self._note_lock_bypass(key, refresh, reason='inherited_bypass')
+            if self._bypass_tasks.get(key) is entry:
+                return await self._start_or_join_at_cap(key, refresh, cache_ok)
+            # Superseded by another caller while we were waiting above --
+            # rejoin against whatever they installed instead of creating a
+            # second new bypass for the same key.
+            continue
+
+    def _note_lock_bypass(
+        self,
+        key: str,
+        refresh: Callable[[], Awaitable[V]],
+        *,
+        reason: str = 'lock_timeout',
+    ) -> None:
+        """Record one lock-acquisition bypass OR bypass re-arm for *key*.
+
+        Mirrors :func:`log_fanout_failure`'s policy: WARNING for the first
+        event of a streak (and every ``_LOCK_BYPASS_REWARN_EVERY``-th
+        thereafter), DEBUG for the repeats — so a sustained wedge still
+        leaves a trace without flooding the journal. Both call sites share
+        ONE streak counter per key, so the throttle covers the whole
+        incident rather than resetting at whichever cause happens next.
+
+        *reason* names what actually timed out, since the two are NOT the
+        same event: ``'lock_timeout'`` (default) is logged from
+        :meth:`get_or_refresh` when the ORIGINAL per-key lock acquisition
+        times out. ``'inherited_bypass'`` is logged from
+        :meth:`_bypass_refresh` when a caller finds the shared bypass it
+        would otherwise join has ITSELF outlived the bound — the lock did
+        not time out again here, the inherited bypass did — and is about to
+        supersede it with a fresh attempt.
+        """
+        streak = self._bypass_streaks.get(key, 0) + 1
+        self._bypass_streaks[key] = streak
+        name = getattr(refresh, '__qualname__', repr(refresh))
+        if reason == 'bypass_cap':
+            opening = (
+                'key %r already has %d live bypass refreshes (bound %.2fs, '
+                'refresh=%s); declining to start another and joining the '
+                'newest instead, so a wedged key cannot exhaust the shared '
+                'HTTP connection pool for unrelated keys (%d consecutive)'
+            )
+            repeat = (
+                'key %r at the live-bypass cap (%d, bound %.2fs, refresh=%s); '
+                'joining the newest live refresh (%d consecutive)'
+            )
+            if streak == 1 or streak % _LOCK_BYPASS_REWARN_EVERY == 0:
+                logger.warning(
+                    opening, key, _MAX_LIVE_BYPASSES_PER_KEY,
+                    _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
+                )
+            else:
+                logger.debug(
+                    repeat, key, _MAX_LIVE_BYPASSES_PER_KEY,
+                    _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
+                )
+            return
+        if reason == 'inherited_bypass':
+            opening = (
+                'a shared bypass refresh for key %r that this caller '
+                'inherited has itself run longer than the bound (%.2fs) '
+                'without completing (refresh=%s); superseding it with a '
+                'fresh refresh (%d consecutive)'
+            )
+            repeat = (
+                'inherited bypass refresh for key %r has itself run longer '
+                'than the bound (%.2fs) without completing (refresh=%s); '
+                'superseding it (%d consecutive)'
+            )
+        else:
+            opening = (
+                'lock acquisition for key %r timed out after %.2fs '
+                '(refresh=%s); a prior refresh for this key has been running '
+                'longer than the bound, so single-flight is being skipped '
+                'and this refresh is running WITHOUT the lock '
+                '(%d consecutive)'
+            )
+            repeat = (
+                'lock acquisition for key %r timed out after %.2fs '
+                '(refresh=%s), running without the lock (%d consecutive)'
+            )
+        if streak == 1 or streak % _LOCK_BYPASS_REWARN_EVERY == 0:
+            logger.warning(opening, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
+        else:
+            logger.debug(repeat, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
+
+    def _note_lock_acquired(self, key: str) -> None:
+        """Close an open bypass streak for *key*, logging recovery.
+
+        Emits at WARNING — the same level as the streak's opening line — so
+        the incident has a visible closing bracket at the operator's default
+        level. Bounded by construction: fires only when a streak was
+        actually open, i.e. at most once per opening WARNING. Called on the
+        NORMAL acquisition path only — a key that self-heals via a bypassed
+        store is instead served from the lock-free warm path on its next
+        call, so its recovery line appears on its next COLD miss rather than
+        immediately; the bracket is still bounded and still closes.
+        """
+        streak = self._bypass_streaks.pop(key, 0)
+        if streak:
+            logger.warning(
+                'lock for key %r recovered after %d consecutive bypass(es)',
+                key, streak,
+            )
 
     async def get_or_refresh(
         self,
@@ -439,35 +1025,98 @@ class TTLCache(Generic[V]):
     ) -> V:
         """Return a fresh cached value for *key*, refreshing at most once.
 
-        Fast path: a warm entry is returned with no lock. Otherwise acquires
-        a per-key lock, re-checks freshness (another waiter may have just
-        filled it), and — if still cold — runs ``refresh()`` and stores the
-        result iff ``cache_ok(value)``.
+        Fast path: a warm entry is returned with no lock. Otherwise lock
+        acquisition is BOUNDED to ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` (task
+        4789). On a NORMAL (within-bound) acquisition, freshness is re-checked
+        (another waiter may have just filled it), and — if still cold —
+        :meth:`_refresh_and_store` runs ``refresh()`` and stores the result
+        iff ``cache_ok(value)``.
 
-        The cold path also sweeps expired entries (:meth:`_evict_expired`).
-        That is deliberately the ONLY sweep site: a cold miss is exactly when
-        a new key can be minted, so reclamation runs at the same rate as
-        growth and a hot warm-path hit stays lock-free and O(1). The sweep is
-        O(store size) but happens only when an ``await refresh()`` — a
-        network round trip — is about to run, which dwarfs it.
+        On a TIMED-OUT acquisition, freshness is re-checked FIRST — mirroring
+        the post-lock double-check on the normal path, because the timeout
+        window is exactly when another caller can have filled the entry, and
+        a bypass that skipped this cheap check would spend a duplicate MCP
+        round trip (and clobber a newer value with an older one) for no
+        benefit — and only if still cold does ``refresh()`` run, WITHOUT the
+        lock, rather than raising: a caller that could never previously see a
+        ``TimeoutError`` from this method still cannot. That unlocked refresh
+        is itself bounded — see :meth:`_bypass_refresh` for both bounds: at
+        most one TRACKED live bypass per key at any instant (not one per
+        timed-out caller), and INHERITANCE of that bypass is itself bounded
+        to ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` — a caller never waits on one
+        already known to have outlived it, and is instead promoted to
+        running its own refresh. The bypassed result is stored under the
+        same ``cache_ok`` rule as the locked path, which is what lets a
+        wedged key self-heal for every later caller — during the 2026-08-27
+        incident nothing was ever stored for the wedged key, which is
+        exactly why every later caller kept queueing on a latch that would
+        only release at process exit. See the class docstring's
+        "bounded single-flight" paragraph for the accepted trade.
+
+        Every bypass is logged under the module's transition-only policy —
+        WARNING on the first bypass of a streak and every
+        ``_LOCK_BYPASS_REWARN_EVERY``-th thereafter, DEBUG in between,
+        WARNING again on recovery (see :meth:`_note_lock_bypass` /
+        :meth:`_note_lock_acquired`, mirroring :func:`log_fanout_failure` /
+        :func:`note_fanout_success`) — so a wedge is never silent even though
+        no caller ever sees a raised exception for it.
+
+        Both the locked cold path and the bypass path sweep expired entries
+        (:meth:`_evict_expired`, via :meth:`_refresh_and_store`). That is
+        deliberately the ONLY sweep site: a cold miss is exactly when a new
+        key can be minted, so reclamation runs at the same rate as growth and
+        a hot warm-path hit stays lock-free and O(1). The sweep is O(store
+        size) but happens only when an ``await refresh()`` — a network round
+        trip — is about to run, which dwarfs it. Running it on the bypass
+        path too matters because a bypass is the ONLY traffic a wedged key
+        sees — skipping the sweep there would create a sweep-starved regime
+        during exactly the outage the eviction work (task 3857) was added
+        for.
         """
         fresh = self.get_fresh(key)
         if fresh is not None:
             return fresh
 
         lock = self._locks.setdefault(key, asyncio.Lock())
-        async with lock:
+        try:
+            await asyncio.wait_for(lock.acquire(), _LOCK_ACQUIRE_TIMEOUT_SECONDS)
+        except TimeoutError:
+            # Report the bypass BEFORE the freshness re-check below: the
+            # wedge outliving the bound is the thing being reported, not
+            # whether this particular caller happens to save a round trip,
+            # so a bypass is logged even when the re-check finds a value.
+            self._note_lock_bypass(key, refresh)
+            # Freshness first, refresh second — never reordered. The timeout
+            # window is exactly when another caller can have filled the
+            # entry, so a bypass that skipped this cheap check would spend a
+            # duplicate MCP round trip (and clobber a newer value with an
+            # older one) for no benefit.
             fresh = self.get_fresh(key)
             if fresh is not None:
                 return fresh
-
-            self._evict_expired()
-            value = await refresh()
-            if cache_ok(value):
-                self._store[key] = (time.monotonic(), value)
-            return value
+            return await self._bypass_refresh(key, refresh, cache_ok)
+        else:
+            self._note_lock_acquired(key)
+            try:
+                fresh = self.get_fresh(key)
+                if fresh is not None:
+                    return fresh
+                return await self._refresh_and_store(key, refresh, cache_ok)
+            finally:
+                lock.release()
 
     def clear(self) -> None:
-        """Reset the store and all per-key locks (test/admin hook)."""
+        """Reset the store, all per-key locks, and open bypass streaks (test/admin hook).
+
+        Does NOT cancel an in-flight bypass task — it simply stops tracking
+        it, so a bypass requested after ``clear()`` starts a fresh one rather
+        than joining the orphaned one. The orphaned task keeps running to
+        completion in the background regardless (it may still store into a
+        since-cleared cache), the same pre-existing race ``clear()`` already
+        has with any other in-flight refresh.
+        """
         self._store.clear()
         self._locks.clear()
+        self._bypass_streaks.clear()
+        self._bypass_tasks.clear()
+        self._live_bypasses.clear()

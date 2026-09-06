@@ -715,7 +715,13 @@ script and decides by **exit code only** — it parses no output:
 |---|---|
 | `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (a **bounded structured verdict** carried as `note` — see below) |
 | non-`0` | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
-| timeout | born-at-L2 `infra_issue` escalation (existing timeout path) + task `blocked`, **no** `gate_escalated_at` stamp |
+| timeout / runner error (**no verdict**) | born-at-L2 escalation + task `blocked`, **no** `gate_escalated_at` stamp in *either* case — the check is simply re-attempted on the next dispatch. Category is `infra_issue` for an ordinary predicate, `milestone_check_failed` for a task carrying `metadata.recurrence` (§6.1) |
+
+The last row covers **three** ways a run produces no exit code — the outer
+wall-clock guard, the script overrunning its own `before_done.timeout_secs`,
+and an unexpected error in the runner seam. Only a **non-zero exit** — a real
+verdict — stamps `gate_escalated_at` and thereby latches the task into the
+resume/resolve-to-done path.
 
 **What the `rc == 0` `note` carries (task 3286):** `predicate check passed
 (rc=0)`, plus — when the script emitted one — a single extracted payload:
@@ -894,10 +900,22 @@ restriction; until one exists, the rejection *is* the contract.
 }
 ```
 
-**Not live yet.** Only the metadata contract above is implemented. The
-mint-on-terminal step, the chain-state gauge, and the carrier's timeout
-category are separate PRD tasks. Filing a carrier today therefore gets you a
-*validated, time-withheld one-shot link* — not an auto-renewing chain.
+**What a carrier gets today.** Every escalation a carrier's deterministic
+run files carries `category='milestone_check_failed'` — the deny-listed
+category (`escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`),
+so a recurring job's failures are discriminable instead of disappearing into
+the crowded `infra_issue` bucket. That covers the no-verdict legs in §6's
+table as well as the non-zero-exit verdict; the **stamp** rule in that table
+is unchanged either way. A non-carrier predicate's no-verdict legs stay
+`infra_issue`, and so do `kind='deploy'` deterministic tasks — the
+deterministic-recon sweep's Source B auto-closer keys on that category to
+resolve deploy-stranded escalations, so widening the carrier rule to deploys
+would make that population un-auto-closable.
+
+**Not fully live yet.** The mint-on-terminal step and the chain-state gauge
+are separate PRD tasks. Filing a carrier today therefore gets you a
+*validated, time-withheld one-shot link* whose failures are correctly
+categorised — not an auto-renewing chain.
 
 ---
 
@@ -1007,8 +1025,8 @@ capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, files_tagged_empty,
 source_finding_id, stage1_finding_id, origin_finding_id,
-related_memory_ids, spawned_from, program, program_stream, stream,
-cross_repo, cross_repo_project, human_curator_gate,
+related_memory_ids, related_tasks, spawned_from, program, program_stream,
+stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class
 ```
@@ -1166,7 +1184,18 @@ after which the resume path nonetheless closed the task.
 These aliases are deliberately *not* on the Tier-A allowlist, so each still
 emits `code=unknown_key` as a greppable drift signal until the caller is
 fixed to use the canonical spelling — with one documented exception,
-`origin_finding_id`, noted under the table:
+`origin_finding_id`, noted under the table.
+
+Every key in the **Canonical** column is itself Tier-A blessed and therefore
+**silent**, so the `code=unknown_key` drift signal is **alias-only** and
+migrating to the canonical spelling actually clears the warning. That is the
+property the preamble above rests on, and it is machine-checked by
+`tests/scripts/test_task_authoring_tier_b_canonical_keys.py` (task 4303) — a
+new row whose canonical is unblessed fails the suite rather than silently
+re-creating that task's defect, where authors were told to migrate to
+`related_tasks` and still minted a census line.
+
+<!-- tier-b-canonical-keys -->
 
 | Canonical | Aliases to avoid |
 |---|---|
@@ -1174,6 +1203,8 @@ fixed to use the canonical spelling — with one documented exception,
 | `invariants` | `inv` |
 | `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
+
+<!-- /tier-b-canonical-keys -->
 
 **The finding-provenance row splits into two classes** (ruling:
 `esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
@@ -1310,9 +1341,13 @@ apparent enum is not the thing writers are actually held to.
 
 Two `unknown_key` sources are known, measured, and deliberately left
 open. They are recorded here so the next reader does not re-measure them.
-All counts are a snapshot of a **growing** corpus (4204 tasks carried dict
-metadata at the latest measurement, up from 3553 when this section was
-first written), not an invariant.
+All counts are a snapshot of a **growing** corpus, not an invariant: 4748
+tasks carried dict metadata at the latest corpus-wide measurement
+(2026-08-31), up from 4204 on 2026-08-18 and 3553 when this section was
+first written. Across that corpus 1516 tasks emit at least one
+`unknown_key` line, 3130 lines over 1028 distinct spellings. The *per-gap*
+counts in the table below are still the 2026-08-18 figures and were **not**
+re-measured — only the corpus total was.
 
 | Gap | Measured | Owner |
 |---|---|---|
@@ -1330,6 +1365,43 @@ convention" above. See the frozenset entry in
 **Semantics** (what the key actually does at submit): §4's
 "`execution_class` routes to a HUMAN" subsection — blessing changed the
 key's census standing, not its dispatch consequence.
+
+**`related_tasks` was never a row here, and is now CLOSED** — task 4303
+blessed it into Tier-A. Recorded in the same shape as the
+`execution_class` row above so a reader arriving from an older revision
+does not re-open the fork: it was **decided, not deferred**. It was the
+largest single `unknown_key` contributor in the corpus and, unusually, the
+*canonical* Tier-B spelling §8 tells authors to migrate toward — so
+following the documentation still minted a census line. Blessing rather
+than retiring, in one line: it is the documented migration target for three
+live aliases, it is corpus-dominant on the `esc-3796-1` precedent, and
+retirement is structurally blocked today because ~70% of its carriers hold
+`done_provenance` and are unwritable under the floor described below —
+sweeping only the writable remainder is the same "fifth of the benefit"
+vocabulary fork ruled out for task 4302 just below. See the frozenset entry
+in `shared/src/shared/task_metadata.py` for the census, the value-shape
+split and the (negative) reader verdict; they are deliberately not restated
+here. **Operator consequence:**
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` now refuses
+`related_tasks` as a Tier-A blessed key (`--force` overrides).
+
+**`delivered_checks` is NOT a census leak — it is a measurement artifact,**
+and it is recorded here precisely so the next census-runner does not
+re-derive it. A raw census will show it near the top (313 tasks on
+2026-08-31), but `delivered_checks` is a **registered submodel**
+(`shared/src/shared/capability_manifest.py`), and registration happens as
+an **import-order side effect**. A standalone script that never imported
+`shared.capability_manifest` therefore counts it as unknown. The live write
+path *does* reach the registration —
+`fused-memory/src/fused_memory/server/tools.py` imports
+`fused_memory.server.manifest_stamping`, which imports
+`shared.capability_manifest` at module level — so no real write emits the
+warning and there is nothing to fix. Measured both ways: with the module
+imported, `parse_metadata({'delivered_checks': []})` emits zero warnings.
+**Operational corollary, and it generalises beyond this key:** anyone
+re-running a task-metadata census must import the submodel registrations
+first, or they will measure phantom leaks. The corpus totals quoted above
+were measured with them imported.
 
 **The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
 a ~30-task metadata rewrite has a very different blast radius from one

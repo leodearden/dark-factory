@@ -70,6 +70,35 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 
 # Host-invariant safety switches that MUST be present in [Service] as
 # non-comment directives.  Extend this list to guard additional safety flags.
+#
+# BUT NEVER ADD A NAME THAT scripts/render_dashboard_unit.py PRESERVES.
+# Concretely, today: never add `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=...`.
+# The two mechanisms are incompatible by construction, and the failure is silent
+# in the worst way — it lands on the unit that governs RECONCILIATION.
+#
+# Since task 4796, setup-host.sh installs this unit through that renderer, which
+# reads the host's DASHBOARD_KNOWN_PROJECT_ROOTS off the installed unit and puts
+# it back into the fresh render. A host that registered nine project roots keeps
+# nine. Now suppose the single-root committed line were added to the list below:
+#
+#   1. find_drift tests EXACT WHOLE-LINE membership, so on that nine-root host
+#      the required single-root line reads as MISSING;
+#   2. --fix appends it after the LAST [Service] line;
+#   3. systemd applies Environment= in file order with LAST-WINS, so the
+#      appended single-root line BEATS the preserved one;
+#   4. the checker then reports parity and exits 0.
+#
+# Eight projects silently stop being known to reconciliation
+# (fused_memory/models/scope.py reads this variable as KNOWN_PROJECT_ROOTS_ENV;
+# reconciliation/harness.py raises UnknownProjectError for a project outside the
+# set), and nothing reports it. The remedy for a host-local value is NOT this
+# list — it is the renderer's preserve set.
+#
+# Held by tests/scripts/test_check_fused_memory_unit_parity.py::
+# test_preserved_names_are_disjoint_from_required_service_directives, with the
+# clobber demonstrated by ::test_a_required_known_project_roots_line_would_reclobber.
+# No code in either module can prevent an edit to a constant in the other, which
+# is why the guard is a cross-module test and this is a comment.
 # Restart=on-failure / RestartSec=5 / RestartSteps=4 / TimeoutStartSec=300 /
 # TimeoutStopSec=90 are host-invariant literal strings (already present
 # verbatim in scripts/fused-memory.service.template) — exact membership

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import dataclasses
 import typing
+from pathlib import Path
 
 import pytest
 
@@ -415,6 +416,71 @@ class TestBornAtL2SeverityAtLevelZeroFailsSafe:
         assert _bucket_of(_rec(level=level, severity=severity), live_claimant=False) == (
             'queue_handoff'
         )
+
+
+class TestInfoAtL2Coupling:
+    """The info-at-L2 / promote_to_l2 coupling (task 4402, follow-up to 3976).
+
+    Task 3976 changed ``promote_to_l2`` so an OMITTED ``severity`` argument
+    inherits ``max(member severities)`` instead of defaulting to
+    ``'blocking'`` — so promote_to_l2 can now MINT a FRESH L2 carrying
+    ``severity='info'``. (This was not the first way to reach an
+    info-severity L2 at all: ``EscalationQueue.park()`` has always been able
+    to PROMOTE an already-open info-severity L0/L1 to level=2 without
+    touching severity — see ``escalation.queue.EscalationQueue.park``. What's
+    new with 3976 is a fresh MINT at that combination, not the combination
+    itself.) Link 1 above short-circuits on ``severity == 'info'`` BEFORE the
+    ``level != 0`` link, so this record classifies ``NON_PINNING``. This is
+    documented as INTENDED semantics on ``escalation.server.promote_to_l2``'s
+    docstring (its members were themselves non-pinning, and the classifier is
+    not yet wired to any production veto site — task 3541).
+
+    The test below exercises the REAL derivation seam
+    (``escalation.server._derive_l2_severity``) against an all-info member
+    cluster and feeds the resulting level=2/severity='info' ``Escalation``
+    through ``classify_pins`` — so a regression on EITHER side of the
+    coupling (the inheritance losing 'info', or pins.py's precedence chain
+    being re-ordered) fails loudly here instead of only contradicting prose.
+    The liveness/filing-identity dimension is deliberately NOT re-parametrised
+    here: it is already exhaustively covered for severity='info' at every
+    level by ``TestInfoNeverPins``, and this test's own job is the derivation
+    seam, not another pass over that matrix."""
+
+    def test_promote_to_l2_mints_info_from_all_info_members_and_it_does_not_pin(
+        self, tmp_path: Path,
+    ) -> None:
+        from escalation.queue import EscalationQueue
+        from escalation.server import _derive_l2_severity
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(Escalation(
+            id='esc-42-1', task_id='42', agent_role='implementer',
+            severity='info', category='infra_issue', summary='s1',
+        ))
+        queue.submit(Escalation(
+            id='esc-42-2', task_id='42', agent_role='implementer',
+            severity='info', category='infra_issue', summary='s2',
+        ))
+
+        # Producer side: an all-info member cluster derives severity='info' —
+        # this is what an omitted promote_to_l2(severity=...) resolves to.
+        derived = _derive_l2_severity(queue, ['esc-42-1', 'esc-42-2'])
+        assert derived == 'info'
+
+        # The shape promote_to_l2's create path mints from `derived`: an
+        # Escalation at level=2 carrying the derived severity and the member
+        # ids (see server.py's `effective_severity` / queue.submit call).
+        minted = Escalation(
+            id='esc-42-3', task_id='42', agent_role='escalation-watcher-auto',
+            severity=typing.cast('str', derived), category='design_concern',
+            summary='cluster', level=2, members=['esc-42-1', 'esc-42-2'],
+        )
+
+        # Consumer side: classify_pins reads the minted record as NON_PINNING.
+        report = classify_pins('42', [minted], live_claimant=False)
+        assert report.non_pinning == ('esc-42-3',)
+        assert report.queue_handoff == ()
+        assert report.pins is False
 
 
 class TestLiveClaimantIdShapeGuard:

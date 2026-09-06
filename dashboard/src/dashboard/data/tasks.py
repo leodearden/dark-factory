@@ -38,6 +38,7 @@ whole key. ``fetch_external_statuses`` is uncached and returns live data.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from datetime import datetime, timedelta
@@ -189,6 +190,7 @@ def _fetch_tasks_cache_key(
     statuses: list[str] | None,
     page_size: int | None,
     offset: int,
+    paginate: bool = False,
 ) -> str:
     """Compose the ``_fetch_tasks_cache`` key for one (root, narrowing) pair.
 
@@ -207,10 +209,24 @@ def _fetch_tasks_cache_key(
 
     A ``\x1f`` (ASCII unit separator) delimits the statuses so a status
     string containing the field separators cannot forge another key.
+
+    ``paginate`` is a MANDATORY part of the key, not a refinement: it selects
+    the RETURN CONTRACT, not the request narrowing.  ``page_size=10,
+    paginate=False`` is one 10-row page; ``page_size=10, paginate=True`` is the
+    complete tree walked ten rows at a time.  Those two answers differ in
+    length and content while agreeing on every other key component, so without
+    this discriminator whichever landed first inside the TTL window would be
+    served to the other caller — handing ``active_tasks`` a whole tree, or
+    handing ``burndown.collect_snapshot`` a 10-row page to write into an
+    append-only history table as the project's true size.
     """
     statuses_part = '*' if statuses is None else '\x1f'.join(statuses)
     page_part = '*' if page_size is None else str(page_size)
-    return f'{project_root_str}|s={statuses_part}|p={page_part}|o={offset}'
+    walk_part = '1' if paginate else '0'
+    return (
+        f'{project_root_str}|s={statuses_part}|p={page_part}|o={offset}'
+        f'|w={walk_part}'
+    )
 
 
 def _shape_task(task: dict) -> dict | None:
@@ -323,6 +339,7 @@ async def fetch_tasks(
     statuses: list[str] | None = None,
     page_size: int | None = None,
     offset: int = 0,
+    paginate: bool = False,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch the dashboard-shaped task list for *project_root* via MCP.
@@ -354,6 +371,65 @@ async def fetch_tasks(
     the resident set to "keys requested within the eviction horizon" no matter
     how many distinct keys are ever used.  That is the real invariant, it lives
     where the store lives, and it holds for every ``TTLCache`` caller.
+
+    **Complete-read pagination (``paginate=True``).**  *page_size* keeps its
+    single-page meaning: it is the size of ONE page, and by default
+    (``paginate=False``) this function issues exactly one request and returns
+    exactly that page, which is what ``active_tasks``' terminal window wants.
+    ``paginate=True`` instead WALKS every page of that size from *offset* and
+    returns the assembled complete set.  It exists for the burndown collector,
+    whose whole-tree read on a large project can exceed the MCP transport's
+    response limit; that response is rejected wholesale, so the collector's
+    cycle writes no row at all into an append-only history table (a permanent
+    hole no later cycle backfills — the hole is logged, but no backfill
+    exists).  ``paginate=True`` with ``page_size=None`` has no page to walk and
+    degrades to the single unpaginated request.
+
+    *paginate* is part of the cache key (see :func:`_fetch_tasks_cache_key`),
+    and MUST stay so: a walk at ``page_size=10`` and a genuine
+    first-page-of-10 slice otherwise compute the identical key and whichever
+    ran first inside the TTL window would be served to the other — a complete
+    tree handed to a caller that asked for one page, or a 10-row page handed to
+    the burndown collector as the whole tree.
+
+    *statuses* and *timeout* are threaded into EVERY page request.  For
+    *statuses* that is required for coherence: ``server/tools.py::get_tasks``
+    applies the status filter BEFORE its in-memory
+    ``all_tasks[offset:offset + page_size]`` slice, so ``total`` under a filter
+    is the FILTERED count and the walk's termination condition is only
+    meaningful if every page carries the same filter.  For *timeout* it follows
+    the per-request contract documented below — a walk multiplies that
+    per-request budget by the page count, so a caller wanting a hard bound on
+    the whole walk must size its own ``asyncio.wait_for`` accordingly.
+
+    Pagination bounds the per-RESPONSE size ONLY.  It is not a way to do less
+    work: MCP ``get_tasks`` has no field projection at any layer and the
+    backend query is ``SELECT *``, so the same rows are read either way — they
+    simply arrive in chunks the caller has sized to be likely to cross the
+    wire.  It is a probability reduction, not a guarantee: no page size can be
+    unconditionally safe because a SINGLE dense task row can exceed the
+    transport envelope on its own.  Nor is it free — the server materialises
+    the whole list and slices in memory per request, so a page size of P on an
+    N-task project costs ``ceil(N/P)`` SEQUENTIAL round trips and O(N**2/P)
+    server-side row builds.  The row-density measurement and the derivation of
+    the only page size in the tree today live in one place:
+    ``burndown._SNAPSHOT_PAGE_SIZE``.
+
+    **A paginated read is all-or-nothing.**  If a page cannot be verified as
+    complete, the partial rows are DISCARDED and the offline marker is returned
+    instead.  Five ways a page fails that check: a non-int ``pagination``
+    envelope; an empty page while the server still claims rows remain; a
+    ``returned`` counter disagreeing with the number of rows actually delivered
+    (the walk advances on that counter, so an unchecked one skips or re-reads
+    rows silently); a ``total`` that GROWS mid-walk (the tree changed underneath
+    the read, so the assembled pages are not one coherent snapshot); and a walk
+    exceeding the page budget derived from the first response's ``total``.  A
+    truncated ``list`` would be indistinguishable from a complete one at every
+    call site, and ``collect_snapshot`` would write that undercount into an
+    append-only history table as fact.  An empty page with no rows still owed
+    (``total <= 0``, or ``offset >= total``) is a complete read of an empty or
+    exhausted tree and still returns ``[]`` — a true zero, not a truncation.
+
 
     **Copy isolation (list-level only):** returns a shallow ``list()`` copy on
     every call, so list-level mutations (``result.clear()``, ``result.append()``)
@@ -436,26 +512,157 @@ async def fetch_tasks(
     """
     project_root_str = str(project_root)
 
-    arguments: dict = {'project_root': project_root_str}
+    base_arguments: dict = {'project_root': project_root_str}
     if statuses is not None:
-        arguments['statuses'] = statuses
+        base_arguments['statuses'] = statuses
     if page_size is not None:
-        arguments['page_size'] = page_size
-        arguments['offset'] = offset
+        base_arguments['page_size'] = page_size
+        base_arguments['offset'] = offset
 
-    async def _call(url: str) -> list[dict]:
-        result = await mcp_tool_call(
-            client, url, 'get_tasks', arguments, timeout=timeout,
-        )
-        if 'error' in result and 'tasks' not in result:
-            raise ValueError(str(result.get('error')))
-
-        raw_tasks = result.get('tasks') or []
-        shaped: list[dict] = []
+    def _shape_all(raw_tasks: list, into: list[dict]) -> None:
         for task in raw_tasks:
             row = _shape_task(task)
             if row is not None:
-                shaped.append(row)
+                into.append(row)
+
+    async def _request(url: str, args: dict) -> dict:
+        result = await mcp_tool_call(
+            client, url, 'get_tasks', args, timeout=timeout,
+        )
+        if 'error' in result and 'tasks' not in result:
+            raise ValueError(str(result.get('error')))
+        return result
+
+    async def _call(url: str) -> list[dict]:
+        if not paginate or page_size is None:
+            # Single-request path — byte-identical to main's pre-walk request,
+            # narrowing included.  ``paginate=True`` with no *page_size* has no
+            # page to walk, so it degrades here rather than spinning.
+            result = await _request(url, base_arguments)
+            shaped: list[dict] = []
+            _shape_all(result.get('tasks') or [], shaped)
+            return shaped
+
+        shaped = []
+        walk_offset = offset
+        pages = 0
+        page_budget: int | None = None
+        first_total: int | None = None
+        while True:
+            page_args: dict = {
+                'project_root': project_root_str,
+                'page_size': page_size,
+                'offset': walk_offset,
+            }
+            if statuses is not None:
+                # Sent on EVERY page: the tool applies the status filter BEFORE
+                # its in-memory slice, so `total` is the FILTERED count and an
+                # unfiltered page would both over-read and desynchronise the
+                # walk's terminator.
+                page_args['statuses'] = statuses
+            result = await _request(url, page_args)
+            # Capture the RAW page: `len(shaped)` is not a usable proxy for it,
+            # because _shape_all drops rows whose _shape_task returns None.
+            page = result.get('tasks') or []
+            _shape_all(page, shaped)
+            pages += 1
+
+            meta = result.get('pagination')
+            if not isinstance(meta, dict):
+                # An older fused-memory ignores page_size and answers with the
+                # whole bare list.  There is no `total` to page against, so this
+                # response IS the answer — take it and stop.  Looping blind
+                # would either spin or re-request the same rows forever.
+                break
+            returned = meta.get('returned')
+            total = meta.get('total')
+            # TRUNCATION IS LOUD, not silent.  The loop still never spins — that
+            # property is retained below — but a bounded-but-INCOMPLETE read must
+            # never be handed back as a plain list.  fetch_tasks's contract
+            # distinguishes only `list` (a complete success) from the
+            # {'offline': True} marker, so a truncated list is indistinguishable
+            # from a complete one at EVERY call site: collect_snapshot triages on
+            # isinstance(result, list) and would write _count_zones([]) — a
+            # confident zero — into the APPEND-ONLY `snapshots` table for a tree
+            # the server itself reported as non-empty.  A plausible dip in an
+            # append-only chart is unfalsifiable after the fact, whereas a gap is
+            # visible.  ValueError is first_success's documented soft-failure
+            # fall-through signal (mcp_fanout.py:250-252, already used by
+            # _request above), so it tries the next URL and, on exhaustion,
+            # yields the offline marker collect_snapshot already skips on.
+            if not isinstance(returned, int) or not isinstance(total, int):
+                # No usable counters: completeness is UNVERIFIABLE here, and an
+                # unverifiable read must not be reported as a complete one.
+                raise ValueError(
+                    f'get_tasks pagination for {project_root_str} truncated at '
+                    f'{len(shaped)} row(s), total={total!r}'
+                )
+            if returned != len(page):
+                # The SELF-REPORTED counter is what the walk advances on, so it
+                # must be cross-checked against what actually arrived — this is
+                # the one remaining way a bounded-but-incomplete read could be
+                # handed back as a plain list.  A server (or a proxy/serialiser
+                # that clips a page) claiming returned=10 while shipping 4 rows
+                # would otherwise skip 6 rows per page silently, terminate
+                # normally at offset >= total, and hand collect_snapshot a
+                # confident undercount to write into an append-only table.  The
+                # mirror case (under-reporting) re-requests rows already held
+                # and inflates the counts instead.  Neither is verifiable after
+                # the fact, so refuse the read.
+                raise ValueError(
+                    f'get_tasks pagination for {project_root_str} inconsistent '
+                    f'at offset {walk_offset}: server claims returned={returned} '
+                    f'but sent {len(page)} row(s)'
+                )
+            if first_total is None:
+                first_total = total
+                # BOUND THE WALK.  `total` is the loop's only terminator, and it
+                # is server-reported: a stale count, a bad merge of tag scopes,
+                # or a tree being written concurrently makes ceil(total/P)
+                # sequential round trips on the SAME httpx client the 2 s render
+                # polls share — the PoolTimeout hazard the burndown size probe
+                # exists to bound.  So derive one budget from the FIRST response
+                # and refuse to exceed it.  The +2 covers the final partial page
+                # plus one page of slack; a server that keeps handing back short
+                # pages is misbehaving in exactly the way that amplifies the
+                # walk, and is caught here rather than paid for.
+                page_budget = math.ceil(total / max(page_size, 1)) + 2
+            elif total > first_total:
+                # A `total` that GROWS mid-walk means the tree changed underneath
+                # the read: the pages in hand are from different states of the
+                # world, so the assembled list is not a coherent snapshot of
+                # either.  It also un-bounds the budget derived above.
+                raise ValueError(
+                    f'get_tasks pagination for {project_root_str} raced a write '
+                    f'at offset {walk_offset}: total grew from {first_total} to '
+                    f'{total} mid-walk'
+                )
+            if returned <= 0:
+                # Guard the COMPLETE cases first.  An empty page with no rows
+                # still owed (total <= 0, or offset already past total) is a
+                # complete read of an empty or exhausted tree — it must keep
+                # returning [], or every empty project becomes a permanent
+                # burndown hole and loses its legitimate all-zero row.
+                if total <= 0 or walk_offset >= total:
+                    break
+                # The server claims rows remain but hands back an empty page, so
+                # it cannot be paged past.  Detail lives in the exception rather
+                # than a second WARNING for the same event.
+                raise ValueError(
+                    f'get_tasks pagination for {project_root_str} truncated at '
+                    f'{len(shaped)} row(s) — empty page at offset {walk_offset}, '
+                    f'total={total}'
+                )
+            walk_offset += len(page)
+            if walk_offset >= total:
+                break
+            if page_budget is not None and pages >= page_budget:
+                raise ValueError(
+                    f'get_tasks pagination for {project_root_str} exceeded its '
+                    f'{page_budget}-page budget at offset {walk_offset} '
+                    f'(total={total}, page_size={page_size}); refusing to keep '
+                    f'walking'
+                )
         return shaped
 
     async def _refresh() -> list[dict] | dict:
@@ -466,7 +673,9 @@ async def fetch_tasks(
             offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
         )
 
-    key = _fetch_tasks_cache_key(project_root_str, statuses, page_size, offset)
+    key = _fetch_tasks_cache_key(
+        project_root_str, statuses, page_size, offset, paginate,
+    )
 
     # A fresh negative entry short-circuits the attempt.  The marker is still
     # RETURNED, so degradation stays exactly as visible to the caller as it was

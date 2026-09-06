@@ -21,7 +21,19 @@ Let `<DF>` be the dark-factory repo root and `<TARGET>` the absolute target path
 
 The committed templates default to **this repo only**: `<DF>/scripts/fused-memory.service.template` (and `dashboard.service.template`) ship `DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__`. dark-factory is a standalone project — the maintainer's other repos don't belong in source control, since a fresh clone won't have them. So register `<TARGET>` by editing the **installed** units and leave the committed templates alone.
 
-The live units at `$HOME/.config/systemd/user/` already have every placeholder resolved. **Do not** re-render from the template by substituting only `__REPO_ROOT__` — the template also contains `__UV_PATH__` (the `ExecStart` line), and a partial `sed` render would leave that placeholder literal and the restart would fail. (If you ever do re-render, substitute *both*: `sed -e 's|__REPO_ROOT__|<DF>|g' -e "s|__UV_PATH__|$(command -v uv)|g"`.)
+The live units at `$HOME/.config/systemd/user/` already have every placeholder resolved. **Do not hand-roll a `sed` re-render.** It fails two ways: it truncates `DASHBOARD_KNOWN_PROJECT_ROOTS` back to the committed single root — silently un-registering every project you added here — and, if you substitute only `__REPO_ROOT__`, it leaves `__UV_PATH__` literal on the `ExecStart` line so the restart fails outright.
+
+If you do need a full re-render, use the supported path, which reads this host's `DASHBOARD_KNOWN_PROJECT_ROOTS` off the installed unit and puts it back (tasks 4793, 4796):
+
+```bash
+python3 <DF>/scripts/render_dashboard_unit.py --unit fused-memory \
+  --template "<DF>/scripts/fused-memory.service.template" \
+  --repo-root "<DF>" --uv-path "$(command -v uv)" \
+  --output "$HOME/.config/systemd/user/fused-memory.service"
+# ...and --unit dashboard with dashboard.service.template / dark-factory-dashboard.service
+```
+
+`<DF>/scripts/setup-host.sh` does exactly this for both units, so re-running it no longer strips the extra roots either. **But do not reach for it here.** Section 4 of that script runs `systemctl --user restart fused-memory` whenever `<DF>/fused-memory/.env` exists — i.e. it performs, unprompted, the destructive restart that step 2 below gates on user confirmation, severing this session's MCP tools — and it re-provisions the whole host around it (docker compose up, `uv sync` of five projects, re-render and enable of every systemd unit this project installs). The two narrow paths are the surgical one-line edit below (the normal registration route) and the direct `render_dashboard_unit.py` invocation above; both leave *when* to restart to you.
 
 Append `,<TARGET>` with a **surgical one-line edit** to the single `DASHBOARD_KNOWN_PROJECT_ROOTS=` line in **both** live units:
 - `~/.config/systemd/user/fused-memory.service` — governs **reconciliation** (the recon-storm hazard; this is the load-bearing one).

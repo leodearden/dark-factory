@@ -1,5 +1,5 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
-const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = window.DF_CHARTS;
+const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS, formatCountTick } = window.DF_CHARTS;
 const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
@@ -618,7 +618,7 @@ function MemoryTab({ projectFilter, onNavigate }) {
             <LC labels={ts.labels} series={[
               { values: ts.reads, color: CP.accent },
               { values: ts.writes, color: CP.ok },
-            ]} height={240} formatX={window.DF_SHELL.fmtDateTime} />
+            ]} height={240} formatY={formatCountTick} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       </div>
@@ -920,7 +920,7 @@ function MergeTab({ projectFilter }) {
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
                   <div className="panel-head"><span className="title">Merge attempts · 15-min buckets</span></div>
-                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatX={window.DF_SHELL.fmtDateTime} /></div>
+                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatY={formatCountTick} formatX={window.DF_SHELL.fmtDateTime} /></div>
                 </div>
 
                 <div className="col-span-5 panel">
