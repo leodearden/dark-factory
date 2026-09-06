@@ -69,6 +69,26 @@ None forever: the liveness watchdog degraded to inert and every cap-retry
 force-freshed instead of resuming.  That ran silently until 2026-08-11.  A
 comment claiming the dir was writable existed the entire time; only a check can
 hold an invariant a comment cannot.
+
+That check has an unstated precondition, made explicit in task 4592: every path
+it reasons about must be ABSOLUTE.  Containment here is computed with
+``os.path.realpath`` in the PARENT process's cwd, but the two things the verdict
+is about are resolved in the CHILD's — ``shared.cli_invoke.invoke_claude_agent``
+exports ``CLAUDE_CONFIG_DIR`` as a bare string and ``_run_subprocess`` spawns the
+wrapped argv with ``cwd=`` ``config.explore_codebase_root``, which is also where
+``landlock-exec`` / ``bwrap`` resolve the ``--writable`` grant tokens.  A relative
+string therefore names one directory to the verifier and a different one to the
+grantor, and the check would return PASS for a directory the child can never
+write — the 2026-07-18 defect re-entering through the relative-path door.  The
+two cwds agree in production today only because the installed systemd unit sets
+``WorkingDirectory`` == ``PROJECT_ROOT``; nothing enforced it, and
+``fused-memory/config/config.yaml`` supplies a RELATIVE ``data_dir``
+(``./data/reconciliation``) whenever ``RECONCILIATION_DATA_DIR`` is unset.  So
+both faces fail closed here: ``_assert_config_dir_writable`` raises on a
+non-absolute ``config_dir``, and ``_writable_roots`` drops a non-absolute extra
+(loudly) rather than counting a grant it cannot resolve the way the child will.
+The producer-side fix — absolutizing the root exactly once — lives at
+``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``.
 """
 
 from __future__ import annotations
@@ -154,6 +174,36 @@ def _assert_config_dir_writable(
     other, which ``run_stage_via_cli`` already does.
     """
     raw = str(config_dir)
+
+    # ABSOLUTE-PATH PRECONDITION (task 4592). Checked BEFORE the containment
+    # loop, because for a relative path that loop cannot answer the question it
+    # is asked: it would compare a parent-cwd resolution against parent-cwd
+    # roots and PASS, certifying a directory the child never writes to.
+    if not Path(config_dir).is_absolute():
+        raise RemediationSandboxUnavailable(
+            f'Refusing to launch a reconciliation agent whose CLAUDE_CONFIG_DIR '
+            f'is a RELATIVE path: {raw}. Containment is undecidable for a '
+            f'relative path — this function resolves it with os.path.realpath '
+            f'against the PARENT process\'s cwd to compute the verdict, but the '
+            f'CLI child resolves the very same string against the cwd it is '
+            f'spawned with (effective_cwd = config.explore_codebase_root, see '
+            f'fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py'
+            f'::run_stage_via_cli, which hands that cwd to both this check and '
+            f'shared/src/shared/cli_invoke.py::_run_subprocess). A PASS here '
+            f'would therefore certify a directory the child will never write '
+            f'to, and its session transcript would be denied by the kernel — '
+            f'silently, which is the 2026-07-18 -> 2026-08-11 recon defect '
+            f'(task 4003) passing the check that exists to catch it. The two '
+            f'cwds agree in production today only because the installed unit '
+            f'sets WorkingDirectory == PROJECT_ROOT. The fix belongs at the '
+            f'PRODUCER, not here: '
+            f'fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py'
+            f'::recon_config_base_dir absolutizes the config-dir root for every '
+            f'creator and GC call site, so seeing this error means a caller '
+            f'bypassed it — pass an absolute path (or route through that '
+            f'function) rather than making this path relative to anything.'
+        )
+
     resolved = os.path.realpath(raw)
     roots = _writable_roots(cwd, writable_extras)
 
