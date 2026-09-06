@@ -204,13 +204,40 @@ class _CursorProxy:
     in `harvest()` legitimately calls it.  Blocking everything would drag the
     probe into the streaming contract this exists to pin, so the guard names
     exactly one property -- the SCAN is streamed -- and nothing more.
+
+    `fail_after_rows` is the MID-ITERATION seam: the cursor yields that many
+    real rows and then raises `exc` from the NEXT `next()`.  An `execute()`
+    failure cannot reach that path at all -- no row has been yielded yet --
+    so it is the only way to pin a failure that surfaces mid-scan.
     """
 
-    def __init__(self, cursor):
+    def __init__(
+        self,
+        cursor,
+        *,
+        fail_after_rows: int | None = None,
+        exc: BaseException | None = None,
+    ):
         self._cursor = cursor
+        self._fail_after_rows = fail_after_rows
+        self._exc = exc
 
     def __iter__(self):
-        return iter(self._cursor)
+        if self._fail_after_rows is None:
+            return iter(self._cursor)
+        return self._iter_then_fail()
+
+    def _iter_then_fail(self):
+        # Raises UNCONDITIONALLY once the row budget is spent OR the real rows
+        # run out, so a short journal cannot silently skip the injection.
+        assert self._exc is not None, 'fail_after_rows requires exc'
+        budget = self._fail_after_rows
+        assert budget is not None
+        for yielded, row in enumerate(self._cursor):
+            if yielded >= budget:
+                break
+            yield row
+        raise self._exc
 
     def fetchone(self):
         return self._cursor.fetchone()
@@ -226,19 +253,37 @@ class _ConnectionProxy:
     `exc` is raised INSTEAD of executing.  That is what lets a test fail
     exactly one statement -- the `write_ops` scan -- while the schema probe
     and every PRAGMA still run for real.
+
+    `fail_after_rows` moves that same injection from `execute()` to the
+    matched statement's ITERATION: the statement succeeds and `exc` lands
+    mid-scan instead, after the given number of real rows.
     """
 
-    def __init__(self, con, *, fail_on=None, exc: BaseException | None = None):
+    def __init__(
+        self,
+        con,
+        *,
+        fail_on=None,
+        exc: BaseException | None = None,
+        fail_after_rows: int | None = None,
+    ):
         self._con = con
         self._fail_on = fail_on
         self._exc = exc
+        self._fail_after_rows = fail_after_rows
 
     def execute(self, *args, **kwargs):
         if self._fail_on is not None and args and self._fail_on(args[0]):
             # `fail_on` is never passed without `exc`; the check narrows
             # `_exc` for the type checker rather than adding a contract.
             assert self._exc is not None, 'fail_on requires exc'
-            raise self._exc
+            if self._fail_after_rows is None:
+                raise self._exc
+            return _CursorProxy(
+                self._con.execute(*args, **kwargs),
+                fail_after_rows=self._fail_after_rows,
+                exc=self._exc,
+            )
         return _CursorProxy(self._con.execute(*args, **kwargs))
 
     def close(self):
@@ -649,9 +694,9 @@ class TestTheJournalPathIsRepoRelative:
     """A published artifact must not name somebody's home directory.
 
     An absolute checkout path is neither reproducible nor readable by anyone
-    else, and it leaks the worktree the run happened in -- the same rule this
-    change set already states for
-    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`.
+    else, and it leaks the worktree the run happened in -- the rule
+    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
+    already states.
 
     Both tests patch `mod._REPO_ROOT`, a module global `_repo_relative` reads
     at call time, so the property is pinned without depending on the
@@ -687,9 +732,6 @@ class TestTheJournalPathIsRepoRelative:
         parked outside the tree is genuinely checkout-independent and must
         stay identifiable.  It distinguishes the census-shaped helper (which
         this uses) from the bake-off one, whose fallback is `resolved.name`.
-
-        It passes today for the wrong reason -- no relativization exists at
-        all -- and earns its keep from step-8 onward.
         """
         mod = _mod()
         db = _standard_journal(tmp_path)
@@ -729,14 +771,17 @@ class TestTheCommittedArtifactsCarryNoAbsolutePath:
         `block['harvest']` through a key-name whitelist guarded by
         `if key in sidecar`, so a silent divergence between the two committed
         artifacts would produce no error anywhere.
+
+        The report's absence is ASSERTED, not skipped: it is tracked in the
+        repo and present in every normal checkout, so a skip would let the
+        guard evaporate silently the moment the artifact is deleted, renamed
+        or moved -- the silently-empty measurement this module's header
+        docstring ("READ-ONLY, LOUDLY") rejects everywhere else.
         """
         import json  # noqa: PLC0415
 
-        import pytest  # noqa: PLC0415
-
         report = Path(__file__).parents[2] / 'plans' / 'read-transform-selection-report.json'
-        if not report.exists():  # partial checkout
-            pytest.skip('selection report not present in this checkout')
+        assert report.exists(), f'published selection report is missing: {report}'
         sidecar = FIXTURES_DIR / 'production_query_sample.provenance.json'
 
         expected = json.loads(sidecar.read_text(encoding='utf-8'))['journal_path']
@@ -814,7 +859,7 @@ class TestTheRefusalNamesTheRealFailure:
     # scan and lets every other statement run for real.
     _SCAN = staticmethod(lambda sql: 'FROM write_ops' in sql)
 
-    def _harvest_with_scan_error(self, tmp_path, monkeypatch, exc):
+    def _harvest_with_scan_error(self, tmp_path, monkeypatch, exc, *, after_rows=None):
         import functools  # noqa: PLC0415
 
         mod = _mod()
@@ -822,7 +867,12 @@ class TestTheRefusalNamesTheRealFailure:
         _patch_connect(
             monkeypatch,
             mod,
-            functools.partial(_ConnectionProxy, fail_on=self._SCAN, exc=exc),
+            functools.partial(
+                _ConnectionProxy,
+                fail_on=self._SCAN,
+                exc=exc,
+                fail_after_rows=after_rows,
+            ),
         )
         return mod, db
 
@@ -854,6 +904,36 @@ class TestTheRefusalNamesTheRealFailure:
 
         injected = sqlite3.OperationalError('disk I/O error')
         mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'disk I/O error' in msg
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_disk_io_error_MID_SCAN_is_still_named(self, tmp_path, monkeypatch):
+        """The guard must wrap the LOOP, not just the `execute()` call.
+
+        Streaming MOVED the point of failure, which is the whole reason
+        `harvest()` keeps `except sqlite3.Error` around the entire scan loop:
+        a `disk I/O error` can now surface on any `next()`, after rows have
+        already been consumed.  Both sibling tests raise from `execute()`,
+        i.e. before the first row, so narrowing the guard to the `execute()`
+        call alone would leave them GREEN while letting a mid-scan sqlite
+        failure escape raw and unnamed -- verified: that narrowing passes the
+        whole file without this test.
+
+        Same three assertions as its `execute()`-time sibling, from
+        mid-iteration instead.
+        """
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('disk I/O error')
+        mod, db = self._harvest_with_scan_error(
+            tmp_path, monkeypatch, injected, after_rows=1
+        )
         with pytest.raises(mod.JournalUnavailableError) as exc:
             mod.harvest(db)
         msg = str(exc.value)
