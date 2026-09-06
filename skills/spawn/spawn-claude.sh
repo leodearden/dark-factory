@@ -398,6 +398,27 @@ q_sentinel_tmp=$(printf %q "$sentinel.tmp")
 # than closing the window at the single writer. `mv` is coreutils — no
 # heavier a dependency than the mktemp/find/python3 this script already
 # requires.
+#
+# FAIL-CLOSED, deliberately not `&&`. The publish is a `;`-separated list
+# with two fallbacks, because the two-step form widened the failure envelope
+# in one direction that must be closed back. A single `> $tmp && mv ...`
+# skips the rename outright when the write to $tmp fails (ENOSPC) and
+# depends on an external `mv` resolved through the payload's inherited PATH,
+# where the old direct `>` needed no binary at all and — being a builtin
+# redirect — created the sentinel at open() time even when the write itself
+# failed. In both of those cases NO sentinel would ever appear, and the
+# consumer on that path is await_sentinel, which is UNBOUNDED and whose
+# started-watchdog has already returned 0 on live-claude evidence and will
+# never write the fts_marker: the script would hang forever. That trades a
+# bounded-wrong verdict for an unbounded one — strictly worse, and the same
+# direction design decision 2 refuses for await_sentinel.
+#
+# So every path ends with the sentinel PATH existing: rename it (atomic,
+# the normal case), else copy the temp over it (non-atomic, but finish()'s
+# bounded re-poll covers a torn read), else create it empty with the
+# `:` builtin (no binary required at all) so finish() renders its 127
+# verdict. The fallbacks are reached ONLY when the atomic path already
+# failed, so the normal case is byte-for-byte what it was.
 #   - HUP trap: converts SIGHUP into exit 129 so the EXIT trap records 129
 #     (distinguishable "window closed while alive" code).
 #   - TERM trap: converts SIGTERM into exit 143 (128+15).
@@ -491,7 +512,7 @@ sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
 # a Python layer that does not read it is unaffected.
 owner_ppid_export="export CLAUDE_SPAWN_OWNER_PPID=\$\$; "
 
-inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel_tmp && mv -f $q_sentinel_tmp $q_sentinel' EXIT; \
+inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel_tmp; mv -f $q_sentinel_tmp $q_sentinel 2>/dev/null || cat $q_sentinel_tmp > $q_sentinel 2>/dev/null || : > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
 ${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
@@ -545,13 +566,23 @@ _wait_sentinel_grace() {
 # script has always accepted. A `case` glob rather than a regex keeps this
 # a POSIX builtin test with no subprocess, consistent with the macOS bash
 # 3.2 support this script commits to (see the mac-terminal note above).
+#
+# On success this PRINTS the validated value; on failure it prints nothing
+# and returns 1. Callers must therefore capture it -- `v=$(_sentinel_settled)`
+# -- and never call it bare in a context whose stdout is the script's own.
+# Validating and yielding in a single read is deliberate: a caller that
+# re-`cat`s the file after a bare success test reads it a SECOND time, and if
+# the sentinel is removed or re-truncated in between, that read returns the
+# empty string -- reintroducing, inside the fix, the exact defect described
+# below. One read, validated and consumed together, has no such window (and
+# costs one fork instead of three on the happy path).
 _sentinel_settled() {
   # `local v` on its own line, NOT `local v=$(cat ...)` -- the combined
   # form masks the substitution's exit status behind `local`'s own success.
   local v
   v=$(cat "$sentinel" 2>/dev/null) || return 1
   case "$v" in ''|*[!0-9]*) return 1 ;; esac
-  return 0
+  printf '%s\n' "$v"
 }
 
 finish() {
@@ -577,14 +608,23 @@ finish() {
   #     new env knob. It is already this script's "how long to tolerate a
   #     hair-late sentinel write" tunable -- semantically the identical
   #     question.
-  local rc=127
+  #
+  # The value is CAPTURED from the predicate rather than re-read after it:
+  # `rc_read=$(_sentinel_settled)` validates and yields in one read, so there
+  # is no window between "it looked settled" and "here is the code" for the
+  # file to be removed or re-truncated. A bare assignment (no `local` prefix)
+  # is required for the loop condition to see the substitution's real exit
+  # status -- the same gotcha _sentinel_settled's own body documents. On
+  # failure the predicate prints nothing, so rc_read is empty and rc keeps
+  # its 127 default; it can never hold unvalidated content.
+  local rc=127 rc_read=""
   if [ -f "$sentinel" ]; then
     local end=$(( SECONDS + SPAWN_LAUNCH_GRACE_SECS ))
-    while ! _sentinel_settled && [ "$SECONDS" -lt "$end" ]; do
+    while ! rc_read=$(_sentinel_settled) && [ "$SECONDS" -lt "$end" ]; do
       sleep 0.1
     done
-    if _sentinel_settled; then
-      rc=$(cat "$sentinel")
+    if [ -n "$rc_read" ]; then
+      rc=$rc_read
     fi
   fi
   rm -f "$sentinel" "$sentinel.tmp"
