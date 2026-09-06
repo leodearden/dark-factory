@@ -5227,13 +5227,40 @@ async def filter_accounted_cluster_growth_flags(
 
     Stage 1 emits a "cluster has grown beyond what gate task N tracks" finding
     by diffing a newly-observed Mem0 cluster member against a title-derived /
-    remembered COUNT rather than against the gate task's CURRENT description
+    REMEMBERED COUNT rather than against the gate task's CURRENT description
     body -- so an addendum appended to the body since the title was written
     reads as unaccounted growth.
 
-    This filter re-runs that claim against the body: a flag is DROPPED iff SOME
-    candidate task's current ``description`` + ``details`` contains EVERY one
-    of the flag's cited memory UUIDs (case-insensitive substring).
+    In remediation run ``df364849-21e9-4f54-b802-a126a49eba97`` (finding
+    ``96a14765``; follow-up ``1ff1b00e``) 2 of 3 such flags were FALSE
+    POSITIVES.  Re-verified live 2026-09-06: task 3417's description still
+    lists ``03b783d5-dc00-441a-af9d-05b0e636b668`` verbatim as PRIMARY entry
+    #3 of 3, while its TITLE still reads "(3 primary + 3 secondary entries)";
+    task 3468's "Cluster UUIDs (mem0)" list has the same shape.  ``details``
+    also carries UUIDs the description does not, which is why the body under
+    test is ``description`` + ``details``.
+
+    **The drop rule.**  A flag is a CANDIDATE iff
+    :func:`_is_cluster_growth_flag_type` accepts its ``flag_type`` AND it cites
+    at least one memory id AND at least one task id resolves.  A candidate is
+    DROPPED iff SOME single candidate task's current body contains EVERY one of
+    its cited memory UUIDs (case-insensitive substring).  Bodies are never
+    UNIONED across tasks: "uuid-A is in 3417 and uuid-B is in 3468" does not
+    establish that the cluster is fully tracked anywhere -- only one task
+    listing the whole cited set does.
+
+    **Fail-safe direction is KEEP.**  This filter drops the only signal that an
+    un-gated duplicate cluster is growing, so it drops ONLY on positive
+    confirmation.  Every other outcome keeps the flag: partial presence (one
+    cited UUID absent -- that is GENUINE growth), a ``get_task`` error or
+    ``TaskNotFoundError``, a non-dict or body-less result, zero cited memories,
+    no resolvable task id, and a falsy ``taskmaster``/``project_root``.  The
+    asymmetry is deliberate -- a false KEEP costs one redundant flag that dedup
+    and suppression already handle and that self-heals next cycle, whereas a
+    false DROP silently loses the signal entirely.
+
+    Non-candidate flags pass through with no ``get_task`` call at all, and a
+    batch with zero candidates returns before any I/O.
 
     Args:
         taskmaster: Object with an async ``get_task(task_id, project_root)``
@@ -5243,7 +5270,14 @@ async def filter_accounted_cluster_growth_flags(
 
     Returns:
         A new list, in input order, with accounted-for growth flags removed.
+        The input list is never mutated and surviving flags are unmodified.
     """
+    if not taskmaster or not project_root:
+        # Degrade to a no-op pass-through -- mirrors filter_terminal_metadata_flags
+        # / filter_style_only_authorship_flags.  No body is readable, so nothing
+        # can be positively confirmed accounted for.
+        return list(flags)
+
     candidate_positions: list[int] = []
     cited_by_pos: dict[int, list[str]] = {}
     task_ids_by_pos: dict[int, list[str]] = {}
@@ -5261,6 +5295,49 @@ async def filter_accounted_cluster_growth_flags(
         cited_by_pos[i] = memory_ids
         task_ids_by_pos[i] = task_ids
 
+    # Detect potential LLM naming drift: flag_type strings that look like this
+    # family (contain 'cluster') but that _is_cluster_growth_flag_type does not
+    # match.  flag_type has no committed schema entry, so an unrecognised
+    # spelling would silently make the guard a no-op; this log makes that
+    # observable (the filter_terminal_metadata_flags drift-log precedent).
+    drift_candidates = [
+        ft
+        for flag in flags
+        if isinstance(ft := flag.get('flag_type'), str)
+        and 'cluster' in ft.casefold()
+        and not _is_cluster_growth_flag_type(ft)
+    ]
+    if drift_candidates:
+        logger.info(
+            'reconciliation.accounted_cluster_growth_filter_possible_drift '
+            'unmatched_flag_types=%s known_types=%s '
+            '— update CLUSTER_GROWTH_FLAG_TYPES if drift confirmed',
+            drift_candidates,
+            sorted(CLUSTER_GROWTH_FLAG_TYPES),
+        )
+
+    if not candidate_positions:
+        # No candidates at all — skip every lookup, so a normal cycle (in which
+        # this family is rare) does zero I/O.
+        return list(flags)
+
+    async def _safe_get_task_or_none(task_id: str) -> Any:
+        # Deliberately NOT the module-level _safe_get_task: this filter fails
+        # SAFE to None (KEEP the flag) rather than to a normalised error dict,
+        # and it binds this filter's single fixed project_root.
+        try:
+            return await taskmaster.get_task(task_id, project_root)
+        except Exception as exc:
+            # WARN, not debug: this is a degraded outcome (the filter cannot
+            # tell whether the flag is accounted for), so it must be visible
+            # without raising the log level — see the silent-fallthrough gate.
+            logger.warning(
+                'reconciliation.accounted_cluster_growth_filter_get_task_error '
+                'task_id=%s error=%s',
+                task_id, exc,
+            )
+            return None  # KEEP flag on error (fail-safe)
+
     # Resolve each distinct task id exactly ONCE per call, however many flags
     # in the batch cite it.
     wanted_task_ids: list[str] = []
@@ -5272,7 +5349,7 @@ async def filter_accounted_cluster_growth_flags(
                 wanted_task_ids.append(tid)
 
     lookup_results: list[Any] = await asyncio.gather(
-        *[taskmaster.get_task(tid, project_root) for tid in wanted_task_ids]
+        *[_safe_get_task_or_none(tid) for tid in wanted_task_ids]
     )
     body_by_task: dict[str, str] = {}
     for tid, result in zip(wanted_task_ids, lookup_results, strict=True):

@@ -12538,15 +12538,14 @@ class TestFilterAccountedClusterGrowthFlags:
     @pytest.mark.asyncio
     async def test_task_not_found_error_keeps_the_flag(self):
         """(c) SqliteTaskBackend RAISES for a missing id — it does not return a dict."""
+        from fused_memory.backends.task_backend_errors import TaskNotFoundError
         from fused_memory.reconciliation.flag_dedup import (
             filter_accounted_cluster_growth_flags,
         )
 
         flag = self._make_growth_flag()
         taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(
-            side_effect=TaskmasterError('Task 3417 not found'),
-        )
+        taskmaster.get_task = AsyncMock(side_effect=TaskNotFoundError('3417'))
 
         result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
 
