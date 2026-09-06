@@ -735,12 +735,23 @@ async def _per_db_history(
     project_id: str,
     *,
     days: int,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Cached wrapper for ``_hour_bucketed_history`` keyed by max(completed_at).
 
     The bucket layout only changes when a new task_results row arrives, so
     the cache is deterministic and self-invalidating. LRU-trim at
     ``_HISTORY_CACHE_MAX`` keeps memory bounded across many projects.
+
+    The cache key deliberately excludes ``now``/the derived cutoff: this
+    endpoint is polled every 3s with ``now=None``, so keying on the cutoff
+    would make every request miss and defeat the cache's purpose. This is
+    not a new staleness risk — the previous SQL-side cutoff (a datetime()
+    call passed a 'now' modifier) already moved between calls while the key
+    stayed fixed, so omitting ``now`` here preserves that existing
+    behaviour exactly (see design decision, task 4624). Callers that vary
+    ``now`` across calls on the same ``db`` (i.e. tests) must clear
+    ``_HISTORY_CACHE`` explicitly.
     """
     if db is None:
         return {'labels': [], 'p50': [], 'p95': [], 'one_pass': [], 'escalation': []}
@@ -750,7 +761,7 @@ async def _per_db_history(
     if cached is not None:
         return cached
     try:
-        result = await _hour_bucketed_history(db, project_id, days=days)
+        result = await _hour_bucketed_history(db, project_id, days=days, now=now)
     except Exception:
         logger.debug('per-db history failed', exc_info=True)
         return {'labels': [], 'p50': [], 'p95': [], 'one_pass': [], 'escalation': []}
@@ -795,6 +806,7 @@ async def aggregate_performance_history(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Return per-project bucketed history for ttc, one-pass, escalation.
 
@@ -807,9 +819,20 @@ async def aggregate_performance_history(
             escalation_history:    {labels, values},
           }
         }
+
+    Args:
+        now: Reference timestamp forwarded to :func:`_cutoff`. Resolved
+            ONCE here (via :func:`resolve_now`) and threaded through both
+            the project-discovery query and every :func:`_per_db_history`
+            call, so the two legs share a single cutoff instant instead of
+            each reading the clock independently and risking a straddled
+            boundary. None (the default) resolves to the current UTC
+            clock, matching the existing ``app.py`` call site.
     """
     if not dbs:
         return {}
+    effective_now = resolve_now(now)
+    since = _cutoff(days, now=effective_now)
     # Discover project IDs across all DBs.
     pid_sets: list[set[str]] = []
     for db in dbs:
@@ -818,8 +841,8 @@ async def aggregate_performance_history(
         try:
             rows = await db.execute_fetchall(
                 'SELECT DISTINCT project_id FROM task_results '
-                "WHERE completed_at >= datetime('now', ? || ' days')",
-                (f'-{int(days)}',),
+                'WHERE completed_at >= ?',
+                (since,),
             )
             pid_sets.append({r[0] for r in rows if r[0]})
         except Exception:
@@ -833,7 +856,7 @@ async def aggregate_performance_history(
     out: dict[str, dict] = {}
     for pid in pids:
         per_db = [
-            await _per_db_history(db, pid, days=days) for db in dbs
+            await _per_db_history(db, pid, days=days, now=effective_now) for db in dbs
         ]
         merged = _merge_history(per_db)
         out[pid] = {
