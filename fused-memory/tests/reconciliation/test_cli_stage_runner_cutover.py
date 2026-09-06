@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -306,6 +307,167 @@ class TestReconConfigDirHelpers:
 
         # No dir created — GC must be a silent no-op (ignore_errors), never raise.
         gc_run_config_dir(tmp_path, 'never-created')
+
+    def test_recon_config_base_dir_absolutizes_a_relative_data_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """A relative ``data_dir`` must still yield an ABSOLUTE config-dir root.
+
+        The root returned here becomes ``TaskConfigDir.path``, which is BOTH the
+        ``CLAUDE_CONFIG_DIR`` handed to the CLI child
+        (``shared/src/shared/cli_invoke.py::invoke_claude_agent`` sets
+        ``env['CLAUDE_CONFIG_DIR'] = str(config_dir)``) and the path the parent
+        verifies in
+        ``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``.
+        A RELATIVE string is resolved against two different cwds: the child's
+        (``_run_subprocess`` spawns with ``cwd=`` ``config.explore_codebase_root``)
+        and the parent's (every ``os.path.realpath`` in the guard). Verified path
+        A, written path B — the containment check says PASS while every transcript
+        write is denied by the kernel.
+
+        ``fused-memory/config/config.yaml`` supplies ``./data/reconciliation``
+        whenever ``RECONCILIATION_DATA_DIR`` is unset, which
+        ``scripts/fused-memory.service.template`` does not set — so the relative
+        case is the standalone/systemd production configuration, not a hypothetical.
+        """
+        from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
+
+        monkeypatch.chdir(tmp_path)
+        base = recon_config_base_dir(Path('data/reconciliation'))
+
+        assert base.is_absolute(), (
+            f'Config-dir root must be absolute so the parent and the CLI child '
+            f'name the same directory; got {base!r}'
+        )
+        assert base == tmp_path / 'data' / 'reconciliation' / 'recon-config', (
+            f'A relative data_dir must anchor at the process cwd (the same '
+            f'implicit anchor ReconciliationJournal.initialize already uses for '
+            f'reconciliation.db); got {base!r}'
+        )
+
+    def test_recon_config_base_dir_is_cwd_independent_for_an_absolute_data_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """An already-absolute ``data_dir`` is untouched, from any cwd.
+
+        The pre-existing ``test_recon_config_base_dir`` leaf pins the VALUE; this
+        pins that the value does not depend on where the process happens to be
+        standing. Together they hold the "absolutize a relative input, leave an
+        absolute one byte-identical" contract — the reason the fix uses
+        ``Path.cwd() / base`` rather than ``.resolve()``, which would additionally
+        collapse symlink components of an already-absolute deployment path.
+        """
+        from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
+
+        here = tmp_path / 'here'
+        there = tmp_path / 'there'
+        here.mkdir()
+        there.mkdir()
+
+        monkeypatch.chdir(here)
+        from_here = recon_config_base_dir(tmp_path)
+        monkeypatch.chdir(there)
+        from_there = recon_config_base_dir(tmp_path)
+
+        assert from_here == from_there == tmp_path / 'recon-config', (
+            f'An absolute data_dir must yield the same root from any cwd; got '
+            f'{from_here!r} and {from_there!r}'
+        )
+
+    def test_gc_run_config_dir_removes_the_cwd_anchored_dir_for_a_relative_data_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """The GC must target the same absolute path the creator built.
+
+        ``gc_run_config_dir`` derives its rmtree target from
+        ``recon_config_base_dir``, so absolutizing there fixes the GC for free —
+        this leaf pins that it actually did, rather than leaving the GC pointed
+        at a cwd-relative path that silently rmtrees nothing (``ignore_errors=True``
+        makes a wrong target indistinguishable from a clean no-op).
+        """
+        from fused_memory.reconciliation.cli_stage_runner import (
+            gc_run_config_dir,
+            recon_config_base_dir,
+        )
+
+        doomed = tmp_path / 'data' / 'reconciliation' / 'recon-config' / 'claude-config-r1'
+        doomed.mkdir(parents=True)
+
+        monkeypatch.chdir(tmp_path)
+        gc_run_config_dir(Path('data/reconciliation'), 'r1')
+
+        assert not doomed.exists(), (
+            f'GC must remove the cwd-anchored dir the creator built; {doomed} '
+            f'still exists, so the GC and the creator disagree on the path'
+        )
+        # Control: the root the GC derives is the absolute one, not a relative
+        # sibling accidentally created under the cwd by the rmtree call.
+        assert recon_config_base_dir(Path('data/reconciliation')).is_absolute()
+
+    def test_production_chain_yields_an_absolute_config_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end: the real chain survives the fail-closed guard tightening.
+
+        Composes exactly what ``stages/base.py::BaseStage.run`` does —
+        ``TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(journal.data_dir))``
+        — with the PARENT standing in one directory and the CLI child spawned in
+        ANOTHER (``run_stage_via_cli`` passes ``cwd=config.explore_codebase_root``
+        to both ``resolve_recon_sandbox_wrap`` and ``_run_subprocess``). That
+        divergence is the whole defect: with a relative ``data_dir`` the two
+        components resolve one string against two cwds.
+
+        This is the leaf that proves the guard tightenings do NOT fail-close the
+        real production chain: the config dir must be absolute, must exist where
+        the parent created it, and must actually appear as a ``--writable`` grant
+        in the wrapped argv the child will run.
+        """
+        from unittest.mock import patch as _patch
+
+        from shared.config_dir import TaskConfigDir
+
+        from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
+        from fused_memory.reconciliation.sandbox_guard import resolve_recon_sandbox_wrap
+
+        parent_cwd = tmp_path / 'parent'
+        child_root = tmp_path / 'child'
+        parent_cwd.mkdir()
+        child_root.mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        cfg = TaskConfigDir(
+            task_id='run-x',
+            base_dir=recon_config_base_dir(Path('data/reconciliation')),
+        )
+
+        assert cfg.path.is_absolute(), (
+            f'The per-run CLAUDE_CONFIG_DIR must be absolute; got {cfg.path!r}'
+        )
+        expected = (
+            parent_cwd / 'data' / 'reconciliation' / 'recon-config' / 'claude-config-run-x'
+        )
+        assert cfg.path == expected, f'Expected {expected!r}; got {cfg.path!r}'
+        assert cfg.path.is_dir(), (
+            f'{cfg.path} must exist where the parent created it — the CLI child '
+            f'writes its session JSONL there'
+        )
+
+        with _patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            wrap = resolve_recon_sandbox_wrap(
+                child_root, [str(cfg.path)], config_dir=cfg.path,
+            )
+            wrapped = wrap(['claude', '--print'])
+
+        writable_vals = [
+            wrapped[i + 1] for i, tok in enumerate(wrapped) if tok == '--writable'
+        ]
+        assert str(cfg.path) in writable_vals, (
+            f'The absolute config dir must be granted in the argv the child runs; '
+            f'got {writable_vals!r}'
+        )
 
 
 class TestResumeParamForwarding:
