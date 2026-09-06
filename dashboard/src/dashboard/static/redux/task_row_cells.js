@@ -130,11 +130,15 @@ function strandBadgeState(task, opts) {
 // would re-create this very defect one layer down.
 //
 // `color` is present-and-null for a real agent, never omitted — deliberately
-// the opposite of how compact omits marginLeft above. That descriptor gets
-// SPREAD, where a present-but-undefined key would emit a stray style attribute;
-// these two sites BRANCH on the field instead. A key that is always present
-// makes `ac.color ? … : ac.text` a total function over a stable shape, and
-// keeps "no colour override" an affirmative decision rather than an absent key.
+// the opposite of how compact omits marginLeft above. The two resolutions have
+// DIFFERENT reasons, and neither is about spreading: no call site spreads
+// either descriptor, they all read explicit fields. compact omits marginLeft
+// because that site renders no `style` attribute at all (see the badge note
+// above), so there is nothing for the key to feed; these two agent-cell sites
+// BRANCH on `color`, so it must always be there to branch on. A key that is
+// always present makes `ac.color ? … : ac.text` a total function over a stable
+// shape, and keeps "no colour override" an affirmative decision rather than an
+// absent key.
 //
 // An empty-string agent is treated as absent — a blank cell would be
 // indistinguishable from a failed load, and the placeholder is the
