@@ -23,14 +23,20 @@ from escalation import archive
 # makes this import legal at all: dedupe.py imports THIS module at module level,
 # so queue.py can never import dedupe.py, where the transform used to live.
 from escalation.canonical import canonical_root_cause
-from escalation.classify import default_resolution_class_for_resolver
+from escalation.classify import classify_resolver_tier, default_resolution_class_for_resolver
 
 # max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
 # stay total over (task 3976), so server.py can share it without reaching for a
 # module-private symbol.  Imported under its real, public name: it is a shared
 # cross-module helper, and spelling it `_max_severity` here would signal the
 # opposite at every use site.
-from escalation.models import RESOLUTION_CLASSES, Amendment, Escalation, max_severity
+from escalation.models import (
+    RESOLUTION_CLASSES,
+    Amendment,
+    Escalation,
+    LateResolution,
+    max_severity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1154,6 +1160,16 @@ class EscalationQueue:
         the lock ensures that two concurrent resolves for the same id
         serialize and produce exactly one archive copy.
 
+        Already-terminal calls are a NON-LOSSY no-op (task 4495).  The record's
+        ``status`` / ``resolution`` / ``resolved_at`` / ``resolved_by`` are never
+        moved — downstream waiters have already consumed that terminal state —
+        but when the stored close was an AUTOMATED sweep and the incoming call
+        is a substantive human/agent resolution, the incoming text is appended to
+        ``late_resolutions`` and persisted IN PLACE at ``_locate_path`` (see
+        ``_write_late_resolution``), inside this same critical section so the
+        capture is atomic with the check-and-set it follows.  See
+        ``_is_late_resolution_worth_capturing`` for the predicate.
+
         Callbacks and cascade run AFTER releasing the lock:
         - ``_resolve_callback`` fires after the lock is released, preventing
           re-entrant callback → resolve deadlocks.
@@ -1212,6 +1228,37 @@ class EscalationQueue:
                 logger.info(
                     f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
                 )
+                # NON-LOSSY no-op (task 4495): the incoming text is refused, not
+                # DISCARDED.  See _is_late_resolution_worth_capturing for why the
+                # predicate is narrow.  Still inside escalation_id_lock, so the
+                # capture is atomic with the check-and-set it follows.
+                if (
+                    esc.status == 'dismissed'
+                    and classify_resolver_tier(esc.resolved_by) == 'reaper-sweep'
+                    and resolution
+                ):
+                    entry: LateResolution = {
+                        'timestamp': datetime.now(UTC).isoformat(),
+                        'resolution': resolution,
+                        'resolved_by': resolved_by,
+                        'resolution_action': None,
+                        'dismiss': dismiss,
+                        'prior_resolution_class': None,
+                    }
+                    esc.late_resolutions.append(entry)
+                    if self._write_late_resolution(escalation_id, esc):
+                        if outcome is not None:
+                            outcome['late_resolution_captured'] = True
+                        logger.warning(
+                            'Escalation %s was already dismissed by %r; a LATE '
+                            'resolution from %r arrived after that automated '
+                            'dismissal and has been CAPTURED in late_resolutions '
+                            '(the record\'s terminal state is unchanged): %s',
+                            escalation_id, esc.resolved_by, resolved_by,
+                            resolution[:200],
+                        )
+                    else:
+                        esc.late_resolutions.pop()
                 return esc
 
             if outcome is not None:
@@ -2213,6 +2260,50 @@ class EscalationQueue:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
+
+    def _write_late_resolution(self, escalation_id: str, esc: Escalation) -> bool:
+        """Persist a late-resolution capture IN PLACE.  Returns True if it landed.
+
+        Writes to ``_locate_path(escalation_id)`` — wherever the record actually
+        lives — via ``_atomic_write_path``.  Deliberately NOT ``_atomic_write``,
+        which is hard-wired to ``queue_dir/{id}.json``: by the time a late
+        resolution arrives the record has been moved into the dated archive by
+        ``_archive_resolved``, so a root-targeted write would leave a SECOND copy
+        beside the archived one — resurrecting a closed record onto the
+        pending-scan surface and creating exactly the orphan state
+        ``TestResolveIdempotent`` exists to prevent.  Also NOT
+        ``_archive_resolved``, which would try to move an already-archived file.
+        ``patch_resolution_metadata`` is the established precedent for patching
+        an already-archived record in place.
+
+        FAIL-CLOSED and LOUD: a missing path or a failed write returns False
+        (the caller then drops the in-memory entry rather than reporting a
+        capture that is not on disk) and logs a WARNING carrying the text that
+        could not be persisted, so the resolution is at worst degraded to
+        log-only — never silently lost, and never reported as captured when it
+        was not.  A capture failure must not crash the resolve() it rode in on:
+        the caller's real business (reporting the record's terminal state) is
+        already done.
+        """
+        path = self._locate_path(escalation_id)
+        if path is None:
+            logger.warning(
+                'Could not locate on-disk record for %s; late resolution NOT '
+                'persisted and survives only in this log line: %s',
+                escalation_id, esc.late_resolutions[-1] if esc.late_resolutions else None,
+            )
+            return False
+        try:
+            self._atomic_write_path(path, esc.to_json())
+        except Exception as exc:
+            logger.warning(
+                'Failed to persist late resolution for %s to %s: %s; it survives '
+                'only in this log line: %s',
+                escalation_id, path, exc,
+                esc.late_resolutions[-1] if esc.late_resolutions else None,
+            )
+            return False
+        return True
 
     def _archive_resolved(self, escalation_id: str, resolved_at: str) -> None:
         """Best-effort move ``queue_dir/{escalation_id}.json`` into the dated archive subdir.
