@@ -560,11 +560,30 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > anywhere in a recovered item's value. Its own stated rule is narrower ("the value is
 > itself doubly corrupted, so its boundary is a guess"), and 4502 restored the
 > implementation to that rule as an **alternative-boundary test**: an inner closer
-> blocks recovery iff **(i)** it names the item itself, the item's opener-dialect
-> closer (`parameter`), or `invoke`; or **(ii)** reading it as this item's terminator
-> also yields a valid parse of the remainder. Otherwise it is quoted prose and
-> recovery proceeds. No allowlist, no record-shape detector, no per-tool carve-out —
-> a narrowing toward the documented contract, not a new exception.
+> blocks recovery iff **(i)** it names the item itself, **either dialect's** closer
+> for it — the name-echoing closer **and** the canonical `parameter`, the latter
+> regardless of which dialect the item's *opener* used — or `invoke`; or **(ii)**
+> reading it as this item's terminator also yields a valid parse of the remainder.
+> Otherwise it is quoted prose and recovery proceeds. No allowlist, no record-shape
+> detector, no per-tool carve-out — a narrowing toward the documented contract, not a
+> new exception.
+>
+> *Amended (esc-4502-3), and the amendment is load-bearing.* Condition (i) first
+> shipped as "the item's **opener-dialect** closer (`parameter`)", implemented as
+> `inner_name in (name, closer_name)`. Those two entries coincide only in the
+> canonical dialect: for an **echo**-dialect item `closer_name` IS the item's own
+> name, so the tuple collapsed to one entry and `parameter` fell out of the block set.
+> Measured consequence — a value opening echo-dialect for `agent_id` and closing with
+> the canonical `parameter` closer recovered `agent_id` as `'claude-interactive'` plus
+> that closer plus a whole trailing next-tool-call paragraph, reported as
+> `outcome=repaired` and, under FORWARD_REPAIR, written straight into the tool's
+> arguments. The mirror pairing (canonical opener / echo closer) was refused
+> throughout; the gap existed precisely because one pairing was pinned by a negative
+> control and its mirror was not. `parameter` is therefore listed **categorically**,
+> because `_parse_body` treats it as a *universal* terminator — a property of the
+> parser, not of the opener — and the dialects demonstrably blend. Negative control
+> (d) in `TestQuotedReportIsRepairable` pins the mirror; unlike controls (a)–(c) it is
+> not a both-ways control, and fails without this amendment.
 >
 > *The invariant that did NOT move.* `clean_value` stays envelope-free, stated against
 > `detect_for`. That is C1's post-condition on the value the repairer **rewrote**, and
