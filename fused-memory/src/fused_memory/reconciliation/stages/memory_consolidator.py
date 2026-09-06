@@ -147,8 +147,7 @@ class MemoryConsolidator(BaseStage):
     # the model conclude something FALSE. Every builder therefore renders these
     # via _render_required_sections() — adding a section is ONE edit here, not
     # one edit per builder. Enforced by
-    # tests/reconciliation/test_stage1_payload_section_parity.py, which also
-    # cross-checks this tuple against STAGE1_SYSTEM_PROMPT in both directions.
+    # tests/reconciliation/test_stage1_payload_section_parity.py.
     #
     # Replaces the drift mechanism behind three hand-fixed instances of the same
     # defect — tasks 2150, 2552 and 3839 each wired ONE section into ONE missed
@@ -161,9 +160,9 @@ class MemoryConsolidator(BaseStage):
     #     returns '' when task_count_verification is None, which is exactly the
     #     remediation-pass state, so registering it would be a no-op.
     #   * _build_project_root_directive — required in all three payloads, but as
-    #     an unconditional directive with NO absence-inference in any prompt.
-    #     Registering it would make the registry↔prompt sync guard unsatisfiable
-    #     by construction; it keeps its own dedicated tests instead (task 2552).
+    #     an unconditional directive with NO absence-inference in any prompt, so
+    #     it falls outside this tuple's inclusion criterion. It keeps its own
+    #     dedicated tests instead (task 2552).
     REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
         RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
     )

@@ -22,6 +22,20 @@ That sentence makes absence load-bearing: a builder that omits the section is
 not merely terser, it makes the model conclude something FALSE. That — not
 symmetry for its own sake — is what makes the section mandatory.
 
+That correspondence between prompt and registry is maintained BY HAND — a
+human-checked inclusion criterion, recorded once in the ``REQUIRED_SECTIONS``
+comment in ``memory_consolidator.py`` — and is deliberately NOT
+machine-asserted. Parsing the prompt for the sentence above pins its WORDING,
+not its contract: the sentence can be reworded with the header identifier and
+the payload contract fully intact ("… does not appear in the payload …") and
+any such pattern then reports spurious drift, while a genuinely new
+absence-inference phrased differently is silently missed. An earlier revision
+of this file asserted exactly that, in both directions, and it was deleted for
+this reason. Do not re-add it, and do not replace it with a tighter pattern —
+that is the same defect with a smaller blast radius. The required set is
+pinned instead as a VALUE, by
+:meth:`TestRequiredSectionsRegistry.test_registry_contains_the_live_workflow_section`.
+
 "All builders emit the same set" is the WRONG invariant and would force real
 regressions. Deliberately NOT swept in:
 
@@ -34,11 +48,10 @@ regressions. Deliberately NOT swept in:
 * ``_build_project_root_directive`` — this one IS required in all three
   builders, but for a different reason: it is an unconditional directive with
   no absence-inference attached anywhere in the prompts. Registering it would
-  satisfy an intuition about "things all builders need" while making
-  :class:`TestRegistryMatchesPromptAbsenceInference` unsatisfiable by
-  construction — the registry would hold a member the prompt never infers
-  from. It stays covered by its own dedicated tests in
-  ``tests/reconciliation/test_stage1.py`` (task 2552).
+  satisfy an intuition about "things all builders need" while falling outside
+  this registry's stated inclusion criterion — the registry would hold a
+  member the prompt never infers from. It stays covered by its own dedicated
+  tests in ``tests/reconciliation/test_stage1.py`` (task 2552).
 
 WHY THIS IS NOT A FOURTH INSTANCE OF THE DEFECT
 -----------------------------------------------
@@ -50,33 +63,22 @@ someone remembered. Here:
   and consumed by all builders through one aggregator — adding a section is a
   single edit, not one edit per builder;
 * the BUILDER set is DERIVED by AST introspection over the class body, so a
-  fourth builder is in scope the day it is added with no edit here;
-* the section set is cross-checked against the prompt that makes it required,
-  in both directions.
+  fourth builder is in scope the day it is added with no edit here.
 
 The only hand-written literals are the registry itself (the intended single
 edit point) and a discovery FLOOR, which can only ever be too small — and being
 too small fails loudly.
-
-Scope note: :data:`STAGE1_SYSTEM_PROMPT` only. ``prompts/stage2.py`` carries
-the byte-identical absence-inference sentence, but it describes Stage 2's own
-payload, built by two separate ``assemble_payload`` methods in
-``task_knowledge_sync.py`` that this task deliberately does not govern.
-Asserting over stage2 here would couple Stage-1's registry to Stage-2 prompt
-drift.
 """
 
 from __future__ import annotations
 
 import ast
 import pathlib
-import re
 
 import pytest
 from _ast_guard import calls_named, parse_python_module
 
 import fused_memory.reconciliation.stages.memory_consolidator as consolidator_module
-from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 from reconciliation.test_stage1 import _make_consolidator
@@ -89,27 +91,6 @@ CONSOLIDATOR_CLASS = 'MemoryConsolidator'
 # f-string opening with the top-level markdown header. See
 # _discover_stage1_payload_builders for the verified discrimination.
 _PAYLOAD_HEADER_PREFIX = '## '
-
-# The machine-readable shape of the prompt's absence-inference sentence. Applied
-# to the IMPORTED runtime string rather than raw source, so the prompt's
-# backslash line-continuations are already joined and the pattern matches the
-# text the model actually receives. Verified to yield exactly
-# ['### Live-Workflow Signals'] against the current prompt.
-_ABSENCE_INFERENCE = re.compile(r'`(###[^`\n]{1,80})`[^.`]{0,80}?\bis absent from the payload')
-
-_REGEX_REPAIR_HINT = (
-    f'The pattern is {_ABSENCE_INFERENCE.pattern!r}, applied to the imported '
-    f'STAGE1_SYSTEM_PROMPT. Two repairs are possible and they are NOT '
-    f'interchangeable: if the prompt sentence was merely REWORDED, fix the '
-    f'pattern in this file; if a NEW absence-inference was added to the prompt, '
-    f'add that section to MemoryConsolidator.REQUIRED_SECTIONS so the inference '
-    f'is actually sound.'
-)
-
-
-def _prompt_absence_inference_headers() -> set[str]:
-    """Every ``### …`` header STAGE1_SYSTEM_PROMPT attaches an absence-inference to."""
-    return set(_ABSENCE_INFERENCE.findall(STAGE1_SYSTEM_PROMPT))
 
 
 def _returns_a_whole_payload(node: ast.AST) -> ast.Return | None:
@@ -379,53 +360,6 @@ class TestRenderRequiredSections:
             "_render_required_sections() must return '' when no section applies — "
             "each renderer keeps its own conditional-empty contract and '' is a "
             f'normal result, keeping the payload tight. Got: {rendered!r}'
-        )
-
-
-class TestRegistryMatchesPromptAbsenceInference:
-    """The registry and the shipped prompt must agree on what is inference-bearing.
-
-    Both containments are asserted because they catch OPPOSITE defects, and only
-    one of them is the defect this task closes:
-
-    * prompt → registry catches a new absence-inference with no enforcement
-      behind it, i.e. an inference the model is told to make that is unsound by
-      construction. That is the gate-3833 defect itself.
-    * registry → prompt catches a registry drifting wider than its own stated
-      inclusion criterion, which would quietly turn this guard into "all
-      builders emit the same set" — the invariant the task ruled out.
-
-    ``prompts/stage2.py`` carries the symmetric sentence for Stage 2's own
-    builders and is deliberately NOT asserted here (see the module docstring).
-    """
-
-    def test_prompt_absence_inferences_are_all_registered(self):
-        registered = {s.header for s in MemoryConsolidator.REQUIRED_SECTIONS}
-        inferred = _prompt_absence_inference_headers()
-
-        unenforced = inferred - registered
-        assert not unenforced, (
-            f'STAGE1_SYSTEM_PROMPT tells the model to infer something from the '
-            f'ABSENCE of {sorted(unenforced)}, but no MemoryConsolidator.'
-            f'REQUIRED_SECTIONS member covers it — so a payload builder may omit '
-            f'the section and the model will confidently conclude something false. '
-            f'Registered today: {sorted(registered)}. {_REGEX_REPAIR_HINT}'
-        )
-
-    def test_registry_has_no_section_the_prompt_never_infers_from(self):
-        registered = {s.header for s in MemoryConsolidator.REQUIRED_SECTIONS}
-        inferred = _prompt_absence_inference_headers()
-
-        unjustified = registered - inferred
-        assert not unjustified, (
-            f'MemoryConsolidator.REQUIRED_SECTIONS registers {sorted(unjustified)}, '
-            f'but STAGE1_SYSTEM_PROMPT draws no inference from those sections being '
-            f'absent — so the registry has drifted wider than its own inclusion '
-            f'criterion and is on its way to "all builders emit the same set", the '
-            f'invariant task 4708 explicitly ruled out. Sections that all builders '
-            f'happen to need but that carry no absence-inference (e.g. the '
-            f'project_root directive) belong in their own dedicated tests, not '
-            f'here. Prompt infers from: {sorted(inferred)}. {_REGEX_REPAIR_HINT}'
         )
 
 
