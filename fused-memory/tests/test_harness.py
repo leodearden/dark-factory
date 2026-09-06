@@ -20400,3 +20400,60 @@ async def test_finding_suppressed_by_the_live_workflow_gate_is_not_routed(
         e for e in harness._escalation_queue.get_pending()
         if e.summary.startswith('Persistently unresolved after remediation')
     ] == []
+
+
+@pytest.mark.asyncio
+async def test_bare_task_id_finding_is_gated_by_the_live_workflow_check(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Inherited layer 4, on the BARE-`task_id` branch — the bypass this closes.
+
+    Contrast with `test_finding_suppressed_by_the_live_workflow_gate_is_not_routed`
+    directly above, which supplies `cited_tasks` and therefore never exercised
+    this path. The remediation pass's live-workflow gate iterates CITED task ids
+    only, so a finding whose target comes from the bare `finding['task_id']`
+    field — the fixture shape, and the commoner one — leaves `cited_task_ids`
+    EMPTY. `any_live` is then vacuously False and the routed filing lands even
+    though the task has live work in flight, which is exactly the case the gate
+    exists to suppress.
+
+    So the routed filing cannot simply INHERIT the gate on this branch: the
+    resolved target has to be gated explicitly. Two assertions, and the second
+    is what keeps the fix narrow:
+
+    (a) ZERO routed records — the resolved target is gated;
+    (b) the pre-existing `recon_integrity_issue` record STILL lands on the recon
+        queue, because the `_escalate` gate is keyed on cited task ids and must
+        NOT be widened by this fix. Widening it would silently suppress recon
+        escalations that file today, a behaviour change well outside this arm.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as _h
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    # The fixture as-is: a bare task_id, NO cited_tasks.
+    finding = _orch_finding()
+    assert 'cited_tasks' not in finding, (
+        'this test is only meaningful while the fixture leaves cited_task_ids empty'
+    )
+    monkeypatch.setattr(_h, 'is_workflow_live_for_task', lambda *a, **k: True)
+
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=4)
+
+    assert _routed_records(orch_dir) == [], (
+        'task 4458 has a live workflow; the routed filing must be suppressed on '
+        'the bare-task_id branch too, not only when the finding cites the task'
+    )
+    # (b) The existing recon-queue gate is UNCHANGED: with no cited tasks it was
+    # vacuously not-live before this fix and must stay that way after it.
+    assert [
+        e for e in harness._escalation_queue.get_pending()
+        if e.summary.startswith('Persistently unresolved after remediation')
+    ] != [], (
+        'the fix must gate only the NEW routed filing — widening the _escalate '
+        'gate to the resolved target would silence recon escalations that file today'
+    )
