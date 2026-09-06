@@ -141,6 +141,16 @@ except ImportError:
 #     by BacklogPolicy.on_judge_unhalt — write and close stay with the class
 #     that owns that record, so this invariant is not contradicted.
 #   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
+#   - Task 4821: the harness now ALSO WRITES (and never resolves)
+#     `recon_task_finding` L1s to the per-project ORCHESTRATOR queue
+#     <project_root>/data/escalations/ — see
+#     ReconciliationHarness._file_finding_task_escalation.  This is NOT an A7b
+#     violation, on exactly the task-2998 scope note above that already
+#     sanctions BacklogPolicy's judge-halt write there: the invariant governs
+#     the RECON queue (config.escalation_queue_dir), and that is a DIFFERENT
+#     queue with a different reader.  Unlike BacklogPolicy, this filer does not
+#     close its own records either — an operator or the auto-watcher does, via
+#     the ordinary L1 ladder.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
     dataclasses.replace(
@@ -2660,6 +2670,16 @@ class ReconciliationHarness:
         - When finding is None, the fingerprint falls back to a description-only
           hash of the summary, so identical recurring messages fold while distinct
           ones stay individually visible.
+
+        Task id, and why this method keeps a SYNTHETIC one: every record filed
+        here carries ``task_id=f'recon-{run_id[:8]}'``.  That is deliberate and
+        stays — a recon escalation is about a RUN, and the port-8103 watcher
+        groups by it.  The cost is that a finding NAMING a task never surfaces
+        on that task's own ladder, because ``get_by_task`` filters on the
+        stored ``task_id`` field.  :meth:`_file_finding_task_escalation` (task
+        4821) closes that gap on the OTHER queue, carrying the REAL task id.
+        The two are complementary, not alternatives: both fire for the same
+        finding, and this one fires first and unconditionally.
         """
         if not HAS_ESCALATION or self._escalation_queue is None:
             return

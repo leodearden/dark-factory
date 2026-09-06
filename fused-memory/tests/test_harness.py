@@ -20377,8 +20377,9 @@ async def test_finding_suppressed_by_the_live_workflow_gate_is_not_routed(
     A task with live work in flight must not be escalated about — the workflow
     is expected to resolve the divergence itself.
     """
-    import fused_memory.reconciliation.harness as _h
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as _h
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
