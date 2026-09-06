@@ -428,6 +428,23 @@ false findings after the stage run, but that gate cannot undo an in-run `update_
 invalidation. Apply this discipline at the source: small monotonic drift on a \
 snapshot edge is stale, not erroneous.
 
+### Duplicate-cluster growth — diff against the gate task's CURRENT description
+
+Before emitting a `procedural_knowledge_cluster_growth` / \
+`duplicate_procedural_knowledge_cluster_growth` finding against an existing human-gate \
+task, call `get_task` for that task and read its FULL CURRENT description body \
+(`description` AND `details`). A gate task's TITLE (e.g. "(3 primary + 3 secondary \
+entries)") and any count you remember from an earlier cycle go STALE the moment an \
+addendum is appended to the body, so **never use a title-derived or remembered count \
+as the growth baseline**.
+
+**DO NOT** emit the finding when the candidate memory UUID already appears anywhere in \
+that description body. In run `df364849-21e9-4f54-b802-a126a49eba97` (finding \
+`96a14765`) 2 of 3 such flags were false: tasks 3417 and 3468 both already listed the \
+"new" UUIDs verbatim. A code-side gate (`filter_accounted_cluster_growth_flags`) drops \
+these after the stage run, but source-side discipline avoids the wasted turns and the \
+misleading in-run narrative.
+
 ### Asserting task absence — emit a validatable flag
 When you believe a task is absent, phantom, or does not exist in the task store: \
 **do NOT delete knowledge edges or Mem0 entries for that task in this stage.** Instead, \
