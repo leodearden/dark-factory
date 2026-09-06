@@ -12342,3 +12342,153 @@ class TestClusterGrowthExtractionHelpers:
         )
 
         assert _cluster_growth_candidate_task_ids(flag) == []
+
+
+# ---------------------------------------------------------------------------
+# ---- task 3476 step-5 ----
+# RED: the core drop path — reproduces the run-df364849 false positives.
+# ---------------------------------------------------------------------------
+
+
+class TestFilterAccountedClusterGrowthFlags:
+    """`filter_accounted_cluster_growth_flags` drops a cluster-growth finding
+    whose cited memory UUIDs are ALREADY written into the referenced task's
+    current description body (task 3476).
+
+    Closes the run-df364849-21e9-4f54-b802-a126a49eba97 / finding-96a14765
+    incident, in which 2 of 3 duplicate-cluster-growth flags were FALSE
+    POSITIVES.  The Stage-1 check diffed the candidate UUID against a
+    title-derived / remembered COUNT rather than against the task's current
+    body -- and task 3417's title still reads "(3 primary + 3 secondary
+    entries)" while its body already lists the "new" UUID verbatim as primary
+    entry #3 of 3.  Same shape for task 3468's "Cluster UUIDs (mem0)" list.
+
+    RED until step-6 adds the filter.
+    """
+
+    _UUID_3417 = '03b783d5-dc00-441a-af9d-05b0e636b668'
+    _UUID_3468 = '01499374-8029-4c01-baa0-b7851d2376cb'
+
+    def _make_growth_flag(
+        self,
+        *,
+        task_id: Any = '3417',
+        flag_type: str = 'procedural_knowledge_cluster_growth',
+        memory_ids: list[str] | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """A Stage-1 duplicate-cluster-growth finding, incident-shaped."""
+        ids = [self._UUID_3417] if memory_ids is None else memory_ids
+        flag: dict[str, Any] = {
+            'task_id': task_id,
+            'category': 'memory_duplicate',
+            'flag_type': flag_type,
+            'description': (
+                'Cluster has grown beyond the 3 primary + 3 secondary entries '
+                f'tracked by gate task {task_id}: mem0 {ids[0]} is unaccounted.'
+            ),
+            'cited_memories': [{'memory_id': m, 'store': 'mem0'} for m in ids],
+        }
+        flag.update(extra)
+        return flag
+
+    def _make_task_record(
+        self,
+        *,
+        task_id: Any = 3417,
+        title: str = (
+            'Human gate: consolidate npx-pyright EACCES procedural_knowledge '
+            'cluster (3 primary + 3 secondary entries)'
+        ),
+        description: str = '',
+        details: str = '',
+    ) -> dict[str, Any]:
+        return {
+            'id': task_id,
+            'title': title,
+            'description': description,
+            'details': details,
+        }
+
+    @pytest.mark.asyncio
+    async def test_task_3417_false_positive_is_dropped(self):
+        """The exact live 3417 false positive: title says 3+3, body lists the UUID."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description=(
+                'Primary entries:\n'
+                '  1. mem0 aaaaaaaa-0000-4c01-baa0-b7851d2376cb (2026-07-30T11:02)\n'
+                '  2. mem0 bbbbbbbb-0000-4c01-baa0-b7851d2376cb (2026-07-31T09:14)\n'
+                f'  3. mem0 {self._UUID_3417} (2026-08-01T00:20) — sudo chown ...\n'
+            ),
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'the cited UUID is already spelled out in task 3417\'s description '
+            f'body, so the growth flag must be DROPPED; got {result!r}. '
+            'RED: filter_accounted_cluster_growth_flags does not exist yet.'
+        )
+        taskmaster.get_task.assert_awaited_once_with('3417', '/df')
+
+    @pytest.mark.asyncio
+    async def test_task_3468_false_positive_with_duplicate_spelling_is_dropped(self):
+        """The 3468 shape, under the `duplicate_...` flag_type spelling."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            task_id='3468',
+            flag_type='duplicate_procedural_knowledge_cluster_growth',
+            memory_ids=[self._UUID_3468],
+        )
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            task_id=3468,
+            title='Human gate: consolidate the verify-lane cluster (4 entries)',
+            description=(
+                'Cluster UUIDs (mem0):\n'
+                '  - cccccccc-0000-4c01-baa0-b7851d2376cb\n'
+                f'  - {self._UUID_3468}\n'
+            ),
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'task 3468 already lists the cited UUID in its "Cluster UUIDs (mem0)" '
+            f'block, so the flag must be DROPPED; got {result!r}'
+        )
+        taskmaster.get_task.assert_awaited_once_with('3468', '/df')
+
+    @pytest.mark.asyncio
+    async def test_all_three_cited_uuids_present_drops(self):
+        """ALL-must-be-present, in its satisfied direction."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        uuids = [
+            self._UUID_3417,
+            self._UUID_3468,
+            '4a4daa2d-1111-4c01-baa0-b7851d2376cb',
+        ]
+        flag = self._make_growth_flag(memory_ids=uuids)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description='Tracked: ' + '\n'.join(f'  - mem0 {u}' for u in uuids),
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'every one of the three cited UUIDs appears in the body, so the flag '
+            f'must be DROPPED; got {result!r}'
+        )
