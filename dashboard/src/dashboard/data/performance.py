@@ -641,6 +641,7 @@ async def _hour_bucketed_history(
     project_id: str,
     *,
     days: int,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Return per-hour rows for *project_id* over the trailing *days* window.
 
@@ -648,10 +649,23 @@ async def _hour_bucketed_history(
     count of done tasks, count of one-pass (review_cycles=0 done) tasks,
     count of escalated (steward_invocations>0) tasks, and total tasks.
     Caller derives ratios.
+
+    Args:
+        now: Reference timestamp forwarded to :func:`_cutoff`. None (the
+            default) resolves to the current UTC clock.
     """
-    # Bucketing is fully covered by idx_task_results_project (project_id +
-    # completed_at). The strftime appears only in GROUP BY so it does not
-    # defeat the index — confirmed via EXPLAIN QUERY PLAN.
+    # The cutoff is bound as a TEXT parameter (via _cutoff) rather than
+    # computed SQL-side with datetime('now', ...): SQLite's datetime()
+    # renders SPACE-separated with no UTC offset, which — compared lexically
+    # against the ISO-with-offset `completed_at` column — short-circuits at
+    # index 10 and silently degrades to DATE granularity, over-including up
+    # to a full extra day (task 4624). Binding the cutoff instead keeps
+    # idx_task_results_project (project_id + completed_at) usable as a
+    # covering index for the WHERE clause — re-confirmed via EXPLAIN QUERY
+    # PLAN and pinned by
+    # TestHourBucketedHistoryWindowBoundary::test_binds_cutoff_as_parameter_and_keeps_covering_index.
+    # strftime appears only in the SELECT/ORDER BY, not the WHERE clause, so
+    # it does not defeat the index either.
     rows = await db.execute_fetchall(
         """
         SELECT strftime('%Y-%m-%dT%H:00', completed_at) AS bucket,
@@ -661,12 +675,12 @@ async def _hour_bucketed_history(
                steward_invocations
           FROM task_results
          WHERE project_id = ?
-           AND completed_at >= datetime('now', ? || ' days')
+           AND completed_at >= ?
            AND completed_at IS NOT NULL
            AND completed_at != ''
          ORDER BY bucket
         """,
-        (project_id, f'-{int(days)}'),
+        (project_id, _cutoff(days, now=now)),
     )
     buckets: dict[str, dict] = {}
     for row in rows:
