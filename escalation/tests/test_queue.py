@@ -7564,3 +7564,150 @@ class TestLateResolutionCapturePredicate:
         queue.resolve('esc-3902-1', stored, resolved_by='claude-task-3902-steward')
 
         self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+
+class TestLateResolutionCorrectsResolutionClass:
+    """The reported harm: "recorded as resolution_class=benign instead of carrying
+    the steward's actual finding".
+
+    `resolved_by='auto-dismissed'` classifies as tier 'reaper-sweep', which
+    `default_resolution_class_for_resolver` maps to 'benign' — so the sweep's
+    own stamp says "nothing actionable happened here" about a record whose
+    actual resolution was a real finding.  Capturing the text without correcting
+    the stamp would leave the dashboard aggregation still reading the lie.
+    """
+
+    LATE_TEXT = "the steward's real finding: verify never ran"
+    LATE_RESOLVER = 'claude-task-3902-steward'
+
+    def _auto_dismissed(
+        self, tmp_path: Path, *, stored_class: str | None = None,
+    ) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed', resolution_class=stored_class,
+        )
+        return queue
+
+    @staticmethod
+    def _outcome() -> ResolveOutcome:
+        return {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': 'poison',
+        }
+
+    def test_derived_benign_is_corrected_to_actionable(self, tmp_path: Path):
+        """(a)(d)(e) The derived stamp is re-stamped, the prior one preserved."""
+        queue = self._auto_dismissed(tmp_path)
+        seeded = queue.get('esc-3902-1')
+        assert seeded is not None and seeded.resolution_class == 'benign', (
+            f'setup: the auto-dismiss must derive benign, got {seeded.resolution_class!r}'
+        )
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER, outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'actionable', (
+            f'the derived benign stamp must be corrected: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] == 'actionable', (
+            f'the caller must learn the stamp was re-derived: {out}'
+        )
+        # (d) the correction DESTROYS nothing — the superseded stamp is on the entry.
+        assert record.late_resolutions[0]['prior_resolution_class'] == 'benign', (
+            f'the superseded stamp must be preserved: {record.late_resolutions[0]!r}'
+        )
+        # (e) the dashboard aggregation now reads the truth rather than the lie.
+        assert effective_benign(record) == ('actionable', 'stamped'), (
+            f'effective_benign must report the corrected stamp: {effective_benign(record)}'
+        )
+
+    def test_explicit_incoming_class_wins_over_the_actionable_default(self, tmp_path: Path):
+        """(b) 'actionable' is the DEFAULT, not an override of the caller."""
+        queue = self._auto_dismissed(tmp_path)
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER,
+            resolution_class='stale-strand', outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'stale-strand', (
+            f'an explicit incoming class must win: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] == 'stale-strand', f'{out}'
+        assert record.late_resolutions[0]['prior_resolution_class'] == 'benign'
+
+    @pytest.mark.parametrize('stored_class', ['actionable', 'moot-terminal-subject'])
+    def test_a_non_benign_stamp_is_never_overwritten(self, tmp_path: Path, stored_class: str):
+        """(c) Only the DERIVED benign is corrected.
+
+        'moot-terminal-subject' is task 2724's deliberately-distinct sweep stamp:
+        it says something specific about WHY the record was closed, and silently
+        flattening it to 'actionable' would destroy that distinction.  An
+        'actionable' stamp is already the truth this correction aims at.
+        """
+        queue = self._auto_dismissed(tmp_path, stored_class=stored_class)
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER, outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == stored_class, (
+            f'a non-benign stamp must survive: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] is None, (
+            f'nothing was corrected, so nothing must be reported: {out}'
+        )
+        # The TEXT is still captured — the capture and the correction are
+        # independent; only the correction is conditional on the stamp.
+        assert len(record.late_resolutions) == 1, (
+            f'the text must still be preserved: {record.late_resolutions!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded, so none is recorded: {record.late_resolutions[0]!r}'
+        )
+
+    def test_patch_resolution_metadata_preserves_the_capture_and_correction(
+        self, tmp_path: Path,
+    ):
+        """(f) The new field rides along through that method's full-record RMW.
+
+        `patch_resolution_metadata` is a `from_json` -> mutate -> `to_json`
+        rewrite of the WHOLE record (serialised under the same per-id lock since
+        commit 226c1ad696), and the steward calls it on records in exactly this
+        family.  A field it did not know about must survive it.
+        """
+        queue = self._auto_dismissed(tmp_path)
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER)
+
+        patched = queue.patch_resolution_metadata(
+            'esc-3902-1', resolved_by='claude-task-3902-steward-repatched',
+        )
+
+        assert patched is not None
+        assert patched.resolved_by == 'claude-task-3902-steward-repatched', 'setup: patch applied'
+        assert len(patched.late_resolutions) == 1, (
+            f'the RMW clobbered the capture: {patched.late_resolutions!r}'
+        )
+        assert patched.late_resolutions[0]['resolution'] == self.LATE_TEXT
+        assert patched.resolution_class == 'actionable', (
+            f'the RMW clobbered the correction: {patched.resolution_class!r}'
+        )
+
+        # And on disk, not merely on the returned object.
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert len(record.late_resolutions) == 1
+        assert record.resolution_class == 'actionable'
