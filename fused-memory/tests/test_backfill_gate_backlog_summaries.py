@@ -25,6 +25,7 @@ _mod = load_script_module(SCRIPT_PATH, mod_name='backfill_gate_backlog_summaries
 
 GATE_BACKLOG_CATEGORY = _mod.GATE_BACKLOG_CATEGORY
 is_legacy_gate_backlog_record = _mod.is_legacy_gate_backlog_record
+extract_gate_escalated_at = _mod.extract_gate_escalated_at
 
 
 # ---------------------------------------------------------------------------
@@ -129,3 +130,77 @@ class TestIsLegacyGateBacklogRecord:
     def test_empty_summary_is_not_selected(self):
         esc = _legacy_esc(summary='')
         assert is_legacy_gate_backlog_record(esc) is False
+
+
+# ---------------------------------------------------------------------------
+# extract_gate_escalated_at
+# ---------------------------------------------------------------------------
+
+
+class TestExtractGateEscalatedAt:
+    """Anchor recovery: a fail-closed prose parser that is NEVER a reformatter."""
+
+    def test_returns_the_anchor_byte_identically(self):
+        """Assert with ``==`` on the STRING, not a date comparison."""
+        assert extract_gate_escalated_at(LEGACY_DETAIL) == ANCHOR
+
+    def test_z_suffixed_value_round_trips_verbatim(self):
+        """A ``Z`` suffix stays a ``Z`` — the parse is a gate, not a normaliser."""
+        detail = LEGACY_DETAIL.replace(
+            f'gate_escalated_at: {ANCHOR}', 'gate_escalated_at: 2026-08-01T18:18:50Z'
+        )
+        assert extract_gate_escalated_at(detail) == '2026-08-01T18:18:50Z'
+
+    def test_crlf_detail_strips_only_the_trailing_cr(self):
+        detail = LEGACY_DETAIL.replace('\n', '\r\n')
+        assert extract_gate_escalated_at(detail) == ANCHOR
+
+    def test_missing_line_returns_none(self):
+        detail = '\n'.join(
+            line for line in LEGACY_DETAIL_LINES
+            if not line.startswith('gate_escalated_at: ')
+        )
+        assert extract_gate_escalated_at(detail) is None
+
+    def test_empty_value_returns_none(self):
+        detail = LEGACY_DETAIL.replace(
+            f'gate_escalated_at: {ANCHOR}', 'gate_escalated_at: '
+        )
+        assert extract_gate_escalated_at(detail) is None
+
+    def test_literal_none_token_returns_none(self):
+        """The emitter writes ``f'gate_escalated_at: {gate_escalated_at}'`` unguarded."""
+        detail = LEGACY_DETAIL.replace(
+            f'gate_escalated_at: {ANCHOR}', 'gate_escalated_at: None'
+        )
+        assert extract_gate_escalated_at(detail) is None
+
+    def test_unparseable_value_returns_none(self):
+        detail = LEGACY_DETAIL.replace(
+            f'gate_escalated_at: {ANCHOR}', 'gate_escalated_at: not-a-timestamp'
+        )
+        assert extract_gate_escalated_at(detail) is None
+
+    def test_empty_detail_returns_none(self):
+        assert extract_gate_escalated_at('') is None
+
+    def test_prefix_is_matched_at_line_start_and_first_wins(self):
+        """The anti-false-positive case that matters on real data.
+
+        A record whose multi-line ``description:`` block itself quotes a
+        ``gate_escalated_at: ...`` line must still yield the value from the real
+        line 4 — proving the parser scans for a LINE-START prefix and takes the
+        FIRST match, not a substring search anywhere in the blob.
+        """
+        decoy = 'gate_escalated_at: 1999-01-01T00:00:00+00:00'
+        detail = '\n'.join([*LEGACY_DETAIL_LINES, decoy])
+        assert extract_gate_escalated_at(detail) == ANCHOR
+
+    def test_mid_line_occurrence_is_not_matched(self):
+        """A prose line MENTIONING the key mid-sentence is not a match."""
+        detail = '\n'.join([
+            'project_id: dark_factory',
+            'task_id: 166',
+            'description: the record had gate_escalated_at: 1999-01-01T00:00:00+00:00 set',
+        ])
+        assert extract_gate_escalated_at(detail) is None
