@@ -7888,3 +7888,145 @@ class TestFilingClaimantIdentityStamp:
         assert esc is not None
         assert esc.level == 1
         assert esc.filing_claimant_run_id == self._ID
+
+
+class TestResolveIssueSurfacesLateResolution:
+    """The MCP caller must not be told "success" when its text was captured LATE.
+
+    `resolve_issue` returns `esc.to_dict()` — a perfectly healthy-looking
+    resolved/dismissed record — on both the applied and the already-terminal
+    path.  In the esc-3902-1 race the second is the one that happened, and the
+    resolving agent was told nothing (task 4495).
+    """
+
+    LATE_TEXT = "the steward's real finding: verify never ran"
+
+    def _auto_dismissed(self, queue: EscalationQueue, esc_id: str = 'esc-3902-1') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='3902',
+            agent_role='implementer',
+            severity='blocking',
+            category='task_failure',
+            summary='the L0 the steward was interrupted on',
+        )
+        queue.submit(esc)
+        queue.resolve(
+            esc_id, 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_late_capture_is_reported_to_the_caller(self, tmp_path: Path):
+        """(a) The return dict carries the flag AND a reason naming the dismisser."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert result.get('late_resolution_captured') is True, (
+            f'the caller must learn its text did not apply: {result}'
+        )
+        reason = result.get('late_resolution_reason', '')
+        assert 'auto-dismissed' in reason, (
+            f'the reason must name the automated dismisser that won: {reason!r}'
+        )
+        assert 'late_resolutions' in reason, (
+            f'the reason must say WHERE the text went: {reason!r}'
+        )
+        # The record dict is still the stored record — its terminal state was
+        # NOT changed, which is exactly what the flag is warning about.
+        assert result.get('status') == 'dismissed', f'{result}'
+        assert result.get('resolution') == (
+            'Auto-dismissed: steward interrupted (attempt cap)'
+        ), f'the stored resolution must not be overwritten: {result}'
+        assert result.get('late_resolutions'), (
+            f'the captured text must be visible on the returned record: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ordinary_resolve_reports_the_flag_as_false(self, tmp_path: Path):
+        """(b) The contract is EXPLICIT: the key is always present, not absent-on-success.
+
+        An always-present key is what lets a caller write
+        `if result['late_resolution_captured']` without a `.get` default that
+        silently reads a typo'd key as "fine".
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = Escalation(
+            id='esc-3902-2', task_id='3902', agent_role='implementer',
+            severity='blocking', category='task_failure', summary='an ordinary L0',
+        )
+        queue.submit(esc)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-2', resolution='really fixed it',
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert result.get('status') == 'resolved', f'{result}'
+        assert result['late_resolution_captured'] is False, (
+            f'the key must be present and False on the applied path: {result}'
+        )
+        assert 'late_resolution_reason' not in result, (
+            f'no reason belongs on a resolve that actually applied: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_terminal_path_does_not_resurrect_the_archived_record(
+        self, tmp_path: Path,
+    ):
+        """(c) The `rec.status == 'pending'` guard still skips the pre-stamp rewrite.
+
+        `queue._rewrite` targets the queue ROOT, so running it on an archived
+        record would leave a second copy there — the orphan state
+        `TestResolveIdempotent` exists to prevent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert not (queue.queue_dir / 'esc-3902-1.json').exists(), (
+            'the already-terminal path resurrected a queue-root copy'
+        )
+        archived = list((queue.queue_dir / 'archive').rglob('esc-3902-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy: {archived}'
+
+    @pytest.mark.asyncio
+    async def test_invalid_resolution_class_still_rejects_with_nothing_persisted(
+        self, tmp_path: Path,
+    ):
+        """(d) INV-1 is unaffected: a rejected call persists nothing and captures nothing."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward', resolution_class='not-a-class',
+        )
+
+        assert result.get('code') == 'invalid_resolution_class', f'{result}'
+        assert 'late_resolution_captured' not in result, (
+            f'a rejection is not a capture report: {result}'
+        )
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.late_resolutions == [], (
+            f'a rejected call must persist NOTHING: {record.late_resolutions!r}'
+        )
+        assert record.resolution_class == 'benign', (
+            f'a rejected call must not correct the stamp either: '
+            f'{record.resolution_class!r}'
+        )
