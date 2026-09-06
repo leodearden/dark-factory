@@ -19818,3 +19818,116 @@ def test_record_resume_failure_reads_its_threshold_live_off_config(
         'the narrowed 1s window must have pruned every earlier failure on this '
         'very call, leaving a count of 1'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 4821 (task 4764 arm 3) — route a Stage-3 finding that names a task id
+# onto that task's ORCHESTRATOR escalation queue
+# ---------------------------------------------------------------------------
+
+
+def _orch_finding(**over) -> dict:
+    """An actionable Stage-3 finding naming a real task id."""
+    finding = {
+        'finding_id': 'f-4458',
+        'severity': 'serious',
+        'category': 'memory_contradiction',
+        'description': 'Operator ruled Option A on esc-4458-87; the commit did the opposite',
+        'suggested_action': 'Re-read the operator ruling before closing',
+        'actionable': True,
+        'task_id': '4458',
+        'affected_ids': ['4458'],
+    }
+    finding.update(over)
+    return finding
+
+
+def _orch_queue_dir(root):
+    """The per-project ORCHESTRATOR escalation queue dir under *root*.
+
+    Distinct from the RECON queue (`config.escalation_queue_dir`, drained by the
+    port-8103 watcher) that `_escalate` writes to — see the A7b scope note.
+    """
+    return root / 'data' / 'escalations'
+
+
+def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
+    """Point 'test-project' at *tmp_path* and force the orchestrator-liveness gate."""
+    import fused_memory.reconciliation.harness as _h
+
+    harness._known_projects = dict(harness._known_projects)
+    harness._known_projects['test-project'] = str(tmp_path)
+    monkeypatch.setattr(_h, 'is_orchestrator_live_for', lambda _root: live)
+    return _orch_queue_dir(tmp_path)
+
+
+def test_file_finding_task_escalation_lands_l1_on_the_real_task(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A finding naming task 4458 files an L1 whose STORED task_id is 4458.
+
+    This is the acceptance SHAPE. `_escalate` files the same finding to the
+    recon queue under a synthetic `recon-<run8>` id, so the real task id
+    survives only inside the JSON detail — and `get_by_task`, which filters on
+    the stored `task_id` field, never surfaces it on task 4458's own ladder.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    esc_id = harness._file_finding_task_escalation(
+        'test-project', 'abcdef0123456789', _orch_finding(), 4,
+    )
+
+    assert esc_id, f'expected the filer to return an escalation id, got {esc_id!r}'
+    assert queue_dir.is_dir(), f'expected a queue at {queue_dir}'
+
+    pending = EscalationQueue(queue_dir).get_pending()
+    assert len(pending) == 1, f'expected exactly one record, got {[e.id for e in pending]}'
+    esc = pending[0]
+
+    assert esc.task_id == '4458', (
+        f'the STORED task_id must be the real one (get_by_task filters on this '
+        f'field, not on the filename), got {esc.task_id!r}'
+    )
+    assert not esc.task_id.startswith('recon-'), (
+        'the synthetic recon-<run8> id is what this arm exists to stop using'
+    )
+    assert esc.id.startswith('esc-4458-'), f'unexpected id stem: {esc.id!r}'
+    assert esc.id == esc_id
+    assert esc.level == 1, 'has_open_l1 reads level-1 records only'
+    assert esc.category == FINDING_TASK_ESCALATION_CATEGORY
+    assert esc.severity == 'info'
+    assert esc.agent_role == 'reconciliation-harness'
+    assert '4458' in esc.summary and 'memory_contradiction' in esc.summary
+
+    detail = json.loads(esc.detail)
+    assert detail['finding_id'] == 'f-4458'
+    assert detail['run_id'] == 'abcdef0123456789'
+    assert detail['project_id'] == 'test-project'
+    assert detail['persistence'] == 4
+
+
+def test_file_finding_task_escalation_resolves_via_same_project_citation(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """With no bare task_id, the same-project citation supplies the target."""
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    finding = _orch_finding(
+        task_id=None,
+        cited_tasks=[{'project_id': 'test-project', 'task_id': '4458', 'title': 'x'}],
+    )
+    esc_id = harness._file_finding_task_escalation('test-project', 'run-1', finding, 4)
+
+    assert esc_id
+    pending = EscalationQueue(queue_dir).get_pending()
+    assert [e.task_id for e in pending] == ['4458']
