@@ -12144,3 +12144,201 @@ class TestIsClusterGrowthFlagType:
             f'{flag_type!r} is not a str; the predicate must return False rather '
             'than raise (flag dicts are LLM-authored and unvalidated)'
         )
+
+
+# ---------------------------------------------------------------------------
+# ---- task 3476 step-3 ----
+# RED: the two pure extractors that feed the accounted-cluster-growth filter.
+# ---------------------------------------------------------------------------
+
+
+class TestClusterGrowthExtractionHelpers:
+    """`_cluster_growth_cited_memory_ids` / `_cluster_growth_candidate_task_ids`
+    read the flag's STRUCTURED citation channels only (task 3476).
+
+    Both are pure/sync/no-I/O and must be TOTAL over malformed LLM-authored
+    flag dicts -- a raised TypeError here would crash the whole Stage-1 filter
+    chain on one bad finding.
+
+    RED until step-4 adds the helpers.
+    """
+
+    _UUID_A = '03b783d5-dc00-441a-af9d-05b0e636b668'
+    _UUID_B = '01499374-8029-4c01-baa0-b7851d2376cb'
+    _UUID_C = '4a4daa2d-1111-4c01-baa0-b7851d2376cb'
+
+    # -- (a) _cluster_growth_cited_memory_ids ------------------------------
+
+    def test_cited_memory_ids_returns_ids_in_order(self):
+        """Every cited memory_id, in citation order."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        flag = {'cited_memories': [
+            {'memory_id': self._UUID_A, 'store': 'mem0'},
+            {'memory_id': self._UUID_B, 'store': 'mem0'},
+        ]}
+        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B], (
+            'cited memory ids must be returned in citation order. '
+            'RED: _cluster_growth_cited_memory_ids does not exist yet.'
+        )
+
+    def test_cited_memory_ids_are_deduped_preserving_first_position(self):
+        """A repeated citation contributes one id, at its first position."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        flag = {'cited_memories': [
+            {'memory_id': self._UUID_A, 'store': 'mem0'},
+            {'memory_id': self._UUID_B, 'store': 'mem0'},
+            {'memory_id': self._UUID_A, 'store': 'mem0'},
+        ]}
+        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B]
+
+    def test_cited_memory_ids_includes_graphiti_store_entries(self):
+        """A non-mem0 citation is INCLUDED -- conservative by design.
+
+        An unmatched graph-edge uuid can only fail the all-present test and
+        thereby force a KEEP, which is the fail-safe direction.  Excluding it
+        could let a partially-accounted finding be dropped.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        flag = {'cited_memories': [
+            {'memory_id': self._UUID_A, 'store': 'mem0'},
+            {'memory_id': self._UUID_B, 'store': 'graphiti'},
+        ]}
+        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B], (
+            'a graphiti citation must be INCLUDED: an unmatched id can only force '
+            'a KEEP, which is the fail-safe direction'
+        )
+
+    @pytest.mark.parametrize('entries', [
+        [{'store': 'mem0'}],                                   # missing memory_id
+        [{'memory_id': None, 'store': 'mem0'}],                # None memory_id
+        [{'memory_id': '', 'store': 'mem0'}],                  # blank memory_id
+        [{'memory_id': '   ', 'store': 'mem0'}],               # whitespace-only
+        [{'memory_id': 123, 'store': 'mem0'}],                 # non-str memory_id
+        ['not-a-dict'],                                        # non-dict entry
+        [None],                                                # None entry
+    ])
+    def test_cited_memory_ids_skips_malformed_entries(self, entries):
+        """Malformed citation entries are skipped, never raised on."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        assert _cluster_growth_cited_memory_ids({'cited_memories': entries}) == [], (
+            f'malformed cited_memories entry {entries!r} must be skipped'
+        )
+
+    @pytest.mark.parametrize('cited', [None, 'oops', 123, {}, []])
+    def test_cited_memory_ids_returns_empty_for_missing_or_non_list(self, cited):
+        """A missing / None / non-list cited_memories yields []."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_cited_memory_ids,
+        )
+
+        assert _cluster_growth_cited_memory_ids({'cited_memories': cited}) == []
+        assert _cluster_growth_cited_memory_ids({}) == []
+
+    # -- (b) _cluster_growth_candidate_task_ids ----------------------------
+
+    def test_candidate_task_ids_yields_top_level_task_id(self):
+        """The flag's own task_id is a candidate."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids({'task_id': '3417'}) == ['3417'], (
+            'the flag\'s own task_id must be a candidate. '
+            'RED: _cluster_growth_candidate_task_ids does not exist yet.'
+        )
+
+    def test_candidate_task_ids_splits_the_comma_joined_shape(self):
+        """A comma-joined task_id decomposes, each component stripped."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids(
+            {'task_id': '3417, 3468 ,3500'},
+        ) == ['3417', '3468', '3500']
+
+    def test_candidate_task_ids_tolerates_an_int_task_id(self):
+        """An int task_id is coerced to str."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids({'task_id': 3417}) == ['3417']
+
+    def test_candidate_task_ids_includes_cited_task_ids(self):
+        """Every cited_tasks[].task_id is also a candidate."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        flag = {
+            'task_id': None,
+            'cited_tasks': [
+                {'project_id': 'dark_factory', 'task_id': '3468', 'title': 'Human gate'},
+                {'project_id': 'reify', 'task_id': 42, 'title': 'Other'},
+            ],
+        }
+        assert _cluster_growth_candidate_task_ids(flag) == ['3468', '42']
+
+    def test_candidate_task_ids_dedupes_across_both_channels_preserving_order(self):
+        """Top-level ids come first; a repeat from cited_tasks is deduped."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        flag = {
+            'task_id': '3417,3468',
+            'cited_tasks': [
+                {'task_id': '3468'},   # duplicate of a top-level id
+                {'task_id': '3500'},
+            ],
+        }
+        assert _cluster_growth_candidate_task_ids(flag) == ['3417', '3468', '3500']
+
+    @pytest.mark.parametrize('entries', [
+        [{'project_id': 'dark_factory'}],       # missing task_id
+        [{'task_id': None}],                    # None task_id
+        [{'task_id': ''}],                      # blank
+        [{'task_id': '   '}],                   # whitespace-only
+        ['not-a-dict'],                         # non-dict entry
+        [None],
+    ])
+    def test_candidate_task_ids_skips_malformed_cited_task_entries(self, entries):
+        """Malformed cited_tasks entries are skipped, never raised on."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids(
+            {'task_id': None, 'cited_tasks': entries},
+        ) == [], f'malformed cited_tasks entry {entries!r} must be skipped'
+
+    @pytest.mark.parametrize('flag', [
+        {},
+        {'task_id': None},
+        {'task_id': ''},
+        {'task_id': '   '},
+        {'task_id': ','},
+        {'task_id': None, 'cited_tasks': []},
+        {'task_id': None, 'cited_tasks': None},
+        {'task_id': None, 'cited_tasks': 'oops'},
+    ])
+    def test_candidate_task_ids_returns_empty_when_nothing_resolvable(self, flag):
+        """No resolvable task id yields [] -- the caller then KEEPs the flag."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cluster_growth_candidate_task_ids,
+        )
+
+        assert _cluster_growth_candidate_task_ids(flag) == []
