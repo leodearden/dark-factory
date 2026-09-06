@@ -306,17 +306,25 @@ def _registered_plan_tool_names() -> frozenset[str]:
     root and asks it what it registered. Measured against the live tree — 16
     names, the 11 plan writers plus the 5 ``report_*``.
 
-    Cached because :func:`_undeclared_alternates` re-derives the candidate set
-    once per row, which would otherwise pay one server build per row for an
-    answer that cannot change within a process.
+    Cached because several callers ask for the registered surface, which
+    cannot change within a process; without it each would pay its own server
+    build.
+
+    The throwaway root is a ``TemporaryDirectory`` and is REMOVED again: it
+    only has to exist for the duration of the build, because neither
+    ``create_server`` nor ``list_tools`` ever writes an artifact through it —
+    the server merely closes over the ``TaskArtifacts`` and enumerates what it
+    registered. A bare ``mkdtemp`` here leaked one directory per test process
+    into the system temp dir for no benefit.
 
     ``asyncio.run`` is safe here: ``list_tools`` is a coroutine function
     (fastmcp 3.2.2) and this file has no ``async def`` test, so no loop is
     ever already running — ``asyncio_mode = "auto"`` governs async test
     functions only.
     """
-    server = plan_tools.create_server(TaskArtifacts(Path(tempfile.mkdtemp())))
-    return frozenset(tool.name for tool in asyncio.run(server.list_tools()))
+    with tempfile.TemporaryDirectory() as root:
+        server = plan_tools.create_server(TaskArtifacts(Path(root)))
+        return frozenset(tool.name for tool in asyncio.run(server.list_tools()))
 
 
 def _plan_writing_tool_names(registered: frozenset[str] | None = None) -> tuple[str, ...]:
@@ -602,10 +610,17 @@ def _undeclared_alternates(
     server's own registered tool surface.
     """
     monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
+    # Derived ONCE, not once per row: the module walk (a `vars(plan_tools)`
+    # scan plus an `inspect.getsource`/`ast.parse` per artifacts-first private
+    # function) cannot change while this loop runs, and paying it per row made
+    # its cost grow as rows x plan-tools surface. Deliberately hoisted rather
+    # than `lru_cache`d — the completeness tests monkeypatch new writers onto
+    # the module BETWEEN calls, and a cache would hide them.
+    candidates = _plan_writing_tool_names(registered)
     undeclared: set[tuple[str, str | None, str]] = set()
     for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
         owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
-        for tool_name in _plan_writing_tool_names(registered):
+        for tool_name in candidates:
             if tool_name == owner:
                 continue  # already reported as `tool`, not an "alternate"
             root = tmp_path / f'{record.collection}-{record.field}-{tool_name}'
