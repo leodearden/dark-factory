@@ -4059,9 +4059,16 @@ class GitOps:
         # The pre-commit hook in hooks/pre-commit strips .task/ from the
         # staging area on ALL branches.  core.hooksPath must point to
         # hooks/ (relative) so worktrees find the hook via their own
-        # working tree.  This is idempotent — safe to run every time.
+        # working tree.  Uses --replace-all rather than a plain set: a
+        # plain `git config core.hooksPath hooks` is REFUSED by git (exit
+        # 5, "cannot overwrite multiple values with a single value") if
+        # the key ever ends up holding more than one value (e.g. an
+        # external/manual `git config --add`), which would wedge every
+        # future worktree-create.  --replace-all instead CONVERGES from
+        # any prior state — absent, single, or duplicated — to exactly
+        # one value, so this call is safe to run every time.
         await _run(
-            ['git', 'config', 'core.hooksPath', 'hooks'],
+            ['git', 'config', '--replace-all', 'core.hooksPath', 'hooks'],
             cwd=self.project_root,
         )
 
@@ -4070,8 +4077,8 @@ class GitOps:
         # maintenance.auto=false on every worktree-create so background
         # auto-gc never fires under the narrow shared-.git write-set (and
         # any config drift/re-clone is re-covered).  Idempotent & best-effort
-        # (never raises) — same "safe to run every time" shape as the
-        # core.hooksPath block above.
+        # (never raises) — same "safe to run every time from any prior
+        # state" shape as the core.hooksPath block above.
         await self.disable_shared_repo_auto_maintenance()
 
         # ── Resolve start-ref: train-predecessor tip or freshened main ──

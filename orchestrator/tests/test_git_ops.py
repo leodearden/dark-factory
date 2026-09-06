@@ -419,6 +419,36 @@ class TestWorktreeLifecycle:
         assert (worktree_info.path / 'README.md').exists()
         assert len(worktree_info.base_commit) == 40
 
+    async def test_create_worktree_self_heals_duplicate_hooks_path(
+        self, git_ops: GitOps,
+    ):
+        """create_worktree must converge core.hooksPath even when it is already
+        duplicated in the shared config (task 4570).
+
+        A plain single-value `git config core.hooksPath hooks` is REFUSED by
+        git (exit 5, "cannot overwrite multiple values with a single value")
+        once the key already holds two values — which is exactly the jammed
+        state this self-heal exists to repair. Seed that jam directly (as an
+        external/manual mutation would) and confirm create_worktree both
+        succeeds and collapses the key back to a single "hooks" value.
+        """
+        await _run(['git', 'config', 'core.hooksPath', 'hooks'], cwd=git_ops.project_root)
+        await _run(['git', 'config', '--add', 'core.hooksPath', 'echo'], cwd=git_ops.project_root)
+        rc, dup_values, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert dup_values.strip().splitlines() == ['hooks', 'echo']
+
+        worktree_info = await git_ops.create_worktree('hooks-path-jam')
+        assert worktree_info.path.exists()
+
+        rc, resolved, _ = await _run(
+            ['git', 'config', '--get-all', 'core.hooksPath'], cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert resolved.strip().splitlines() == ['hooks']
+
     async def test_create_worktree_returns_worktree_info(self, git_ops: GitOps):
         """create_worktree returns WorktreeInfo with path and base_commit."""
         result = await git_ops.create_worktree('feature-wi')
