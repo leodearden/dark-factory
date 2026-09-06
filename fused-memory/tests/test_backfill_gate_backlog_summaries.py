@@ -598,3 +598,87 @@ class TestApplyRewritesFrozenFields:
         report = apply_rewrites(queue, plan)
         assert report['rewritten'] == 0
         assert report['skipped_missing'] == 1
+
+
+# ---------------------------------------------------------------------------
+# apply_rewrites — LOCK AND RE-READ (safety against live Stage-1 folds)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyRewritesLockDiscipline:
+    """These records are LIVE fold targets; every RMW must be lock-scoped."""
+
+    def test_takes_the_per_id_sidecar_lock(self, tmp_path: Path):
+        """Mirrors escalation/tests/test_sweep.py::TestSweepRelocationLock.
+
+        The sidecar is removed after seeding — ``queue.submit`` takes the same
+        lock, so leaving it in place would make this assertion vacuous.
+        """
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        plan = plan_rewrites(queue.get_pending())
+        (tmp_path / 'esc-166-1.json.lock').unlink()
+
+        apply_rewrites(queue, plan)
+
+        assert (tmp_path / 'esc-166-1.json.lock').exists(), (
+            'Expected sidecar lock file esc-166-1.json.lock in the queue root — '
+            'apply_rewrites must take escalation_id_lock around every '
+            'read-modify-write, because these records are live Stage-1 fold targets'
+        )
+
+    def test_a_concurrent_fold_is_not_reverted(self, tmp_path: Path):
+        """A fold landing after planning must survive the rewrite intact.
+
+        A lock-free ``get()`` -> mutate-the-planned-copy -> ``submit()`` would
+        silently revert ``dedupe_count``/``dedupe_children``/``updated_at`` —
+        exactly the mutation this backfill is forbidden to make.
+        """
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        plan = plan_rewrites(queue.get_pending())
+
+        # A Stage-1 cycle folds a repeat filing into this parent.
+        queue.attach_dedupe_child('esc-166-1', 'esc-166-9')
+        folded = json.loads((tmp_path / 'esc-166-1.json').read_text())
+
+        apply_rewrites(queue, plan)
+
+        after = json.loads((tmp_path / 'esc-166-1.json').read_text())
+        assert after['summary'] == rebuild_summary('166', ANCHOR)
+        assert after['dedupe_count'] == folded['dedupe_count'] == 8
+        assert after['dedupe_children'] == ['esc-166-2', 'esc-166-3', 'esc-166-9']
+        assert after['updated_at'] == folded['updated_at'] != FROZEN_UPDATED_AT
+
+    def test_record_no_longer_legacy_at_apply_time_is_skipped(self, tmp_path: Path):
+        """TOCTOU: re-check the predicate INSIDE the lock, as sweep does."""
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        plan = plan_rewrites(queue.get_pending())
+
+        raw = tmp_path / 'esc-166-1.json'
+        record = json.loads(raw.read_text())
+        record['summary'] = ANCHORED_SUMMARY
+        raw.write_text(json.dumps(record))
+
+        report = apply_rewrites(queue, plan)
+
+        assert report['rewritten'] == 0
+        assert report['skipped_no_longer_legacy'] == 1
+        assert json.loads(raw.read_text())['summary'] == ANCHORED_SUMMARY
+
+    def test_a_concurrent_detail_change_is_not_clobbered_by_stale_text(
+        self, tmp_path: Path
+    ):
+        """The rebuild must run on the FRESHLY READ record, not the planned string."""
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        plan = plan_rewrites(queue.get_pending())
+
+        raw = tmp_path / 'esc-166-1.json'
+        record = json.loads(raw.read_text())
+        fresh_detail = f'{LEGACY_DETAIL}\nnote: appended after planning'
+        record['detail'] = fresh_detail
+        raw.write_text(json.dumps(record))
+
+        apply_rewrites(queue, plan)
+
+        after = json.loads(raw.read_text())
+        assert after['detail'] == rebuild_detail(fresh_detail)
+        assert after['detail'].endswith('\nnote: appended after planning')
