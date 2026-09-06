@@ -21,27 +21,25 @@ rather than a raw yaml.safe_load: OrchestratorConfig is declared with
 would otherwise silently drop the value and revert to the field's default
 with no error anywhere. Mirrors
 tests/scripts/test_orchestrator_restart_config_drift.py::test_orchestrator_restart_config_round_trips_through_config_model.
+
+Anchors ``ORCH_CONFIG_PATH`` via the directory-wide ``root_config`` fixture
+(tests/scripts/conftest.py, task 4320/4598) rather than open-coding its own
+``monkeypatch.setenv`` + ``OrchestratorConfig()`` construction — see that
+fixture's docstring for why the anchor is load-bearing rather than hygiene.
 """
 
-import pathlib
-
-import pytest
 from orchestrator.config import LaneCommand, OrchestratorConfig
-
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
 
 def test_offline_lane_qdrant_config_round_trips_through_config_model(
-    monkeypatch: pytest.MonkeyPatch,
+    root_config: OrchestratorConfig,
 ) -> None:
     """dark-factory-orchestrator.yaml must instantiate the qdrant-integration
     offline-lane sub-run with the three gate flags plus its own LaneCommand.
 
     Other lane entries may coexist; this asserts only the qdrant one.
     """
-    monkeypatch.setenv("ORCH_CONFIG_PATH", str(DF_CONFIG_PATH))
-    config = OrchestratorConfig()
+    config = root_config
 
     assert config.git.offline_lane_enabled is True, (
         "config.git.offline_lane_enabled did not bind to True from the "
