@@ -12,6 +12,7 @@ import aiosqlite
 import pytest
 
 from dashboard.data.performance import (
+    _cutoff,
     _load_escalations,
     aggregate_completion_paths,
     aggregate_escalation_rates,
@@ -1862,3 +1863,44 @@ class TestLoadEscalationsLogsWarningOnCorruptFile:
         ), (
             f'Expected WARNING mentioning esc-bad-1.json; got: {warning_texts}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Test_Cutoff (step-1)
+# ---------------------------------------------------------------------------
+
+
+class Test_Cutoff:
+    """Tests for performance._cutoff — adapted from test_costs_data.py:250-268."""
+
+    def test_cutoff_uses_provided_now(self):
+        """_cutoff(days=7, now=fixed_dt) returns (fixed_dt - 7d).isoformat().
+
+        Also asserts the returned string carries a 'T' separator and a
+        '+00:00' offset — that is the whole point of the fix, since it must
+        compare correctly against the ISO-with-offset `completed_at` column.
+        """
+        fixed_dt = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+        expected = datetime(2026, 5, 8, 12, 0, tzinfo=UTC).isoformat()
+        result = _cutoff(7, now=fixed_dt)
+        assert result == expected
+        assert result == '2026-05-08T12:00:00+00:00'
+        assert 'T' in result
+        assert '+00:00' in result
+
+    def test_cutoff_no_now_uses_current_time(self):
+        """Without now, _cutoff derives its cutoff from the current UTC clock.
+
+        Brackets the real clock read with before/after captures (rather than
+        asserting equality) because the no-now branch resolves through
+        `resolve_now` in `dashboard.data.utils`, not a clock read local to
+        this test — the established non-flaky pattern for the `now=None`
+        default path (test_costs_data.py:257-272).
+        """
+        before = datetime.now(UTC)
+        result = _cutoff(7)
+        after = datetime.now(UTC)
+
+        lower = (before - timedelta(days=7)).isoformat()
+        upper = (after - timedelta(days=7)).isoformat()
+        assert lower <= result <= upper
