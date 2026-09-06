@@ -225,6 +225,7 @@ together by
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import os
 import signal
@@ -511,6 +512,76 @@ def deploy_clock_snapshot(
         except OSError:
             snapshot[relpath] = None
     return snapshot
+
+
+# The provenance vocabulary (task 4823) — the three spellings four tiers must
+# agree on and none can import from another (see the module docstring's
+# stdlib+pytest import constraint). `scripts/restart-all-orchestrators.sh` and
+# `scripts/orchestrator-watchdog.py` each mirror them as their own literals, and
+# all three mirrors are pinned together by
+# tests/scripts/test_restart_all_orchestrators.py and
+# tests/scripts/test_orchestrator_watchdog.py, which assert against THESE
+# objects rather than against strings of their own.
+PYTEST_SESSION_TOKEN_ENV = 'DF_PYTEST_SESSION_TOKEN'
+CLOCK_PROVENANCE_SOURCE_KEY = 'source'
+CLOCK_PROVENANCE_SESSION_KEY = 'pytest_session'
+
+
+def clock_stamp_provenance(entry: tuple[bytes, int] | None) -> dict[str, str] | None:
+    """Who wrote this clock stamp, or ``None`` when the stamp cannot say.
+
+    Parses one :func:`deploy_clock_snapshot` entry into
+    ``{CLOCK_PROVENANCE_SOURCE_KEY: <writer>, CLOCK_PROVENANCE_SESSION_KEY:
+    <token>}``, where the token is the ambient :data:`PYTEST_SESSION_TOKEN_ENV`
+    the writer ran under — empty when no pytest session was an ancestor of the
+    write, which is the shape every genuine machine-operated deploy emits.
+
+    ``None`` IS THE FAIL-CLOSED VALUE, and every not-exactly-right shape maps to
+    it: an absent file, an unparseable or non-object body, the pre-4823 legacy
+    ``{ts, iso}``, a body carrying only one of the two keys, or either key
+    holding a non-``str``.  An unattributable stamp must keep TODAY's
+    fail-the-run behaviour, so a writer added later without provenance — or one
+    that emits a half-migrated body — cannot buy itself an exemption by
+    omission.  That is also what makes this change safe to land with no
+    coordinated writer rollout.
+
+    WHY THE DECISION KEYS ON ``pytest_session`` AND NEVER ON ``source``.  The
+    defect this guard exists to catch (task 3797) is a TEST running the REAL
+    writer: ``scripts/tests/test_restart_all_orchestrators.py`` drove
+    ``scripts/restart-all-orchestrators.sh`` against a fake ``systemctl``
+    without redirecting the clock, and that write carries a perfectly
+    legitimate ``source`` — it IS the production script.  So an allowlist of
+    trusted ``source`` values would clear exactly the write that must fail.
+    The only property that actually differs between a test-spawned write and a
+    real deploy is process ANCESTRY, which is what the ambient token records
+    (the same mechanism :data:`LEAK_TOKEN_ENV` established for the drain-leak
+    guard).  ``source`` is triage prose: it makes the file self-describing for
+    an operator reading it by hand, and nothing branches on it.
+
+    Never raises.  This runs inside a session-teardown fixture, where an
+    exception would replace the guard's own message — which names the clock
+    that moved and both observed bodies — with a traceback about JSON.
+
+    No coercion, deliberately: ``None`` must not become ``''``, because the
+    empty string is the POSITIVE assertion "no pytest session was an ancestor
+    of this write", i.e. the one value that forgives a change.
+    """
+    if entry is None:
+        return None
+    try:
+        payload = json.loads(entry[0].decode('utf-8'))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get(CLOCK_PROVENANCE_SOURCE_KEY)
+    session = payload.get(CLOCK_PROVENANCE_SESSION_KEY)
+    if not isinstance(source, str) or not isinstance(session, str):
+        return None
+    return {
+        CLOCK_PROVENANCE_SOURCE_KEY: source,
+        CLOCK_PROVENANCE_SESSION_KEY: session,
+    }
 
 
 def _clock_change_kind(
