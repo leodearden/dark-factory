@@ -12034,3 +12034,113 @@ class TestFilterStyleOnlyAuthorshipFlags:
         assert flags == [benign1, dropped, benign2, survivor, benign3], (
             'the input list itself must never be mutated'
         )
+
+
+# ---------------------------------------------------------------------------
+# ---- task 3476 step-1 ----
+# RED: the cluster-growth flag_type predicate must exist and be total.
+# ---------------------------------------------------------------------------
+
+
+class TestIsClusterGrowthFlagType:
+    """`_is_cluster_growth_flag_type` recognises the duplicate-cluster-growth
+    family across LLM spelling drift (task 3476).
+
+    Stage 1 emits these findings with an LLM-authored, un-enumerated
+    ``flag_type``; the two spellings named in the run-df364849 /
+    finding-96a14765 incident (``procedural_knowledge_cluster_growth`` and
+    ``duplicate_procedural_knowledge_cluster_growth``) are observed samples,
+    not a closed set.  The predicate therefore matches on
+    :func:`canonical_flag_type_family` membership OR on the token pair
+    ``{'cluster', 'growth'}``.
+
+    RED until step-2 adds the predicate.
+    """
+
+    @pytest.mark.parametrize('flag_type', [
+        'procedural_knowledge_cluster_growth',
+        'duplicate_procedural_knowledge_cluster_growth',
+    ])
+    def test_known_canonical_spellings_match(self, flag_type):
+        """Both spellings named in the incident are recognised."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is True, (
+            f'{flag_type!r} is a canonical incident spelling and must match. '
+            'RED: _is_cluster_growth_flag_type does not exist yet.'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'Procedural-Knowledge Cluster Growth',
+        'PROCEDURAL_KNOWLEDGE_CLUSTER_GROWTH',
+        'cluster_growth_procedural_knowledge',
+        'Duplicate Procedural Knowledge  Cluster-Growth',
+        'growth_cluster_knowledge_procedural_duplicate',
+    ])
+    def test_case_separator_and_word_order_variants_match(self, flag_type):
+        """canonical_flag_type_family normalization collapses these onto a known family."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is True, (
+            f'{flag_type!r} is a case/separator/word-order variant of a known '
+            'spelling and must match via canonical_flag_type_family'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'mem0_duplicate_cluster_growth',
+        'memory_cluster_growth_detected',
+        'unaccounted-cluster-growth',
+    ])
+    def test_token_drift_spellings_carrying_both_tokens_match(self, flag_type):
+        """An unknown spelling still matches when it carries BOTH 'cluster' and 'growth'.
+
+        Deliberately broader than the sibling filters' exact-family matching:
+        this filter only ever DROPS on positively-confirmed UUID presence, so
+        over-matching can only reclassify an already-accounted-for finding.
+        """
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is True, (
+            f'{flag_type!r} carries both the cluster and growth tokens and must '
+            'match via the token-pair arm'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'cluster_consolidation',
+        'duplicate_procedural_knowledge_cluster_expansion',
+        'entity_growth',
+        'memory_growth_detected',
+    ])
+    def test_single_token_flag_types_do_not_match(self, flag_type):
+        """Only ONE of the two tokens is not enough — the pair is required."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is False, (
+            f'{flag_type!r} carries only one of the cluster/growth tokens and '
+            'must NOT match'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'stale_metadata',
+        'missing_deliverable',
+        'systemic_pattern',
+        '',
+        '   ',
+    ])
+    def test_unrelated_flag_types_do_not_match(self, flag_type):
+        """Unrelated / empty flag types never match."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is False, (
+            f'{flag_type!r} is unrelated to cluster growth and must NOT match'
+        )
+
+    @pytest.mark.parametrize('flag_type', [None, 123, 4.2, [], {}, object()])
+    def test_non_string_input_is_false_not_raising(self, flag_type):
+        """The predicate must be TOTAL over malformed LLM-authored input."""
+        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+
+        assert _is_cluster_growth_flag_type(flag_type) is False, (
+            f'{flag_type!r} is not a str; the predicate must return False rather '
+            'than raise (flag dicts are LLM-authored and unvalidated)'
+        )
