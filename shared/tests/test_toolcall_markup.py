@@ -432,6 +432,14 @@ def _canonical_opener(name: str) -> str:
 #: The canonical closing tag. Specimen 4's mis-close, and always a candidate.
 _CANONICAL_CLOSER = '\x3c/parameter>'
 
+#: Two MALFORMED closing sequences: a slash where the tag name should start,
+#: and the degenerate empty-name tag. Both carry the two-character sequence the
+#: repairer's cheap prefilter scans for, and NEITHER matches the closing-tag
+#: grammar, whose name must be an identifier. That is the shape the narrowed
+#: boundary row B5 rule deliberately does not widen onto — see
+#: ``TestQuotedReportIsRepairable`` negative control (e).
+_MALFORMED_CLOSERS = '\x3c/ note> and \x3c/>'
+
 
 def _invoke_opener(tool: str) -> str:
     """The opening ``invoke`` tag that heads a whole tool-call block.
@@ -1214,6 +1222,111 @@ class TestQuotedReportIsRepairable:
             schema_params=_SUBMIT_TASK_PARAMS,
             supplied={'project_root', 'title', 'description'},
         ) is None
+
+    # -- the narrowed rule's own BOUNDS -------------------------------------
+    #
+    # Three branches decide how far the narrowing does NOT reach: the
+    # malformed-closer fallback, the inner-closer budget, and the probe's depth
+    # bound. Measured with ``pytest --cov=shared.toolcall_markup`` before these
+    # pins existed, all three were UNEXECUTED by the entire suite — so for a
+    # change whose whole subject is loosening a safety guard, the parts that
+    # bound the loosening carried no regression pin at all. Each specimen below
+    # is mutation-verified: deleting the branch it names flips that specimen and
+    # leaves every other test in this file green.
+
+    def test_a_malformed_closing_sequence_alone_is_still_refused(self):
+        """NEGATIVE CONTROL (e) — the prefilter fires, nothing is WELL-FORMED.
+
+        The recovered value carries the two-character sequence the cheap
+        prefilter scans for, but no closing tag that actually matches the
+        grammar (a tag name must be an identifier). The alternative-boundary
+        rule therefore has NOTHING to reason about, and it keeps B5's original
+        answer — refuse — rather than widening the carve-out onto a shape it
+        was never measured against.
+
+        MUTATION-VERIFIED: replacing that fallback with a bare ``return False``
+        flips this specimen from refused to RECOVERED, silently widening the
+        carve-out in precisely the direction controls (a)-(d) exist to bound,
+        while every other test in this file stays green.
+        """
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence')
+            + 'the sweep logged a malformed fragment ' + _MALFORMED_CLOSERS + ' here.'
+            + '\n' + INVOKE_CLOSER
+        )
+
+        assert self._repair(value) is None
+
+    def test_more_inner_closers_than_the_budget_is_still_refused(self):
+        """NEGATIVE CONTROL (f) — past the bound the answer is BLOCK.
+
+        At most ``_MAX_CANDIDATES`` inner closers are considered; beyond that
+        the rule refuses rather than keeping a value under examination, which is
+        the conservative direction and the one that makes the cost ceiling mean
+        something. Every closer here is individually harmless — none names the
+        item, either dialect's closer for it, or ``invoke``, and no remainder
+        parses — so the budget is the ONLY thing refusing.
+
+        The ceiling is READ from the module rather than restated: a test that
+        hardcoded the number would pass vacuously the day the bound moved.
+
+        MUTATION-VERIFIED: deleting the budget guard flips this specimen from
+        refused to RECOVERED.
+        """
+        from shared.toolcall_markup import _MAX_CANDIDATES
+
+        quoted = ' '.join(_closer(f'note{i}') for i in range(_MAX_CANDIDATES + 1))
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence')
+            + 'the sweep quoted ' + quoted + ' and then prose that does not parse.'
+            + '\n' + INVOKE_CLOSER
+        )
+
+        assert self._repair(value) is None
+
+    def test_the_ambiguity_probe_does_not_recurse_and_that_is_VISIBLE(self):
+        """The probe's DEPTH-1 bound, pinned by the shape whose answer it decides.
+
+        Not a negative control: it asserts a RECOVERY, because the bound can
+        only push the answer that way. The probe asks "does the remainder after
+        this inner closer ALSO parse?", and at depth 1 it restores the blanket
+        substring refusal — so a remainder that WOULD parse into an item whose
+        own value quotes markup reads as "does not parse", condition (ii) stays
+        silent, and the tail is recovered whole.
+
+        This specimen is exactly that shape: the quoted report carries a closer
+        immediately followed by a canonical opener, so the remainder is itself a
+        quoting item. MUTATION-VERIFIED: deleting the ``probe`` short-circuit —
+        i.e. letting the probe re-enter the narrowed rule — makes that remainder
+        parse, fires condition (ii), and flips this specimen to ``None``.
+
+        So the bound is a DESIGN CHOICE with an observable consequence rather
+        than a free safety net, and moving it must be a decision rather than a
+        tidy-up. What is delivered stays verbatim caller text under D5, which
+        the invariant assertion states rather than assumes.
+        """
+        quoted_tail = (
+            'the report quotes ' + _closer('foo') + ' '
+            + _canonical_opener('suggested_action')
+            + 'refile once the guard is narrowed ' + _closer('xyz') + ' done'
+        )
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence') + quoted_tail
+            + '\n' + INVOKE_CLOSER
+        )
+
+        result = self._repair(value)
+
+        assert result is not None
+        assert set(result.recovered) == {'evidence'}
+        assert result.recovered['evidence'] == quoted_tail
+        assert_repair_invariants(value, result)
 
 
 class TestRepairInvariants:
