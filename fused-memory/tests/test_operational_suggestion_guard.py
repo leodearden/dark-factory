@@ -616,3 +616,137 @@ class TestProvenanceStampDoesNotDisarmOperationalSuggestion:
         )
         assert finding is not None, 'Single-newline continuation is stripped with the stamp'
         assert 'restart' in finding.markers
+
+    def test_stamp_naming_a_code_artifact_still_gates_a_weak_marker(self):
+        """SCOPE BOUNDARY of this port, pinned so it stays a visible choice:
+        the strip feeds the _CODE_CHANGE_SIGNALS_RE suppression scan ONLY.
+        The _WEAK_MARKER_LABELS / _CODE_ARTIFACT_RE gate is evaluated inside
+        the marker loop, which by design keeps reading RAW field text — so a
+        stamp that merely NAMES a code-level artifact noun ("field") still
+        gates a weak marker ('confirm') in that field, even though the same
+        stamp's "bug" no longer arms the code-change suppression.
+
+        Left unfixed deliberately (task 4569 is scoped to the code-change
+        scan; extending the strip into the marker loop would break the
+        monotonicity invariant and needs its own precision matrix). Follow-up
+        ticket tkt_0RT8E1WV27YBJ2RYS22GYK1Q49 is scoped to close it — this
+        test is its regression anchor, so closing it means flipping the first
+        assertion here, not discovering the behaviour from scratch.
+
+        Asserted as a PAIR so the pin is specific to the artifact noun rather
+        than to the whole stamp: swapping the single word 'field' -> 'prose'
+        is the only difference between the two calls, and it is what decides
+        the outcome.
+        """
+        gated = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Confirm the fused-memory service is healthy.'
+                '\n\n[RECON CORRECTION 2026-08-08] the dependencies field was '
+                'wrong; a bug.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert gated is None, (
+            "A stamp's own code-artifact noun still gates the weak marker "
+            f'(the tkt_0RT8E1WV27YBJ2RYS22GYK1Q49 boundary), got: {gated!r}'
+        )
+
+        ungated = operational_suggestion_finding(
+            title=None,
+            description=(
+                'Confirm the fused-memory service is healthy.'
+                '\n\n[RECON CORRECTION 2026-08-08] the dependencies prose was '
+                'wrong; a bug.'
+            ),
+            details=None,
+            task_kind='normal',
+            metadata=None,
+        )
+        assert ungated is not None, (
+            'Without a code-artifact noun the stamp no longer suppresses at '
+            'all (the part task 4569 DID fix)'
+        )
+        assert 'confirm' in ungated.markers
+
+
+class TestProvenanceStampRecognizerParityWithRoutingIntentGuard:
+    """The stamp recognizer is duplicated LOCALLY in this guard rather than
+    shared (plan design decision (a) — this codebase's guards each keep local
+    copies of private helpers instead of importing a sibling's).
+
+    That decision makes byte-identity a claim in a comment. This class makes
+    it MECHANICAL: a corpus shape added to one guard's recognizer and not the
+    other fails here, at the edit, instead of surfacing later as the two
+    guards silently disagreeing about what a stamp is. The over-strip
+    direction is the one that can manufacture a finding out of authored prose
+    — and in routing_intent_guard's enforce mode, hard-reject an honest
+    submission — so a one-sided widening is worth catching mechanically.
+
+    Deliberately NOT pinned: the surrounding COMMENT prose. Each copy
+    localizes its own cross-references (routing_intent_guard's cites the
+    task-2408 precision case, which is not this guard's concern), and all the
+    semantics live in the compiled pattern and flags.
+    """
+
+    def test_compiled_pattern_and_flags_match_routing_intent_guard(self):
+        """The two recognizers compile to the same pattern and the same
+        flags. Comments differ (see class docstring); semantics must not."""
+        from fused_memory.middleware import operational_suggestion_guard, routing_intent_guard
+
+        assert (
+            operational_suggestion_guard._PROVENANCE_STAMP_RE.pattern
+            == routing_intent_guard._PROVENANCE_STAMP_RE.pattern
+        ), (
+            'Stamp recognizers have DIVERGED. They are duplicated deliberately '
+            '(plan decision (a)) but must stay byte-identical: port the change '
+            'to both guards, or promote the recognizer to a shared module.'
+        )
+        assert (
+            operational_suggestion_guard._PROVENANCE_STAMP_RE.flags
+            == routing_intent_guard._PROVENANCE_STAMP_RE.flags
+        ), (
+            'Stamp recognizer FLAGS have diverged — e.g. a dropped MULTILINE '
+            'silently unanchors the opener in one guard only.'
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            # The reify-5117 defect shape.
+            'Restart the service.'
+            '\n\n[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX: re-derived.',
+            # Undated [Stage N ...] branch.
+            'Restart the service.\n\n[Stage 2 sync] DOC-DRIFT FIX: re-derived.',
+            # Containment: authored paragraph after the stamp survives.
+            'Restart it.\n\n[RECON CORRECTION 2026-08-08] corrected.\n\nAlso fix the helper.',
+            # Must NOT be stripped: markdown link, inline bracket, bulleted stamp.
+            '[Stage 1 stall detector](fused-memory/src/x.py) crashes under load.',
+            'The worker [re-verified 2026-08-06] still needs a fix.',
+            'Restart it.\n\n- [Stage 2 sync 2026-07-07] DOC-DRIFT FIX: re-derived.',
+            # CRLF paragraph bound.
+            'Restart it.\r\n\r\n[RECON CORRECTION 2026-08-08] a bug.\r\n\r\nAlso fix it.',
+            # Two stamps in one field, and a multi-line stamp body.
+            '[Stage 2 sync 2026-07-07] FIX one.\n\n[RECON CORRECTION 2026-08-08] fix two.',
+            '[Stage 2 sync 2026-07-07] line one\ncontinues with a bug ref\nand a third line.',
+            # Empty / marker-free inputs.
+            '',
+            'Restart the fused-memory service and confirm it is back up.',
+        ],
+    )
+    def test_strip_helper_output_matches_routing_intent_guard(self, text):
+        """Behavioural backstop to the identity assertion above: the two
+        `_strip_provenance_stamps` copies produce identical output across the
+        corpus shapes and boundary cases this port was built against. Catches
+        a divergence in the HELPER (a `count=1` substitution, a different
+        replacement string) that a pattern comparison alone would miss."""
+        from fused_memory.middleware import operational_suggestion_guard, routing_intent_guard
+
+        assert operational_suggestion_guard._strip_provenance_stamps(
+            text
+        ) == routing_intent_guard._strip_provenance_stamps(text), (
+            'The two _strip_provenance_stamps copies disagree on this input; '
+            'they are deliberate duplicates and must stay equivalent.'
+        )

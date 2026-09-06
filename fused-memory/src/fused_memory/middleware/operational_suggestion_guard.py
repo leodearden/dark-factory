@@ -97,7 +97,12 @@ this module is only:
   pre-4569 behaviour (a finding is lost, never manufactured), the safe
   direction. Extending the strip here would also break the monotonicity
   invariant above, so it needs its own precision matrix rather than a copy
-  of this one. Follow-up ticket ``tkt_0RT8E1WV27YBJ2RYS22GYK1Q49``.
+  of this one. Follow-up ticket ``tkt_0RT8E1WV27YBJ2RYS22GYK1Q49``; its
+  regression anchor is this measurement's own test,
+  ``test_operational_suggestion_guard.py::
+  test_stamp_naming_a_code_artifact_still_gates_a_weak_marker`` -- pinned on
+  the guard's RETURN VALUES rather than on this prose, so closing the ticket
+  means flipping that assertion rather than rediscovering the behaviour.
 
 This module is declaration-only and WARN-ONLY: it never coerces
 ``task_kind`` or ``execution_class`` and never rejects a submission — see
@@ -142,7 +147,14 @@ _CODE_CHANGE_SIGNALS_RE = re.compile(r'\b(?:fix|bug|crash|implement)\w*\b', re.I
 # routing_intent_guard._PROVENANCE_STAMP_RE (task 4532) -- deliberately kept
 # byte-identical, private name included, so the parallel is greppable and a
 # future reader diffing the two guards sees intended equivalence rather than
-# accidental divergence. WHAT a stamp is, the observed corpus behind its
+# accidental divergence. That byte-identity is held MECHANICALLY, not just by
+# this comment: test_operational_suggestion_guard.py::
+# TestProvenanceStampRecognizerParityWithRoutingIntentGuard compares the two
+# compiled patterns, their flags, and the two _strip_provenance_stamps
+# outputs across the corpus, so a shape added to one guard and not the other
+# fails at the edit. Widen BOTH copies, or promote the recognizer to a shared
+# module -- never one side alone. (The surrounding COMMENT prose is
+# deliberately localized per guard and is not compared.) WHAT a stamp is, the observed corpus behind its
 # branches and the directional-safety rule for widening it live in ONE place:
 # routing_intent_guard.py's module-docstring "Provenance-stamp carve-out"
 # section. Only the constraints local to this pattern are noted here, each at
