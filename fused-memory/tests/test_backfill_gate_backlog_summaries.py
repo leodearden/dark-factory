@@ -35,6 +35,7 @@ GATE_BACKLOG_CATEGORY = _mod.GATE_BACKLOG_CATEGORY
 is_legacy_gate_backlog_record = _mod.is_legacy_gate_backlog_record
 extract_gate_escalated_at = _mod.extract_gate_escalated_at
 rebuild_summary = _mod.rebuild_summary
+rebuild_detail = _mod.rebuild_detail
 
 
 # ---------------------------------------------------------------------------
@@ -282,3 +283,82 @@ class TestRebuildSummary:
             'Gate task 166 has awaited a human decision since '
             '2026-08-01T18:18:50Z (past the 48h gate-backlog threshold)'
         )
+
+
+# ---------------------------------------------------------------------------
+# rebuild_detail
+# ---------------------------------------------------------------------------
+
+
+class TestRebuildDetail:
+    """Rename ONE key on ONE line; every other byte of the detail is preserved."""
+
+    def test_only_the_age_line_changes(self):
+        """Line-by-line byte identity except index 4 — same value, same position."""
+        before = LEGACY_DETAIL.split('\n')
+        after = rebuild_detail(LEGACY_DETAIL).split('\n')
+
+        assert len(after) == len(before), 'line count must not change'
+        assert after[4] == 'age_hours_at_filing: 48.7'
+        assert before[4] == 'age_hours: 48.7'
+        for i, (b, a) in enumerate(zip(before, after, strict=True)):
+            if i == 4:
+                continue
+            assert a == b, f'line {i} must be byte-identical: {b!r} != {a!r}'
+
+    def test_line_zero_is_untouched(self):
+        """Line 0 is gate_backlog_fingerprint_key's ONLY recovery site."""
+        assert rebuild_detail(LEGACY_DETAIL).split('\n')[0] == 'project_id: dark_factory'
+
+    def test_multiline_description_block_is_preserved_verbatim(self):
+        after = rebuild_detail(LEGACY_DETAIL)
+        assert '\n'.join(_DESCRIPTION_LINES) in after
+
+    def test_already_canonical_detail_round_trips_unchanged(self):
+        """Idempotence: a second pass over a rewritten detail is a true no-op."""
+        once = rebuild_detail(LEGACY_DETAIL)
+        assert rebuild_detail(once) == once
+
+    def test_detail_with_no_age_line_round_trips_unchanged(self):
+        detail = '\n'.join(
+            line for line in LEGACY_DETAIL_LINES if not line.startswith('age_hours: ')
+        )
+        assert rebuild_detail(detail) == detail
+
+    def test_empty_detail_round_trips_unchanged(self):
+        assert rebuild_detail('') == ''
+
+    def test_only_the_first_age_line_is_renamed(self):
+        detail = '\n'.join([*LEGACY_DETAIL_LINES, 'age_hours: 99.9'])
+        after = rebuild_detail(detail).split('\n')
+        assert after[4] == 'age_hours_at_filing: 48.7'
+        assert after[-1] == 'age_hours: 99.9'
+
+    def test_mid_prose_occurrence_is_not_renamed(self):
+        """Line-start prefix match only — a description mentioning it stays put."""
+        detail = '\n'.join([
+            'project_id: dark_factory',
+            'task_id: 166',
+            'description: the record said age_hours: 3.2 at filing time',
+        ])
+        assert rebuild_detail(detail) == detail
+
+    def test_canonical_prefix_is_never_double_prefixed(self):
+        """``age_hours_at_filing: `` must not be read as ``age_hours: `` + junk."""
+        detail = 'project_id: dark_factory\nage_hours_at_filing: 1.0'
+        after = rebuild_detail(detail)
+        assert 'age_hours_at_filing_at_filing:' not in after
+        assert after == detail
+
+    def test_canonical_line_does_not_shield_a_later_legacy_line(self):
+        """A canonical line earlier in the blob must not stop the legacy rename."""
+        detail = '\n'.join([
+            'project_id: dark_factory',
+            'age_hours_at_filing: 1.0',
+            'age_hours: 48.7',
+        ])
+        assert rebuild_detail(detail).split('\n') == [
+            'project_id: dark_factory',
+            'age_hours_at_filing: 1.0',
+            'age_hours_at_filing: 48.7',
+        ]
