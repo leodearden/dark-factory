@@ -19931,3 +19931,94 @@ def test_file_finding_task_escalation_resolves_via_same_project_citation(
     assert esc_id
     pending = EscalationQueue(queue_dir).get_pending()
     assert [e.task_id for e in pending] == ['4458']
+
+
+def test_file_finding_task_escalation_folds_across_cycles_via_has_open_l1(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Two cycles flagging the same finding leave exactly ONE open record.
+
+    The `_sweep_escalate_l1` template this filer is transcribed from does NOT
+    dedupe and refiles on every sweep — acceptable for a one-shot cancellation
+    event, but not for a filer that re-evaluates on every reconciliation cycle.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert first, 'the first filing must land'
+    assert second is None, f'the second filing must fold, got {second!r}'
+    assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [first]
+
+
+def test_unrelated_open_l1_on_the_same_task_does_not_suppress_the_filing(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """An open L1 of a DIFFERENT category must not swallow a recon finding.
+
+    This pins the `category=` argument to `has_open_l1`. Without it, any
+    pre-existing open L1 on the task — e.g. the `scope_violation` that
+    `targeted.py::_sweep_escalate_l1` files for a cancelled parent's orphan —
+    would silently suppress every recon finding for that task forever, which is
+    exactly the failure mode `has_open_l1`'s category filter (task 2757) exists
+    to prevent.
+    """
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    # A pre-existing, UNRELATED open L1 on the very same task.
+    queue = EscalationQueue(queue_dir)
+    queue.submit(Escalation(
+        id=queue.make_id('4458'),
+        task_id='4458',
+        agent_role='reconciler',
+        severity='blocking',
+        category='scope_violation',
+        summary='Task 4458 orphaned: parent 4457 cancelled (dependent)',
+        level=1,
+    ))
+
+    esc_id = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+
+    assert esc_id, 'an unrelated open L1 must not suppress a recon finding'
+    filed = [
+        e for e in EscalationQueue(queue_dir).get_pending()
+        if e.category == FINDING_TASK_ESCALATION_CATEGORY
+    ]
+    assert [e.id for e in filed] == [esc_id]
+
+
+def test_resolved_prior_record_does_not_suppress_a_refile(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """`has_open_l1` reads PENDING records only, so a settled finding can refile.
+
+    If the finding recurs after a human adjudicated the previous record, that is
+    new information and must reach the ladder again.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    EscalationQueue(queue_dir).resolve(first, 'adjudicated by operator')
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert second and second != first, (
+        f'a resolved prior record must not suppress a refile, got {second!r}'
+    )
+    assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [second]
