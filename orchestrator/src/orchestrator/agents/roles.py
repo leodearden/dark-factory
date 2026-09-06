@@ -419,8 +419,12 @@ single normative source for all of this; consult it rather than guessing.
 # (`skills/curate-fused-memories/SKILL.md`,
 # `plans/mem0-in-place-update-decision.md`, `OPERATIONS.md`), none of which a
 # dispatched plan AUTHOR reads. The durable, greppable statement now lives in
-# `docs/task-authoring.md` section 10; this constant is the half that reaches
-# an agent that never opens it.
+# `docs/task-authoring.md`, cited by HEADING TITLE rather than by its `## 10.`
+# ordinal both here and in the prompt text below: a later section inserted
+# ahead of it would silently repoint five role prompts at the wrong section,
+# and nothing checks the docs half (deliberately -- see
+# tests/test_roles_memory_amend_routing.py's docstring). This constant is the
+# half that reaches an agent that never opens that file.
 #
 # WHY HERE, not in `orchestrator/src/orchestrator/agents/briefing.py`. One
 # splice reaches both plan AUTHORS (architect, simple_task) and the plan
@@ -466,12 +470,14 @@ admitting only reconciliation stages and a sanctioned curator sitting; your
 dispatched agent_id matches neither, so the refusal is deterministic — not a
 flake to retry around or a permission to request.
 
-Instead, write a NEW memory with `add_memory` recording the correction, or
-file a follow-up task for a curator sitting (`skills/curate-fused-memories`)
-to perform the amendment. Renaming yourself to a `curator-` agent_id to clear
-the gate is forbidden: that is self-authorization for a silent-rewrite
-primitive. Stop, leave the record alone, and escalate. Full rule and
-cross-links: `docs/task-authoring.md` section 10.
+Instead, write a NEW memory with `add_memory` recording the correction, and
+— if you hold a task-filing tool — file a follow-up task for a curator
+sitting (`skills/curate-fused-memories`) to perform the amendment. If you
+cannot file tasks, escalate asking for one to be filed. Renaming yourself to
+a `curator-` agent_id to clear the gate is forbidden: that is
+self-authorization for a silent-rewrite primitive. Stop, leave the record
+alone, and escalate. Full rule and cross-links: `docs/task-authoring.md`,
+section "In-place memory amendments are not task-agent work".
 """
 
 _MEMORY_INSTRUCTIONS = """

@@ -21,8 +21,9 @@ existed only in curator- and operator-facing files
 (`skills/curate-fused-memories/SKILL.md`,
 `plans/mem0-in-place-update-decision.md`, `OPERATIONS.md`), none of which a
 dispatched plan AUTHOR reads. Task 4548 put it where an architect will see
-it: `docs/task-authoring.md` section 10 for the durable, greppable statement,
-and `MEMORY_AMEND_ROUTING_RULE` spliced into
+it: `docs/task-authoring.md`, section "In-place memory amendments are not
+task-agent work", for the durable, greppable statement, and
+`MEMORY_AMEND_ROUTING_RULE` spliced into
 `orchestrator/src/orchestrator/agents/roles.py::_MEMORY_INSTRUCTIONS` -- the
 `## Memory` block already carried by the two plan AUTHORS (architect,
 simple_task) and the two plan EXECUTORS who would receive such a step
@@ -44,7 +45,11 @@ The `docs/task-authoring.md` half of task 4548 is deliberately NOT tested
 here. Documentation prose is not runtime behaviour, and a substring pin on
 doc wording is the same meta-test class. A composed role `system_prompt` is
 different in kind -- it is a runtime artifact this repo already
-contract-tests -- so only that half is test-driven.
+contract-tests -- so only that half is test-driven. That is also why every
+citation of that section here and in `MEMORY_AMEND_ROUTING_RULE` names its
+HEADING TITLE rather than its `## 10.` ordinal: a section inserted ahead of
+it would repoint five role prompts and the messages below at the wrong
+section, and with the docs half untested nothing would catch the drift.
 """
 
 from __future__ import annotations
@@ -156,7 +161,8 @@ def test_no_role_is_granted_the_in_place_update_tool() -> None:
     """No role holds `update_memory`, directly or via a family wildcard.
 
     The premise guard for the rule the three tests above carry: both the
-    prompt constant and `docs/task-authoring.md` section 10 assert that a
+    prompt constant and `docs/task-authoring.md`, section "In-place memory
+    amendments are not task-agent work", assert that a
     dispatched agent cannot amend a memory in place. Granting the tool to a
     role would make that claim false while every containment check above
     stayed green.
@@ -177,5 +183,6 @@ def test_no_role_is_granted_the_in_place_update_tool() -> None:
         "`agent_id`-prefix allowlist no `claude-task-<id>-<role>` identity "
         'matches, so the grant buys a deterministic Mem0UpdateNotAuthorized '
         'refusal, and it contradicts the rule stated in '
-        'MEMORY_AMEND_ROUTING_RULE and docs/task-authoring.md section 10.'
+        'MEMORY_AMEND_ROUTING_RULE and in docs/task-authoring.md, section '
+        '"In-place memory amendments are not task-agent work".'
     )
