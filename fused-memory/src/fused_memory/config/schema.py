@@ -1382,6 +1382,26 @@ class ReconciliationConfig(BaseModel):
         return data
 
     enabled: bool = Field(default=True)
+    # data_dir MAY be RELATIVE, and the default is (task 4592).  config.yaml
+    # supplies `${RECONCILIATION_DATA_DIR:./data/reconciliation}`, and the
+    # `${VAR:default}` expander (YamlSettingsSource._expand_env_vars) is plain
+    # string substitution — no abspath.  scripts/fused-memory.service.template
+    # sets WorkingDirectory and PROJECT_ROOT but NOT RECONCILIATION_DATA_DIR, so
+    # the relative default is what a standalone/systemd launch actually uses;
+    # only a managed spawn gets an absolute value, injected as an XDG path by
+    # orchestrator/src/orchestrator/mcp_lifecycle.py.
+    #
+    # A relative value is anchored at the PROCESS cwd by every in-process
+    # consumer — reconciliation/journal.py::ReconciliationJournal.initialize
+    # mkdirs it and opens reconciliation.db under it, and server/main.py builds
+    # ten sibling paths the same way — so those all agree by construction.
+    #
+    # The per-run CLI config dir derived from it does NOT get to inherit that
+    # relativity: it crosses a process boundary as CLAUDE_CONFIG_DIR and would be
+    # resolved against the CHILD's cwd while the sandbox verifier resolves it
+    # against the parent's.  It is absolutized exactly once, at
+    # reconciliation/cli_stage_runner.py::recon_config_base_dir, so the verifier
+    # and the CLI child cannot disagree.
     data_dir: str = Field(default='./data/reconciliation')
 
     # Buffer triggers
@@ -1526,6 +1546,18 @@ class ReconciliationConfig(BaseModel):
     # sandbox_recon_writable_extras: additional paths to add to the writable set
     #   (e.g. a uvx/pip cache dir used by a stdio MCP server).  Empty by default;
     #   use only when an MCP server genuinely needs to write outside /tmp.
+    #
+    #   Entries MUST be ABSOLUTE paths.  A relative entry is DROPPED (with a
+    #   logger.warning naming it) by reconciliation/sandbox_guard.py::_writable_roots
+    #   rather than honoured: that function verifies each extra with
+    #   os.path.realpath in the PARENT process's cwd, but the `--writable <path>`
+    #   token it becomes is consumed by landlock-exec / bwrap inside the wrapped
+    #   argv, which shared/src/shared/cli_invoke.py::_run_subprocess spawns with
+    #   the CHILD's cwd.  A relative entry therefore names one directory to the
+    #   verifier and another to the grantor, and counting it would certify a
+    #   config dir as contained by a root the child never actually grants — a
+    #   vacuous grant, the same class as an extra naming a directory that does
+    #   not exist, which is dropped for the same reason (task 4592).
     #
     #   Do NOT add the recon CLAUDE_CONFIG_DIR here.  The PER-RUN dir is granted
     #   AUTOMATICALLY per invocation by cli_stage_runner.run_stage_via_cli, which

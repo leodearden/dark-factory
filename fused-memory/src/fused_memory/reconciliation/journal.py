@@ -195,6 +195,31 @@ class ReconciliationJournal:
     """Persistent journal backed by SQLite — one database per project directory."""
 
     def __init__(self, data_dir: Path):
+        """Store *data_dir* VERBATIM — it may be RELATIVE (task 4592).
+
+        ``fused-memory/config/config.yaml`` supplies ``./data/reconciliation``
+        whenever ``RECONCILIATION_DATA_DIR`` is unset, which
+        ``scripts/fused-memory.service.template`` does not set, and the
+        ``${VAR:default}`` expander in
+        ``fused-memory/src/fused_memory/config/schema.py::YamlSettingsSource._expand_env_vars``
+        is plain string substitution with no abspath. No coercion happens here
+        either.
+
+        In-process that is fine, and deliberately so: ``initialize`` mkdirs
+        ``data_dir`` and opens ``reconciliation.db`` under it, and
+        ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
+        (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
+        the dead-letter JSONL) the same way — all anchored at the PROCESS cwd, all
+        in this process, so they agree with each other by construction.
+
+        A CROSS-PROCESS consumer must NOT inherit that relativity. A path handed
+        to a child process is resolved against the CHILD's cwd, not this one's,
+        so the two would silently name different directories. The boundary that
+        absolutizes it for the ``CLAUDE_CONFIG_DIR`` chain is
+        ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``;
+        ``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``
+        fails closed if anything bypasses it.
+        """
         self.data_dir = data_dir
         self._db: aiosqlite.Connection | None = None
         self._write_journal: WriteJournal | None = None
