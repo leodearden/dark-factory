@@ -52,6 +52,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
+    FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
     resolve_finding_task_target,
 )
@@ -2736,7 +2737,8 @@ class ReconciliationHarness:
           :func:`~fused_memory.reconciliation.finding_task_escalation.resolve_finding_task_target`);
         - the project is not registered in ``_known_projects``;
         - no orchestrator is live for that root, so nothing would drain the
-          record.
+          record;
+        - an open L1 of this same category is already pending on the task.
 
         FAIL-SAFE: a queue hiccup is logged and swallowed — a reconciliation
         cycle is never aborted by a failed filing (mirroring
@@ -2794,6 +2796,27 @@ class ReconciliationHarness:
             queue = EscalationQueue(  # type: ignore[possibly-undefined]
                 Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
             )
+            # Cross-cycle dedupe.  The `_sweep_escalate_l1` template omits this
+            # and can refile on every sweep — fine for a one-shot cancellation
+            # event, wrong for a filer that re-evaluates each reconciliation
+            # cycle.  `category=` is NOT optional: per has_open_l1's own
+            # docstring (task 2757) the filter is what lets a NEW root cause
+            # escape being silently suppressed by an UNRELATED open L1 — without
+            # it, a lingering `scope_violation` on the task would swallow every
+            # recon finding for it forever.  Pending-only by construction, so a
+            # finding that recurs after a human adjudicated the last record
+            # reaches the ladder again.
+            if queue.has_open_l1(task_id, category=FINDING_TASK_ESCALATION_CATEGORY):
+                logger.info(
+                    'reconciliation.finding_task_escalation_deduped',
+                    extra={
+                        'project_id': project_id,
+                        'run_id': run_id,
+                        'task_id': task_id,
+                        'finding_category': finding.get('category', ''),
+                    },
+                )
+                return None
             esc = Escalation(  # type: ignore[possibly-undefined]
                 id=queue.make_id(task_id),
                 **build_finding_task_escalation_kwargs(
