@@ -62,7 +62,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: test_sandbox_enforcement_matrix
+      pattern: Landlock enforcement-matrix suite
       paths:
       - orchestrator/tests/
       expect: present

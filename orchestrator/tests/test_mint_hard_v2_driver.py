@@ -11,9 +11,11 @@ ladder runs against temp git repos built per-test. No live data / no network.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -73,6 +75,27 @@ def _commit(repo: Path, filename: str, body: str, message: str,
     else:
         subprocess.run(
             ['git', *env_args], cwd=str(repo), check=True, capture_output=True,
+            text=True, env={
+                **_base_env(), 'GIT_AUTHOR_DATE': date, 'GIT_COMMITTER_DATE': date,
+            },
+        )
+    return _git(['rev-parse', 'HEAD'], repo)
+
+
+def _merge(repo: Path, branch: str, message: str,
+           date: str | None = None) -> str:
+    """No-ff merge *branch* into the current branch; return the merge SHA.
+
+    *date* pins author and committer date, mirroring :func:`_commit`, so a
+    merge can be placed deterministically relative to the commits it brings in
+    — which is what makes the off-mainline timestamp-walk shape expressible.
+    """
+    args = ['merge', '--no-ff', '-q', branch, '-m', message]
+    if date is None:
+        _git(args, repo)
+    else:
+        subprocess.run(
+            ['git', *args], cwd=str(repo), check=True, capture_output=True,
             text=True, env={
                 **_base_env(), 'GIT_AUTHOR_DATE': date, 'GIT_COMMITTER_DATE': date,
             },
@@ -287,6 +310,57 @@ class TestBaselineLadder:
         assert sha == early, 'must pick the newest main commit BEFORE the ts'
         assert rung == 'timestamp_walk'
 
+    def test_rung3_never_returns_an_off_mainline_commit(
+        self, tmp_path: Path,
+    ) -> None:
+        # The measured defect. Without --first-parent, `git rev-list -n1
+        # --before=<ts> main` traverses EVERYTHING reachable from main,
+        # including commits that only ever lived on a merged-in side branch.
+        # It then hands back a tree state that was never a state of main.
+        #
+        # Reproduces reify_task_4026's committed base e21d047026 (a side-branch
+        # commit, 245 commits from the true branch point, and absent from
+        # `git rev-list --first-parent main`) and reify_task_4086's.
+        repo = _init_repo(tmp_path)
+        mainline = _commit(repo, 'a.txt', 'base\n', 'base',
+                           date='2026-01-01T00:00:00+00:00')
+        _git(['checkout', '-q', '-b', 'task/999'], repo)
+        side = _commit(repo, 'b.txt', 'work\n', 'work on someone else task',
+                       date='2026-02-01T00:00:00+00:00')
+        _git(['checkout', '-q', 'main'], repo)
+        _merge(repo, 'task/999', 'Merge task/999 into main',
+               date='2026-03-01T00:00:00+00:00')
+
+        # Task 790 has no landing merge and no status auto-commit, so it falls
+        # to rung 3. Its first invocation sits between the side commit and the
+        # merge that landed it.
+        sha, rung = driver.resolve_baseline(repo, '790', '2026-02-15T00:00:00+00:00')
+        assert rung == 'timestamp_walk'
+        first_parent = _git(['rev-list', '--first-parent', 'main'], repo).split()
+        assert sha in first_parent, (
+            f'rung 3 returned {sha}, which is not on main\'s first-parent line '
+            f'— that tree state never existed on main'
+        )
+        assert sha != side
+        assert sha == mainline
+
+    def test_rung3_still_picks_the_newest_mainline_commit_before_ts(
+        self, tmp_path: Path,
+    ) -> None:
+        # Guard against --first-parent over-pruning: on a linear main it must
+        # still return the NEWEST commit before the cutoff, not the oldest.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'oldest',
+                date='2026-01-01T00:00:00+00:00')
+        middle = _commit(repo, 'b.txt', 'more\n', 'middle',
+                         date='2026-02-01T00:00:00+00:00')
+        _commit(repo, 'c.txt', 'later\n', 'newest',
+                date='2026-03-01T00:00:00+00:00')
+
+        sha, rung = driver.resolve_baseline(repo, '791', '2026-02-15T00:00:00+00:00')
+        assert rung == 'timestamp_walk'
+        assert sha == middle
+
     def test_raises_when_every_rung_fails(self, tmp_path: Path) -> None:
         # Loud-over-silent: an empty pre_task_commit would blow up deep inside
         # run_architect_eval's worktree creation instead of here.
@@ -345,6 +419,128 @@ class TestFindMergeSha:
         _git(['checkout', '-q', 'main'], repo)
         _git(['merge', '--no-ff', 'task/8030', '-m', 'Merge task/8030 into main'], repo)
         assert driver.find_merge_sha(repo, '803') is None
+
+    def test_finds_colon_spelled_merge_subject(self, tmp_path: Path) -> None:
+        # The regressed spelling. Both are in live use on reify's main
+        # (censused: 2741 x "Merge task/N into main", 74 x "Merge task/N: ..."),
+        # and matching only the first is what stamped a false
+        # `reference_unavailable` on fixtures that DO have a landing merge.
+        # This is reify_task_4026's real subject, verbatim.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'task/4026'], repo)
+        _commit(repo, 'b.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/4026', '-m',
+              'Merge task/4026: Add SPEED_OF_LIGHT + BOLTZMANN_CONSTANT '
+              'physical constants to std.units'], repo)
+        assert driver.find_merge_sha(repo, '4026') == _git(['rev-parse', 'HEAD'], repo)
+
+    def test_colon_spelling_does_not_prefix_match_a_longer_id(
+        self, tmp_path: Path,
+    ) -> None:
+        # Substring-safety must hold for the colon spelling too: 'Merge
+        # task/8030: work' cannot answer a query for task 803. Asserted in BOTH
+        # directions so a pattern that matched nothing at all could not pass.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'task/8030'], repo)
+        _commit(repo, 'b.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/8030', '-m', 'Merge task/8030: work'], repo)
+        merge = _git(['rev-parse', 'HEAD'], repo)
+        assert driver.find_merge_sha(repo, '803') is None
+        assert driver.find_merge_sha(repo, '8030') == merge
+
+    def test_ambiguous_across_spellings_is_planrate_only(
+        self, tmp_path: Path,
+    ) -> None:
+        # The 'ambiguity is planRate-only, never a coin flip' contract holds
+        # over the UNION of the two spellings, not per-spelling: two landing
+        # merges for one id are ambiguous however each one is worded.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        for branch, fn, subject in (
+            ('task/803-1', 'b.txt', 'Merge task/803 into main'),
+            ('task/803-2', 'c.txt', 'Merge task/803: the colon spelling'),
+        ):
+            _git(['checkout', '-q', '-b', branch], repo)
+            _commit(repo, fn, 'work\n', f'work on {branch}')
+            _git(['checkout', '-q', 'main'], repo)
+            _git(['merge', '--no-ff', branch, '-m', subject], repo)
+        assert driver.find_merge_sha(repo, '803') is None
+
+    def test_colon_spelling_requires_the_space_separator(
+        self, tmp_path: Path,
+    ) -> None:
+        # 'Merge task/803:no-space' is not the landing-merge shape and must not
+        # count as a second match. If it did, the real merge below would be
+        # reported as ambiguous and lost.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'task/803-decoy'], repo)
+        _commit(repo, 'b.txt', 'decoy\n', 'decoy')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/803-decoy', '-m',
+              'Merge task/803:no-space'], repo)
+        _git(['checkout', '-q', '-b', 'task/803'], repo)
+        _commit(repo, 'c.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/803', '-m',
+              'Merge task/803: the real landing merge'], repo)
+        assert driver.find_merge_sha(repo, '803') == _git(['rev-parse', 'HEAD'], repo)
+
+    def test_a_body_only_match_is_not_a_landing_merge(
+        self, tmp_path: Path,
+    ) -> None:
+        # git's --grep applies ^/$ per LINE across the WHOLE message, so a BODY
+        # line reading 'Merge task/803: ...' matches an ^-anchored pattern just
+        # as a subject does. Two silent failures ride on that: a body-only
+        # match on a non-landing commit mints a fabricated reference plus a
+        # `{source:'landed', passed:true}` verify outcome, and a spurious
+        # SECOND match trips `len(shas) == 1` and downgrades a genuine
+        # reference to planRate-only. Both are asserted here: the decoy alone
+        # answers None, and the decoy does not shadow the real merge.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _commit(
+            repo, 'b.txt', 'notes\n',
+            'docs: record the merge convention\n\n'
+            'Merge task/803: the colon spelling, quoted in a body line\n'
+            'Merge task/803 into main\n',
+        )
+        assert driver.find_merge_sha(repo, '803') is None
+
+        _git(['checkout', '-q', '-b', 'task/803'], repo)
+        _commit(repo, 'c.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'main'], repo)
+        _git(['merge', '--no-ff', 'task/803', '-m',
+              'Merge task/803: the real landing merge'], repo)
+        assert driver.find_merge_sha(repo, '803') == _git(['rev-parse', 'HEAD'], repo)
+
+    def test_a_merge_that_never_landed_on_main_is_not_a_landing_merge(
+        self, tmp_path: Path,
+    ) -> None:
+        # A LANDING merge is by definition one that landed on main. A merge
+        # living only on a side branch would otherwise answer, and the caller
+        # would stamp `verify_outcome {source:'landed', passed:true}` plus
+        # `base_is_approximated: false` for a state of main that never existed.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'integration'], repo)
+        _git(['checkout', '-q', '-b', 'task/804'], repo)
+        _commit(repo, 'b.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'integration'], repo)
+        _git(['merge', '--no-ff', 'task/804', '-m',
+              'Merge task/804 into main'], repo)
+        side_merge = _git(['rev-parse', 'HEAD'], repo)
+        _git(['checkout', '-q', 'main'], repo)
+
+        assert driver.find_merge_sha(repo, '804') is None
+        # ... and it IS found once that same merge reaches main, so the test
+        # cannot pass by matching nothing at all.
+        _git(['merge', '--ff-only', 'integration'], repo)
+        assert driver.find_merge_sha(repo, '804') == side_merge
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +614,724 @@ class TestPlanRateOnlyVerifyOutcome:
 
 
 # ---------------------------------------------------------------------------
+# _mint_one — every fixture declares whether its base is an approximation
+# ---------------------------------------------------------------------------
+
+class TestBaseApproximationMarking:
+    """Only ``merge_first_parent`` yields the task's TRUE branch point (M^1 of
+    its landing merge). Every weaker rung is a guess, and a readout that
+    cannot tell the two apart silently averages them together — which is how
+    reify_task_3883 shipped a base ~1900 first-parent commits from where its
+    work actually started with nothing in the JSON to say so."""
+
+    def test_merge_derived_base_is_not_approximated(self) -> None:
+        rec = _mint(_planrate_row(
+            mint_mode='planrate_only', baseline_source='merge_first_parent',
+        ))
+        assert rec['provenance']['base_is_approximated'] is False
+        assert 'base_approximation_reason' not in rec['provenance']
+
+    def test_status_autocommit_base_is_approximated_and_says_which_rung(
+        self,
+    ) -> None:
+        rec = _mint(_planrate_row(baseline_source='status_autocommit'))
+        assert rec['provenance']['base_is_approximated'] is True
+        reason = rec['provenance']['base_approximation_reason']
+        assert reason.strip()
+        assert 'status_autocommit' in reason
+
+    def test_timestamp_walk_base_is_approximated_and_says_which_rung(
+        self,
+    ) -> None:
+        rec = _mint(_planrate_row(baseline_source='timestamp_walk'))
+        assert rec['provenance']['base_is_approximated'] is True
+        reason = rec['provenance']['base_approximation_reason']
+        assert 'timestamp_walk' in reason
+        # Self-describing: a reader of the JSON alone learns this is an
+        # approximation a readout should exclude, not a derived branch point.
+        assert 'approximation' in reason.lower()
+        assert 'exclude' in reason.lower()
+
+    def test_the_flag_is_a_real_bool(self) -> None:
+        # A readout filters on this. A truthy string would make every fixture
+        # look approximated, including the merge-derived ones.
+        for source in ('merge_first_parent', 'status_autocommit', 'timestamp_walk'):
+            flag = _mint(_planrate_row(baseline_source=source))[
+                'provenance']['base_is_approximated']
+            assert isinstance(flag, bool), f'{source}: {flag!r} is not a bool'
+
+
+# ---------------------------------------------------------------------------
+# _mint_one, `referenced` branch — the landed claim is MEASURED, never assumed
+# ---------------------------------------------------------------------------
+
+def _landing_merge_repo(tmp_path: Path, task_id: str = '900') -> tuple[Path, str]:
+    """A repo whose ``main`` carries one landing merge; return ``(repo, M)``."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, 'a.txt', 'base\n', 'base')
+    _git(['checkout', '-q', '-b', f'task/{task_id}'], repo)
+    _commit(repo, 'b.txt', 'work\n', 'work')
+    _git(['checkout', '-q', 'main'], repo)
+    _git(['merge', '--no-ff', f'task/{task_id}', '-m',
+          f'Merge task/{task_id} into main'], repo)
+    return repo, _git(['rev-parse', 'HEAD'], repo)
+
+
+def _referenced_row(repo: Path, merge: str, **over: object) -> dict:
+    row = _planrate_row(
+        task_id='900', project_root=str(repo), status='done',
+        merge_sha=merge, mint_mode='referenced',
+        baseline_source='merge_first_parent',
+        baseline_sha=_git(['rev-parse', f'{merge}^1'], repo),
+    )
+    row.update(over)
+    return row
+
+
+class TestReferencedFixtureMeasuresItsLandedClaim:
+    """``build_fixture_record`` stamps ``{source:'landed', passed:True}`` on the
+    premise "the task merged to main => its gates passed at the post commit".
+    ``_mint_continuity_one`` already MEASURES that premise and refuses the
+    claim when it fails; the ``referenced`` path must not merely assume it."""
+
+    def test_records_that_the_post_commit_is_reachable_from_main(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, merge = _landing_merge_repo(tmp_path)
+        rec = _mint(_referenced_row(repo, merge))
+        assert rec['provenance']['post_commit_reachable_from_main'] is True
+        assert rec['verify_outcome']['source'] == 'landed'
+        assert rec['verify_outcome']['passed'] is True
+
+    def test_an_unreachable_post_commit_does_not_claim_passing_gates(
+        self, tmp_path: Path,
+    ) -> None:
+        # A merge living only on a side branch. `find_merge_sha` now scopes to
+        # `main` so it cannot produce this row, but the fixture is read on its
+        # own, far from that scoping detail — the landed claim must rest on a
+        # measurement recorded IN the fixture, not on a guarantee two
+        # functions away.
+        repo = _init_repo(tmp_path)
+        _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'integration'], repo)
+        _git(['checkout', '-q', '-b', 'task/900'], repo)
+        _commit(repo, 'b.txt', 'work\n', 'work')
+        _git(['checkout', '-q', 'integration'], repo)
+        _git(['merge', '--no-ff', 'task/900', '-m',
+              'Merge task/900 into main'], repo)
+        side_merge = _git(['rev-parse', 'HEAD'], repo)
+        _git(['checkout', '-q', 'main'], repo)
+
+        rec = _mint(_referenced_row(repo, side_merge))
+        assert rec['provenance']['post_commit_reachable_from_main'] is False
+        assert rec['verify_outcome']['source'] == 'landed_branch_tip'
+        assert rec['verify_outcome']['passed'] is None
+        assert side_merge in rec['verify_outcome']['reason']
+        # The reference itself is unaffected: it is captured from the pre/post
+        # SHAs directly, so only the GATE claim is withdrawn.
+        assert rec['reference']['post_task_commit'] == side_merge
+
+    def test_a_referenced_row_on_a_weaker_rung_is_refused(
+        self, tmp_path: Path,
+    ) -> None:
+        # `mint_mode: referenced` and `baseline_source: merge_first_parent` are
+        # one fact recorded twice. Were they to disagree, the fixture would
+        # ship a `pre` that IS the true branch point stamped
+        # `base_is_approximated: true` naming a rung it never used, and
+        # base_distance_rows would pick the wrong branch point for it.
+        repo, merge = _landing_merge_repo(tmp_path)
+        with pytest.raises(RuntimeError, match='merge_first_parent'):
+            _mint(_referenced_row(repo, merge, baseline_source='timestamp_walk'))
+
+
+# ---------------------------------------------------------------------------
+# _mint_continuity_one — the inherited base is MEASURED, never assumed
+# ---------------------------------------------------------------------------
+
+def _standing_fixture(repo: Path, task_id: str, pre: str, post: str) -> dict:
+    """A minimal canonical ``evals/tasks/<id>.json`` for the continuity path."""
+    return {
+        'id': f'reify_task_{task_id}',
+        'name': f'Standing fixture {task_id}',
+        'project': 'reify',
+        'project_root': str(repo),
+        'pre_task_commit': pre,
+        'post_task_commit': post,
+        'task_definition': {
+            'title': f'Standing fixture {task_id}',
+            'description': 'Carried verbatim from the standing corpus.',
+        },
+        'verify_commands': {'test': 'true'},
+        'modules': ['kernel'],
+        'complexity': 'complex',
+    }
+
+
+def _mint_continuity(monkeypatch: Any, tmp_path: Path, src_fixture: dict) -> dict:
+    """Mint one continuity record from *src_fixture*, written under a fake
+    REPO_ROOT so nothing is read from or written to the real corpus."""
+    import asyncio
+    rel = Path('orchestrator/src/orchestrator/evals/tasks') / f'{src_fixture["id"]}.json'
+    dest = tmp_path / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(src_fixture, indent=2))
+    monkeypatch.setattr(driver, 'REPO_ROOT', tmp_path)
+    sampler = driver._import_sampler()
+    return asyncio.run(driver._mint_continuity_one(
+        sampler, {'id': src_fixture['id'], 'source_path': str(rel)},
+        sampled_at='2026-08-04T00:00:00+00:00', seed=3631,
+        ceilings={'max_architect_turns': 120, 'timeout_minutes': 180},
+    ))
+
+
+class TestContinuityBaseApproximation:
+    """Continuity fixtures sit OUTSIDE the three-rung ladder: their base is
+    carried verbatim from the standing corpus under
+    ``CONTINUITY_BASELINE_SOURCE``, so the flag cannot be read off a rung
+    label. It is MEASURED against the task's landing merge — the same
+    measure-the-premise discipline as ``post_commit_reachable_from_main``."""
+
+    def test_inherited_base_equal_to_merge_first_parent_is_not_approximated(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        repo = _init_repo(tmp_path, 'reify')
+        base = _commit(repo, 'a.txt', 'base\n', 'base')
+        _git(['checkout', '-q', '-b', 'task/12'], repo)
+        tip = _commit(repo, 'b.txt', 'work\n', 'work on 12')
+        _git(['checkout', '-q', 'main'], repo)
+        # The colon spelling on purpose: df_task_18 and reify_task_12 both
+        # have colon-spelled landing merges in the live checkouts, so the
+        # step-2 matcher is what makes them measurable at all.
+        merge = _merge(repo, 'task/12', 'Merge task/12: the landing merge')
+
+        rec = _mint_continuity(
+            monkeypatch, tmp_path, _standing_fixture(repo, '12', base, tip))
+        prov = rec['provenance']
+        assert prov['base_is_approximated'] is False
+        # The measurement is recorded, not just its verdict: a reader can see
+        # WHICH merge the inherited base was checked against.
+        assert prov['base_verified_against_merge'] == merge
+        assert 'base_approximation_reason' not in prov
+
+    def test_inherited_base_diverging_from_merge_first_parent_is_approximated(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        repo = _init_repo(tmp_path, 'reify')
+        older = _commit(repo, 'a.txt', 'base\n', 'base')
+        branch_point = _commit(repo, 'a2.txt', 'more\n', 'later main commit')
+        _git(['checkout', '-q', '-b', 'task/13'], repo)
+        tip = _commit(repo, 'b.txt', 'work\n', 'work on 13')
+        _git(['checkout', '-q', 'main'], repo)
+        _merge(repo, 'task/13', 'Merge task/13 into main')
+
+        # The standing fixture inherited `older`, not the real branch point.
+        rec = _mint_continuity(
+            monkeypatch, tmp_path, _standing_fixture(repo, '13', older, tip))
+        prov = rec['provenance']
+        assert prov['base_is_approximated'] is True
+        assert prov['base_verified_against_merge'] == \
+            _git(['rev-parse', 'main'], repo)
+        # Both SHAs are reported, so the divergence is legible from the JSON.
+        reason = prov['base_approximation_reason']
+        assert older in reason and branch_point in reason
+
+    def test_no_landing_merge_leaves_the_base_unverifiable(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        repo = _init_repo(tmp_path, 'reify')
+        base = _commit(repo, 'a.txt', 'base\n', 'base')
+        tip = _commit(repo, 'b.txt', 'work\n', 'landed directly, no merge')
+
+        rec = _mint_continuity(
+            monkeypatch, tmp_path, _standing_fixture(repo, '14', base, tip))
+        prov = rec['provenance']
+        assert prov['base_is_approximated'] is True
+        assert prov['base_verified_against_merge'] is None
+        assert 'no landing merge' in prov['base_approximation_reason'].lower()
+
+    def test_pre_and_post_are_still_carried_verbatim(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        # The continuity contract forbids divergence; this marking is
+        # OBSERVATIONAL only and must never move a commit.
+        repo = _init_repo(tmp_path, 'reify')
+        older = _commit(repo, 'a.txt', 'base\n', 'base')
+        branch_point = _commit(repo, 'a2.txt', 'more\n', 'later main commit')
+        _git(['checkout', '-q', '-b', 'task/15'], repo)
+        tip = _commit(repo, 'b.txt', 'work\n', 'work on 15')
+        _git(['checkout', '-q', 'main'], repo)
+        _merge(repo, 'task/15', 'Merge task/15 into main')
+
+        # An approximated base and a verified one must BOTH be carried through
+        # untouched — the marking is observational, never corrective.
+        for pre in (older, branch_point):
+            fixture = _standing_fixture(repo, '15', pre, tip)
+            rec = _mint_continuity(monkeypatch, tmp_path, fixture)
+            assert rec['pre_task_commit'] == fixture['pre_task_commit']
+            assert rec['post_task_commit'] == fixture['post_task_commit']
+            assert rec['provenance']['baseline_source'] == \
+                driver.CONTINUITY_BASELINE_SOURCE
+
+
+# ---------------------------------------------------------------------------
+# merge_sha_availability_block — counts and prose from ONE derivation
+# ---------------------------------------------------------------------------
+
+# The inverted claim the committed manifest shipped: authored when the census
+# was planRate-majority and never re-derived when the dual-spelling matcher
+# flipped the balance. Pinned here as a literal so the majority clause is
+# checked against a fixed expectation rather than against the code's own
+# wording.
+_SPLIT_MAJORITY_CLAIM = 'SPLIT / direct-landed candidates are a MAJORITY'
+_REFERENCED_MAJORITY_CLAIM = 'Candidates that CAN carry a reference are a MAJORITY'
+
+# The two accepted landing-merge spellings, as a reader of CURATION.md sees
+# them (`_merge_subject_patterns` carries the machine form).
+_SPELLING_INTO_MAIN = '`Merge task/<id> into main`'
+_SPELLING_COLON = '`Merge task/<id>: <subject>`'
+
+
+def _availability_rows(referenced: int, planrate: int,
+                       excluded: int = 2) -> list[dict]:
+    """Manifest-shaped candidate rows for the availability block.
+
+    *excluded* defaults to 2 — the committed manifest's two excludes — so the
+    default shape reproduces the exact denominator defect: 41 rows, 39 of them
+    included and therefore carrying a ``mint_mode`` at all.
+    """
+    rows = [{'task_id': f'r{i}', 'project': 'reify', 'decision': 'include',
+             'mint_mode': 'referenced'} for i in range(referenced)]
+    rows += [{'task_id': f'p{i}', 'project': 'reify', 'decision': 'include',
+              'mint_mode': 'planrate_only'} for i in range(planrate)]
+    # An excluded row is never minted, so it has no mint mode. The committed
+    # manifest omits the key entirely; an explicit None is the harsher shape,
+    # and counting by `decision` must ignore both.
+    rows += [{'task_id': f'x{i}', 'project': 'reify', 'decision': 'exclude',
+              'mint_mode': None} for i in range(excluded)]
+    return rows
+
+
+class TestMergeShaAvailabilityBlock:
+    def test_counts_only_included_rows(self) -> None:
+        # The shipped defect: `author_manifest` divided by len(rows) — all 41
+        # census candidates — while only the 39 INCLUDED rows carry a
+        # mint_mode, so the two published counts did not sum to their own
+        # stated denominator (17 + 22 = 39, not 41).
+        block = driver.merge_sha_availability_block(_availability_rows(20, 19))
+        assert set(block) == {'referenced', 'planrate_only', 'total', 'finding'}
+        assert block['referenced'] == 20
+        assert block['planrate_only'] == 19
+        assert block['total'] == 39
+        assert block['referenced'] + block['planrate_only'] == block['total']
+
+    def test_finding_quotes_only_the_derived_counts(self) -> None:
+        # Every number in the sentence comes from the counts computed in the
+        # same call, so prose and counts cannot drift apart.
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(20, 19))['finding']
+        assert '20 of 39' in finding
+        assert '19 of 39' in finding
+        # The literals the stale sentence carried, measured on the committed
+        # manifest: "22/41" and "17 of 41" beside rows that say 20 and 19.
+        for stale in ('22', '17', '41'):
+            assert stale not in finding, (
+                f'finding still carries the stale literal {stale!r}: {finding}'
+            )
+
+    @pytest.mark.parametrize('referenced,planrate,split_is_majority', [
+        # The original census reality the shipped sentence was authored for.
+        (17, 22, True),
+        # The CURRENT post-redrive reality: the dual-spelling matcher moved
+        # three fixtures across, inverting the majority.
+        (20, 19, False),
+    ])
+    def test_majority_claim_tracks_the_counts(
+        self, referenced: int, planrate: int, split_is_majority: bool,
+    ) -> None:
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(referenced, planrate))['finding']
+        if split_is_majority:
+            assert _SPLIT_MAJORITY_CLAIM in finding
+            assert _REFERENCED_MAJORITY_CLAIM not in finding
+        else:
+            # Absence of the INVERTED claim is the load-bearing half: a
+            # sentence that still calls the SPLIT set a majority is wrong no
+            # matter what else it says.
+            assert _SPLIT_MAJORITY_CLAIM not in finding, (
+                f'finding claims the SPLIT set is a majority at '
+                f'referenced={referenced} > planrate_only={planrate}: {finding}'
+            )
+            assert _REFERENCED_MAJORITY_CLAIM in finding
+
+    def test_a_tie_is_stated_as_a_tie(self) -> None:
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(19, 19))['finding']
+        assert _SPLIT_MAJORITY_CLAIM not in finding
+        assert _REFERENCED_MAJORITY_CLAIM not in finding
+        assert 'Neither mint mode is a majority' in finding
+
+    def test_finding_names_both_accepted_spellings(self) -> None:
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(20, 19))['finding']
+        assert _SPELLING_INTO_MAIN in finding
+        assert _SPELLING_COLON in finding
+        # The single-matcher sentence this task replaced must be gone: it
+        # described a check narrower than the one `find_merge_sha` now runs.
+        assert 'single clean "Merge task/<id> into main" commit' not in finding
+
+    def test_finding_keeps_the_surviving_substance(self) -> None:
+        # Correcting the counts must not quietly drop WHY the split matters.
+        finding = driver.merge_sha_availability_block(
+            _availability_rows(20, 19))['finding']
+        for claim in ('plan_quality', 'γ1', 'β1', 'D9'):
+            assert claim in finding, f'finding dropped {claim!r}: {finding}'
+
+    def test_block_is_deterministic(self) -> None:
+        rows = _availability_rows(20, 19)
+        assert driver.merge_sha_availability_block(rows) == \
+            driver.merge_sha_availability_block(rows)
+        # Counting must not depend on row order either — the manifest's rows
+        # are grouped per project, and a regrouping is not a finding.
+        shuffled = list(reversed(rows))
+        assert driver.merge_sha_availability_block(shuffled) == \
+            driver.merge_sha_availability_block(rows)
+
+
+# ---------------------------------------------------------------------------
+# redrive_provenance — re-derive provenance WITHOUT re-censusing
+# ---------------------------------------------------------------------------
+
+def _redrive_manifest() -> dict:
+    """A manifest with the blocks --redrive must leave alone."""
+    return {
+        'census': {'date': '2026-08-08', 'n': 41},
+        'ceilings': {'max_architect_turns': 120, 'timeout_minutes': 180},
+        'continuity': {'fixtures': [{'id': 'reify_task_12'}]},
+        'merge_sha_availability': {'referenced': 1, 'planrate_only': 1},
+        'candidates': [
+            {
+                'task_id': '4026', 'project': 'reify',
+                'project_root': '/home/leo/src/reify',
+                'title': 'Add physical constants', 'status': 'done',
+                'brief_chars': 224, 'decision': 'include',
+                'reason': 'INCLUDE. The brief states an implementable goal.',
+                'merge_sha': None, 'baseline_sha': 'e' * 40,
+                'baseline_source': 'timestamp_walk',
+                'mint_mode': 'planrate_only',
+            },
+            {
+                'task_id': '3883', 'project': 'reify',
+                'project_root': '/home/leo/src/reify',
+                'title': 'Add stdlib dynamics', 'status': 'cancelled',
+                'brief_chars': 300, 'decision': 'include',
+                'reason': 'INCLUDE. The brief states an implementable goal.',
+                'merge_sha': None, 'baseline_sha': '2' * 40,
+                'baseline_source': 'timestamp_walk',
+                'mint_mode': 'planrate_only',
+            },
+            {
+                'task_id': '999', 'project': 'reify',
+                'project_root': '/home/leo/src/reify',
+                'title': 'Too vague', 'status': 'done',
+                'brief_chars': 12, 'decision': 'exclude',
+                'reason': 'EXCLUDE. The brief states no implementable goal.',
+            },
+        ],
+    }
+
+
+def _fake_resolve(table: dict[str, tuple[str | None, str, str]]):
+    """Injected resolver: task_id -> (merge_sha, baseline_sha, baseline_source).
+
+    Same dependency-injection discipline as
+    ``task_sampler.audit_fixture_corpus``'s ``ref_exists`` — no checkout is
+    touched, so the redrive rule itself is testable in isolation.
+    """
+    def resolve(project_root: str, task_id: str):
+        return table[task_id]
+    return resolve
+
+
+class TestRedriveProvenance:
+    def test_a_newly_resolvable_row_is_upgraded(self) -> None:
+        before = _redrive_manifest()
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        row = after['candidates'][0]
+        assert row['merge_sha'] == '3613bea224' + 'f' * 30
+        assert row['baseline_sha'] == '794d321596' + 'a' * 30
+        assert row['baseline_source'] == 'merge_first_parent'
+        assert row['mint_mode'] == 'referenced'
+
+    def test_a_row_that_still_has_no_merge_keeps_planrate_only(self) -> None:
+        after, _changes = driver.redrive_provenance(
+            _redrive_manifest(), _fake_resolve({
+                '4026': (None, 'e' * 40, 'timestamp_walk'),
+                '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+            }))
+        row = after['candidates'][1]
+        assert row['mint_mode'] == 'planrate_only'
+        assert row['merge_sha'] is None
+        assert row['baseline_source'] == 'timestamp_walk'
+        assert row['baseline_sha'] == '2ceaf9ec17' + 'b' * 30
+
+    def test_curation_fields_are_never_re_adjudicated(self) -> None:
+        before = _redrive_manifest()
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        curation_keys = ('task_id', 'project', 'project_root', 'decision',
+                         'reason', 'title', 'status', 'brief_chars')
+        for old_row, new_row in zip(before['candidates'], after['candidates'],
+                                    strict=True):
+            for key in curation_keys:
+                if key in old_row:
+                    assert new_row[key] == old_row[key], key
+
+    def test_the_row_set_and_the_exclude_row_are_untouched(self) -> None:
+        # --redrive re-derives provenance on rows that already exist; by
+        # construction it cannot add or drop a fixture.
+        before = _redrive_manifest()
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        assert len(after['candidates']) == len(before['candidates'])
+        assert [r['task_id'] for r in after['candidates']] == \
+            [r['task_id'] for r in before['candidates']]
+        assert after['candidates'][2] == before['candidates'][2]
+
+    def test_census_ceilings_and_continuity_blocks_are_untouched(self) -> None:
+        before = _redrive_manifest()
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        for block in ('census', 'ceilings', 'continuity'):
+            assert after[block] == before[block]
+
+    def test_does_not_mutate_the_manifest_it_was_given(self) -> None:
+        before = _redrive_manifest()
+        snapshot = json.dumps(before, sort_keys=True)
+        driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+        }))
+        assert json.dumps(before, sort_keys=True) == snapshot
+
+    def test_the_change_list_names_exactly_what_moved(self) -> None:
+        _after, changes = driver.redrive_provenance(
+            _redrive_manifest(), _fake_resolve({
+                '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                         'merge_first_parent'),
+                '3883': (None, '2ceaf9ec17' + 'b' * 30, 'timestamp_walk'),
+            }))
+        # 3883's rung and mode are unchanged; only its baseline_sha moved (the
+        # --first-parent fix), so BOTH rows moved and both must be listed.
+        assert [c['task_id'] for c in changes] == ['4026', '3883']
+        upgraded = changes[0]
+        assert upgraded['before']['baseline_source'] == 'timestamp_walk'
+        assert upgraded['after']['baseline_source'] == 'merge_first_parent'
+        assert upgraded['before']['mint_mode'] == 'planrate_only'
+        assert upgraded['after']['mint_mode'] == 'referenced'
+
+    def test_an_unchanged_row_is_not_listed(self) -> None:
+        _after, changes = driver.redrive_provenance(
+            _redrive_manifest(), _fake_resolve({
+                '4026': (None, 'e' * 40, 'timestamp_walk'),
+                '3883': (None, '2' * 40, 'timestamp_walk'),
+            }))
+        assert changes == []
+
+    def test_redrive_regenerates_the_finding_prose_not_just_the_counts(
+        self,
+    ) -> None:
+        # The shipped contradiction: --redrive recomputed the two integers and
+        # left the sentence beside them untouched, so the manifest ended up
+        # publishing counts that its own prose denied.
+        before = _redrive_manifest()
+        before['merge_sha_availability'] = driver.merge_sha_availability_block(
+            before['candidates'])
+        stale_finding = before['merge_sha_availability']['finding']
+        # Authored while both include rows were planRate-only.
+        assert _SPLIT_MAJORITY_CLAIM in stale_finding
+
+        # Upgrade BOTH rows, inverting the majority.
+        after, _changes = driver.redrive_provenance(before, _fake_resolve({
+            '4026': ('3613bea224' + 'f' * 30, '794d321596' + 'a' * 30,
+                     'merge_first_parent'),
+            '3883': ('7c1d0e5b91' + 'c' * 30, '0a4f2b6d83' + 'd' * 30,
+                     'merge_first_parent'),
+        }))
+
+        # The WHOLE block — counts AND prose — is the shared derivation over
+        # the rows this call just rewrote.
+        assert after['merge_sha_availability'] == \
+            driver.merge_sha_availability_block(after['candidates'])
+        # And the sentence actually moved: "recomputed the two integers, left
+        # the sentence" cannot pass here.
+        assert after['merge_sha_availability']['finding'] != stale_finding
+        assert _SPLIT_MAJORITY_CLAIM not in \
+            after['merge_sha_availability']['finding']
+
+
+# ---------------------------------------------------------------------------
+# base_distance_rows — REPORT the measured distances, never assert them
+# ---------------------------------------------------------------------------
+
+def _row(task_id: str, baseline_sha: str, baseline_source: str,
+         merge_sha: str | None, mint_mode: str) -> dict:
+    return {
+        'task_id': task_id, 'project': 'reify',
+        'project_root': '/home/leo/src/reify', 'decision': 'include',
+        'baseline_sha': baseline_sha, 'baseline_source': baseline_source,
+        'merge_sha': merge_sha, 'mint_mode': mint_mode,
+    }
+
+
+_BEFORE_ROWS = [
+    _row('4026', 'e21d047026', 'timestamp_walk', None, 'planrate_only'),
+    _row('3883', '2ceaf9ec17', 'timestamp_walk', None, 'planrate_only'),
+]
+_AFTER_ROWS = [
+    _row('4026', '794d321596', 'merge_first_parent', '3613bea224', 'referenced'),
+    _row('3883', '2ceaf9ec17', 'timestamp_walk', None, 'planrate_only'),
+]
+
+
+def _fake_distance(table: Mapping[tuple[str, str], int | None]):
+    """Injected ``distance(project_root, a, b) -> int | None``."""
+    def distance(project_root: str, a: str, b: str) -> int | None:
+        return table.get((a, b))
+    return distance
+
+
+_DISTANCES = {
+    ('794d321596', 'e21d047026'): 245,
+    ('794d321596', '794d321596'): 0,
+}
+
+
+class TestBaseDistanceReport:
+    def test_reports_before_and_after_for_each_fixture(self) -> None:
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        upgraded = rows[0]
+        assert upgraded['fixture_id'] == 'reify_task_4026'
+        assert upgraded['before']['baseline_source'] == 'timestamp_walk'
+        assert upgraded['after']['baseline_source'] == 'merge_first_parent'
+        assert upgraded['before']['baseline_sha'] == 'e21d047026'
+        assert upgraded['after']['baseline_sha'] == '794d321596'
+        assert upgraded['before']['distance_from_branch_point'] == 245
+        assert upgraded['after']['distance_from_branch_point'] == 0
+
+    def test_carries_the_shared_approximation_flag(self) -> None:
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        # From the step-6 helper, so the report and the minted fixtures can
+        # never disagree about which bases a readout should exclude.
+        assert rows[0]['before']['base_is_approximated'] is True
+        assert rows[0]['after']['base_is_approximated'] is False
+        assert rows[1]['after']['base_is_approximated'] is True
+
+    def test_an_unknowable_distance_is_reported_not_omitted(self) -> None:
+        # reify_3883's real case: no landing merge under either spelling, so
+        # the true branch point is not derivable from git at all. Dropping the
+        # row would let the report read as full coverage when it is not.
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        assert [r['fixture_id'] for r in rows] == \
+            ['reify_task_4026', 'reify_task_3883']
+        unknown = rows[1]
+        assert unknown['before']['distance_from_branch_point'] is None
+        assert unknown['after']['distance_from_branch_point'] is None
+        assert unknown['branch_point'] is None
+        assert 'no landing merge' in unknown['note'].lower()
+        assert 'approximated' in unknown['note'].lower()
+
+    def test_names_the_branch_point_it_measured_against(self) -> None:
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        assert rows[0]['branch_point'] == '794d321596'
+
+    def test_is_deterministic_and_wall_clock_free(self) -> None:
+        first = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        second = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES))
+        assert first == second
+        assert json.dumps(first, sort_keys=True) == \
+            json.dumps(second, sort_keys=True)
+
+    def test_a_distance_the_measurement_could_not_resolve_stays_none(
+        self,
+    ) -> None:
+        # An empty `git rev-list --count` (an unresolvable SHA in this
+        # checkout) must read as "not measured", never as 0.
+        rows = driver.base_distance_rows(
+            _BEFORE_ROWS, _AFTER_ROWS, _fake_distance({}))
+        assert rows[0]['before']['distance_from_branch_point'] is None
+        assert rows[0]['branch_point'] == '794d321596'
+
+    def test_the_measurement_is_direction_agnostic(self, tmp_path: Path) -> None:
+        # The production measurement must count the SYMMETRIC difference. A
+        # one-directional `git rev-list --count A..B` answers 0 whenever B is
+        # an ancestor of A — which is exactly reify_task_4026's shape, and
+        # would have reported its 245-commit-stale base as a perfect 0.
+        repo = _init_repo(tmp_path)
+        old = _commit(repo, 'a.txt', 'base\n', 'base')
+        _commit(repo, 'b.txt', 'one\n', 'one')
+        new = _commit(repo, 'c.txt', 'two\n', 'two')
+
+        assert driver._commit_distance(str(repo), new, old) == 2
+        assert driver._commit_distance(str(repo), old, new) == 2
+        assert driver._commit_distance(str(repo), new, new) == 0
+        assert driver._first_parent_commit_distance(str(repo), new, old) == 2
+
+    def test_an_unresolvable_sha_measures_as_none_not_zero(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = _init_repo(tmp_path)
+        head = _commit(repo, 'a.txt', 'base\n', 'base')
+        assert driver._commit_distance(str(repo), head, 'f' * 40) is None
+        assert driver._first_parent_commit_distance(
+            str(repo), head, 'f' * 40) is None
+
+    def test_the_summary_states_the_approximated_count_once(self) -> None:
+        # An earlier draft read '{approximated} ... of which {unmeasurable}
+        # have no landing merge', but both counts are the same set by
+        # construction (each is exactly `baseline_source !=
+        # merge_first_parent`), so it always printed N of N — a distinction
+        # the report cannot draw, inviting a reader to believe some
+        # approximated fixtures ARE measurable.
+        table = driver._render_distance_table(
+            driver.base_distance_rows(
+                _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES)),
+            driver.base_distance_rows(
+                _BEFORE_ROWS, _AFTER_ROWS, _fake_distance(_DISTANCES)),
+        )
+        assert 'of which' not in table
+        assert '1 still have an APPROXIMATED base' in table
+        assert 'UNMEASURABLE' in table
+
+    def test_refuses_rows_that_do_not_line_up(self) -> None:
+        # A before/after pair that disagrees on which fixtures it covers would
+        # silently mis-attribute every distance in the table.
+        with pytest.raises(ValueError):
+            driver.base_distance_rows(
+                _BEFORE_ROWS, list(reversed(_AFTER_ROWS)),
+                _fake_distance(_DISTANCES))
+
+
+# ---------------------------------------------------------------------------
 # (d) --render — the documented regeneration path, with no db access
 # ---------------------------------------------------------------------------
 
@@ -439,6 +1353,29 @@ class TestRenderMode:
         assert out.read_text() == driver.render_curation_md(manifest)
         assert out.read_text() == committed
 
+    def test_the_base_section_derives_its_counts_from_the_manifest(
+        self,
+    ) -> None:
+        # CURATION.md's job is the CURRENT numbers; the rule and its rationale
+        # live once, in README.md. A second static copy of the prose here is
+        # exactly the two-hand-maintained-artifacts drift the availability
+        # block was consolidated to abolish.
+        import json as _json
+        manifest = _json.loads(driver.CURATION_JSON.read_text())
+        includes = [r for r in manifest['candidates']
+                    if r['decision'] == 'include']
+        merge_derived = sum(
+            1 for r in includes
+            if r['baseline_source'] == driver.MERGE_DERIVED_BASELINE_SOURCE)
+        md = driver.render_curation_md(manifest)
+        section = md.split(
+            '## Is the base a true branch point, or an approximation?', 1,
+        )[1].split('\n## ', 1)[0]
+        assert f'**{merge_derived}**' in section
+        assert f'**{len(includes) - merge_derived}**' in section
+        assert f'**{len(manifest["continuity"]["fixtures"])}**' in section
+        assert '`README.md`' in section
+
     def test_render_refuses_when_the_manifest_is_absent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -448,6 +1385,17 @@ class TestRenderMode:
         monkeypatch.setattr(driver, 'CURATION_MD', tmp_path / 'CURATION.md')
         with pytest.raises(RuntimeError, match='no manifest'):
             driver.run_render()
+
+    def test_base_distance_report_refuses_an_absent_before_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # --before-manifest is what keeps the measurement reproducible after
+        # the redrive has landed (a redriven manifest compared against itself
+        # necessarily shows no movement). A mistyped path must be named
+        # immediately — the check runs BEFORE the redrive, which walks three
+        # live checkouts, so this test needs none of them.
+        with pytest.raises(RuntimeError, match='--before-manifest'):
+            driver.run_base_distance_report(tmp_path / 'nope.json')
 
 
 # ---------------------------------------------------------------------------

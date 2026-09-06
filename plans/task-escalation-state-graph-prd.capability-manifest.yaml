@@ -35,10 +35,10 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: has_open_l1\(task_id\)
+      pattern: vetoes_done_flip
       paths:
       - orchestrator/src/orchestrator/harness.py
-      expect: absent
+      expect: present
 - label: β
   task_id: 3535
   title: Structured recovery emission + streak escalation
@@ -63,7 +63,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: test_workflow_merge_gating_strand
+      pattern: TestNoStrandExitProperty
       paths:
       - orchestrator/tests/
       expect: present
