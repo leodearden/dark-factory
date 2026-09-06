@@ -405,6 +405,7 @@
       "orchestrator/tests/test_role_done_provenance_gate.py",
       "orchestrator/tests/test_roles_ancestry_check.py",
       "orchestrator/tests/test_roles_background_warning.py",
+      "orchestrator/tests/test_roles_error_remedy_hint.py",
       "orchestrator/tests/test_roles_escalation_ladder.py",
       "orchestrator/tests/test_roles_merge_halt_safety.py",
       "orchestrator/tests/test_roles_operator_tools.py",
