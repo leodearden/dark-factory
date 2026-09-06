@@ -5657,12 +5657,21 @@ class MemoryService:
         # the mapping is unrecoverable — nothing else in the system records it.
         # Tasks 3583/3584 key off this.
         real_uuid = getattr(getattr(result, 'episode', None), 'uuid', None)
-        logger.info(
-            'add_episode write executed: correlation_id=%r -> episode_uuid=%r '
-            '(group_id=%r, causation_id=%r)',
-            payload.get('correlation_id'), real_uuid,
-            payload.get('group_id'), causation_id,
-        )
+        # Gated on the operation, and `operation` interpolated rather than
+        # hard-coded: this method is the FALLTHROUGH dispatch target for every
+        # queued operation other than mem0's (see `_execute_durable_write`), so
+        # an unconditional line here also fires for every 'add_memory_graphiti'
+        # write. Those carry no correlation_id, so each would land in this
+        # channel mislabelled as an add_episode with `correlation_id=None`,
+        # diluting the one log stream 3583/3584 exist to mine. Keeping the emit
+        # gated leaves it a clean, greppable one-line-per-episode record.
+        if operation == 'add_episode':
+            logger.info(
+                '%s write executed: correlation_id=%r -> episode_uuid=%r '
+                '(group_id=%r, causation_id=%r)',
+                operation, payload.get('correlation_id'), real_uuid,
+                payload.get('group_id'), causation_id,
+            )
 
         # INVARIANT (task 3561): every path below is either a register or a
         # loud warning — never an implicit fallthrough. A planning episode is

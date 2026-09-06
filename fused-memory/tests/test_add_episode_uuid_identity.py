@@ -354,7 +354,9 @@ class TestPlanningRegistrationKeysOnTheRealUuid:
 LEGACY_UUID = 'stale-uuid-from-before-the-fix'
 
 
-def _pre_fix_payload(*, uuid: str | None = LEGACY_UUID) -> dict[str, Any]:
+def _pre_fix_payload(
+    *, uuid: str | None = LEGACY_UUID, temporal_context: str | None = None
+) -> dict[str, Any]:
     """A durable-queue payload in the shape ``add_episode`` produced BEFORE the fix.
 
     Reproduced verbatim (minus the fields added since) rather than derived from
@@ -370,7 +372,7 @@ def _pre_fix_payload(*, uuid: str | None = LEGACY_UUID) -> dict[str, Any]:
         'project_id': 'p',
         '_causation_id': 'causation-legacy-1',
         '_write_op_id': 'write-op-legacy-1',
-        'temporal_context': None,
+        'temporal_context': temporal_context,
         'reference_time': None,
     }
     if uuid is not None:
@@ -421,6 +423,14 @@ class TestLegacyPayloadDrainedAfterTheFix:
             'The backend must be reached with uuid=None even when the payload '
             f'carries a legacy one; got {fake.calls[0]["uuid"]!r}'
         )
+        # The stated reason execution POPS rather than GETS: `_dual_write_callback`
+        # receives this same dict, so a key left in place would leak onward to a
+        # consumer that has no reason to expect a dead uuid. Pinned here because
+        # `get` would satisfy every other assertion in this test.
+        assert 'uuid' not in payload, (
+            "The legacy key must be POPPED from the payload, not merely ignored, "
+            f'so it cannot leak onward; still holds {payload.get("uuid")!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_legacy_uuid_payload_warns_naming_the_ignored_key(
@@ -443,7 +453,12 @@ class TestLegacyPayloadDrainedAfterTheFix:
             f'Records seen: {[r.getMessage() for r in caplog.records]}'
         )
         message = warnings[0]
-        assert 'uuid' in message, f"The warning must name the ignored key; got {message!r}"
+        # The QUOTED spelling, not the bare word: `warnings` was filtered on
+        # LEGACY_UUID, which itself contains the substring 'uuid', so
+        # `'uuid' in message` could never fail and pinned nothing.
+        assert "'uuid'" in message, (
+            f'The warning must name the ignored key by name; got {message!r}'
+        )
         assert 'legacy-group' in message, (
             f'The warning must name the group_id so the row is locatable; got {message!r}'
         )
@@ -462,16 +477,54 @@ class TestLegacyPayloadDrainedAfterTheFix:
                 'add_episode', _pre_fix_payload(uuid=None)
             )
 
+        # 'Ignoring legacy', not the bare word 'legacy': the payload's group_id
+        # is literally 'legacy-group', so any unrelated warning naming the group
+        # would fail this test with a thoroughly misleading message.
         offenders = [
             r.getMessage()
             for r in caplog.records
-            if r.levelno >= logging.WARNING and 'legacy' in r.getMessage().lower()
+            if r.levelno >= logging.WARNING
+            and 'ignoring legacy' in r.getMessage().lower()
         ]
         assert not offenders, (
             'A clean post-fix payload carries no uuid key, so it must not warn; '
             f'got {offenders}'
         )
         assert len(fake.episodes) == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_planning_row_registers_the_minted_uuid_not_the_stale_one(
+        self, svc_fake_registry
+    ):
+        """The one cell where the two guards interact, and the only one that can
+        resurrect the ORIGINAL defect.
+
+        A pre-fix backlog row that is also a planning episode exercises the
+        legacy-uuid pop and the registration keying at once.  A regression that
+        re-reads ``payload['uuid']`` for registration passes every other test in
+        this module — the write still succeeds, the warning still fires — while
+        registering a uuid that names no node, which is exactly the vacuous
+        registration task 3561 exists to end.
+        """
+        svc, fake, reg = svc_fake_registry
+
+        await svc._execute_graphiti_write(
+            'add_episode', _pre_fix_payload(temporal_context='planning')
+        )
+
+        assert len(fake.episodes) == 1
+        (minted_uuid,) = fake.episodes
+        assert minted_uuid != LEGACY_UUID
+
+        assert await reg.is_planned(minted_uuid) is True, (
+            'A legacy planning row must register under the uuid graphiti_core '
+            f'minted ({minted_uuid!r}); the search filter matches registered '
+            'uuids against edge episode provenance, so anything else is inert.'
+        )
+        assert await reg.is_planned(LEGACY_UUID) is False, (
+            'The stale payload uuid names no graph node and must never reach '
+            'the registry — registering it is the pre-3561 vacuous behaviour.'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +731,36 @@ class TestEpisodeIdIsACorrelationId:
             f'({response.episode_id!r}) and the real episode uuid '
             f'({minted_uuid!r}); otherwise the mapping is unrecoverable. '
             f'Records seen: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_mapping_log_for_the_fallthrough_operations(
+        self, svc_and_fake, caplog
+    ):
+        """The mapping channel stays one line per EPISODE, not per Graphiti write.
+
+        ``_execute_graphiti_write`` is the fallthrough dispatch target for every
+        queued operation other than mem0's, so ``add_memory_graphiti`` lands here
+        too — carrying no ``correlation_id``.  An ungated emit would file those
+        under ``add_episode ... correlation_id=None``, mislabelling them and
+        diluting the exact channel tasks 3583/3584 have to grep.
+        """
+        svc, fake = svc_and_fake
+
+        with caplog.at_level(logging.INFO):
+            await svc._execute_graphiti_write(
+                'add_memory_graphiti', _pre_fix_payload(uuid=None)
+            )
+
+        assert len(fake.episodes) == 1, 'the write itself must still happen'
+        stray = [
+            r.getMessage()
+            for r in caplog.records
+            if 'write executed' in r.getMessage()
+        ]
+        assert not stray, (
+            'Only add_episode rows carry a correlation id, so only they may '
+            f'emit the mapping line; got {stray}'
         )
 
 
