@@ -74,21 +74,21 @@ That check has an unstated precondition, made explicit in task 4592: every path
 it reasons about must be ABSOLUTE.  Containment here is computed with
 ``os.path.realpath`` in the PARENT process's cwd, but the two things the verdict
 is about are resolved in the CHILD's — ``shared.cli_invoke.invoke_claude_agent``
-exports ``CLAUDE_CONFIG_DIR`` as a bare string and ``_run_subprocess`` spawns the
-wrapped argv with ``cwd=`` ``config.explore_codebase_root``, which is also where
-``landlock-exec`` / ``bwrap`` resolve the ``--writable`` grant tokens.  A relative
-string therefore names one directory to the verifier and a different one to the
-grantor, and the check would return PASS for a directory the child can never
-write — the 2026-07-18 defect re-entering through the relative-path door.  The
-two cwds agree in production today only because the installed systemd unit sets
-``WorkingDirectory`` == ``PROJECT_ROOT``; nothing enforced it, and
-``fused-memory/config/config.yaml`` supplies a RELATIVE ``data_dir``
-(``./data/reconciliation``) whenever ``RECONCILIATION_DATA_DIR`` is unset.  So
-both faces fail closed here: ``_assert_config_dir_writable`` raises on a
-non-absolute ``config_dir``, and ``_writable_roots`` drops a non-absolute extra
-(loudly) rather than counting a grant it cannot resolve the way the child will.
-The producer-side fix — absolutizing the root exactly once — lives at
-``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``.
+exports ``CLAUDE_CONFIG_DIR`` as a bare string, and ``landlock-exec`` / ``bwrap``
+resolve the ``--writable`` grant tokens, in the cwd ``_run_subprocess`` spawns
+with.  A relative string therefore names one directory to the verifier and a
+different one to the grantor, and the check would return PASS for a directory the
+child can never write — the 2026-07-18 defect re-entering through the
+relative-path door.  So both faces fail closed here:
+``_assert_config_dir_writable`` raises on a non-absolute ``config_dir``, and
+``_absolute_writable_extras`` drops a non-absolute extra — loudly, and from the
+grant as well as the verdict, so the two sets cannot diverge.
+
+Why a relative ``data_dir`` reaches here at all, why the two cwds nonetheless
+agree in production today, and the producer-side fix that absolutizes the root
+exactly once are all recorded at
+``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``,
+which is the canonical statement — this module cites it rather than restating it.
 """
 
 from __future__ import annotations

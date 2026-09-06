@@ -314,21 +314,14 @@ class TestReconConfigDirHelpers:
         """A relative ``data_dir`` must still yield an ABSOLUTE config-dir root.
 
         The root returned here becomes ``TaskConfigDir.path``, which is BOTH the
-        ``CLAUDE_CONFIG_DIR`` handed to the CLI child
-        (``shared/src/shared/cli_invoke.py::invoke_claude_agent`` sets
-        ``env['CLAUDE_CONFIG_DIR'] = str(config_dir)``) and the path the parent
-        verifies in
-        ``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``.
-        A RELATIVE string is resolved against two different cwds: the child's
-        (``_run_subprocess`` spawns with ``cwd=`` ``config.explore_codebase_root``)
-        and the parent's (every ``os.path.realpath`` in the guard). Verified path
-        A, written path B — the containment check says PASS while every transcript
-        write is denied by the kernel.
+        ``CLAUDE_CONFIG_DIR`` handed to the CLI child and the path the parent
+        verifies for sandbox containment. A relative string is resolved against
+        the child's cwd in the first role and the parent's in the second:
+        verified path A, written path B — the containment check says PASS while
+        the kernel denies every transcript write.
 
-        ``fused-memory/config/config.yaml`` supplies ``./data/reconciliation``
-        whenever ``RECONCILIATION_DATA_DIR`` is unset, which
-        ``scripts/fused-memory.service.template`` does not set — so the relative
-        case is the standalone/systemd production configuration, not a hypothetical.
+        The relative case is the standalone/systemd production configuration, not
+        a hypothetical. Full mechanism and deployment story: ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``.
         """
         from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
 

@@ -622,27 +622,19 @@ class TestConfigDirContainment:
 class TestRelativePathContainment:
     """Containment is undecidable for a RELATIVE path — refuse it (task 4592).
 
-    Every ``os.path.realpath`` in this module runs in the PARENT's cwd, but the
-    two things the verdict is about are resolved in the CHILD's:
-    ``shared/src/shared/cli_invoke.py::invoke_claude_agent`` writes
-    ``env['CLAUDE_CONFIG_DIR'] = str(config_dir)`` and ``_run_subprocess`` spawns
-    the wrapped argv with ``cwd=str(cwd)`` — which
-    ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::run_stage_via_cli``
-    sets to ``config.explore_codebase_root``. The ``--writable <path>`` grant
-    tokens inside that argv are likewise consumed by ``landlock-exec`` / ``bwrap``
-    in the child.
+    Every ``os.path.realpath`` in the module under test runs in the PARENT's cwd,
+    but the two things the verdict is about — ``CLAUDE_CONFIG_DIR`` and the
+    ``--writable`` grant tokens — are resolved in the CHILD's. So a relative
+    string names one directory to the verifier and a different one to the
+    grantor, and the check would report PASS while the kernel denies every
+    session-JSONL write: ``count_transcript_turns`` None forever, the liveness
+    watchdog inert, every cap-retry force-freshing instead of resuming. That is
+    the 2026-07-18 -> 2026-08-11 silent-transcript-loss defect the fail-closed
+    check (task 4003) exists to make impossible, re-entering through the
+    relative-path door.
 
-    So a relative string names one directory to the verifier here and a different
-    one to the grantor there. The check would report PASS while the kernel denies
-    every session-JSONL write — ``count_transcript_turns`` None forever, the
-    liveness watchdog inert, every cap-retry force-freshing instead of resuming.
-    That is precisely the 2026-07-18 -> 2026-08-11 silent-transcript-loss defect
-    this module's fail-closed check (task 4003) exists to make impossible,
-    re-entering through the relative-path door.
-
-    The two cwds agree in production today only because the installed unit sets
-    ``WorkingDirectory`` == ``PROJECT_ROOT``
-    (``scripts/fused-memory.service.template``); nothing enforced that.
+    Full mechanism and deployment story (which cwd comes from where, and why the
+    two agree in production today): ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``.
     """
 
     def test_relative_config_dir_fails_closed(

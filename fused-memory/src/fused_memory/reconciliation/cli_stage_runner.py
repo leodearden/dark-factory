@@ -462,10 +462,24 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     transcript write, which is exactly the 2026-07-18 -> 2026-08-11 silent
     transcript loss that task 4003's check exists to make impossible.
     ``data_dir`` really can be relative: ``fused-memory/config/config.yaml``
-    supplies ``./data/reconciliation`` whenever ``RECONCILIATION_DATA_DIR`` is
-    unset, which ``scripts/fused-memory.service.template`` does not set. The two
-    cwds agree today only because that unit sets ``WorkingDirectory`` ==
-    ``PROJECT_ROOT``.
+    supplies ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``, the
+    ``${VAR:default}`` expander
+    (``fused-memory/src/fused_memory/config/schema.py::YamlSettingsSource._expand_env_vars``)
+    is plain string substitution with no abspath, and
+    ``scripts/fused-memory.service.template`` sets ``WorkingDirectory`` and
+    ``PROJECT_ROOT`` but NOT ``RECONCILIATION_DATA_DIR`` — so the relative default
+    is what a standalone/systemd launch actually uses. Only a MANAGED spawn
+    escapes it, because ``orchestrator/src/orchestrator/mcp_lifecycle.py`` injects
+    an absolute XDG path. The two cwds agree today only because that unit sets
+    ``WorkingDirectory`` == ``PROJECT_ROOT``; nothing enforces it.
+
+    THIS DOCSTRING IS THE CANONICAL STATEMENT of that deployment story. The other
+    sites that depend on it — ``journal.py::ReconciliationJournal.__init__``,
+    ``config/schema.py``'s ``data_dir`` and ``sandbox_recon_writable_extras``
+    comments, ``sandbox_guard.py``'s module docstring, and the two test modules —
+    state only their LOCAL invariant and cite back here, so a change to the
+    deployment story (the unit starts setting ``RECONCILIATION_DATA_DIR``, or the
+    expander gains an abspath) has exactly one place to be corrected.
 
     The anchor is ``Path.cwd()`` and deliberately NOT
     ``config.explore_codebase_root``. This function's job is only to make the
