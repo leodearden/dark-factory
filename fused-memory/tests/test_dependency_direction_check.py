@@ -22,6 +22,8 @@ import pytest
 
 from fused_memory.middleware.dependency_direction_check import (
     DependencyAssertion,
+    DependencyIndex,
+    build_dependency_index,
     extract_dependency_assertions,
 )
 
@@ -167,3 +169,73 @@ class TestExtractDependencyAssertions:
     @pytest.mark.parametrize('fact', [None, '', '   ', 12345, object()])
     def test_never_raises_on_a_non_string_or_empty_fact(self, fact):
         assert extract_dependency_assertions(fact) == []
+
+
+# ── build_dependency_index — direct, reverse and TRANSITIVE closure ────────
+
+
+class TestBuildDependencyIndex:
+    """The index is where refinement #1 lives: the closure is TRANSITIVE, so an
+    inverted chain is detectable even when neither id appears in the other's
+    direct edge list.
+    """
+
+    @pytest.fixture
+    def index(self):
+        return build_dependency_index(LIVE_SHAPE_EDGES)
+
+    def test_index_is_frozen(self, index):
+        assert isinstance(index, DependencyIndex)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            index.direct = {}  # type: ignore[misc]
+
+    def test_direct_mirrors_the_input_edges(self, index):
+        assert index.direct[3578] == frozenset({3256, 3619, 3727})
+        assert index.direct[3730] == frozenset({3578, 3727, 3728})
+        assert index.direct[3618] == frozenset()
+
+    def test_closure_is_transitive(self, index):
+        # 3618 is reachable from 3578 via 3619, though direct[3578] EXCLUDES
+        # it — the whole point of computing a closure rather than checking
+        # direct edges.
+        assert 3618 not in index.direct[3578]
+        assert index.closure[3578] == frozenset({3256, 3619, 3727, 3618})
+        assert index.closure[3730] == frozenset(
+            {3578, 3727, 3728, 3256, 3619, 3618}
+        )
+        assert index.closure[3733] == frozenset(
+            {3578, 3728, 3256, 3727, 3619, 3618}
+        )
+        assert index.closure[3619] == frozenset({3256, 3618})
+        assert index.closure[3618] == frozenset()
+
+    def test_reverse_adjacency(self, index):
+        assert index.dependents[3578] == frozenset({3730, 3733})
+        assert index.dependents[3256] == frozenset({3619, 3727, 3728, 3578})
+        # Frozen-fixture value: 5020 is deliberately absent, see the drift
+        # note on LIVE_SHAPE_EDGES.
+        assert index.dependents[3733] == frozenset()
+
+    def test_diamond_is_deduplicated_not_double_counted(self):
+        # 3578 reaches 3256 directly AND via 3619 — a set, not a multiset.
+        index = build_dependency_index(LIVE_SHAPE_EDGES)
+        assert sorted(index.closure[3578]) == [3256, 3618, 3619, 3727]
+
+    def test_cycle_terminates(self):
+        """A malformed cyclic graph must terminate, not blow the stack."""
+        index = build_dependency_index({1: [2], 2: [1]})
+        assert index.closure[1] == frozenset({1, 2})
+        assert index.closure[2] == frozenset({1, 2})
+
+    def test_id_present_only_as_a_dependency_value_is_still_a_known_node(self):
+        index = build_dependency_index({10: [11]})
+        assert 11 in index.closure
+        assert index.closure[11] == frozenset()
+        assert index.dependents[11] == frozenset({10})
+        assert index.direct[11] == frozenset()
+
+    def test_caller_input_is_not_mutated(self):
+        edges = {1: [2], 2: []}
+        before = {k: list(v) for k, v in edges.items()}
+        build_dependency_index(edges)
+        assert edges == before
