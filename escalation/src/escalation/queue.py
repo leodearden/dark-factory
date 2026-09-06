@@ -285,6 +285,52 @@ def _elide(text: str, limit: int) -> tuple[str, int]:
     ), dropped
 
 
+def _is_late_resolution_worth_capturing(
+    esc: Escalation, resolution: str, resolved_by: str | None,
+) -> bool:
+    """Should this already-terminal ``resolve()`` PRESERVE its incoming text?
+
+    The capture exists for one shape — the W9-δ auto-dismiss race (task 4495,
+    esc-3902-1) — and is deliberately narrow, because a forensic field is only
+    high-signal while it stays rare.  Every conjunct below suppresses a shape
+    that already happens routinely in this system:
+
+    - ``esc.status == 'dismissed'`` — a stored *resolve* already carries a
+      substantive finding of its own, so a second one displaces nothing.  Only a
+      DISMISSAL closed the record without one.
+
+    - stored tier is ``'reaper-sweep'`` — the close was AUTOMATED (a sweep that
+      never read the record), so the incoming text is strictly more informative
+      than what it lost the race to.  Without this, every ordinary idempotent
+      double-resolve of a human- or steward-closed record would append an entry.
+
+    - incoming tier is NOT ``'reaper-sweep'`` — an auto-dismisser re-closing an
+      already-auto-dismissed record is routine bookkeeping, not a lost finding.
+      This is what keeps ``orchestrator.workflow``'s idempotent auto-dismiss
+      backstops (five call sites) and ``test_workflow_escalated_steward_stall``'s
+      deliberate re-dismissals silent.
+
+    - the incoming ``resolution`` is non-empty and DIFFERENT from the stored one
+      — an empty or byte-identical retry preserves nothing the record lacks.
+
+    BOTH resolver-tier tests go through ``escalation.classify.classify_resolver_tier``
+    rather than re-deriving an ``'auto-dismissed'`` literal here, so the
+    reaper-sweep membership stays single-sited in classify.py (INV-5) and a
+    future member added to ``_REAPER_SWEEP_RESOLVERS`` is covered by construction
+    rather than silently starting to generate noise.
+
+    Pure — no I/O, no mutation.  The caller holds ``escalation_id_lock``, so
+    *esc* is the record as it is inside the critical section.
+    """
+    if esc.status != 'dismissed':
+        return False
+    if classify_resolver_tier(esc.resolved_by) != 'reaper-sweep':
+        return False
+    if classify_resolver_tier(resolved_by) == 'reaper-sweep':
+        return False
+    return bool(resolution) and resolution != esc.resolution
+
+
 def _build_amendment(
     *, root_cause: str, summary: str, evidence: str, options: list[str] | None,
     agent_role: str, timestamp: str,
@@ -1232,11 +1278,7 @@ class EscalationQueue:
                 # DISCARDED.  See _is_late_resolution_worth_capturing for why the
                 # predicate is narrow.  Still inside escalation_id_lock, so the
                 # capture is atomic with the check-and-set it follows.
-                if (
-                    esc.status == 'dismissed'
-                    and classify_resolver_tier(esc.resolved_by) == 'reaper-sweep'
-                    and resolution
-                ):
+                if _is_late_resolution_worth_capturing(esc, resolution, resolved_by):
                     entry: LateResolution = {
                         'timestamp': datetime.now(UTC).isoformat(),
                         'resolution': resolution,
