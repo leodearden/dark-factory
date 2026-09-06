@@ -684,8 +684,8 @@ def _atomic_write_text(path: Path, text: str) -> None:
     ``test_session_registry.py::TestStdlibOnlySelfContainment`` — which
     mutation-tests it by injecting this very import — and this
     function is recorded in ``_ALLOWED_RENAMERS`` in
-    ``shared/tests/test_safe_io.py`` so the anti-regrowth guard reads it as the
-    documented exception it is rather than a fresh copy.
+    ``tests/scripts/test_atomic_write_regrowth.py`` so the anti-regrowth guard
+    reads it as the documented exception it is rather than a fresh copy.
 
     The cost is conscious: the repo keeps two hand-rolled copies of this
     pattern instead of one. A documented, allowlisted, test-pinned second copy

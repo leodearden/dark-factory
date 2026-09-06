@@ -7555,7 +7555,7 @@ class TestAtomicWriteSemantics:
     ``shared.safe_io.atomic_write_text``, but this module is the deliberate
     exception: it is stdlib-only so ``skills/spawn/spawn-claude.sh`` can run it
     with no venv (see ``TestStdlibOnlySelfContainment`` below and
-    ``_ALLOWED_RENAMERS`` in ``shared/tests/test_safe_io.py``).
+    ``_ALLOWED_RENAMERS`` in ``tests/scripts/test_atomic_write_regrowth.py``).
 
     So these assert the OBSERVABLE result on disk rather than that a particular
     helper was called. That is the more durable pin anyway: it holds whether

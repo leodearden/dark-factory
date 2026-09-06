@@ -1645,7 +1645,8 @@ class TaskArtifacts:
         the pattern (its unique-per-writer O_CREAT|O_EXCL temp, fchmod on the
         still-open fd, and BaseException-safe cleanup are all things a local
         copy would have to re-earn), and the consolidation is machine-enforced
-        by ``TestNoRegrownAtomicWriters`` in shared/tests/test_safe_io.py.
+        by ``TestNoRegrownAtomicWriters`` in
+        ``tests/scripts/test_atomic_write_regrowth.py``.
 
         ``append_iteration_log`` is deliberately NOT routed through here: it
         is genuinely append-only, and tmp+rename would turn an O(1) append
