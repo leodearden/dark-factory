@@ -413,9 +413,15 @@ def daemon_reload() -> None:
 def main(argv: Sequence[str]) -> int:
     """Parse args and run parity check (and optional fix).
 
-    Returns:
-        0 — parity
-        1 — drift
+    Returns (mirroring the module docstring's exit contract — keep the two in
+    step, because a reader reasoning about the ``if dropins: return 1`` branches
+    below from THIS docstring alone would conclude they are dead code):
+        0 — parity (all required directives present, and no drop-in overrides
+            the unit)
+        1 — drift, OR a drop-in override applies (the unit FILE was compared,
+            the EFFECTIVE configuration was NOT). Both on 1 because "I could
+            not verify" belongs with "I found a difference", not with the
+            benign 2 below, which setup-host.sh's gate treats as a skip.
         2 — installed unit absent
     """
     parser = argparse.ArgumentParser(

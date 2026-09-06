@@ -255,7 +255,7 @@ def _log(message: str, *, stream=None) -> None:
 # find_dropins tests still call mod.find_dropins and are what proves the lift
 # was behaviour-preserving.
 from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    _ABSENT,  # noqa: F401  (re-exported: read by the test suite)
+    _ABSENT,
     Drift,
     _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
     find_dropins,
@@ -488,7 +488,7 @@ def _compare_exec_start_flags(
 # directly (test_check_dashboard_unit_parity.py's registry-staleness guards),
 # so that surface stays intact and IS the extraction's regression net.
 from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    environment_map as _environment_map,  # noqa: F401  (re-exported: read by the test suite)
+    environment_map as _environment_map,
 )
 
 

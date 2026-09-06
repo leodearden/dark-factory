@@ -240,7 +240,8 @@ here.
 
 Design notes
 ------------
-- Stdlib-only (argparse, dataclasses, pathlib, sys) plus the shared parser —
+- Stdlib-only (argparse, pathlib, sys) plus the shared
+  ``scripts/systemd_unit_parity.py``, which is itself stdlib-only —
   runs under a plain python3, exactly like the two sibling checkers whose
   idioms this script follows deliberately rather than inventing a pattern.
 - The parser is imported from ``scripts/systemd_unit_parity.py``, which was
@@ -288,7 +289,7 @@ from collections.abc import Sequence
 # it three copies; this suite's existing find_dropins tests still call
 # mod.find_dropins, so they are what proves the lift was behaviour-preserving.
 from systemd_unit_parity import (
-    _ABSENT,  # noqa: F401  (re-exported: read by the test suite)
+    _ABSENT,
     Drift,
     find_dropins,
     parse_unit_directives,

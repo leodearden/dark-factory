@@ -91,7 +91,7 @@ from collections.abc import Sequence
 # suites assert on) with a filed follow-up. Do not read the import above as
 # evidence the lift is finished.
 from systemd_unit_parity import (
-    _ABSENT,  # noqa: F401  (re-exported: read by the test suite)
+    _ABSENT,
     Drift,
     find_dropins,
     parse_unit_directives,
