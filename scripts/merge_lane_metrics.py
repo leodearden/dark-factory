@@ -995,6 +995,60 @@ BASELINE_README = (
 _PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
 
 
+def _lane_scoped_enumeration(enumeration: dict) -> dict:
+    """Narrow ``enumeration.requested`` to the lane-relevant paths, for STORAGE.
+
+    WHY THIS EXISTS (esc-5021-7). ``_sweep_test_tree`` appends EVERY ``*.py``
+    under ``orchestrator/tests`` to ``requested`` -- 583 paths, of which only
+    the lane-importing ones are ever measured. Freezing that full manifest in
+    the committed baseline made this gate a hair trigger: any task ANYWHERE in
+    the repo that adds, removes or renames a single test file reddened
+    ``test_baseline_matches_a_fresh_measurement`` even though no lane measure
+    moved, and the failure it printed ("Regenerate it in this commit if you
+    lowered a measure") invited a blind regeneration of a baseline that task had
+    never inspected -- exactly the silent widening ``BASELINE_README`` and that
+    test exist to prevent. Observed live: an unrelated file arriving via rebase
+    (test_roles_error_remedy_hint.py, task 4964) produced a ONE-LINE baseline
+    diff and a red gate.
+
+    It also cut against this task's decompose-time baseline-format constraint,
+    which rejected even a single shared ``totals`` line because ten parallel
+    gamma branches "would conflict on every rebase". A frozen 583-entry list is
+    strictly MORE rebase-sensitive than the line that constraint rejected, and
+    it is sensitive to churn outside the lane entirely.
+
+    WHAT IS KEPT: every ``CLUSTER_PATHS`` entry (including the glob LITERALS,
+    which are the SPOT record of PRD Appendix A and do not churn), plus anything
+    that actually resolved or was skipped. So the stored list still moves on
+    REAL lane churn -- a new test that imports a lane module lands in
+    ``resolved`` and is kept, and it was already going to move the ``tests``
+    section anyway -- while a non-lane test file is invisible here.
+
+    INV-11 IS UNAFFECTED, and deliberately so: ``unreadable`` entries are
+    retained rather than filtered, ``complete`` is untouched, and
+    ``check_against_baseline`` reads completeness from the CURRENT report, never
+    from the stored list. The full 583-path denominator remains in ``--report``
+    and ``--json`` output, which is where the sweep's coverage is legible; the
+    live sweep's breadth is floored by
+    ``test_the_live_sweep_denominator_covers_the_whole_test_tree`` so a
+    COLLAPSED sweep still fails loudly rather than quietly shrinking this list.
+
+    Idempotent, which ``render_baseline``'s round-trip contract requires:
+    the kept set is a function of ``resolved``/``unreadable``/``CLUSTER_PATHS``,
+    all of which survive filtering, so re-filtering a filtered block is a no-op.
+    """
+    requested = enumeration.get('requested')
+    if not isinstance(requested, list):
+        return enumeration
+    keep = set(CLUSTER_PATHS)
+    keep.update(enumeration.get('resolved', ()) or ())
+    keep.update(enumeration.get('unreadable', ()) or ())
+    return {
+        **enumeration,
+        'requested': [entry for entry in requested if entry in keep],
+    }
+
+
 def _render_section(name: str, mapping: dict) -> str:
     """Render one per-path map with exactly one line per entry, key-sorted."""
     if not mapping:
@@ -1023,7 +1077,12 @@ def render_baseline(report: dict) -> str:
             entries.append(_render_section(key, value))
         else:
             # Top-level scalars and the small params/enumeration blocks are
-            # ordinary pretty-printed JSON, shifted one level in.
+            # ordinary pretty-printed JSON, shifted one level in. `enumeration`
+            # is narrowed to the lane-relevant paths first -- see
+            # _lane_scoped_enumeration for why storing the full 583-path sweep
+            # made this a hair trigger on unrelated test files (esc-5021-7).
+            if key == 'enumeration' and isinstance(value, dict):
+                value = _lane_scoped_enumeration(value)
             block = json.dumps(value, indent=2).replace('\n', '\n  ')
             entries.append(f'  {json.dumps(key)}: {block}')
     return '{\n' + ',\n'.join(entries) + '\n}\n'

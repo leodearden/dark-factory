@@ -1205,6 +1205,84 @@ class TestBuildReport:
 # parallel gamma branches rebase without conflicting.
 
 
+class TestLaneScopedEnumeration:
+    """The stored `requested` list is lane-scoped, so non-lane churn is inert.
+
+    esc-5021-7: freezing all 583 orchestrator/tests paths made ANY unrelated
+    test-file addition redden test_baseline_matches_a_fresh_measurement.
+    """
+
+    @staticmethod
+    def _enum(requested: list[str], resolved: list[str], unreadable: list[str]) -> dict:
+        return {
+            'requested': requested,
+            'resolved': resolved,
+            'unreadable': unreadable,
+            'complete': not unreadable,
+        }
+
+    def test_a_non_lane_test_file_is_dropped_from_the_stored_list(self) -> None:
+        # THE BUG. A swept-but-never-measured file must not reach the baseline.
+        enum = self._enum(
+            ['orchestrator/tests/test_unrelated.py'], [], []
+        )
+        assert metrics._lane_scoped_enumeration(enum)['requested'] == []
+
+    def test_a_lane_importing_test_file_is_kept(self) -> None:
+        # Real lane churn must still move the baseline -- it already moves the
+        # `tests` section, so keeping it adds no new trigger.
+        lane = 'orchestrator/tests/test_merge_queue_x.py'
+        enum = self._enum([lane, 'orchestrator/tests/test_other.py'], [lane], [])
+        assert metrics._lane_scoped_enumeration(enum)['requested'] == [lane]
+
+    def test_cluster_paths_are_kept_including_the_glob_literals(self) -> None:
+        # CLUSTER_PATHS entries are the SPOT record of PRD Appendix A. The glob
+        # LITERALS never appear in `resolved`, so a resolved-only filter would
+        # silently delete them.
+        globs = [entry for entry in metrics.CLUSTER_PATHS if '*' in entry]
+        assert globs, 'expected at least one glob entry in CLUSTER_PATHS'
+        enum = self._enum(list(metrics.CLUSTER_PATHS), [], [])
+        kept = metrics._lane_scoped_enumeration(enum)['requested']
+        assert kept == list(metrics.CLUSTER_PATHS)
+        for glob in globs:
+            assert glob in kept
+
+    def test_an_unreadable_path_is_kept_so_inv_11_still_reads(self) -> None:
+        # INV-11: a partial enumeration must stay distinguishable in the RESULT.
+        # Filtering must never hide the very path that made it partial.
+        bad = 'orchestrator/tests/test_broken.py'
+        enum = self._enum([bad], [], [bad])
+        narrowed = metrics._lane_scoped_enumeration(enum)
+        assert narrowed['requested'] == [bad]
+        assert narrowed['unreadable'] == [bad]
+        assert narrowed['complete'] is False
+
+    def test_filtering_is_idempotent(self) -> None:
+        # render_baseline's round-trip contract: regenerating a baseline FROM a
+        # baseline must be a no-op, not a second round of deletions.
+        lane = 'orchestrator/tests/test_lane.py'
+        enum = self._enum(
+            [lane, 'orchestrator/tests/test_other.py', *metrics.CLUSTER_PATHS],
+            [lane],
+            [],
+        )
+        once = metrics._lane_scoped_enumeration(enum)
+        assert metrics._lane_scoped_enumeration(once) == once
+
+    def test_the_rendered_baseline_is_stable_across_an_unrelated_new_test(
+        self,
+    ) -> None:
+        # THE REGRESSION, end to end and in the units that bit: adding one
+        # non-lane test file to the sweep must not change a single byte.
+        report = _synthetic_report()
+        before = metrics.render_baseline(report)
+        report['enumeration']['requested'] = [
+            *report['enumeration']['requested'],
+            'orchestrator/tests/test_roles_error_remedy_hint.py',
+        ]
+        assert metrics.render_baseline(report) == before
+
+
 class TestRenderBaseline:
     def test_round_trips_without_dropping_a_measure(self) -> None:
         # A hand-rolled writer's failure mode is a silently omitted measure, so
@@ -1936,6 +2014,29 @@ class TestBaselineIsNotVacuous:
     ) -> None:
         assert committed_baseline['enumeration']['complete'] is True
         assert committed_baseline['enumeration']['unreadable'] == []
+
+    def test_the_live_sweep_denominator_covers_the_whole_test_tree(
+        self, live_report: dict
+    ) -> None:
+        """The FLOOR that replaces the full manifest the baseline no longer stores.
+
+        `render_baseline` narrows `enumeration.requested` to lane-relevant paths
+        before committing it (esc-5021-7), so the committed file no longer
+        witnesses that the sweep walked the whole test tree. That evidence moves
+        HERE, as a one-sided floor on the LIVE measurement -- the idiom this
+        module already uses for every live-tree anchor (commit d54acca456,
+        "live-tree anchors become floors, not exact pins").
+
+        A floor, not an equality, is the whole point: it catches a COLLAPSED
+        sweep (the failure that would let the stored list silently shrink) while
+        staying green when an unrelated task adds one test file -- which is the
+        churn that made this a hair trigger in the first place. Measured 583
+        paths under orchestrator/tests; the floor sits far below that so it
+        survives ordinary attrition rather than tracking the tree.
+        """
+        requested = live_report['enumeration']['requested']
+        swept = [p for p in requested if p.startswith('orchestrator/tests/')]
+        assert len(swept) >= 400, len(swept)
 
 
 def test_baseline_matches_a_fresh_measurement(live_report: dict) -> None:
