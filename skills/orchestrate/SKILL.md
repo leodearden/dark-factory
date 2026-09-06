@@ -533,7 +533,7 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 
    On the ladder's genuine not-landed outcomes — rc=0's **phantom-branch** exit, and, both **outside** the `coalesce-*` arm, rc=1 and rc=128 with an empty marker search — stamp nothing and report, rather than substituting a convenient sha. A citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict: stamp nothing there either, and report it as un-evaluable rather than as not-landed.
 
-   A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<branch tip, or the sibling's landing sha>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
+   A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<the commit on main that cites this task>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
    ```bash
    git worktree remove .worktrees/<task-id>
