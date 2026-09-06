@@ -5381,12 +5381,12 @@ class TestLivenessSubjectFactsIsAdditive:
     covers the strictly harder one they do not reach -- clause evidence that
     is non-empty but INCOMPLETE.
 
-    Measured against the shipped module before this class landed: record B
-    below names task 94 in its first clause and puts the other two fields in a
-    second clause naming no task, so the subject keyed on the partial
-    `status=in-progress`, matched nothing, and the whole-record bucket it had
-    shared with A was silently vacated -- `find_liveness_snapshot_recurrences`
-    returned `[]` with an ALL-ZERO disclosure. A fallback that fires only on
+    This is the failure mode the unconditional seed closes: record B below
+    names task 94 in its first clause and puts the other two fields in a
+    second clause naming no task, so keying the subject on the partial
+    `status=in-progress` alone matches nothing, and the whole-record bucket it
+    shares with A is silently vacated -- `find_liveness_snapshot_recurrences`
+    returns `[]` with an ALL-ZERO disclosure. A fallback that fires only on
     the empty set cannot catch that; a non-empty-but-incomplete set wins
     outright.
 
