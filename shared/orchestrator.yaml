@@ -11,80 +11,154 @@ type_check_command: "uv run --directory shared pyright src/ tests/"
 # here and fell HARD through to the repo-root whole-fleet ceiling — see the
 # cascade note below.
 #
-# (1) MEASUREMENT PROVENANCE. Four runs of the VERBATIM test_command above,
-# copied byte-for-byte, on base main 5a7770d239. All rc=0, all reporting
-# 3222 passed / 12 skipped / 9 deselected. EVERY FIGURE IS CONTENDED — a
-# 32-core host running /proc/loadavg 85-223 throughout, ~3-7x oversubscribed —
+# (1) MEASUREMENT PROVENANCE. RE-MEASURED by task 5131 on base main
+# 1b3c50e98f63b08beec2f4b10e4e4d7b02e2596b (2026-09-05): TEN runs of the
+# VERBATIM test_command above, copied byte-for-byte — five by the task's
+# architect, five by its pre-1. All rc=0, reporting either 4779 passed / 14
+# skipped / 9 deselected or 4781 passed / 12 skipped / 9 deselected (4802
+# collected either way; the 2/2 wobble is a conditionally-skipped pair, not a
+# collection change). EVERY FIGURE IS CONTENDED — a 32-core host at
+# /proc/loadavg 73-357 throughout this sweep, ~2x to ~11x oversubscribed —
 # and none is quoted as an unloaded one, per the norm at
 # orchestrator/tests/warm-lane/README.md (whose own argument abandoned
 # wall-clock for load-independent counters, calling it "nearly unusable" here).
+# Runs 2-10 below ran under a REAL NINE-WAY GATHER — the eight other
+# registered module test_commands running concurrently, reproducing
+# verify.run_full_verification's asyncio.gather over module_configs.values()
+# — which is the standard paragraph (1a) below prescribes for a re-measure;
+# run 1 predates the wave.
 #
-#     79.04s wall / 74.43s pytest  @ loadavg  85.78   <- the CONVENIENT figure
+#    141.81s wall / 129.51s pytest  architect run 1; rc=0, 4779p/14s/9d;
+#                                   loadavg  73.42 ->  81.93
+#    236.17s wall / 223.19s pytest  architect run 2; rc=0, 4779p/14s/9d;
+#                                   loadavg  81.93 -> 135.06
+#    272.22s wall / 254.87s pytest  architect run 3; rc=0, 4781p/12s/9d;
+#                                   loadavg 135.06 -> 129.08
+#    241.10s wall / 231.13s pytest  architect run 4; rc=0, 4781p/12s/9d;
+#                                   loadavg 129.08 -> 165.93
+#    211.50s wall / 200.34s pytest  architect run 5; rc=0, 4781p/12s/9d;
+#                                   loadavg 165.93 -> 357.09
+#    296.88s wall / 271.59s pytest  pre-1 run 1; rc=0, 4781p/12s/9d;
+#                                   loadavg 119.12 -> 179.03   <- WORST; W
+#    253.45s wall / 238.09s pytest  pre-1 run 2; rc=0, 4781p/12s/9d;
+#                                   loadavg 179.03 -> 289.04
+#    197.82s wall / 183.23s pytest  pre-1 run 3; rc=0, 4781p/12s/9d;
+#                                   loadavg 289.04 ->  99.54
+#    222.42s wall / 200.70s pytest  pre-1 run 4; rc=0, 4781p/12s/9d;
+#                                   loadavg  99.54 -> 105.74
+#    180.75s wall / 168.49s pytest  pre-1 run 5; rc=0, 4781p/12s/9d;
+#                                   loadavg 105.74 ->  90.92
+#
+# The ten-run MEAN is 225.41s, which would derive only a 400s floor and round
+# to ~600 at 2.6x — the budget this module ALREADY has, and already below the
+# family's convention band. Sizing against the mean would have looked "fine"
+# while leaving this module no safer than today; the rule is the worst RUN,
+# never the mean, for exactly this reason.
+#
+# SUPERSEDED EPOCH, kept for history and no longer sized against: four runs
+# at base main 5a7770d239 (2026-08-06), all rc=0, all reporting 3222 passed /
+# 12 skipped / 9 deselected (3243 collected — today's 4802 is ~48% more):
+#
+#     79.04s wall / 74.43s pytest  @ loadavg  85.78
 #     96.17s wall / 88.34s pytest  @ loadavg 133.65
 #    147.06s wall /135.59s pytest  @ loadavg 102.15
-#    219.08s wall /209.94s pytest  @ loadavg 191.12   <- the INCONVENIENT one
+#    219.08s wall /209.94s pytest  @ loadavg 191.12   <- the epoch's WORST
 #
-# The 219.08s run is recorded first-class rather than discarded as an outlier:
-# it is the 6-way CONCURRENT wave, and a purely serial measurement
-# systematically under-measures the real cost, so the concurrent figure governs.
-# (Full per-run table, including a disclosed procedural defect in that sweep, in
-# .task/measurements.md.)
+# Full per-run detail lived in the respective task's own .task/measurements.md
+# at measurement time (worktree-local scratch, scrubbed at merge); this block
+# is the single durable home for the figures themselves.
 #
-# (1a) BE PRECISE ABOUT WHAT THAT WAVE IS — it is a LOWER BOUND on the
-# production shape, not a reproduction of it. This paragraph is the full
+# (1a) BE PRECISE ABOUT WHAT THAT GATHER IS. This paragraph is the full
 # statement; the other five module yamls this task closed carry a one-line
 # pointer here rather than a sixth copy of it.
+#   CORRECTED IN PLACE (task 5131): this paragraph used to open "it is a
+#   LOWER BOUND on the production shape, not a reproduction of it", reasoning
+#   from "the six-way wave measured above". Paragraph (1)'s ten runs are no
+#   longer that six-way wave — runs 2-10 ran under a REAL NINE-WAY gather,
+#   the eight other registered module configs launched concurrently exactly
+#   as verify.run_full_verification's asyncio.gather does — so W now reflects
+#   the full gather this paragraph calls for, rather than an extrapolation
+#   from a smaller one. The two mechanisms below still bound the residual gap
+#   to a true production run and are otherwise unaffected by this change.
 #
 # verify.run_full_verification asyncio.gathers over module_configs.values(),
 # which is NINE registered configs today — the six this task closed plus
 # scripts, tests/scripts, and the dominant `orchestrator` segment measured at
-# 1366.23s in task 3062. A full nine-way gather is therefore materially heavier
-# than the six-way wave measured above, so W UNDER-states the fully-concurrent
-# cost, and this yaml does not claim otherwise.
+# 1366.23s in task 3062.
 #
-# Two mechanisms cut the other way, so the residual gap is smaller than a naive
-# nine-versus-six comparison implies. NEITHER is credited in the sizing — they
-# are stated so a reader can see the gap is bounded, not to justify a tighter
-# number:
+# Two mechanisms bound the residual gap to a true production run. NEITHER is
+# credited in the sizing — they are stated so a reader can see the gap is
+# bounded, not to justify a tighter number:
 #
 #   * verify_plan.derive_verify_plan scopes most verifies to the modules a
 #     change actually touches, so the all-nine gather is the exception (full
 #     verification) rather than the common case.
 #   * On the task and background roles the pytest leg is gated by the
-#     shared.verify_admission flock semaphore at verify_admission_task_slots
-#     (default 1), and shared.verify_admission._acquire takes that wait BEFORE
-#     the timeout clock starts. So the gather WIDTH is not the real pytest
-#     concurrency, and time spent queueing for a slot does not count against the
-#     budget below. (The merge role no-ops in acquire_task_slot and is not
-#     gated.)
+#     shared.verify_admission flock semaphore at verify_admission_task_slots,
+#     and shared.verify_admission._acquire takes that wait BEFORE the timeout
+#     clock starts. So the gather WIDTH is not the real pytest concurrency,
+#     and time spent queueing for a slot does not count against the budget
+#     below. (The merge role no-ops in acquire_task_slot and is not gated.)
+#       CORRECTED IN PLACE (task 5131): this bullet used to say
+#       "verify_admission_task_slots (default 1)".
+#       dark-factory-orchestrator.yaml raised that to 3 on 2026-09-03, so the
+#       mitigation this bullet credits is now three times weaker than the
+#       prose claims. Hypothesis, NOT established here: that widening may
+#       have contributed to esc-4502-1's starvation. Not measured; this
+#       corrects only the stale default-1 premise.
 #
 # What remains after those is what the 2.6x multiple absorbs. That is an
 # ASSUMPTION with an error bar, not a measurement, and false infra_timeout on
-# the honest green path is precisely the defect these blocks exist to avoid — so
-# if this suite ever does time out under a full nine-way gather, RE-MEASURE with
-# all nine in flight rather than assuming the multiple still covers it.
+# the honest green path is precisely the defect these blocks exist to avoid —
+# so if this suite ever does time out under a full nine-way gather,
+# RE-MEASURE with all nine in flight rather than assuming the multiple still
+# covers it. Task 5131 is the worked example of doing exactly that.
 #
-# (2) SIZING. W = 219.08s, the WORST run, never the mean.
-#     B ~= 2.6 x W = 569.6 -> rounded up to 600.
+# (2) SIZING (task 5131 re-measurement). W = 296.88s, the WORST run across
+#     all TEN VERBATIM runs on record, never the mean.
+#     B ~= 2.6 x W = 771.9 -> rounded up to 800.
 # Max-not-mean is forced by recorded evidence, not preference:
 # scripts/orchestrator.yaml logs a ~3x spread (310.33s -> 914.61s) for a
 # BYTE-IDENTICAL command on a BYTE-IDENTICAL tree, which is host load at
-# measurement time rather than suite variance. This sweep reproduced the effect
-# — shared itself spanned 79.04s -> 219.08s, ~2.8x. A mean (135.34s) would have
-# yielded ~400s and red-walled the honest green path on the next loaded day.
+# measurement time rather than suite variance. This sweep reproduced the
+# effect again — the ten runs in (1) span 141.81s -> 296.88s, ~2.09x. The
+# ten-run MEAN (225.41s) would derive only a 400s floor and round to ~600 at
+# 2.6x — the budget this module already has, and already below the family's
+# convention band (see (3)). The worst run, not the mean, is what makes this
+# a real raise rather than a relabelling.
 #
-# (3) THE 2.6x MULTIPLE AND THE 600s FLOOR ARE INHERITED DELIBERATELY, not
-# coincidentally. Both sibling configs already use 2.6x — tests/scripts' 600
-# ~= 2.6 x 233.50, scripts' 2400 ~= 2.6 x 930.59 — and scripts/orchestrator.yaml
-# states explicitly that it kept the multiple identical across the two on
-# purpose. 600s is additionally tests/scripts' own declared value, and is the
-# absolute floor this task applies underneath the arithmetic. For shared the
-# two agree: 2.6 x W rounds to exactly 600, so the floor is not doing the work
-# here (it is, for sampler and cockpit).
+# (3) THE 2.6x MULTIPLE IS THIS FAMILY'S OWN CONVENTION, drawn from every
+# sibling that sizes a budget this way — not from any one of them by
+# coincidence. CORRECTED IN PLACE (task 5131): this paragraph used to cite
+# "tests/scripts' 600 ~= 2.6 x 233.50" as one of two anchor points for the
+# multiple. Task 4320 re-measured tests/scripts on 2026-08-22 and moved that
+# pair to 1000 / 397.47 (2.52x); the 233.50-based figure this paragraph went
+# on quoting had been stale since — a THIRD-copy drift of exactly the kind
+# this block exists to prevent, left uncorrected until this task touched the
+# paragraph. Family band today: tests/scripts 1000/397.47 = 2.52x, scripts
+# 2400/930.59 = 2.58x, dashboard 1700/653.54 = 2.60x, fused-memory
+# 1200/439.80 = 2.73x, escalation 1000/354.56 = 2.82x. shared's own B/W =
+# 800/296.88 = 2.69x now sits inside that band, against today's 600/296.88 =
+# 2.02x — already the family's thinnest before this task, and thinner still
+# once W moved from 219.08 to 296.88.
+#
+# The claim that "600s is ... the absolute floor this task [3473] applies
+# underneath the arithmetic" is UNCHANGED as a statement about task 3473's
+# original policy for the six modules it closed, and this paragraph does not
+# revisit sampler's or cockpit's own budgets. What no longer holds is the
+# sentence that followed it, which was specific to shared: "For shared the
+# two agree: 2.6 x W rounds to exactly 600, so the floor is not doing the
+# work here." That coincidence is gone — shared's declared budget is now
+# arithmetic-derived (800), not the ~600 that once happened to satisfy both
+# the floor and the multiple at once.
 #
 # (4) WHAT THIS ACTUALLY BUYS, stated plainly rather than oversold: 3600s ->
-# 600s, a 6x narrowing. It does NOT make the suite faster and does not detect
-# suite growth — see the GATED-BY guard's own scope note.
+# 800s, a 4.5x narrowing (was 6x at the now-superseded 600s). It does NOT
+# make the suite faster and does not detect suite growth — see the GATED-BY
+# guard's own scope note. That gap is precisely why this re-measurement
+# needed to be a TASK (5131): the suite grew 3243 -> 4802 collected (+48%)
+# with no mechanism to notice, until esc-4502-1 surfaced it as a false
+# infra_timeout instead.
 #
 # (4a) COUNT THE RETRIES — the wall-clock a hang really costs is a MULTIPLE of
 # the number below, not the number below. This paragraph is the full statement;
@@ -95,42 +169,108 @@ type_check_command: "uv run --directory shared pyright src/ tests/"
 # defaults.yaml) and dark-factory-orchestrator.yaml does NOT override it, and
 # verify.py's attempt loop re-runs a PURE TIMEOUT failure — it breaks only on
 # `attempt.passed or not attempt.pure_timeout_failure or retries >=
-# max_retries`. So on the TASK path a genuine hang burns up to 3 x 600s = ~30
-# minutes before it surfaces, not ~10. Before this declaration it burned up to
-# 3 x 3600s = ~3 hours, not ~60 minutes.
+# max_retries`. So on the TASK path a genuine hang burns up to 3 x 800s = ~40
+# minutes before it surfaces, not ~10. Before task 3473's declaration it
+# burned up to 3 x 3600s = ~3 hours, not ~60 minutes.
 #
-# The 6x RATIO is what the narrowing buys and is unaffected by the multiplier —
-# it divides out. The absolute minutes are 3x larger than the budget alone
-# suggests, and are written down here because a block that promises to state
-# things "plainly rather than oversold" cannot quietly be 3x optimistic about
-# the one number an operator would act on.
+# The 4.5x RATIO (was 6x at the now-superseded 600s) is what the narrowing
+# buys and is unaffected by the multiplier — it divides out. The absolute
+# minutes are 3x larger than the budget alone suggests, and are written down
+# here because a block that promises to state things "plainly rather than
+# oversold" cannot quietly be 3x optimistic about the one number an operator
+# would act on.
 #
-# The MERGE-verify and background-sweep paths pass max_retries=0 explicitly, so
-# on those the bound is a single 600s.
+# The MERGE-verify and background-sweep paths pass max_retries=0 explicitly,
+# so on those the bound is a single 800s.
 #
 # (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
 # TEST leg on its own — NOT test + lint + type summed. Each leg gets its own
-# 600s.
+# 800s.
 #
 # (6) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET: shared has
 # no build step whose cold cost would justify a separate cold budget. Note what
 # that actually means, because the cascade is counter-intuitive and reads the
 # opposite way at a glance. Per verify._resolve_verify_timeout, an unset module
-# cold knob does NOT inherit the 600 below — it falls through to the repo-root
+# cold knob does NOT inherit the 800 below — it falls through to the repo-root
 # verify_cold_command_timeout_secs (5400), and on a MERGE-cold verify falls
 # through first to config.merge_verify_cold_command_timeout_secs (7200, shipped
 # by the package-bundled orchestrator/src/orchestrator/defaults.yaml and not
 # overridden by the root yaml). A reader who assumes warm covers cold would
-# conclude this module is bounded at 600 on a cold run when it is bounded at
+# conclude this module is bounded at 800 on a cold run when it is bounded at
 # 5400/7200. Gated by assertion (f) of the guard named below.
 #
-# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 600s,
+# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 800s,
 # RE-MEASURE and raise BOTH this value and
 # MEASURED_MODULE_SUITE_WORST_SECS['shared'] in
 # tests/scripts/test_module_verify_budgets.py — never quietly widen one. That
 # exact pair has already rotted once undetected between the two sibling configs
 # and was caught only by a reviewer.
 #
+#   IT HAS NOW FIRED ONCE, and this records how it was discharged (task
+#   5131). The suite grew 3243 -> 4802 collected (+48%) between the
+#   5a7770d239 epoch and base 1b3c50e98f, and esc-4502-1 hit a 601.4s false
+#   infra_timeout at ~44% completion under that growth. A RE-MEASURE — ten
+#   VERBATIM runs, table in (1) above — moved W 219.08 -> 296.88s (+35.5%)
+#   and the declared budget 600 -> 800s in the SAME change. Notably, the
+#   owning guard's `budget >= min_budget(W)` assertion did NOT go red this
+#   time (min_budget(296.88) = 500 <= 600): the raise is driven by the
+#   family's OWN 2.6x convention, under which 600/W had fallen to 2.02x —
+#   already this family's thinnest — not by a failing assertion. Two
+#   findings shape how the NEXT re-measure must be run, not just this one:
+#
+#     * LINEAR SCALING IN TEST COUNT OVER-PREDICTS WALL CLOCK HERE. The
+#       task's own sizing sketch, spelled fully, is (219.08 x 4802/3243 ->
+#       ~324s W, x2.6 -> ~849s budget) — the ~849s end figure is reached only
+#       after the 2.6x multiple is ALSO applied; on its own the count ratio
+#       predicts a W of ~324s. The honest over-prediction is therefore ~324s
+#       predicted vs 296.88s measured (~9% over), not 849 vs 296.88. The
+#       actual worst-run growth was only ~35.5%, against 48% more tests. Do
+#       not scale a stale W by a test-count ratio — RE-MEASURE.
+#     * LOADAVG DOES NOT PREDICT WALL CLOCK ON THIS HOST — the same finding
+#       task 4320 recorded for tests/scripts. The architect's run 5 STARTED
+#       at this sweep's HIGHEST load (165.93, ending at 357.09) and was the
+#       SECOND-FASTEST of the ten; run 3 started at a LOWER load (135.06) and
+#       was the SLOWEST. A figure annotated "recorded at loadavg N" cannot be
+#       normalised to a clean-host number.
+#
+#   ALSO RECORDED, first-class and clearly labelled NOT USED FOR SIZING —
+#   this block's norm is that an inconvenient or differently-scoped figure is
+#   recorded, never discarded:
+#
+#     (a) esc-4502-1's original 601.4s KILL at ~44% completion, and a replay
+#         reaching only 21% after 366s on 17s of CPU (~4.6% of one core). The
+#         kill is a CENSORED truncation point, not a run's duration, so it
+#         cannot be W under this table's own definition. The RE-MEASURE this
+#         paragraph itself directs was performed — ten VERBATIM runs under a
+#         real nine-way gather peaking at loadavg 357 (~11x oversubscribed on
+#         32 cores) — and did NOT reproduce it: every run completed GREEN in
+#         141-297s. No cgroup CPU/Memory cap explains the difference —
+#         verify.py launches the command via `systemd-run --user --scope
+#         --quiet --collect` with no CPU/Memory properties set.
+#     (b) A SEPARATE 646.13s GREEN run (mem0 956618f8, ticket
+#         tkt_0RT9WWEY36BA5BAEV5F2KRFXJV) recorded against this same
+#         escalation used a DIFFERENT, non-verbatim command — `-p no:xdist -o
+#         addopts=`, which blanks shared/pyproject.toml's own `-m 'not
+#         integration'` filter — so it is this module's own FALLBACK-PATH
+#         figure, the same shape tests/scripts/orchestrator.yaml already
+#         keeps separate from its sizing table, not a larger VERBATIM figure
+#         this block failed to use. KEPT OUT OF THE W TABLE FOR THAT REASON,
+#         but it is NOT unrelated to this budget: verify.py's ENV_TRANSIENT
+#         recovery path re-runs a timed-out test leg via `_serial_pytest_str`/
+#         `_run_or_skip_timed` under this SAME resolved
+#         verify_command_timeout_secs, and that rewrite also blanks the `-m
+#         'not integration'` filter — so the recovery leg is strictly LARGER
+#         than the verbatim command and genuinely shares this budget. Against
+#         the new 800s, this one observed run leaves only 800/646.13 =
+#         ~1.24x headroom, on a host this block documents producing a ~2.1x
+#         run-to-run spread on the verbatim command alone (141.81s-296.88s
+#         across ten runs) — so the recovery leg could plausibly manufacture
+#         a false infra_timeout even though the verbatim leg now has 2.69x
+#         (800/296.88). Filed as a follow-up (tkt_0RTA9VTCQ7W92QZBK2QB94XJJN)
+#         rather than fixed here: treating 646.13s as a second sizing input,
+#         or giving the recovery path its own bound, is a design change
+#         beyond this task's re-measurement scope.
+#
 # (8) GATED BY tests/scripts/test_module_verify_budgets.py::
 # test_module_carries_its_own_measured_verify_budget[shared].
-verify_command_timeout_secs: 600
+verify_command_timeout_secs: 800
