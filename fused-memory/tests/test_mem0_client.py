@@ -476,6 +476,112 @@ class TestMem0BackendPayloadFilterSingleHome:
         with pytest.raises(ValueError, match='at least one filter'):
             backend._build_payload_filter({})
 
+    # -- the optional text-needle arm (task 3682) --------------------------
+    #
+    # ``scan_payload_text`` built its own ``Filter(must=[...], should=[...])``
+    # inline, so the "one construction site" claim held for three of the four
+    # metadata-addressed reads and quietly excluded the fourth.  Folding its
+    # needle prefilter in as an optional ``should`` arm is what makes the
+    # cross-method equality below provable at that entry point too.
+
+    def test_text_needles_build_matchtext_should_conditions_in_order(self, backend):
+        """One FieldCondition(key='data', MatchText) per needle, in call order.
+
+        MatchText (not MatchValue) is load-bearing: MatchValue is exact
+        equality on the whole field and can never find a fragment embedded in
+        a longer memory.
+        """
+        from qdrant_client.http import models as qmodels
+
+        built = backend._build_payload_filter({}, text_needles=['alpha', 'beta'])
+
+        assert isinstance(built, qmodels.Filter)
+        assert isinstance(built.should, list)
+        assert len(built.should) == 2
+        conds = [c for c in built.should if isinstance(c, qmodels.FieldCondition)]
+        assert len(conds) == 2
+        assert [c.key for c in conds] == ['data', 'data']
+        for cond, needle in zip(conds, ['alpha', 'beta'], strict=True):
+            assert isinstance(cond.match, qmodels.MatchText)
+            assert cond.match.text == needle
+
+    def test_filters_and_needles_populate_both_arms_of_one_filter(self, backend):
+        """A narrowed prefilter scan is ONE Filter: must AND-ed, should OR-ed."""
+        from qdrant_client.http import models as qmodels
+
+        built = backend._build_payload_filter(
+            {'category': 'procedural_knowledge'}, text_needles=['alpha']
+        )
+
+        assert isinstance(built.must, list) and len(built.must) == 1
+        must_cond = built.must[0]
+        assert isinstance(must_cond, qmodels.FieldCondition)
+        assert must_cond.key == 'category'
+        assert isinstance(must_cond.match, qmodels.MatchValue)
+        assert must_cond.match.value == 'procedural_knowledge'
+
+        assert isinstance(built.should, list) and len(built.should) == 1
+        should_cond = built.should[0]
+        assert isinstance(should_cond, qmodels.FieldCondition)
+        assert should_cond.key == 'data'
+        assert isinstance(should_cond.match, qmodels.MatchText)
+        assert should_cond.match.text == 'alpha'
+
+    def test_an_unused_arm_is_omitted_not_emitted_empty(self, backend):
+        """OMIT an unused arm; never emit ``[]``.
+
+        This is what makes the cross-method anti-drift equality provable.  A
+        live probe (qdrant 1.17.1) measured that ``Filter(must=[c])`` and
+        ``Filter(must=[c], should=[])`` select the SAME points — an empty arm
+        is a server-side no-op, so this is not a live selection bug.  But
+        qdrant models are pydantic, and ``Filter(must=[c]) ==
+        Filter(must=[c], should=[])`` is **False** under structural equality.
+        So a builder that emitted ``should=[]`` could never be asserted equal
+        to what ``count_by_metadata`` hands Qdrant, and the single-home claim
+        would stay untestable at the scan entry point.
+        """
+        filters_only = backend._build_payload_filter({'k': 'v'})
+        assert filters_only.should is None, (
+            'an unused should arm must be omitted, not emitted as []; '
+            f'got {filters_only.should!r}'
+        )
+
+        needles_only = backend._build_payload_filter({}, text_needles=['alpha'])
+        assert needles_only.must is None, (
+            'an unused must arm must be omitted, not emitted as []; '
+            f'got {needles_only.must!r}'
+        )
+
+    def test_needles_only_is_allowed_and_does_not_raise(self, backend):
+        """A prefilter scan with no metadata narrowing is a legitimate call.
+
+        The empty-input guard rejects "no filters AND no needles", not "no
+        filters" — a ``should``-only Filter still selects a proper subset of
+        the collection, so the guard's whole-collection rationale does not
+        apply to it.
+        """
+        from qdrant_client.http import models as qmodels
+
+        built = backend._build_payload_filter({}, text_needles=['alpha'])
+
+        assert isinstance(built, qmodels.Filter)
+        assert isinstance(built.should, list) and len(built.should) == 1
+
+    @pytest.mark.parametrize(
+        ('filters', 'needles'),
+        [({}, None), ({}, []), (None, None), (None, [])],
+        ids=['empty-none', 'empty-empty', 'none-none', 'none-empty'],
+    )
+    def test_both_arms_empty_still_raises_value_error(self, backend, filters, needles):
+        """Two empty arms is still an unfiltered whole-collection select.
+
+        The message keeps the ``at least one filter`` substring the existing
+        ``test_empty_filters_raises_value_error`` matches on, so widening the
+        guard cannot silently retire that assertion.
+        """
+        with pytest.raises(ValueError, match='at least one filter'):
+            backend._build_payload_filter(filters, text_needles=needles)
+
 
 def _paging_client(pages: list[tuple[list, object]]) -> AsyncMock:
     """AsyncMock Qdrant client whose scroll() replays a scripted sequence of
@@ -603,7 +709,7 @@ class TestMem0BackendScrollCollectionPages:
 
     @pytest.mark.asyncio
     async def test_raises_when_page_budget_exhausted_with_live_next_offset(self, backend):
-        """A truncated stream RAISES, never returns short (INV-2 no-silent-fail).
+        """A truncated stream RAISES, never returns short (INV-11 no-silent-fail-soft).
 
         A pager with no budget loops forever if Qdrant keeps handing back a
         live next_offset, so the budget travels with the loop — and exhausting
@@ -642,6 +748,280 @@ class TestMem0BackendScrollCollectionPages:
         from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
 
         assert issubclass(ScrollPageBudgetExhausted, Exception)
+
+    @pytest.mark.asyncio
+    async def test_scroll_point_budget_exhausted_is_an_exception(self):
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        assert issubclass(ScrollPointBudgetExhausted, Exception)
+
+    @pytest.mark.asyncio
+    async def test_the_two_budget_exhaustions_are_unrelated_by_inheritance(self):
+        """Neither budget exception may be a sub- or superclass of the other.
+
+        The two are DIFFERENT events: ``max_points`` is a cap the caller asked
+        for, ``max_pages`` is a safety backstop against an endless walk.  The
+        whole point of splitting them is that a caller can catch exactly one
+        and let the other propagate — which is how ``scan_payload_text`` keeps
+        its flag-and-warn posture for its own ``limit`` while still failing
+        loudly on the backstop.  An inheritance link would silently collapse
+        that choice back into one.
+
+        Load-bearing beyond this class:
+        ``scripts/census_memory_metadata.CensusScanIncomplete`` is a
+        module-level ALIAS of ScrollPageBudgetExhausted, so its ``except
+        CensusScanIncomplete`` would start catching (or, in the other
+        direction, leaking) a points-cap event the census has no cap for.
+        ``scripts/consolidate_namespace_families`` catches the page budget
+        directly and has the same exposure.
+        """
+        from fused_memory.backends.mem0_client import (
+            ScrollPageBudgetExhausted,
+            ScrollPointBudgetExhausted,
+        )
+
+        assert ScrollPointBudgetExhausted is not ScrollPageBudgetExhausted
+        assert not issubclass(ScrollPointBudgetExhausted, ScrollPageBudgetExhausted), (
+            'a points-cap event must not be catchable as a page-budget event; '
+            'census_memory_metadata.CensusScanIncomplete aliases the latter'
+        )
+        assert not issubclass(ScrollPageBudgetExhausted, ScrollPointBudgetExhausted), (
+            'a page-budget event must not be catchable as a points-cap event; '
+            "scan_payload_text catches only the points cap and relies on the "
+            'page budget propagating past it'
+        )
+
+    # -- the caller-supplied points cap (task 3682) ------------------------
+    #
+    # scan_payload_text carried a second copy of this walk purely because it
+    # needed to stop after N POINTS rather than N pages.  Pushing that cap in
+    # here is what lets the walk have one home; the tests below pin the three
+    # properties the fold must not lose.
+
+    @pytest.mark.asyncio
+    async def test_max_points_shrinks_the_request_so_it_never_over_fetches(self, backend):
+        """The request is shrunk to what is still wanted: ONE round-trip, limit=3.
+
+        This is the property a naive ``async for ... break`` layering cannot
+        have: to learn "there is more" it must pull a point PAST the cap,
+        costing an extra scroll round-trip (~70-90 ms measured against live
+        qdrant).  Owning the cap inside the pager makes the look-ahead free.
+        """
+        points = [self._make_mock_point(f'id-{i}') for i in range(3)]
+        client = _paging_client([(points, None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(
+                backend.scroll_collection_pages('c', page_size=256, max_points=3)
+            )
+
+        assert len(got) == 3
+        assert client.scroll.await_count == 1
+        assert client.scroll.call_args.kwargs.get('limit') == 3, (
+            'the page request must shrink to the remaining budget, not ask for '
+            f'the full page_size; got {client.scroll.call_args.kwargs.get("limit")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_raises_when_the_points_cap_is_reached_with_a_live_next_offset(self, backend):
+        """All capped points are yielded, THEN it raises — never a short return."""
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [self._make_mock_point(f'id-{i}') for i in range(2)]
+        client = _paging_client([(points, 'off-1')])
+        got: list = []
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted) as excinfo,
+        ):
+            async for point in backend.scroll_collection_pages(
+                'fused_reify', page_size=256, max_points=2
+            ):
+                got.append(point)
+
+        assert got == points, 'the capped points are yielded before the raise'
+        message = str(excinfo.value)
+        assert 'fused_reify' in message, 'the message must name the collection'
+        assert '2' in message, 'the message must name the cap'
+        assert 'off-1' in message, 'the message must name the still-live offset'
+
+    @pytest.mark.asyncio
+    async def test_a_clean_end_exactly_at_the_cap_does_not_raise(self, backend):
+        """Reaching the cap and the end of the stream together is NOT a truncation.
+
+        Nothing was left behind, so there is nothing to disclose.  Ordering the
+        ``next_offset is None`` return ahead of the cap check is what makes an
+        exhaustive-but-exactly-capped walk a clean result instead of a
+        spurious error.
+        """
+        points = [self._make_mock_point(f'id-{i}') for i in range(3)]
+        client = _paging_client([(points, None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(
+                backend.scroll_collection_pages('c', page_size=256, max_points=3)
+            )
+
+        assert got == points
+
+    @pytest.mark.asyncio
+    async def test_the_default_points_cap_is_inert(self, backend):
+        """max_points=None (the default) never caps and never raises.
+
+        Pins that the existing consumers are structurally unaffected:
+        scroll_all_by_metadata / _scroll_all_records,
+        scripts/census_memory_metadata and
+        scripts/consolidate_namespace_families all pass no cap, so none of
+        them can ever see ScrollPointBudgetExhausted.
+        """
+        # Annotated because the comprehension alone narrows the offset to str,
+        # which then rejects the None-offset terminal page appended below.
+        pages: list[tuple[list, object]] = [
+            ([self._make_mock_point(f'id-{i}')], f'off-{i}') for i in range(5)
+        ]
+        pages.append(([self._make_mock_point('last')], None))
+        client = _paging_client(pages)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_collection_pages('c', page_size=1))
+
+        assert len(got) == 6
+        assert client.scroll.call_args.kwargs.get('limit') == 1, (
+            'with no cap the request stays at the full page_size'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_points_cap_wins_when_both_budgets_are_exhausted(self, backend):
+        """Same page exhausts both: the caller's explicit cap is the event raised.
+
+        max_pages is a backstop; reporting it when the caller's own cap
+        explains the stop would misattribute an expected outcome to an
+        internal safety limit.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        client = _paging_client([([self._make_mock_point('a')], 'off-1')])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted),
+        ):
+            await _drain(
+                backend.scroll_collection_pages('c', page_size=1, max_pages=1, max_points=1)
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_server_over_return_stops_at_the_cap_rather_than_over_yielding(self, backend):
+        """If the server hands back MORE than the shrunk request asked for, the
+        cap still holds.
+
+        The cap is enforced per-yield, not per-page, so a server that ignores
+        the shrunk ``limit`` cannot walk a caller past the budget it set.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [self._make_mock_point(f'id-{i}') for i in range(5)]
+        client = _paging_client([(points, 'off-1')])
+        got: list = []
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted),
+        ):
+            async for point in backend.scroll_collection_pages(
+                'c', page_size=256, max_points=2
+            ):
+                got.append(point)
+
+        assert got == points[:2], f'must not yield past the cap; got {len(got)} points'
+
+    @pytest.mark.asyncio
+    async def test_a_server_over_return_says_so_instead_of_naming_a_live_offset(self, backend):
+        """The over-return message must not read as a self-contradiction.
+
+        When the server ignores the shrunk request on the FINAL page, the cap
+        fires with ``next_offset=None``.  The truncation is real — points WERE
+        dropped — but describing a ``None`` offset as "still live" reads as
+        nonsense to whoever finds it in a log, so that case names the actual
+        cause instead.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [self._make_mock_point(f'id-{i}') for i in range(5)]
+        client = _paging_client([(points, None)])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted) as excinfo,
+        ):
+            await _drain(backend.scroll_collection_pages('fused_reify', page_size=256, max_points=2))
+
+        message = str(excinfo.value)
+        assert 'still live' not in message, (
+            f'a None offset must not be described as a live cursor; got {message!r}'
+        )
+        assert 'more points than' in message, (
+            f'the message must name the real cause — a server over-return; got {message!r}'
+        )
+        assert 'fused_reify' in message, 'the message must still name the collection'
+        assert '2' in message, 'the message must still name the cap'
+
+    @pytest.mark.asyncio
+    async def test_the_cap_shrinks_each_page_by_what_was_already_yielded(self, backend):
+        """MULTI-PAGE: the remaining budget, not the whole budget, sizes page N.
+
+        Every other cap test terminates on page 1, which leaves the
+        ``- yielded`` term in ``min(page_size, max_points - yielded)``
+        unpinned: a regression to ``min(page_size, max_points)`` would
+        re-request the full budget on every page after the first (over-fetching
+        exactly what the cap exists to avoid) and still pass all of them.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [self._make_mock_point(f'id-{i}') for i in range(3)]
+        client = _paging_client([(points[:2], 'off-1'), (points[2:], 'off-2')])
+        got: list = []
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPointBudgetExhausted),
+        ):
+            async for point in backend.scroll_collection_pages(
+                'c', page_size=2, max_points=3
+            ):
+                got.append(point)
+
+        assert got == points, 'all three capped points are yielded before the raise'
+        limits = [call.kwargs.get('limit') for call in client.scroll.await_args_list]
+        assert limits == [2, 1], (
+            'page 2 must ask for only the REMAINING budget (max_points - yielded); '
+            f'got {limits!r}'
+        )
+
+    @pytest.mark.parametrize('max_points', [0, -1])
+    @pytest.mark.asyncio
+    async def test_a_non_positive_points_cap_raises_before_any_scroll(self, backend, max_points):
+        """The backstop for the guard scan_payload_text already has.
+
+        ``max_points=0`` shrinks every page request to ``limit=0``; if the
+        server then hands back an empty page with ``next_offset=None`` the walk
+        ends having yielded nothing and raised nothing — indistinguishable from
+        a genuinely empty collection, which is the silent-clean-sweep failure
+        the sibling ``limit <= 0`` guard exists to prevent.  A negative cap
+        additionally sends a negative ``limit`` down to the client.  This
+        method is public, so it owns the guard rather than trusting the one
+        opt-in caller that happens to pre-validate today.
+        """
+        client = _paging_client([([], None)])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ValueError, match='strictly positive'),
+        ):
+            await _drain(backend.scroll_collection_pages('c', max_points=max_points))
+
+        client.scroll.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_hung_page_request_raises_instead_of_hanging(self, backend):
@@ -1542,6 +1922,30 @@ def _scan_point(point_id: str, payload: dict):
     return point
 
 
+def _stub_pager(points=(), raises=None):
+    """Stand-in for ``scroll_collection_pages``: records its call args, yields
+    *points*, then optionally raises *raises*.
+
+    A plain factory rather than an AsyncMock because the real method is an
+    async GENERATOR: calling it must return an async iterator, not a coroutine.
+    """
+    calls: list = []
+
+    def _factory(*args, **kwargs):
+        calls.append((args, kwargs))
+
+        async def _gen():
+            for point in points:
+                yield point
+            if raises is not None:
+                raise raises
+
+        return _gen()
+
+    _factory.calls = calls
+    return _factory
+
+
 class TestMem0BackendScanPayloadText:
     """Literal payload-text scan: prefilter, mandatory re-verify, pagination."""
 
@@ -1578,6 +1982,66 @@ class TestMem0BackendScanPayloadText:
             assert cond.key == 'data'
             assert isinstance(cond.match, qmodels.MatchText)
             assert cond.match.text == needle
+
+    @pytest.mark.asyncio
+    async def test_scan_filter_equals_the_count_filter_for_the_same_filters(self, backend):
+        """ANTI-DRIFT (INV-5): scan's scroll_filter == count's count_filter.
+
+        The fourth entry point onto ``_build_payload_filter``.  The same
+        reconciliation hazard the other three are pinned against applies here
+        with a sharper edge: ``scan_payload_text``'s whole purpose is a TRUE
+        incidence rate, and an incidence rate is a ratio of a scan against a
+        count.  If the two filter constructions ever selected different point
+        sets the ratio would be wrong with no error surface at all.
+
+        Exhaustive mode is the one that matters: it is the mode used to
+        establish the true rate, and it is the one where scan previously
+        emitted an empty ``should`` arm that made this equality false.
+        """
+        filters = {'category': 'procedural_knowledge', 'recon_pool': 'stage2_cycle_summary'}
+        scope = Scope(project_id='dark_factory')
+
+        count_client = AsyncMock()
+        count_client.count = AsyncMock(return_value=MagicMock(count=0))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=count_client)):
+            await backend.count_by_metadata(scope=scope, filters=filters)
+
+        scan_client = AsyncMock()
+        scan_client.scroll = AsyncMock(return_value=([], None))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=scan_client)):
+            await backend.scan_payload_text(scope=scope, filters=filters, exhaustive=True)
+
+        count_filter = count_client.count.call_args.kwargs.get('count_filter')
+        scan_filter = scan_client.scroll.call_args.kwargs.get('scroll_filter')
+        built = backend._build_payload_filter(filters)
+
+        assert scan_filter == built, (
+            f'scan_payload_text built {scan_filter!r}, _build_payload_filter built {built!r}'
+        )
+        assert scan_filter == count_filter, (
+            'an exhaustive scan and the count it is divided by must select the same '
+            f'point set; got scan_filter={scan_filter!r} count_filter={count_filter!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_prefilter_scan_filter_comes_from_the_shared_builder(self, backend):
+        """The prefilter mode routes through the same home, needles and all."""
+        filters = {'category': 'procedural_knowledge'}
+        needles = [_SCAN_CLOSE_CONTENT, _SCAN_CLOSE_INVOKE]
+
+        scan_client = AsyncMock()
+        scan_client.scroll = AsyncMock(return_value=([], None))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=scan_client)):
+            await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=needles, filters=filters
+            )
+
+        scan_filter = scan_client.scroll.call_args.kwargs.get('scroll_filter')
+        built = backend._build_payload_filter(filters, text_needles=needles)
+
+        assert scan_filter == built, (
+            f'scan_payload_text built {scan_filter!r}, _build_payload_filter built {built!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_metadata_filters_are_anded_in_via_must(self, backend):
@@ -1658,6 +2122,242 @@ class TestMem0BackendScanPayloadText:
         assert [m['id'] for m in result['matches']] == ['id-1', 'id-2']
         assert result['scanned'] == 2
         assert result['truncated'] is False
+
+    # -- the walk is delegated, not duplicated (task 3682) -----------------
+
+    @pytest.mark.asyncio
+    async def test_the_walk_is_delegated_to_the_shared_pager(self, backend):
+        """SINGLE HOME: scan drives scroll_collection_pages, not its own loop.
+
+        The caller's ``limit`` rides on the pager's ``max_points``, which is
+        why the cap could be pushed down there rather than layered on top with
+        a ``break``.  The raw-client assertion is the load-bearing half: it is
+        what proves no second copy of the walk survives inside this method.
+        """
+        from fused_memory.utils.toolcall_xml_leak import PREFILTER_NEEDLES
+
+        filters = {'category': 'procedural_knowledge'}
+        pager = _stub_pager(points=[_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})])
+        raw_client = AsyncMock()
+        raw_client.scroll = AsyncMock(return_value=([], None))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=raw_client)),
+            patch.object(backend, 'scroll_collection_pages', pager),
+        ):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), filters=filters, page_size=64, limit=10
+            )
+
+        assert len(pager.calls) == 1, f'expected exactly one pager call, got {pager.calls!r}'
+        args, kwargs = pager.calls[0]
+        collection_prefix = backend.config.mem0.collection_prefix
+        assert args[0] == f'{collection_prefix}_p'
+        assert kwargs['page_size'] == 64
+        assert kwargs['max_points'] == 10, (
+            "the caller's limit must ride on the pager's points cap, not a "
+            f'caller-side break; got {kwargs.get("max_points")!r}'
+        )
+        assert kwargs['with_vectors'] is False
+        assert kwargs['scroll_filter'] == backend._build_payload_filter(
+            filters, text_needles=list(PREFILTER_NEEDLES)
+        )
+        raw_client.scroll.assert_not_awaited()
+        assert result['scanned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_points_cap_becomes_a_truncated_flag_not_a_raise(self, backend, caplog):
+        """POSTURE: scan converts the points cap into its own flag + WARNING.
+
+        The primitive raises so it can never truncate silently; THIS caller
+        chooses to report that as a normal capped result, because being
+        stopped by a limit the caller itself passed is an expected outcome.
+        The exception must never reach the caller.
+        """
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        points = [_scan_point(f'id-{i}', {'data': _SCAN_LEAK_TEXT}) for i in range(3)]
+        pager = _stub_pager(points=points, raises=ScrollPointBudgetExhausted('capped'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
+            patch.object(backend, 'scroll_collection_pages', pager),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), limit=3)
+
+        assert result['truncated'] is True
+        assert result['scanned'] == 3, (
+            'every point yielded before the raise is counted, so `scanned` stays '
+            f'an exact incidence-rate denominator; got {result["scanned"]!r}'
+        )
+        assert len(result['matches']) == 3
+        assert any('truncat' in r.message.lower() for r in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
+    async def test_the_points_cap_handler_does_not_swallow_other_failures(self, backend):
+        """NARROW EXCEPT: only the points cap is converted; nothing else.
+
+        A broad ``except Exception`` around the walk would fold a timed-out or
+        otherwise-failed scan into a clean-looking capped result — the exact
+        silent-wrong-value class this scan exists to measure.  Pinned here
+        against a sentinel the handler must not know about; the live timeout
+        path is covered by test_timeout_propagates_not_swallowed.
+        """
+        class _Sentinel(RuntimeError):
+            pass
+
+        pager = _stub_pager(
+            points=[_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], raises=_Sentinel('boom')
+        )
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
+            patch.object(backend, 'scroll_collection_pages', pager),
+            pytest.raises(_Sentinel),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+    @pytest.mark.asyncio
+    async def test_a_failure_in_the_loop_body_still_closes_the_pager(self, backend):
+        """DETERMINISTIC CLOSE on every exit path, not just the loop's own two.
+
+        A bare ``async for`` closes the generator when the ITERATION ends or
+        raises — but an exception from the loop BODY (a malformed payload
+        reaching the detector) or a cancellation is neither, and leaves
+        scroll_collection_pages suspended mid-walk for the event loop's
+        async-generator hooks to finalise at some later, unpredictable point.
+        ``contextlib.aclosing`` is what makes the close deterministic; the
+        never-`break` discipline alone does not buy it.
+
+        The sibling test above exercises a raise FROM the generator, which
+        closes either way — this one is the case that distinguishes them.
+        """
+        closed = False
+
+        def _pager(*args, **kwargs):
+            async def _gen():
+                nonlocal closed
+                try:
+                    yield _scan_point('id-1', {'data': _SCAN_LEAK_TEXT})
+                    yield _scan_point('id-2', {'data': _SCAN_LEAK_TEXT})
+                finally:
+                    closed = True
+
+            return _gen()
+
+        def _explode(_text):
+            raise RuntimeError('malformed payload')
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
+            patch.object(backend, 'scroll_collection_pages', _pager),
+            patch(
+                'fused_memory.utils.toolcall_xml_leak.find_toolcall_xml_leak', _explode
+            ),
+            pytest.raises(RuntimeError, match='malformed payload'),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        assert closed, (
+            'the pager must be closed on the way out of a body failure, not left '
+            'suspended for the GC to finalise later'
+        )
+
+    @pytest.mark.asyncio
+    async def test_max_pages_is_accepted_and_forwarded_to_the_pager(self, backend):
+        """The page budget scan inherits from the shared pager is steerable.
+
+        At the default page_size=256 and max_pages=200 the ceiling is 51,200
+        points walked. Re-measured against live Qdrant on 2026-08-27, the
+        BINDING collection is fused_reify at 33,163 points — 1.54x headroom,
+        i.e. one exhaustive sweep of it already consumes 65% of the budget;
+        fused_dark_factory (the sweep script's default scope) is 25,635, 2.0x.
+        The default is not reachable today, but that margin is roughly half
+        what the stale ~19,321-point/2.6x figure implied, so it is a real
+        ceiling a caller can outgrow.
+
+        The override is Python-API-level ONLY: neither
+        services/memory_service.py::MemoryService.scan_memory_content nor
+        scripts/sweep_toolcall_xml_leak.py (no --max-pages flag) forwards or
+        exposes max_pages, so the operational sweep runs at the default
+        ceiling. What this test pins is that the kwarg reaches the pager at
+        all, which keeps wiring it through a plumbing change rather than
+        "copy the walk back out".
+        """
+        from fused_memory.backends.mem0_client import DEFAULT_SCROLL_MAX_PAGES
+
+        pager = _stub_pager()
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
+            patch.object(backend, 'scroll_collection_pages', pager),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'))
+        assert pager.calls[0][1]['max_pages'] == DEFAULT_SCROLL_MAX_PAGES
+
+        pager2 = _stub_pager()
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
+            patch.object(backend, 'scroll_collection_pages', pager2),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), max_pages=7)
+        assert pager2.calls[0][1]['max_pages'] == 7
+
+    @pytest.mark.asyncio
+    async def test_page_budget_exhaustion_propagates_rather_than_flagging_truncated(
+        self, backend
+    ):
+        """The two truncation events must stay DISTINGUISHABLE at this caller.
+
+        A caller `limit` is something the caller asked for, so it is reported
+        as a normal capped result.  The page budget is a safety backstop
+        nobody asked for; reporting it the same way would hand a sweep a
+        plausible-looking undercount carrying a `truncated` flag it was not
+        told to expect — the exact silent-wrong-value class this scan exists
+        to measure.  So it PROPAGATES.
+        """
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        # Pages that never exhaust: next_offset stays live forever.
+        client = AsyncMock()
+        client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], 'cursor-forever')
+        )
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPageBudgetExhausted),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), max_pages=3)
+
+        assert client.scroll.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_a_limit_reached_first_is_the_quiet_flagged_form_not_a_raise(
+        self, backend, caplog
+    ):
+        """Both budgets in play, `limit` reached first: flag, not raise.
+
+        Pins the precedence chosen inside the pager — the caller's explicit
+        cap outranks the backstop — as observed from this caller.
+        """
+        client = AsyncMock()
+        client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], 'cursor-forever')
+        )
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), limit=1, max_pages=3
+            )
+
+        assert result['truncated'] is True
+        assert result['scanned'] == 1
+        assert client.scroll.await_count == 1
+        assert any('truncat' in r.message.lower() for r in caplog.records), caplog.text
 
     @pytest.mark.asyncio
     async def test_page_size_is_forwarded_as_scroll_limit(self, backend):
@@ -1841,6 +2541,40 @@ class TestMem0BackendScanPayloadText:
         assert any('truncat' in r.message.lower() for r in caplog.records), caplog.text
 
     @pytest.mark.asyncio
+    async def test_a_capped_walk_shrinks_each_page_across_a_page_boundary(self, backend, caplog):
+        """MULTI-PAGE: the cap keeps shrinking as the walk advances.
+
+        Every other truncation test here stops on page 1, so the per-page
+        shrink is only ever observed once — a regression that re-requested the
+        whole remaining budget on each page would over-fetch invisibly.  Drives
+        the REAL pager (raw client mock, not a stub) so the scan's `limit` is
+        pinned all the way down to the wire.
+        """
+        points = [_scan_point(f'id-{i}', {'data': _SCAN_LEAK_TEXT}) for i in range(3)]
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            side_effect=[(points[:2], 'cursor1'), (points[2:], 'cursor2')]
+        )
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), page_size=2, limit=3
+            )
+
+        assert result['scanned'] == 3
+        assert len(result['matches']) == 3
+        assert result['truncated'] is True
+        limits = [call.kwargs.get('limit') for call in mock_client.scroll.await_args_list]
+        assert limits == [2, 1], (
+            'page 2 must ask only for the remaining budget (limit - scanned); '
+            f'got {limits!r}'
+        )
+        assert any('truncat' in r.message.lower() for r in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
     async def test_untruncated_walk_reports_truncated_false_and_logs_nothing(self, backend, caplog):
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(
@@ -1864,7 +2598,15 @@ class TestMem0BackendScanPayloadText:
         with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
             result = await backend.scan_payload_text(scope=Scope(project_id='p'))
 
-        assert result == {'matches': [], 'scanned': 0, 'truncated': False}
+        expected_collection = Scope(project_id='p').mem0_collection_name(
+            backend.config.mem0.collection_prefix
+        )
+        assert result == {
+            'matches': [],
+            'scanned': 0,
+            'truncated': False,
+            'collection': expected_collection,
+        }
 
     @pytest.mark.parametrize('limit', [0, -1])
     @pytest.mark.asyncio
@@ -1903,6 +2645,88 @@ class TestMem0BackendScanPayloadText:
 
         assert result['scanned'] == 1
         assert len(result['matches']) == 1
+
+
+class TestMem0BackendScanPayloadTextNamesItsCollection:
+    """The scan result must identify the collection it actually walked.
+
+    A scan result is a MEASUREMENT of a collection, and a measurement that
+    does not say what it measured cannot be audited later.  This is not
+    hypothetical: the authoritative 21,089-point 2026-08-05 incidence sweep
+    committed two reports (``docs/toolcall-xml-leak-sweep-2026-08-05/``) that
+    each carry ``"collection": ""``, because the caller read a key this
+    method never returned (task 3243).
+
+    Every assertion below compares the reported name against the
+    ``collection_name`` RECORDED on the ``client.scroll`` call rather than
+    against a re-spelled literal.  That is the load-bearing part: a literal
+    would still pass on the day the scan reports one collection while walking
+    another, which is the only failure this field exists to rule out.
+    """
+
+    @staticmethod
+    def _expected(backend) -> str:
+        return Scope(project_id='p').mem0_collection_name(backend.config.mem0.collection_prefix)
+
+    @pytest.mark.asyncio
+    async def test_default_prefilter_mode_reports_the_collection_it_scrolled(self, backend):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], None)
+        )
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        walked = mock_client.scroll.call_args.kwargs.get('collection_name')
+        assert result['collection'] == walked
+        assert result['collection'] == self._expected(backend)
+
+    @pytest.mark.asyncio
+    async def test_exhaustive_mode_reports_the_collection_it_scrolled(self, backend):
+        """Exhaustive is the mode that establishes the TRUE incidence rate, so
+        it is the mode whose provenance matters most."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], None)
+        )
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), exhaustive=True)
+
+        walked = mock_client.scroll.call_args.kwargs.get('collection_name')
+        assert result['collection'] == walked
+        assert result['collection'] == self._expected(backend)
+
+    @pytest.mark.asyncio
+    async def test_an_empty_corpus_still_reports_the_collection_it_scrolled(self, backend):
+        """A clean verdict is exactly when an operator most needs to know what
+        was swept — "zero hits" is worthless without "zero hits in WHAT"."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        walked = mock_client.scroll.call_args.kwargs.get('collection_name')
+        assert result['matches'] == []
+        assert result['collection'] == walked
+        assert result['collection'] == self._expected(backend)
+
+    @pytest.mark.asyncio
+    async def test_the_reported_name_tracks_the_scope_rather_than_a_constant(self, backend):
+        """Two different scopes must not report the same collection — the guard
+        against a hardcoded/stale name that happens to match in one test."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            first = await backend.scan_payload_text(scope=Scope(project_id='alpha'))
+            second = await backend.scan_payload_text(scope=Scope(project_id='beta'))
+
+        walked = [c.kwargs.get('collection_name') for c in mock_client.scroll.call_args_list]
+        assert [first['collection'], second['collection']] == walked
+        assert first['collection'] != second['collection']
 
 
 # ---------------------------------------------------------------------------

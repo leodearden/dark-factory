@@ -26,26 +26,22 @@ module's OWN BYTES at import, so a future editor cannot quietly reintroduce one
 from __future__ import annotations
 
 import copy
-import errno
 import inspect
 import json
 import logging
-import os
 import stat
-import tempfile
-import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
 from shared.toolcall_markup import ENVELOPE_LITERALS, detect
 
-from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.artifacts import (
+    PLAN_SCHEMA_VERSION,
+    ArtifactWriteError,
+    TaskArtifacts,
+)
 from orchestrator.mcp import plan_tools
-
-#: What a failed atomic write may raise. The helper's own declared error, plus
-#: the serialization errors that fire before the temp is ever opened.
-PLAN_WRITE_FAILURES = (OSError, TypeError, ValueError)
 
 # ---------------------------------------------------------------------------
 # Sentinel BUILDERS — the only way markup enters this module.
@@ -1243,7 +1239,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         ``clean_value`` is the HOLE and the recovered self-value is the authored
         prose. Declining here would blank the field, and because the fact still
         reads ``outcome: 'repaired'``, ``_read_plan_repaired`` persists that
-        blank through ``_atomic_write_plan`` — authored text destroyed on disk,
+        blank through ``TaskArtifacts.write_plan`` — authored text destroyed on disk,
         unrecoverable on the next read. Which side wins is therefore decided by
         CONTENT, never by position.
         """
@@ -1530,404 +1526,81 @@ class TestRecoveryTargetsAreRealPlanKeys:
 
 
 # ---------------------------------------------------------------------------
-# step-9 — the atomic write helper, contract C3 / boundary row B12.
+# step-9 / task 3957 step-8 — the plan.json write contract.
+#
+# `_atomic_write_plan` and its helpers (`_verify_plan_json`,
+# `_target_file_mode`, `PlanWriteError`) are GONE, together with the
+# `_AtomicSpies` harness, `TestAtomicWritePlan` and
+# `TestAtomicWritePlanFollowsSymlink`.  Their coverage did not disappear — it
+# MOVED down to the layer that now owns it, `TaskArtifacts._write_json`, in
+# orchestrator/tests/test_artifacts.py:
+#
+#   torn reads: a racing reader sees the  ->  TestWriteJsonIsAtomic
+#     complete old or complete new doc,
+#     and the name is never absent
+#   mode preservation across the swap,    ->  TestWriteJsonPreservesMode
+#     stat failures that must surface
+#   symlink write-through, the temp       ->  TestWriteJsonFollowsSymlinks
+#     BESIDE the real file, dangling
+#     refusal, no temp residue
+#   that `_write_json` asks safe_io       ->  TestWriteJsonDelegates
+#     for fsync=True / mkdir=True at all      ToSharedSafeIo
+#
+# One piece landed a layer FURTHER down, since `_write_json` no longer owns
+# the mechanism it delegates to: the fsync of the temp before the replace
+# (and of the parent directory after it) is pinned by
+# shared/tests/test_safe_io.py::TestAtomicWriteDurability.
+#
+# What stays HERE is the assertion that is genuinely plan-tools-level: the
+# repair write-back produces the same bytes the ordinary mutation path does.
+# That was the anti-duplication invariant while there were two writers; with
+# one writer it becomes the self-parity check that a repair write-back never
+# churns a plan's formatting.
 # ---------------------------------------------------------------------------
 
 
-class _AtomicSpies:
-    """Delegating spies over the three syscalls ``_atomic_write_plan`` uses.
+class TestRepairWriteBackByteFormat:
+    """A repaired plan differs from its predecessor ONLY where it was repaired."""
 
-    Every spy DELEGATES to the real implementation, so the helper's behaviour
-    is observed rather than simulated; only the call record is added.
-    """
+    def test_the_write_back_stamps_the_schema_version(self, plan_artifacts):
+        _seed_corrupt(plan_artifacts)
 
-    def __init__(self, monkeypatch):
-        self.mkstemp_dirs: list = []
-        self.replace_calls: list = []
-        self.fsync_calls: list = []
-        self.order: list[str] = []
-        self._real_mkstemp = tempfile.mkstemp
-        self._real_replace = os.replace
-        self._real_fsync = os.fsync
+        repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
-        monkeypatch.setattr(plan_tools.tempfile, 'mkstemp', self._mkstemp)
-        monkeypatch.setattr(plan_tools.os, 'fsync', self._fsync)
-        monkeypatch.setattr(plan_tools.os, 'replace', self._replace)
-
-    def _mkstemp(self, *args, **kwargs):
-        self.mkstemp_dirs.append(kwargs.get('dir'))
-        self.order.append('mkstemp')
-        return self._real_mkstemp(*args, **kwargs)
-
-    def _fsync(self, fd):
-        self.fsync_calls.append(fd)
-        self.order.append('fsync')
-        return self._real_fsync(fd)
-
-    def _replace(self, src, dst):
-        # Capture the temp file's state AT REPLACE TIME.
-        src_path = Path(src)
-        self.replace_calls.append({
-            'src': src_path,
-            'dst': Path(dst),
-            'src_exists': src_path.exists(),
-            'src_document': (
-                json.loads(src_path.read_text()) if src_path.exists() else None
-            ),
-        })
-        self.order.append('replace')
-        return self._real_replace(src, dst)
-
-
-@pytest.fixture()
-def plan_dir(tmp_path):
-    """A directory holding exactly one pre-existing plan.json."""
-    directory = tmp_path / 'meta'
-    directory.mkdir()
-    (directory / 'plan.json').write_text(
-        json.dumps({'task_id': 'test-1', 'steps': []}, indent=2) + '\n'
-    )
-    return directory
-
-
-class TestAtomicWritePlan:
-    """A concurrent reader must never observe a partial plan.json (B12)."""
-
-    def test_temp_file_is_created_in_the_targets_own_directory(self, plan_dir, monkeypatch):
-        """Same directory => os.replace is an intra-filesystem RENAME.
-
-        A temp file in /tmp could land on a different filesystem, where
-        os.replace raises EXDEV instead of atomically swapping.
-        """
-        spies = _AtomicSpies(monkeypatch)
-        target = plan_dir / 'plan.json'
-
-        plan_tools._atomic_write_plan(target, corrupt_plan())
-
-        assert spies.mkstemp_dirs == [target.parent]
-
-    def test_temp_is_written_and_verified_before_the_replace(self, plan_dir, monkeypatch):
-        spies = _AtomicSpies(monkeypatch)
-        target = plan_dir / 'plan.json'
-        plan = corrupt_plan()
-
-        plan_tools._atomic_write_plan(target, plan)
-
-        assert len(spies.replace_calls) == 1
-        call = spies.replace_calls[0]
-        assert call['src_exists'], 'the temp must be fully written before replace'
-        assert call['dst'] == target
-        # The complete document is already on disk at replace time.
-        assert call['src_document']['task_id'] == plan['task_id']
-        assert call['src_document']['design_decisions'] == plan['design_decisions']
-
-    def test_fsync_happens_before_the_replace(self, plan_dir, monkeypatch):
-        spies = _AtomicSpies(monkeypatch)
-
-        plan_tools._atomic_write_plan(plan_dir / 'plan.json', corrupt_plan())
-
-        assert spies.fsync_calls, 'the temp must be fsynced, not just flushed'
-        assert spies.order.index('fsync') < spies.order.index('replace')
-
-    def test_writes_the_document_and_stamps_the_schema_version(self, plan_dir):
-        target = plan_dir / 'plan.json'
-
-        plan_tools._atomic_write_plan(target, corrupt_plan())
-
-        written = json.loads(target.read_text())
+        assert any(f['outcome'] == 'repaired' for f in facts)
+        written = _on_disk(plan_artifacts)
         assert written['_schema_version'] == PLAN_SCHEMA_VERSION
         assert written['task_id'] == 'test-1'
+        assert written == repaired
 
-    def test_byte_format_parity_with_task_artifacts_write_plan(self, tmp_path):
-        """The repair write-back must not churn the file's formatting.
+    def test_byte_format_parity_with_task_artifacts_write_plan(
+        self, plan_artifacts, tmp_path
+    ):
+        """No reindentation, no key-order noise, no permission drift.
 
-        Same bytes as the existing writer means a repaired plan diffs only
-        where it was repaired — no reindentation, no key-order noise.
+        The repaired document that `_read_plan_repaired` writes back must be
+        byte-identical to what `TaskArtifacts.write_plan` produces for the
+        same document, so a repaired plan diffs only where it was repaired.
         """
-        via_artifacts = tmp_path / 'artifacts'
-        via_artifacts.mkdir()
-        artifacts = TaskArtifacts(via_artifacts)
-        artifacts.init('test-1', 'Test task', 'A test')
-        artifacts.write_plan(copy.deepcopy(corrupt_plan()))
+        _seed_corrupt(plan_artifacts)
+        repaired, _ = plan_tools._read_plan_repaired(plan_artifacts)
+        via_write_back = plan_artifacts.root / 'plan.json'
 
-        via_atomic = tmp_path / 'atomic'
-        via_atomic.mkdir()
-        atomic_target = via_atomic / 'plan.json'
-        plan_tools._atomic_write_plan(atomic_target, copy.deepcopy(corrupt_plan()))
+        reference_worktree = tmp_path / 'reference'
+        reference_worktree.mkdir()
+        reference = TaskArtifacts(reference_worktree)
+        reference.init('test-1', 'Test task', 'A test')
+        reference.write_plan(copy.deepcopy(repaired))
+        via_write_plan = reference.root / 'plan.json'
 
+        assert via_write_back.read_bytes() == via_write_plan.read_bytes()
+        # ...and the same PERMISSIONS, a difference the content comparison
+        # above cannot see.  This is what catches a writer that lands its
+        # temp's 0600 on the target instead of the umask-derived bits.
         assert (
-            atomic_target.read_bytes()
-            == (artifacts.root / 'plan.json').read_bytes()
+            stat.S_IMODE(via_write_back.stat().st_mode)
+            == stat.S_IMODE(via_write_plan.stat().st_mode)
         )
-        # ...and the same PERMISSIONS. mkstemp forces 0600 and os.replace
-        # carries the temp's mode onto the target, so a fresh atomic write would
-        # otherwise land at 0600 where the existing writer lands at 0666 & ~umask
-        # — a difference invisible in the content the parity check above compares.
-        assert (
-            stat.S_IMODE(atomic_target.stat().st_mode)
-            == stat.S_IMODE((artifacts.root / 'plan.json').stat().st_mode)
-        )
-
-    @pytest.mark.parametrize('mode', [0o644, 0o664, 0o600])
-    def test_the_targets_existing_mode_survives_the_replace(self, plan_dir, mode):
-        """A repair is a READ. It must not narrow the file's permissions.
-
-        Every plan.json in the fleet was created by ``TaskArtifacts._write_json``
-        (``path.write_text``, so 0666 & ~umask — typically 0644). ``mkstemp``
-        forces 0600 and ``os.replace`` carries that mode across, so without an
-        explicit restore the FIRST repair write-back would permanently narrow the
-        artifact to owner-only as a side effect of reading it. Nothing breaks
-        while every consumer shares a uid, which is exactly why it would go
-        unnoticed until a sandboxed reader or a group-readable operator workflow
-        touched it.
-        """
-        target = plan_dir / 'plan.json'
-        target.chmod(mode)
-
-        plan_tools._atomic_write_plan(target, corrupt_plan())
-
-        assert stat.S_IMODE(target.stat().st_mode) == mode
-
-    def test_verification_failure_leaves_the_original_untouched(self, plan_dir, monkeypatch):
-        target = plan_dir / 'plan.json'
-        before_bytes = target.read_bytes()
-        before_entries = set(plan_dir.iterdir())
-
-        def boom(_path):
-            raise json.JSONDecodeError('injected', 'doc', 0)
-
-        monkeypatch.setattr(plan_tools, '_verify_plan_json', boom)
-
-        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
-            plan_tools._atomic_write_plan(target, corrupt_plan())
-
-        assert str(target) in str(excinfo.value), (
-            'the failure must name the path — loud, not a silent skip'
-        )
-        assert target.read_bytes() == before_bytes
-        assert set(plan_dir.iterdir()) == before_entries, (
-            'no .plan.json.*.tmp residue may be left behind'
-        )
-
-    def test_replace_failure_leaves_the_original_untouched(self, plan_dir, monkeypatch):
-        target = plan_dir / 'plan.json'
-        before_bytes = target.read_bytes()
-        before_entries = set(plan_dir.iterdir())
-
-        def boom(_src, _dst):
-            raise OSError('injected replace failure')
-
-        monkeypatch.setattr(plan_tools.os, 'replace', boom)
-
-        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
-            plan_tools._atomic_write_plan(target, corrupt_plan())
-
-        assert str(target) in str(excinfo.value)
-        assert target.read_bytes() == before_bytes
-        assert set(plan_dir.iterdir()) == before_entries
-
-    def test_target_file_mode_propagates_a_non_missing_file_os_error(
-        self, plan_dir, monkeypatch
-    ):
-        """Direct coverage of the premise the two tests below are built on.
-
-        Both monkeypatch ``_target_file_mode`` WHOLESALE, which proves
-        ``_atomic_write_plan`` correctly WRAPS whatever the lookup raises, but
-        never exercises what ``_target_file_mode`` itself actually swallows.
-        Mutation-verified in this worktree: widening its
-        ``except FileNotFoundError:`` to a bare ``except OSError:`` left every
-        other test in this file green — this is the test that catches it.
-        """
-        target = plan_dir / 'plan.json'
-        real_stat = Path.stat
-
-        # Scoped to *target* — falling back to the REAL stat() for every other
-        # path — rather than raising unconditionally, mirroring the same
-        # Path.stat patch idiom already used in test_session_registry.py and
-        # test_crash_recovery.py. A blanket raise would also break this
-        # module's autouse _no_mock_derived_stray_dirs conftest fixture, whose
-        # teardown itself calls Path.stat() (via Path.exists()) on an
-        # unrelated path.
-        def boom(self, *args, **kwargs):
-            if self == target:
-                raise OSError(errno.EACCES, 'Permission denied')
-            return real_stat(self, *args, **kwargs)
-
-        monkeypatch.setattr(Path, 'stat', boom)
-
-        with pytest.raises(OSError) as excinfo:
-            plan_tools._target_file_mode(target)
-
-        assert excinfo.value.errno == errno.EACCES, (
-            '_target_file_mode must swallow ONLY FileNotFoundError; any other '
-            'OSError from target.stat() (EACCES, ELOOP, ENAMETOOLONG) must '
-            'propagate so _atomic_write_plan can turn it into PlanWriteError'
-        )
-
-    def test_a_mode_lookup_failure_surfaces_as_PlanWriteError(self, plan_dir, monkeypatch):
-        """``_target_file_mode`` deliberately swallows only ``FileNotFoundError``.
-
-        Any OTHER ``OSError`` from ``target.stat()`` (EACCES on the parent dir,
-        ELOOP, ENAMETOOLONG) must still turn into the documented
-        ``PlanWriteError`` — the docstring promises 'Any failure ... raises
-        PlanWriteError naming the path', and today the lookup sits BEFORE the
-        try block that makes that true.
-        """
-        target = plan_dir / 'plan.json'
-        before_bytes = target.read_bytes()
-        before_entries = set(plan_dir.iterdir())
-
-        def boom(_target):
-            raise OSError(errno.EACCES, 'Permission denied')
-
-        monkeypatch.setattr(plan_tools, '_target_file_mode', boom)
-
-        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
-            plan_tools._atomic_write_plan(target, corrupt_plan())
-
-        assert str(target) in str(excinfo.value), (
-            'the failure must name the path — loud, not a silent skip'
-        )
-        assert target.read_bytes() == before_bytes
-        assert set(plan_dir.iterdir()) == before_entries, (
-            'no .plan.json.*.tmp residue may be left behind'
-        )
-
-    def test_a_mode_lookup_failure_names_both_the_lane_and_resolved_paths(
-        self, lane_and_meta, monkeypatch
-    ):
-        """Mirrors ``test_dangling_symlink_fails_loudly_without_materialising_a_file``.
-
-        This is the half of the docstring contract the current ordering cannot
-        honour: when the target is a lane symlink, the wrapper's message must
-        name BOTH the original lane path and the resolved meta-root path.
-        """
-        lane_plan, real_plan = lane_and_meta
-
-        def boom(_target):
-            raise OSError(errno.EACCES, 'Permission denied')
-
-        monkeypatch.setattr(plan_tools, '_target_file_mode', boom)
-
-        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
-            plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
-
-        message = str(excinfo.value)
-        assert str(lane_plan) in message, 'the ORIGINAL path must be named'
-        assert str(real_plan) in message, 'the RESOLVED path must be named too'
-
-    def test_writing_a_plan_that_does_not_serialize_leaves_no_residue(self, plan_dir):
-        """An unserializable payload must not strand a temp file either."""
-        target = plan_dir / 'plan.json'
-        before_bytes = target.read_bytes()
-        before_entries = set(plan_dir.iterdir())
-
-        with pytest.raises(PLAN_WRITE_FAILURES):
-            plan_tools._atomic_write_plan(target, corrupt_plan(title=object()))
-
-        assert target.read_bytes() == before_bytes
-        assert set(plan_dir.iterdir()) == before_entries
-
-
-# ---------------------------------------------------------------------------
-# step-11 — the write-back must PRESERVE the lane plan symlink.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def lane_and_meta(tmp_path):
-    """The real meta-root plan plus the absolute lane symlink onto it.
-
-    Reproduces exactly what ``TaskArtifacts.ensure_lane_plan_symlink`` builds:
-    ``<worktree>/.task/plan.json`` is an ABSOLUTE symlink to the durable
-    meta-root plan, so the lane copy can never diverge from it.
-    """
-    meta = tmp_path / 'meta'
-    meta.mkdir()
-    real_plan = meta / 'plan.json'
-    real_plan.write_text(json.dumps({'task_id': 'test-1'}, indent=2) + '\n')
-
-    lane_task = tmp_path / 'worktree' / '.task'
-    lane_task.mkdir(parents=True)
-    lane_plan = lane_task / 'plan.json'
-    os.symlink(real_plan, lane_plan)
-    return lane_plan, real_plan
-
-
-class TestAtomicWritePlanFollowsSymlink:
-    """A naive os.replace onto the lane path would EAT the symlink.
-
-    ``TaskArtifacts.ensure_lane_plan_symlink`` makes the lane plan an absolute
-    symlink onto the meta-root copy, and ``_artifacts_from_args`` still
-    supports ``meta_root=None`` where ``self.root`` IS ``<worktree>/.task`` —
-    so ``self.root / 'plan.json'`` can be that symlink. Replacing it with a
-    regular file would silently RE-FORK the lane and meta-root copies, which is
-    the esc-5205-9 stale-plan divergence the symlink exists to make impossible.
-    """
-
-    def test_symlink_survives_and_the_real_file_receives_the_write(
-        self, lane_and_meta, monkeypatch
-    ):
-        lane_plan, real_plan = lane_and_meta
-        link_target_before = os.readlink(lane_plan)
-        spies = _AtomicSpies(monkeypatch)
-
-        plan_tools._atomic_write_plan(lane_plan, corrupt_plan(title='written'))
-
-        assert lane_plan.is_symlink(), 'the lane symlink was replaced by a file'
-        assert os.readlink(lane_plan) == link_target_before
-        assert json.loads(real_plan.read_text())['title'] == 'written'
-        # And the lane path still resolves to the same single source of truth.
-        assert json.loads(lane_plan.read_text())['title'] == 'written'
-        assert spies.replace_calls[0]['dst'] == real_plan
-
-    def test_temp_lands_beside_the_REAL_file_not_beside_the_symlink(
-        self, lane_and_meta, monkeypatch
-    ):
-        """The mechanism, not a side effect.
-
-        Resolving first is what keeps the rename intra-filesystem (the lane and
-        the meta root need not share one) AND what stops the replace from
-        eating the link.
-        """
-        lane_plan, real_plan = lane_and_meta
-        spies = _AtomicSpies(monkeypatch)
-
-        plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
-
-        assert spies.mkstemp_dirs == [real_plan.parent]
-        assert spies.mkstemp_dirs != [lane_plan.parent]
-
-    def test_no_temp_residue_in_either_directory(self, lane_and_meta):
-        lane_plan, real_plan = lane_and_meta
-
-        plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
-
-        assert {p.name for p in real_plan.parent.iterdir()} == {'plan.json'}
-        assert {p.name for p in lane_plan.parent.iterdir()} == {'plan.json'}
-
-    def test_dangling_symlink_fails_loudly_without_materialising_a_file(self, tmp_path):
-        """A broken link must NOT quietly become a stray regular file.
-
-        Materialising one at the link path is the divergence itself: the lane
-        would hold a plan the meta root has never seen.
-        """
-        lane_task = tmp_path / 'worktree' / '.task'
-        lane_task.mkdir(parents=True)
-        lane_plan = lane_task / 'plan.json'
-        missing = tmp_path / 'gone' / 'plan.json'
-        os.symlink(missing, lane_plan)
-        assert lane_plan.is_symlink() and not lane_plan.exists()
-
-        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
-            plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
-
-        message = str(excinfo.value)
-        assert str(lane_plan) in message, 'the ORIGINAL path must be named'
-        assert str(missing) in message, 'the RESOLVED path must be named too'
-        assert lane_plan.is_symlink()
-        assert not lane_plan.exists(), 'a stray regular file was materialised'
-        assert {p.name for p in lane_task.iterdir()} == {'plan.json'}
 
 
 # ---------------------------------------------------------------------------
@@ -2048,12 +1721,13 @@ class TestReadPlanRepaired:
         before_mtime = plan_path.stat().st_mtime_ns
 
         writes: list = []
-        real_write = plan_tools._atomic_write_plan
-        monkeypatch.setattr(
-            plan_tools,
-            '_atomic_write_plan',
-            lambda path, plan: (writes.append(path), real_write(path, plan))[1],
-        )
+        real_write_plan = TaskArtifacts.write_plan
+
+        def spy(self, plan):
+            writes.append(plan)
+            return real_write_plan(self, plan)
+
+        monkeypatch.setattr(TaskArtifacts, 'write_plan', spy)
 
         second, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
@@ -2069,7 +1743,7 @@ class TestReadPlanRepaired:
         before_mtime = plan_path.stat().st_mtime_ns
         writes: list = []
         monkeypatch.setattr(
-            plan_tools, '_atomic_write_plan', lambda path, plan: writes.append(path)
+            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
         )
 
         plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2089,7 +1763,7 @@ class TestReadPlanRepaired:
         before_bytes = plan_path.read_bytes()
         writes: list = []
         monkeypatch.setattr(
-            plan_tools, '_atomic_write_plan', lambda path, plan: writes.append(path)
+            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
         )
 
         _, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2252,7 +1926,7 @@ class TestReadPlanRepaired:
         assert plan_artifacts.read_plan() == {}
         writes: list = []
         monkeypatch.setattr(
-            plan_tools, '_atomic_write_plan', lambda path, plan: writes.append(path)
+            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
         )
 
         plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2272,7 +1946,7 @@ class TestReadPlanRepaired:
             plan_artifacts.read_plan()
         writes: list = []
         monkeypatch.setattr(
-            plan_tools, '_atomic_write_plan', lambda path, plan: writes.append(path)
+            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
         )
 
         with pytest.raises(json.JSONDecodeError):
@@ -2291,10 +1965,12 @@ class TestReadPlanRepaired:
         """
         _seed_mixed_plan(plan_artifacts)
 
-        def boom(_path, _plan):
-            raise plan_tools.PlanWriteError('disk on fire')
+        # Patched at the writer plan-tools now delegates to, so the contract
+        # is still exercised after the module's own writer was retired.
+        def boom(self, plan):
+            raise ArtifactWriteError('disk on fire')
 
-        monkeypatch.setattr(plan_tools, '_atomic_write_plan', boom)
+        monkeypatch.setattr(TaskArtifacts, 'write_plan', boom)
 
         with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
             plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2302,6 +1978,9 @@ class TestReadPlanRepaired:
         assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
         assert any(f['outcome'] == 'repaired' for f in facts)
         assert 'disk on fire' in caplog.text, 'the write failure must be LOUD'
+        assert plan_tools._MARKUP_WRITE_FAILED_EVENT in caplog.text, (
+            'the failure must be a STRUCTURED fact, not just prose'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2402,107 +2081,6 @@ class TestUnresolvableLocatorIsNeverMemoized:
             'still converge to silence on repeat, unlike a broken locator'
         )
         assert len(plan_tools._REPORTED_REFUSALS) == 1
-
-
-# ---------------------------------------------------------------------------
-# step-13(d) — boundary row B12: a concurrent reader never sees a partial file.
-# ---------------------------------------------------------------------------
-
-
-class TestConcurrentReadersNeverSeeAPartialPlan:
-    """B12 stated as an executable property, not as an assertion about code.
-
-    ``TaskArtifacts._write_json`` is ``path.write_text`` — truncate-then-write —
-    so a reader racing it CAN observe a half-written file. The repair write-back
-    must not inherit that window, and the only convincing evidence is to race it.
-    """
-
-    READERS = 4
-    READS_PER_READER = 300
-    WRITES = 50
-
-    def test_readers_only_ever_observe_a_complete_document(self, tmp_path):
-        directory = tmp_path / 'meta'
-        directory.mkdir()
-        plan_path = directory / 'plan.json'
-
-        # Two documents of DIFFERENT sizes: a torn read of the larger one
-        # cannot be mistaken for a clean read of the smaller.
-        doc_a = corrupt_plan(title='A' * 4000)
-        doc_b = corrupt_plan(title='B', analysis='B' * 40000)
-        expected = []
-        for doc in (doc_a, doc_b):
-            stamped = copy.deepcopy(doc)
-            stamped['_schema_version'] = PLAN_SCHEMA_VERSION
-            expected.append(stamped)
-
-        plan_path.write_text(json.dumps(expected[0], indent=2) + '\n')
-
-        errors: list = []
-        observed_unexpected: list = []
-        start = threading.Barrier(self.READERS + 1)
-        done = threading.Event()
-
-        def reader():
-            start.wait(timeout=30)
-            for _ in range(self.READS_PER_READER):
-                try:
-                    document = json.loads(plan_path.read_text())
-                except Exception as exc:  # noqa: BLE001 — recorded, then asserted on
-                    errors.append(repr(exc))
-                    continue
-                if document not in expected:
-                    observed_unexpected.append(sorted(document))
-                if done.is_set():
-                    break
-
-        threads = [
-            threading.Thread(target=reader, name=f'reader-{i}', daemon=True)
-            for i in range(self.READERS)
-        ]
-        for thread in threads:
-            thread.start()
-
-        start.wait(timeout=30)
-        for i in range(self.WRITES):
-            plan_tools._atomic_write_plan(plan_path, copy.deepcopy(doc_b if i % 2 else doc_a))
-        done.set()
-
-        for thread in threads:
-            thread.join(timeout=60)
-            assert not thread.is_alive(), f'{thread.name} did not finish'
-
-        assert errors == [], f'a reader observed an unparseable plan.json: {errors[:3]}'
-        assert observed_unexpected == [], (
-            'a reader observed a document that is neither the pre-write nor the '
-            f'post-write plan: {observed_unexpected[:2]}'
-        )
-
-    def test_the_plan_path_is_never_absent_mid_write(self, tmp_path):
-        """``os.replace`` swaps in place — it must never unlink-then-create."""
-        directory = tmp_path / 'meta'
-        directory.mkdir()
-        plan_path = directory / 'plan.json'
-        plan_path.write_text(json.dumps(corrupt_plan(), indent=2) + '\n')
-
-        misses: list = []
-        stop = threading.Event()
-
-        def watcher():
-            while not stop.is_set():
-                if not plan_path.exists():
-                    misses.append(1)
-
-        thread = threading.Thread(target=watcher, daemon=True)
-        thread.start()
-        try:
-            for i in range(self.WRITES):
-                plan_tools._atomic_write_plan(plan_path, corrupt_plan(title=f't{i}'))
-        finally:
-            stop.set()
-            thread.join(timeout=30)
-
-        assert misses == [], 'plan.json vanished during an atomic write-back'
 
 
 # ---------------------------------------------------------------------------
@@ -3037,3 +2615,81 @@ class TestQuotedSiblingTagIsNeverTruncated:
 
         assert repaired['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
         assert repaired['design_decisions'][0]['rationale'] == _QUOTED_SIBLING_PROSE
+
+
+# ---------------------------------------------------------------------------
+# task 3957 step-7 — plan-tools persists a repaired plan THROUGH TaskArtifacts,
+# and keeps no second plan.json writer of its own.
+# ---------------------------------------------------------------------------
+
+
+class TestRepairWriteBackDelegatesToTaskArtifacts:
+    """`TaskArtifacts.write_plan` is the SINGLE owner of the plan.json write.
+
+    plan-tools used to carry `_atomic_write_plan` — a parallel implementation
+    of the same byte format and the same durability contract, kept only
+    because `TaskArtifacts._write_json` was truncate-then-write.  It is not
+    any more (task 3957 steps 1-6), so the duplicate has no reason to exist
+    and the write-back goes through the public writer.
+    """
+
+    @staticmethod
+    def _spy_on_write_plan(monkeypatch) -> list[dict]:
+        """A DELEGATING spy: records the call, then performs the real write.
+
+        Delegating rather than stubbing is what keeps the on-disk assertions
+        meaningful — a stub would prove the call happened while quietly
+        turning every "and the bytes landed" check vacuous.
+        """
+        calls: list[dict] = []
+        real_write_plan = TaskArtifacts.write_plan
+
+        def spy(self, plan):
+            calls.append(plan)
+            return real_write_plan(self, plan)
+
+        monkeypatch.setattr(TaskArtifacts, 'write_plan', spy)
+        return calls
+
+    def test_repair_write_back_goes_through_task_artifacts_write_plan(
+        self, plan_artifacts, monkeypatch
+    ):
+        _seed_mixed_plan(plan_artifacts)
+        calls = self._spy_on_write_plan(monkeypatch)
+
+        repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert any(f['outcome'] == 'repaired' for f in facts)
+        assert len(calls) == 1, (
+            f'expected exactly one write_plan call, got {len(calls)} — the '
+            'repair write-back must go through TaskArtifacts'
+        )
+        assert calls[0] == repaired
+        # And the delegation really wrote: the bytes on disk are the repair.
+        assert _on_disk(plan_artifacts) == repaired
+
+    def test_a_clean_plan_still_writes_nothing(self, plan_artifacts, monkeypatch):
+        """Consolidating the writer must not convert a read into a write."""
+        plan_artifacts.write_plan(corrupt_plan())
+        calls = self._spy_on_write_plan(monkeypatch)
+
+        _, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert facts == []
+        assert calls == []
+
+    def test_an_all_refusal_plan_still_writes_nothing(
+        self, plan_artifacts, monkeypatch
+    ):
+        """Nothing changed, so nothing is written — the 2939 prose plan stays."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+        plan_artifacts.write_plan(plan)
+        before_bytes = (plan_artifacts.root / 'plan.json').read_bytes()
+        calls = self._spy_on_write_plan(monkeypatch)
+
+        _, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert [f['outcome'] for f in facts] == ['unrepairable']
+        assert calls == []
+        assert (plan_artifacts.root / 'plan.json').read_bytes() == before_bytes

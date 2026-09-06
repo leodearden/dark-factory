@@ -64,6 +64,66 @@ cd fused-memory && uv sync
 
 Full fresh-machine walkthrough: `SETUP.md`.
 
+### Locating installed code
+
+The uv workspace has ONE root `.venv` per tree — `<project_root>/.venv` (CPython
+3.13.9, uv 0.11.6 in the main checkout). None of the seven workspace members
+carries its own. A task worktree gets an INDEPENDENT root `.venv`, not a share
+of main's, once it has been cold-verified — `verify_cold_preprovision_command`
+(`uv sync --all-packages && npm ci …`) runs *inside* the worktree, and such a
+venv can even be a different interpreter (measured: several `.worktrees/*/.venv` are CPython
+3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. Meanwhile
+an agent Bash session typically inherits `VIRTUAL_ENV` and a bare `python` from
+the MAIN checkout's `.venv` even when cwd is a worktree.
+
+So the venv path is **not derivable from your cwd**. Ask the interpreter; never
+guess a path.
+
+<!-- package-source-lookup:begin
+     This command is EXECUTED verbatim by
+     tests/scripts/test_package_source_lookup_convention.py. Edit it into
+     anything that is not a `python -c` interpreter query and that guard goes
+     red — that is deliberate, and it is what keeps this recipe honest. -->
+- **Third-party package source**: `python -c 'import uvicorn, os; print(os.path.dirname(uvicorn.__file__))'`
+<!-- package-source-lookup:end -->
+
+That prints `<venv>/lib/python3.13/site-packages/uvicorn` in ~0.4s (measured
+0.396s); grep inside that directory for whatever you actually wanted.
+
+**Never `find /` for an installed package.** The scan this replaces —
+`find / -path '*/uvicorn/config.py'` — blew through the Bash tool's 120000ms
+default `timeout` and returned nothing (exit 143). That `timeout` can be raised,
+but raising it is the wrong fix: the scoped query above is ~300x faster.
+
+Third-party packages resolve under `<venv>/lib/python3.X/site-packages/`.
+First-party workspace members do NOT: they are installed **editable**, so they
+resolve into a checkout's `src/` tree instead. WHICH checkout is the question
+that matters — from a worktree shell that inherited main's `VIRTUAL_ENV`,
+`import <member>` hands you MAIN's source, not the code you just edited in your
+worktree. That inheritance is real for **your own Bash session and only there**
+— the orchestrator hands an agent subprocess a plain copy of its own environment
+(`orchestrator/src/orchestrator/agents/invoke.py`), `VIRTUAL_ENV` included. It is
+NOT how verify runs: every verify command is spawned through
+`orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips
+`VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its
+OWN `.venv`. So a hand-run import in your shell can disagree with verify — when
+it does, verify is the one reading your worktree. That asymmetry is the mechanism
+behind the `OPERATIONS.md` Troubleshooting row for an agent reporting an
+`AttributeError` in its own shell for code it just wrote.
+
+<!-- import-provenance-check:begin
+     Also EXECUTED verbatim by
+     tests/scripts/test_package_source_lookup_convention.py, which asserts the
+     INVERSE of the check above: this one must resolve into a checkout's `src/`
+     tree, never under `site-packages`. -->
+- **First-party import provenance**: `python -c 'import shared; print(shared.__file__)'`
+<!-- import-provenance-check:end -->
+
+Any workspace member works; `shared` is used because it is the one member every
+`uv run --project shared` environment installs. A cold-verified worktree
+resolves to its OWN tree, an un-synced one to the main checkout — both are
+correct, and knowing which you are in is the whole point of asking.
+
 ## Memory Usage
 
 ### When to read memory

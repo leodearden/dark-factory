@@ -28,6 +28,7 @@ from shared.task_metadata import (
     ExternalDep,
     MemoryHints,
     Milestone,
+    Recurrence,
     RetryLedger,
     RoutingDecisionMirror,
     RoutingState,
@@ -622,6 +623,71 @@ class TestMilestone:
     def test_unknown_subfield_retained_and_reemitted(self):
         m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
         dumped = m.model_dump()
+        assert dumped['x_extra'] == 'keep'
+
+
+class TestRecurrence:
+    """``metadata.recurrence`` — the recurring-chain link spec (task 4676).
+
+    PRD ``docs/prds/recurring-deterministic-tasks.md`` decision R-D4. A
+    recurrence marks one link of a chain of deterministic predicate tasks:
+    ``key`` is the stable chain id every link shares, ``interval_secs`` is
+    the cadence, and ``minted_from`` is the predecessor's task id — absent
+    on the seed link an author writes, stamped by the mint on successors.
+    """
+
+    def test_minimal_seed_link_constructs(self):
+        r = Recurrence(key='reify-closure-staleness', interval_secs=86400)
+        assert r.key == 'reify-closure-staleness'
+        assert r.interval_secs == 86400
+        assert r.minted_from is None
+
+    def test_minted_link_constructs(self):
+        r = Recurrence(key='reify-closure-staleness', interval_secs=86400, minted_from='4676')
+        assert r.minted_from == '4676'
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            pytest.param({'key': 'k', 'interval_secs': 0}, id='interval_secs_zero'),
+            pytest.param({'key': 'k', 'interval_secs': -1}, id='interval_secs_negative'),
+            pytest.param({'key': 'k', 'interval_secs': '1d'}, id='interval_secs_non_int'),
+            # The three rows pydantic's LAX int coercion would have ACCEPTED
+            # (True -> 1, '86400' -> 86400, 86400.0 -> 86400). strict=True is
+            # what rejects them, and a bool slipping through would mint a
+            # one-second cadence — the silent-wrong-value bug, not a typo.
+            pytest.param({'key': 'k', 'interval_secs': True}, id='interval_secs_bool'),
+            pytest.param({'key': 'k', 'interval_secs': '86400'}, id='interval_secs_numeric_str'),
+            pytest.param({'key': 'k', 'interval_secs': 86400.0}, id='interval_secs_float'),
+            pytest.param({'key': 'k'}, id='interval_secs_missing'),
+            pytest.param({'interval_secs': 86400}, id='key_missing'),
+            pytest.param({'key': '', 'interval_secs': 86400}, id='key_empty'),
+            pytest.param({'key': 'Reify-Closure', 'interval_secs': 86400}, id='key_upper'),
+            pytest.param({'key': 'reify_closure', 'interval_secs': 86400}, id='key_underscore'),
+            pytest.param({'key': 'reify closure', 'interval_secs': 86400}, id='key_space'),
+            pytest.param({'key': '-reify', 'interval_secs': 86400}, id='key_leading_dash'),
+            pytest.param({'key': 'reify-', 'interval_secs': 86400}, id='key_trailing_dash'),
+            pytest.param({'key': 'reify--closure', 'interval_secs': 86400}, id='key_double_dash'),
+            # The cap half of the topic-slug mirror: the regex alone accepts
+            # any length, so without max_length this row constructs fine.
+            pytest.param({'key': 'a' * 101, 'interval_secs': 86400}, id='key_over_max_len'),
+        ],
+    )
+    def test_invalid_specs_rejected(self, kwargs):
+        with pytest.raises(ValidationError):
+            Recurrence(**kwargs)  # type: ignore[arg-type]
+
+    def test_key_at_max_length_accepted(self):
+        """The cap is 100 (TOPIC_SLUG_MAX_LEN), inclusive — pin the boundary.
+
+        Paired with the ``key_over_max_len`` row above so a future edit to
+        the literal cannot move the limit in silence.
+        """
+        assert Recurrence(key='a' * 100, interval_secs=86400).key == 'a' * 100
+
+    def test_unknown_subfield_retained_and_reemitted(self):
+        r = Recurrence(key='k', interval_secs=86400, x_extra='keep')  # type: ignore[call-arg]
+        dumped = r.model_dump()
         assert dumped['x_extra'] == 'keep'
 
 
@@ -1244,6 +1310,109 @@ class TestMilestoneRegistration:
             parse_metadata({'milestone': {'mode': 'delayed'}}, direction='write', enforce=True)
 
 
+class TestRecurrenceRegistration:
+    """``recurrence``'s registration with the W10 extension point + parse_metadata integration.
+
+    Task 4676 / PRD ``docs/prds/recurring-deterministic-tasks.md`` R-D4. The
+    cardinality pin lives HERE rather than in
+    TestProductionRegistrationCardinality for the reason that class's
+    docstring gives: cardinality is pinned in the suite that imports the
+    registering module, and this file imports ``shared.task_metadata``
+    directly.
+
+    These rows READ the production registration made at import time; none of
+    them calls ``register_metadata_submodel('recurrence', ...)``, because the
+    autouse fixture's teardown fails any test that adds a non-``_stub`` key
+    (task 3352).
+    """
+
+    _CARRIER = {
+        'task_kind': 'deterministic',
+        'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
+        'before_done': {
+            'kind': 'predicate',
+            'script': 'scripts/x.sh',
+            'timeout_secs': 120,
+        },
+        'recurrence': {'key': 'reify-closure-staleness', 'interval_secs': 86400},
+    }
+
+    def test_registered_at_import(self):
+        assert task_metadata_module._SUBMODEL_REGISTRY['recurrence'] is Recurrence
+
+    def test_registered_as_dict_cardinality(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['recurrence'] == 'dict'
+
+    def test_carrier_round_trip_no_warnings(self):
+        model, warnings = parse_metadata(copy.deepcopy(self._CARRIER), direction='write')
+        assert warnings == []
+        assert isinstance(model.recurrence, Recurrence)  # type: ignore[attr-defined]
+        dumped = model.model_dump()['recurrence']
+        assert not isinstance(dumped, BaseModel)
+        assert dumped == {
+            'key': 'reify-closure-staleness',
+            'interval_secs': 86400,
+            'minted_from': None,
+        }
+        # The seed/successor discriminator r2's mint (and R-D5's gauge) must
+        # use, pinned explicitly because the dict above already shows the
+        # trap: the carrier was authored WITHOUT 'minted_from', yet the
+        # round-trip materialises the key with a None value. Key PRESENCE is
+        # therefore not the discriminator and never was —
+        # ``'minted_from' in rec`` reads True for this seed link. Only the
+        # VALUE separates the two, and it holds on the as-authored form too.
+        assert 'minted_from' not in self._CARRIER['recurrence']
+        assert 'minted_from' in dumped
+        assert dumped['minted_from'] is None
+        assert model.recurrence.minted_from is None  # type: ignore[attr-defined]
+
+    def test_malformed_slice_read_warns_and_retains_raw(self):
+        model, warnings = parse_metadata({'recurrence': {'key': 'k'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'invalid_submodel'
+        assert model.model_dump()['recurrence'] == {'key': 'k'}
+
+    def test_malformed_slice_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata({'recurrence': {'key': 'k'}}, direction='write', enforce=True)
+
+    def test_scalar_slice_is_invalid_submodel_not_wrong_cardinality(self):
+        """A scalar slice falls through to ``submodel(**raw)`` — a TypeError, not a shape error.
+
+        The task-4142 cardinality gate compares ``isinstance(raw, list)``
+        against the declared cardinality, so a SCALAR never trips it; only a
+        list value does (see the row below).
+        """
+        _, warnings = parse_metadata({'recurrence': 'nope'}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'invalid_submodel'
+
+    def test_list_slice_read_warns_wrong_cardinality(self):
+        model, warnings = parse_metadata(
+            {'recurrence': [{'key': 'k', 'interval_secs': 86400}]}, direction='read'
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == 'recurrence'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()['recurrence'] == [{'key': 'k', 'interval_secs': 86400}]
+
+    def test_list_slice_write_enforce_raises_type_error(self):
+        """The task-4142 shape rejection registration buys under write+enforce.
+
+        This is what covers ``update_task``, which never runs fused-memory's
+        deterministic-task guard: registering the key subjects the slice to
+        the cardinality gate at the write boundary regardless of caller.
+        """
+        with pytest.raises(TypeError):
+            parse_metadata(
+                {'recurrence': [{'key': 'k', 'interval_secs': 86400}]},
+                direction='write',
+                enforce=True,
+            )
+
+
 class TestRoutingRegistration:
     """``routing``'s registration with the W10 extension point + parse_metadata integration."""
 
@@ -1861,6 +2030,45 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
 
+    def test_recurrence_metadata_key_is_blessed(self):
+        """The recurring-chain link spec is deliberately blessed AND registered (task 4676).
+
+        PRD ``docs/prds/recurring-deterministic-tasks.md`` R-D4 specifies
+        BOTH: ``recurrence`` is a registered submodel (so parse_metadata
+        types and validates the slice) and a Tier-A blessed key (so the
+        unknown-key scan skips it even if the registration is ever moved,
+        made lazy, or otherwise not yet in place when a blob is parsed) —
+        and so that migrate_task_metadata_to_x_namespace.py refuses to
+        x_-namespace it, which for a submodel-backed key with live readers
+        is the correct refusal.
+
+        Assertion 2 exists precisely because assertion-by-unknown_key-alone
+        cannot distinguish the blessing from the registration: a REGISTERED
+        key is already in known_fields and never reaches the unknown-key
+        scan, so the obvious spelling of this test would be born green. It
+        pops the registration to isolate the property the blessing buys.
+
+        The parametrized
+        test_every_blessed_metadata_key_individually_suppresses_unknown_key_warning
+        above also covers the key for free once blessed — this test carries
+        the rationale, not the coverage.
+        """
+        # 1. Direct membership: the blessing is belt-and-braces over the
+        #    registration.
+        assert 'recurrence' in task_metadata_module._BLESSED_METADATA_KEYS
+
+        # 2. The behaviour that membership buys, proven independently of the
+        #    registration. The autouse fixture snapshots and restores
+        #    _SUBMODEL_REGISTRY, and its ownership assertion inspects only
+        #    keys a test ADDED — so a pop is safe and is restored on
+        #    teardown. Do NOT re-register the production key (task 3352).
+        task_metadata_module._SUBMODEL_REGISTRY.pop('recurrence')
+        _, warnings = parse_metadata(
+            {'recurrence': {'key': 'k', 'interval_secs': 1}}, direction='read'
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'recurrence' not in unknown_key_fields
+
     def test_cross_repo_metadata_keys_are_blessed(self):
         """The cross-repo deliverable marker must not census-warn (task 3004).
 
@@ -2016,6 +2224,299 @@ class TestParseMetadataFailurePolicy:
         assert near_miss_alias in unknown_key_fields, (
             f'{near_miss_alias} must stay unblessed so its drift line keeps appearing '
             f'in the census; got warnings: {warnings}'
+        )
+
+    def test_execution_class_metadata_key_is_blessed(self):
+        """The recon-stage execution-class discriminator must not census-warn (task 3780).
+
+        `execution_class` is MACHINE-read by live guards at the fused-memory
+        submit boundary and carries real dispatch consequences — most sharply
+        `fused_memory.middleware.operational_routing_guard`, which coerces an
+        `operational`/`decision` record to `task_kind='deterministic'` +
+        `always_escalates`. That is exactly the profile
+        docs/task-authoring.md §8 "Promoting a convention" prescribes blessing
+        for: a load-bearing, stable, machine-written convention with live code
+        readers. The point-in-time census behind the ruling is transcribed
+        ONCE, beside the frozenset entry in shared/src/shared/task_metadata.py,
+        and deliberately not restated here — a measurement kept in three
+        places ages into two stale copies.
+
+        Blessed rather than promoted to a typed field, which is the non-obvious
+        half: the note on `operational_mode` in shared/src/shared/task_metadata.py
+        already records that `execution_class` is "validated only by a
+        fused-memory guard conditional on recon-stage caller identity — logic a
+        pydantic field validator cannot express", and contrasts `operational_mode`
+        as the caller-INDEPENDENT rule a plain typed `Literal` can carry.
+
+        RED until 'execution_class' is added to _BLESSED_METADATA_KEYS.
+        """
+        # (a) The census leg — the only leg RED at base.
+        _, warnings = parse_metadata({'execution_class': 'code_tdd'}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'execution_class'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for execution_class; got: {offending}'
+        )
+
+        # (b) An allowlist entry, NOT a typed Literal — a difference that is
+        # load-bearing rather than stylistic. Tasks 3623 and 3624 (both `done`,
+        # both carrying `done_provenance`) really do carry the
+        # out-of-vocabulary value 'implementation', outside
+        # recon_self_model.EXECUTION_CLASSES ('code_tdd', 'operational',
+        # 'decision'). Under direction='write', enforce=True the parser RAISES
+        # on malformed input, so a future well-meaning promotion to a typed
+        # Literal would block EVERY metadata write to those two tasks — and
+        # they are unrepairable until task 3777 lifts the presence-only
+        # write-authority floor on done_provenance. Accepting the value here is
+        # not laxity: value validation for recon-stage callers correctly lives
+        # in fused_memory.middleware.execution_class_guard.execution_class_error
+        # at the submit boundary, which can see the caller identity the rule is
+        # conditional on.
+        model, write_warnings = parse_metadata(
+            {'execution_class': 'implementation'}, direction='write', enforce=True
+        )
+        invalid_field_warnings = [w for w in write_warnings if w.code == 'invalid_field']
+        assert invalid_field_warnings == [], (
+            'execution_class must not be value-validated by the parser (tasks '
+            f'3623/3624 carry \'implementation\'); got: {invalid_field_warnings}'
+        )
+
+        # (c) Round-trip preservation (I1): re-emitted verbatim, and living in
+        # model_extra — i.e. still an extra='allow' key, not a typed field.
+        assert model.model_dump()['execution_class'] == 'implementation'
+        assert (model.model_extra or {}).get('execution_class') == 'implementation', (
+            'execution_class must stay an extra=\'allow\' key, not become a typed field'
+        )
+
+        # (d) No-noise: an absent execution_class contributes no key to the
+        # dump. This is the documented rationale for Tier-A being an allowlist
+        # rather than a wall of typed Optional fields (docs/task-authoring.md §8).
+        empty_model, _ = parse_metadata({}, direction='read')
+        assert 'execution_class' not in empty_model.model_dump()
+
+    def test_finding_provenance_memory_ids_key_is_blessed(self):
+        """`related_memory_ids` must not census-warn (esc-3796-1 / task 4373).
+
+        The memory-ids half of the finding-provenance family: where
+        `source_finding_id` names WHICH finding a task was spawned from,
+        `related_memory_ids` names the memory ids that finding cites. It is
+        ratified as the CANONICAL plural spelling on the same corpus-dominance
+        grounds as the id-trio above, and shares that family's unusual
+        property of having no code reader and no code writer — after task
+        4373 the recon Stage 1/2 prompts are its writer, so a future reader
+        who greps for a code writer and finds none must not prune it as dead.
+
+        Basis: esc-3796-1, cited by id. The per-key census figures are
+        transcribed exactly once, beside the entries in
+        shared/src/shared/task_metadata.py; restating them here would age
+        into a second stale copy.
+
+        RED until 'related_memory_ids' is added to _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata({'related_memory_ids': ['90bd6ecf']}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'related_memory_ids'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for related_memory_ids; got: {offending}'
+        )
+
+    @pytest.mark.parametrize('near_miss_alias', ['origin_memory_ids', 'memory_ids'])
+    def test_finding_provenance_memory_ids_near_miss_aliases_still_warn(self, near_miss_alias):
+        """The plural-memory-id near misses must KEEP emitting unknown_key (esc-3796-1).
+
+        The negative half of the test above. Once `related_memory_ids` is
+        blessed it goes silent by design, so the drift signal for the
+        plural-memory-id family lives entirely in the UNBLESSED spellings:
+        `code=unknown_key` is what an operator greps for to find a caller
+        still on a wrong spelling. Blessing one of these — or promoting it to
+        a typed `TaskMetadata` field — would void that contract with no other
+        test failing and leave the grep silently returning nothing.
+
+        Scoped to exactly two spellings, both of which this task measured:
+        `origin_memory_ids` is the variant esc-3796-1 explicitly rejected, and
+        `memory_ids` is the bare form. The wider corpus holds further ad-hoc
+        plural spellings, but their inventory is a point-in-time census figure
+        this task did not re-measure — pinning unmeasured names would assert
+        something unverified.
+
+        This asserts parser BEHAVIOUR (warning emitted / not emitted), not the
+        wording of docs/task-authoring.md §8 — so it is a real contract test,
+        not a documentation meta-test.
+        """
+        _, warnings = parse_metadata({near_miss_alias: ['v']}, direction='read')
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert near_miss_alias in unknown_key_fields, (
+            f'{near_miss_alias} must stay unblessed so its drift line keeps appearing '
+            f'in the census; got warnings: {warnings}'
+        )
+
+    def test_related_tasks_metadata_key_is_blessed(self):
+        """The canonical Tier-B cross-reference spelling must not census-warn (task 4303).
+
+        `related_tasks` is the CANONICAL spelling that docs/task-authoring.md
+        §8's Tier-B table tells authors to migrate TOWARD, yet it was itself
+        unblessed — so an author who followed the documentation exactly still
+        minted a `code=unknown_key` census line, and the drift signal could not
+        discriminate "used a deprecated alias" from "used the canonical
+        spelling". That is the defect: the table's preamble promises the
+        aliases warn *until the caller is fixed to use the canonical spelling*,
+        a promise only meaningful if migrating actually clears the warning.
+
+        BLESSED ON CORPUS-DOMINANCE GROUNDS, NOT ON A LIVE-READER CLAIM — say
+        this plainly, because the honest record is what keeps the entry alive.
+        The reader/writer trace came back NEGATIVE: no code reader, no code
+        writer, and `git log -S` finds the key has never existed in code in
+        this repo's history. It is blessed on the esc-3796-1 precedent, under
+        which the finding-provenance family and `related_memory_ids` are Tier-A
+        with no reader and no writer because THE CORPUS IS THE USAGE. A future
+        reader who greps for a reader, finds none, and prunes this entry as
+        dead would be wrong in exactly the way those entries already warn
+        against.
+
+        The census figures, the reader verdict and the bless-not-retire /
+        bless-not-type rulings are transcribed ONCE, beside the frozenset entry
+        in shared/src/shared/task_metadata.py, and deliberately not restated
+        here — a point-in-time measurement kept in three places ages into two
+        stale copies.
+
+        RED until 'related_tasks' is added to _BLESSED_METADATA_KEYS: on the
+        base tree parse_metadata returns unknown_key for it (measured, not
+        predicted), so legs 1 and 2 both fail.
+        """
+        # 1. Direct membership in the allowlist.
+        assert 'related_tasks' in task_metadata_module._BLESSED_METADATA_KEYS, (
+            'related_tasks is the canonical Tier-B spelling docs/task-authoring.md §8 '
+            'directs authors to; it must be Tier-A blessed so following the '
+            'documentation does not mint a census warning'
+        )
+
+        # 2. The behaviour that membership buys.
+        model, warnings = parse_metadata({'related_tasks': ['1', '2']}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'related_tasks'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for related_tasks; got: {offending}'
+        )
+
+        # 3. Value preservation (I1). Blessing suppresses the census LINE and
+        #    must not touch the stored value: it stays an extra='allow' key,
+        #    round-tripped verbatim, not coerced by a typed field.
+        assert model.model_dump()['related_tasks'] == ['1', '2']
+
+    @pytest.mark.parametrize(
+        'value', [['1', '2'], 'task-1'], ids=['list_value', 'bare_str_value']
+    )
+    def test_related_tasks_accepts_heterogeneous_values_on_write(self, value):
+        """`related_tasks` must stay untyped: BOTH corpus value shapes survive a
+        strict write (task 4303).
+
+        THIS IS THE ASSERTION THE BLESS-NOT-TYPE RULING RESTS ON. §8's
+        "Promoting a convention" fork offers two ways to stop a key warning:
+        bless it into `_BLESSED_METADATA_KEYS`, or promote it to a typed
+        `TaskMetadata` field. Task 4303 chose bless, and the whole reason was a
+        measurement about VALUES, not about readers: of the 469 corpus carriers,
+        432 hold a list and 37 hold a BARE STR. A typed `list[str]` field would
+        raise on every metadata write to those 37 under
+        ``direction='write', enforce=True`` — permanently, because most are
+        terminal and unrepairable under the presence-only write-authority floor
+        that also blocks a retire sweep (326 of 469 carry `done_provenance`).
+
+        Without this leg that ruling is defended by PROSE ALONE. The blessing
+        test above exercises only ``direction='read'`` with a list, so a later
+        change that added ``related_tasks: list[str]`` to the model would land
+        GREEN across the whole file while silently breaking writes for the
+        bare-str carriers — the identical argument that decided `execution_class`
+        (task 3780), which is why it is pinned here rather than restated.
+
+        Two properties, and both matter:
+        - NEITHER SHAPE RAISES under the strictest setting the parser has.
+          `enforce=True` is what turns a warning into an exception, so this is
+          the mode a typed field would fail in.
+        - NEITHER SHAPE IS COERCED. Blessing suppresses the census LINE only; the
+          value stays an ``extra='allow'`` passenger, round-tripped verbatim. A
+          field that quietly wrapped ``'task-1'`` into ``['task-1']`` would keep
+          this test from raising while still rewriting 37 records' data.
+
+        Parametrized so a regression names WHICH shape broke: the bare-str leg
+        is the load-bearing one (a `list[str]` field passes the list leg).
+
+        MEASURED, NOT PREDICTED — this test is born GREEN (task 4303 blessed
+        rather than typed, so nothing raises today), which proves only that it
+        RUNS. It was therefore falsified by hand against the change it exists to
+        stop: adding ``related_tasks: list[str] | None = None`` to
+        :class:`TaskMetadata` failed exactly ONE case,
+        ``...on_write[bare_str_value]``, with
+        ``ValidationError: Input should be a valid list [input_value='task-1']``,
+        while ``[list_value]`` and the other five related_tasks cases stayed
+        green. That is precisely the asymmetry the parametrization is for, and it
+        confirms the 37 bare-str carriers would have become unwritable. The
+        typed field was not committed.
+        """
+        model, warnings = parse_metadata(
+            {'related_tasks': value}, direction='write', enforce=True
+        )
+
+        assert warnings == [], (
+            f'a strict write of related_tasks={value!r} must be silent — it is the '
+            f'canonical Tier-B spelling and Tier-A blessed; got: {warnings}'
+        )
+        assert model.model_dump()['related_tasks'] == value, (
+            f'related_tasks={value!r} was coerced on write. It is deliberately NOT a '
+            f'typed field: 37 of 469 corpus carriers hold a bare str, so any typing '
+            f'that normalises or rejects a non-list rewrites or breaks those records '
+            f'(task 4303, the bless-not-type ruling)'
+        )
+
+    @pytest.mark.parametrize(
+        'alias', ['related_task', 'related_df_tasks', 'related_task_examples']
+    )
+    def test_related_tasks_aliases_still_warn(self, alias):
+        """The three cross-reference aliases must KEEP emitting unknown_key (task 4303).
+
+        The negative half of ``test_related_tasks_metadata_key_is_blessed``, and
+        the assertion the Tier-B row now actually rests on. Task 4303 blessed the
+        CANONICAL spelling, so from here the drift signal for this family lives
+        ENTIRELY in these three aliases — before that, the canonical warned too
+        and `code=unknown_key` could not discriminate "used a deprecated alias"
+        from "used the spelling docs/task-authoring.md §8 told me to use".
+
+        BORN GREEN BY DESIGN, and that is the point: this is a regression lock,
+        not a defect reproduction. Verified on the base tree — all three aliases
+        already warn correctly. Its falsifier is a FUTURE change that blesses one
+        of them (or promotes it to a typed `TaskMetadata` field), which would
+        void the Tier-B table's drift contract with no other test failing and
+        leave an operator's `grep code=unknown_key` silently returning nothing.
+        Modelled directly on `test_finding_provenance_near_miss_aliases_still_warn`
+        above, whose docstring makes exactly this argument for its own family.
+
+        Parametrized rather than looped inside one test so a single regressed
+        alias is isolated BY NAME in the failure output. Both properties were
+        measured, not assumed: temporarily blessing `related_df_tasks` failed
+        exactly one case, reported as
+        `test_related_tasks_aliases_still_warn[related_df_tasks]`, while the
+        other two stayed green. The temporary blessing was not committed.
+
+        This asserts parser BEHAVIOUR (warning emitted / not emitted), not the
+        wording of docs/task-authoring.md §8 — so it is a real contract test, not
+        a documentation meta-test.
+
+        Scoped key-exact to the three spellings the Tier-B row lists, and nothing
+        beyond them. In particular NOT `related_task_ids`: that is a different
+        key entirely, it lives in MEMORY metadata rather than task metadata, and
+        it has a live reader at
+        `fused-memory/scripts/audit_duplicate_memories.py::
+        liveness_snapshot_subject_task_ids`. Pulling it into this family is the
+        `related_task*` wildcard mistake task 4303 removed from the frozenset
+        header comment.
+        """
+        _, warnings = parse_metadata({alias: 'v'}, direction='read')
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert alias in unknown_key_fields, (
+            f'{alias} must stay unblessed so its drift line keeps appearing in '
+            f'the census; got warnings: {warnings}'
         )
 
     def test_deterministic_invariant_violation_write_enforce_raises(self):
@@ -2374,3 +2875,59 @@ class TestRegistryKeyOwnershipGuard:
         _assert_only_test_owned_registry_keys(
             {_DEPLOY_STATE_STUB_KEY, TestListValuedSubmodelSlice._KEY}
         )
+
+
+class TestFilesTaggedEmptyBlessed:
+    """Task 3122: the module tagger's affirmative "no local file" verdict.
+
+    Written unconditionally as a bool on every tagged task by
+    ``Harness._tag_task_modules``, in the SAME payload and by the same line
+    of code as its already-blessed ``files_tagged_at`` sibling.
+
+    That write path is INERT today — ``harness._MODULE_TAGGER_ENABLED`` is
+    False (task 4523) — so this pins the blessing, not live traffic. The
+    blessing lands per plans/module-tagger-retirement-prd.md decision 4's
+    ratified ordering (3122 first, then 4523 deletes the write path); see
+    the comment beside the key in ``shared/src/shared/task_metadata.py``.
+    """
+
+    def _unknown_key_fields(self, blob: dict) -> set[str]:
+        _, warnings = parse_metadata(blob, direction='write')
+        return {w.field for w in warnings if w.code == 'unknown_key'}
+
+    def test_no_unknown_key_warning_for_the_pair(self):
+        fields = self._unknown_key_fields({
+            'files_tagged_empty': True,
+            'files_tagged_at': '2026-07-26T14:59:34',
+        })
+        assert 'files_tagged_empty' not in fields
+        # Control: the already-blessed sibling stays clean too.
+        assert 'files_tagged_at' not in fields
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_both_bool_values_are_accepted(self, value):
+        """False is the COMMON case — the key is written unconditionally."""
+        assert 'files_tagged_empty' not in self._unknown_key_fields(
+            {'files_tagged_empty': value},
+        )
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_round_trips_through_the_model(self, value):
+        """Invariant I1: a blessed key survives parse -> dump unchanged."""
+        model, _ = parse_metadata(
+            {'files_tagged_empty': value,
+             'files_tagged_at': '2026-07-26T14:59:34'},
+            direction='write',
+        )
+        dumped = model.model_dump()
+        assert dumped['files_tagged_empty'] is value
+        assert dumped['files_tagged_at'] == '2026-07-26T14:59:34'
+
+    def test_an_adjacent_unblessed_key_still_warns(self):
+        """Negative control: the parser is not vacuously permissive."""
+        fields = self._unknown_key_fields({
+            'files_tagged_empty': True,
+            'files_tagged_nonsense': True,
+        })
+        assert 'files_tagged_nonsense' in fields
+        assert 'files_tagged_empty' not in fields

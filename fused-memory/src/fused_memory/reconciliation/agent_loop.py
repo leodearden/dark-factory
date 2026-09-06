@@ -92,6 +92,7 @@ class AgentLoop:
         tools: dict[str, ToolDefinition],
         terminal_tool: str = 'stage_complete',
         usage_gate=None,
+        cwd: Path | None = None,
     ):
         # NOTE: for recon stages running via the CLI path (production), the effective
         # terminal action is `mcp__recon-report__complete` — the stage agent calls that
@@ -109,6 +110,12 @@ class AgentLoop:
         self.token_count: int = 0
         self._cli_session_id: str | None = None
         self._usage_gate = usage_gate
+        # Task 4722 / PRD D5: the codebase root this agent runs in.  The
+        # verifier now supplies the TASK's own project root per call; every
+        # other construction site passes nothing and keeps the process-global
+        # config value, so the fallback is what leaves those sites unaffected.
+        # Resolved once here so `self.cwd` is always a Path.
+        self.cwd: Path = Path(cwd) if cwd is not None else Path(config.explore_codebase_root)
 
     async def run(self, initial_payload: str) -> tuple[dict, list[JournalEntry]]:
         """Execute agent loop. Returns (terminal_tool_args, journal_entries)."""
@@ -438,13 +445,13 @@ class AgentLoop:
                 # branches that would invoke rebuild_prompt. If AgentLoop is ever
                 # constructed with a real usage_gate, add a rebuild_prompt hook here
                 # at the same time.
-                # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
-                # switched to a neutral cwd. This is a multi-turn agent that
-                # actively adjudicates memory-vs-codebase discrepancies, and the
-                # auto-loaded CLAUDE.md is plausibly its main passive codebase
-                # signal.
+                # Task 1989 (sweep verdict): kept at the CODEBASE root (now the
+                # per-call one, task 4722) rather than a neutral cwd. This is a
+                # multi-turn agent that actively adjudicates memory-vs-codebase
+                # discrepancies, and the auto-loaded CLAUDE.md is plausibly its
+                # main passive codebase signal.
                 #
-                # This cwd is the project root and holds a live .mcp.json, which
+                # This cwd is a project root and may hold a live .mcp.json, which
                 # bypassPermissions would otherwise let the CLI ambient-merge and
                 # expose unreviewed. disallowed_tools=['*'] above does NOT cover
                 # that: with output_schema set, cli_invoke expands the wildcard
@@ -463,7 +470,7 @@ class AgentLoop:
                 # turn >= 2 with a green suite here. Tracked as a follow-up test
                 # in shared/tests/test_build_claude_argv.py (out of this task's
                 # locked-module scope).
-                cwd=Path(self.config.explore_codebase_root),
+                cwd=self.cwd,
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
 

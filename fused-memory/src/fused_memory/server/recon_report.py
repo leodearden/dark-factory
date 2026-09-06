@@ -183,6 +183,24 @@ def _cited_task_key(project_id: str, task_id: str) -> str:
     return f'{project_id}:{task_id}'
 
 
+def _citation_failure_key(marker: Any) -> tuple[Any, Any, Any]:
+    """Identity of a ``citation_failures`` marker for dedupe (task 2979).
+
+    ``(memory_id, store, reason)`` — deliberately EXCLUDING ``error_type``.
+    Two ``verification_error`` markers for the same citation record the same
+    fact ("this id could not be resolved") no matter which exception class
+    surfaced it, and including ``error_type`` would let a flapping backend
+    append an unbounded run of near-identical markers across repeat passes.
+
+    Tolerates a non-dict marker (returns a key derived from its repr) so a
+    malformed entry that somehow reached the durable record can still be
+    compared instead of raising inside the write-back.
+    """
+    if not isinstance(marker, dict):
+        return (repr(marker), None, None)
+    return (marker.get('memory_id'), marker.get('store'), marker.get('reason'))
+
+
 def _traces_exclusively_to_stage1(
     finding: dict,
     stage1_identities: set[str],
@@ -311,6 +329,14 @@ class _Finding:
     # cited entity carries an active decision; defaults None so old persisted
     # rows hydrate round-trip-safe via _Finding(**fd).
     standing_decision_id: str | None = None
+    # Task 2979: markers for cited memories that failed post-assembly
+    # re-verification — {memory_id, store, reason} (plus error_type on a
+    # verification_error). Written by apply_citation_verification, so a phantom
+    # claim is SURFACED rather than silently vanishing when it is stripped from
+    # cited_memories. Defaulted for the same round-trip-safety reason as
+    # standing_decision_id above: rows persisted before this field existed must
+    # still hydrate via _Finding(**fd) with no migration.
+    citation_failures: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1380,6 +1406,120 @@ class ReconReportState:
 
         return {'status': 'deleted', 'finding_id': finding_id}
 
+    def apply_citation_verification(
+        self, run_id: str, results: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Write a post-assembly citation-verification outcome back to the
+        AUTHORITATIVE findings, then persist once (task 2979).
+
+        Each entry of *results* is
+        ``{'finding_id': str, 'cited_memories': list[dict],
+        'citation_failures': list[dict]}`` — the surviving citations and the
+        failure markers that ``citation_verifier.verify_cited_memories``
+        produced for that finding. ``cited_memories`` REPLACES the finding's
+        list (the verifier returns the kept set, not a delta);
+        ``citation_failures`` is EXTENDED — so markers from an earlier pass are
+        never lost — but the extend is DEDUPED on ``(memory_id, store,
+        reason)``, which is what makes a repeat pass idempotent.
+
+        The dedupe is load-bearing, not belt-and-braces. Callers send the FULL
+        marker list off the assembled projection, not the delta this pass
+        appended, and ``get_assembled_report`` projects the already-persisted
+        ``citation_failures`` back out — so a plain extend would duplicate
+        every prior marker on any second pass over the same (run_id, stage).
+        A repeat is architecturally reachable: ``start_report`` is deliberately
+        idempotent and RETAINS prior findings, and the resume path can
+        re-invoke ``stage.run()`` under the same ``run_id``. ``error_type`` is
+        NOT part of the key: two verification errors for the same citation are
+        the same failure regardless of which exception class surfaced it, and
+        keying on it would let a flapping backend grow the list without bound.
+
+        Why this exists: ``get_assembled_report`` builds a fresh dict per
+        finding with ``'cited_memories': list(f.cited_memories)`` — a NEW list
+        object. Verification therefore corrects only that throwaway projection,
+        while the authoritative ``_Finding`` and its durable row (written inside
+        the CLI subprocess at add_finding/cite_memory/complete time, strictly
+        BEFORE verification runs) keep the phantom. Without this write-back the
+        report and the store permanently disagree, and whether a consumer sees
+        the phantom depends on which one it happens to read.
+
+        Findings are resolved via :meth:`_resolve_finding`, so this is
+        cross-stage capable exactly as the ``cite_*`` tools are.
+
+        **Deliberately NOT guarded by ``_ERR_ALREADY_COMPLETED``**, unlike
+        :meth:`delete_finding`. That guard exists to stop an in-flight agent
+        RETRACTING a finding after ``complete()`` cached ``flagged_count`` /
+        ``stats``. This is a harness-side integrity correction that by
+        construction runs after the subprocess has already called
+        ``complete()``, so the guard would reject every legitimate call. It is
+        also strictly narrower than a retraction: it only edits citation lists,
+        never adds or removes a finding, so the cached ``flagged_count`` stays
+        accurate.
+
+        ``_persist_run`` — which re-serialises and upserts EVERY entry of the
+        run — fires only when a finding's citation lists actually changed. The
+        common case by far is a clean run where verification resolved every
+        citation and dropped nothing; re-writing the whole run's rows to record
+        "nothing moved" is pure cost.
+
+        Never raises, and never returns an error for an unresolvable
+        ``run_id``/``finding_id`` — this is a post-hoc hygiene pass, and turning
+        a citation-hygiene miss into a failed reconciliation stage would be a
+        far worse outcome than a stale marker. Skips are logged (WARNING,
+        structured) rather than swallowed silently. Returns
+        ``{'status': 'applied', 'findings_updated': int, 'findings_changed':
+        int, 'findings_skipped': int}`` — ``findings_updated`` counts the
+        results that RESOLVED to a finding, ``findings_changed`` the subset
+        that actually mutated it (and so drove the persist).
+        """
+        updated = 0
+        changed = 0
+        skipped = 0
+        for result in results:
+            finding_id = (result or {}).get('finding_id')
+            if not finding_id:
+                skipped += 1
+                continue
+            resolved = self._resolve_finding(run_id, finding_id)
+            if resolved is None:
+                logger.warning(
+                    'recon_report: apply_citation_verification could not resolve '
+                    'run_id=%r finding_id=%r; skipping (citation correction not '
+                    'applied to the durable record)',
+                    run_id,
+                    finding_id,
+                )
+                skipped += 1
+                continue
+            _owning_entry, finding = resolved
+            new_cited = list(result.get('cited_memories') or [])
+            finding_changed = new_cited != finding.cited_memories
+            finding.cited_memories = new_cited
+            seen = {_citation_failure_key(m) for m in finding.citation_failures}
+            for marker in result.get('citation_failures') or []:
+                key = _citation_failure_key(marker)
+                if key in seen:
+                    continue
+                seen.add(key)
+                finding.citation_failures.append(marker)
+                finding_changed = True
+            updated += 1
+            changed += 1 if finding_changed else 0
+
+        # One persist for the whole batch — _persist_run upserts every entry of
+        # the run, so a per-finding call would re-write the same rows N times —
+        # and only when something actually moved, so a clean verification pass
+        # (no drops, no errors, no new markers) costs zero writes.
+        if changed:
+            self._persist_run(run_id)
+
+        return {
+            'status': 'applied',
+            'findings_updated': updated,
+            'findings_changed': changed,
+            'findings_skipped': skipped,
+        }
+
     def set_stat(
         self,
         run_id: str,
@@ -1557,6 +1697,7 @@ class ReconReportState:
                 'cited_memories': list(f.cited_memories),
                 'cited_runs': list(f.cited_runs),  # task-2595
                 'standing_decision_id': f.standing_decision_id,  # task 2897 δ
+                'citation_failures': list(f.citation_failures),  # task 2979
             }
             # Cross-project routing taxonomy guard (task-2453): downgrade an
             # anchor-less cross_project_routing claim before the Fix-1 check
@@ -1632,6 +1773,7 @@ class ReconReportState:
                     'cited_memories': list(f.cited_memories),
                     'cited_runs': list(f.cited_runs),  # task-2595
                     'standing_decision_id': f.standing_decision_id,  # task 2897 δ
+                    'citation_failures': list(f.citation_failures),  # task 2979
                 })
         return results
 
@@ -2029,7 +2171,25 @@ class ReconReportState:
         task's title has since changed, a re-citation is still skipped and
         the stored citation keeps the original title rather than refreshing
         it. Titles are cosmetic display text, not part of the citation's
-        identity, so this staleness is accepted rather than reconciled.
+        identity.
+
+        THE CONSUMER NOW AGREES (task 4864). That last sentence used to end
+        "so this staleness is accepted rather than reconciled", which was only
+        half true: the consumer disagreed. ``flag_dedup._cited_fix_task_live``
+        required the cited title to EQUAL the live record's, so an ordinary
+        retitle silently disabled the cross-project fix-task suppression gate
+        for that citation, permanently. That contradiction is resolved in
+        THIS side's favour — titles are cosmetic — and the consumer was
+        changed to match: it admits on live presence plus a non-abandoned
+        status, and a stale or absent title downgrades the decision to a
+        WARNING (``cross_project_fix_task_title_uncorroborated``) instead of
+        disabling suppression. A title this method cannot resolve at all is
+        likewise cited (the existence check passed) and logged at WARNING
+        here, rather than written silently as ``title=''``. Note the STRICT
+        sibling ``flag_dedup._cited_task_corroborated``, used by the phantom
+        task-creation guard, still requires title equality — a wrong drop
+        there has no bounded expiry — so a title-less citation genuinely does
+        cost corroborating power on that path.
 
         Two in-run folds anchor on this call — BOTH are CHECKED before
         EITHER registers, so a call that folds under either one always
@@ -2134,6 +2294,26 @@ class ReconReportState:
         # Guard against data=None (some get_task paths return data: null explicitly)
         data = result.get('data') if isinstance(result.get('data'), dict) else {}
         title = result.get('title') or data.get('title', '')
+        if not title:
+            # The one permanently-degraded citation this VALIDATING producer
+            # mints itself (task 4864).  The existence check above PASSED, so
+            # the citation stands — a title is cosmetic display text, not part
+            # of the citation's identity, and dropping the citation here would
+            # discard the very evidence the consumer gate needs.  But an empty
+            # title is a real loss of corroborating signal, and it used to
+            # happen in total silence: downstream,
+            # ``flag_dedup._titles_corroborate`` can never match ``''``, so
+            # every consumer that reads a title degrades to its weak path for
+            # the life of this citation (titles are never refreshed — see the
+            # first-cited-title-wins contract in the docstring above).  Say so
+            # once, here, where the project/task is still in hand.
+            logger.warning(
+                'recon_report.cite_task_title_unresolved project_id=%s task_id=%s'
+                ' — the task exists but neither the top-level record nor its'
+                ' data sub-dict carried a title; citing with title=%r, which'
+                ' downstream consumers cannot corroborate',
+                project_id, task_id, title,
+            )
         citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
 
         # In-run cited-task folds (task-2425 project-scoped; task-2432
@@ -2305,7 +2485,12 @@ class ReconReportState:
         # duplicate rows. Keyed on (project_id, task_id) only, NOT title —
         # first-cited title wins; a re-citation after the upstream title
         # changed is still skipped rather than refreshing the stored title
-        # (see cite_task's docstring).
+        # (see cite_task's docstring). Task 4864 reconciled the CONSUMER to
+        # that contract rather than the other way round: flag_dedup's
+        # cross-project fix-task gate no longer treats title equality as
+        # identity, so a title left stale here downgrades that gate to a
+        # WARNING instead of silently disabling it. The strict phantom guard
+        # (flag_dedup._cited_task_corroborated) still requires equality.
         already_cited = any(
             c['project_id'] == project_id and c['task_id'] == task_id
             for c in finding.cited_tasks
@@ -2705,13 +2890,67 @@ class ReconReportState:
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tool classification (task 3878)
+# ---------------------------------------------------------------------------
+# REGISTERING A NEW @mcp.tool() BELOW MEANS CLASSIFYING IT INTO EXACTLY ONE OF
+# THREE BUCKETS. Two of them are declared here; the third is the derived
+# remainder, so most tools need no edit at all:
+#
+#   shared guidance  — every OTHER registered tool, i.e. the derived remainder
+#                      (`set(get_recon_report_tool_signatures()) -
+#                      HARNESS_CALLED_REPORT_TOOLS - STAGE_GATED_REPORT_TOOLS`).
+#                      These are rendered into the STAGE-AGNOSTIC guidance block
+#                      that reconciliation/prompts/__init__.py's
+#                      render_recon_report_tool_guidance() interpolates into ALL
+#                      THREE stage prompts. A new tool lands here by default and
+#                      is rendered automatically — that default is deliberate:
+#                      it is what makes silently omitting a tool from the
+#                      guidance structurally impossible.
+#   harness-called   — the harness calls it for the agent before the stage
+#                      begins, so a call example would be actively wrong.
+#                      start_report is the only one.
+#   stage-gated      — held by some stages but DENIED in others, so it must stay
+#                      out of the stage-agnostic block.
+#
+# Why stage-gated needs its own bucket rather than being swept into the shared
+# block: `--disallowed-tools` OMITS a denied tool rather than surfacing it and
+# rejecting the call (cli_stage_runner.py). So naming a denied tool in the
+# shared block does not produce a clean refusal — it tells Stage 1 and Stage 3
+# about an action they cannot take, and in write_entity_standing_decision's case
+# licenses a durable SQLite-ledger write from stages that are read-only with
+# respect to the ledger (repair_memory_citation is the same shape one level
+# over: denied in Stage 3 via DISALLOW_RECON_REPORT_JOURNAL_WRITES because it
+# writes the durable ReconciliationJournal, and Stage 3 is read-only by
+# contract). That is precisely the norm
+# render_escalation_boundary_note() codifies in reconciliation/prompts/__init__.py:
+# never tell a stage about an action it is not sanctioned to take, and never
+# license a durable write from a read-only stage.
+#
+# Counter-example, so the boundary is not over-applied: delete_finding is NOT
+# stage-gated. It writes only in-process ReconReportState, sits in no disallow
+# list, and cli_stage_runner.py's carve-out NOTE plus stage3.py's own
+# post-guidance NOTE sanction it in every stage — so it is a shared-guidance
+# tool and belongs in the block.
+#
+# tests/test_recon_report_guidance_drift.py fails loudly until a newly
+# registered tool is classified: TestReportToolClassificationPartitionsTheLiveToolSet
+# additionally cross-checks STAGE_GATED_REPORT_TOOLS against
+# DISALLOW_RECON_REPORT_LEDGER_WRITES + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+# (cli_stage_runner.py) — the lists that actually reach --disallowed-tools — so
+# these must move together.
+HARNESS_CALLED_REPORT_TOOLS: frozenset[str] = frozenset({'start_report'})
+STAGE_GATED_REPORT_TOOLS: frozenset[str] = frozenset(
+    {'write_entity_standing_decision', 'repair_memory_citation'}
+)
+
 RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
 Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
        cite_entity, cite_edge, cite_task, cite_memory, cite_run,
-       repair_memory_citation.
+       write_entity_standing_decision, repair_memory_citation.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.  Idempotent:
@@ -2753,8 +2992,42 @@ Citation tools (call after add_finding, before or after complete):
                   from a fresh tool result's run_id/metadata.run_id field —
                   never re-type or paraphrase it from memory.
 
+Ledger write (Stage 2 ONLY):
+11. write_entity_standing_decision(project_id, entity_uuid, grounds, [evidence])
+                  — record that a class of complaint about entity_uuid,
+                  identified by grounds (a closed-enum value), has been
+                  investigated and dismissed, so later stages can filter or
+                  annotate future recon flags instead of re-raising them.
+                  Stage-2 ONLY: blocked in Stage 1 and Stage 3 via
+                  DISALLOW_RECON_REPORT_LEDGER_WRITES
+                  (reconciliation/cli_stage_runner.py), because this is the
+                  first recon-report tool that writes past in-process
+                  ReconReportState — it upserts a row into the durable SQLite
+                  reconciliation ledger.  It takes NO run_id (the decision is
+                  about an entity, not scoped to a report entry) and NO
+                  authorized_by: the write is ALWAYS evidence-gated, and
+                  succeeds only if EITHER arm holds — arm 1: >=1 cited,
+                  locally-resolvable, human-authored mem0 evidence record;
+                  arm 2: >=3 investigation_outcome mem0 records for this
+                  entity with actionable=false and distinct run_ids.
+                  evidence is OPTIONAL (bracketed above, matching the
+                  generated guidance block's convention): a list of cited-ref
+                  dicts ({type, id, ...}), defaulting to none.  Omit it when
+                  relying on arm 2, which is satisfied by the mem0 record
+                  history alone and cites nothing — do NOT fabricate an
+                  evidence list to reach that path.  Supply it for arm 1: mem0
+                  refs are resolved for provenance, foreign refs
+                  (escalation/task ids) are recorded but never count toward a
+                  gate arm.  Returns {status: 'written', entity_uuid, grounds,
+                  edge_count_at_decision, expires_at, decided_at} on success,
+                  or a structured error dict: insufficient_evidence
+                  (unmet_arms + hint) when neither arm is satisfied,
+                  invalid_grounds when grounds is outside the enum, or
+                  service_not_configured when the memory service is
+                  unavailable.
+
 Cross-run repair (exceptional, evidence-gated — not part of the normal loop):
-11. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
+12. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
                   replacement_memory_id=None) — re-point (or, with no
                   replacement, drop) a citation that no longer resolves, on a
                   finding owned by a PRIOR, ALREADY-COMPLETED run. The cite_*

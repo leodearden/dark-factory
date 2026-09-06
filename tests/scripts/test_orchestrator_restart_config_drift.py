@@ -1,15 +1,17 @@
 """Config-integrity drift test for the U2 orchestrator-restart-on-merge flip.
 
-Per plans/orchestrator-fleet-staleness-prd.md task γ: orchestrator/config.yaml
-enables orchestrator_restart_on_merge_enabled for dark-factory's own daemon,
-pointing at scripts/restart-all-orchestrators.sh with a set of watch prefixes.
+Per plans/orchestrator-fleet-staleness-prd.md task γ: dark-factory-orchestrator.yaml
+(the canonical top-level config filename — see the module docstring convention
+recorded in tests/scripts/conftest.py) declares orchestrator_restart_on_merge_enabled
+for dark-factory's own daemon, pointing at scripts/restart-all-orchestrators.sh
+with a set of watch prefixes.
 
 The dormant U2 coordinator (Harness._build_orchestrator_restart_coordinator)
 fails OPEN at fire time: a missing/non-executable script path raises
 FileNotFoundError which the coordinator swallows down to a WARNING log and
 clears the pending restart — so a typo'd path would silently no-op the whole
 fleet restart with no hard failure anywhere in the running system. Most of
-these tests assert directly on the *committed* orchestrator/config.yaml,
+these tests assert directly on the *committed* dark-factory-orchestrator.yaml,
 independent of the runtime config-loading / hot-reload path. One additional
 test loads the file through the real OrchestratorConfig pydantic model to
 guard the YAML-key-to-field binding itself: OrchestratorConfig uses
@@ -17,9 +19,30 @@ guard the YAML-key-to-field binding itself: OrchestratorConfig uses
 would otherwise silently revert to the field's (disabled-by-default) default
 with no error anywhere — passing the raw-YAML assertions below while the
 runtime coordinator stays dark.
+
+This file guards the committed ``orchestrator_restart_*`` block against
+silent DRIFT — the YAML-key-to-pydantic-field binding
+(``tests/scripts/test_orchestrator_restart_config_drift.py::_assert_key_binds``),
+the restart script's existence, and the watch prefixes' existence — and
+deliberately does NOT pin the VALUE of ``orchestrator_restart_on_merge_enabled``.
+That flag is an operator lever, not a code contract: it was flipped ``true``
+-> ``false`` on 2026-09-03 by the fleet deploy pause (see the ``DEPLOY PAUSE``
+comment block above the key in dark-factory-orchestrator.yaml; task 5020 is
+the gate that restores it).
+
+Task 5088 removed a value pin that had been added here to survive that same
+pause: it asserted on the PROSE of the YAML comment block above the key,
+which can be checked for shape but never for truth — a reworded pause
+comment with the identical declared intent would have turned it red, and any
+comment containing the magic marker phrase (including one copy-pasted
+forward from a long-lifted pause) would have turned it green. The binding
+guard, ``::_assert_key_binds``, is value-agnostic and is paired with
+``test_binding_guard_bites_on_a_typod_key_and_on_a_renamed_field`` proving it
+still bites on a typo'd key or a renamed field.
 """
 
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -33,12 +56,38 @@ def _load_df_config() -> dict:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))
 
 
-def test_orchestrator_restart_on_merge_enabled_is_true() -> None:
-    """The U2 coordinator must be flipped on for the dark-factory daemon."""
-    cfg = _load_df_config()
-    assert cfg.get("orchestrator_restart_on_merge_enabled") is True, (
-        "orchestrator/config.yaml must set orchestrator_restart_on_merge_enabled: "
-        "true (PRD task γ) — the U2 coordinator is otherwise dormant"
+def _assert_key_binds(cfg: dict, config: object, key: str) -> None:
+    """Assert a committed YAML key still binds to the same-named OrchestratorConfig field.
+
+    Three terms, each catching a distinct drift mode:
+
+    1. The key must exist in the committed YAML. ``OrchestratorConfig`` is
+       declared with ``extra='ignore'``, so a YAML key typo/removal reverts
+       silently to the field's default with no error anywhere.
+    2. The field must exist on the parsed config. A field rename in
+       ``orchestrator/src/orchestrator/config.py`` would otherwise raise a
+       bare ``AttributeError`` from a plain ``getattr``; ``hasattr`` plus an
+       explanatory message names the failure instead.
+    3. The parsed value must equal the raw committed value — the value
+       actually round-tripped.
+
+    Deliberately no ``is True`` / ``is False`` anywhere in this helper: the
+    committed value is an operator lever, not a fixed policy this helper
+    enforces.
+    """
+    assert key in cfg, (
+        f"{key!r} is not a key in the committed dark-factory-orchestrator.yaml "
+        "— a YAML key typo/removal silently reverts to the field's default "
+        "under OrchestratorConfig's extra='ignore', with no error anywhere"
+    )
+    assert hasattr(config, key), (
+        f"OrchestratorConfig has no field named {key!r} — check for a field "
+        "rename in orchestrator/src/orchestrator/config.py"
+    )
+    assert getattr(config, key) == cfg[key], (
+        f"OrchestratorConfig.{key} did not round-trip the committed YAML "
+        f"value ({cfg[key]!r}) — check for a field rename/typo in "
+        "orchestrator/src/orchestrator/config.py"
     )
 
 
@@ -75,7 +124,7 @@ def test_orchestrator_restart_watch_prefixes_all_exist() -> None:
 
     This enforces a project convention that is deliberately STRICTER than
     that runtime semantics (see the WATCH-PREFIX CONVENTION note above
-    ``orchestrator_restart_watch_prefixes`` in orchestrator/config.yaml):
+    ``orchestrator_restart_watch_prefixes`` in dark-factory-orchestrator.yaml):
     every configured entry must be a full, existing path. The runtime
     matcher would also accept a bare string prefix of a real path that is
     not itself on disk (e.g. a partial-filename prefix meant to match
@@ -94,7 +143,7 @@ def test_orchestrator_restart_watch_prefixes_all_exist() -> None:
 
 
 def test_orchestrator_restart_config_round_trips_through_config_model(
-    monkeypatch: pytest.MonkeyPatch,
+    root_config: OrchestratorConfig,
 ) -> None:
     """The committed keys must still bind to real OrchestratorConfig fields.
 
@@ -102,38 +151,56 @@ def test_orchestrator_restart_config_round_trips_through_config_model(
     whether those keys still bind to a live pydantic field: OrchestratorConfig
     is declared with ``extra='ignore'``, so a field rename in config.py or a
     key typo here would silently drop the value and fall back to the field's
-    (disabled-by-default) default with no error anywhere — the exact
-    silent-drift failure mode this file exists to prevent, and one the
-    raw-YAML tests above cannot see. Loading through the real model closes
-    that gap: a rename/typo shows up here as the field reverting to its
-    default, failing this test even though the raw-YAML tests still pass.
+    default with no error anywhere — the exact silent-drift failure mode this
+    file exists to prevent, and one the raw-YAML tests above cannot see.
+
+    Asserts ``parsed == raw`` via ``_assert_key_binds``, not a hardcoded
+    ``True``, so a DELIBERATE operator flip (the 2026-09-03 deploy pause;
+    task 5020 is the gate that restores it) does not fail this test, while a
+    rename/typo still does. Residual limitation, stated honestly: while the
+    committed value equals the field's own default (as it does during the
+    pause), the equality term alone is vacuous — a silently-dropped key would
+    ALSO read back as the default. The two presence terms inside
+    ``_assert_key_binds`` are what carry the guard in that case, which is why
+    ``test_binding_guard_bites_on_a_typod_key_and_on_a_renamed_field`` exists:
+    it proves those terms still fire on a typo'd key and a renamed field.
     """
     cfg = _load_df_config()
-    monkeypatch.setenv("ORCH_CONFIG_PATH", str(DF_CONFIG_PATH))
-    config = OrchestratorConfig()
+    _assert_key_binds(cfg, root_config, "orchestrator_restart_on_merge_enabled")
+    _assert_key_binds(cfg, root_config, "orchestrator_restart_script")
+    _assert_key_binds(cfg, root_config, "orchestrator_restart_watch_prefixes")
 
-    assert config.orchestrator_restart_on_merge_enabled is True, (
-        "OrchestratorConfig.orchestrator_restart_on_merge_enabled did not bind "
-        "to True from the committed YAML — check for a field rename/typo "
-        "(config.py uses extra='ignore', so a mismatch silently reverts to "
-        "the disabled-by-default default instead of raising)"
-    )
-    assert config.orchestrator_restart_script == cfg["orchestrator_restart_script"], (
-        "OrchestratorConfig.orchestrator_restart_script did not round-trip "
-        "the committed value — check for a field rename/typo in config.py"
-    )
-    assert (
-        config.orchestrator_restart_watch_prefixes
-        == cfg["orchestrator_restart_watch_prefixes"]
-    ), (
-        "OrchestratorConfig.orchestrator_restart_watch_prefixes did not "
-        "round-trip the committed value — check for a field rename/typo in "
-        "config.py"
-    )
     # Self-redeploy rate cap (task 2371). The committed YAML does not set this
     # key, so it must round-trip to the field's default (8h). A rename/typo in
     # config.py would surface here as the attribute vanishing (AttributeError).
-    assert config.orchestrator_restart_min_interval_secs == pytest.approx(28800.0), (
+    assert root_config.orchestrator_restart_min_interval_secs == pytest.approx(28800.0), (
         "OrchestratorConfig.orchestrator_restart_min_interval_secs did not "
         "resolve to its 8h default — check for a field rename/typo in config.py"
     )
+
+
+def test_binding_guard_bites_on_a_typod_key_and_on_a_renamed_field(
+    root_config: OrchestratorConfig,
+) -> None:
+    """``_assert_key_binds`` must still fail on the two drift modes it exists for.
+
+    Under the 2026-09-03 deploy pause (task 5088) the committed raw value
+    (``false``) equals ``OrchestratorConfig.orchestrator_restart_on_merge_
+    enabled``'s own field default (``Field(default=False)``), so the
+    ``parsed == raw`` term ALONE cannot distinguish "bound correctly" from
+    "silently dropped by ``extra='ignore'``" while the pause holds. The two
+    presence terms — the key exists in the committed YAML, and the field
+    exists on the parsed config — are what actually carry the guard during
+    the pause, and this test is what proves they are still there.
+    """
+    typod_cfg = _load_df_config()
+    typod_cfg["orchestrator_restart_on_merge_enabled_typo"] = typod_cfg.pop(
+        "orchestrator_restart_on_merge_enabled"
+    )
+    with pytest.raises(AssertionError, match="is not a key in the committed"):
+        _assert_key_binds(typod_cfg, root_config, "orchestrator_restart_on_merge_enabled")
+
+    cfg = _load_df_config()
+    renamed_config = SimpleNamespace()
+    with pytest.raises(AssertionError, match="has no field named"):
+        _assert_key_binds(cfg, renamed_config, "orchestrator_restart_on_merge_enabled")

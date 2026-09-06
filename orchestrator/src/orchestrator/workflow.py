@@ -1460,6 +1460,57 @@ class TaskWorkflow:
         self._claimant_heartbeat_task: asyncio.Task | None = None
 
     @property
+    def _filing_claimant_run_id(self) -> str:
+        """This incarnation's identity, stamped on every ``Escalation`` it files.
+
+        Task 3550.  Spec ``docs/task-escalation-state-spec.md`` S6, realised
+        by ``escalation.pins::classify_pins`` Link 4: an L0 is a live handoff
+        ONLY while the incarnation that FILED it lives, and liveness is judged
+        by comparing this value WHOLE against the live claimant.  That live
+        claimant is read from the ``claimant_run_id`` DB column, so this
+        property is also the SINGLE expression composing that column's value
+        — :meth:`_setup_worktree_and_artifacts`'s dispatch stamp routes
+        through it.  Two copies could drift, and a drifted filing identity
+        classifies a genuinely LIVE filer's own L0 as ``dead_l0``, the unsafe
+        direction.  Byte-identical by construction is the only guarantee
+        strong enough for an exact-string rule.
+
+        KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP, a
+        task 3563 follow-up): ``or ''`` means a HARNESS-LESS workflow
+        (``_process_run_id is None`` — tests/evals, see the field comment at
+        its declaration) composes the PARTIAL identity
+        ``'/{session_id}/pid={pid}'``.  That string carries the ``/pid=``
+        marker, so it passes ``escalation.pins._norm_id``'s shape guard and is
+        then compared whole as if it were KNOWN.  The ``plan.lock`` writer
+        deliberately does the OPPOSITE — it omits the key entirely when the
+        run id is unknown, so ``TaskGroundTruth`` resolves a fail-safe
+        ``None`` (see the :meth:`Artifacts.lock_plan` call site and the
+        ``Claimant`` docstring), and ``Harness._filing_claimant_run_id``
+        makes that same choice because it has no DB counterpart to match.
+        Task 3563 landed while deliberately leaving THIS side alone, so the
+        asymmetry is ratified and owned elsewhere.  Normalising it is the
+        follow-up's job; do not "fix" it by changing the plan.lock side to
+        match, and do not change it here — this side must keep matching the
+        DB stamp it composes.
+
+        Both components are read via ``getattr`` because this sits on the
+        ESCALATION-FILING path, which ``object.__new__(TaskWorkflow)`` test
+        fixtures reach while setting only the handful of attributes their
+        methods touch (see ``tests/test_workflow_sandbox_refusal.py``).  This
+        does NOT weaken the byte-identity guarantee above — the dispatch stamp
+        routes through this same property, so the two cannot diverge whatever
+        the attributes hold.  Nor does it widen the hazard: a MISSING
+        attribute and a declared-but-``None`` one are the same statement (the
+        component is unknown), which the ratified ``or ''`` already maps to an
+        empty component.
+        """
+        return compose_claimant_run_id(
+            getattr(self, '_process_run_id', None) or '',
+            getattr(self, 'session_id', None) or '',
+            os.getpid(),
+        )
+
+    @property
     def state(self) -> WorkflowState:
         """Current workflow phase, delegated to :attr:`machine`.
 
@@ -2299,23 +2350,15 @@ class TaskWorkflow:
         # claimant atomically with the dispatch status write, so there is no
         # window where the task is in-progress with no live claimant.
         #
-        # KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP,
-        # a task 3563 follow-up): `or ''` means a HARNESS-LESS workflow
-        # (`_process_run_id is None` — tests/evals, see the field comment at
-        # its declaration) stamps the PARTIAL identity '/{session_id}/pid={pid}'.
-        # That string carries the '/pid=' marker, so it passes
-        # escalation.pins._norm_id's shape guard and is then compared whole
-        # against filing identities as if it were KNOWN. The plan.lock writer
-        # below deliberately does the OPPOSITE — it omits the key entirely when
-        # the run id is unknown, so TaskGroundTruth resolves a fail-safe None
-        # (see the lock_plan call site and the Claimant docstring). Normalising
-        # THIS side is the follow-up's job; do not "fix" it by changing the
-        # plan.lock side to match.
+        # Composed via `_filing_claimant_run_id` (task 3550), which is the ONE
+        # expression producing this workflow's identity — the same value every
+        # Escalation this incarnation files carries. `escalation.pins` Link 4
+        # compares the two WHOLE, so they must not be able to drift; the
+        # property's docstring also carries the `or ''` KNOWN HAZARD note that
+        # used to live here.
         await self.scheduler.set_task_status(
             self.task_id, 'in-progress',
-            claimant_run_id=compose_claimant_run_id(
-                self._process_run_id or '', self.session_id, os.getpid(),
-            ),
+            claimant_run_id=self._filing_claimant_run_id,
             heartbeat_at=datetime.now(UTC).isoformat(),
         )
         self._claimant_heartbeat_task = asyncio.create_task(
@@ -7242,6 +7285,7 @@ class TaskWorkflow:
                 ),
                 suggested_action='manual_intervention',
                 level=2,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(esc)
         except Exception:
@@ -8966,6 +9010,7 @@ class TaskWorkflow:
             suggested_action='verify_wip_reconciliation',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
 
@@ -11252,6 +11297,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 suggested_action='main_health_auto_heal_in_flight',
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             if fp:
                 esc.dedupe_fingerprint = fp
@@ -12093,6 +12139,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     workflow_state=self.state.value,
                     level=1,
                     train_state=train_state,  # type: ignore[arg-type]
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 self.escalation_queue.submit(esc)
                 logger.warning(
@@ -12293,6 +12340,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
             train_state=train_state,  # type: ignore[arg-type]
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._submit_halt_owning_escalation(esc)
         logger.info(
@@ -12350,6 +12398,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 train_state=train_state,  # type: ignore[arg-type]
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(esc)
         except Exception:
@@ -12394,6 +12443,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 level=1,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP conflict resolved — retrying merge')
@@ -12438,6 +12488,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 level=1,
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             await self._submit_halt_escalation_and_wait(esc)
             logger.info(f'Task {self.task_id}: WIP recovery escalation resolved')
@@ -13105,7 +13156,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         )
             # RE-CORROBORATE against the config dir we are about to USE.
             #
-            # The harness eligibility guard (_session_resume_eligible) checks a
+            # The harness eligibility guard (_session_resume_reasons) checks a
             # BOOT-TIME snapshot path — the config dir that existed when
             # recovery ran.  self._config_dir is constructed fresh (see
             # _setup_worktree) from whatever lane was acquired AFTERWARDS, and
@@ -14733,6 +14784,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_and_retry',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -14822,6 +14874,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='install_sandbox_backend_or_set_backend_none',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -15139,6 +15192,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_and_retry',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -15174,6 +15228,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='investigate_log_corruption',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
 
@@ -15334,6 +15389,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 worktree=str(self.worktree) if self.worktree else None,
                 workflow_state=self.state.value,
                 level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
             )
             self.escalation_queue.submit(l1)
             if self.event_store:
@@ -15668,6 +15724,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     suggested_action=suggested_action,
                     worktree=str(self.worktree) if self.worktree else None,
                     workflow_state=self.state.value,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
                 )
                 if dedupe_fingerprint:
                     # Cross-task N->1 dedup: stamp the fingerprint and route
@@ -15840,9 +15897,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     #     already-merged task.  Escalation.filing_claimant_run_id
                     #     is the field that would make a real
                     #     filed-by-this-incarnation predicate possible, but it
-                    #     is stamped only in tests today, never on a
-                    #     production filing path; stamping it is the
-                    #     principled follow-up.
+                    #     is now stamped on every production filing path
+                    #     (task 3550: TaskWorkflow, Harness, and the
+                    #     escalate_blocker/escalate_info chokepoint).  This
+                    #     sweep's dismissal set is nonetheless STILL
+                    #     deliberately unchanged — narrowing it to a real
+                    #     filed-by-this-incarnation predicate is a behaviour
+                    #     change owned by task 3541, not by the task that
+                    #     merely populated the field.
                     # (iii) Do NOT "fix" the sibling sweep sites by symmetry:
                     #     each of them has an L1 open by construction, so
                     #     dismissing a stray L0 there is deliberate
@@ -16140,6 +16202,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             level=1,
             train_state=train_state,
             root_cause=root_cause,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -16582,6 +16645,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='triage_suggestions',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:
@@ -16621,6 +16685,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             suggested_action='fix_review_issues',
             worktree=str(self.worktree) if self.worktree else None,
             workflow_state=self.state.value,
+            filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self.escalation_queue.submit(esc)
         if self.event_store:

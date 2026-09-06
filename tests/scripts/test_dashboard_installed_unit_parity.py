@@ -80,10 +80,19 @@ records this exact variable as a deliberate value-divergence. A byte-parity
 assertion here would not just be fragile to a future comment-only template
 edit; it would actively demand DESTROYING that host-specific data, since the
 only way to satisfy byte-parity would be to strip the eight extra roots back
-out of the installed unit. That destructive path — a `sed` re-render or a
-setup-host.sh re-run — is exactly what this module's _REMEDIATION warns
-against; scripts/check_dashboard_unit_parity.py itself calls setup-host.sh's
-unconditional re-render over an already-installed unit "A HOLE IN THE GATE".
+out of the installed unit.
+
+UPDATED 2026-08-27 (task 4793). This paragraph used to continue: "That
+destructive path — a `sed` re-render or a setup-host.sh re-run — is exactly
+what this module's _REMEDIATION warns against." The re-render is no longer
+destructive. setup-host.sh section 8 now installs this unit through
+scripts/render_dashboard_unit.py, which reads the ALREADY-INSTALLED unit's
+host-local Environment= values and puts them back
+(render_dashboard_unit.HOST_LOCAL_ENVIRONMENT), so a re-run preserves the nine
+roots instead of collapsing them to one. _REMEDIATION below is rewritten
+accordingly. What is unchanged is the argument in the paragraph above: BYTE
+parity is still the wrong invariant for this module, because the divergence is
+deliberate and permanent, not because re-installing is unsafe.
 Also deliberately NOT asserted: ActiveState — liveness is the watchdog's
 job, and pinning it here would make this suite fail during any legitimate
 restart window.
@@ -200,8 +209,9 @@ from systemd_unit_invariants import (
 UNIT_BASENAME = "dark-factory-dashboard.service"
 INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME
 
-# The committed template the installed copy is rendered FROM via `sed`
-# placeholder substitution (scripts/setup-host.sh:790-794) — NOT a plain
+# The committed template the installed copy is rendered FROM by
+# scripts/render_dashboard_unit.py (`__REPO_ROOT__` / `__UV_PATH__` placeholder
+# substitution, invoked by setup-host.sh section 8) — NOT a plain
 # `cp`, which is why this is a differently-named `.template` file rather
 # than `parents[2]/"scripts"/UNIT_BASENAME` as in the orchestrator-*.service
 # sibling modules. See the module docstring's DEVIATION paragraph for why no
@@ -224,23 +234,36 @@ COMMITTED_UNIT_PATH = (
 # sentinel" is.
 _NO_CAP_SENTINEL = "infinity"
 
-# Remediation for either layer below. Unlike the fused-memory module,
-# scripts/check_dashboard_unit_parity.py has NO --fix flag by design, so the
-# fix is a manual, surgical single-line insertion — never a `sed` re-render
-# or a setup-host.sh re-run, both of which would silently strip the host's
-# extra DASHBOARD_KNOWN_PROJECT_ROOTS entries (see module docstring). The
-# daemon-reload is not optional — without it the manager keeps serving the
-# stale unit and only the FILE-layer test goes green. Both layers really do
-# interpolate it: the FILE layer delegates its assertion to the shared
-# helper (whose generic message points at an unrelated template), so it
-# re-raises with this appended rather than leaving the operator the one
-# message that never mentions re-installing THIS unit.
+# Remediation for either layer below. TWO routes now, where there used to be
+# one — task 4793 removed the hazard that made the surgical edit the only safe
+# option. setup-host.sh section 8 installs this unit through
+# scripts/render_dashboard_unit.py, which reads the installed unit's host-local
+# Environment= values and puts them back, so a re-run no longer strips this
+# host's extra DASHBOARD_KNOWN_PROJECT_ROOTS entries. It is the SANCTIONED path
+# and it is what check_dashboard_unit_parity.py's own drift report tells the
+# operator to run; it also propagates every other committed fix, which for this
+# unit means the three further stale axes recorded in the module docstring
+# (task 4445) — a larger change than the single line this module asserts, which
+# is the only reason the surgical route is still offered rather than retired.
+#
+# scripts/check_dashboard_unit_parity.py still has NO --fix flag by design;
+# re-running the installer IS the propagation path.
+#
+# The daemon-reload is not optional on the surgical route — without it the
+# manager keeps serving the stale unit and only the FILE-layer test goes green.
+# (setup-host.sh runs its own.) Both layers really do interpolate this: the
+# FILE layer delegates its assertion to the shared helper (whose generic
+# message points at an unrelated template), so it re-raises with this appended
+# rather than leaving the operator the one message that never mentions
+# re-installing THIS unit.
 _REMEDIATION = (
-    "To reconcile (manual, surgical — never re-render or re-run "
-    "setup-host.sh, which would strip this host's extra "
-    "DASHBOARD_KNOWN_PROJECT_ROOTS entries): insert `RestartSteps=4` "
-    f"immediately after `RestartSec=5` in {INSTALLED_UNIT_PATH}, changing "
-    "nothing else, then `systemctl --user daemon-reload`."
+    "To reconcile, either: (a) re-run `scripts/setup-host.sh` — the sanctioned "
+    "path, which since task 4793 PRESERVES this host's local Environment= "
+    "values (DASHBOARD_KNOWN_PROJECT_ROOTS) instead of stripping them, and "
+    "which re-renders the whole unit, so it also picks up the other committed "
+    "fixes this module does not assert; or (b) surgically, changing nothing "
+    "else: insert `RestartSteps=4` immediately after `RestartSec=5` in "
+    f"{INSTALLED_UNIT_PATH}, then `systemctl --user daemon-reload`."
 )
 
 

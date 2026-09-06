@@ -13,7 +13,9 @@ question, Read the normative doc, not this one. INV-1..5 fixtures were
 seeded 2026-07-14; INV-6..7 fixtures were added 2026-08-02 with the
 task/escalation state-graph invariants; INV-8 fixtures were added
 2026-08-06 with the loop-occupancy invariant; INV-9 fixtures were added
-2026-08-24 with the one-fact-one-home invariant.
+2026-08-24 with the one-fact-one-home invariant; INV-10 fixtures were
+added 2026-08-30 with the guards-exercise-behaviour invariant (task 4666);
+INV-11 fixtures were added with the promotion of `no-silent-fail-soft`.
 
 **Two fixture shapes.** Each invariant below carries exactly two seeded
 violations — both expressions of the SAME underlying violation, so the two
@@ -56,8 +58,9 @@ records the verdict each yields against the expected slug. Columns:
 
 Acceptance: every fixture flags with the correct slug. The base table
 holds 10 rows (INV-1..5); the 2026-08-02 addendum adds 4 (INV-6..7), the
-2026-08-06 addendum adds 2 (INV-8), and the 2026-08-24 addendum adds 2
-(INV-9) — 18 rows cumulative, all `Y`.
+2026-08-06 addendum adds 2 (INV-8), the 2026-08-24 addendum adds 2
+(INV-9), the 2026-08-30 addendum adds 2 (INV-10), and the INV-11 addendum
+adds 2 — 22 rows cumulative, all `Y`.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -399,6 +402,84 @@ def record_ruling(task, ruling: str) -> None:
 {"invariant": "one-fact-one-home", "file": "orchestrator/src/orchestrator/ruling_writer.py", "line": 3, "issue": "record_ruling writes the same ruling as independent prose into the task description and the PRD while the escalation record that owns the question is never updated — three copies, no designated home, no pointers, no reconciler, so the copies drift the moment any one is corrected", "severity": "warning"}
 ```
 
+## INV-10 `guards-exercise-behaviour`
+
+### PRD-leaf-shaped (`INV-10-PRD`)
+
+> The /unblock runbook must keep telling agents to derive the landing SHA
+> with a task-scoped search rather than from main's tip. Add a pytest
+> guard that greps `skills/unblock/SKILL.md` for the
+> `--grep="Merge task/<TASK_ID> into main"` form and fails if a
+> `git log --format=%H -1 main` appears anywhere in the file.
+
+**Expected disposition**: `flag: guards-exercise-behaviour`
+
+**Redesign that clears it**: Run the documented derivation against a
+fixture repo carrying two task merges and assert it returns THIS task's
+merge SHA rather than main's tip. The guard then fails on the defect
+itself instead of on the spelling, survives a rewrite of every sentence
+around the command, and cannot be defeated by a placeholder the matcher
+did not anticipate.
+
+### Code-snippet-shaped (`INV-10-CODE`)
+
+```python
+_SCOPED_RE = re.compile(r'--grep="Merge task/<[A-Za-z0-9_]+> into main"')
+
+def test_runbook_derivation_is_task_scoped():
+    text = (REPO_ROOT / "skills/orchestrate/SKILL.md").read_text()
+    for cmd in _extract_git_commands(text):
+        assert _SCOPED_RE.search(cmd), f"unscoped SHA derivation: {cmd}"
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "guards-exercise-behaviour", "file": "tests/scripts/test_runbook_sha_derivation.py", "line": 1, "issue": "the guard asserts on the SPELLING of a documented command rather than on what the command resolves to: its character class excludes the hyphen, so orchestrate's `task/<task-id>` placeholder makes every CORRECT instruction in that runbook fail, while nothing here would notice a well-spelled command that returns the wrong commit — the derivation is runnable against a fixture repo and should be run", "severity": "warning"}
+```
+
+## INV-11 `no-silent-fail-soft`
+
+### PRD-leaf-shaped (`INV-11-PRD`)
+
+> Add a `--since` filter to the transcript census: parse each record's
+> timestamp, keep the ones inside the window, and skip any record whose
+> timestamp fails to parse so one malformed line cannot abort a census
+> over 40k records. The command prints the matching-record count and
+> exits 0 as it does today; skipped records are noted in the debug log.
+
+**Expected disposition**: `flag: no-silent-fail-soft`
+
+**Redesign that clears it**: Carry the shortfall in the RESULT the caller
+sees — report `complete: false` with a named entry counting the skipped
+records and why, and exit nonzero when any were skipped — so a partial
+census cannot be read as a full one. The debug line is not the result: the
+caller deciding whether the count is trustworthy never reads it. Skipping
+the malformed record is fine; skipping it invisibly is the defect.
+
+### Code-snippet-shaped (`INV-11-CODE`)
+
+```python
+def load_records(path: Path) -> list[dict]:
+    records = []
+    for line in path.read_text().splitlines():
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            logger.debug("skipping malformed record")
+            continue
+    return records  # a short list looks exactly like a complete one
+
+def census(path: Path) -> int:
+    return len(load_records(path))
+```
+
+**Expected `invariant_findings` entry**:
+
+```json
+{"invariant": "no-silent-fail-soft", "file": "fused-memory/scripts/transcript_window_census.py", "line": 7, "issue": "load_records drops unparseable lines and returns a plain list, so census() returns a count its caller cannot distinguish from a complete one — the only trace of the shortfall is a debug log the caller never reads, and neither the return value nor the exit code carries it", "severity": "high"}
+```
+
 ## Rehearsal verdict table
 
 Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
@@ -527,6 +608,66 @@ prompt text (`no-lockstep-duplication`'s scope; INV-9's own rule text
 draws that seam explicitly), there is no fallback/suppressor (INV-4),
 no log-scrape of emitter-known facts (INV-2), and the defect is writing
 copies, not acting on a stale one (not INV-3).
+
+### Addendum — INV-10 walk (2026-08-30)
+
+Walked against the as-landed G7 text (both paths: the normative walk,
+which Reads the doc at run time and auto-extended to INV-10 with no edit;
+and the trigger-shape fallback, which never auto-extends and gained an
+INV-10 entry in the same change) and the Step 5.5 audit text. The same
+snapshot caveat applies: the Verdict column transcribes phrasing as it
+read on 2026-08-30, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-10-PRD` | PRD | INV-10 guards-exercise-behaviour | `guards-exercise-behaviour` | Normative path: G7's walk of the checkable question ("if what needs protecting is an instruction or a documented command, can it be EXECUTED against a fixture instead of matched?") fires — the row proposes a grep over a runbook for a command that is runnable against a fixture repo. Fallback path: the new trigger-shape entry ("a guard whose assertion target is prose/text rather than the behaviour it protects, where the thing could have been executed or mirrored") fires on the same row → `flag: guards-exercise-behaviour` | Y |
+| `INV-10-CODE` | CODE | INV-10 guards-exercise-behaviour | `guards-exercise-behaviour` | Step 5.5 (unchanged — Reads the doc generically) applies INV-10's question to `test_runbook_derivation_is_task_scoped`: the assertion target is the command's spelling, the matcher is itself untested and excludes a placeholder the guarded doc actually uses, and a correctly-spelled command resolving the wrong commit passes → `invariant_findings` entry with `invariant="guards-exercise-behaviour"`, `severity="warning"` | Y |
+
+**Addendum result: 2/2 match** (cumulative 20/20). Isolation re-checked
+while walking: no other trigger shape fires on either INV-10 fixture —
+the guard is not duplicated lock-step logic (`no-lockstep-duplication`
+covers the copy, not the check over it), there is no fallback/suppressor
+(INV-4), no log-scrape of emitter-known facts (INV-2), and nothing acts
+on a stale snapshot (INV-3). INV-1 is adjacent by construction — INV-10
+is INV-1 turned on the checks themselves — but INV-1's trigger shapes ask
+whether a CONTRACT lives in prose, not whether a GUARD asserts on it.
+
+### Addendum — INV-11 walk (2026-08-20)
+
+Walked against the as-landed G7 §"Design invariants pass" text and the
+Step 5.5 audit text, both re-read from the working tree at the commit that
+promotes INV-11 (task 3803) rather than from the drafting context. Both G7
+paths were walked, as in the 2026-08-06 addendum: the normative path
+(which Reads the doc at run time and auto-extended to INV-11 with no edit)
+and the no-invariants-file fallback path (the trigger-shape list, which
+does NOT auto-extend and gained an INV-11 entry in the same commit).
+
+The same snapshot caveat applies: the Verdict column transcribes phrasing
+as it read on 2026-08-20, not a live pin.
+
+| Fixture ID | Shape | Invariant | Expected slug | Verdict (as-landed text yields) | Match |
+|---|---|---|---|---|---|
+| `INV-11-PRD` | PRD | INV-11 no-silent-fail-soft | `no-silent-fail-soft` | Normative path: G7's walk of the checkable question ("what value does the caller receive, and can that value be told apart from the success value?") fires — the row's caller receives a count and a zero exit whether or not records were skipped, and the row's own justification offers the debug log as the answer, which the rule names as silent. Fallback path: the new trigger-shape entry ("a failure, fallback or partial enumeration whose result a caller cannot tell apart from success") fires on the same row → `flag: no-silent-fail-soft` | Y |
+| `INV-11-CODE` | CODE | INV-11 no-silent-fail-soft | `no-silent-fail-soft` | Step 5.5 ("Read it and audit the modules in scope against each invariant's checkable question" — unchanged, Reads the doc generically) applies INV-11's question to `load_records`/`census`: the returned list is shorter and otherwise identical to a complete one, nothing in the return value or the exit code names the delta, and the `logger.debug` call is not a value any caller receives → `invariant_findings` entry with `invariant="no-silent-fail-soft"`, `severity="high"` per Step 5.5's blast-radius classification | Y |
+
+**Addendum result: 2/2 match** (cumulative 22/22). No wording change to
+G7's walk instruction or to Step 5.5 was needed — both read the normative
+doc at run time, so INV-11's arrival is enough. The two gate-text edits
+this change did require (G7's trigger-shape entry and the family-inventory
+row) are not rehearsal misses: neither enumeration auto-extends, which is
+why `scripts/tests/test_design_invariants_consistency.py` now fails the
+moment a heading lands without them.
+
+Isolation re-checked while walking: no other trigger shape fires on
+either INV-11 fixture. There is no rate or streak dimension anywhere in
+them — a single skipped record is already the defect — so INV-4
+`storm-escape-required`, which asks who hears about the hundredth firing
+of a path that legitimately degrades, does not apply; and no signal that
+exists is being log-scraped or re-derived, so INV-2
+`structured-facts-at-failure`, which constrains the SHAPE of a signal that
+is emitted, does not apply either. The fixtures are deliberately seeded
+against exactly that seam, which the normative doc's own "Family boundary"
+paragraph draws.
 
 ## Reconciliation — 2026-07-14 base walk
 

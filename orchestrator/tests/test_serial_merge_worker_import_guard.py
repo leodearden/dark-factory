@@ -23,6 +23,24 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+# This guard AST-parses every *.py under orchestrator/tests/ -- 535 files at
+# authorship time -- via rglob. MEASURED at 6.46s/call unloaded and serial
+# (-n0), and the CLEAREST crash in the family: branch task/3787 @ 168c4288b4 --
+# "FAILED test_no_new_serial_merge_worker_imports" / "[gw6] node down", session
+# truncated at 65% ("1 failed, 11774 passed, 16 skipped"). Per-call 17.85s /
+# 21.32s / 30.75s at loadavg 120-176 -- a ~4.8x inflation over the 6.46s
+# unloaded figure -- and whole-file 36.69s / 44.78s / 63.87s, against the bare
+# 60s default (esc-3787-1). The 30.75s is the measurement the family ceiling is
+# anchored to.
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _THIS_FILE = Path(__file__).name
 _TESTS_DIR = Path(__file__).parent
 

@@ -151,6 +151,51 @@ asyncio_mode = "auto"
 # NOTHING BEYOND them, because an un-compared key here would be an eighth
 # hand-maintained copy free to drift from the seven. To add one, extend that
 # comparison first.
+#
+# ── THE SAME WALK-UP, SEEN FROM A TASK WORKTREE (task 3922) ───────────────────
+#
+# The per-file walk-up documented above does not stop at a worktree either, and
+# a git VCS root does not halt it. A task worktree at <parent>/.worktrees/<id>
+# whose OWN root pyproject.toml carries no [tool.ruff] -- i.e. any branch based
+# before this table landed -- walks straight out and resolves the PARENT
+# checkout's table instead, plus the parent's .ruff_cache. So its lint gate
+# reads a rule set from another checkout's WORKING TREE, which the branch does
+# not control and which may be uncommitted, and shares one cache directory with
+# every concurrently-verifying sibling worktree. Measured at filing time: 286 of
+# 567 worktrees carrying a pyproject.toml had no [tool.ruff] (down from 349/425
+# a fortnight earlier -- the config half is self-healing as branches rebase).
+#
+# --config WAS REJECTED, in both its bare and its conditional form. Aimed at a
+# pyproject declaring no [tool.ruff] it neither merges nor resumes the walk-up:
+# it pins that file and falls through to ruff's BUILT-IN defaults. Measured on
+# identical bytes, ruff 0.15.9: {I001, F401} without it, {F401} with it. On the
+# 286 stale worktrees that trades a transiently OVER-strict gate for a
+# permanently UNDER-strict green -- "a rule set nobody chose applies silently",
+# the failure THIS TABLE exists to eliminate, merely relocated. Conditionally
+# pinning ("only when the root declares the rules") fails the other way: a
+# worktree whose root declares [tool.ruff] cannot escape at all, so the pin is a
+# no-op exactly where it is safe. Rebase-forward-as-policy was also rejected --
+# a broad branch-lifecycle change with real conflict cost, against a symptom the
+# numbers above show is already shrinking unaided.
+#
+# WHAT WAS ADOPTED, in two halves. (1) The CACHE half is FIXED unconditionally:
+# verify._target_subprocess_env injects RUFF_CACHE_DIR=<worktree>/.ruff_cache,
+# keyed off the subprocess cwd in _run_cmd. Licensed by measurement -- the
+# redirect moves cache_dir and leaves BOTH the resolved settings path and the
+# emitted rule codes byte-identical -- so it needs no audit of which worktrees
+# are stale. (2) The CONFIG half is made LOUD, not fixed: a WARNING naming the
+# worktree, the foreign settings path measured and the remediation (merge main
+# forward). Deliberately NON-FATAL, for the reason stated in "WHY THE ATOMICITY
+# MATTERS" above -- hard-failing would red ~286 live worktrees at once, on
+# branches carrying no defect at all. Materialising a worktree-local ruff config
+# is NOT an option either: test_nonmember_ruff_config.py::_shadowing_configs
+# sweeps `git ls-files --cached --others`, so even an untracked generated one is
+# caught.
+#
+# KEPT TRUE BY: tests/scripts/test_worktree_ruff_config_boundary.py (pins both
+# measurements above against a synthetic parent/worktree pair) and
+# orchestrator/tests/test_verify_ruff_config_boundary.py (pins the injection,
+# the detector and its non-fatality).
 
 [tool.ruff]
 line-length = 100

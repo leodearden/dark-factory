@@ -89,6 +89,34 @@ DELETER_GC = 'gc-on-terminal-or-ttl'
 DELETER_POOL_TRIM = 'cycle-summary-pool-cap-trim-or-ttl'
 DELETER_TTL = 'ttl-expiry'
 
+# The `deleter` audit tags of the ONLY Mem0 delete paths that write a
+# mem0_tombstone ledger row, via mem0_tombstone.record_mem0_deletion_tombstones
+# (the batched/plural writer — see the mem0_tombstone MARKER_LIFECYCLE entry
+# below). There are exactly three production call sites of that writer:
+# summary_pool.enforce_summary_pool_cap, task_knowledge_sync._sweep_stale_mem0_pool
+# (a shared choke point for three delegating GC-sweep callers), and
+# server.tools.consolidate_memories — six deleter tags in total. Named by
+# mechanism, not by file:line: line numbers in this module drift silently
+# (see the design decision on this task), while these tags are stable string
+# constants a reader can grep straight to.
+#
+# Hand-transcribed here, not imported, because this module is import-light by
+# contract (module docstring above: only recon_pool_map and
+# standing_decision_constants) — the six source constants live in
+# task_knowledge_sync, memory_consolidator, and server.tools, all heavy.
+# test_recon_self_model.py cross-checks this tuple against those live
+# constants (imported lazily, inside the test body) so drift between this
+# description and the live code fails a test rather than silently diverging —
+# the same arrangement MARKER_KINDS already has with recon_ledger.MARKER_KINDS.
+MEM0_TOMBSTONE_DELETERS = (
+    'stage1_flag_marker_gc_sweep',
+    'stage2_persistence_marker_gc_sweep',
+    'flag_for_stage2_gc_sweep',
+    'stage1_cycle_summary_trim',
+    'stage2_cycle_summary_trim',
+    'consolidate_memories',
+)
+
 
 @dataclass(frozen=True)
 class MarkerLifecycle:
@@ -147,14 +175,29 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # flag_for_stage2 row into the ledger — the identical
         # declared-vs-actual gap documented on stage2_persistence_marker
         # below (task 2228 W5-κ, review finding model_drift). The live
-        # collector is the separate Mem0 age-based sweep
-        # task_knowledge_sync._sweep_stale_mem0_flag_for_stage2_markers
+        # collector is the separate Mem0 sweep
+        # stages/task_knowledge_sync.py::_sweep_stale_mem0_flag_for_stage2_markers
         # (task 2966), which — unlike stage2_persistence_marker's sweep —
         # enumerates via the boolean payload filter
         # {'flag_for_stage2': True} rather than a {'source': ...} filter,
-        # since these markers carry no source metadata field. Migrating the
-        # writer onto the ledger — so DELETER_GC becomes true in practice and
-        # not just in eligibility — is a follow-up.
+        # since these markers carry no source metadata field.
+        #
+        # That collector is NO LONGER age-based (task 4375). Retirement is now
+        # COMPOSITE: a marker is deleted only when it is past the 14-day age
+        # cutoff AND is not a protected cycle_summary mirror AND its kind is
+        # not in mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is
+        # confirmed terminal. The age-only rule destroyed 40 kind='cadence_check'
+        # audit records in autopilot_video, all citing a merely-'deferred' task.
+        #
+        # The terminal-closure arm NARROWS the declared-vs-actual gap this
+        # comment documents, without closing it: the Mem0 side now applies the
+        # same terminal-task-closure test that
+        # recon_ledger.ReconLedgerStore.gc()'s terminal-referenced DELETE arm
+        # applies to ledger rows, so DELETER_GC is now accurate about the
+        # ELIGIBILITY RULE even though the rows themselves still never reach
+        # the ledger. Migrating the writer onto the ledger — so DELETER_GC
+        # becomes true in mechanism too, not just in rule — remains a
+        # follow-up.
         deleter=DELETER_GC,
     ),
     'stage2_persistence_marker': MarkerLifecycle(
@@ -193,10 +236,11 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
     # Not a MARKER_KINDS member — see the superset note above.
     'mem0_tombstone': MarkerLifecycle(
         writer=(
-            'Python, from mem0_tombstone.record_mem0_deletion_tombstone — one '
-            'per CONFIRMED recon-initiated Mem0 delete (both the marker-GC '
-            'sweeps and the cycle_summary pool-cap trim), keyed by the deleted '
-            "record's memory uuid"
+            'Python, from mem0_tombstone.record_mem0_deletion_tombstones — one '
+            'per CONFIRMED delete performed by the sweeps that call it: the '
+            'marker-GC sweeps, the cycle_summary pool-cap trim, and the '
+            'consolidate_memories supersede path (not every recon-initiated '
+            "Mem0 delete), keyed by the deleted record's memory uuid"
         ),
         deleter=DELETER_TTL,
     ),
@@ -490,6 +534,7 @@ def render_cycle_summary_section() -> str:
         f"  - stage='{stage}' -> recon_pool='{pool}'"
         for stage, pool in CYCLE_SUMMARY_STAGE_TO_RECON_POOL.items()
     )
+    deleters_str = ', '.join(f'`{deleter}`' for deleter in MEM0_TOMBSTONE_DELETERS)
     return (
         '## Per-Cycle Summary\n'
         'Python writes exactly one per-cycle summary memory per stage, '
@@ -517,13 +562,28 @@ def render_cycle_summary_section() -> str:
         'The Mem0 record is a best-effort searchable copy; the AUTHORITATIVE '
         'record is the ReconLedgerStore cycle_summary row — check it with '
         '`get_cycle_summary_presence`, never by looking for the mirror.\n\n'
-        'Any recon-initiated Mem0 deletion now leaves a TOMBSTONE, returned by '
-        "`get_memory_by_id` on its not-found branch as a `'tombstone'` key "
-        'naming the sweep that deleted the record, the run that did it, and the '
-        "victim's metadata. Before reporting a missing memory as silent loss, "
-        'consult it: a tombstone means the record was deliberately reaped by a '
-        'named sweep. Reporting a capped-pool eviction as fleet-wide data loss '
-        'is a real failure mode — it happened (recon gate 165, task 3041).\n\n'
+        f'Deletes performed by these named sweeps — {deleters_str} — leave a '
+        "TOMBSTONE, returned by `get_memory_by_id` on its not-found branch as "
+        "a `'tombstone'` key naming the sweep that deleted the record "
+        '(`deleter`), the run that performed the deletion (`deleting_run_id`), '
+        "and the victim's metadata. Before reporting a missing memory as "
+        'silent loss, consult it: a tombstone means the record was '
+        'deliberately reaped by a named sweep. Reporting a capped-pool '
+        'eviction as fleet-wide data loss is a real failure mode — it '
+        'happened (recon gate 165, task 3041).\n\n'
+        'A tombstone proves deliberate deletion; its ABSENCE does NOT prove '
+        'the converse — never treat a missing tombstone as evidence a record '
+        'was not deliberately deleted. Absence is uninformative for two '
+        'reasons: (1) several Mem0 delete paths write no tombstone at all — '
+        'most notably the MCP `delete_memory` tool itself (the path the '
+        "recon stages' own flag-reaping instructions call), plus cascade "
+        'child deletes, the task_count_snapshot prune, the targeted-recon '
+        'completion-echo delete, the harness status-correction delete, and '
+        'the scope-freshness snapshot pool cap; and (2) even a written '
+        'tombstone expires after `mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS` '
+        'days. Widening tombstone coverage to the paths above is tracked as '
+        'task 4422 — treat this as a point-in-time scope, not a closed '
+        'set.\n\n'
         "The `record_type` metadata key discriminates cycle_summary writers by "
         "purpose, not by shape: `'ledger_stamp'` marks Python's deterministic "
         "code mirror described above; `'narrative'` marks the distinct "

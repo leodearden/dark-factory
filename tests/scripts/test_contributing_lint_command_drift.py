@@ -44,9 +44,8 @@ import re
 import shlex
 
 import pytest
+import verify_command_invariants as vci
 import yaml
-
-from orchestrator import verify_cmd
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -265,6 +264,14 @@ _RUFF_FLAGS_TAKING_A_VALUE = frozenset(
     }
 )
 
+# The keyword whose segment both helpers below read, ALIASED from the shared
+# parser rather than restated as a literal (task 3745). It is what selects that
+# parser's anchor (``keyword.split()[-1]`` — here, ``check``), so it belongs to
+# the shared contract; the value-flag set above, by contrast, is this guard's
+# own policy and stays local. The local name keeps the helpers reading
+# unchanged.
+_RUFF_KEYWORD = vci.RUFF
+
 
 def _root_lint_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["lint_command"]
@@ -273,23 +280,26 @@ def _root_lint_command() -> str:
 def _ruff_segment(cmd: str, label: str) -> str:
     """The ``&&``-chained segment of *cmd* that actually invokes ``ruff check``.
 
-    Uses the production splitter ``verify_cmd.split_top_level_and`` (quote-aware)
-    rather than a naive ``str.split('&&')``, matching ``_ruff_segment`` in
-    ``test_root_lint_covers_nonmember_py.py`` and ``test_scripts_module_config.py``.
+    Delegates to the shared implementation in ``verify_command_invariants``
+    (task 3745), which uses the production splitter
+    ``verify_cmd.split_top_level_and`` (quote-aware) rather than a naive
+    ``str.split('&&')``.
 
     Extracting the ruff segment FIRST is what keeps the target comparison honest:
     tokenising the whole live chain would read ``&&``, ``python3`` and the
     magicmock checker's own directory arguments as ruff lint targets. Works
     unchanged on the single-segment documented command, so both sides of the
     mirror are tokenised by exactly one code path.
+
+    *label* is passed through because THIS guard parses two commands with the
+    same keyword — the live ``lint_command`` and the one documented in
+    CONTRIBUTING.md — so it is what keeps the two failures distinguishable.
+
+    The shared selector STRIPS the segment, which is load-bearing here and
+    nowhere else: ``test_contributing_lint_bullet_mirrors_the_live_lint_command``
+    compares this return value as a RAW STRING against the documented bullet.
     """
-    segments = verify_cmd.split_top_level_and(cmd)
-    ruff_segments = [s for s in segments if "ruff check" in s]
-    assert len(ruff_segments) == 1, (
-        f"expected exactly one `ruff check` segment in {label}, got "
-        f"{ruff_segments!r} (task 3558); full command: {cmd!r}"
-    )
-    return ruff_segments[0].strip()
+    return vci.required_segment(cmd, _RUFF_KEYWORD, label=f"{label} (task 3558)")
 
 
 def _ruff_targets(cmd: str, label: str) -> list[str]:
@@ -297,29 +307,31 @@ def _ruff_targets(cmd: str, label: str) -> list[str]:
 
     Returns whole path TOKENS. Callers must compare against them by exact element
     and never substring-match the raw command — the contract documented on
-    ``_lint_leg_targets`` in ``test_fallback_verify_config.py`` and restated on
-    ``_ruff_targets`` in ``test_root_lint_covers_nonmember_py.py``.
+    ``tests/scripts/verify_command_invariants.py::positional_targets`` (its
+    canonical home since task 3883, when ``_lint_leg_targets`` in
+    ``test_fallback_verify_config.py`` stopped implementing the rule and started
+    delegating) and restated on ``_ruff_targets`` in
+    ``test_root_lint_covers_nonmember_py.py``.
 
     That rule is backed by a MEASURED counterexample, not a hypothetical:
     ``'shared' in cmd`` is ALREADY TRUE of the live ``lint_command`` via the
     ``check_bare_magicmock_config.py`` TAIL leg's ``shared/tests`` argument. The
     ruff leg and the tail leg have DISJOINT target lists, so a substring test
     would pass vacuously for a path the ruff leg never checks.
-    """
-    tokens = shlex.split(_ruff_segment(cmd, label))
-    assert "check" in tokens, f"no ruff `check` subcommand in {label}: {cmd!r} (task 3558)"
 
-    targets: list[str] = []
-    consume_next = False
-    for token in tokens[tokens.index("check") + 1:]:
-        if consume_next:
-            consume_next = False
-            continue
-        if token.startswith("-"):
-            consume_next = token in _RUFF_FLAGS_TAKING_A_VALUE
-            continue
-        targets.append(token)
-    return targets
+    ``_RUFF_FLAGS_TAKING_A_VALUE`` is passed EXPLICITLY to the shared extractor
+    (task 3745). Its two sibling guards deliberately pass nothing and keep the
+    naive ``-``-prefix filter, so supplying the set here is exactly what
+    preserves the behavioural gap rather than silently widening them — see
+    ``test_ruff_targets_reads_flag_values_as_flags_not_paths`` below, which is
+    the executable proof that the set is still being consulted.
+    """
+    return vci.positional_targets(
+        _ruff_segment(cmd, label),
+        _RUFF_KEYWORD,
+        value_flags=_RUFF_FLAGS_TAKING_A_VALUE,
+        label=f"{label} (task 3558)",
+    )
 
 
 def test_ruff_targets_reads_flag_values_as_flags_not_paths() -> None:

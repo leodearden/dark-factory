@@ -53,7 +53,9 @@ from .metrics import (
     compose_cost_source,
     detect_invocation_error,
     is_proxied_endpoint,
+    read_decline_artifacts,
     resolve_cost_usd,
+    resolve_terminal_kind,
 )
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
@@ -740,6 +742,20 @@ async def run_architect_eval(
     pre-invoke cap) skips the resolution altogether: $0.00 has no provenance to
     resolve, and resolving it would attach a loud degradation WARNING to spend
     that never happened.
+
+    TERMINAL OUTCOME (task 4760). The cell also carries
+    ``metrics.terminal_kind``: WHAT the architect's last statement about the
+    task actually was — a scorable plan, one of the five explicit plan-tools
+    decline exits, or neither. A DECLINE IS NOT A CONTENT FAILURE: it is the
+    correct refusal the prompt tells the architect to make INSTEAD of planning,
+    so ``plan_steps``, ``cap_tainted`` and ``plan_quality`` are all left exactly
+    as they were and planRate keeps its historical ``plan_steps > 0``
+    derivation. The field exists so a ``plan_steps = 0`` cell can be split by
+    CAUSE without transcript forensics. When a cell carries BOTH a plan and a
+    decline, LAST TERMINAL CALL WINS — see
+    :func:`~orchestrator.evals.metrics.resolve_terminal_kind` for the policy and
+    its ambiguity direction. The artifacts are read in the ``finally`` block
+    below, which is the last moment they exist.
     """
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
@@ -768,6 +784,10 @@ async def run_architect_eval(
     )
 
     plan: dict = {}
+    # Pre-initialised for the same reason ``artifacts``/``usage_gate`` below
+    # are: the finally block READS the decline artifacts, and it must not
+    # NameError on a failure that happened before that read.
+    declines: dict[str, dict | None] = {}
     # Pre-initialised so the cap-exhaustion handler below can best-effort
     # re-read the plan artifact: that handler runs on an exception raised AT
     # the invoke, which is before the normal ``artifacts.read_plan()``, and on
@@ -1064,6 +1084,30 @@ async def run_architect_eval(
         arch_error = arch_error or f'harness_error: {type(e).__name__}: {reason}'
         arch_unmeasurable = True
     finally:
+        # The architect's DECLINE artifacts (task 4760) — read HERE, and only
+        # here, for two reasons. (a) This single site is reached by ALL FOUR
+        # exits: success, TimeoutError, AllAccountsCappedException and the
+        # generic harness-error handler. Reading beside ``artifacts.read_plan()``
+        # on the happy path instead would leave the timeout and harness-error
+        # cells with no terminal kind at all, and would need a SECOND copy on
+        # the cap-exhaustion re-read path — the duplication that path's own
+        # comment exists to justify avoiding. (b) It is the LAST moment the
+        # artifacts exist: the very next statement rmtree's the relocated
+        # .task-meta/<name>/ root (snapshots.cleanup_eval_worktree), so any read
+        # placed after it — which is everywhere post-``finally`` — finds nothing.
+        #
+        # Best-effort for the same reason the gate teardown below is: a failure
+        # while cleaning up must never turn an already-scored cell into a lost
+        # run. read_decline_artifacts already degrades PER KIND; this is the
+        # outer backstop.
+        try:
+            declines = read_decline_artifacts(artifacts)
+        except Exception:
+            logger.warning(
+                f'decline-artifact read failed for {task_id} × {config.name}; '
+                f'the cell keeps its plan-derived terminal kind',
+                exc_info=True,
+            )
         # Plan already read above; the worktree is no longer needed (scoring
         # reads the in-memory plan + the committed reference diff).
         await snapshots.cleanup_eval_worktree(project_root, worktree)
@@ -1285,6 +1329,13 @@ async def run_architect_eval(
             # bound plan_quality validity into uselessness.
             judged_without_reference = not reference_diff
 
+    # The terminal outcome (task 4760), resolved from the two facts now in
+    # scope: the ``plan`` local the scoring block above just used, and the
+    # decline artifacts the finally block read while they still existed.
+    # ADDITIVE — no existing metric consults it, so plan_steps / cap_tainted /
+    # plan_quality, and therefore planRate, are byte-identical to before.
+    terminal_kind = resolve_terminal_kind(plan, declines)
+
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
     # The marker names WHICH stage failed; the join keeps the field well-defined
@@ -1349,6 +1400,10 @@ async def run_architect_eval(
     metrics = EvalMetrics(
         plan_quality=plan_quality,
         role_under_test='architect',
+        # See the TERMINAL OUTCOME paragraph in the docstring: a decline is a
+        # correct refusal, reported ALONGSIDE plan_steps rather than folded into
+        # it, so both facts survive on a plan-then-decline cell.
+        terminal_kind=terminal_kind,
         # NO test signal exists for a plan-only cell (task 3099): this path
         # freezes implementer/debugger/reviewer/verify, so verification never
         # runs. ``None`` is the documented "unknown" sentinel; the dataclass
@@ -1441,6 +1496,9 @@ async def run_architect_eval(
         )
         # So a run's OWN log carries the validity bound, not just the report.
         + (' [judged_without_reference]' if judged_without_reference else '')
+        # ...and the terminal outcome, so an operator watching a LIVE campaign
+        # sees a decline as it happens instead of reconstructing it afterwards.
+        + f' [terminal_kind={terminal_kind}]'
     )
     return result_obj
 

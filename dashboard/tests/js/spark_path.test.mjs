@@ -1182,6 +1182,48 @@ test('barFractions: does not mutate its input array', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The ROW-PROJECTED composition — charts.jsx's HBarChart (task 3681)
+//
+// HBarChart is the one primitive whose input is rows of OBJECTS, so it projects
+// to a values array at the CALL SITE and reuses plottableMax + barFractions
+// with no export of its own. The shape that is NOT already covered above is its
+// SEGMENTS: a second projection, per row, over a key list unioned across all
+// rows, scaled against the max folded from a DIFFERENT projection. That
+// cross-projection sharing of one max is what this case executes.
+//
+// ONE case, deliberately. The hole/mutation/legacy-arithmetic behaviour of both
+// builders is already covered above and does not become new coverage by being
+// re-entered through a `rows.map(...)`; and everything 3681 changed lives in
+// charts.jsx, which is CDN-Babel JSX with no node_modules, so nothing in this
+// repo can render it. 3681's RED signal is in test_charts_null_samples.py's
+// source assertions, which freeze the pre-fix HBarChart body verbatim. Do not
+// weaken spark_path.js to manufacture a failure here.
+// ---------------------------------------------------------------------------
+
+test('row projection: segments hole only the keys their row lacks', () => {
+  // The live tabs.jsx case: model keys are unioned across ALL rows, so a
+  // project that never used a model simply lacks that key. Pre-fix
+  // `(r[s.key] || 0)` scrubbed that hole into a measured zero — the same
+  // conflation banned for StackedAreaChart.
+  const segments = [{ key: 'opus' }, { key: 'sonnet' }, { key: 'haiku' }];
+  const rows = [{ total: 10, opus: 6, sonnet: 4 }, { total: 5, haiku: 5 }];
+  const max = plottableMax(rows.map(r => r.total), 1);
+
+  assert.equal(max, 10);
+  assert.deepEqual(
+    barFractions(segments.map(s => rows[0][s.key]), max).fractions,
+    [0.6, 0.4, null],
+    'the present segments keep their true fraction of the SHARED max; the ' +
+      'unused model is absent, not zero',
+  );
+  assert.deepEqual(
+    barFractions(segments.map(s => rows[1][s.key]), max).fractions,
+    [null, null, 0.5],
+    'a second row holes a different set of keys, scaled against the same max',
+  );
+});
+
+// ---------------------------------------------------------------------------
 // stackedAreaPaths — banded areas with a PREFIX hole rule (task 3489)
 //
 // charts.jsx's StackedAreaChart scrubbed every sample with `(st.values[i] || 0)`

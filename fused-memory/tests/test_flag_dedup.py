@@ -3318,12 +3318,11 @@ class TestFilterFalsePhantomTaskCreationFlags:
 class TestCitedFixTaskLive:
     """Tests for ``_cited_fix_task_live(cited, get_task_result) -> bool``.
 
-    Layers the ruled status policy on top of :func:`_cited_task_corroborated`:
-    a cited fix task counts as LIVE when it is positively present, its title
-    corroborates the citation, and its status is any filed status OTHER than
-    ``cancelled``.
-
-    RED until step-4 adds ``_cited_fix_task_live`` to flag_dedup.py.
+    A cited fix task counts as LIVE when it is positively present and its
+    status is any filed status OTHER than ``cancelled``.  As of task 4864 the
+    TITLE is not part of that test (see the block comment below): it is a
+    cosmetic, never-refreshed snapshot, so requiring equality made an ordinary
+    retitle silently disable the gate.
     """
 
     CITED = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix the thing'}
@@ -3391,19 +3390,91 @@ class TestCitedFixTaskLive:
             f'an inconclusive status must not suppress; got {result!r}'
         )
 
-    def test_false_on_title_mismatch(self):
-        """Id-collision / hallucinated-citation guard inherited from
-        _cited_task_corroborated: task ids are per-project sequential integers,
-        so a bare id match is routinely an unrelated task."""
+    # ---- task 4864 step-3: titles are COSMETIC for this gate ---------------
+    #
+    # ``recon_report.cite_task`` snapshots a title at cite time and NEVER
+    # refreshes it (first-cited title wins), so title equality is defeated by
+    # an ordinary retitle — and by a title-less ``get_task`` record, which
+    # cite_task itself stores as ``title=''``.  Contract A wins: the title is
+    # display text, not identity.  What replaces the lost protection is not
+    # nothing — ``_resolve_live_cross_project_fix_task`` issues a LIVE
+    # ``get_task`` for every citation on EVERY cycle (gate-time
+    # re-verification), bounded by HIT-only, foreign-only, non-cancelled and
+    # done-bounded-to-8-cycles.  The STRICT sibling
+    # ``_cited_task_corroborated`` is deliberately left alone; see
+    # ``test_strict_phantom_guard_still_rejects_the_titleless_citation``.
+
+    @pytest.mark.parametrize(
+        'cited',
+        [
+            {'project_id': 'dark_factory', 'task_id': '3839'},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': ''},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': '   '},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': None},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Stale old name'},
+        ],
+        ids=['title-missing', 'title-empty', 'title-blank', 'title-none', 'title-stale'],
+    )
+    def test_true_for_weakly_corroborated_titles(self, cited):
+        """A missing, empty or STALE title must not veto the gate.
+
+        RED until step-4 stops delegating the title veto to
+        ``_cited_task_corroborated``.
+        """
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        result = {'id': 3839, 'title': 'Fix the thing', 'status': 'pending'}
+        assert _cited_fix_task_live(cited, result) is True, (
+            f'a cosmetic title must not veto a present, non-cancelled fix '
+            f'task; got cited={cited!r}'
+        )
+
+    def test_true_on_a_title_that_matches_nothing(self):
+        """The contract stated at its bluntest: a live, filed, non-cancelled
+        task at the cited id counts, whatever its title says."""
         from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
 
         result = {'id': 3839, 'title': 'A completely unrelated task', 'status': 'pending'}
-        assert _cited_fix_task_live(self.CITED, result) is False, (
-            f'a title mismatch must not suppress; got {result!r}'
+        assert _cited_fix_task_live(self.CITED, result) is True, (
+            f'a title mismatch must not veto the fix-task gate; got {result!r}'
+        )
+
+    def test_false_for_weak_title_when_the_task_is_cancelled(self):
+        """Dropping the title veto must not weaken the ABANDONED guard, which
+        is the one that prevents permanent silencing."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        cited = {'project_id': 'dark_factory', 'task_id': '3839'}
+        result = {'id': 3839, 'title': 'Fix the thing', 'status': 'cancelled'}
+        assert _cited_fix_task_live(cited, result) is False, (
+            f'a cancelled task must never suppress, title or no title; got {result!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'cited',
+        [
+            {'project_id': 'dark_factory', 'task_id': '3839'},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': ''},
+        ],
+        ids=['title-missing', 'title-empty'],
+    )
+    def test_strict_phantom_guard_still_rejects_the_titleless_citation(self, cited):
+        """The SPLIT: ``_cited_task_corroborated`` stays strict.
+
+        A false drop there silences a phantom-task finding with no bounded
+        expiry, and ``test_phantom_finding_kept_when_cited_title_missing``
+        pins that.  Only the fix-task gate relaxes.
+        """
+        from fused_memory.reconciliation.flag_dedup import _cited_task_corroborated
+
+        result = {'id': 3839, 'title': 'Fix the thing', 'status': 'pending'}
+        assert _cited_task_corroborated(cited, result) is False, (
+            f'the strict phantom guard must keep requiring a title; got {cited!r}'
         )
 
     def test_true_on_title_match_with_different_case_and_whitespace(self):
-        """Title normalisation (casefold + whitespace-collapse) is inherited."""
+        """Title normalisation (casefold + whitespace-collapse) still applies —
+        it now decides STRENGTH (INFO vs WARNING), not admission."""
         from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
 
         result = {'id': 3839, 'title': '  FIX   THE    THING ', 'status': 'pending'}
@@ -3711,6 +3782,172 @@ class TestResolveLiveCrossProjectFixTask:
             f'{taskmaster.get_task.call_count}'
         )
 
+
+# ---------------------------------------------------------------------------
+# ---- task 4864 step-1 ----
+# RED: truncation parity between _sanitize_cited_tasks and title corroboration.
+# ---------------------------------------------------------------------------
+
+
+class TestCitedTaskTitleTruncationParity:
+    """A citation the gate's OWN sanitizer truncated must still corroborate.
+
+    ``_sanitize_cited_tasks`` truncates every string value to
+    ``_MAX_CITED_TASK_STR_CHARS`` (200), but the live record's ``title`` used
+    to be compared UNTRUNCATED — so the gate mutated a perfectly good citation
+    into one that could never match its own live task.  Every real title in
+    this factory is well under the cap, so this is not about ordinary titles:
+    it is about the sanitizer's mutation being lossless for MATCHING at
+    whatever the cap happens to be, which is what makes the cap safe to tune
+    later.
+
+    Two live consumers of that comparison, both covered here: the STRICT
+    phantom guard ``_cited_task_corroborated``, where a title still ADMITS and
+    a truncation-induced miss causes an unexpiring wrong drop; and the
+    fix-task gate's STRENGTH signal, where it decides INFO versus WARNING
+    (task 4864 step-4 — the fix-task gate itself no longer admits on title).
+    """
+
+    PROJECT = 'know_live'
+    KNOWN = {'dark_factory': '/df'}
+    #: 250 chars — comfortably past _MAX_CITED_TASK_STR_CHARS (200).
+    LONG_TITLE = 'Fix the cross-project fix-task citation-suppression gate ' + ('x' * 193)
+
+    @staticmethod
+    def _cited(title):
+        """Sanitize a one-citation flag and hand back the surviving entry."""
+        from fused_memory.reconciliation.flag_dedup import _sanitize_cited_tasks
+
+        sanitized = _sanitize_cited_tasks(
+            {'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': title}]}
+        )
+        assert sanitized is not None and len(sanitized) == 1, (
+            f'the sanitizer must keep this citation; got {sanitized!r}'
+        )
+        return sanitized[0]
+
+    def test_sanitizer_actually_truncates_the_long_title(self):
+        """Premise check: without this the parity assertions below are vacuous."""
+        from fused_memory.reconciliation.flag_dedup import _MAX_CITED_TASK_STR_CHARS
+
+        assert len(self.LONG_TITLE) > _MAX_CITED_TASK_STR_CHARS
+        cited = self._cited(self.LONG_TITLE)
+        assert len(cited['title']) == _MAX_CITED_TASK_STR_CHARS, (
+            f'the fixture must exercise the truncation path; got {cited!r}'
+        )
+        assert cited['title'] != self.LONG_TITLE
+
+    def test_truncated_citation_still_corroborates_untruncated_live_title(self):
+        """THE DEFECT: the sanitizer's own mutation must not break matching."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _cited_task_corroborated,
+            _titles_corroborate,
+        )
+
+        cited = self._cited(self.LONG_TITLE)
+        live = {'id': 3839, 'title': self.LONG_TITLE, 'status': 'pending'}
+
+        assert _titles_corroborate(cited['title'], live['title']) is True, (
+            'a citation truncated by the gate\'s OWN sanitizer must still '
+            f'corroborate the live record it was copied from; got {cited!r}'
+        )
+        # And through the STRICT guard, where title equality is still binding
+        # and this defect could still cause a wrong, unexpiring drop.
+        assert _cited_task_corroborated(cited, live) is True, (
+            f'the strict phantom guard must not be defeated by truncation; got {cited!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolver_reports_a_truncated_citation_as_strongly_corroborated(
+        self, caplog
+    ):
+        """Same defect at the resolver seam ``dedup_flags`` actually calls.
+
+        Since task 4864 the fix-task gate no longer ADMITS on title, so what
+        truncation can still corrupt here is the STRENGTH signal: a citation
+        the sanitizer shortened would be reported as weakly corroborated and
+        logged at WARNING, turning a routine long title into a permanent false
+        alarm that drowns the real ones.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            _LiveFixTask,
+            _resolve_live_cross_project_fix_task,
+        )
+
+        cited = self._cited(self.LONG_TITLE)
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': self.LONG_TITLE, 'status': 'pending'}
+        )
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await _resolve_live_cross_project_fix_task(
+                taskmaster, self.KNOWN, self.PROJECT, [cited]
+            )
+
+        assert isinstance(result, _LiveFixTask), (
+            f'the truncated citation must resolve to a live fix task; got {result!r}'
+        )
+        assert result.cited == cited and result.status == 'pending'
+        assert result.title_corroborated is True, (
+            f'a title the sanitizer truncated must still count as STRONG; got {result!r}'
+        )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            'truncation must not raise a false uncorroborated-title alarm; got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+
+    def test_different_long_title_does_not_corroborate(self):
+        """Companion: the fix must not degrade into "any long title matches".
+
+        Two 250-char titles differing WITHIN the first
+        ``_MAX_CITED_TASK_STR_CHARS`` characters.
+
+        WEAKENED FROM step-1, deliberately (task 4864 step-2).  This assertion
+        was first written with the two titles differing only PAST character
+        200, and that form is unsatisfiable BY DESIGN once both sides are
+        truncated to the same bound: a cap on how much title the gate reads is
+        precisely a statement that nothing past it is consulted.  Raising or
+        special-casing the cap to rescue it would reintroduce the unbounded
+        string the cap exists to prevent.  What the assertion is actually FOR
+        — "the fix must not degrade into a prefix match that any long title
+        satisfies" — is preserved here and, more sharply, in
+        ``test_short_citation_is_not_satisfied_by_a_long_title_that_starts_with_it``
+        below, which is the case that genuinely separates symmetric truncation
+        from a prefix rule.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            _MAX_CITED_TASK_STR_CHARS,
+            _titles_corroborate,
+        )
+
+        cited = self._cited(self.LONG_TITLE)
+        other = 'A completely different long task title ' + ('z' * 211)
+        assert len(other) > _MAX_CITED_TASK_STR_CHARS
+        assert other[:_MAX_CITED_TASK_STR_CHARS] != self.LONG_TITLE[:_MAX_CITED_TASK_STR_CHARS]
+
+        assert _titles_corroborate(cited['title'], other) is False, (
+            f'two genuinely different long titles must not corroborate; got {other!r}'
+        )
+
+    def test_short_citation_is_not_satisfied_by_a_long_title_that_starts_with_it(self):
+        """The prefix-match guard the companion above exists to protect.
+
+        A SHORT cited title (never truncated) against a long live title that
+        merely BEGINS with it must not corroborate — a prefix rule would accept
+        it, truncating-both-sides correctly rejects it.  This is the assertion
+        that distinguishes the two candidate fixes, so it is kept regardless of
+        how the past-the-cap case above resolves.
+        """
+        from fused_memory.reconciliation.flag_dedup import _titles_corroborate
+
+        cited = self._cited('Fix the gate')
+        assert cited['title'] == 'Fix the gate', 'a short title must not be truncated'
+        live_title = 'Fix the gate ' + ('y' * 300)
+
+        assert _titles_corroborate(cited['title'], live_title) is False, (
+            f'a long live title must not be corroborated by a short prefix; got {live_title!r}'
+        )
 
 # ---------------------------------------------------------------------------
 # task-1654 step-1 — RED: compute_content_fingerprint_signature tests
@@ -4220,49 +4457,87 @@ class TestDedupFlagsDedupedAgainstEnrichment:
 
 
 # ---------------------------------------------------------------------------
-# ---- task 4381 step-1 ----
-# RED: dedup_flags carries the flag's cited_tasks into the stage1_flag_marker
-# ledger payload (GAP 1 / esc-3841-1), sanitized so the payload json.dumps can
-# never fail on LLM-authored content.
+# ---- task 4712 step-1 ----
+# RED: no INPUT to compute_flag_signature may be persisted in the
+# stage1_flag_marker payload as durable cross-cycle state (task 4712 /
+# esc-3841-1 follow-up). cited_tasks is folded into compute_flag_signature's
+# own task-id component (see that function's docstring), so a value derived
+# from it is stored in a row keyed by itself: a later cycle presenting a
+# DIFFERENT cited_tasks set keys to a DIFFERENT row and can never read the
+# anchor back. Measured on this branch (task 4712 pre-1):
+#   compute_flag_signature({'task_id': 598, 'flag_type': ft,
+#       'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839'}]})
+#     == ('3839,598', ft)
+#   compute_flag_signature({'task_id': 598, 'flag_type': ft})
+#     == ('598', ft)
+# — two different rows for one logical flag. Genuinely RED today: dedup_flags
+# currently writes the sanitized cited_tasks into the payload of the row
+# keyed by the CURRENT cycle's own signature — exactly the row a
+# citation-matching cycle would key to anyway — so the anchor can never be
+# read back by a cycle that would actually need it.
 # ---------------------------------------------------------------------------
 
 
-class TestDedupFlagsCitedTasksPayload:
-    """dedup_flags threads the flag's ``cited_tasks`` into the persisted
-    ``stage1_flag_marker`` payload (task 4381 GAP 1).
+class TestMarkerPayloadKeyInvariant:
+    """No INPUT to ``compute_flag_signature`` may be persisted in the
+    ``stage1_flag_marker`` payload as durable cross-cycle state (task 4712).
 
-    Every assertion reads the PERSISTED payload rather than the in-memory
-    flag, because the gap this closes is exactly at that boundary: the
-    payload was a fixed 6-key literal that never consulted
-    ``flag['cited_tasks']``, so a carried-forward marker lost the
-    project-qualified anchor its cross-project fix task lives behind.
-
-    The persisted value is SANITIZED (the three canonical keys, scalar values
-    only) so the ``json.dumps`` inside dedup_flags' best-effort try/except
-    can never raise on LLM-authored content and silently stop persisting the
-    marker at all.
+    A payload field that is ALSO a signature input is stored in a row keyed
+    by itself, so any cycle presenting a different value for that field keys
+    to a different row and can never read the field back. ``task_id`` and
+    ``flag_type`` are exempt from this rule only because they are exact
+    mirrors of the row's own key columns (the ledger's ``task_id``/
+    ``flag_type`` columns), which any cycle keying to this row at all
+    trivially reproduces. ``cited_tasks`` is not such a mirror — it carries
+    ``project_id``/``title`` the key does not encode — which is exactly what
+    made the now-retired anchor unreachable.
     """
 
+    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    #: Payload keys that mirror the row's own (task_id, flag_type) key
+    #: columns — the only signature inputs allowed to appear in the payload.
+    KEY_MIRROR_KEYS = frozenset({'source', 'kind', 'task_id', 'flag_type'})
+    #: Every input compute_flag_signature reads off a flag (see its
+    #: docstring: task_id, flag_type, cited_tasks).
+    SIGNATURE_INPUT_FIELDS = frozenset({'task_id', 'flag_type', 'cited_tasks'})
+
+    PROJECT = 'know_live'
+    FIX_CITE = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}
+    KNOWN = {'dark_factory': '/df'}
+
+    @staticmethod
+    def _taskmaster(*, status='pending', side_effect=None):
+        """Same idiom as TestDedupFlagsCrossProjectFixTaskSuppression._taskmaster."""
+        taskmaster = AsyncMock()
+        if side_effect is not None:
+            taskmaster.get_task = AsyncMock(side_effect=side_effect)
+        else:
+            taskmaster.get_task = AsyncMock(
+                return_value={'id': 3839, 'title': 'Fix', 'status': status}
+            )
+        return taskmaster
+
     @pytest.mark.asyncio
-    async def test_payload_carries_cited_tasks_in_order(self, ledger_memory_service):
-        """(a) A flag citing two project-qualified tasks persists both, in the
-        order given, under payload['cited_tasks']."""
+    async def test_no_signature_input_is_persisted_as_durable_payload_state(
+        self, ledger_memory_service
+    ):
+        """RED: a flag citing a FOREIGN task must not persist ``cited_tasks``
+        — a ``compute_flag_signature`` input — in its marker payload."""
         from fused_memory.reconciliation.flag_dedup import (
             compute_flag_signature,
             dedup_flags,
         )
 
-        cited = [
-            {'project_id': 'know_live', 'task_id': '598', 'title': 'T1'},
-            {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'T2'},
-        ]
         flag = {
             'task_id': 598,
-            'flag_type': 'remediation_payload_live_workflow_signals_gap',
-            'cited_tasks': cited,
+            'flag_type': self.FLAG_TYPE,
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}],
         }
         sig = compute_flag_signature(flag)
-        assert sig is not None
+        assert sig is not None, 'a well-formed flag must yield a signature'
+        assert sig == ('3839,598', self.FLAG_TYPE), (
+            f'pre-1 measured signature must still hold; got {sig!r}'
+        )
         tid, ftype = sig
 
         await dedup_flags(
@@ -4275,16 +4550,39 @@ class TestDedupFlagsCitedTasksPayload:
         row = await _get_marker(ledger_memory_service.recon_ledger, 'know_live', tid, ftype)
         assert row is not None, 'marker row must be persisted'
         payload = json.loads(row.payload_json)
-        assert payload['cited_tasks'] == [
-            {'project_id': 'know_live', 'task_id': '598', 'title': 'T1'},
-            {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'T2'},
-        ], f'cited_tasks must round-trip in input order; got {payload.get("cited_tasks")!r}'
+
+        # (a) The whole defect in one assertion: cited_tasks is a signature
+        # input and must never be persisted as durable payload state.
+        assert 'cited_tasks' not in payload, (
+            f'cited_tasks is a compute_flag_signature INPUT — persisting it '
+            f'stores it in a row keyed by itself, unreachable to any cycle '
+            f'presenting a different citation set; got {payload!r}'
+        )
+
+        # (b) The invariant in general form: no payload key OUTSIDE the
+        # key-mirror set may be a compute_flag_signature input.
+        non_mirror_keys = set(payload) - self.KEY_MIRROR_KEYS
+        assert not (non_mirror_keys & self.SIGNATURE_INPUT_FIELDS), (
+            f'no payload key outside {sorted(self.KEY_MIRROR_KEYS)} may be a '
+            f'compute_flag_signature input; got {payload!r}'
+        )
+
+        # The two signature inputs that DO appear in the payload are exact
+        # mirrors of the row's own key columns, so they are trivially
+        # reproducible by any cycle that keys to this row at all.
+        assert payload['task_id'] == row.task_id
+        assert payload['flag_type'] == row.flag_type
 
     @pytest.mark.asyncio
     async def test_no_cited_tasks_payload_shape_unchanged(self, ledger_memory_service):
-        """(b) REGRESSION: a flag with no cited_tasks key persists exactly the
-        six historical payload keys, and its returned annotations are
-        unchanged."""
+        """The six-key payload is now the ONLY shape dedup_flags ever writes:
+        no flag, cited or not, ever adds a 'cited_tasks' key (task 4712).
+
+        Folded in from the retired ``TestDedupFlagsCitedTasksPayload`` (task
+        4381), formerly the sole regression pin for this shape — its sibling
+        tests asserting a persisted ``cited_tasks`` key are deleted along
+        with the write they pinned.
+        """
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
         flag = {'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'x'}
@@ -4301,7 +4599,7 @@ class TestDedupFlagsCitedTasksPayload:
         payload = json.loads(row.payload_json)
         assert set(payload) == {
             'source', 'kind', 'task_id', 'flag_type', 'run_id', 'last_seen_run_id',
-        }, f'payload key set must be unchanged for a flag with no cited_tasks; got {sorted(payload)!r}'
+        }, f'payload key set must be the six-key literal, unconditionally; got {sorted(payload)!r}'
         assert 'cited_tasks' not in payload
         assert len(result) == 1
         assert result[0]['last_seen_run_id'] == 'r1'
@@ -4310,111 +4608,165 @@ class TestDedupFlagsCitedTasksPayload:
         )
 
     @pytest.mark.asyncio
-    async def test_empty_cited_tasks_omits_key(self, ledger_memory_service):
-        """(c) cited_tasks=[] persists no 'cited_tasks' key either — the key is
-        optional exactly like 'deduped_against'."""
+    async def test_a_later_cycle_reads_back_the_row_the_earlier_cycle_wrote(
+        self, ledger_memory_service
+    ):
+        """POSITIVE round-trip: the REACHABILITY half of the key invariant
+        (task 4712). When a flag's signature-bearing inputs are UNCHANGED
+        across cycles, the row a cycle writes IS the row a later cycle reads
+        back — no cross-cycle anchor is needed for the ordinary,
+        stable-signature case; the signature itself is the anchor."""
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
-        flag = {'task_id': 42, 'flag_type': 'missing_deliverable', 'cited_tasks': []}
-
-        await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id='p',
-            run_id='r1',
-            flags=[flag],
-        )
-
-        row = await _get_marker(ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable')
-        assert row is not None
-        payload = json.loads(row.payload_json)
-        assert 'cited_tasks' not in payload, (
-            f'an empty cited_tasks must omit the key entirely; got {payload!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_sanitizer_drops_junk_entries_and_values(self, ledger_memory_service):
-        """(d) Non-dict entries, unknown keys, and non-scalar values are all
-        dropped before the payload is written."""
-        from fused_memory.reconciliation.flag_dedup import (
-            compute_flag_signature,
-            dedup_flags,
-        )
-
         flag = {
-            'task_id': 42,
-            'flag_type': 'missing_deliverable',
-            'cited_tasks': [
-                'not-a-dict',
-                {'project_id': 'p', 'task_id': 1, 'title': 'ok', 'extra': 'dropped'},
-                {'project_id': 'p', 'task_id': 2, 'title': {'nested': 'dict'}},
-            ],
+            'task_id': 598,
+            'flag_type': self.FLAG_TYPE,
+            'cited_tasks': [self.FIX_CITE],
         }
-        sig = compute_flag_signature(flag)
-        assert sig is not None
-        tid, ftype = sig
 
-        await dedup_flags(
+        r1 = await dedup_flags(
             memory_service=ledger_memory_service,
-            project_id='p',
+            project_id=self.PROJECT,
             run_id='r1',
-            flags=[flag],
+            flags=[dict(flag)],
+        )
+        assert 'persisted_from_run' not in r1[0], (
+            f'a first cycle (MISS) must not annotate persisted_from_run; got {r1[0]!r}'
         )
 
-        row = await _get_marker(ledger_memory_service.recon_ledger, 'p', tid, ftype)
-        assert row is not None
-        payload = json.loads(row.payload_json)
-        assert payload['cited_tasks'] == [
-            {'project_id': 'p', 'task_id': 1, 'title': 'ok'},
-            {'project_id': 'p', 'task_id': 2},
-        ], f'sanitizer must drop non-dicts, unknown keys and non-scalar values; got {payload.get("cited_tasks")!r}'
+        r2 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[dict(flag)],
+        )
+        assert r2[0]['persisted_from_run'] == 'r1', (
+            f'a repeat of the SAME signature must read back the row r1 wrote; got {r2[0]!r}'
+        )
 
     @pytest.mark.asyncio
-    async def test_unserialisable_cited_value_still_persists_marker(
-        self, ledger_memory_service, caplog
+    async def test_a_citation_less_cycle_keys_to_a_different_row_and_is_not_suppressed(
+        self, ledger_memory_service
     ):
-        """(e) A cited_tasks value that is NOT JSON-serialisable still yields a
-        persisted marker row with a valid payload.
+        """The replacement for the two deleted vacuously-seeded tests
+        (test_anchor_survives_the_cycle_it_suppresses and
+        test_persisted_anchor_alone_suppresses) — and the test that would
+        have caught this defect in the first place.
 
-        This pins that the enrichment can never turn the ledger write into the
-        best-effort WARNING path and silently stop persisting the marker —
-        which would be a regression on the module's core cross-cycle dedup
-        guarantee, not merely a lost annotation.
+        Retiring the anchor means a citation-less cycle keys to a DIFFERENT
+        row than a citing cycle did, so it is a MISS, not suppressed, and
+        re-asserts the finding. This is the ACCEPTED, DOCUMENTED consequence
+        of retiring the anchor — the two deleted tests asserted the opposite
+        only because they hand-seeded a payload row dedup_flags itself can
+        never write.
         """
-        import logging
-
         from fused_memory.reconciliation.flag_dedup import (
             compute_flag_signature,
             dedup_flags,
         )
 
-        flag = {
-            'task_id': 42,
-            'flag_type': 'missing_deliverable',
-            'cited_tasks': [{'project_id': 'p', 'task_id': 1, 'title': object()}],
+        citing_flag = {
+            'task_id': 598,
+            'flag_type': self.FLAG_TYPE,
+            'cited_tasks': [self.FIX_CITE],
         }
-        sig = compute_flag_signature(flag)
-        assert sig is not None
-        tid, ftype = sig
+        citation_less_flag = {'task_id': 598, 'flag_type': self.FLAG_TYPE}
 
-        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
-            await dedup_flags(
-                memory_service=ledger_memory_service,
-                project_id='p',
-                run_id='r1',
-                flags=[flag],
-            )
+        r1 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[citing_flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+        )
+        assert 'persisted_from_run' not in r1[0], (
+            f'the first cycle is a MISS — the gate is HIT-only; got {r1[0]!r}'
+        )
 
-        row = await _get_marker(ledger_memory_service.recon_ledger, 'p', tid, ftype)
-        assert row is not None, (
-            'an unserialisable cited_tasks value must not suppress the marker write'
+        r2 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[citation_less_flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
         )
-        payload = json.loads(row.payload_json)
-        assert payload['cited_tasks'] == [{'project_id': 'p', 'task_id': 1}], (
-            f'the unserialisable value must be stripped by the sanitizer; got {payload.get("cited_tasks")!r}'
+
+        # (a) the r2 flag is RETURNED, not suppressed.
+        assert len(r2) == 1, f'a citation-less cycle must not be suppressed; got {r2!r}'
+        # (b) it carries no persisted_from_run — a MISS, keyed to a different row.
+        assert 'persisted_from_run' not in r2[0], (
+            f'a citation-less cycle keys to a DIFFERENT row than the citing '
+            f'cycle did, so it must be a MISS; got {r2[0]!r}'
         )
-        warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        assert not any('recon_ledger read/write failed' in m for m in warnings), (
-            f'the ledger write must not fall into the best-effort WARNING path; got {warnings!r}'
+
+        # (c) both rows exist, at compute_flag_signature of each cycle's own
+        # flag, and those two signatures DIFFER.
+        citing_sig = compute_flag_signature(citing_flag)
+        citation_less_sig = compute_flag_signature(citation_less_flag)
+        assert citing_sig is not None, 'a well-formed citing flag must yield a signature'
+        assert citation_less_sig is not None, (
+            'a well-formed citation-less flag must yield a signature'
+        )
+        assert citing_sig != citation_less_sig, (
+            f'sanity: the two cycles must key differently; got '
+            f'{citing_sig!r} == {citation_less_sig!r}'
+        )
+        citing_row = await _get_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, *citing_sig
+        )
+        citation_less_row = await _get_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, *citation_less_sig
+        )
+        assert citing_row is not None, 'the r1 citing row must still exist'
+        assert citation_less_row is not None, 'the r2 citation-less row must exist too'
+
+    @pytest.mark.asyncio
+    async def test_a_stable_citation_set_still_suppresses_across_cycles(
+        self, ledger_memory_service
+    ):
+        """The path that DOES work, pinned so a future change cannot quietly
+        break it: when the LLM re-emits the SAME citation set, the signature
+        is stable, the row is the SAME row across cycles, and suppression
+        fires off the CURRENT cycle's own citation — no anchor required.
+        This is the honest statement of what the gate buys: suppression
+        works exactly when the LLM re-emits the citation."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {
+            'task_id': 598,
+            'flag_type': self.FLAG_TYPE,
+            'cited_tasks': [self.FIX_CITE],
+        }
+        taskmaster = self._taskmaster()
+
+        r1 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[dict(flag)],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+        assert len(r1) == 1, f'the first cycle is a MISS — the gate is HIT-only; got {r1!r}'
+
+        stats: dict = {}
+        r2 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[dict(flag)],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert r2 == [], (
+            f'a stable citation set must still suppress across cycles; got {r2!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1, (
+            f'the suppression must be counted; got {stats!r}'
         )
 
 
@@ -4470,607 +4822,6 @@ class TestSanitizeCitedTasks:
 
 
 # ---------------------------------------------------------------------------
-# ---- task 4381 step-16 (review fix) ----
-# RED: the PERSISTENCE projection that BOUNDS the cross-cycle anchor.
-#
-# step-19 feeds the union back into the ledger payload every cycle, which makes
-# the persisted list a feedback loop: whatever is written is read back and
-# re-merged next cycle. _union_cited_tasks deliberately appends an
-# identity-less entry WITHOUT collapsing it against `seen`, so such entries
-# would accumulate +1 per cycle forever (simulated: 2,3,4,5,6,7 over six
-# cycles). _persistable_cited_tasks is the projection applied ONLY to the
-# persisted value: identity-bearing entries only, hard-capped.
-# ---------------------------------------------------------------------------
-
-
-class TestPersistableCitedTasks:
-    """Direct unit tests for the pure ``_persistable_cited_tasks`` helper and
-    its ``_MAX_PERSISTED_CITED_TASKS`` ceiling (task 4381 review fix).
-
-    RED until step-17 adds both symbols.
-    """
-
-    def test_identity_bearing_entries_survive_identity_less_are_dropped(self):
-        """(a) IDENTITY FILTER: only entries carrying BOTH project_id and
-        task_id are persistable — those are the only ones that de-duplicate on
-        the next cycle's union, and the only ones the resolver can look up."""
-        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
-
-        result = _persistable_cited_tasks([
-            {'title': 'x'},
-            {'project_id': 'p', 'task_id': '1', 'title': 'keep me'},
-            {'project_id': 'p'},
-            {'task_id': '2'},
-            {'project_id': 'q', 'task_id': 3},
-        ])
-        assert result == [
-            {'project_id': 'p', 'task_id': '1', 'title': 'keep me'},
-            {'project_id': 'q', 'task_id': 3},
-        ], f'only identity-bearing entries survive, in input order; got {result!r}'
-
-    @pytest.mark.parametrize(
-        'entry',
-        [
-            {'project_id': None, 'task_id': '1'},
-            {'project_id': 'p', 'task_id': None},
-            {'project_id': None, 'task_id': None},
-        ],
-        ids=['null-project', 'null-task', 'both-null'],
-    )
-    def test_explicit_none_identity_counts_as_absent(self, entry):
-        """(b) An explicit ``None`` value for either identity key is exactly as
-        un-deduplicable as an absent key — dropped."""
-        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
-
-        result = _persistable_cited_tasks([entry])
-        assert result is None, (
-            f'an explicit None identity must be dropped like an absent key; got {result!r}'
-        )
-
-    def test_falsy_but_present_identity_values_are_kept(self):
-        """(c) task_id=0 and project_id='' are FALSY but PRESENT — a
-        truthiness check would silently discard a legitimate zero id. Pins an
-        ``is None`` check."""
-        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
-
-        result = _persistable_cited_tasks([
-            {'project_id': 'p', 'task_id': 0, 'title': 'zero id'},
-            {'project_id': '', 'task_id': '7', 'title': 'empty project'},
-        ])
-        assert result == [
-            {'project_id': 'p', 'task_id': 0, 'title': 'zero id'},
-            {'project_id': '', 'task_id': '7', 'title': 'empty project'},
-        ], f'falsy-but-present identity scalars must survive; got {result!r}'
-
-    def test_caps_at_max_keeping_the_first_entries(self):
-        """(d) CAP: the ceiling truncates to the FIRST N — ``_union_cited_tasks``
-        sorts the current cycle's citations first, so the freshest anchor is the
-        one retained."""
-        from fused_memory.reconciliation.flag_dedup import (
-            _MAX_PERSISTED_CITED_TASKS,
-            _persistable_cited_tasks,
-        )
-
-        entries = [
-            {'project_id': 'p', 'task_id': str(i)}
-            for i in range(_MAX_PERSISTED_CITED_TASKS + 5)
-        ]
-        result = _persistable_cited_tasks(entries)
-        assert result is not None
-        assert len(result) == _MAX_PERSISTED_CITED_TASKS, (
-            f'the persisted anchor must be capped at {_MAX_PERSISTED_CITED_TASKS}; '
-            f'got {len(result)}'
-        )
-        assert result == entries[:_MAX_PERSISTED_CITED_TASKS], (
-            f'truncation must keep the FIRST (freshest) entries in order; got {result!r}'
-        )
-
-    @pytest.mark.parametrize(
-        'value',
-        [[], None, 'not-a-list', 42, {'project_id': 'p', 'task_id': '1'}],
-        ids=['empty-list', 'none', 'str', 'int', 'dict'],
-    )
-    def test_nothing_to_persist_returns_none(self, value):
-        """(e) None (never ``[]``) so the caller's ``if persistable:`` gate omits
-        the payload key exactly as the ``deduped_against`` idiom does."""
-        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
-
-        result = _persistable_cited_tasks(value)
-        assert result is None, f'nothing to persist must yield None; got {result!r}'
-
-    def test_all_identity_less_returns_none(self):
-        """(e, mirror) A list that survives sanitization but carries no
-        identity at all yields None, not an empty list."""
-        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
-
-        result = _persistable_cited_tasks([{'title': 'a'}, {'title': 'b'}, 'junk'])
-        assert result is None, (
-            f'an all-identity-less list must yield None, not []; got {result!r}'
-        )
-
-    def test_returns_a_new_list_and_does_not_mutate_input(self):
-        """(f) The projection is pure — the in-memory resolution list handed to
-        the resolver must be untouched by what gets persisted."""
-        import copy
-
-        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
-
-        entries = [
-            {'title': 'identity-less'},
-            {'project_id': 'p', 'task_id': '1'},
-        ]
-        snapshot = copy.deepcopy(entries)
-        result = _persistable_cited_tasks(entries)
-        assert entries == snapshot, (
-            f'the input list must not be mutated; got {entries!r}'
-        )
-        assert result is not entries, (
-            'the projection must return a NEW list, not the caller\'s'
-        )
-
-# ---------------------------------------------------------------------------
-# ---- task 4381 step-18 (review fix) ----
-# RED: the persisted anchor is ERASED by the very cycle it does its job.
-#
-# `payload` is built from the CURRENT cycle's cited_tasks only, and the prior
-# row's anchor — read back into `prior_cited` AFTER the literal is built — is
-# never merged into it before json.dumps. So a cycle that suppresses purely on
-# the persisted anchor rewrites the row WITHOUT that anchor, and the NEXT
-# cycle resurfaces the flag. The union must be persisted, not just resolved.
-# ---------------------------------------------------------------------------
-
-
-class TestDedupFlagsPersistedAnchorUnion:
-    """The ``stage1_flag_marker`` payload must persist the UNION of the prior
-    row's anchor and the current cycle's citations (task 4381 review fix).
-
-    Anything less makes the anchor single-use: it survives exactly one
-    citation-less cycle and is then erased by that cycle's own upsert.
-    """
-
-    PROJECT = 'know_live'
-    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
-    FIX_CITE = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}
-    OLD_CITE = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
-    KNOWN = {'dark_factory': '/df'}
-    BASE_PAYLOAD_KEYS = {
-        'source', 'kind', 'task_id', 'flag_type', 'run_id', 'last_seen_run_id',
-    }
-
-    @staticmethod
-    def _make_flag(cited_tasks=None):
-        flag = {
-            'task_id': 598,
-            'flag_type': TestDedupFlagsPersistedAnchorUnion.FLAG_TYPE,
-            'description': 'the remediation payload omits live workflow signals',
-        }
-        if cited_tasks is not None:
-            flag['cited_tasks'] = cited_tasks
-        return flag
-
-    @staticmethod
-    def _signature(flag):
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
-
-        sig = compute_flag_signature(flag)
-        assert sig is not None
-        return sig
-
-    @staticmethod
-    def _taskmaster(records=None):
-        """AsyncMock taskmaster resolving ``str(task_id) -> record``.
-
-        An unlisted id resolves to ``None`` (not found), which never
-        corroborates and therefore never suppresses.
-        """
-        table = dict(records or {})
-
-        async def _get_task(task_id, project_root):
-            return table.get(str(task_id))
-
-        taskmaster = AsyncMock()
-        taskmaster.get_task = AsyncMock(side_effect=_get_task)
-        return taskmaster
-
-    @classmethod
-    def _live_fix(cls):
-        return {'3839': {'id': 3839, 'title': 'Fix', 'status': 'pending'}}
-
-    async def _payload(self, ledger, tid, ftype):
-        row = await _get_marker(ledger, self.PROJECT, tid, ftype)
-        assert row is not None, 'the marker row must exist after the cycle'
-        return json.loads(row.payload_json)
-
-    @pytest.mark.asyncio
-    async def test_anchor_survives_the_cycle_it_suppresses(self, ledger_memory_service):
-        """(a) HEADLINE, THREE CYCLES: r1 seeds the fix citation; r2 suppresses
-        a citation-less flag on the anchor alone and MUST re-persist it; r3
-        must therefore still be suppressed.
-
-        The r3 assertion is the whole point — today the r2 upsert erases the
-        anchor, so r3 sees an anchor-less row and resurfaces the finding.
-        """
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        flag = self._make_flag()
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': [self.FIX_CITE]},
-        )
-        taskmaster = self._taskmaster(self._live_fix())
-
-        r2 = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[self._make_flag()],
-            taskmaster=taskmaster,
-            known_projects=self.KNOWN,
-        )
-        assert r2 == [], f'the persisted anchor must suppress at r2; got {r2!r}'
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert payload.get('cited_tasks') == [self.FIX_CITE], (
-            'the suppressing cycle must RE-PERSIST the anchor it resolved against; '
-            f'got {payload.get("cited_tasks")!r}'
-        )
-
-        r3 = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r3',
-            flags=[self._make_flag()],
-            taskmaster=taskmaster,
-            known_projects=self.KNOWN,
-        )
-        assert r3 == [], (
-            'the anchor must be self-carrying across arbitrarily many '
-            f'citation-less cycles, not single-use; got {r3!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_union_is_persisted_current_first(self, ledger_memory_service):
-        """(b) The persisted value is the UNION, de-duplicated, current-first —
-        matching ``_union_cited_tasks``' documented precedence."""
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        flag = self._make_flag([self.FIX_CITE])
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': [self.OLD_CITE]},
-        )
-
-        result = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[flag],
-            taskmaster=self._taskmaster(),
-            known_projects=self.KNOWN,
-        )
-        assert len(result) == 1, f'nothing resolves, so nothing is suppressed; got {result!r}'
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert payload.get('cited_tasks') == [self.FIX_CITE, self.OLD_CITE], (
-            'the persisted anchor must carry BOTH sides, current first; '
-            f'got {payload.get("cited_tasks")!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_same_identity_collapses_with_the_current_title_winning(
-        self, ledger_memory_service
-    ):
-        """(c) A task cited by both sides persists ONCE, carrying the CURRENT
-        cycle's title — so a renamed fix task's fresh title replaces the stale
-        anchor rather than accumulating beside it."""
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        stale = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Stale name'}
-        fresh = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Renamed fix'}
-        flag = self._make_flag([fresh])
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': [stale]},
-        )
-
-        await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[flag],
-            taskmaster=self._taskmaster(),
-            known_projects=self.KNOWN,
-        )
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert payload.get('cited_tasks') == [fresh], (
-            'the same (project_id, task_id) must collapse to ONE entry carrying the '
-            f'current cycle\'s title; got {payload.get("cited_tasks")!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_non_suppressed_hit_still_persists_the_prior_anchor(
-        self, ledger_memory_service
-    ):
-        """(d) The anchor must survive EVERY cycle, not only suppressing ones.
-
-        Prior cites a CANCELLED foreign task and the current cycle cites
-        nothing: the flag is correctly RE-ASSERTED, and the anchor must still
-        be there — otherwise a cancelled-then-reopened fix task loses the only
-        record of which task the finding was ever converted into.
-        """
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        flag = self._make_flag()
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': [self.FIX_CITE]},
-        )
-
-        result = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[flag],
-            taskmaster=self._taskmaster(
-                {'3839': {'id': 3839, 'title': 'Fix', 'status': 'cancelled'}}
-            ),
-            known_projects=self.KNOWN,
-        )
-        assert len(result) == 1, (
-            f'a cancelled fix task must never suppress; got {result!r}'
-        )
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert payload.get('cited_tasks') == [self.FIX_CITE], (
-            'the anchor must survive a NON-suppressing cycle too; '
-            f'got {payload.get("cited_tasks")!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_miss_path_persists_the_current_list_exactly(self, ledger_memory_service):
-        """(e) MISS (no prior row): the persisted value is exactly the
-        sanitized current list — re-pins step-1 case (a) through the new
-        code path."""
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        flag = self._make_flag([self.FIX_CITE, self.OLD_CITE])
-        tid, ftype = self._signature(flag)
-
-        result = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r1',
-            flags=[flag],
-            taskmaster=self._taskmaster(self._live_fix()),
-            known_projects=self.KNOWN,
-        )
-        assert len(result) == 1, f'a first-cycle finding is never suppressed; got {result!r}'
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert payload.get('cited_tasks') == [self.FIX_CITE, self.OLD_CITE], (
-            f'the MISS path must persist the current list verbatim; got {payload!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_citations_anywhere_keeps_the_exact_six_key_payload(
-        self, ledger_memory_service
-    ):
-        """(f) REGRESSION: a merge that produces nothing must OMIT the key,
-        never write an empty list — the historical payload stays byte-shaped
-        as it was (re-pins step-1 case (b))."""
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        flag = self._make_flag()
-        tid, ftype = self._signature(flag)
-
-        await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r1',
-            flags=[flag],
-            taskmaster=self._taskmaster(),
-            known_projects=self.KNOWN,
-        )
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert 'cited_tasks' not in payload, (
-            f'an empty merge must omit the key entirely; got {payload!r}'
-        )
-        assert set(payload) == self.BASE_PAYLOAD_KEYS, (
-            f'the citation-less payload must stay the exact six-key literal; got {payload!r}'
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        'prior_cited',
-        ['a-bare-string', {'project_id': 'dark_factory'}, ['not-a-dict', 7], 42, None],
-        ids=['str', 'dict', 'list-of-non-dicts', 'int', 'none'],
-    )
-    async def test_malformed_prior_anchor_degrades_to_current_only(
-        self, ledger_memory_service, prior_cited
-    ):
-        """(g) A malformed prior anchor must not raise: the flag is processed
-        normally and the persisted value is the sanitized CURRENT list only."""
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        flag = self._make_flag([self.FIX_CITE])
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': prior_cited},
-        )
-
-        result = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[flag],
-            taskmaster=self._taskmaster(),
-            known_projects=self.KNOWN,
-        )
-        assert len(result) == 1, (
-            f'a malformed prior anchor must degrade, not raise or suppress; got {result!r}'
-        )
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert payload.get('cited_tasks') == [self.FIX_CITE], (
-            f'a malformed prior contributes nothing to the union; got {payload!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_malformed_prior_with_no_current_citations_omits_the_key(
-        self, ledger_memory_service
-    ):
-        """(g, mirror) Malformed prior AND a citation-less flag -> the key is
-        omitted, not written as ``[]``."""
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        flag = self._make_flag()
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': 'a-bare-string'},
-        )
-
-        await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[flag],
-            taskmaster=self._taskmaster(),
-            known_projects=self.KNOWN,
-        )
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert 'cited_tasks' not in payload, (
-            f'an empty merge must omit the key entirely; got {payload!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_identity_less_citation_does_not_grow_the_row_across_cycles(
-        self, ledger_memory_service
-    ):
-        """(h) BOUNDEDNESS END-TO-END: the feedback-loop regression guard.
-
-        An identity-less entry cannot be de-duplicated by ``_union_cited_tasks``,
-        so feeding the union back every cycle would grow the persisted list by
-        +1 per cycle forever (simulated: 2,3,4,5,6,7). Five consecutive cycles
-        must leave it at exactly the one identity-bearing entry.
-        """
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        ledger = ledger_memory_service.recon_ledger
-        cited = [{'title': 'no identity'}, self.OLD_CITE]
-        tid, ftype = self._signature(self._make_flag(cited))
-        taskmaster = self._taskmaster()
-
-        for cycle in range(5):
-            await dedup_flags(
-                memory_service=ledger_memory_service,
-                project_id=self.PROJECT,
-                run_id=f'r{cycle}',
-                flags=[self._make_flag([dict(e) for e in cited])],
-                taskmaster=taskmaster,
-                known_projects=self.KNOWN,
-            )
-            payload = await self._payload(ledger, tid, ftype)
-            assert payload.get('cited_tasks') == [self.OLD_CITE], (
-                f'the persisted anchor must stay bounded at cycle {cycle}; '
-                f'got {payload.get("cited_tasks")!r}'
-            )
-
-    @pytest.mark.asyncio
-    async def test_oversized_current_citation_list_is_capped(self, ledger_memory_service):
-        """(i) CAP END-TO-END: a flag citing more than the ceiling persists
-        exactly the ceiling, keeping the freshest (first) entries."""
-        from fused_memory.reconciliation.flag_dedup import (
-            _MAX_PERSISTED_CITED_TASKS,
-            dedup_flags,
-        )
-
-        ledger = ledger_memory_service.recon_ledger
-        cited = [
-            {'project_id': 'dark_factory', 'task_id': str(9000 + i), 'title': f't{i}'}
-            for i in range(_MAX_PERSISTED_CITED_TASKS + 5)
-        ]
-        flag = self._make_flag(cited)
-        tid, ftype = self._signature(flag)
-
-        await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r1',
-            flags=[flag],
-            taskmaster=self._taskmaster(),
-            known_projects=self.KNOWN,
-        )
-
-        payload = await self._payload(ledger, tid, ftype)
-        assert payload.get('cited_tasks') == cited[:_MAX_PERSISTED_CITED_TASKS], (
-            f'the persisted anchor must be capped at {_MAX_PERSISTED_CITED_TASKS} '
-            f'keeping the first entries; got {payload.get("cited_tasks")!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_union_with_an_oversized_prior_anchor_stays_capped(
-        self, ledger_memory_service
-    ):
-        """(i, mirror) A second cycle citing FURTHER distinct tasks on top of an
-        already-full anchor still persists exactly the ceiling — never more."""
-        from fused_memory.reconciliation.flag_dedup import (
-            _MAX_PERSISTED_CITED_TASKS,
-            dedup_flags,
-        )
-
-        ledger = ledger_memory_service.recon_ledger
-        prior = [
-            {'project_id': 'dark_factory', 'task_id': str(8000 + i), 'title': f'old{i}'}
-            for i in range(_MAX_PERSISTED_CITED_TASKS + 5)
-        ]
-        current = [
-            {'project_id': 'dark_factory', 'task_id': str(9000 + i), 'title': f'new{i}'}
-            for i in range(5)
-        ]
-        flag = self._make_flag(current)
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': prior},
-        )
-
-        await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[flag],
-            taskmaster=self._taskmaster(),
-            known_projects=self.KNOWN,
-        )
-
-        payload = await self._payload(ledger, tid, ftype)
-        persisted = payload.get('cited_tasks')
-        assert isinstance(persisted, list) and len(persisted) == _MAX_PERSISTED_CITED_TASKS, (
-            f'the union must stay capped at {_MAX_PERSISTED_CITED_TASKS}; got {persisted!r}'
-        )
-        assert persisted[: len(current)] == current, (
-            f'the current cycle\'s citations must be the retained ones; got {persisted!r}'
-        )
-
-
-# ---------------------------------------------------------------------------
 # ---- task 4381 step-7 ----
 # RED: dedup_flags' HIT-path cross-project fix-task suppression gate.
 # ---------------------------------------------------------------------------
@@ -5114,13 +4865,13 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         return sig
 
     @staticmethod
-    def _taskmaster(*, status='pending', side_effect=None):
+    def _taskmaster(*, status='pending', side_effect=None, title='Fix'):
         taskmaster = AsyncMock()
         if side_effect is not None:
             taskmaster.get_task = AsyncMock(side_effect=side_effect)
         else:
             taskmaster.get_task = AsyncMock(
-                return_value={'id': 3839, 'title': 'Fix', 'status': status}
+                return_value={'id': 3839, 'title': title, 'status': status}
             )
         return taskmaster
 
@@ -5316,25 +5067,37 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         )
         taskmaster.get_task.assert_not_called()
 
-    # ---- task 4381 step-9: the persisted anchor carries the fix across cycles ----
+    # ---- task 4381 step-9 / task 4712 ----
+    # Cross-project suppression resolves against the CURRENT cycle's citation
+    # ONLY — the cross-cycle anchor (a persisted 'cited_tasks' payload key) is
+    # retired (task 4712): it was a compute_flag_signature INPUT stored in a
+    # row keyed by itself, unreachable to any cycle presenting a different
+    # citation set (see TestMarkerPayloadKeyInvariant). The two headline
+    # "persisted anchor" tests this section used to pin — one asserting a
+    # citation-less cycle stays suppressed purely off a hand-seeded prior
+    # payload, one asserting a persisted citation outweighs a cancelled
+    # current one — hand-seeded a payload dedup_flags could never itself
+    # write, and are deleted rather than adapted: there is no replacement
+    # behaviour to pin, only its absence (see
+    # test_a_citation_less_cycle_keys_to_a_different_row_and_is_not_suppressed
+    # in TestMarkerPayloadKeyInvariant for that replacement characterization).
+    # ----
 
     @pytest.mark.asyncio
-    async def test_persisted_anchor_alone_suppresses(self, ledger_memory_service):
-        """(a) HEADLINE: the prior payload's cited_tasks — precisely the row
-        step-2 now writes — suppresses even when THIS cycle's LLM output
-        re-emits no citation of its own.
-
-        This is the whole point of the ledger enrichment: a carried-forward
-        finding need not re-cite its fix task every cycle to stay resolved.
-        """
+    async def test_current_citation_suppresses_when_persisted_one_is_cancelled(
+        self, ledger_memory_service
+    ):
+        """The current cycle's live citation suppresses a carried-forward
+        flag. Formerly a UNION case (a persisted anchor citing a CANCELLED
+        task, outweighed by a live current citation); task 4712 retired the
+        persisted anchor, so there is no "persisted one" left to be
+        cancelled — this keeps the original name/fixture shape as the
+        surviving current-cycle-only pin."""
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
-        flag = self._make_flag()
+        flag = self._make_flag([self.FIX_CITE])
         tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': [self.FIX_CITE]},
-        )
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
 
         result = await dedup_flags(
             memory_service=ledger_memory_service,
@@ -5346,77 +5109,7 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         )
 
         assert result == [], (
-            f'the persisted anchor alone must suppress a carried-forward flag; got {result!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_current_citation_suppresses_when_persisted_one_is_cancelled(
-        self, ledger_memory_service
-    ):
-        """(b) UNION: prior anchor cites a CANCELLED task, the current cycle
-        cites a live one -> suppressed via the current citation."""
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        old_cite = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
-
-        async def _get_task(task_id, project_root):
-            if str(task_id) == '3833':
-                return {'id': 3833, 'title': 'Old fix', 'status': 'cancelled'}
-            return {'id': 3839, 'title': 'Fix', 'status': 'pending'}
-
-        flag = self._make_flag([self.FIX_CITE])
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': [old_cite]},
-        )
-
-        result = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[flag],
-            taskmaster=self._taskmaster(side_effect=_get_task),
-            known_projects=self.KNOWN,
-        )
-
-        assert result == [], (
             f'the current cycle\'s live citation must suppress; got {result!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_persisted_citation_suppresses_when_current_one_is_cancelled(
-        self, ledger_memory_service
-    ):
-        """(b, mirror) The persisted anchor is live and the current citation is
-        cancelled -> still suppressed. Either side alone suffices."""
-        from fused_memory.reconciliation.flag_dedup import dedup_flags
-
-        cancelled_cite = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
-
-        async def _get_task(task_id, project_root):
-            if str(task_id) == '3833':
-                return {'id': 3833, 'title': 'Old fix', 'status': 'cancelled'}
-            return {'id': 3839, 'title': 'Fix', 'status': 'pending'}
-
-        flag = self._make_flag([cancelled_cite])
-        tid, ftype = self._signature(flag)
-        await _seed_marker(
-            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
-            run_id='r1', extra_payload={'cited_tasks': [self.FIX_CITE]},
-        )
-
-        result = await dedup_flags(
-            memory_service=ledger_memory_service,
-            project_id=self.PROJECT,
-            run_id='r2',
-            flags=[flag],
-            taskmaster=self._taskmaster(side_effect=_get_task),
-            known_projects=self.KNOWN,
-        )
-
-        assert result == [], (
-            f'the persisted live citation must suppress; got {result!r}'
         )
 
     @pytest.mark.asyncio
@@ -5428,7 +5121,12 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         other_cite = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
 
         async def _get_task(task_id, project_root):
-            return {'id': int(task_id), 'title': 'Nope', 'status': 'pending'}
+            # CANCELLED so the batch resolves nothing and the lookup COUNT
+            # stays the subject of this test.  It used to lean on a
+            # non-matching title ('Nope') for that, which stopped disqualifying
+            # anything once titles became cosmetic (task 4864); an abandoned
+            # status is the disqualifier that is actually load-bearing.
+            return {'id': int(task_id), 'title': 'Nope', 'status': 'cancelled'}
 
         # prior cites {3839}; current cites {3839, 3833} — one shared, one new.
         flag = self._make_flag([self.FIX_CITE, other_cite])
@@ -5448,7 +5146,9 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
             known_projects=self.KNOWN,
         )
 
-        assert len(result) == 1, f'titles do not corroborate, so nothing is suppressed; got {result!r}'
+        assert len(result) == 1, (
+            f'every citation is cancelled, so nothing is suppressed; got {result!r}'
+        )
         assert taskmaster.get_task.call_count == 2, (
             'the union must be de-duplicated on (project_id, task_id) — the shared '
             f'citation must not be looked up twice; got {taskmaster.get_task.call_count}'
@@ -5490,10 +5190,19 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
 
     @pytest.mark.asyncio
     async def test_marker_survives_suppression_with_refreshed_ttl(self, ledger_memory_service):
-        """(d) MARKER SURVIVES SUPPRESSION: the row stays active, its payload
-        advances to the current run_id, its cited_tasks are re-persisted, and
-        its TTL moves forward — so a suppressed-but-recurring signature never
-        ages out and loses its recurrence history."""
+        """MARKER SURVIVES SUPPRESSION: the row stays active, its payload
+        advances to the current run_id, and its TTL moves forward — so a
+        suppressed-but-recurring signature never ages out and loses its
+        recurrence history.
+
+        task 4712 amendment: this test formerly also asserted that
+        ``cited_tasks`` was re-persisted on the suppressed cycle — that
+        pinned the now-retired anchor write (dedup_flags never persists a
+        ``cited_tasks`` payload key at all, see
+        TestMarkerPayloadKeyInvariant) and is replaced below by the
+        assertion that the key is ABSENT. The marker-survival and
+        TTL-refresh properties are independent of that write and still hold.
+        """
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
         seeded_expiry = '2026-01-15T00:00:00+00:00'
@@ -5521,8 +5230,8 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         assert payload['last_seen_run_id'] == 'r2', (
             f'the upsert must run before suppression; got {payload!r}'
         )
-        assert payload['cited_tasks'] == [self.SUBJECT_CITE, self.FIX_CITE], (
-            f'cited_tasks must be re-persisted on the suppressed cycle; got {payload!r}'
+        assert 'cited_tasks' not in payload, (
+            f'dedup_flags never persists cited_tasks (task 4712); got {payload!r}'
         )
         assert row.expires_at is not None and row.expires_at > seeded_expiry, (
             f'the 14-day TTL must be pushed forward; got {row.expires_at!r}'
@@ -5558,6 +5267,1198 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
             and 'fix_task_id=3839' in m
             for m in messages
         ), f'expected a structured suppression log naming the fix task; got {messages!r}'
+
+
+    # ---- task 4864 step-3: weakly-corroborated citations, audibly ----------
+    #
+    # The three shapes no test covered, all reachable from the real producer:
+    # a citation whose ``title`` key is MISSING, one whose title is ``''``
+    # (exactly what ``recon_report.cite_task`` stores for a title-less
+    # ``get_task`` record), and a STALE title (the live task was renamed after
+    # it was cited).  Each must SUPPRESS — the title is cosmetic — and each
+    # must say so at WARNING, because a suppression resting on an
+    # uncorroborated title is a weaker decision than one resting on an exact
+    # match and must not be indistinguishable from it in a log.
+
+    WEAK_CITES = {
+        'title-missing': {'project_id': 'dark_factory', 'task_id': '3839'},
+        'title-empty': {'project_id': 'dark_factory', 'task_id': '3839', 'title': ''},
+        'title-stale': {
+            'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Old name',
+        },
+    }
+    LOGGER = 'fused_memory.reconciliation.flag_dedup'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('shape', sorted(WEAK_CITES), ids=sorted(WEAK_CITES))
+    async def test_weakly_corroborated_citation_suppresses_and_warns(
+        self, shape, ledger_memory_service, caplog
+    ):
+        """(i)+(ii)+(iii): suppressed, counted, and logged at WARNING."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.WEAK_CITES[shape]])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1'
+        )
+        stats: dict[str, int] = {}
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag],
+                taskmaster=self._taskmaster(title='Live current name'),
+                known_projects=self.KNOWN,
+                stats=stats,
+            )
+
+        assert result == [], (
+            f'a cosmetic title must not disable the gate ({shape}); got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1, (
+            f'the drop must be counted ({shape}); got {stats!r}'
+        )
+        # THE WARNING RIDES THE DECISION, not the resolution (amendment).
+        # Level is asserted explicitly: a weak suppression that ACTUALLY
+        # happened must be audible at WARNING.
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and 'stage1_flag_cross_project_fix_task_suppressed_weakly_corroborated'
+            in r.message
+        ]
+        assert len(warnings) == 1, (
+            f'a weakly-corroborated suppression must be logged at WARNING '
+            f'exactly once ({shape}); got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+        message = warnings[0].message
+        assert 'cited_project_id=dark_factory' in message and 'cited_task_id=3839' in message, (
+            f'the warning must name the cited project/task; got {message!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed_weakly_corroborated') == 1, (
+            'the weak subset must be separately countable for the cycle '
+            f'report ({shape}); got {stats!r}'
+        )
+        # The resolver's own line stays, demoted to INFO and reworded to an
+        # OBSERVATION: it runs before the policy branch has decided anything,
+        # so it must not assert an outcome (see the exhausted-branch case).
+        observations = [
+            r for r in caplog.records
+            if 'cross_project_fix_task_title_uncorroborated' in r.message
+        ]
+        assert observations and all(
+            r.levelno == logging.INFO for r in observations
+        ), (
+            'the resolver must merely OBSERVE the uncorroborated title, at '
+            f'INFO ({shape}); got '
+            f'{[(r.levelname, r.message) for r in observations]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_exact_title_match_suppresses_without_a_warning(
+        self, ledger_memory_service, caplog
+    ):
+        """REGRESSION: the WARNING must stay a SIGNAL. A strongly-corroborated
+        suppression still logs only at INFO, or the new level means nothing."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1'
+        )
+        stats: dict[str, int] = {}
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag],
+                taskmaster=self._taskmaster(title='Fix'),
+                known_projects=self.KNOWN,
+                stats=stats,
+            )
+
+        assert result == [] and stats.get('cross_project_fix_task_suppressed') == 1
+        assert not [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ], (
+            'an exact title match must suppress at INFO only; got '
+            f'{[(r.levelname, r.message) for r in caplog.records]!r}'
+        )
+        assert any(
+            'stage1_flag_cross_project_fix_task_suppressed' in r.message
+            for r in caplog.records
+        ), f'the INFO suppression log must still fire; got {caplog.text!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('shape', sorted(WEAK_CITES), ids=sorted(WEAK_CITES))
+    async def test_cancelled_foreign_task_never_suppresses_whatever_the_title(
+        self, shape, ledger_memory_service
+    ):
+        """REGRESSION: relaxing the title veto must not weaken the ABANDONED
+        guard — that is the one preventing permanent silencing."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.WEAK_CITES[shape]])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1'
+        )
+        stats: dict[str, int] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(status='cancelled', title='Live current name'),
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert len(result) == 1, (
+            f'a cancelled fix task must never suppress ({shape}); got {result!r}'
+        )
+        assert 'cross_project_fix_task_suppressed' not in stats, (
+            f'no drop must be counted ({shape}); got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_foreign_task_never_suppresses_whatever_the_title(
+        self, ledger_memory_service
+    ):
+        """The presence check is now the WHOLE admission test, so pin it: a
+        citation naming a task that does not exist must still fail open."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.WEAK_CITES['title-missing']])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1'
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(side_effect=RuntimeError(
+                'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 3839'
+            )),
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, (
+            f'an absent fix task must fail open even title-less; got {result!r}'
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# task 4864 step-9 — RED: dedup_flags consumes the discovery producer WITHOUT
+# perturbing the marker identity
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsCrossProjectDiscovery:
+    """``dedup_flags`` suppresses a carried-forward finding whose covering fix
+    task was DISCOVERED, not cited (task 4864, workstream 1).
+
+    Everything the task-4381 gate does stays exactly as ruled — this only
+    supplies the citation the gate could never get.  The anti-relocation
+    assertion below is the load-bearing one: ``cited_tasks`` is a
+    ``compute_flag_signature`` INPUT read at the TOP of the per-flag loop, so
+    a discovered citation that reached the flag dict would move the marker to
+    a different row.  Since the gate is HIT-only, the first enriched cycle
+    would become a MISS; and because discovery matches a live backlog that
+    changes between cycles, the row would relocate perpetually and never
+    accumulate a HIT at all — strictly worse than today's inertness, and a
+    direct violation of task 4712's ``TestMarkerPayloadKeyInvariant``.
+
+    RED until step-10 wires discovery into dedup_flags.
+    """
+
+    PROJECT = 'know_live'
+    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    KNOWN = {'know_live': '/kl', 'dark_factory': '/df'}
+    #: The signature a citation-less flag keys to — the identity that must
+    #: SURVIVE a discovery-driven suppression untouched.
+    CITATION_FREE_TID = '598'
+    #: What the row would relocate to if a discovered citation ever reached
+    #: the flag dict before compute_flag_signature read it.
+    RELOCATED_TID = '3839,598'
+
+    @classmethod
+    def _flag(cls, task_id: int = 598, description: str | None = None,
+              cited_tasks: list[dict] | None = None) -> dict:
+        """A carried-forward finding with NO citations of its own.
+
+        Description text is shared with TestDiscoverForeignFixTaskCitations so
+        the two classes' fixtures cannot drift apart.
+        """
+        flag = {
+            'task_id': task_id,
+            'flag_type': cls.FLAG_TYPE,
+            'description': (
+                TestDiscoverForeignFixTaskCitations.DESCRIPTION
+                if description is None else description
+            ),
+        }
+        if cited_tasks is not None:
+            flag['cited_tasks'] = cited_tasks
+        return flag
+
+    @staticmethod
+    def _taskmaster(*args, **kwargs):
+        """The discovery fake: get_tasks fan-out + get_task title/live read."""
+        return TestDiscoverForeignFixTaskCitations._taskmaster(*args, **kwargs)
+
+    @classmethod
+    def _covering(cls, **kwargs) -> dict:
+        return TestDiscoverForeignFixTaskCitations._covering_task(**kwargs)
+
+    @staticmethod
+    def _roots(taskmaster) -> list[str]:
+        return [call.args[0] for call in taskmaster.get_tasks.call_args_list]
+
+    # ---- (i) the headline --------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_hit_flag_with_no_citations_is_suppressed_by_discovery(
+        self, ledger_memory_service
+    ):
+        """(i) HEADLINE: a carried-forward finding that cites NOTHING is
+        suppressed because a live foreign fix task covering it was DISCOVERED
+        — the case the gate could never reach before."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._flag()
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster({'/df': [self._covering()]}),
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert result == [], (
+            'a carried-forward complaint already covered by a filed foreign '
+            f'task must be suppressed even with no citation; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1, (
+            f'the suppression must be counted for the cycle report; got {stats!r}'
+        )
+
+    # ---- (ii) THE ANTI-RELOCATION ASSERTION --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_discovery_does_not_relocate_the_marker(self, ledger_memory_service):
+        """(ii) THE LOAD-BEARING ASSERTION: a discovery-driven suppression
+        leaves the marker identity byte-identical to a citation-less cycle.
+
+        Three ways the discovered citation could leak into the signature are
+        pinned at once: the surviving row's task_id, the absence of the
+        relocated row, and the flag dict itself.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        flag = self._flag()
+        assert compute_flag_signature(flag) == (
+            self.CITATION_FREE_TID, self.FLAG_TYPE,
+        ), 'fixture must key to the citation-less signature'
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster({'/df': [self._covering()]}),
+            known_projects=self.KNOWN,
+        )
+        assert result == [], 'precondition: the flag must have been suppressed'
+
+        ledger = ledger_memory_service.recon_ledger
+        row = await _get_marker(
+            ledger, self.PROJECT, self.CITATION_FREE_TID, self.FLAG_TYPE,
+        )
+        assert row is not None, (
+            'the marker must still key to the CITATION-LESS signature '
+            f'{self.CITATION_FREE_TID!r} after a discovery-driven suppression'
+        )
+        assert row.task_id == self.CITATION_FREE_TID
+
+        relocated = await _get_marker(
+            ledger, self.PROJECT, self.RELOCATED_TID, self.FLAG_TYPE,
+        )
+        assert relocated is None, (
+            'a discovered citation must never reach compute_flag_signature: a '
+            f'row at {self.RELOCATED_TID!r} means the marker RELOCATED, which '
+            'would make every enriched cycle a MISS under a HIT-only gate'
+        )
+
+        payload = json.loads(row.payload_json)
+        assert 'cited_tasks' not in payload, (
+            'cited_tasks is a compute_flag_signature INPUT and must never be '
+            f'persisted (task 4712 invariant); got {payload!r}'
+        )
+
+        assert 'cited_tasks' not in flag, (
+            'the discovered citation is an in-memory gate input ONLY — the '
+            f'caller-owned flag dict must not be enriched; got {flag!r}'
+        )
+
+    # ---- (iii) HIT-only policy is inherited --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_first_cycle_miss_is_never_suppressed_by_discovery(
+        self, ledger_memory_service
+    ):
+        """(iii) The HIT-only bound is the gate's, not the citation path's:
+        discovery must not let a FIRST-cycle finding be suppressed, which is
+        exactly the bound filter_already_tracked_systemic_patterns lacks."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[self._flag()],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, (
+            f'a first-cycle finding must never be suppressed; got {result!r}'
+        )
+        assert 'persisted_from_run' not in result[0]
+        taskmaster.get_tasks.assert_not_called()
+
+    # ---- (iv) discovery is the FALLBACK, not the primary --------------------
+
+    @pytest.mark.asyncio
+    async def test_own_citation_resolving_skips_discovery_entirely(
+        self, ledger_memory_service
+    ):
+        """(iv) When the flag's OWN citations already name a live foreign fix
+        task, discovery must not run at all — it is the fallback for findings
+        that cite nothing usable, not a second sweep on every cycle."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        cite = {
+            'project_id': 'dark_factory',
+            'task_id': '3839',
+            'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
+        }
+        flag = self._flag(cited_tasks=[cite])
+        sig = compute_flag_signature(flag)
+        assert sig is not None
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, sig[0], sig[1],
+            run_id='r1',
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], 'the cited live fix task must still suppress'
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a flag whose own citation resolved must issue no discovery '
+            f'fan-out; got {taskmaster.get_tasks.call_args_list!r}'
+        )
+
+    # ---- (v) the lazy-cost guarantee, end to end ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_no_qualifying_flag_issues_zero_get_tasks_calls(
+        self, ledger_memory_service
+    ):
+        """(v) THE COST BOUND, measured through dedup_flags: a cycle whose
+        carried-forward flags have too little signal to match issues ZERO
+        get_tasks calls, so today's per-cycle cost is preserved exactly."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        thin = self._flag(description='No fix task has been filed.')
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[thin],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, f'a thin finding must survive; got {result!r}'
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a cycle with no qualifying flag must issue no get_tasks call at '
+            f'all; got {taskmaster.get_tasks.call_count}'
+        )
+
+    # ---- (vi) the batch memo -----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_task_lists_are_fetched_once_per_batch(self, ledger_memory_service):
+        """(vi) Two qualifying flags share ONE per-project fetch.  Without the
+        dedup_flags-scoped memo, a family of carried-forward findings would
+        re-pull every foreign project's whole backlog per flag."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        ledger = ledger_memory_service.recon_ledger
+        flags = [self._flag(task_id=598), self._flag(task_id=599)]
+        for tid in ('598', '599'):
+            await _seed_marker(ledger, self.PROJECT, tid, self.FLAG_TYPE, run_id='r1')
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=flags,
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert result == [], f'both findings must be suppressed; got {result!r}'
+        assert stats.get('cross_project_fix_task_suppressed') == 2
+        assert self._roots(taskmaster) == ['/df'], (
+            'each foreign project must be fetched ONCE per dedup_flags call, '
+            f'not once per qualifying flag; got {self._roots(taskmaster)!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_term_extraction_is_paid_once_per_batch_not_once_per_flag(
+        self, ledger_memory_service, monkeypatch
+    ):
+        """(vi-b) THE COST BOUND THE MEMO ACTUALLY OWES (amendment).
+
+        Memoising the fetched task LISTS bounds the round trips but not the
+        CPU: term extraction is the expensive half (~0.6s of blocking CPU per
+        ~4.2k-task project, and the plan's cost decision cites 9 known
+        projects), and discovery is invoked once per qualifying flag.  With a
+        raw-payload memo, N carried-forward findings in one family re-extract
+        every foreign task N times — the comment on the memo claimed the
+        opposite outright.  The memo therefore holds the EXTRACTED TERMS.
+        """
+        from fused_memory.reconciliation import flag_dedup as fd
+
+        calls: list[list[str]] = []
+        real = fd._extract_tracked_task_terms
+
+        def _counting(project_ids, project_task_lists):
+            calls.append(list(project_ids))
+            return real(project_ids, project_task_lists)
+
+        monkeypatch.setattr(fd, '_extract_tracked_task_terms', _counting)
+
+        ledger = ledger_memory_service.recon_ledger
+        flags = [self._flag(task_id=598), self._flag(task_id=599)]
+        for tid in ('598', '599'):
+            await _seed_marker(ledger, self.PROJECT, tid, self.FLAG_TYPE, run_id='r1')
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+
+        result = await fd.dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=flags,
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], f'both findings must be suppressed; got {result!r}'
+        assert calls == [['dark_factory']], (
+            'each foreign project must be term-extracted ONCE per dedup_flags '
+            'call, not once per qualifying flag — otherwise the per-batch memo '
+            f'bounds the fetch and not the CPU; got {calls!r}'
+        )
+
+    # ---- (vii) citations that FAIL to resolve fall through to discovery ----
+    #
+    # Amendment (reviewer_comprehensive, test-coverage).  Every other test in
+    # this class uses a citation-LESS flag.  A flag that HAS cited_tasks which
+    # do not resolve is the interesting branch: it keys to a citation-FOLDED
+    # signature, so its HIT depends on the model re-emitting the same citation
+    # set, and it makes two _resolve_live_cross_project_fix_task passes rather
+    # than one.
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_own_citation_falls_through_to_discovery(
+        self, ledger_memory_service
+    ):
+        """(vii) A finding citing only its OWN subject task — the live repro's
+        actual shape — resolves nothing (FOREIGN-only), falls through to
+        discovery, and is suppressed by the foreign task discovery found.
+
+        The gate and discovery also SHARE the get_task memo, so the winning
+        task is read exactly once across both resolver passes: the gate cannot
+        be looking at a different snapshot than the one discovery matched.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        own = {'project_id': self.PROJECT, 'task_id': '601', 'title': 'The subject'}
+        flag = self._flag(cited_tasks=[own])
+        sig = compute_flag_signature(flag)
+        assert sig is not None, f'the flag must have a signature; got {flag!r}'
+        tid, ftype = sig
+        assert tid == '598,601', (
+            'fixture drift: this flag must key to a CITATION-FOLDED signature '
+            f'— that is the branch under test; got {tid!r}'
+        )
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1',
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert result == [], (
+            'a same-project citation resolves nothing, so discovery must still '
+            f'answer the complaint; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1
+        assert [
+            (c.args, c.kwargs) for c in taskmaster.get_task.await_args_list
+        ] == [(('3839', '/df'), {})], (
+            'the discovered task must be read exactly ONCE despite two '
+            'resolver passes — discovery and the gate share fix_task_cache; '
+            f'got {taskmaster.get_task.await_args_list!r}'
+        )
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+        )
+        assert row is not None and row.task_id == tid, (
+            'the flag\'s OWN citation still keys the marker; discovery must '
+            f'not move it either; got {row!r}'
+        )
+        assert 'cited_tasks' not in json.loads(row.payload_json)
+
+    @pytest.mark.asyncio
+    async def test_not_found_foreign_citation_falls_through_to_discovery(
+        self, ledger_memory_service
+    ):
+        """(vii) Same branch via the other route: a FOREIGN citation the
+        backend cannot confirm.  The near-miss must not short-circuit the
+        fallback."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        stale = {'project_id': 'dark_factory', 'task_id': '404', 'title': 'Gone'}
+        flag = self._flag(cited_tasks=[stale])
+        sig = compute_flag_signature(flag)
+        assert sig is not None, f'the flag must have a signature; got {flag!r}'
+        tid, ftype = sig
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1',
+        )
+
+        def _get_task(task_id, project_root):
+            if str(task_id) == '3839':
+                return {
+                    'id': '3839',
+                    'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
+                    'status': 'blocked',
+                }
+            return {'error': f'No tasks found for id {task_id}',
+                    'error_type': 'TaskmasterError'}
+
+        taskmaster = self._taskmaster(
+            {'/df': [self._covering()]}, get_task_side_effect=_get_task,
+        )
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert result == [], (
+            'a citation naming a task that no longer exists must not disable '
+            f'the discovery fallback; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1
+        assert [c.args[0] for c in taskmaster.get_task.await_args_list] == [
+            '404', '3839',
+        ], (
+            'the dead citation is tried first, then the discovered task once; '
+            f'got {taskmaster.get_task.await_args_list!r}'
+        )
+
+    # ---- (viii) discovery is scoped to the complaint class -----------------
+
+    @pytest.mark.asyncio
+    async def test_flag_that_asserts_nothing_is_never_discovered_for(
+        self, ledger_memory_service
+    ):
+        """(viii) A carried-forward finding of some OTHER complaint class is
+        not suppressed by a foreign task that merely covers its wording, and
+        costs no fan-out (amendment — see the candidacy predicate)."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._flag(
+            description=TestDiscoverForeignFixTaskCitations.NON_ASSERTING_DESCRIPTION,
+        )
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering()]})
+        stats: dict[str, Any] = {}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert len(result) == 1, (
+            'only the "no fix task has been filed" complaint class may be '
+            f'answered with "one is filed"; got {result!r}'
+        )
+        assert 'cross_project_fix_task_suppressed' not in stats
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a non-candidate must not trigger the discovery fan-out at all; '
+            f'got {taskmaster.get_tasks.call_args_list!r}'
+        )
+
+    # ---- task 4381's bounds apply to the DISCOVERED path too (step-13) -----
+    #
+    # The failure mode this guards is the one the task names: a bound that
+    # exists on the citation path and silently does not apply to the new
+    # producer.  Discovery must feed the SAME policy branch, not a second one.
+
+    @classmethod
+    def _discovering_taskmaster(cls, status: str):
+        """Backlog and live record agreeing on *status*.
+
+        The gate reads status off the per-id ``get_task``, the matcher off the
+        bulk listing, so both must carry it or the test would prove nothing
+        about the policy actually applied.
+        """
+        return cls._taskmaster(
+            {'/df': [cls._covering(status=status)]},
+            get_task_result={
+                'id': '3839',
+                'title': TestDiscoverForeignFixTaskCitations.LIVE_TITLE,
+                'status': status,
+            },
+        )
+
+    async def _cycle(self, ledger_memory_service, taskmaster, run_id, stats=None):
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        return await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id=run_id,
+            flags=[self._flag()],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=stats if stats is not None else {},
+        )
+
+    async def _done_suppressions(self, ledger_memory_service):
+        row = await _get_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE,
+        )
+        assert row is not None, 'the marker must survive every cycle'
+        return json.loads(row.payload_json).get('cross_project_done_suppressions')
+
+    @pytest.mark.asyncio
+    async def test_done_discovered_fix_task_burns_the_bounded_counter(
+        self, ledger_memory_service
+    ):
+        """(i) A DONE discovered fix task suppresses — but each consecutive
+        cycle burns one of its bounded grace cycles, exactly as a DONE cited
+        one does."""
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        taskmaster = self._discovering_taskmaster('done')
+
+        for cycle, run_id in enumerate(('r2', 'r3'), start=1):
+            stats: dict[str, Any] = {}
+            result = await self._cycle(
+                ledger_memory_service, taskmaster, run_id, stats,
+            )
+            assert result == [], (
+                f'a done discovered fix task must still suppress within its '
+                f'grace window; got {result!r} on cycle {cycle}'
+            )
+            assert stats.get('cross_project_fix_task_suppressed') == 1
+            assert await self._done_suppressions(ledger_memory_service) == cycle, (
+                'each consecutive done-suppressed cycle must burn one grace '
+                'cycle on the marker, or the ceiling can never be reached'
+            )
+
+    @pytest.mark.asyncio
+    async def test_done_discovered_fix_task_stops_suppressing_at_the_ceiling(
+        self, ledger_memory_service, caplog
+    ):
+        """(ii) THE BOUND: at the ceiling the discovered path stops silencing
+        the finding and says so loudly — a fix that landed while the finding
+        keeps recurring is a fix that demonstrably did not work."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+        )
+
+        assert _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES == 8, (
+            'the ruled ceiling is 8 cycles; a change here is a policy change'
+        )
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+            extra_payload={
+                'cross_project_done_suppressions':
+                    _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+            },
+        )
+        stats: dict[str, Any] = {}
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.flag_dedup',
+        ):
+            result = await self._cycle(
+                ledger_memory_service, self._discovering_taskmaster('done'),
+                'r2', stats,
+            )
+
+        assert len(result) == 1, (
+            'past the ceiling the finding must be surfaced again, not silenced '
+            f'forever by a done fix task; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppression_exhausted') == 1
+        assert 'cross_project_fix_task_suppressed' not in stats
+        exhausted = [
+            rec.getMessage() for rec in caplog.records
+            if 'stage1_flag_cross_project_fix_task_suppression_exhausted'
+            in rec.getMessage() and rec.levelno == logging.WARNING
+        ]
+        assert len(exhausted) == 1, (
+            f'exhaustion must be audible at WARNING; got {caplog.records!r}'
+        )
+        # _LiveFixTask.cited carries the DISCOVERED citation, so the log line
+        # names the real foreign task rather than degrading to a bare "some
+        # fix task" — the same identification a cited-path exhaustion gives.
+        assert 'fix_project_id=dark_factory' in exhausted[0]
+        assert 'fix_task_id=3839' in exhausted[0], (
+            f'the exhaustion log must name the discovered fix task; got '
+            f'{exhausted[0]!r}'
+        )
+        assert await self._done_suppressions(ledger_memory_service) == (
+            _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES
+        ), (
+            'the count must FREEZE at the ceiling rather than keep climbing, '
+            'so the finding stays surfaced instead of oscillating'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('status', ['pending', 'blocked'])
+    async def test_filed_but_unfinished_discovered_task_resets_the_counter(
+        self, ledger_memory_service, status
+    ):
+        """(iii) A discovered fix task that is filed but NOT done suppresses
+        indefinitely and RESETS a partially-burned done counter — a reopened
+        fix task earns a fresh window."""
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+            extra_payload={'cross_project_done_suppressions': 3},
+        )
+        stats: dict[str, Any] = {}
+
+        result = await self._cycle(
+            ledger_memory_service, self._discovering_taskmaster(status),
+            'r2', stats,
+        )
+
+        assert result == [], (
+            f'a {status} discovered fix task must suppress; got {result!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppressed') == 1
+        assert await self._done_suppressions(ledger_memory_service) is None, (
+            'a non-done fix task must clear the burned done-grace, not carry '
+            'it forward'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_discovered_task_never_suppresses(
+        self, ledger_memory_service
+    ):
+        """(iv) A CANCELLED task means the work was abandoned; discovering it
+        would silence the complaint forever.  Guarded twice over — the matcher
+        skips it client-side, so the gate is never even consulted."""
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT,
+            self.CITATION_FREE_TID, self.FLAG_TYPE, run_id='r1',
+        )
+        taskmaster = self._discovering_taskmaster('cancelled')
+        stats: dict[str, Any] = {}
+
+        result = await self._cycle(ledger_memory_service, taskmaster, 'r2', stats)
+
+        assert len(result) == 1, (
+            f'a cancelled task must never suppress; got {result!r}'
+        )
+        assert stats == {}, f'nothing may be counted; got {stats!r}'
+        assert taskmaster.get_task.call_count == 0, (
+            'the cancelled task must be dropped before any live read — the '
+            'client-side skip is the belt to the query kwarg braces'
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# task 4864 step-11 — THE ACCEPTANCE TEST: the real producer -> gate seam
+# ---------------------------------------------------------------------------
+
+
+class TestCrossProjectFixTaskProducerToGateSeam:
+    """END TO END over a real ledger: the live repro finding is suppressed on
+    its second cycle by a citation NOTHING IN THIS TEST WROTE (task 4864).
+
+    This is the seam the task says is untested.  Every existing cross-project
+    test hand-writes a ``cited_tasks`` literal whose title it authored to match
+    its own ``AsyncMock`` — which exercises the GATE but proves nothing about
+    whether any producer can reach it.  The measured answer before this task
+    was that none could: Stage 1 sees only its own project's task tree, so it
+    has nothing to cite a FOREIGN fix task from, and the gate had never fired.
+
+    So this class contains NO ``cited_tasks`` literal anywhere.  The only
+    inputs are a finding and a foreign backlog; the citation is produced by
+    the code under test.
+
+    THE ACCEPTANCE CRITERION IS RETARGETED, deliberately.  The task's literal
+    wording — "a foreign citation landing in a ``stage1_flag_marker``
+    payload" — became UNSATISFIABLE BY DESIGN when task 4712 retired
+    ``cited_tasks`` from the payload and added ``TestMarkerPayloadKeyInvariant``
+    to guard it; a test asserting it would have to break a landed invariant to
+    pass.  Its INTENT (drive the REAL producer through to the gate, no
+    hand-built fixture) is preserved in full and asserted here on the gate's
+    OUTCOME instead: suppression happened, the stats counter incremented, and
+    the marker still keys to the citation-less identity.  That last assertion
+    is strictly STRONGER than the original, because it also pins the
+    anti-relocation constraint the payload assertion never touched.
+
+    Shape is the live repro: know_live flag e3527208 (task 598, flag_type
+    ``remediation_payload_live_workflow_signals_gap``), whose complaint is
+    literally that no fix task has been filed, against a dark_factory backlog
+    where 3833/3839 are blocked/pending — the same statuses that let the
+    finding survive the pre-ruling done-only filter.
+    """
+
+    PROJECT = 'know_live'
+    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    KNOWN = {'know_live': '/kl', 'dark_factory': '/df'}
+    #: The identity a citation-less flag keys to, and must keep.
+    TID = '598'
+
+    #: The finding, in the originating wording — the "no fix task has been
+    #: filed" complaint class of Leo's 2026-08-17 ruling on gate 3841.
+    DESCRIPTION = (
+        'Stage 2 remediation payloads omit the live workflow signals an '
+        'operator needs to diagnose a stalled task — merge-queue depth and '
+        'scheduler state never appear in the payload. This has recurred for '
+        'many cycles and no fix task has been filed.'
+    )
+
+    #: The dark_factory backlog as the live repro had it: two genuine fix
+    #: tasks (blocked/pending, both covering the complaint) and one unrelated
+    #: task that must never be discovered.  Measured against the production
+    #: thresholds: 3839 and 3833 both score coverage 0.86 / precision >= 0.73,
+    #: while 4102 scores 0.00 — so a "matches anything" regression in the
+    #: matcher would surface here rather than hide behind a rigged fixture.
+    BACKLOG = [
+        {
+            'id': '3839',
+            'status': 'pending',
+            'title': 'Remediation payload omits live workflow signals',
+            'description': (
+                'Stage 2 emits a remediation payload without the live workflow '
+                'signals an operator needs — merge-queue depth and scheduler '
+                'state never appear — so a stalled task cannot be diagnosed '
+                'from the payload. Recurred for many cycles; fix the payload '
+                'builder.'
+            ),
+        },
+        {
+            'id': '3833',
+            'status': 'blocked',
+            'title': 'Carry live workflow signals through the remediation payload',
+            'description': (
+                'The remediation payload an operator reads omits merge-queue '
+                'depth, scheduler state and every other live workflow signal '
+                'needed to diagnose a stalled task; it has recurred for many '
+                'cycles. Fix stage 2 so the signals appear.'
+            ),
+        },
+        {
+            'id': '4102',
+            'status': 'in-progress',
+            'title': 'Rotate the OpenAI embedding key',
+            'description': 'The embedding key is due for rotation this quarter.',
+        },
+    ]
+    #: Either genuine fix task may win — they tie on coverage, so the winner
+    #: is backlog-order-dependent and pinning one would over-specify.
+    FIX_TASK_IDS = frozenset({'3833', '3839'})
+
+    @classmethod
+    def _flag(cls) -> dict:
+        """The finding as Stage 1 emits it — with NO citations."""
+        return {
+            'task_id': 598,
+            'flag_type': cls.FLAG_TYPE,
+            'description': cls.DESCRIPTION,
+        }
+
+    @classmethod
+    def _taskmaster(cls):
+        """A backend serving the dark_factory backlog and per-id task reads.
+
+        ``get_task`` answers from the SAME records ``get_tasks`` listed, so the
+        live title a discovered citation carries is the real one — which is
+        what makes a discovered citation corroborate by construction.
+        """
+        by_id = {task['id']: task for task in cls.BACKLOG}
+
+        def _get_tasks(project_root, *, statuses=None):
+            return {'tasks': list(cls.BACKLOG) if project_root == '/df' else []}
+
+        def _get_task(task_id, project_root):
+            task = by_id.get(str(task_id))
+            if task is None or project_root != '/df':
+                return {'error': f'No tasks found for id {task_id}',
+                        'error_type': 'TaskmasterError'}
+            return dict(task)
+
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(side_effect=_get_tasks)
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_second_cycle_is_suppressed_by_a_citation_the_code_produced(
+        self, ledger_memory_service, caplog
+    ):
+        """THE ACCEPTANCE TEST. Cycle 1 records the marker and re-asserts the
+        finding; cycle 2 suppresses it — on a citation this test never wrote."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        assert compute_flag_signature(self._flag()) == (self.TID, self.FLAG_TYPE), (
+            'the finding must key to the CITATION-LESS identity — the whole '
+            'point is that it cites nothing'
+        )
+        taskmaster = self._taskmaster()
+
+        # ---- cycle 1: first sighting -----------------------------------
+        cycle1_stats: dict[str, Any] = {}
+        cycle1 = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[self._flag()],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+            stats=cycle1_stats,
+        )
+
+        assert len(cycle1) == 1, (
+            f'the first sighting must be re-asserted, never suppressed; got {cycle1!r}'
+        )
+        assert 'persisted_from_run' not in cycle1[0]
+        assert cycle1_stats == {}, (
+            f'no suppression may be counted on a first cycle; got {cycle1_stats!r}'
+        )
+        assert taskmaster.get_tasks.call_count == 0, (
+            'HIT-only: a first cycle must not even attempt discovery'
+        )
+
+        # ---- cycle 2: carried forward, and now suppressed ---------------
+        flag2 = self._flag()
+        cycle2_stats: dict[str, Any] = {}
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.reconciliation.flag_dedup',
+        ):
+            cycle2 = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag2],
+                taskmaster=taskmaster,
+                known_projects=self.KNOWN,
+                stats=cycle2_stats,
+            )
+
+        assert cycle2 == [], (
+            'the carried-forward finding must be suppressed by the DISCOVERED '
+            f'fix task; got {cycle2!r}'
+        )
+        assert cycle2_stats.get('cross_project_fix_task_suppressed') == 1, (
+            f'the suppression must be counted; got {cycle2_stats!r}'
+        )
+
+        # The citation was PRODUCED, not supplied: the suppression log names a
+        # real dark_factory fix task from the backlog.
+        suppressed_lines = [
+            rec.getMessage() for rec in caplog.records
+            if 'stage1_flag_cross_project_fix_task_suppressed' in rec.getMessage()
+        ]
+        assert len(suppressed_lines) == 1, (
+            f'expected exactly one suppression log line; got {suppressed_lines!r}'
+        )
+        line = suppressed_lines[0]
+        assert 'fix_project_id=dark_factory' in line, line
+        assert any(f'fix_task_id={tid}' in line for tid in self.FIX_TASK_IDS), (
+            'the gate must name one of the real foreign fix tasks discovery '
+            f'found (3833/3839); got {line!r}'
+        )
+        assert 'fix_task_id=4102' not in line, (
+            f'the unrelated backlog task must never be discovered; got {line!r}'
+        )
+
+        # A discovered citation carries the LIVE title, so it takes the gate's
+        # strongly-corroborated branch — the WARNING stays a signal about
+        # genuinely stale LLM-authored citations (task 4864 step-4).
+        assert not [
+            rec for rec in caplog.records
+            if 'cross_project_fix_task_title_uncorroborated' in rec.getMessage()
+        ], 'a discovered citation must corroborate by construction'
+
+        # ---- the marker identity survived untouched --------------------
+        ledger = ledger_memory_service.recon_ledger
+        row = await _get_marker(ledger, self.PROJECT, self.TID, self.FLAG_TYPE)
+        assert row is not None, (
+            'the suppressing cycle must still refresh the marker — skipping '
+            'the write would let it age out and lose the recurrence history'
+        )
+        assert row.task_id == self.TID, (
+            'the marker must still key to the CITATION-LESS identity after a '
+            f'discovery-driven suppression; got {row.task_id!r}'
+        )
+        payload = json.loads(row.payload_json)
+        assert 'cited_tasks' not in payload, (
+            f'task 4712 payload invariant must hold; got {payload!r}'
+        )
+        assert payload['last_seen_run_id'] == 'r2'
+        for fix_task_id in self.FIX_TASK_IDS:
+            assert await _get_marker(
+                ledger, self.PROJECT, f'{fix_task_id},{self.TID}', self.FLAG_TYPE,
+            ) is None, (
+                f'a row keyed {fix_task_id},{self.TID} means the discovered '
+                'citation reached compute_flag_signature and RELOCATED the '
+                'marker — under a HIT-only gate that cycle becomes a MISS'
+            )
+        assert flag2 == self._flag(), (
+            f'the caller-owned flag dict must come back unmutated; got {flag2!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_backlog_without_a_covering_task_still_re_asserts(
+        self, ledger_memory_service
+    ):
+        """The seam's negative control: with the two genuine fix tasks removed
+        from the foreign backlog, the SAME two cycles re-assert the finding.
+
+        Without this, a suppression bug that fires on any carried-forward flag
+        would pass the acceptance test above and look like success.
+        """
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        taskmaster = self._taskmaster()
+        unrelated = [task for task in self.BACKLOG if task['id'] == '4102']
+
+        def _get_tasks(project_root, *, statuses=None):
+            return {'tasks': list(unrelated) if project_root == '/df' else []}
+
+        taskmaster.get_tasks = AsyncMock(side_effect=_get_tasks)
+
+        for run_id in ('r1', 'r2'):
+            stats: dict[str, Any] = {}
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id=run_id,
+                flags=[self._flag()],
+                taskmaster=taskmaster,
+                known_projects=self.KNOWN,
+                stats=stats,
+            )
+            assert len(result) == 1, (
+                f'with no covering foreign task the finding must survive cycle '
+                f'{run_id}; got {result!r}'
+            )
+            assert stats == {}, f'nothing may be suppressed; got {stats!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -9322,6 +10223,538 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
 
 
 # ---------------------------------------------------------------------------
+# task 4864 — deterministic cross-project fix-task DISCOVERY (workstream 1,
+# design option (b)): the PRODUCER the task-4381 gate has never had
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverForeignFixTaskCitations:
+    """Tests for ``_discover_foreign_fix_task_citations(taskmaster,
+    known_projects, project_id, candidates)`` (task 4864, workstream 1).
+
+    The task-4381 gate suppresses a carried-forward finding whose
+    ``cited_tasks`` names a live FOREIGN fix task — but nothing has ever
+    PRODUCED such a citation.  Stage 1's context is its own project's task
+    tree, so the model has nothing to cite from, and design option (a)
+    (Stage 2 -> Stage 1 marker enrichment) is defeated outright by
+    ``compute_flag_signature`` folding citations into the marker row's own
+    KEY (task 4712's invariant).  This helper is the deterministic producer
+    that closes the gap: it matches a candidate finding's key terms against
+    every FOREIGN project's non-cancelled backlog through the module's own
+    proven ``_match_already_tracked_candidates`` and synthesises a
+    ``{project_id, task_id, title}`` citation from the winning task.
+
+    The result is an in-memory GATE INPUT ONLY and is never written back onto
+    the flag — see ``TestDedupFlagsCrossProjectDiscovery``'s anti-relocation
+    assertion for why that constraint is load-bearing.
+
+    RED until step-8 adds the helper.
+    """
+
+    PROJECT = 'know_live'
+    KNOWN = {'know_live': '/kl', 'dark_factory': '/df'}
+
+    #: The live repro shape (know_live flag e3527208 / dark_factory 598): a
+    #: recurring finding whose own wording is the "no fix task has been
+    #: filed" complaint the ruled gate exists to answer.  Yields 8 key terms
+    #: — comfortably above min_key_terms=4.
+    DESCRIPTION = (
+        'The Stage 2 remediation payload omits live workflow signals; '
+        'no fix task has been filed.'
+    )
+    #: What ``_safe_get_task`` reports for the matched task.  Deliberately
+    #: DIFFERENT from the ``get_tasks`` title below so a test can prove the
+    #: citation's title is read from the LIVE record rather than from the
+    #: bulk listing the match was computed against.
+    LIVE_TITLE = 'Remediation payload omits live workflow signals (renamed)'
+
+    @classmethod
+    def _candidate(cls, description: str | None = None) -> dict:
+        """A carried-forward finding in the repro's shape."""
+        return {
+            'task_id': 598,
+            'flag_type': 'remediation_payload_live_workflow_signals_gap',
+            'description': cls.DESCRIPTION if description is None else description,
+        }
+
+    @staticmethod
+    def _covering_task(task_id: str = '3839', status: str = 'blocked') -> dict:
+        """A foreign task whose title+description covers the candidate's terms.
+
+        Measured against the production thresholds: coverage 1.00 (>= 0.75)
+        and precision 0.67 (>= 0.2).
+        """
+        return {
+            'id': task_id,
+            'status': status,
+            'title': 'Remediation payload omits live workflow signals',
+            'description': (
+                'Stage 2 emits a remediation payload with no live workflow '
+                'signals; fix the payload builder so it carries them.'
+            ),
+        }
+
+    @classmethod
+    def _taskmaster(
+        cls,
+        project_tasks: dict[str, list[dict]] | None = None,
+        *,
+        tasks_side_effect=None,
+        tasks_result=None,
+        get_task_result: Any = None,
+        get_task_side_effect=None,
+    ):
+        """Fake exposing BOTH backend calls discovery makes: the per-project
+        ``get_tasks`` fan-out and the winning task's ``get_task`` title read."""
+        taskmaster = AsyncMock()
+        if tasks_side_effect is not None:
+            taskmaster.get_tasks = AsyncMock(side_effect=tasks_side_effect)
+        elif tasks_result is not None:
+            taskmaster.get_tasks = AsyncMock(return_value=tasks_result)
+        else:
+            tasks_by_root = project_tasks or {}
+
+            def _get_tasks(project_root, *, statuses=None):
+                return {'tasks': list(tasks_by_root.get(project_root, []))}
+
+            taskmaster.get_tasks = AsyncMock(side_effect=_get_tasks)
+        if get_task_side_effect is not None:
+            taskmaster.get_task = AsyncMock(side_effect=get_task_side_effect)
+        else:
+            taskmaster.get_task = AsyncMock(
+                return_value=(
+                    {'id': '3839', 'title': cls.LIVE_TITLE, 'status': 'blocked'}
+                    if get_task_result is None
+                    else get_task_result
+                )
+            )
+        return taskmaster
+
+    # ---- (i) the headline: a foreign match becomes a citation --------------
+
+    @pytest.mark.asyncio
+    async def test_matching_foreign_task_yields_citation_with_live_title(self):
+        """(i) HEADLINE: a candidate covered by a live FOREIGN task produces a
+        ``{project_id, task_id, title}`` citation, titled from the LIVE record."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _NON_CANCELLED_TASK_STATUSES,
+            _discover_foreign_fix_task_citations,
+        )
+
+        flag = self._candidate()
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [flag],
+        )
+
+        assert result == {
+            0: {
+                'project_id': 'dark_factory',
+                'task_id': '3839',
+                'title': self.LIVE_TITLE,
+            },
+        }, (
+            'a carried-forward complaint already covered by a filed foreign '
+            f'task must yield a citation naming it; got {result!r}'
+        )
+        # The title comes from the LIVE record (_safe_get_task), not from the
+        # bulk listing the coverage match was computed against — so a
+        # discovered citation corroborates by construction.
+        taskmaster.get_task.assert_awaited_once_with('3839', '/df')
+        # FOREIGN-only fan-out, with the ruled non-cancelled vocabulary.
+        roots = [call.args[0] for call in taskmaster.get_tasks.call_args_list]
+        assert roots == ['/df'], (
+            f'discovery must query FOREIGN projects only; got {roots!r}'
+        )
+        for call in taskmaster.get_tasks.call_args_list:
+            assert call.kwargs.get('statuses') == _NON_CANCELLED_TASK_STATUSES
+
+    @pytest.mark.asyncio
+    async def test_candidate_flag_is_never_mutated(self):
+        """(i, cont.) ANTI-RELOCATION at the helper boundary: discovery must
+        not write its result back onto the flag — ``cited_tasks`` is a
+        ``compute_flag_signature`` INPUT, so enriching the dict would move the
+        marker row instead of annotating it (task 4712)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        flag = self._candidate()
+        before = dict(flag)
+
+        await _discover_foreign_fix_task_citations(
+            self._taskmaster({'/df': [self._covering_task()]}),
+            self.KNOWN, self.PROJECT, [flag],
+        )
+
+        assert flag == before, (
+            f'discovery must not mutate the candidate flag; got {flag!r}'
+        )
+        assert 'cited_tasks' not in flag
+
+    # ---- (ii) foreign-only -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_same_project_match_is_never_returned(self):
+        """(ii) FOREIGN-ONLY, mirroring the gate's correctness core: a covering
+        task in the RUNNING project is never discovered, and that project is
+        not even queried."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({
+            '/kl': [self._covering_task(task_id='598')],
+            '/df': [],
+        })
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}, (
+            'a SAME-project covering task must never be discovered — a '
+            "finding's own subject task would otherwise self-suppress it; "
+            f'got {result!r}'
+        )
+        roots = [call.args[0] for call in taskmaster.get_tasks.call_args_list]
+        assert '/kl' not in roots, (
+            f'the running project must not even be queried; got {roots!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_foreign_project_known_issues_no_lookup(self):
+        """(ii, cont.) When the ONLY known project is the running one there is
+        nothing foreign to query, so discovery short-circuits with no I/O."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({'/kl': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, {'know_live': '/kl'}, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}
+        taskmaster.get_tasks.assert_not_called()
+
+    # ---- (iii) cancelled tasks can never be discovered ---------------------
+
+    @pytest.mark.asyncio
+    async def test_cancelled_foreign_task_is_never_returned(self):
+        """(iii) A CANCELLED task means the work was explicitly abandoned;
+        discovering it would silence the complaint forever.  Pinned with the
+        backend IGNORING the ``statuses`` kwarg (it returns the cancelled task
+        anyway), so the guarantee rests on the client-side re-check rather
+        than on the query alone."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({
+            '/df': [self._covering_task(status='cancelled')],
+        })
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}, (
+            'a cancelled foreign task must never be discovered, even when the '
+            f'backend ignores the statuses kwarg; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    # ---- (iv) too little signal -------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_below_min_key_terms_candidate_yields_nothing(self):
+        """(iv) A candidate with fewer than ``min_key_terms`` distinctive terms
+        is never matched — too little signal to trust a coverage match — and
+        because no candidate qualifies, no ``get_tasks`` call is issued."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+            _significant_terms,
+        )
+
+        thin = self._candidate(description='No fix task has been filed.')
+        assert len(_significant_terms(thin['description'])) < 4, (
+            'fixture must genuinely fall below min_key_terms'
+        )
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [thin],
+        )
+
+        assert result == {}, f'a thin candidate must not match; got {result!r}'
+        taskmaster.get_tasks.assert_not_called()
+
+    # ---- (v) fail-open in every direction ---------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('taskmaster_kwargs', 'known_projects'),
+        [
+            pytest.param({'tasks_side_effect': RuntimeError('backend down')},
+                         KNOWN, id='get-tasks-raises'),
+            pytest.param({'tasks_result': {'tasks': None}}, KNOWN,
+                         id='malformed-tasks-none'),
+            pytest.param({'tasks_result': 'not-a-dict'}, KNOWN,
+                         id='malformed-not-a-dict'),
+            pytest.param({'tasks_result': {}}, KNOWN, id='malformed-empty'),
+            pytest.param({}, {}, id='no-known-projects'),
+            pytest.param({}, None, id='none-known-projects'),
+            pytest.param({}, {'dark_factory': ''}, id='blank-project-root'),
+        ],
+    )
+    async def test_fail_open_yields_no_citation_and_never_raises(
+        self, taskmaster_kwargs, known_projects
+    ):
+        """(v) Every degraded input resolves to "no discovery" rather than a
+        raise — suppress-only-on-positive-confirmation, matching the sibling
+        filters' posture."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]},
+                                      **taskmaster_kwargs)
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, known_projects, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}, f'degraded input must yield no citation; got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_falsy_taskmaster_is_fail_open(self):
+        """(v, cont.) No taskmaster at all — the pre-4864 call shape — is a
+        no-op, which is what keeps every existing call site unaffected."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        assert await _discover_foreign_fix_task_citations(
+            None, self.KNOWN, self.PROJECT, [self._candidate()],
+        ) == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'get_task_kwargs',
+        [
+            pytest.param({'get_task_side_effect': RuntimeError('boom')},
+                         id='get-task-raises'),
+            pytest.param({'get_task_result': {'error': 'not found',
+                                              'error_type': 'TaskmasterError'}},
+                         id='not-found'),
+            pytest.param({'get_task_result': {'id': '3839', 'status': 'blocked'}},
+                         id='title-missing'),
+            pytest.param({'get_task_result': {'id': '3839', 'title': '',
+                                              'status': 'blocked'}},
+                         id='title-empty'),
+        ],
+    )
+    async def test_unresolvable_live_title_is_fail_open(self, get_task_kwargs):
+        """(v, cont.) The title read backs the "corroborates by construction"
+        property of a discovered citation, so when it cannot be resolved
+        discovery declines rather than synthesising a citation it cannot
+        stand behind."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]},
+                                      **get_task_kwargs)
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [self._candidate()],
+        )
+
+        assert result == {}, (
+            'an unresolvable live title must fail open to no discovery; '
+            f'got {result!r}'
+        )
+
+    # ---- (vi) the lazy-cost guarantee -------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_zero_candidates_issues_no_get_tasks_call(self):
+        """(vi) THE COST BOUND: with no candidates at all, discovery issues
+        ZERO ``get_tasks`` calls — the per-project fan-out is seconds of
+        blocking CPU on a real backlog, so a cycle with nothing to discover
+        must cost exactly what it costs today."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [],
+        )
+
+        assert result == {}
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a cycle with zero candidates must issue no get_tasks call at all; '
+            f'got {taskmaster.get_tasks.call_count}'
+        )
+        assert taskmaster.get_task.call_count == 0
+
+    # ---- (vii) CANDIDACY: only the complaint class the gate answers -------
+    #
+    # Amendment (reviewer_comprehensive, architecture).  Without this
+    # predicate discovery applied to EVERY carried-forward flag, replacing the
+    # citation path's anchor — an LLM's judgment that the cited task FIXES the
+    # finding — with bare term overlap for findings that never claimed nothing
+    # was filed.  A recurring stranded-work or metadata-drift flag whose
+    # wording happened to be 75%-covered by any non-cancelled foreign task
+    # would then be suppressed for as long as that task stayed open, with only
+    # a stats counter and an INFO line as the trace.
+
+    #: Same subject and term count as DESCRIPTION, but it makes no
+    #: never-tracked assertion at all — a plain recurring observation.
+    NON_ASSERTING_DESCRIPTION = (
+        'The Stage 2 remediation payload omits live workflow signals; '
+        'operators keep re-deriving them by hand.'
+    )
+
+    @pytest.mark.asyncio
+    async def test_candidate_that_asserts_nothing_is_not_discovered_for(self):
+        """(vii) A finding that never says "no fix task has been filed" is not
+        answered with "one is filed", however well its wording overlaps."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _asserts_never_tracked,
+            _discover_foreign_fix_task_citations,
+            _significant_terms,
+        )
+
+        # The fixture must fail ONLY the candidacy predicate — if it were also
+        # below min_key_terms this test would pass for the wrong reason.
+        assert not _asserts_never_tracked(self.NON_ASSERTING_DESCRIPTION)
+        assert len(_significant_terms(self.NON_ASSERTING_DESCRIPTION)) >= 4
+        flag = self._candidate(description=self.NON_ASSERTING_DESCRIPTION)
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [flag],
+        )
+
+        assert result == {}, (
+            'discovery must be scoped to the "no fix task has been filed" '
+            f'complaint class the gate answers; got {result!r}'
+        )
+        assert taskmaster.get_tasks.call_count == 0, (
+            'a non-asserting candidate must not even trigger the per-project '
+            f'fan-out; got {taskmaster.get_tasks.call_args_list!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_asserting_candidate_still_carries_the_batch(self):
+        """(vii) The predicate zeroes out non-candidates WITHOUT shifting the
+        returned indices — a mixed batch still answers for the right flag."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+        )
+
+        candidates = [
+            self._candidate(description=self.NON_ASSERTING_DESCRIPTION),
+            self._candidate(),
+        ]
+        taskmaster = self._taskmaster({'/df': [self._covering_task()]})
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, candidates,
+        )
+
+        assert set(result) == {1}, (
+            'the citation must key to the ASSERTING candidate\'s own index; '
+            f'got {result!r}'
+        )
+        assert result[1]['task_id'] == '3839'
+
+    # ---- (viii) an OPEN match beats a better-covering DONE one -------------
+    #
+    # Amendment (reviewer_comprehensive, robustness).  Discovery synthesises
+    # exactly ONE citation per candidate, and the gate bounds a `done` fix task
+    # to _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES cycles.  So a marginally
+    # better-covering done task winning over a still-open one burns that
+    # ceiling and re-asserts the finding — logging "the cited fix task is done
+    # yet the finding keeps recurring" — while an OPEN fix task for it sits in
+    # the same backlog.  Safe direction, misleading signal, gate inert for
+    # exactly the case it was built for.
+
+    #: An OPEN (blocked) fix task covering 7 of the candidate's 8 key terms —
+    #: 0.875 coverage, 0.70 precision, both comfortably over the thresholds.
+    OPEN_TASK = {
+        'id': '3839',
+        'status': 'blocked',
+        'title': 'Carry live workflow signals through the remediation payload',
+        'description': (
+            'The remediation payload lacks live workflow signals; fix the '
+            'stage 2 payload builder.'
+        ),
+    }
+    #: A DONE task covering ALL 8 — 1.00 coverage, 0.89 precision.  On
+    #: coverage alone it beats OPEN_TASK outright, which is the whole point.
+    BETTER_COVERING_DONE_TASK = {
+        'id': '9001',
+        'status': 'done',
+        'title': 'Remediation payload omits live workflow signals',
+        'description': 'Fix stage 2 so the payload carries live workflow signals.',
+    }
+
+    @pytest.mark.asyncio
+    async def test_open_match_wins_over_a_better_covering_done_match(self):
+        """(viii) The open task is cited even though the done one covers more."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _discover_foreign_fix_task_citations,
+            _extract_tracked_task_terms,
+            _match_extracted_tracked_tasks,
+            _significant_terms,
+        )
+
+        backlog = [self.BETTER_COVERING_DONE_TASK, self.OPEN_TASK]
+        # Prove the fixture is the adversarial one: on COVERAGE alone the done
+        # task wins, so a passing assertion below can only come from the
+        # status preference and not from fixture luck or ordering.
+        tracked = [
+            entry
+            for per_project in _extract_tracked_task_terms(
+                ['dark_factory'], [backlog],
+            )
+            if per_project is not None
+            for entry in per_project
+        ]
+        terms = [_significant_terms(self.DESCRIPTION)]
+        coverage_only = _match_extracted_tracked_tasks(tracked, terms, 4, 0.75, 0.2)
+        assert coverage_only[0].task_id == '9001', (
+            'fixture drift: the DONE task must out-cover the open one, or '
+            f'this test proves nothing; got {coverage_only!r}'
+        )
+
+        by_id = {task['id']: task for task in backlog}
+        taskmaster = self._taskmaster(
+            {'/df': backlog},
+            get_task_side_effect=lambda task_id, project_root: dict(
+                by_id[str(task_id)]
+            ),
+        )
+
+        result = await _discover_foreign_fix_task_citations(
+            taskmaster, self.KNOWN, self.PROJECT, [self._candidate()],
+        )
+
+        assert result[0]['task_id'] == '3839', (
+            'a still-OPEN fix task must be preferred over an already-done one '
+            'whatever the coverage — the gate bounds a done suppression to 8 '
+            f'cycles and would then re-assert the finding; got {result!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 4711 — widen _NEVER_TRACKED_PHRASES so the pointer-free cross-project
 # filter reaches the "no fix task has been filed" complaint class
 # ---------------------------------------------------------------------------
@@ -9795,8 +11228,7 @@ class TestCrossProjectGateAmendments:
         flag_a = self._flag(task_id=601)
         flag_b = self._flag(task_id=598, cited=[self.FIX_CITE])
         flag_c = self._flag(task_id=602)
-        await self._seed(ledger_memory_service.recon_ledger, flag_b,
-                         cited_tasks=[self.FIX_CITE])
+        await self._seed(ledger_memory_service.recon_ledger, flag_b)
 
         result = await dedup_flags(
             memory_service=ledger_memory_service,
@@ -9823,8 +11255,7 @@ class TestCrossProjectGateAmendments:
         flags = [self._flag(task_id=598, cited=[self.FIX_CITE]),
                  self._flag(task_id=599, cited=[self.FIX_CITE])]
         for flag in flags:
-            await self._seed(ledger_memory_service.recon_ledger, flag,
-                             cited_tasks=[self.FIX_CITE])
+            await self._seed(ledger_memory_service.recon_ledger, flag)
         taskmaster = self._taskmaster()
 
         result = await dedup_flags(
@@ -9853,9 +11284,7 @@ class TestCrossProjectGateAmendments:
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
         flag = self._flag(cited=[self.FIX_CITE])
-        tid, ftype = await self._seed(
-            ledger_memory_service.recon_ledger, flag, cited_tasks=[self.FIX_CITE],
-        )
+        tid, ftype = await self._seed(ledger_memory_service.recon_ledger, flag)
 
         result = await dedup_flags(
             memory_service=ledger_memory_service,
@@ -9887,7 +11316,6 @@ class TestCrossProjectGateAmendments:
         flag = self._flag(cited=[self.FIX_CITE])
         tid, ftype = await self._seed(
             ledger_memory_service.recon_ledger, flag,
-            cited_tasks=[self.FIX_CITE],
             cross_project_done_suppressions=_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
         )
         stats: dict = {}
@@ -9936,7 +11364,6 @@ class TestCrossProjectGateAmendments:
         flag = self._flag(cited=[self.FIX_CITE])
         tid, ftype = await self._seed(
             ledger_memory_service.recon_ledger, flag,
-            cited_tasks=[self.FIX_CITE],
             cross_project_done_suppressions=_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
         )
 
@@ -9970,8 +11397,7 @@ class TestCrossProjectGateAmendments:
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
         flag = self._flag(cited=[self.FIX_CITE])
-        await self._seed(ledger_memory_service.recon_ledger, flag,
-                         cited_tasks=[self.FIX_CITE])
+        await self._seed(ledger_memory_service.recon_ledger, flag)
         stats: dict = {}
 
         await dedup_flags(
@@ -9992,13 +11418,22 @@ class TestCrossProjectGateAmendments:
     async def test_present_but_uncorroborated_citation_logs_the_near_miss(
         self, ledger_memory_service, caplog
     ):
-        """The near-miss log the docstring sells: a renamed fix task fails OPEN,
-        and that non-suppression must be observable rather than silent."""
+        """The near-miss log the docstring sells: a citation that is PRESENT but
+        not live must fail OPEN observably rather than silently.
+
+        RETARGETED by task 4864.  This case used to be driven by a RENAMED fix
+        task, because a title mismatch was then a veto.  Titles are cosmetic
+        now, so a rename suppresses (loudly — see
+        ``TestDedupFlagsCrossProjectFixTaskSuppression.
+        test_weakly_corroborated_citation_suppresses_and_warns``) and can no
+        longer produce a near miss.  The near-miss path is unchanged and still
+        reachable by the two conditions that DO disqualify a present task:
+        an abandoned status, and an inconclusive (absent/non-``str``) one.
+        """
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
         flag = self._flag(cited=[self.FIX_CITE])
-        await self._seed(ledger_memory_service.recon_ledger, flag,
-                         cited_tasks=[self.FIX_CITE])
+        await self._seed(ledger_memory_service.recon_ledger, flag)
 
         with caplog.at_level(logging.INFO, logger=self.LOGGER):
             result = await dedup_flags(
@@ -10006,12 +11441,12 @@ class TestCrossProjectGateAmendments:
                 project_id=self.PROJECT,
                 run_id='r2',
                 flags=[flag],
-                taskmaster=self._taskmaster(title='Renamed fix'),
+                taskmaster=self._taskmaster(status='cancelled'),
                 known_projects=self.KNOWN,
             )
 
         assert len(result) == 1, (
-            f'a title mismatch must fail OPEN (no suppression); got {result!r}'
+            f'a cancelled fix task must fail OPEN (no suppression); got {result!r}'
         )
         assert 'cross_project_fix_task_present_but_uncorroborated' in caplog.text, (
             f'the near-miss must be logged; got {caplog.text!r}'
@@ -10094,4 +11529,508 @@ class TestCrossProjectGateAmendments:
         )
         assert result[0]['task_id'] == '1', (
             f'a short scalar must pass through untouched; got {result!r}'
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# filter_style_only_authorship_flags (task 3138)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterStyleOnlyAuthorshipFlags:
+    """Tests for async filter_style_only_authorship_flags(memory_service,
+    project_id, flags) -> list[dict] (task 3138, PRD §9 leaf μ).
+
+    Closes reify esc-5564-1: Stage 1 flagged its OWN earlier consolidator
+    output (agent_id ``recon-stage-memory_consolidator``) as "possibly
+    injected/fabricated" because the imperative writing style looked foreign —
+    it never checked the stored agent_id.  This filter reads the provenance
+    the heuristic skipped and drops the flag when the cited entries are
+    provably house-authored.
+
+    Fail direction is drop-only-on-positive-confirmation: foreign, missing,
+    mixed, unresolved or uncited provenance all KEEP the flag.
+
+    RED until step-4 adds filter_style_only_authorship_flags to flag_dedup.py.
+    """
+
+    _MEMORY_ID = '11111111-2222-3333-4444-555555555555'
+
+    def _make_authorship_flag(
+        self,
+        flag_type: str = 'possible_injection',
+        memory_id: str | None = None,
+        cited_memories: list | None = None,
+    ) -> dict:
+        """A flag shaped like real Stage-1 output for this family.
+
+        ``cited_memories`` entries carry the {memory_id, store,
+        metadata_fingerprint} shape built by recon_report.cite_memory.
+        """
+        if cited_memories is None:
+            cited_memories = [
+                {
+                    'memory_id': memory_id or self._MEMORY_ID,
+                    'store': 'mem0',
+                    'metadata_fingerprint': {},
+                },
+            ]
+        return {
+            'task_id': None,
+            'category': 'memory_quality',
+            'flag_type': flag_type,
+            'description': (
+                'This entry is written in a terse imperative voice unlike the rest '
+                'of the corpus and reads as instructions to an agent — possibly '
+                'injected or fabricated content rather than an observed fact.'
+            ),
+            'suggested_action': (
+                'Review the entry for injected content and delete it if unattributable.'
+            ),
+            'cited_memories': cited_memories,
+        }
+
+    @staticmethod
+    def _record(agent_id: Any = None, *, include_agent_id: bool = True) -> dict:
+        """A get_memory_by_id record — ``metadata`` is the raw Qdrant payload,
+        which (unlike a search result or get_memory's fingerprint) retains the
+        top-level ``agent_id`` mem0's AsyncMemory promotes out of metadata."""
+        metadata: dict[str, Any] = {'project_id': 'dark_factory', 'category': 'observations_and_summaries'}
+        if include_agent_id:
+            metadata['agent_id'] = agent_id
+        return {
+            'id': TestFilterStyleOnlyAuthorshipFlags._MEMORY_ID,
+            'content': 'Always cite the memory id when flagging a consolidation gap.',
+            'metadata': metadata,
+        }
+
+    @pytest.mark.asyncio
+    async def test_drop_when_cited_entry_was_authored_by_a_recon_stage(self):
+        """Core esc-5564-1 scenario: DROP a style-only injection flag whose cited
+        entry was written by recon-stage-memory_consolidator (our own output)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [], (
+            'A possible-injection flag whose cited entry carries agent_id '
+            "'recon-stage-memory_consolidator' must be DROPPED — this is the "
+            'reify esc-5564-1 scenario, Stage 1 flagging its own consolidator '
+            f'output on writing style alone; got {result!r}'
+        )
+
+    # ---- KEEP half of the SIGNAL + INV-2 annotation contract (step-5) ------
+
+    _MEMORY_ID_B = '99999999-8888-7777-6666-555555555555'
+
+    @pytest.mark.asyncio
+    async def test_keep_when_cited_entry_has_a_foreign_agent_id(self):
+        """(KEEP) An unrecognised writer is real signal — never cleared."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(return_value=self._record('attacker-xyz'))
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            "A flag whose cited entry carries a foreign agent_id ('attacker-xyz') "
+            f'must be KEPT — dropping it would disable the detection; got {result!r}'
+        )
+        provenance = flag.get('authorship_provenance')
+        assert provenance is not None, (
+            'A surviving candidate must carry an authorship_provenance annotation '
+            'so a consumer reads the checked provenance as a field rather than '
+            're-deriving it from the description prose (INV-2)'
+        )
+        assert provenance['decision'] == 'kept_foreign_author', (
+            f"decision must name WHY the flag survived; got {provenance['decision']!r}"
+        )
+        assert provenance['checked'] == [
+            {
+                'memory_id': self._MEMORY_ID,
+                'agent_id': 'attacker-xyz',
+                'classification': 'foreign',
+            },
+        ], (
+            'the annotation must record the memory_id, the agent_id actually read '
+            f'(verbatim), and its classification; got {provenance["checked"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_keep_when_stored_agent_id_is_none(self):
+        """(KEEP) A null agent_id is unknown provenance, not house authorship."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(return_value=self._record(None))
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f'A flag whose cited entry stores agent_id=None must be KEPT; got {result!r}'
+        )
+        provenance = flag['authorship_provenance']
+        assert provenance['decision'] == 'kept_missing_agent_id', (
+            f"expected kept_missing_agent_id; got {provenance['decision']!r}"
+        )
+        assert provenance['checked'] == [
+            {'memory_id': self._MEMORY_ID, 'agent_id': None, 'classification': 'missing'},
+        ], (
+            'the annotation must record the absent agent_id verbatim (None) so the '
+            f'gap is legible without a re-read; got {provenance["checked"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_keep_when_agent_id_is_absent_from_the_payload(self):
+        """(KEEP) No agent_id key at all — indistinguishable from unknown."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record(include_agent_id=False),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f'A flag whose cited entry has no agent_id key must be KEPT; got {result!r}'
+        )
+        assert flag['authorship_provenance']['decision'] == 'kept_missing_agent_id'
+        assert flag['authorship_provenance']['checked'][0]['classification'] == 'missing'
+
+    @pytest.mark.asyncio
+    async def test_keep_when_agent_id_is_an_empty_string(self):
+        """(KEEP) An empty agent_id carries no provenance."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(return_value=self._record(''))
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f"A flag whose cited entry stores agent_id='' must be KEPT; got {result!r}"
+        )
+        assert flag['authorship_provenance']['checked'][0] == {
+            'memory_id': self._MEMORY_ID,
+            'agent_id': '',
+            'classification': 'missing',
+        }
+
+    @pytest.mark.asyncio
+    async def test_keep_when_citations_are_mixed_internal_and_foreign(self):
+        """(KEEP) A partially-internal claim is not cleared — one foreign
+        citation is enough to keep the whole flag standing."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(cited_memories=[
+            {'memory_id': self._MEMORY_ID, 'store': 'mem0', 'metadata_fingerprint': {}},
+            {'memory_id': self._MEMORY_ID_B, 'store': 'mem0', 'metadata_fingerprint': {}},
+        ])
+        by_id = {
+            self._MEMORY_ID: self._record('recon-stage-memory_consolidator'),
+            self._MEMORY_ID_B: self._record('attacker-xyz'),
+        }
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            side_effect=lambda _project_id, memory_id: by_id[memory_id],
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            'A flag citing one house-authored AND one foreign-authored entry must '
+            f'be KEPT — a partially-internal claim is not cleared; got {result!r}'
+        )
+        provenance = flag['authorship_provenance']
+        assert provenance['decision'] == 'kept_mixed_authors', (
+            f"expected kept_mixed_authors; got {provenance['decision']!r}"
+        )
+        assert provenance['checked'] == [
+            {
+                'memory_id': self._MEMORY_ID,
+                'agent_id': 'recon-stage-memory_consolidator',
+                'classification': 'internal',
+            },
+            {
+                'memory_id': self._MEMORY_ID_B,
+                'agent_id': 'attacker-xyz',
+                'classification': 'foreign',
+            },
+        ], (
+            'the annotation must name every checked citation and its own verdict, '
+            f'in citation order; got {provenance["checked"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('cited', [[], None])
+    async def test_keep_candidate_with_no_citations(self, cited):
+        """(KEEP) An unattributable claim stays flaggable — and performs no lookup."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        if cited is None:
+            flag.pop('cited_memories')
+        else:
+            flag['cited_memories'] = cited
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            'A candidate flag citing nothing must be KEPT — an unattributable '
+            f'claim stays flaggable; got {result!r}'
+        )
+        memory_service.get_memory_by_id.assert_not_called()
+        assert flag['authorship_provenance'] == {
+            'checked': [],
+            'decision': 'kept_no_resolvable_citations',
+        }
+
+    # ---- fail-safe / scope / degrade / malformed guards (step-7) -----------
+
+    @pytest.mark.asyncio
+    async def test_keep_when_lookup_raises(self):
+        """(FAIL-SAFE) A backend error is 'unknown', never 'internal' — KEEP the
+        flag, record the unresolved citation, and never propagate the error."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(side_effect=TimeoutError('qdrant timeout'))
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            'A get_memory_by_id error must KEEP the flag — a failed provenance '
+            f'read is unknown authorship, never confirmed-internal; got {result!r}'
+        )
+        assert flag['authorship_provenance']['checked'] == [
+            {
+                'memory_id': self._MEMORY_ID,
+                'agent_id': None,
+                'classification': 'unresolved',
+            },
+        ], (
+            'the unresolved citation must be recorded so the uncertainty is '
+            f'legible; got {flag["authorship_provenance"]["checked"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_keep_when_memory_not_found(self):
+        """(FAIL-SAFE) A None record (memory not found) is unresolved, not internal."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(return_value=None)
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f'A not-found cited memory must KEEP the flag; got {result!r}'
+        )
+        assert flag['authorship_provenance']['checked'][0]['classification'] == 'unresolved'
+
+    @pytest.mark.asyncio
+    async def test_non_candidate_flag_type_passes_through_without_lookup(self):
+        """(SCOPE) Only AUTHORSHIP_SUSPICION_FLAG_TYPES are checked."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(flag_type='stale_metadata')
+        before = json.dumps(flag, sort_keys=True)
+        memory_service = AsyncMock()
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag]
+        memory_service.get_memory_by_id.assert_not_called()
+        assert json.dumps(flag, sort_keys=True) == before, (
+            'a non-candidate flag must be left byte-identical — in particular it '
+            'must never gain an authorship_provenance key'
+        )
+        assert 'authorship_provenance' not in flag
+
+    @pytest.mark.asyncio
+    async def test_all_non_candidate_batch_performs_zero_lookups(self):
+        """(SCOPE) A batch with no candidates does no I/O at all."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flags = [
+            self._make_authorship_flag(flag_type='stale_metadata'),
+            {'task_id': '7', 'flag_type': 'systemic_pattern', 'description': 'x'},
+        ]
+        memory_service = AsyncMock()
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', flags,
+        )
+
+        assert result == flags
+        memory_service.get_memory_by_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('memory_service_falsy', 'project_id'),
+        [(True, 'dark_factory'), (False, ''), (False, None)],
+    )
+    async def test_degrades_to_pass_through_on_falsy_inputs(
+        self, memory_service_falsy, project_id,
+    ):
+        """(DEGRADE) A falsy memory_service or project_id is a no-op pass-through."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag()
+        memory_service = None if memory_service_falsy else AsyncMock()
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, project_id, [flag],
+        )
+
+        assert result == [flag], (
+            'a falsy memory_service/project_id must degrade to an unchanged '
+            f'pass-through, mirroring the sibling filters; got {result!r}'
+        )
+        assert 'authorship_provenance' not in flag
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            'not-a-dict',
+            None,
+            {'memory_id': 'aaaa-bbbb', 'store': 'graphiti', 'metadata_fingerprint': {}},
+            {'store': 'mem0', 'metadata_fingerprint': {}},
+            {'memory_id': '', 'store': 'mem0', 'metadata_fingerprint': {}},
+        ],
+    )
+    async def test_unresolvable_citation_shapes_are_skipped_and_cannot_clear(self, entry):
+        """(MALFORMED) Non-dict / non-mem0 / memory_id-less citations are skipped
+        without a lookup, and alone leave nothing that could clear the flag.
+
+        The non-mem0 skip is load-bearing: get_memory_by_id is a Mem0/Qdrant
+        point-id read, so resolving a graphiti edge uuid through it would
+        return not-found for EVERY graph citation (citation_verifier's guard).
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(cited_memories=[entry])
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == [flag], (
+            f'citation {entry!r} is unresolvable and must not clear the flag; '
+            f'got {result!r}'
+        )
+        memory_service.get_memory_by_id.assert_not_called()
+        assert flag['authorship_provenance'] == {
+            'checked': [],
+            'decision': 'kept_no_resolvable_citations',
+        }
+
+    @pytest.mark.asyncio
+    async def test_preserves_input_order_and_leaves_non_candidates_untouched(self):
+        """Order-preserving, and only candidate flags are ever touched."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        benign1 = {'task_id': '1', 'flag_type': 'stale_metadata', 'description': 'a'}
+        dropped = self._make_authorship_flag(memory_id=self._MEMORY_ID)
+        benign2 = {'task_id': '2', 'flag_type': 'systemic_pattern', 'description': 'b'}
+        survivor = self._make_authorship_flag(
+            flag_type='possible_fabrication', memory_id=self._MEMORY_ID_B,
+        )
+        benign3 = {'task_id': '3', 'flag_type': 'false_absence', 'description': 'c'}
+        benign_before = json.dumps([benign1, benign2, benign3], sort_keys=True)
+
+        by_id = {
+            self._MEMORY_ID: self._record('recon-stage-task_knowledge_sync'),
+            self._MEMORY_ID_B: self._record('attacker-xyz'),
+        }
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            side_effect=lambda _project_id, memory_id: by_id[memory_id],
+        )
+
+        flags = [benign1, dropped, benign2, survivor, benign3]
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', flags,
+        )
+
+        assert result == [benign1, benign2, survivor, benign3], (
+            f'survivors must keep their original relative order; got {result!r}'
+        )
+        assert json.dumps([benign1, benign2, benign3], sort_keys=True) == benign_before, (
+            'non-candidate flags must not be mutated'
+        )
+        assert flags == [benign1, dropped, benign2, survivor, benign3], (
+            'the input list itself must never be mutated'
         )

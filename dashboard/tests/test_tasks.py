@@ -1391,6 +1391,710 @@ class TestFanoutStreakIsolationAcrossProjectRoots:
         )
 
 
+# ---------------------------------------------------------------------------
+# TestFetchTasksPagination — opt-in page_size seam (task 4360, finding 4)
+# ---------------------------------------------------------------------------
+
+
+def _paged_task_raw(tid: int) -> dict:
+    """One raw MCP get_tasks row, distinguishable by id."""
+    return {
+        'id': str(tid),
+        'title': f'task {tid}',
+        'status': 'in-progress',
+        'description': '',
+        'details': '',
+        'dependencies': [],
+        'metadata': {},
+    }
+
+
+def _paging_mcp(tasks: list[dict], calls: list[dict], *, envelope: bool = True):
+    """An ``mcp_tool_call`` stub that pages exactly as MCP ``get_tasks`` does.
+
+    Mirrors fused-memory ``server/tools.py`` (the ``_pagination_meta``
+    envelope): when ``page_size`` is absent the full list comes back with NO
+    ``pagination`` key at all — the backward-compatible shape every existing
+    caller relies on.  When it is present, the response carries the page plus
+    ``{total, offset, page_size, returned, has_more}``.
+
+    ``envelope=False`` stands in for an OLDER fused-memory that ignores
+    ``page_size`` and answers with a bare, unpaginated list.
+    """
+
+    async def _call(_client, _url, tool, args, **_kwargs):
+        assert tool == 'get_tasks', tool
+        calls.append(dict(args))
+        page_size = args.get('page_size')
+        if page_size is None or not envelope:
+            return {'tasks': list(tasks)}
+        offset = args.get('offset', 0)
+        page = tasks[offset:offset + page_size]
+        return {
+            'tasks': page,
+            'pagination': {
+                'total': len(tasks),
+                'offset': offset,
+                'page_size': page_size,
+                'returned': len(page),
+                'has_more': offset + len(page) < len(tasks),
+            },
+        }
+
+    return _call
+
+
+class TestFetchTasksPagination:
+    """``fetch_tasks(..., page_size=N)`` — opt-in, delivery-only pagination.
+
+    The burndown collector reads the whole task tree every cycle and writes one
+    row per cycle into an APPEND-ONLY history table.  An oversize MCP response
+    is rejected wholesale, the collector's ``not isinstance(result, list)``
+    guard logs and continues, and that cycle's row is never written — a
+    permanent hole no later cycle backfills.  There is no field-limited read to
+    reach for (MCP ``get_tasks`` exposes only project_root/tag/page_size/
+    offset/statuses and the backend query is ``SELECT *``), so bounding the
+    per-RESPONSE size is the available lever.
+
+    Pagination must be a pure delivery detail: opt-in, invisible to every
+    existing caller, and assembling to exactly the list a single request would
+    have produced.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_fetch_tasks_cache(self):
+        import dashboard.data.tasks as tasks_mod
+        tasks_mod._fetch_tasks_cache_clear()
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    async def test_pages_are_assembled_in_order(self, dummy_client, dummy_config):
+        """7 tasks at page_size=3 → 3 requests, all 7 rows, original order."""
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[dict] = []
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/pag', page_size=3, paginate=True,
+            )
+
+        assert isinstance(result, list)
+        assert [t['id'] for t in result] == list(range(1, 8)), (
+            f'every page must be accumulated, in order; got {result!r}'
+        )
+        assert [c.get('offset') for c in calls] == [0, 3, 6], (
+            f'offset must advance by the returned count; got {calls!r}'
+        )
+        assert all(c.get('page_size') == 3 for c in calls), calls
+
+    async def test_default_call_is_byte_identical_to_today(
+        self, dummy_client, dummy_config,
+    ):
+        """No page_size → ONE request carrying no page_size/offset key.
+
+        This is the backward-compatibility guarantee for ``active_tasks`` and
+        every other request-path caller: they must keep sending exactly
+        ``{'project_root': ...}``, so the wire shape they have always sent —
+        and the unpaginated response they have always parsed — is unchanged.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[dict] = []
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
+        ):
+            result = await fetch_tasks(dummy_client, dummy_config, '/proj/plain')
+
+        assert isinstance(result, list)
+        assert len(result) == 7
+        assert calls == [{'project_root': '/proj/plain'}], (
+            f'the unpaginated request shape must not change; got {calls!r}'
+        )
+
+    async def test_a_server_that_ignores_page_size_terminates_after_one_page(
+        self, dummy_client, dummy_config,
+    ):
+        """No ``pagination`` key back → take that page and stop.
+
+        An older fused-memory ignores ``page_size`` and answers with the whole
+        bare list.  Without an explicit terminator the loop has no ``total`` to
+        compare against and would either spin or silently truncate; it must
+        degrade to exactly today's single-request behaviour instead.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[dict] = []
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_paging_mcp(tasks, calls, envelope=False)),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/old', page_size=3, paginate=True,
+            )
+
+        assert isinstance(result, list)
+        assert [t['id'] for t in result] == list(range(1, 8))
+        assert len(calls) == 1, (
+            f'an envelope-less response must end the loop; got {calls!r}'
+        )
+
+    async def test_a_non_advancing_server_yields_the_offline_marker_not_a_truncated_list(
+        self, dummy_client, dummy_config,
+    ):
+        """``returned == 0`` with rows still owed → offline marker, never ``[]``.
+
+        A hang is no longer the hazard: the loop terminates either way.  The
+        hazard is the SHAPE of what a bounded-but-incomplete read hands back.
+        ``fetch_tasks``'s contract distinguishes only ``list`` (a complete
+        success) from the ``{'offline': True}`` marker, so a TRUNCATED list is
+        indistinguishable from a complete one at every call site.
+        ``collect_snapshot`` triages on ``isinstance(result, list)`` and would
+        write ``_count_zones([])`` — a confident zero — into the APPEND-ONLY
+        ``snapshots`` table for a tree the server itself reported as holding 99
+        rows.  A fabricated dip in an append-only chart is unfalsifiable after
+        the fact; a gap is visible.  So: raise, fall through the fan-out, and
+        surface the marker the collector already skips on.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        calls: list[dict] = []
+
+        async def _stuck(_client, _url, tool, args, **_kwargs):
+            calls.append(dict(args))
+            return {
+                'tasks': [],
+                'pagination': {
+                    'total': 99, 'offset': args.get('offset', 0),
+                    'page_size': args.get('page_size'), 'returned': 0,
+                    'has_more': True,
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_stuck),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/stuck', page_size=3, paginate=True,
+            )
+
+        assert isinstance(result, dict), (
+            f'a truncated read must NOT be reported as a list; got {result!r}'
+        )
+        assert result.get('offline') is True, result
+        error = str(result.get('error', ''))
+        assert '/proj/stuck' in error, (
+            f'the error must name the project root so an operator can grep it; got {error!r}'
+        )
+        assert 'truncat' in error.lower(), (
+            f'the error must name the truncation as the cause; got {error!r}'
+        )
+        # Exactly one call per configured URL: proves BOTH that the loop cannot
+        # spin AND that the failure fell through the fan-out (each URL tried
+        # once) rather than being swallowed at the first one.
+        assert len(calls) == len(dummy_config.fused_memory_urls), (
+            f'a non-advancing page must end that URL\'s loop; got {calls!r}'
+        )
+
+    async def test_a_non_int_pagination_envelope_yields_the_offline_marker(
+        self, dummy_client, dummy_config,
+    ):
+        """``total``/``returned`` not both ints → unverifiable, so not a success.
+
+        With a malformed envelope there is no way to decide whether the page in
+        hand is the whole tree, so completeness is UNVERIFIABLE.  An
+        unverifiable read must not be reported as a complete one — the same
+        reasoning as the non-advancing case, and the same remedy.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        calls: list[dict] = []
+
+        async def _garbled(_client, _url, tool, args, **_kwargs):
+            calls.append(dict(args))
+            return {
+                'tasks': [_paged_task_raw(1)],
+                'pagination': {
+                    'total': 'many', 'offset': args.get('offset', 0),
+                    'page_size': args.get('page_size'), 'returned': None,
+                    'has_more': True,
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_garbled),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/garbled', page_size=3, paginate=True,
+            )
+
+        assert isinstance(result, dict) and result.get('offline') is True, (
+            f'a non-int envelope must not be reported as a complete list; got {result!r}'
+        )
+        assert '/proj/garbled' in str(result.get('error', '')), result
+        assert len(calls) == len(dummy_config.fused_memory_urls), calls
+
+    async def test_a_partial_read_that_stalls_yields_the_marker_not_the_partial_rows(
+        self, dummy_client, dummy_config,
+    ):
+        """Pages 0-1 arrive, then the server stalls → marker, and NO partial rows.
+
+        The most insidious case.  An all-zero row at least looks odd in a chart;
+        a PARTIAL count looks entirely plausible, so nobody ever goes looking.
+        The partial rows must not leak out as a list.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[dict] = []
+
+        async def _stalls_after_two_pages(_client, _url, tool, args, **_kwargs):
+            calls.append(dict(args))
+            offset = args.get('offset', 0)
+            page_size = args.get('page_size')
+            page = tasks[offset:offset + page_size] if offset < 4 else []
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': len(tasks), 'offset': offset,
+                    'page_size': page_size, 'returned': len(page),
+                    'has_more': True,
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_stalls_after_two_pages),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/stall', page_size=2, paginate=True,
+            )
+
+        assert isinstance(result, dict) and result.get('offline') is True, (
+            f'a partial read must not be handed back as a list; got {result!r}'
+        )
+        assert '/proj/stall' in str(result.get('error', '')), result
+        # 3 requests per URL: offsets 0 and 2 serve rows, offset 4 stalls.
+        assert [c.get('offset') for c in calls] == (
+            [0, 2, 4] * len(dummy_config.fused_memory_urls)
+        ), calls
+
+    async def test_a_genuinely_empty_tree_still_returns_an_empty_list(
+        self, dummy_client, dummy_config,
+    ):
+        """``total == 0, returned == 0`` is a COMPLETE read of an empty project.
+
+        The anti-over-raise guard.  This case passes today and must keep
+        passing: a naive "raise whenever ``returned <= 0``" would convert every
+        empty project into a permanent burndown hole and suppress its
+        legitimate all-zero row — the exact inverse of the bug being fixed, and
+        just as invisible.  ``[]`` here is a true zero, not a manufactured one.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        calls: list[dict] = []
+
+        async def _empty(_client, _url, tool, args, **_kwargs):
+            calls.append(dict(args))
+            return {
+                'tasks': [],
+                'pagination': {
+                    'total': 0, 'offset': args.get('offset', 0),
+                    'page_size': args.get('page_size'), 'returned': 0,
+                    'has_more': False,
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_empty),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/empty', page_size=3, paginate=True,
+            )
+
+        assert result == [], (
+            f'an empty project is a complete read, not a truncation; got {result!r}'
+        )
+        assert len(calls) == 1, (
+            f'a complete empty read must not fall through the fan-out; got {calls!r}'
+        )
+
+    async def test_a_server_whose_returned_count_disagrees_with_the_page_yields_the_marker(
+        self, dummy_client, dummy_config,
+    ):
+        """``returned`` is cross-checked against the rows actually delivered.
+
+        The walk ADVANCES on the server's self-reported ``returned``, so an
+        unchecked counter is the one remaining way a bounded-but-incomplete read
+        reaches a caller as a plain ``list``.  A server (or a proxy/serialiser
+        that clips a page) claiming ``returned=10`` while shipping 4 rows skips
+        6 rows per page, terminates NORMALLY at ``offset >= total``, and hands
+        back a 40-row list for a 100-task tree — which ``collect_snapshot``
+        triages as healthy and writes into the append-only ``snapshots`` table
+        as fact.  That is precisely the plausible-dip-nobody-falsifies artefact
+        the all-or-nothing rule exists to prevent, so it must surface the marker.
+
+        ``len(shaped)`` cannot stand in for the raw page length: ``_shape_all``
+        drops rows whose ``_shape_task`` returns None (an unparseable id), so a
+        legitimately-shaped page can be shorter than what arrived.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 101)]
+        calls: list[dict] = []
+
+        async def _over_reports(_client, _url, tool, args, **_kwargs):
+            calls.append(dict(args))
+            offset = args.get('offset', 0)
+            page_size = args.get('page_size') or 0
+            # Ships 4 rows but claims it sent a full page.
+            page = tasks[offset:offset + 4]
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': len(tasks), 'offset': offset,
+                    'page_size': page_size, 'returned': page_size,
+                    'has_more': True,
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_over_reports),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/miscount', page_size=10, paginate=True,
+            )
+
+        assert isinstance(result, dict), (
+            f'a page whose delivered row count contradicts its own counter is '
+            f'not a verified read and must NOT be reported as a list; got {result!r}'
+        )
+        assert result.get('offline') is True, result
+        error = str(result.get('error', ''))
+        assert '/proj/miscount' in error, (
+            f'the error must name the project root so an operator can grep it; got {error!r}'
+        )
+        assert 'returned=10' in error and '4 row' in error, (
+            f'the error must report BOTH the claimed and the delivered count so '
+            f'the disagreement is diagnosable; got {error!r}'
+        )
+        # One call per configured URL: the disagreement is caught on the FIRST
+        # page, so no rows are ever accumulated on a bad counter.
+        assert len(calls) == len(dummy_config.fused_memory_urls), (
+            f'the miscount must end that URL\'s walk immediately; got {calls!r}'
+        )
+
+    async def test_a_total_that_grows_mid_walk_yields_the_marker(
+        self, dummy_client, dummy_config,
+    ):
+        """A ``total`` that GROWS mid-walk is a raced read, not a snapshot.
+
+        ``total`` is the loop's only terminator.  If it climbs while the walk is
+        in flight, the tree was written underneath the read: the assembled pages
+        come from different states of the world and are a coherent snapshot of
+        neither.  It also un-bounds the page budget derived from the first
+        response.  Both reasons say the same thing — refuse the read rather than
+        hand back a list stitched from two trees.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 101)]
+        calls: list[dict] = []
+
+        async def _growing(_client, _url, tool, args, **_kwargs):
+            calls.append(dict(args))
+            offset = args.get('offset', 0)
+            page_size = args.get('page_size') or 0
+            page = tasks[offset:offset + page_size]
+            # The tree is being filed into while the walk runs: the first page
+            # sees a 20-task tree, the second a 50-task one.  Per-URL state, so
+            # the fan-out's second attempt observes the same growth.
+            total = 20 if offset == 0 else 50
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': total, 'offset': offset,
+                    'page_size': page_size, 'returned': len(page),
+                    'has_more': True,
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_growing),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/racing', page_size=10, paginate=True,
+            )
+
+        assert isinstance(result, dict), (
+            f'pages stitched from a changing tree are not one snapshot; got {result!r}'
+        )
+        assert result.get('offline') is True, result
+        error = str(result.get('error', ''))
+        assert '/proj/racing' in error, error
+        assert 'grew from 20 to 50' in error, (
+            f'the error must report the observed growth so the race is '
+            f'diagnosable; got {error!r}'
+        )
+
+    async def test_an_endlessly_short_paged_server_cannot_walk_unbounded(
+        self, dummy_client, dummy_config,
+    ):
+        """The walk is bounded by a budget derived from the FIRST ``total``.
+
+        ``total`` alone does not bound the number of ROUND TRIPS: the loop
+        advances by the rows actually delivered, so a server that answers every
+        request with one row — while honestly reporting ``returned=1`` — stretches
+        a ``ceil(total/page_size)`` walk into a ``total``-request one.  Those are
+        sequential, on the SAME shared ``httpx.AsyncClient`` the 2 s render polls
+        use, which is the ``httpx.PoolTimeout`` starvation hazard the burndown
+        size probe exists to bound; and ``_burndown_loop`` wraps
+        ``collect_snapshot`` in a bare ``except Exception`` with no
+        ``asyncio.wait_for``, so a wedged walk just stops producing snapshots
+        indefinitely instead of failing loudly.
+
+        So the budget is derived ONCE from the first response and enforced:
+        ``ceil(100/10) + 2 == 12`` requests, not 100.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 101)]
+        calls: list[dict] = []
+
+        async def _one_row_at_a_time(_client, _url, tool, args, **_kwargs):
+            calls.append(dict(args))
+            offset = args.get('offset', 0)
+            # Honest counters throughout — the page is simply always short.
+            page = tasks[offset:offset + 1]
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': len(tasks), 'offset': offset,
+                    'page_size': args.get('page_size'), 'returned': len(page),
+                    'has_more': True,
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_one_row_at_a_time),
+        ):
+            result = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/dribble', page_size=10, paginate=True,
+            )
+
+        assert isinstance(result, dict), (
+            f'a walk that blew its budget is not a verified read; got {result!r}'
+        )
+        assert result.get('offline') is True, result
+        error = str(result.get('error', ''))
+        assert '/proj/dribble' in error, error
+        assert 'budget' in error.lower(), (
+            f'the error must name the budget as the cause; got {error!r}'
+        )
+        # 12 = ceil(100/10) + 2 per configured URL.  The load-bearing assertion:
+        # without the budget this stub serves 100 requests per URL, so an exact
+        # count is what proves the walk is bounded rather than merely finite.
+        expected = 12 * len(dummy_config.fused_memory_urls)
+        assert len(calls) == expected, (
+            f'the walk must stop at its {12}-page budget per URL, not run to '
+            f'total; issued {len(calls)} request(s), expected {expected}'
+        )
+
+    async def test_the_truncation_marker_is_not_cached(
+        self, dummy_client, dummy_config,
+    ):
+        """A truncation marker is refused by the POSITIVE cache.
+
+        Restated for main's negative cache (task 3857).  The original claim —
+        "must return real rows on the very next call" — is no longer the
+        contract: a marker IS held by ``_fetch_tasks_negative_cache`` for
+        ``_FETCH_TASKS_NEGATIVE_TTL_SECONDS`` (5 s), deliberately, so a broken
+        root stops being the expensive path.  What must still hold, and what
+        this test now checks, is the two-part property the finding actually
+        cared about: the marker is never admitted to the POSITIVE cache
+        (``cache_ok=lambda v: isinstance(v, list)``), and it is not retained
+        beyond the short negative TTL — past it, a healthy server yields real
+        rows.  The 5 s window is unreachable by the only caller that walks:
+        ``burndown.collect_snapshot`` runs once per ``_SAMPLE_INTERVAL_SECONDS``
+        (600 s).
+        """
+        from dashboard.data import tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        healthy: list[bool] = [False]
+        calls: list[dict] = []
+
+        async def _flaky(_client, _url, tool, args, **_kwargs):
+            calls.append(dict(args))
+            offset = args.get('offset', 0)
+            page_size = args.get('page_size')
+            if not healthy[0]:
+                return {
+                    'tasks': [],
+                    'pagination': {
+                        'total': 99, 'offset': offset, 'page_size': page_size,
+                        'returned': 0, 'has_more': True,
+                    },
+                }
+            page = tasks[offset:offset + page_size]
+            return {
+                'tasks': page,
+                'pagination': {
+                    'total': len(tasks), 'offset': offset, 'page_size': page_size,
+                    'returned': len(page), 'has_more': offset + len(page) < len(tasks),
+                },
+            }
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_flaky),
+        ):
+            first = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/flaky', page_size=3, paginate=True,
+            )
+            assert isinstance(first, dict) and first.get('offline') is True, first
+
+            # The marker was refused by the POSITIVE cache.  Asserted on the
+            # walk's own key, so a mis-keyed entry cannot pass this by hiding
+            # under a different key.
+            key = tasks_mod._fetch_tasks_cache_key(
+                '/proj/flaky', None, 3, 0, True,
+            )
+            assert tasks_mod._fetch_tasks_cache.get_fresh(key) is None, (
+                'the offline marker must never enter the positive cache'
+            )
+
+            healthy[0] = True
+            # Expire the NEGATIVE entry rather than sleeping out its 5 s TTL.
+            # Retention past that window is what the finding forbids; retention
+            # inside it is main's deliberate retry suppression.
+            tasks_mod._fetch_tasks_negative_cache.clear()
+            second = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/flaky', page_size=3, paginate=True,
+            )
+
+        assert isinstance(second, list), (
+            f'the marker must not outlive the negative TTL; got {second!r}'
+        )
+        assert [t['id'] for t in second] == list(range(1, 8)), second
+
+    async def test_the_assembled_list_is_what_gets_cached(
+        self, dummy_client, dummy_config,
+    ):
+        """The cache holds the ASSEMBLED list, under the walk's own key.
+
+        Caching per PAGE would break the documented ~20 s TTL contract and
+        re-issue the whole fan-out on every render.  The key is the full
+        (root, statuses, page_size, offset, paginate) tuple — `paginate` is
+        what keeps this assembled entry from being served to a caller that
+        asked for one page of the same size (and vice versa).
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[dict] = []
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
+        ):
+            first = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/cached', page_size=3, paginate=True,
+            )
+            assert len(calls) == 3
+            second = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/cached', page_size=3, paginate=True,
+            )
+
+        assert len(calls) == 3, (
+            f'the second call must be served from cache; got {calls!r}'
+        )
+        assert first == second
+        assert [t['id'] for t in second] == list(range(1, 8))
+
+    async def test_a_walk_and_a_same_size_page_do_not_share_a_cache_entry(
+        self, dummy_client, dummy_config,
+    ):
+        """`paginate` MUST discriminate the cache key (task 4360, esc-4360-8).
+
+        `page_size=3, paginate=False` is ONE 3-row page; `page_size=3,
+        paginate=True` is the complete 7-row tree walked 3 rows at a time.
+        Every other key component is identical, so without the `paginate`
+        discriminator whichever ran first inside the 20 s TTL would be served
+        to the other — handing a one-page caller the whole tree, or handing
+        `burndown.collect_snapshot` a 3-row page to write into an APPEND-ONLY
+        history table as the project's true size.
+
+        This asserts the two results DIFFER, not merely that two keys differ:
+        it fails if the discriminator is dropped, and it cannot pass by
+        accident the way an `in`-only key assertion could.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[dict] = []
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
+        ):
+            walked = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/disc', page_size=3, paginate=True,
+            )
+            one_page = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/disc', page_size=3,
+            )
+
+        assert [t['id'] for t in walked] == list(range(1, 8)), walked
+        assert [t['id'] for t in one_page] == [1, 2, 3], (
+            f'paginate=False must return exactly one page, got {one_page!r}'
+        )
+
+    async def test_statuses_and_timeout_reach_every_page_of_a_walk(
+        self, dummy_client, dummy_config,
+    ):
+        """Both must be on EVERY page request, not just the first.
+
+        `server/tools.py::get_tasks` applies the status filter BEFORE its
+        in-memory slice, so `total` is the FILTERED count; a page sent without
+        the filter both over-reads and desynchronises the walk's terminator.
+        `timeout` is a per-HTTP-request budget, so a page issued without it
+        silently falls back to the default.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[dict] = []
+        seen_timeouts: list[object] = []
+        paging = _paging_mcp(tasks, calls)
+
+        async def _spy(client, url, tool, args, **kwargs):
+            seen_timeouts.append(kwargs.get('timeout'))
+            return await paging(client, url, tool, args, **kwargs)
+
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_spy),
+        ):
+            rows = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/thread',
+                statuses=['pending'], page_size=3, paginate=True, timeout=7.5,
+            )
+
+        assert isinstance(rows, list), rows
+        assert len(calls) >= 3, calls
+        assert all(c.get('statuses') == ['pending'] for c in calls), (
+            f'every page must carry the status filter, got {calls!r}'
+        )
+        assert seen_timeouts == [7.5] * len(calls), (
+            f'every page must carry the per-request timeout, got {seen_timeouts!r}'
+        )
+
+
 class TestFetchStatusesCache:
     """Per-project_root TTL cache inside fetch_statuses (task 3857 amendment).
 

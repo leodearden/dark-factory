@@ -37,6 +37,9 @@ from fused_memory.memory_metadata import (
     parent_liveness_violation,
     validate_memory_metadata,
 )
+from fused_memory.middleware.entity_mint_storm_escalator import (
+    emit_entity_mint_storm_escalation,
+)
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
 from fused_memory.middleware.referent_repair_storm_escalator import (
     emit_referent_repair_storm_escalation,
@@ -1638,6 +1641,12 @@ class ReconcileStats:
 #: outright: it "folds in", and is "not a distinct leaf".
 REFERENT_CHECKS: tuple[str, ...] = ('set-membership', 'per-edge-pairing')
 
+#: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
+#: the ``entity_mint.lock_timeout_seconds`` config hop is missing, None or the
+#: wrong type. Matches the schema default; the LIVE config value is what
+#: normally applies, read per call so the leaf stays genuinely green-tier.
+_ENTITY_MINT_DEFAULT_LOCK_TIMEOUT_SECONDS: float = 5.0
+
 
 @dataclass(frozen=True, kw_only=True)
 class ReferentFinding:
@@ -2449,6 +2458,20 @@ class MemoryService:
         # likely to be noticed any other way.
         self._mem0_update_storm_counters: dict[str, StormCounter] = {}
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
+        # keyed per `agent_id` for the same attribution reason as the dict above.
+        # No escalator OBJECT beside it: `middleware/entity_mint_storm_escalator`
+        # is a module FUNCTION taking project_root explicitly, so there is no
+        # queue cache to own and no set_known_projects lifecycle to keep in sync.
+        self._entity_mint_storm_counters: dict[str, StormCounter] = {}
+        # Warn-ONCE latch for a corrupt/absent `entity_mint.storm_*` leaf. The
+        # corrupt-leaf branch of `_record_entity_mint` is reached on EVERY mint
+        # (unlike the `_known_projects` miss beside it, which only fires at a
+        # breach), so an unconditional WARN would put one line per mint in the
+        # log and drown the operator it exists to reach. Cleared whenever the
+        # leaves read back valid, so a green-tier hot reload that fixes and
+        # later re-breaks them earns a second line.
+        self._entity_mint_storm_config_warned = False
         # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
         # leaf epsilon). `_decode_referents` degrades an unreadable or absent
         # blob to ('none') rather than raising — losing the memory over a
@@ -2519,6 +2542,8 @@ class MemoryService:
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
+        # Same seam for the entity-mint burst alarm's own 3600s window.
+        self._entity_mint_storm_time_provider: Callable[[], float] = time.time
         # Process-start baselines for uptime reporting
         self._started_at: datetime = datetime.now(UTC)
         self._start_monotonic: float = time.monotonic()
@@ -7164,7 +7189,18 @@ class MemoryService:
         silently-wrong clean verdict, which is the exact failure class this
         tool exists to eliminate.
 
-        Returns ``{'matches': [...], 'scanned': int, 'truncated': bool}``.
+        Returns ``{'matches': [...], 'scanned': int, 'truncated': bool,
+        'collection': str}`` — a verbatim passthrough of
+        ``Mem0Backend.scan_payload_text``'s result.
+
+        ``collection`` names the Qdrant collection the backend actually
+        scrolled. It is part of the shape because a scan result is a
+        MEASUREMENT of a collection, and one that does not identify what it
+        measured cannot be audited later (task 3243). Note that the MCP
+        ``scan_memory_content`` tool rebuilds its response from an explicit
+        key whitelist and deliberately does NOT forward this key; direct
+        callers of this method — such as
+        ``scripts/sweep_toolcall_xml_leak.py`` — do receive it.
 
         A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), not
         returned as an empty match list — a timed-out scan must never be
@@ -8648,6 +8684,376 @@ class MemoryService:
             ))
 
         return {'status': 'reassigned', 'store': 'graphiti', **result}
+
+    async def ensure_entity_node(
+        self,
+        name: str,
+        *,
+        project_id: str,
+        summary: str = '',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Resolve an Entity node by exact name, MINTING one if none exists.
+
+        Wraps ``graphiti_client.py::GraphitiBackend.ensure_entity_node`` with the
+        two guards an MCP-reachable mint needs and the backend deliberately does
+        not carry.
+
+        GUARD 1 — BOUNDED IDENTITY-LOCK ACQUIRE. The backend method's docstring
+        states the LOCK CONTRACT: callers MUST hold
+        ``graphiti_client.py::GraphitiBackend._identity_lock_for(group_id)``; it
+        performs no locking of its own. This is the SECOND acquisition site in
+        all of ``fused-memory/src/`` — the first is
+        ``memory_service.py::MemoryService._execute_graphiti_write``, which holds
+        the same lock across a full LLM extraction plus the entire
+        ``_reconcile_episode_identity`` chain. That is precisely why the acquire
+        here is ``asyncio.wait_for(lock.acquire(), timeout)`` rather than
+        ``async with lock:``: ``async with`` cannot be bounded, and an unbounded
+        wait behind that holder would block an MCP request for tens of seconds.
+        Deadlock is NOT reachable from an MCP handler (``add_memory`` /
+        ``add_episode`` enqueue and return; the queue worker runs on the same
+        loop and the handler arrives holding nothing), so the bound is about
+        LATENCY, not safety. Note the mint itself makes an embedding round trip
+        INSIDE the lock, which is the other reason the hold time matters.
+
+        GUARD 2 — EXACT-NAME PRE-READ under that lock, via the read-only
+        ``get_nodes_by_exact_name``. This is deliberately a WRAPPER-level
+        pre-read rather than an edit to
+        ``graphiti_client.py::GraphitiBackend._resolve_or_create_entity``: that
+        primitive is the shared write-time-identity chokepoint that
+        ``_dedup_episode_nodes`` and the leaf-eta repair path both depend on, and
+        both WANT its >=2-match COLLAPSE arm. Narrowing it would change behaviour
+        for callers this tool never touches and would break its documented
+        post-condition. Refusing here leaves the primitive intact while making
+        the collapse structurally unreachable from the tool: having observed 0
+        matches under the lock we hold, the >=2 branch cannot fire on the mint
+        path; the 1-match case short-circuits to a pure resolve with no backend
+        call at all; and >=2 returns a structured refusal that merges NOTHING.
+
+        THE MINT BRANCH THEREFORE READS THE NAME TWICE, DELIBERATELY. The
+        pre-read above runs, and then ``graphiti.ensure_entity_node`` calls
+        ``_resolve_or_create_entity``, which issues the SAME
+        ``get_nodes_by_exact_name`` query with the same arguments — two
+        identical Cypher round trips inside the very lock guard 1 exists to keep
+        short. This is a known, accepted cost, not an oversight:
+
+        * Only the MINT branch pays it. A resolve (the common case once the
+          graph is populated) short-circuits above with no backend call at all,
+          and both refusals return before the backend is reached.
+        * The mint already makes a far more expensive embedding round trip
+          inside the same lock, so a second read-only exact-name query is not
+          what sets the hold time.
+        * Removing it means a new backend entry point that accepts the
+          already-read node list (a ``_mint_entity_node`` primitive this wrapper
+          could call directly, leaving ``_resolve_or_create_entity`` untouched
+          for its other callers). That is a change to
+          ``backends/graphiti_client.py``, which task 4932 held no lock on, so
+          it was recorded here and filed as an agent-followup ticket against
+          that module rather than done inline.
+
+        Refusals are VALUES, never raises, so an MCP caller gets machine-readable
+        data — an ambiguous-name refusal must hand back the conflicting uuids so
+        an operator can adjudicate them, which an exception string cannot carry.
+
+        Args:
+            name: The node name to resolve or mint. Callers are expected to have
+                validated it with ``server/entity_mint_authz.py::validate_mint_name``;
+                this layer does not re-parse it.
+            project_id: Project scope (graph key, lock key, journal logging).
+            summary: Optional summary for a newly minted node.
+            agent_id: Which agent is calling (journal + storm attribution).
+            session_id: Session context (optional).
+            causation_id: Reconciliation causation ID (optional).
+            _source: Source label for the journal entry.
+
+        Returns:
+            ``{'status': 'minted'|'resolved', 'store': 'graphiti', 'uuid': str,
+            'minted': bool, 'name': str}`` on success, or
+            ``{'status': 'refused', 'error': str, 'error_type': str, ...}`` on a
+            refusal.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+        success = True
+        error_msg = None
+        result: dict = {}
+
+        # Read the timeout LIVE off the shared config object on every call.  A
+        # value captured at construction could not observe an in-place
+        # reload_config mutation, which would leave entity_mint.lock_timeout_seconds
+        # restart-only while sitting in RELOADABLE_FIELDS as if it were green-tier.
+        section = getattr(self.config, 'entity_mint', None)
+        timeout = getattr(section, 'lock_timeout_seconds', None)
+        if not isinstance(timeout, int | float) or isinstance(timeout, bool) \
+                or timeout <= 0:
+            timeout = _ENTITY_MINT_DEFAULT_LOCK_TIMEOUT_SECONDS
+
+        lock = self.graphiti._identity_lock_for(project_id)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout)
+        except TimeoutError:
+            # A VALUE, not a raise: the caller can retry, and the operator can
+            # see from the journal that the mint was refused rather than lost.
+            result = {
+                'status': 'refused',
+                'error_type': 'EntityMintLockBusy',
+                'error': (
+                    f'Could not acquire the write-time-identity lock for '
+                    f'project {project_id!r} within {timeout}s, so '
+                    f'{name!r} was NOT minted. Another write is holding it '
+                    '(the episode-ingest path holds it across a full LLM '
+                    'extraction). Retry, or raise '
+                    'entity_mint.lock_timeout_seconds.'
+                ),
+                'name': name,
+            }
+            await self._journal_entity_mint(
+                write_op_id=write_op_id, causation_id=causation_id,
+                source=_source, project_id=project_id, agent_id=agent_id,
+                session_id=session_id, name=name, summary=summary,
+                result_summary=result, success=False, error=None,
+            )
+            return result
+
+        try:
+            existing = await self.graphiti.get_nodes_by_exact_name(
+                name, group_id=project_id,
+            )
+            if len(existing) >= 2:
+                uuids = [n.get('uuid') for n in existing]
+                success = False
+                result = {
+                    'status': 'refused',
+                    'error_type': 'EntityMintAmbiguousName',
+                    'error': (
+                        f'{len(existing)} Entity nodes already carry the name '
+                        f'{name!r} in project {project_id!r}, so this tool '
+                        'refuses to act. Collapsing them is irreversible and '
+                        'is deliberately NOT done here — adjudicate the '
+                        f'duplicates by hand. Conflicting uuids: {uuids!r}.'
+                    ),
+                    'name': name,
+                    'uuids': uuids,
+                }
+            elif len(existing) == 1:
+                # A pure resolve: no backend call, no write of any kind.
+                result = {
+                    'status': 'resolved',
+                    'store': 'graphiti',
+                    'uuid': existing[0].get('uuid'),
+                    'minted': False,
+                    'name': name,
+                }
+            else:
+                uuid = await self.graphiti.ensure_entity_node(
+                    name, group_id=project_id, summary=summary,
+                )
+                result = {
+                    'status': 'minted',
+                    'store': 'graphiti',
+                    'uuid': uuid,
+                    'minted': True,
+                    'name': name,
+                }
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            raise
+        finally:
+            lock.release()
+            await self._journal_entity_mint(
+                write_op_id=write_op_id, causation_id=causation_id,
+                source=_source, project_id=project_id, agent_id=agent_id,
+                session_id=session_id, name=name, summary=summary,
+                result_summary=result if result else None,
+                success=success, error=error_msg,
+            )
+
+        # GUARD 7, the MINT branch only, and only once the lock is released
+        # (the `finally` above ran on every path that reaches here). A resolve
+        # created nothing and the two refusals wrote nothing, so neither is
+        # evidence of a mint storm.
+        if result.get('minted'):
+            await self._record_entity_mint(project_id, agent_id)
+
+        return result
+
+    async def _record_entity_mint(
+        self, project_id: str, agent_id: str | None,
+    ) -> None:
+        """Count one MINT; escalate on a burst (INV-4, guard 7).
+
+        Post-write and never blocking: this is a monitoring alarm, not a rate
+        limiter. Crossing the threshold must not reject the mint that crossed
+        it, or a legitimate large repair batch would fail mid-run over its own
+        success count — precisely when the batch is going well.
+
+        Counts the MINT branch ONLY. A resolve makes no backend call at all and
+        the two refusals write nothing, so counting them would measure tool
+        TRAFFIC while the operator question is how many new nodes entered the
+        identity graph. Nothing sweeps orphan minted nodes, which is what makes
+        that the load-bearing number.
+
+        Called AFTER the identity lock is released, and the emit is dispatched
+        through ``asyncio.to_thread`` because ``EscalationQueue.submit`` is a
+        synchronous filesystem write — holding the lock across it would extend
+        exactly the hold time the bounded acquire in ``ensure_entity_node``
+        exists to bound, and would stall the event loop besides.
+
+        One counter per ``agent_id``, so two independently-busy agents cannot
+        sum into a false alarm. The threshold and window are read LIVE off the
+        shared config and passed INTO ``record()`` per call — captured once,
+        they would make both green-tier leaves restart-only in disguise.
+        """
+        label = agent_id or '<unattributed>'
+        counter = self._entity_mint_storm_counters.get(label)
+        if counter is None:
+            counter = StormCounter(time_provider=self._entity_mint_storm_time_provider)
+            self._entity_mint_storm_counters[label] = counter
+
+        cfg = getattr(self.config, 'entity_mint', None)
+        threshold = getattr(cfg, 'storm_threshold', None)
+        window_seconds = getattr(cfg, 'storm_window_seconds', None)
+        if not isinstance(threshold, int) or isinstance(threshold, bool) \
+                or not isinstance(window_seconds, int | float) \
+                or isinstance(window_seconds, bool):
+            # A corrupt or absent config leaf costs the ALARM, never the mint
+            # that already landed — but it says so. Returning silently here
+            # would disable the only signal a mint loop produces and tell
+            # nobody, which is the same silent-degradation shape this alarm
+            # exists to rule out; an operator who mistypes a leaf would lose
+            # the alarm and never learn it. Deliberately LOUDER than the
+            # `_record_content_amend` branch this otherwise mirrors, and in
+            # the same shape as the `_known_projects` miss below: name the
+            # offending leaf, carry its value, say what it costs, and say that
+            # minting continues.
+            if not self._entity_mint_storm_config_warned:
+                self._entity_mint_storm_config_warned = True
+                logger.warning(
+                    'entity mint storm alarm DISABLED by a malformed config '
+                    'leaf: entity_mint.storm_threshold=%r (want a non-bool '
+                    'int), entity_mint.storm_window_seconds=%r (want a '
+                    'non-bool int/float). No mint burst can be escalated '
+                    'until this is fixed; minting continues meanwhile. Both '
+                    'leaves are green-tier, so reload_config repairs this '
+                    'with no restart. Logged once per contiguous run of bad '
+                    'config, not once per mint.',
+                    threshold, window_seconds,
+                )
+            return
+        self._entity_mint_storm_config_warned = False
+
+        storm = counter.record(
+            threshold=threshold,
+            window_seconds=float(window_seconds),
+            label=label,
+        )
+
+        # Evict counters whose window has gone empty. Each counter self-prunes
+        # its own deque, but nothing would drop the counter OBJECT, and
+        # ``agent_id`` is caller-supplied and unbounded in cardinality — the
+        # gate is a self-reported prefix match, so a widened prefix admits
+        # arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
+        # every run). A server designed to run for weeks between restarts would
+        # otherwise accumulate one dead counter per agent it ever saw. Mirrors
+        # ``_record_content_amend``'s sweep exactly; see StormCounter.prune on
+        # why dropping an empty counter is behaviour-preserving.
+        for other, dormant in list(self._entity_mint_storm_counters.items()):
+            if other != label and dormant.prune(float(window_seconds)) == 0:
+                del self._entity_mint_storm_counters[other]
+
+        if storm is None:
+            return
+
+        # PROJECT ROOT resolution has NO FALLBACK. graphiti's ``group_id`` IS
+        # the ``project_id``, so ``_known_projects`` is the correct and only
+        # answer. Falling back to ``config.taskmaster.project_root`` is
+        # forbidden: it defaults to ``'.'``, so the fallback files into the
+        # server's cwd, where no operator watches, and reports success doing it
+        # — a silent misfile is strictly worse than a logged refusal, because it
+        # also destroys the evidence that the alarm ever fired.
+        project_root = self._known_projects.get(project_id)
+        if not project_root:
+            logger.warning(
+                'entity mint storm from agent_id=%r in project_id=%r '
+                '(count=%s, threshold=%s, window_seconds=%s) could NOT be '
+                'escalated: the project is absent from `_known_projects`, so '
+                'no project queue can be resolved. Wire '
+                'MemoryService.set_known_projects(build_known_projects_map(...)) '
+                'at server startup to restore this alarm. Minting continues.',
+                label, project_id, storm['count'], storm['threshold'],
+                storm['window_seconds'],
+            )
+            return
+
+        # Never let the alarm's own failure reach the caller: the mint already
+        # landed, and turning a completed mint into an exception would be
+        # strictly worse than losing the signal. The escalator is itself
+        # never-raise; this is the belt to its braces.
+        try:
+            await asyncio.to_thread(
+                emit_entity_mint_storm_escalation,
+                project_root,
+                project_id=project_id,
+                agent_id=label,
+                count=storm['count'],
+                threshold=storm['threshold'],
+                window_seconds=storm['window_seconds'],
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'entity mint storm escalation failed for agent %r in project %r '
+                '(count=%s); the mint itself succeeded',
+                label, project_id, storm['count'],
+            )
+
+    async def _journal_entity_mint(
+        self,
+        *,
+        write_op_id: str,
+        causation_id: str | None,
+        source: str,
+        project_id: str,
+        agent_id: str | None,
+        session_id: str | None,
+        name: str,
+        summary: str,
+        result_summary: dict | None,
+        success: bool,
+        error: str | None,
+    ) -> None:
+        """Best-effort journal write for ``ensure_entity_node``.
+
+        Extracted so the lock-busy early return and the main path share ONE
+        spelling of the journal params. Never raises: the journal is the
+        evidence trail an entity_mint_storm escalation points an operator at,
+        and a journal outage must not turn a landed mint into an error.
+        """
+        if not self._write_journal:
+            return
+        try:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=source,
+                operation='ensure_entity_node',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params={'name': name, 'summary': summary},
+                result_summary=result_summary,
+                success=success,
+                error=error,
+            )
+        except Exception as journal_exc:
+            logger.warning(
+                'ensure_entity_node: journal log_write_op failed: %s',
+                journal_exc,
+            )
 
     async def delete_episode(
         self,

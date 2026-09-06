@@ -6,12 +6,14 @@ Step-7: RED — idempotent resume + quiescence (I2/B3/B4/B11)
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import functools
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -134,6 +136,45 @@ def _mock_scheduler(task: dict):
     scheduler.update_task = AsyncMock(return_value=True)
     scheduler.get_task = AsyncMock(return_value=task)
     return scheduler
+
+
+class _SchedulerWithoutConfig:
+    """A scheduler-shaped collaborator with genuinely NO ``config`` attribute.
+
+    Not a contrivance: ``Harness._run_deterministic_slot`` builds the runner
+    "with only the minimal dependencies needed", so an attribute CHAIN read off
+    the duck-typed ``scheduler`` is a real production failure surface.
+    """
+
+    def __init__(self, task: dict) -> None:
+        self._task = task
+        self.set_task_status = AsyncMock()
+        self.update_task = AsyncMock(return_value=True)
+        self.get_task = AsyncMock(return_value=task)
+
+
+def _degraded_scheduler(label: str, task: dict):
+    """Build the no-usable-project_root scheduler shape named by *label*.
+
+    The two shapes fail DIFFERENTLY, which is why they are parametrized rather
+    than looped over inside one test body:
+
+    * ``mock-config`` — a bare ``MagicMock``: the ``.config.project_root`` chain
+      RESOLVES, to an auto-created Mock, which f-string-interpolates into
+      operator-facing text as ``<MagicMock id=...>``.
+    * ``no-config`` — no ``config`` at all: the chain RAISES ``AttributeError``.
+    """
+    if label == 'mock-config':
+        scheduler = _mock_scheduler(task)
+        assert not isinstance(scheduler.config.project_root, (str, Path)), (
+            'this shape is only meaningful while MagicMock auto-creates .config.project_root'
+        )
+        return scheduler
+    if label == 'no-config':
+        scheduler = _SchedulerWithoutConfig(task)
+        assert not hasattr(scheduler, 'config')
+        return scheduler
+    raise AssertionError(f'unknown degraded scheduler shape: {label!r}')
 
 
 def _seed_resolved_gate(queue: EscalationQueue, task_id: str) -> Escalation:
@@ -1137,10 +1178,145 @@ def _curator_gate_task(
         gate_options=gate_options,
         gate_escalated_at=gate_escalated_at,
     )
+    # BARE WIRE LITERALS, DELIBERATELY (task 3420) — here and at the direct-stamp
+    # sites further down this file.  Do NOT "clean these up" into imports of
+    # shared.task_metadata's HUMAN_CURATOR_GATE_KEY /
+    # HUMAN_CURATOR_ADJUDICATED_AT_KEY: stamping the spelling real tasks carry on
+    # the wire and then driving code that reads those shared constants IS the
+    # drift check.  Import the constants and the test renames in lockstep with a
+    # forked/renamed constant, silently deleting the only detector.  An
+    # in-process `is`/`id()` identity check is no substitute — CPython interns
+    # identifier-shaped literals, so it passes either way (see the SINGLE SOURCE
+    # comment block in orchestrator/src/orchestrator/deterministic_runner.py).
     task['metadata']['human_curator_gate'] = marker
     if human_curator_adjudicated_at is not None:
         task['metadata']['human_curator_adjudicated_at'] = human_curator_adjudicated_at
     return task
+
+
+def _parse_update_task_snippet(detail: str) -> dict:
+    """Extract the runbook's ``update_task(`` line and return its keyword map.
+
+    Shared by the remediation-snippet tests below so the two cannot drift.
+    Parses the line as a Python expression, because the whole point of the
+    snippet is that an operator can PASTE it: it must be a syntactically valid,
+    fully-keyworded call, never a bare positional token.  If a later edit wraps
+    the snippet across physical output lines this raises ``SyntaxError`` — the
+    correct loud signal, not a flake.
+    """
+    line = next(ln for ln in detail.splitlines() if 'update_task(' in ln).strip()
+    call = ast.parse(line, mode='eval').body
+    assert isinstance(call, ast.Call), f'snippet is not a call expression: {line!r}'
+    assert isinstance(call.func, ast.Name) and call.func.id == 'update_task', (
+        f'snippet must call update_task by bare name, got: {line!r}'
+    )
+    assert call.args == [], (
+        f'update_task snippet must pass everything by keyword, got positional: {call.args!r}'
+    )
+    return {k.arg: k.value for k in call.keywords}
+
+
+class TestSnippetProjectRoot:
+    """``_snippet_project_root`` — every accept/reject arm, tested DIRECTLY.
+
+    The end-to-end escalation tests below reach this helper only through a full
+    ``runner.run()``, and only through two of its arms.  Direct coverage exists
+    because of what those two cannot see:
+
+    * PRODUCTION ONLY EVER PASSES A ``Path``.  ``config.project_root`` is typed
+      ``project_root: Path = Field(default=Path('.'))`` with an after-validator
+      that calls ``.resolve()`` (orchestrator/config.py), so the ``isinstance``
+      arm that actually runs in the fleet is the ``Path`` one — and it is the
+      easiest to lose silently.  Narrowing the check to ``(str,)``, or slipping
+      ``repr`` in for ``str``, would degrade EVERY real escalation to the
+      placeholder while an end-to-end test that configured a ``str`` stayed
+      green.  ``test_curator_remediation_snippet_is_a_runnable_update_task_call``
+      is parametrized over both types for the same reason.
+    * The ``''``/``'None'`` rejection arms are UNREACHABLE through a
+      pydantic-validated config, so without a direct test they are unexercised
+      code a later edit could drop as dead.  They are the guard against a value
+      that BYPASSED validation — the same defence the scheduler applies to its
+      own snapshot (``not self._project_root or self._project_root == 'None'``).
+    """
+
+    @pytest.mark.parametrize(
+        ('configured', 'expected'),
+        [
+            # The production type: a resolved Path off the validated config.
+            pytest.param(Path('/home/leo/src/reify'), '/home/leo/src/reify', id='path'),
+            pytest.param('/home/leo/src/reify', '/home/leo/src/reify', id='str'),
+            pytest.param('  /home/leo/src/reify  ', '/home/leo/src/reify', id='str-padded'),
+        ],
+    )
+    def test_a_usable_root_is_rendered_verbatim(self, configured, expected: str) -> None:
+        """The configured root reaches the operator as itself — never as a repr."""
+        from orchestrator.deterministic_runner import _snippet_project_root
+
+        rendered = _snippet_project_root(
+            SimpleNamespace(config=SimpleNamespace(project_root=configured))
+        )
+
+        assert isinstance(rendered, str)
+        # Equality (not `in`) is the repr guard: `repr(Path(...))` would render
+        # `PosixPath('/home/leo/src/reify')`, which is not a pasteable value.
+        assert rendered == expected
+
+    @pytest.mark.parametrize(
+        'configured',
+        [
+            pytest.param('', id='empty'),
+            pytest.param('   ', id='whitespace-only'),
+            pytest.param('None', id='literal-None-string'),
+            pytest.param(None, id='none'),
+            pytest.param(12345, id='wrong-type'),
+        ],
+    )
+    def test_an_unusable_root_degrades_to_the_visible_placeholder(self, configured) -> None:
+        """Never raise, never interpolate a non-path — name the parameter instead."""
+        from orchestrator.deterministic_runner import (
+            _PROJECT_ROOT_PLACEHOLDER,
+            _snippet_project_root,
+        )
+
+        rendered = _snippet_project_root(
+            SimpleNamespace(config=SimpleNamespace(project_root=configured))
+        )
+
+        assert rendered == _PROJECT_ROOT_PLACEHOLDER
+
+    def test_a_collaborator_without_config_degrades_instead_of_raising(self) -> None:
+        """The ATTRIBUTE CHAIN, not just its leaf, must tolerate a minimal collaborator.
+
+        Both ``getattr`` defaults are exercised: an object with no ``config`` at
+        all, and one whose ``config`` is ``None``.  An ``AttributeError`` here
+        would propagate out of ``_file_curator_adjudication_missing_and_block``
+        while formatting runbook PROSE, losing the durable safety escalation
+        that method's contract promises.
+        """
+        from orchestrator.deterministic_runner import (
+            _PROJECT_ROOT_PLACEHOLDER,
+            _snippet_project_root,
+        )
+
+        class _NoConfigAtAll:
+            pass
+
+        assert _snippet_project_root(_NoConfigAtAll()) == _PROJECT_ROOT_PLACEHOLDER
+        assert (
+            _snippet_project_root(SimpleNamespace(config=None)) == _PROJECT_ROOT_PLACEHOLDER
+        )
+
+    def test_a_mock_attribute_never_reaches_an_operator(self) -> None:
+        """A test double's auto-created attribute must not render as ``<MagicMock ...>``."""
+        from orchestrator.deterministic_runner import (
+            _PROJECT_ROOT_PLACEHOLDER,
+            _snippet_project_root,
+        )
+
+        rendered = _snippet_project_root(MagicMock())
+
+        assert rendered == _PROJECT_ROOT_PLACEHOLDER
+        assert 'Mock' not in rendered
 
 
 @pytest.mark.asyncio
@@ -1218,6 +1394,138 @@ class TestHumanCuratorGateAdjudicationGuard:
         assert 'human_curator_adjudicated_at' in pending[0].detail
 
         scheduler.set_task_status.assert_any_await('3181', 'blocked')
+
+    @pytest.mark.parametrize(
+        'configured_root',
+        [
+            # The PRODUCTION type: `config.project_root` is typed `Path` with an
+            # after-validator calling `.resolve()` (orchestrator/config.py), so
+            # this is the only shape the fleet ever passes.  Pinned first so the
+            # branch that actually runs is the one under test.
+            pytest.param(Path('/home/leo/src/reify'), id='path'),
+            # A duck-typed/hand-built collaborator may still hand over a str.
+            pytest.param('/home/leo/src/reify', id='str'),
+        ],
+    )
+    async def test_curator_remediation_snippet_is_a_runnable_update_task_call(
+        self, tmp_path: Path, configured_root,
+    ):
+        """The (a) remediation must be PASTEABLE, not merely suggestive.
+
+        The real MCP signature is ``update_task(id: str, project_root: str, ...)``
+        (fused-memory/src/fused_memory/server/tools.py) — BOTH are required and
+        neither has a default.  An operator clearing a safety escalation must
+        not be handed a call that errors on arity/type at exactly the moment
+        they are trying to do the right thing.
+
+        ``project_root`` is set DELIBERATELY DIFFERENT from the process cwd:
+        every fleet orchestrator unit pins
+        ``WorkingDirectory=/home/leo/src/dark-factory`` (so ``uv run --project
+        orchestrator`` resolves the only pyproject that defines it) while
+        selecting its real target project purely via ``--config``.  So an
+        ``os.getcwd()``-derived snippet would silently aim most operators at
+        the WRONG project — worse than the missing argument it replaces,
+        because it fails misleadingly instead of loudly.  This test fails
+        against exactly that mistake.
+
+        Parametrized over ``Path`` AND ``str`` because only the ``Path`` arm
+        runs in production: configuring a ``str`` here would leave the real
+        branch unexercised, so a later narrowing of ``_snippet_project_root``'s
+        isinstance check to ``(str,)`` would degrade every live escalation to
+        the ``<project_root>`` placeholder with the suite still green.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')  # the exact esc-3181-1 shape
+
+        scheduler = _mock_scheduler(task)
+        scheduler.config.project_root = configured_root
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        assert await runner.run(_make_assignment(task)) == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'curator_adjudication_missing'
+
+        kw = _parse_update_task_snippet(pending[0].detail)
+        assert set(kw) == {'id', 'project_root', 'metadata', 'metadata_mode'}
+        # A QUOTED str, not a bare int-like token — `id` is typed `str`.
+        assert ast.literal_eval(kw['id']) == '3181'
+        assert ast.literal_eval(kw['project_root']) == '/home/leo/src/reify'
+        assert ast.literal_eval(kw['metadata_mode']) == 'merge'
+        assert list(ast.literal_eval(kw['metadata'])) == ['human_curator_adjudicated_at']
+
+    @pytest.mark.parametrize('label', ['mock-config', 'no-config'])
+    async def test_curator_remediation_snippet_survives_a_scheduler_without_project_root(
+        self, tmp_path: Path, label: str,
+    ):
+        """A scheduler with no usable project_root must still file a VALID escalation.
+
+        The runner's ``scheduler`` collaborator is duck-typed and unannotated —
+        ``Harness._run_deterministic_slot`` constructs the runner "with only the
+        minimal dependencies needed" — so reading an attribute CHAIN off it is a
+        real production failure surface, not test paranoia.  This method's
+        contract (see its docstring) is that a durable on-disk safety escalation
+        is filed no matter what: an ``AttributeError`` raised while formatting
+        runbook PROSE must never convert a BLOCK into a propagated exception,
+        exactly as ``test_blocked_writeback_failure_still_returns_blocked`` pins
+        for the sibling writeback path.
+
+        PARAMETRIZED, not looped: the two shapes (see ``_degraded_scheduler``)
+        fail for genuinely different reasons — the chain RESOLVES to a Mock vs.
+        RAISES ``AttributeError`` — so a regression in the first must not abort
+        before the second ever runs, and the failure report must name which
+        shape broke instead of relying on hand-written ``[label]`` prefixes.
+
+        Either way the render must degrade to a VISIBLE ``<project_root>``
+        placeholder, which keeps the call syntactically valid and still NAMES
+        the required parameter — strictly better than omitting it.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+
+        scheduler = _degraded_scheduler(label, task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner.run(_make_assignment(task))
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            'a degraded scheduler must not turn a durable BLOCK into a '
+            'propagated exception'
+        )
+
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1, 'the safety escalation must stay durable'
+        esc = pending[0]
+        assert esc.category == 'curator_adjudication_missing'
+
+        kw = _parse_update_task_snippet(esc.detail)
+        assert set(kw) == {'id', 'project_root', 'metadata', 'metadata_mode'}
+        assert ast.literal_eval(kw['id']) == '3181'
+        assert ast.literal_eval(kw['project_root']) == '<project_root>', (
+            'an unusable project_root must degrade to a visible placeholder '
+            'naming the required parameter'
+        )
+        assert 'MagicMock' not in esc.detail, (
+            'an operator must never be handed a mock repr'
+        )
 
     async def test_curator_gate_with_zero_records_still_refiles_milestone_gate(
         self, tmp_path: Path,

@@ -12,15 +12,17 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
+import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
@@ -66,6 +68,7 @@ from orchestrator.verify_cmd import (
     cargo_scope,
     govern_cpu,
     has_unpreserved_chain_clauses,
+    keyword_truncation_end,
     parse_config_command,
     promote_cwd_to_project,
     render,
@@ -208,7 +211,15 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     idx = head.find(keyword)
     if idx == -1:
         return cmd
-    retained = head[: idx + len(keyword)]
+    # Task 3931 / esc-3805-1: token-aware, not a bare byte-offset slice. The
+    # old `head[: idx + len(keyword)]` cut mid-token at the `@` of a pinned npx
+    # package spec, silently dropping `@1.1.408` before the string was
+    # re-parsed — so the gate advertised a pinned pyright and ran whatever npx
+    # last cached. See `keyword_truncation_end` for the boundary rule and why
+    # it is anchored on `@` rather than "keep the whole token"; the shared
+    # helper is also what keeps this in structural lockstep with
+    # `verify_plan._scope_prefix_to_keyword`.
+    retained = head[: keyword_truncation_end(head, idx + len(keyword))]
     parsed = parse_config_command(retained)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
@@ -3319,6 +3330,34 @@ class VerifyResult:
     # test_verify_merge_cli_wrapper_transparency). Folded in here to clear a
     # preexisting main red introduced by task 1802.
     duration_secs: float = field(default=0.0, compare=False)
+    # Task 3789 (ε): the discriminator's observation about a failing merge verify —
+    # `confirm_isolated_rerun_verdict`'s FlakeSuppression, attached by
+    # `apply_merge_flake_suppression` on BOTH branches (suppressed and not), and
+    # consumed ONLY on the dispatcher by `flake_recorder.record_merge_flake_suppression`.
+    # None = no discriminator ran (every non-merge-gate result, and an OLDER remote
+    # whose wire payload simply omits the key — boundary row B13).
+    #
+    # THE ONE FIELD THAT DEVIATES from the `contention`/`plan`/`failing_test_ids`
+    # "plain JSON-native, never a nested dataclass" rule above, deliberately: PRD §8
+    # specifies a TYPED carrier and the recorder consumes a `FlakeSuppression`, not a
+    # dict, so a bare dict would make this annotation a lie on exactly the deserialized
+    # path the field exists to serve.
+    #
+    # The rule's usual consequence still does not bite, because only HALF the codec is
+    # generic in the problematic direction: `result_to_dict` is `dataclasses.asdict`,
+    # which flattens the nested dataclass (and `json.dumps` flattens its StrEnums to
+    # their values and the tuple to an array), so the WRITE half needs no change. Only
+    # `result_from_dict` — a bare `VerifyResult(**d)` — needs the reconstruction hook,
+    # and it has exactly one: `flake_ledger.flake_suppression_from_wire`, mirroring
+    # `MergeVerifySpec.from_dict`'s optional nested `global_verify_command`.
+    #
+    # compare=False, for the identical reason spelled out for `duration_secs` above:
+    # `FlakeSuppression.observed_at` is a wall-clock stamp taken at observation, so two
+    # independent runs of the same logical verification carry different values. Since
+    # §5.5 requires attaching the observation on the NON-suppressed branch too, without
+    # compare=False a failing CLI verify that produced an `unconfirmable` observation
+    # would break test_cli test_verify_merge_cli_wrapper_transparency.
+    flake_suppression: FlakeSuppression | None = field(default=None, compare=False)
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -3606,7 +3645,11 @@ def _strip_venv_bin_from_path(path: str | None, venv: str | None) -> str | None:
     return os.pathsep.join(kept)
 
 
-def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
+def _target_subprocess_env(
+    extra: dict[str, str] | None,
+    *,
+    worktree: Path | None = None,
+) -> dict[str, str]:
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
@@ -3620,6 +3663,22 @@ def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
     ``DF_VERIFY_ROLE`` plus reify's ``RUSTC_WRAPPER`` / ``CARGO_*`` / jobserver
     vars) LAST, so target-supplied vars always win — an ``ORCH_*`` var a caller
     intentionally injects therefore survives the scrub.
+
+    When *worktree* is given, also injects ``RUFF_CACHE_DIR=<worktree>/.ruff_cache``
+    so ruff's cache resolution TERMINATES at the worktree boundary (task 3922).
+    This is the SAME cross-checkout-coupling class as the ghost-venv scrub
+    above: ruff resolves both its config and its cache by walking parent dirs
+    up from each linted file, so a task worktree whose own root declares no
+    ``[tool.ruff]`` walks out into the PARENT checkout and shares the parent's
+    ``.ruff_cache`` with every concurrently-verifying sibling — coupling a
+    merge gate to another checkout's UNCOMMITTED working tree.  Measured on
+    ruff 0.15.9 in exactly that geometry, ``RUFF_CACHE_DIR`` redirects
+    ``cache_dir`` while leaving the resolved ``Settings path`` and the emitted
+    rule codes byte-identical; that rule-neutrality is what makes it safe to
+    apply unconditionally, at any branch base age.  (A ``--config`` pin is NOT:
+    aimed at a pyproject declaring no ``[tool.ruff]`` it silently falls back to
+    ruff's built-in defaults — a false green.  See pyproject.toml's
+    ``[tool.ruff]`` decision block.)
     """
     venv = os.environ.get('VIRTUAL_ENV')
     env = {
@@ -3631,9 +3690,515 @@ def _target_subprocess_env(extra: dict[str, str] | None) -> dict[str, str]:
     if stripped_path is not None:
         env['PATH'] = stripped_path
     env['PYTHONUNBUFFERED'] = '1'
+    # This assignment's POSITION is load-bearing, not incidental: it must stay
+    # strictly ABOVE the `extra` overlay so an operator's `verify_env`
+    # RUFF_CACHE_DIR keeps winning (pinned by
+    # test_verify_env.py::TestRuffCacheIsWorktreeLocal::
+    # test_caller_overlay_still_wins_over_injected_cache_dir — move it below
+    # and that test goes red).  And it fires ONLY on an explicit *worktree*:
+    # never synthesise one from os.getcwd(), which would silently re-point the
+    # cache for every non-verify caller that shares this builder.
+    if worktree is not None:
+        env['RUFF_CACHE_DIR'] = str(Path(worktree) / '.ruff_cache')
     if extra:
         env.update(extra)
     return env
+
+
+# ``ruff check --show-settings`` prints ``Settings path: "<abs path>"`` as its
+# second line.  Matched by PREFIX, never by line index — ruff is free to add a
+# preamble line and an index match would then silently read the wrong thing.
+#
+# SECOND READER OF THE SAME OUTPUT: ``_show_settings_field`` in
+# tests/scripts/test_worktree_ruff_config_boundary.py parses these same
+# ``--show-settings`` lines.  It IMPORTS the constant below rather than copying
+# it, precisely because the two sites fail differently when ruff reformats its
+# output — this one degrades to silence (a diagnostic that stops diagnosing),
+# that one fails loudly — so a divergent copy could sit unnoticed.  Renaming
+# this constant is therefore safe; changing its VALUE moves both readers.
+_RUFF_SETTINGS_PATH_PREFIX = 'Settings path:'
+_RUFF_PROBE_TIMEOUT_S = 20.0
+# Bound on the fallback probe-target search (below).  A cap, not a tuning knob:
+# a DIAGNOSTIC must never walk a large tree looking for something to measure.
+_RUFF_PROBE_SCAN_DIR_LIMIT = 64
+_RUFF_PROBE_SKIP_DIRS = frozenset({
+    '.git', '.venv', 'venv', '.worktrees', '__pycache__', 'node_modules',
+    'target', '.mypy_cache', '.ruff_cache', '.pytest_cache', 'build', 'dist',
+})
+
+
+def _ruff_probe_binary(worktree: Path, env: dict[str, str]) -> list[str]:
+    """Resolve WHICH ruff the escape probe should run — best effort, and say so.
+
+    The probe is an INTERPRETATION of a lint leg it does not itself run, so
+    fidelity matters: the leg resolves ruff through the TARGET's own toolchain
+    (``uv run --project … ruff``, under a PATH ``_target_subprocess_env``
+    deliberately scrubs of the orchestrator venv), while the cheapest probe
+    would just be ``sys.executable -m ruff`` — the ORCHESTRATOR's ruff, a
+    possibly different version, and absent entirely for a target whose verify
+    env never installed one.  Preference order, most faithful first:
+
+    1. ``<worktree>/.venv/bin/ruff`` — the target's own venv, which is what a
+       workspace-scoped ``uv run`` resolves.
+    2. ``ruff`` on the SCRUBBED PATH — what a bare ``ruff`` in the configured
+       lint command would resolve in the same env the leg runs under.
+    3. ``sys.executable -m ruff`` — the orchestrator's own ruff, the honest
+       last resort.
+
+    Rung 3 may measure a different ruff than the one that produced the verdict,
+    so the emitted diagnostic NAMES the binary it used rather than implying the
+    leg's own.  Total and non-raising: an unreadable path just falls through.
+    """
+    root = Path(worktree)
+    local = root / '.venv' / 'bin' / 'ruff'
+    try:
+        if local.is_file() and os.access(local, os.X_OK):
+            return [str(local)]
+    except OSError:
+        pass
+    on_path = shutil.which('ruff', path=env.get('PATH'))
+    if on_path:
+        return [on_path]
+    return [sys.executable, '-m', 'ruff']
+
+
+def _ruff_probe_target(worktree: Path) -> Path | None:
+    """The file to ask ruff about, or None when the worktree offers none.
+
+    Normally the worktree's own root ``pyproject.toml``: that is the probe
+    which answers the question actually being asked ("does the ROOT config
+    escape?").
+
+    When the root carries no pyproject.toml at all — a project rooted on
+    ``ruff.toml``/``setup.cfg``, a polyglot repo, or a branch that deleted it —
+    ruff would exit with "No files found under the given path", print no
+    settings line, and the detector would go SILENT on precisely the geometry
+    most likely to escape (no root pyproject ⇒ certainly no root
+    ``[tool.ruff]``).  So fall back to a real ``.py`` file, breadth-first and
+    SHALLOWEST-first: the closer the probe file sits to the worktree root, the
+    fewer intervening configs can answer for it.  A deep file under a workspace
+    MEMBER would resolve that member's own ``[tool.ruff]`` and report "no
+    escape" for a reason that has nothing to do with the root.
+
+    Bounded by ``_RUFF_PROBE_SCAN_DIR_LIMIT`` directories and pruned of vendor/
+    cache/nested-worktree dirs; returns None rather than scanning further, and
+    the caller logs that give-up at DEBUG so the silence stays diagnosable.
+    """
+    root = Path(worktree)
+    default = root / 'pyproject.toml'
+    try:
+        if default.is_file():
+            return default
+    except OSError:
+        return None
+    queue: list[Path] = [root]
+    visited = 0
+    while queue and visited < _RUFF_PROBE_SCAN_DIR_LIMIT:
+        current = queue.pop(0)
+        visited += 1
+        try:
+            entries = sorted(current.iterdir())
+        except OSError:
+            continue
+        subdirs: list[Path] = []
+        for entry in entries:
+            try:
+                if entry.is_file() and entry.suffix == '.py':
+                    return entry
+                if (
+                    entry.is_dir()
+                    and not entry.name.startswith('.')
+                    and entry.name not in _RUFF_PROBE_SKIP_DIRS
+                ):
+                    subdirs.append(entry)
+            except OSError:
+                continue
+        queue.extend(subdirs)
+    return None
+
+
+def _ruff_settings_path(worktree: Path, target: Path | None = None) -> Path | None:
+    """Report WHERE ruff actually resolves its settings for *target* (task 3922).
+
+    ruff resolves its config by walking parent directories up from each linted
+    file, and a git VCS root does NOT halt that walk.  A task worktree whose own
+    root declares no ``[tool.ruff]`` therefore resolves the PARENT checkout's
+    pyproject.toml — reading a rule set from another checkout's UNCOMMITTED
+    working tree.  This helper measures that rather than assuming it.
+
+    *target* defaults to ``_ruff_probe_target(worktree)`` — the worktree's own
+    root ``pyproject.toml``, or the shallowest ``.py`` file when there is none.
+    Do NOT default it to the worktree DIRECTORY: ruff then resolves settings for
+    whichever file its traversal happens to reach first, which in this repo is a
+    workspace MEMBER carrying its own ``[tool.ruff]``, and the answer would be
+    about that member instead of the root.
+
+    Runs whichever binary ``_ruff_probe_binary`` selects: a best-effort stand-in
+    for the lint leg's own ruff, possibly a different build of it — see that
+    helper, and note the emitted diagnostic names the binary it used.
+
+    TOTAL AND NON-RAISING by construction: a missing ruff, an unreadable cwd, a
+    timeout, an absent probe target or an unparseable line all return None.
+    This is a diagnostic and must be structurally incapable of reddening a
+    verify by itself.  Every give-up is logged at DEBUG with its REASON —
+    ``probe target missing`` / ``ruff unavailable`` / ``no settings line`` — so
+    the silence is diagnosable rather than merely quiet.  One subprocess,
+    ``--no-cache``, short timeout.
+
+    SYNCHRONOUS on purpose (one blocking ``subprocess.run``); every async caller
+    must reach it through ``asyncio.to_thread`` — see ``_report_ruff_config_escape``.
+    """
+    probe = _ruff_probe_target(worktree) if target is None else Path(target)
+    if probe is None:
+        logger.debug(
+            'ruff config-escape probe gave up on %s: probe target missing '
+            '(no root pyproject.toml, and no .py file within %d directories)',
+            worktree, _RUFF_PROBE_SCAN_DIR_LIMIT,
+        )
+        return None
+    env = _target_subprocess_env(None, worktree=Path(worktree))
+    argv = _ruff_probe_binary(Path(worktree), env)
+    try:
+        proc = subprocess.run(
+            [*argv, 'check', '--no-cache', '--show-settings', str(probe)],
+            cwd=str(worktree),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_RUFF_PROBE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug(
+            'ruff config-escape probe gave up on %s: ruff unavailable (%s): %s',
+            worktree, ' '.join(argv), exc,
+        )
+        return None
+    for line in proc.stdout.splitlines():
+        if not line.startswith(_RUFF_SETTINGS_PATH_PREFIX):
+            continue
+        value = line[len(_RUFF_SETTINGS_PATH_PREFIX):].strip().strip('"')
+        if value:
+            return Path(value)
+        break
+    logger.debug(
+        'ruff config-escape probe gave up on %s: no settings line for %s '
+        '(rc=%d, probe=%s); stderr: %s',
+        worktree, probe, proc.returncode, ' '.join(argv), proc.stderr.strip()[:400],
+    )
+    return None
+
+
+def _settings_path_escapes(settings: Path | None, worktree: Path) -> bool:
+    """True iff *settings* is a real path lying OUTSIDE *worktree*.
+
+    The single escape predicate — one detection site, never a second copy of
+    the comparison.  Callers (production and test alike) compose it with
+    ``_ruff_settings_path``; there is deliberately no third helper wrapping the
+    pair, because a test-only wrapper can drift out of agreement with the real
+    call path without any test noticing.
+
+    Fail-safe in the QUIET direction: an unmeasurable probe (``None``) or an
+    unresolvable path reports False, so a broken or absent ruff produces
+    silence rather than a spurious diagnostic.
+    """
+    if settings is None:
+        return False
+    try:
+        return not settings.resolve().is_relative_to(Path(worktree).resolve())
+    except OSError:
+        return False
+
+
+def _command_invokes_ruff(config_cmd: str) -> bool:
+    """True iff *config_cmd* actually invokes ruff, by TOKEN rather than substring.
+
+    The probe gate's cheap half.  A bare ``'ruff' in config_cmd`` was wrong in
+    the false-positive direction: any lint command whose text merely CONTAINS
+    those four characters matched, so ``python3 scripts/check_ruff_drift.py``
+    would spend a 20s-timeout subprocess and emit an escape diagnostic for a leg
+    that never ran ruff — a record attributing a rule-set caveat to a verdict
+    ruff did not produce, which is worse than the wasted spawn.
+
+    Matches a token that IS ruff (``ruff``) or a path ENDING in it
+    (``.venv/bin/ruff``), which are the two spellings the repo's own commands
+    and ``_ruff_probe_binary`` use.  ``shlex.split`` rather than ``str.split``
+    so a quoted argument cannot be shredded into a spurious token.
+
+    Falls back to the old substring test when ``shlex.split`` raises (an
+    unbalanced quote), and NOT to False: the fallback's failure mode is a
+    wasted probe, while False would silently drop the diagnostic for a command
+    that may well be running ruff.  Loud-over-silent, in the cheap direction.
+
+    RESIDUAL, stated rather than papered over: this is a lexical test, so a leg
+    that reaches ruff through a wrapper script or a make target never spelling
+    the name still reads as non-ruff and is not probed.  Narrowing the
+    false-positive direction does not touch that, and nothing short of
+    inspecting what the leg actually exec'd would — which is the cost the gate
+    exists to avoid.
+    """
+    try:
+        tokens = shlex.split(config_cmd)
+    except ValueError:
+        return 'ruff' in config_cmd
+    return any(tok == 'ruff' or tok.endswith('/ruff') for tok in tokens)
+
+
+# Stable, greppable token carried by the escape diagnostic, so an operator (and
+# the guard test) can key on the RECORD rather than on its prose.
+_RUFF_ESCAPE_MARKER = 'ruff-config-escapes-worktree'
+# The remediation, as a named constant: it is the one part of the message with
+# behavioural weight (an operator acts on it), so the guard asserts THIS rather
+# than a literal phrase that a wording edit would redden for no reason.
+_RUFF_ESCAPE_REMEDIATION = (
+    "merge main forward so this branch's own root pyproject.toml declares "
+    '[tool.ruff]'
+)
+# The worktree-ROOT config files whose presence decides whether ruff's walk-up
+# halts at the boundary, listed in ruff's own per-directory precedence order:
+# ``.ruff.toml`` > ``ruff.toml`` > ``pyproject.toml[tool.ruff]``.  All THREE are
+# fingerprinted, not just the pyproject: a base carrying only a root
+# ``ruff.toml`` halts the walk exactly as effectively, so a pyproject-only
+# fingerprint would read that base as config-less and miss the change outright.
+# Measured on ruff 0.15.9 in both directions — with all three present the
+# settings path is the ``.ruff.toml``; with the parent declaring [tool.ruff] and
+# the worktree root declaring only a bare ``ruff.toml``, the walk stops at the
+# worktree.
+_RUFF_ROOT_CONFIG_NAMES: tuple[str, ...] = ('.ruff.toml', 'ruff.toml', 'pyproject.toml')
+
+# (resolved worktree path, per-root-config content digests).
+_RuffEscapeLatchKey = tuple[str, tuple[str | None, ...]]
+
+
+def _ruff_escape_latch_key(worktree: Path) -> _RuffEscapeLatchKey:
+    """Identity for the escape latch: the worktree PATH plus its BASE's config.
+
+    The path alone is not an identity for the question the latch suppresses.
+    A worktree path is recycled across DIFFERENT bases within one orchestrator
+    process, and re-measuring is exactly what those recycles require.  So the
+    key carries a fingerprint of the base's root config alongside the path.
+
+    ``base_fingerprint`` digests each name in ``_RUFF_ROOT_CONFIG_NAMES`` at the
+    worktree root, in that fixed order, as ``None`` (absent or unreadable) or a
+    sha256 hex digest of its bytes.  A CONTENT digest rather than an
+    ``st_mtime_ns``/``st_size`` stat because identical config bytes provably
+    mean an identical halt decision: a rewrite-to-identical-content, or a lane
+    reset that leaves the file untouched, must NOT re-probe, which is what
+    keeps the per-module and per-retry dedup working.
+
+    SUBPROCESS-FREE on purpose.  This runs on the verify hot path, before the
+    latch check, so it must not spawn — which also rules out identifying the
+    base by ``git rev-parse HEAD``: ``run_verification`` carries no commit sha,
+    so that would cost a spawn per lint leg per module.
+
+    TOTAL AND NON-RAISING like every other helper here: an unreadable file
+    degrades to ``None`` for that entry, and an unresolvable worktree to its
+    raw path.
+    """
+    root = Path(worktree)
+    try:
+        resolved = str(root.resolve())
+    except OSError:
+        resolved = str(root)
+    digests: list[str | None] = []
+    for name in _RUFF_ROOT_CONFIG_NAMES:
+        try:
+            digests.append(hashlib.sha256((root / name).read_bytes()).hexdigest())
+        except OSError:
+            digests.append(None)
+    return resolved, tuple(digests)
+
+
+# One-record-per-(WORKTREE, BASE) latch, module-level on purpose.
+# ``verify.py::run_full_verification`` gathers one ``run_verification`` per
+# module config, and the merge lane fans out the same way in
+# ``merge_queue.py::_run_unscoped_typechecks``, so a latch scoped to a single
+# call would still emit the same multi-line WARNING — and spawn the same probe
+# — once per module for one worktree.
+#
+# The scope is process-lifetime, but the KEY is not the path alone: a worktree
+# PATH is recycled across different bases inside one process, by warm lanes
+# (fixed ``_lane-<k>`` dirs handed out task after task by
+# ``warm_lane_pool.py::WarmLanePool.try_acquire``/``.release``, re-pointed by
+# ``git_ops.py::GitOps._reset_warm_lane``'s ``git checkout -f -B``), by the fixed
+# persistent ``git_ops.py::PERSISTENT_MERGE_WORKTREE_NAME`` worktree reset per
+# merge commit, and by per-task dirs reused when a task id recurs
+# (``git_ops.py::GitOps.create_worktree``).  A path-only key would let the FIRST
+# task to occupy a lane decide, for the rest of the fleet-deploy window, whether
+# every later task on it is measured at all.  So the key carries the base's
+# root-config fingerprint too (``_ruff_escape_latch_key``); the path half stays
+# RESOLVED so ``.worktrees/77`` and its symlinked spelling still collapse.
+#
+# ONE documented residual: the fingerprint covers the worktree ROOT's config
+# files only.  A base change confined to an INTERMEDIATE directory's config, or
+# to which ``.py`` file ``_ruff_probe_target`` falls back on, is not caught and
+# stays suppressed for the process.  That is bounded and strictly better than a
+# path-only key, and is stated rather than papered over.
+#
+# Holds MEASURED keys only — see ``_RUFF_ESCAPE_PROBE_ATTEMPTS``.
+_RUFF_ESCAPE_REPORTED: set[_RuffEscapeLatchKey] = set()
+
+# Probe attempts for keys that have NOT yet yielded a measurement.  Deliberately
+# a SECOND structure, because the two states mean different things: a key in
+# ``_RUFF_ESCAPE_REPORTED`` was ANSWERED, and suppressing a repeat of a known
+# answer is exactly what a latch is for; a key here was merely ASKED, and
+# suppressing a question never answered would let one transient failure (ruff
+# momentarily unavailable, a single timeout) silence that base for the rest of
+# the process.
+#
+# Bounded rather than unlimited, because two of the probe's three None paths are
+# PERSISTENT — ruff genuinely absent, or its output no longer formatting as
+# ``Settings path:`` — and an unbounded retry would spawn a doomed subprocess on
+# every lint leg of every module for the life of the process.  A key is dropped
+# from here the moment it IS measured, so the two structures never both hold the
+# same key.
+#
+# What is bounded is the PROBE COUNT per key (at
+# ``_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS``), NOT the ENTRY count — stated plainly
+# because the two are easy to conflate.  Every distinct (worktree, base) pair the
+# process sees retains exactly one entry for the process lifetime: in
+# ``_RUFF_ESCAPE_REPORTED`` once measured, or here at the cap if it never was.
+# Neither structure is ever swept, and the key deliberately CHANGES whenever a
+# recycled worktree's base changes (the whole point of the fingerprint above), so
+# a warm lane or the persistent merge worktree adds a NEW entry per task it
+# hosts.  ACCEPTED rather than bounded, and why: an entry is one path string plus
+# three hex digests (~250 B), the orchestrator process is torn down every fleet
+# redeploy (~8h), and any eviction policy trades that flat cost for a re-emitted
+# duplicate WARNING whenever it evicts a key whose base has NOT changed — the
+# exact noise the latch exists to suppress.
+_RUFF_ESCAPE_PROBE_ATTEMPTS: dict[_RuffEscapeLatchKey, int] = {}
+_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS: int = 3
+
+# Keys whose probe is RUNNING right now.  A THIRD structure because neither of
+# the two above can express "asked but not yet answered": ``_report_ruff_config
+# _escape`` yields at ``await asyncio.to_thread`` and only records its outcome
+# after the probe returns, so a plain check-then-set would be a read of the two
+# structures separated from their write by a suspension point.  Production fans
+# the per-module ``run_verification`` calls out CONCURRENTLY
+# (``verify.py::run_full_verification``'s ``asyncio.gather`` over
+# ``module_configs.values()``, and the same fan-out in
+# ``merge_queue.py::_run_unscoped_typechecks``), so every concurrent lint leg on
+# one worktree would clear the latch check before ANY of them finished: N
+# probes, N copies of the multi-line WARNING, and an attempt counter that
+# advances by one per ROUND instead of per attempt — admitting
+# ~N*_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS doomed 20s-timeout subprocesses instead
+# of the bounded 3.
+#
+# Reserved SYNCHRONOUSLY, in the same await-free block as the latch check, which
+# is what makes the reservation atomic under asyncio's single-threaded loop;
+# discarded in a ``finally`` so a losing leg re-asks on the NEXT lint leg rather
+# than being suppressed forever.  A concurrent loser returns silently instead of
+# waiting: the record is a diagnostic, and one copy of it is the whole point.
+_RUFF_ESCAPE_IN_FLIGHT: set[_RuffEscapeLatchKey] = set()
+
+
+async def _report_ruff_config_escape(worktree: Path) -> None:
+    """Emit the ONE non-fatal diagnostic for a worktree whose ruff config escapes.
+
+    Deliberately an INTERPRETATION layered on top of the lint leg, never a
+    verdict — exactly the shape of the mis-resolved-interpreter record in
+    ``_run_or_skip_timed``.  Hard-failing an escaping worktree was rejected:
+    it would red every stale-based worktree on the host at once (286 of 567
+    carried no ``[tool.ruff]`` at time of writing), the fleet-wide outage mode
+    pyproject.toml's ``[tool.ruff]`` block warns against.  The escape is a
+    property of the BRANCH'S BASE AGE, not of the code under review, so the
+    branch must still be judged on its own lint output.
+
+    ASYNC because the probe is a blocking ``subprocess.run``: it runs on a
+    worker thread via ``asyncio.to_thread`` so it cannot stall the event loop
+    that is concurrently streaming and wall-clock-timing other verify legs
+    (``verify.py::run_full_verification`` gathers one ``run_verification`` per
+    module; ``merge_queue.py::_run_unscoped_typechecks`` does the same).  Every
+    other potentially-blocking call in this module observes the same rule.
+
+    The latch is OUTCOME-AWARE: a key is suppressed once it has been MEASURED,
+    not once it has been asked.  An unmeasurable probe increments
+    ``_RUFF_ESCAPE_PROBE_ATTEMPTS`` instead and is retried on the next lint leg,
+    up to ``_RUFF_ESCAPE_MAX_PROBE_ATTEMPTS``.
+
+    CONCURRENCY-SAFE by reservation, not by luck: the latch check and the
+    ``_RUFF_ESCAPE_IN_FLIGHT`` reserve happen in one await-free block, because
+    the concurrency this exists for is exactly the case where several lint legs
+    for ONE worktree are in flight at once (``asyncio.gather`` over per-module
+    ``run_verification`` calls).  A check-then-set spanning the ``await`` below
+    would dedupe nothing.
+
+    Structurally non-fatal — nothing here propagates.
+    """
+    key = _ruff_escape_latch_key(Path(worktree))
+    # ---- BEGIN await-free reservation block ----------------------------------
+    # Everything from the check to the two writes below must stay free of ``await``:
+    # that is the ONLY thing making the reserve atomic against the concurrent
+    # lint legs described above ``_RUFF_ESCAPE_IN_FLIGHT``.  Do not introduce a
+    # suspension point here.
+    if (
+        key in _RUFF_ESCAPE_REPORTED
+        or key in _RUFF_ESCAPE_IN_FLIGHT
+        or _RUFF_ESCAPE_PROBE_ATTEMPTS.get(key, 0) >= _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS
+    ):
+        return
+    _RUFF_ESCAPE_IN_FLIGHT.add(key)
+    # Counted HERE rather than on the unmeasured path, so the cap bounds ACTUAL
+    # probe spawns.  Popped again below the moment the key is measured, so a
+    # measured key never leaves a counter behind.
+    attempts = _RUFF_ESCAPE_PROBE_ATTEMPTS.get(key, 0) + 1
+    _RUFF_ESCAPE_PROBE_ATTEMPTS[key] = attempts
+    # ---- END await-free reservation block ------------------------------------
+    try:
+        settings = await asyncio.to_thread(_ruff_settings_path, Path(worktree))
+        if settings is None:
+            # UNMEASURED, which is not the same as "no escape": the attempt is
+            # already counted, so just let the next lint leg ask again.
+            # ``_ruff_settings_path`` has already logged WHICH give-up reason
+            # fired; this logs the give-up on the KEY, once, as the cap is reached.
+            if attempts >= _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS:
+                logger.debug(
+                    'ruff config-escape probe gave up on %s: unmeasurable on '
+                    '%d of %d permitted attempts; not probing this base again',
+                    key, attempts, _RUFF_ESCAPE_MAX_PROBE_ATTEMPTS,
+                )
+            return
+        # Measured. The question is answered for this (worktree, base), so the
+        # latch may suppress it and the attempt counter is no longer needed.
+        _RUFF_ESCAPE_REPORTED.add(key)
+        _RUFF_ESCAPE_PROBE_ATTEMPTS.pop(key, None)
+        if not _settings_path_escapes(settings, worktree):
+            return
+        probe = ' '.join(
+            _ruff_probe_binary(
+                Path(worktree), _target_subprocess_env(None, worktree=Path(worktree)),
+            )
+        )
+        logger.warning(
+            'Lint gate ruff config ESCAPES this worktree (%s): ruff resolved its '
+            'settings from %s — a file OUTSIDE the worktree, in the parent '
+            "checkout's working tree, which this branch does not control and "
+            'which may be uncommitted. ruff walks parent dirs up from each '
+            'linted file and a git root does not stop it, so a worktree whose '
+            'own root declares no [tool.ruff] inherits whatever the parent '
+            'currently has. The lint verdict below is UNCHANGED and still '
+            'yours to act on; this line only explains why its rule set may not '
+            "match this branch's. Remediation: %s. Measured by a best-effort "
+            'probe (%s), which may be a different build of ruff than the lint '
+            'leg itself resolved. (%s; task 3922)',
+            worktree,
+            settings,
+            _RUFF_ESCAPE_REMEDIATION,
+            probe,
+            _RUFF_ESCAPE_MARKER,
+        )
+    except Exception:
+        # Intentionally blind: a DIAGNOSTIC must never be able to red a verify,
+        # so every failure mode degrades to a DEBUG line and silence. The
+        # helpers above are already total; this is the belt-and-braces layer.
+        # The attempt reserved above is deliberately NOT refunded here: a raising
+        # probe is a spawn that happened and must count against the cap, or a
+        # deterministic raise would retry unboundedly for the life of the process.
+        logger.debug('ruff config-escape probe failed; skipping', exc_info=True)
+    finally:
+        # Always released, so a key is only ever suppressed by an ANSWER
+        # (``_RUFF_ESCAPE_REPORTED``) or by the attempt cap — never by a probe
+        # that already finished.
+        _RUFF_ESCAPE_IN_FLIGHT.discard(key)
 
 
 @dataclass(frozen=True)
@@ -3890,7 +4455,34 @@ async def _run_cmd(
     # venv/uv activation vars + the venv bin dir from PATH, sets
     # PYTHONUNBUFFERED, and reapplies the caller overlay (`env`) LAST so reify's
     # RUSTC_WRAPPER/CARGO_*/jobserver vars and DF_VERIFY_ROLE always win.
-    subprocess_env: dict[str, str] = _target_subprocess_env(env)
+    # `cwd` doubles as the ruff-cache anchor (task 3922): <cwd>/.ruff_cache
+    # terminates ruff's cache walk-up at the subprocess cwd instead of letting it
+    # escape into the parent checkout's shared .ruff_cache.  Both spawn branches
+    # below read this same dict, so the one thread-through covers systemd-run
+    # --scope and the plain create_subprocess_shell path alike.
+    #
+    # The anchor is the SUBPROCESS cwd, which is not always the worktree ROOT:
+    # `_run_segmented` spawns each segment of a `cd X && …` chain under
+    # `worktree / segment.cwd_rel`, so a segmented leg anchors the cache at that
+    # SUBDIRECTORY.  Said precisely rather than rounded off to "the worktree
+    # root", because the two differ exactly where this repo's own root
+    # test_command lives (`cd shared && … && cd ../escalation && …`).  What the
+    # difference does and does not cost, measured rather than assumed:
+    #   - The BOUNDARY property is unconditional either way — `verify_cmd` refuses
+    #     a chain whose accumulated cwd leaves the worktree, so a segment cwd is
+    #     always inside it and the cache can never reach the parent checkout.
+    #     That, not the exact directory, is what task 3922 is about.
+    #   - The cost is fragmentation: a segmented leg keeps one cache per segment
+    #     directory instead of one per worktree.  Segments lint DISJOINT package
+    #     directories, so there is little cross-segment reuse to lose.
+    #   - The stray dirs are inert: ruff writes a `.gitignore` containing `*` into
+    #     every cache dir it creates (verified — `.ruff_cache/.gitignore` in this
+    #     checkout), so a per-segment dir is self-ignoring and can never be staged
+    #     by the lane's `git add -A`.
+    # Pinned by test_verify_ruff_config_boundary.py::
+    # test_segmented_chain_anchors_each_segment_at_its_own_cwd — kept on one
+    # line so the name greps.
+    subprocess_env: dict[str, str] = _target_subprocess_env(env, worktree=cwd)
 
     proc = None
     pgid: int | None = None
@@ -5286,6 +5878,24 @@ async def run_verification(
         # regex. The raw pyright text still streams to the per-leg log file
         # untouched; this line is an interpretation layered ON TOP of it, not a
         # replacement for it (loud-over-silent-degradation).
+        # Ruff config-escape diagnostic (task 3922), sited alongside the
+        # interpreter record below for the same reason: this is the single
+        # post-_run_cmd path, so the record is structurally at-most-once.
+        # Gated to where it can be true at all — a ruff-bearing LINT leg. Note
+        # this passes `worktree`, the true worktree ROOT, NOT the leg's cwd:
+        # under `_run_segmented` the cwd is a SUBDIRECTORY (see the anchor note
+        # in `_run_cmd`), and the escape question is about the worktree
+        # boundary, so the root is the only correct thing to ask about. The GATE
+        # is load-bearing, not decorative: without it the probe would spawn on
+        # the test and type legs too, where its answer is meaningless, and it
+        # matches ruff by TOKEN rather than substring so a lint command that
+        # merely MENTIONS ruff in a filename does not spend a probe (both
+        # pinned by
+        # test_verify_ruff_config_boundary.py::TestEscapeProbeIsGated). Fires
+        # on green legs too: the escape is about which RULE SET ran, which is
+        # exactly the question a green result cannot answer for itself.
+        if label == 'lint' and _command_invokes_ruff(config_cmd):
+            await _report_ruff_config_escape(worktree)
         if rc != 0 and is_interpreter_missing_workspace_packages(out):
             logger.error(
                 'Verification %r check failed against a Python interpreter that '
@@ -6309,7 +6919,28 @@ def _reverse_dependency_module_configs(
         if dependent in already_scoped:
             continue
         base = config.module_configs_or_empty.get(dependent)
-        if base is None or not base.test_command:
+        if base is None:
+            # The map named a dependent this config's registry does not
+            # register, so there is no base command to narrow. Log rather
+            # than drop silently (amendment, review suggestion 1) — the
+            # silent-coverage-loss shape task 2607 exists to prevent.
+            # Two ways to land here: (1) a stale _REVERSE_TEST_DEPENDENTS
+            # entry naming a package this project doesn't have; (2) the
+            # CLI/remote merge leg under merge_verify_breadth='scoped',
+            # where verify_runner.run_merge_verify_on_worktree installs the
+            # dispatcher's spec set as the registry (task 4536) and that set
+            # is exactly `already_scoped` — see that function's KNOWN
+            # CONSEQUENCE note for why the trade is deliberate.
+            logger.warning(
+                'Reverse-dependency widening: %s is a mapped dependent of the '
+                'changed files but is absent from this config\'s module registry '
+                '(registered: %s) — skipping widening for this dependent; its '
+                '%d coupled test file(s) are NOT covered by this run',
+                dependent, sorted(config.module_configs_or_empty) or '<none>',
+                len(coupled),
+            )
+            continue
+        if not base.test_command:
             continue
         scoped_test_command = _scope_to_keyword(base.test_command, 'pytest', coupled)
         if scoped_test_command == base.test_command:
@@ -6438,7 +7069,9 @@ async def run_scoped_verification(
             # bypassed-scoping path executes, not WHETHER it executes.
             # role=='merge' + breadth=='full' replaces the single OPAQUE
             # global command below with a per-module full-suite fan-out
-            # across every REGISTERED module (config.module_configs_or_empty),
+            # across every REGISTERED module (config.module_configs_or_empty
+            # — whose registry that is on each leg:
+            # see verify_runner.run_merge_verify_on_worktree, task 4536),
             # reusing the SAME _derive_full_suite_runs /
             # _executed_module_configs_from_plan bridge the module_configs-
             # branch merge+full expansion above uses (PRD Resolved decision
@@ -6540,6 +7173,13 @@ async def run_scoped_verification(
             # direct-instantiated config in most unit tests) falls back to
             # the passed module_configs unchanged — degrades safely rather
             # than silently verifying nothing.
+            #
+            # THIS is the site dark_factory's production merge gate actually
+            # takes: dark-factory-orchestrator.yaml sets
+            # merge_verify_breadth: "full" but leaves merge_verify_workspace
+            # at its False default, so the force_workspace fan-out above is
+            # NOT the live routing. Whose registry the read here is on each
+            # leg: see verify_runner.run_merge_verify_on_worktree, task 4536.
             #
             # The expansion lives in verify_plan.effective_merge_module_configs
             # (flake-ledger PRD §8.2 / task 3787 γ), which also owns the
@@ -8656,52 +9296,58 @@ async def confirm_merge_verify_flake_suppressible(
     *,
     worktree: Path,
     module_configs: list[ModuleConfig],
-) -> list[str] | None:
+) -> FlakeSuppression:
     """THIN WRAPPER: is *failing_result* a suppressible CPU-starvation flake?
 
     Holds NO re-run logic of its own. It asks THE discriminator —
     :func:`confirm_isolated_rerun_verdict` with ``call_site='merge_gate'`` —
-    and maps the returned verdict onto this gate's long-standing
-    ``list[str] | None`` contract. Everything substantive (the node-id ->
-    subproject mapping rules and their ambiguity handling, *module_configs*
+    and returns its observation UNCHANGED. Everything substantive (the node-id
+    -> subproject mapping rules and their ambiguity handling, *module_configs*
     provenance, the SAME-TREE / forced-serial / generous-timeout re-run
     composition, and this site's calibration in ``_CALL_SITE_POLICY``) is
     documented THERE, so it is stated once: two gates asking the same question
     through one implementation cannot drift into two different notions of
     "passes in isolation" (PRD §8.1, INV-5).
 
-    Returns the examined node-id list ONLY on ``passes_in_isolation`` — every
-    named failing test demonstrably PASSED on a scoped + forced-serial +
-    generous-timeout isolated re-run in the GIVEN merge *worktree* at the merge
-    SHA (INV-3: the exact tree being gated; no ``git worktree add``/``remove``,
-    no cleanup ``finally``). Single-shot per node-id group (PRD §5.1), not the
-    sweep's 2-attempt loop — the merge_gate policy's engine.
+    It survives as a function, rather than being inlined into its one caller,
+    because it is the merge gate's NAMED entry point — the exact role
+    :func:`_main_probe_failure_is_isolated_flake` plays for the probe — and it
+    is where ``call_site=FlakeCallSite.merge_gate`` is bound, once.
 
-    Returns ``None`` for EVERY other verdict — ``fails_in_isolation`` and BOTH
-    flavours of ``unconfirmable`` alike (no recoverable node-id from an
-    opaque/lint/type failure; a node-id mapping to no given subproject; an
-    infra-sentinel re-run category, which is never trusted as confirmation).
-    That collapse is deliberate: it is what makes the extraction provably
-    behaviour-preserving here. Fail CLOSED — never mask a REAL red — and NEVER
-    raise, because the merge path (merge_queue.py) has no ``VerifyInfraError``
-    handler and an uncaught raise there stalls the merge queue; the
-    discriminator's INV-1 owns that guarantee now (an unexpected exception
-    becomes ``fails_in_isolation``, which lands here as ``None``). The finer
-    ``unconfirmable`` distinction is visible to the discriminator's consumers
-    and deliberately invisible to this one — widening this return type is task
-    γ's work, not this extraction's.
+    ``passes_in_isolation`` means every named failing test demonstrably PASSED
+    on a scoped + forced-serial + generous-timeout isolated re-run in the GIVEN
+    merge *worktree* at the merge SHA (INV-3: the exact tree being gated; no
+    ``git worktree add``/``remove``, no cleanup ``finally``). Single-shot per
+    node-id group (PRD §5.1), not the sweep's 2-attempt loop — the merge_gate
+    policy's engine.
+
+    The verdict is returned WHOLE (task ε). β mapped every non-suppressing
+    verdict onto a shared ``None``, which made the extraction provably
+    behaviour-preserving but discarded the observation at exactly the point it
+    became knowable: ``fails_in_isolation`` (a REAL red) and ``unconfirmable``
+    (we could not tell — no recoverable node-id from an opaque/lint/type
+    failure; a node-id mapping to no given subproject; an infra-sentinel re-run
+    category, which is never trusted as confirmation) are different facts, and
+    θ's class-1 health check is an unconfirmable RATE that cannot be computed
+    from a ``None``. The caller — ``apply_merge_flake_suppression`` — still
+    suppresses on ``passes_in_isolation`` alone, so the GATE's behaviour is
+    unchanged; what changes is that the reason now reaches the dispatcher's
+    recorder instead of being dropped here.
+
+    Fail CLOSED — never mask a REAL red — and NEVER raise, because the merge
+    path (merge_queue.py) has no ``VerifyInfraError`` handler and an uncaught
+    raise there stalls the merge queue; the discriminator's INV-1 owns that
+    guarantee (an unexpected exception becomes ``fails_in_isolation``, which is
+    "merge stays red" rather than "we could not tell").
 
     Empty *module_configs* / files-not-on-disk (unit-test fakes) naturally map
-    nothing -> ``None``, which keeps existing ``LocalRunner.run_merge_verify``
-    tests byte-identical.
+    nothing -> ``unconfirmable``, which suppresses nothing and so keeps existing
+    ``LocalRunner.run_merge_verify`` tests byte-identical in outcome.
     """
-    suppression = await confirm_isolated_rerun_verdict(
+    return await confirm_isolated_rerun_verdict(
         worktree, config, module_configs, failing_result,
         call_site=FlakeCallSite.merge_gate,
     )
-    if suppression.verdict is FlakeVerdict.passes_in_isolation:
-        return list(suppression.test_ids)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -8836,33 +9482,6 @@ def _merge_flake_suppressed_pass(
     )
 
 
-def _emit_merge_flake_suppressed(
-    event_store: 'EventStore | None',
-    task_id: str | None,
-    merge_sha: str,
-    node_ids: list[str],
-) -> None:
-    """Emit the INV-2 structured suppression fact. None-safe (skips on None).
-
-    ``EventType`` is imported lazily to avoid any import-order coupling on this
-    central module (event_store.py has no reverse dependency on verify.py, but
-    the lazy import keeps it that way by construction).
-    """
-    if event_store is None:
-        return
-    from orchestrator.event_store import EventType  # noqa: PLC0415 — lazy, avoid cycle
-
-    event_store.emit(
-        EventType.merge_flake_suppressed,
-        task_id=task_id,
-        data={
-            'node_ids': node_ids,
-            'merge_sha': merge_sha,
-            'measured_at': datetime.now(UTC).isoformat(),
-        },
-    )
-
-
 def _emit_trivial_pass_escalated(
     event_store: 'EventStore | None',
     task_id: str | None,
@@ -8878,7 +9497,8 @@ def _emit_trivial_pass_escalated(
     ``reason`` ∈ {no_source_files, empty_existing_files, empty_command_set}.
 
     ``EventType`` is imported lazily to avoid any import-order coupling on this
-    central module (mirrors :func:`_emit_merge_flake_suppressed`).  The remote
+    central module (mirrors ``flake_recorder._emit_merge_flake_suppressed``,
+    which task ε moved out of this module onto the dispatcher).  The remote
     in-worktree LocalRunner leaves *event_store* None (it cannot reach the
     dispatching store), so only the dispatch-side event is local — the
     correctness fix still applies remotely.
@@ -8899,130 +9519,85 @@ def _emit_trivial_pass_escalated(
     )
 
 
-#: Module-global suppression counter (INV-4 storm detector). Bumped ONLY on a
-#: suppression; reset to 0 only once the window (threshold) is reached and the
-#: storm escalation decision is made. A clean, non-suppressed merge-verify does
-#: NOT reset it, so this is a CUMULATIVE count of suppressions since the last
-#: reset — NOT a count of back-to-back (consecutive) merges. A count-window
-#: detector; time-windowing is a sanctioned PRD §9 follow-up.
-_merge_flake_suppression_streak = 0
-
-#: Suppressions per window before the born-at-L2 storm escalation fires. A
-#: tunable (PRD §9): chronic suppression means α is repeatedly masking reds —
-#: a fleet-health "someone must look now" condition.
-_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD = 5
-
-#: Fixed dedup sentinel task_id for the storm escalation — the signal is a
-#: global fleet-health condition, not tied to any one merge task.
-_MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL = 'merge-flake-suppression-storm'
-
-
-def _bump_suppression_streak_and_maybe_escalate(
-    escalation_queue: Any, task_id: str | None, merge_sha: str,
-) -> None:
-    """Advance the suppression streak; file a born-at-L2 storm escalation at
-    the threshold, then reset the counter (INV-4).
-
-    Modeled on ``merge_queue._alarm_verify_worktree_contention``: a born-at-L2
-    escalation (``severity='critical'``, ``level=2``,
-    ``agent_role='orchestrator-merge-flake-monitor'`` — the ``orchestrator-``
-    prefix marks it a harness sentinel so the escalation server never downgrades
-    the critical severity) that routes straight to a human, bypassing the
-    auto-watcher. Deduped on a fixed open-L2 sentinel task_id so a persistent
-    storm files at most one open critical per window.
-
-    The window resets to 0 whenever the threshold is reached — on submit, on a
-    dedup-skip, AND on a ``None`` queue — so the counter can never grow
-    unbounded and each fresh window makes an independent escalation decision.
-    None-safe: with no queue there is nothing to file into, so it resets and
-    returns (the CLI / remote paths that pass ``escalation_queue=None`` are not
-    the CPU-starvation target this gate addresses — see the α scope fence).
-    """
-    global _merge_flake_suppression_streak
-    _merge_flake_suppression_streak += 1
-    if _merge_flake_suppression_streak < _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD:
-        return
-
-    # Window reached: make the escalation decision once, then reset regardless.
-    _merge_flake_suppression_streak = 0
-    if escalation_queue is None:
-        return
-
-    from escalation.models import Escalation  # noqa: PLC0415 — local, escalation optional dep
-
-    sentinel = _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
-    # Dedup: don't re-alarm while an open L2 already exists for the storm
-    # sentinel (has_open_l1 is hardcoded to level=1, so get_by_task is used).
-    if escalation_queue.get_by_task(sentinel, status='pending', level=2):
-        return
-
-    summary = (
-        'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate '
-        f'has suppressed {_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify '
-        'reds since the last reset'
-    )
-    detail = (
-        f'The role=merge isolated-rerun-confirm gate (verify.'
-        f'apply_merge_flake_suppression) has suppressed '
-        f'{_MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD} merge-verify failures as '
-        f'CPU-starvation flakes since the counter was last reset — a CUMULATIVE '
-        f'count, NOT necessarily back-to-back merges (a clean merge-verify does '
-        f'not reset the counter). Most recent merge SHA: {merge_sha}, task_id: '
-        f'{task_id}. Each suppression means a merge-verify red passed on isolated '
-        're-run — but a sustained rate of suppressions indicates either chronic '
-        'host CPU starvation or a genuinely flaky test that is being repeatedly '
-        'masked. Investigate before the gate hides a real regression.'
-    )
-    esc = Escalation(
-        id=escalation_queue.make_id(sentinel),
-        task_id=sentinel,
-        agent_role='orchestrator-merge-flake-monitor',
-        severity='critical',
-        level=2,
-        category='merge_flake_suppression_storm',
-        summary=summary,
-        detail=detail,
-        suggested_action=(
-            'Inspect merge-flake-suppressed events (EventType.merge_flake_suppressed) '
-            'and host CPU load. Confirm the suppressed tests are load flakes, not a '
-            'masked regression; if a specific test is chronically flaky, de-flake or '
-            'quarantine it.'
-        ),
-    )
-    escalation_queue.submit(esc)
-
-
 async def apply_merge_flake_suppression(
     failing_result: VerifyResult,
     *,
     worktree: Path,
     config: 'OrchestratorConfig',
     module_configs: list[ModuleConfig],
-    merge_sha: str,
-    event_store: 'EventStore | None' = None,
-    escalation_queue: Any = None,
-    task_id: str | None = None,
     _confirm=confirm_merge_verify_flake_suppressible,
 ) -> VerifyResult:
-    """Merge-verify result handler: suppress a confirmed CPU-starvation flake.
+    """Merge-verify result handler: OBSERVE a red, ATTACH the observation.
 
     THE hook ``LocalRunner.run_merge_verify`` calls on its ``not scoped.passed``
-    branch (PRD task α). Runs the pure gate *_confirm*; on a confirmed flake it
-    emits the INV-2 fact, bumps the INV-4 storm streak, and returns a PASSED
-    VerifyResult (category ``merge_flake_suppressed``) so the merge proceeds
-    into the unscoped typecheck gate. On a non-confirmation it returns
-    *failing_result* UNCHANGED (merge stays red; no fact, streak untouched).
+    branch (PRD task α). Runs the pure gate *_confirm* and returns a
+    ``VerifyResult`` carrying its ``FlakeSuppression`` on BOTH branches: a
+    PASSED result (category ``merge_flake_suppressed``) on
+    ``passes_in_isolation``, so the merge proceeds into the unscoped typecheck
+    gate; otherwise *failing_result* with the observation attached (merge stays
+    red).
+
+    IT PERFORMS NO SIDE-EFFECT (task ε). The ``merge_flake_suppressed`` emit and
+    the INV-4 storm-streak bump used to happen HERE, inline, and that was the
+    defect: this function runs wherever the WORKTREE is, and on the remote path
+    that host has no event store and its own module-global streak counter — so
+    the fact was dropped and the storm detector silently disarmed exactly where
+    load is highest. Both now happen on the DISPATCHER, in
+    ``flake_recorder.record_merge_flake_suppression``, driven off the attached
+    observation. Keeping ``event_store``/``escalation_queue``/``merge_sha``/
+    ``task_id`` OUT of this signature is what makes that structural.
+
+    §5.5 — record the OBSERVATION, not the remedy: the observation is attached
+    on the non-suppressed branch too, so a ``fails_in_isolation`` or
+    ``unconfirmable`` verdict still reaches the ledger. Only
+    ``passes_in_isolation`` changes the VERDICT.
+
+    Shaping the suppressed pass stays here rather than moving to the recorder:
+    that is the GATE's judgement about the merge, not a record of anything.
 
     Never raises: the pure gate is itself fail-closed and non-raising, and the
-    fact/streak side-effects are None-safe — an uncaught raise here would stall
-    the merge queue (merge_queue.py has no VerifyInfraError handler). *_confirm*
-    is injectable for testing.
+    ``_is_attachable`` guard below covers BOTH branches' ``replace`` calls — an
+    uncaught raise here would stall the merge queue (merge_queue.py has no
+    VerifyInfraError handler). *_confirm* is injectable for testing.
     """
-    ids = await _confirm(
+    suppression = await _confirm(
         config, failing_result, worktree=worktree, module_configs=module_configs,
     )
-    if not ids:
+    # ONE guard, checked before either branch, because BOTH of them reach
+    # `dataclasses.replace` — the suppressed branch via `_merge_flake_suppressed_pass`
+    # and the non-suppressed branch directly.  Guarding only the second (as this
+    # originally did) left the never-raise claim above half-true: the exact
+    # non-dataclass input it defended against still raised `TypeError` one branch over.
+    if not _is_attachable(failing_result):
+        logger.warning(
+            'apply_merge_flake_suppression: cannot attach a %s observation to a '
+            '%s (not a VerifyResult dataclass); returning the verdict unchanged',
+            getattr(suppression.verdict, 'value', suppression.verdict),
+            type(failing_result).__name__,
+        )
         return failing_result
-    _emit_merge_flake_suppressed(event_store, task_id, merge_sha, ids)
-    _bump_suppression_streak_and_maybe_escalate(escalation_queue, task_id, merge_sha)
-    return _merge_flake_suppressed_pass(failing_result, ids)
+    if suppression.verdict is FlakeVerdict.passes_in_isolation:
+        return replace(
+            _merge_flake_suppressed_pass(failing_result, list(suppression.test_ids)),
+            flake_suppression=suppression,
+        )
+    return replace(failing_result, flake_suppression=suppression)
+
+
+def _is_attachable(result: object) -> bool:
+    """True iff *result* is a dataclass INSTANCE, so ``dataclasses.replace`` is safe.
+
+    ``replace`` raises ``TypeError`` on anything else (including a dataclass CLASS,
+    hence the ``isinstance(..., type)`` arm).  Degrading instead of raising is the
+    point: the caller is holding a real verdict, and the only thing being added is a
+    record of WHY.  Raising would convert a legible 'Verification failed' outcome into
+    an opaque 'Merge worker error: replace() should be called on dataclass instances'
+    — trading the caller's verdict for a bookkeeping crash, and violating
+    ``apply_merge_flake_suppression``'s never-raise contract (merge_queue.py has no
+    VerifyInfraError handler).
+
+    Same discipline as ``VerifyRunnerPool.dispatch``'s guard on the runner re-stamp:
+    an observation is evidence ABOUT a verdict and must never be able to destroy the
+    verdict it describes.
+    """
+    return is_dataclass(result) and not isinstance(result, type)

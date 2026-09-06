@@ -312,16 +312,76 @@ class SpeculationController:
     def is_idle(self) -> bool:
         """True when there is no in-flight speculation state at all.
 
-        Mirrors the merger loop's DD1 coalesce gate: ``spec_base``,
-        ``prefetched``, and ``pending_spec_base`` all None.
+        ``spec_base``, ``prefetched``, and ``pending_spec_base`` all None.
         ``pending_predecessor`` is not checked separately — it is always
         set/cleared in lockstep with ``pending_spec_base``.
+
+        **No longer the coalesce gate.** This USED to be the merger loop's
+        DD1 gate; it is now an observability/diagnostic predicate with no
+        production caller (``test_merge_queue_permit_conservation.py`` polls
+        it as a settle probe). The coalesce gate is :meth:`can_coalesce` —
+        see that method for why total idleness was the wrong condition.
         """
         return (
             self.spec_base is None
             and self.prefetched is None
             and self.pending_spec_base is None
         )
+
+    def can_coalesce(self) -> bool:
+        """True when the merger may retro-coalesce waiting singles into a train.
+
+        The gate for ``merge_queue.py::SpeculativeMergeWorker.
+        _maybe_coalesce_waiting_singles``. Deliberately WEAKER than
+        :meth:`is_idle`, which it replaced: ``is_idle`` additionally required
+        ``spec_base is None``, and that made trains form only when the merge
+        pipeline was UNHEALTHY.
+
+        Why ``spec_base`` must not be part of this gate: ``_merger_loop`` ends
+        every successful merge with an unconditional look-ahead, and BOTH of
+        its outcomes leave speculation state behind —
+        :meth:`on_lookahead_found` sets ``spec_base`` (+ ``prefetched``),
+        :meth:`on_lookahead_pending` sets ``pending_spec_base``.
+        :meth:`take_prefetched` then clears ``prefetched`` but NOT
+        ``spec_base`` (it is the base the item just taken merges against), and
+        :meth:`on_dequeue` — the only other clearer on the success path — is
+        skipped precisely because a prefetched item was in hand. So a leftover
+        ``spec_base`` is the NORMAL steady state of a healthy pipeline, not
+        evidence of merger work in progress: gating on it kept ``is_idle()``
+        permanently False for as long as merges kept succeeding, and left the
+        coalescer reachable only after a merge that produced no merge commit
+        (conflict / already_merged / abandoned / drop, all of which call
+        :meth:`on_abort` or :meth:`on_transfer_terminal`) or on a freshly
+        started worker's sterile first iteration. Measured consequence: of the
+        33 trains dark-factory has ever coalesced, every one fell on a day
+        with at least one such window-opening event, and none formed at all
+        between 2026-08-19 and 2026-08-28.
+
+        What DOES block coalescing:
+
+        * ``prefetched is not None`` — an item has been popped out of the lane
+          buffers by the look-ahead but not yet consumed as the loop's ``req``.
+          It is invisible to the candidate scan (it is no longer buffered) and
+          not yet armed on the request-liveness ledger, so no train may be
+          formed while it is merely in hand. At the single call site this
+          holds vacuously (the gate is evaluated after ``take_prefetched()``);
+          it is asserted here so the predicate stays honest for any future
+          caller.
+        * ``pending_spec_base`` with a still-in-flight predecessor — a
+          late-arrival ATTACH is armed (task 1862) and the very next dequeue
+          may attach to the predecessor's merge commit. The drained-predecessor
+          relaxation mirrors :meth:`on_dequeue`'s condition (d): once the
+          predecessor's result Future is done, ``on_dequeue`` would take the
+          FALLBACK branch anyway, so the pending state is vestigial and must
+          not keep the gate shut.
+        """
+        if self.prefetched is not None:
+            return False
+        if self.pending_spec_base is not None:
+            pred = self.pending_predecessor
+            if pred is None or not pred.result.done():
+                return False
+        return True
 
     def take_prefetched(self) -> MergeRequest | None:
         """Consume and return the pre-fetched request, or None if absent."""

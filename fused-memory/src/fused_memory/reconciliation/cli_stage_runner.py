@@ -83,6 +83,36 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__delete_entity',
     'mcp__fused-memory__rebuild_entity_summaries',
     'mcp__fused-memory__update_edge',
+    # ensure_entity_node (task 4932) is the identity-MINT primitive — strictly
+    # more CREATIVE than every sibling in this list, all of which only mutate or
+    # remove an ALREADY-EXISTING node. It is classified in the SAME change that
+    # adds the tool, deliberately, so it does not repeat the update_memory
+    # incident the block comment at the head of this list records.
+    #
+    # The tool-level denial here is LOAD-BEARING, not redundant with the tool's
+    # own authorization gate: the shipped
+    # entity_mint.allowed_agent_prefixes=['recon-stage-', 'curator-']
+    # (config/schema.py::EntityMintConfig) admits every reconciliation stage's
+    # canonical f'recon-stage-{stage_id}' agent_id (reconciliation/stages/base.py,
+    # reconciliation/stage_stats.py), so
+    # server/entity_mint_authz.py::resolve_entity_mint_authorization ALONE would
+    # NOT turn Stage 3 away — the same two-layer gap the update_memory incident
+    # describes, where a write primitive was in no disallow list AND was admitted
+    # by an allowlist whose default covers every recon stage.
+    #
+    # And nothing sweeps orphan minted nodes (as server/entity_mint_authz.py and
+    # the tool docstring both state), so a Stage 3 mint would leave a durable,
+    # un-reversed artifact — created by the stage that is read-only by contract
+    # and that is itself the DETECTOR of identity anomalies, collapsing
+    # detect-and-repair into one unaccountable actor. That is the same rationale
+    # the repair_memory_citation carve-out below records.
+    #
+    # Stage 1 and the curator are the sanctioned callers, so STAGE1_DISALLOWED
+    # and STAGE2_DISALLOWED are deliberately untouched (neither folds this list).
+    # Stage 1's ADVERTISEMENT of the op in the stage prompts is separate work —
+    # the same split the consolidate_memories entry above records for task 3134;
+    # this is the safety classification, which belongs with the tool.
+    'mcp__fused-memory__ensure_entity_node',
 ]
 
 # Recon-report tools that perform DURABLE writes (disallowed outside Stage 2).

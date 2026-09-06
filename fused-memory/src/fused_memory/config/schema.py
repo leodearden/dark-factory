@@ -232,6 +232,30 @@ class LLMConfig(BaseModel):
     provider: Literal['openai', 'anthropic'] = Field(default='openai')
     model: str = Field(default='gpt-4o-mini')
     temperature: float | None = Field(default=None)
+
+    # Output-token budget per LLM request. Authoritative on EVERY arm that
+    # reads it: graphiti `client_class='openai'`, graphiti
+    # `client_class='openai_generic'`, the graphiti anthropic arm, and mem0's
+    # LLM (backends/mem0_client.py).
+    #
+    # Before task 3864 the default 'openai' arm silently substituted
+    # graphiti-core's DEFAULT_MAX_TOKENS (16384) — the configured value was
+    # accepted and dropped, because BaseOpenAIClient.__init__ re-assigns
+    # self.max_tokens from its own parameter after super().__init__ had read it
+    # off the config object. Only the constructor kwarg reaches the wire, and
+    # backends/graphiti_client.py now passes it (as the generic arm has since
+    # task 3715).
+    #
+    # The default stays 4096 DELIBERATELY. This is a SHARED knob: raising it to
+    # match the old observed behaviour of one arm would silently raise the
+    # anthropic arm and mem0 too, and Anthropic rejects a max_tokens above a
+    # model's output ceiling with a hard 400 (claude-3-opus caps at 4096).
+    #
+    # Exhaustion is LOUD, not silent: graphiti's LLM client raises
+    # `Output length exceeded max tokens <N>` (or a truncated body fails
+    # json.loads), which graphiti retries and the durable queue then
+    # dead-letters visibly. Remedy: raise this value and restart (llm.* is
+    # restart-tier — absent from config/reload.py's RELOADABLE_FIELDS).
     max_tokens: int = Field(default=4096)
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
@@ -799,11 +823,57 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 '-p no:xdist',
             ],
             min_phrase_hits=2,
+            # The previous hint's sole instruction -- amend the canonical
+            # memory in place -- is authz-refused for every orchestrator-
+            # dispatched agent: update_memory's content-amend arm is gated to
+            # recon-stage- / curator- agent_id prefixes
+            # (Mem0UpdateConfig.content_amend_allowed_agent_prefixes), and no
+            # dispatched task/merge agent carries either. That made the block
+            # a dead end for its actual audience. Replaced with the
+            # three-outcome shape ratified 2026-08-25 (task 4738, fix A):
+            # override / skip / escalate, naming only tools this audience
+            # actually holds (search, escalate_*) and never suggesting the
+            # self-rename into curator- that skills/curate-fused-memories
+            # forbids. The structural fix -- stopping a per-cluster hint from
+            # shadowing the guard's escape hatches at all -- is the sibling
+            # fix-B task, deliberately not done here.
+            #
+            # Amendment (reviewer, task 4738): the first cut told the reader
+            # to SEARCH the bare uuid, but `search` is semantic/vector, not
+            # an id lookup -- a bare-uuid query returns noise, not that
+            # record. Reworded to a topic-phrase query with the uuid kept as
+            # a verification target, and escalate named as the fallback when
+            # it still can't be confirmed that way. Outcome (3) now names
+            # escalate_blocker/escalate_info explicitly (previously only the
+            # bare word "escalate"), matching how outcomes (1)/(2) already
+            # name an exact literal to act on.
             hint=(
                 'Known-recurring topic (pytest-xdist -n0 serial-override workaround '
                 'for the hardcoded -n auto addopts in orchestrator/fused-memory '
-                'pyproject.toml). Do NOT add another entry -- update/consolidate '
-                'canonical memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51.'
+                'pyproject.toml). The canonical entry is memory '
+                '8bb3eb15-1133-4e7b-ac1f-5bac10329b51. To check it, run '
+                "search(query='pytest-xdist -n0 serial-override workaround', "
+                'project_id=...) and look for the result whose id matches that '
+                'uuid -- a bare-uuid query will not find it, since search is '
+                'semantic, not an id lookup. If you cannot confirm it that way, '
+                'treat that as case (3) below and escalate rather than guessing. '
+                'Do not try to amend it either way: content amends are '
+                'authz-gated to recon-stage- / curator- agent_ids, so that '
+                'call will refuse you. '
+                '(1) Your content is genuinely DISTINCT from that entry -- '
+                're-send this write with metadata='
+                "{'allow_near_duplicate': True}, which is open to every agent "
+                'and bypasses this block. '
+                '(2) Your content is a DUPLICATE -- SKIP the write. Skipping '
+                'is a sanctioned outcome here, not a failure: consolidating '
+                'this cluster belongs to an interactive curation sitting '
+                'running skills/curate-fused-memories, not to you, and '
+                'renaming yourself into that role to get past this block is '
+                'forbidden by that skill. '
+                '(3) You are unsure, your content CONTRADICTS the canonical '
+                'entry, or you could not confirm it above -- escalate with '
+                'escalate_blocker (or escalate_info if you are merely '
+                'unsure). Do not retry the refused call.'
             ),
         ),
         ProceduralTopicCluster(
@@ -2018,12 +2088,13 @@ class CuratorConfig(BaseModel):
 
     # Zero-output-timeout (ZOT) circuit-breaker watchdog.
     # Root cause: transient Anthropic-backend degradation on the curator's
-    # sonnet+json-schema call shape (task 1550). Each hang burns the full
+    # sonnet+json-schema call shape (task 1743). Each hang burns the full
     # timeout_seconds (180s); the breaker stops every call burning that cost
     # during a sustained outage while preserving the best-effort
     # degrade-to-create contract.
     # Open after this many CONSECUTIVE ZOT curator LLM failures (reset on
-    # any success or on a non-ZOT failure).
+    # any success or on a non-ZOT failure — the batch path's missing reset
+    # was fixed in task 4143).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)
     # How long the breaker stays open / short-circuits to action='create'
     # before allowing a half-open probe.
@@ -2531,6 +2602,110 @@ class Mem0UpdateConfig(BaseModel):
     )
 
 
+class EntityMintConfig(BaseModel):
+    """Authorization + storm knobs for the ensure_entity_node MCP tool (task 4932).
+
+    Minting a Graphiti Entity node from MCP is a write-time-IDENTITY primitive:
+    a mint that lands under a non-canonical name splits a referent instead of
+    resolving it, and nothing sweeps orphan minted nodes. So the tool ships
+    behind a narrow self-reported-agent allowlist and a kill switch, exactly as
+    ``Mem0UpdateConfig`` gates the in-place update_memory tool.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig or Mem0UpdateConfig. Recon Stage 1 and the curator are
+    this gate's first sanctioned CALLERS, not its owners, and the subject matter
+    is the graph's identity surface rather than mem0 in-place updates — nesting
+    it under either would assume colocation implies subsystem ownership, the
+    precise mistake ReconciliationConfig's own ownership note warns against.
+
+    Declared on FusedMemoryConfig as a BARE (non-Optional) submodel so
+    config/reload.py's `_iter_leaves` descends into per-leaf paths. An
+    `X | None` submodel is compared whole and lands as a single
+    restart_required entry (esc-2718-1), which would cost every leaf here its
+    green-tier hot-reload — including the kill switch, and a restart-only kill
+    switch is no kill switch.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for the ensure_entity_node MCP tool. When false EVERY '
+            'caller is denied regardless of agent_id, with error_type '
+            'EntityMintToolDisabled — the single knob an operator flips to stop '
+            'a runaway minter without a restart. Defaults ON, mirroring '
+            'Mem0UpdateConfig.enabled: the narrow prefix allowlist below is the '
+            'real bar, and this tool is strictly MORE careful than '
+            'merge_entities, delete_entity(force=True), rename_entity, '
+            'set_entity_summary and reassign_edge — all already on the MCP '
+            'surface with no locking and no allowlist at all. Green-tier '
+            'hot-reloadable via reload_config: it is read live on every tool '
+            'call by server/entity_mint_authz.py::resolve_entity_mint_enabled, '
+            'so flipping it denies the very NEXT call with no restart.'
+        ),
+    )
+    allowed_agent_prefixes: list[str] = Field(
+        default_factory=lambda: ['recon-stage-', 'curator-'],
+        description=(
+            'agent_id prefixes authorized to MINT an Entity node. Narrow by '
+            'design: an unbounded minter turns the identity graph into a junk '
+            'store, and nothing sweeps orphan minted nodes. recon-stage- (the '
+            'same literal prefix add_system_record and the mem0_update bars gate '
+            'on) admits every reconciliation stage agent; curator- admits the '
+            'interactive memory-consolidation sitting, which is the flow that '
+            'discovers a dangling referent and needs the node it points at. '
+            'Deliberately NOT the everyday claude-interactive. NOTE: agent_id is '
+            'SELF-REPORTED, so this is a misuse deterrent for cooperating '
+            'callers, NOT a security boundary — a caller that wants to bypass it '
+            'need only claim a different agent_id. Green-tier hot-reloadable via '
+            'reload_config; read live per call by '
+            'server/entity_mint_authz.py::resolve_entity_mint_allowed_prefixes.'
+        ),
+    )
+    lock_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            'Bound on the wait for the per-group_id write-time-identity lock '
+            '(backends/graphiti_client.py::GraphitiBackend._identity_lock_for), '
+            'which the mint must hold across its exact-name pre-read and the '
+            'mint itself. Bounded rather than unbounded because the other '
+            'holder — services/memory_service.py::MemoryService._execute_graphiti_write '
+            '— keeps that lock across a full LLM extraction plus the entire '
+            '_reconcile_episode_identity chain, so an unbounded wait would block '
+            'an MCP request for tens of seconds. On expiry the tool returns an '
+            'EntityMintLockBusy refusal VALUE and mints nothing. Green-tier '
+            'hot-reloadable: read live off the shared config object per call and '
+            'passed as the timeout ARGUMENT to asyncio.wait_for, which is what '
+            'makes it genuinely reloadable rather than restart-only in disguise.'
+        ),
+    )
+    storm_threshold: int = Field(
+        default=10,
+        gt=0,
+        description=(
+            'MINT calls from one agent_id within storm_window_seconds before an '
+            'entity_mint_storm escalation fires (INV-4). Resolves (the '
+            'idempotent re-call this primitive is designed to make cheap) and '
+            'refusals do NOT count, or a runaway minter would drown in ordinary '
+            'traffic. This is an ALARM, not a rate limiter: crossing the '
+            'threshold never rejects the mint — the node it is complaining about '
+            'has already landed. Green-tier hot-reloadable — read live on every '
+            'call and passed into StormCounter.record(), which is what makes the '
+            'leaf genuinely reloadable rather than restart-only in disguise (see '
+            'server/storm_counter.py).'
+        ),
+    )
+    storm_window_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Rolling window for storm_threshold. Half-open: a mint aged exactly '
+            'this long is already out. Green-tier hot-reloadable on the same '
+            'read-live-per-record() basis as storm_threshold.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -2552,6 +2727,10 @@ class FusedMemoryConfig(BaseSettings):
     write_triage: WriteTriageConfig = Field(default_factory=WriteTriageConfig)
     # Bare submodel for the same per-leaf-reload reason as write_triage above.
     mem0_update: Mem0UpdateConfig = Field(default_factory=Mem0UpdateConfig)
+    # Bare submodel for the same per-leaf-reload reason as write_triage above.
+    # Here nullability would additionally cost the KILL SWITCH its green tier,
+    # and a restart-only kill switch is no kill switch.
+    entity_mint: EntityMintConfig = Field(default_factory=EntityMintConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)
     path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(

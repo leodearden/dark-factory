@@ -1207,6 +1207,47 @@ _EFFECT_PROBE_TRANSIENT_FAILURES = frozenset({
     'main_sha_unresolved',
 })
 
+#: How long GitOps._lookup_merge_marker may reuse its marker index without
+#: re-resolving main's sha.  The staleness check is one `git rev-parse`, and
+#: `git rev-parse main` was measured at ~29ms on the dark-factory repo — paid
+#: once per CANDIDATE (~721 branch-absent candidates on a scheduler tick) that
+#: is ~21s of pure subprocess, which would eat the entire latency budget this
+#: index exists to reclaim.  A short recheck window collapses that to one or
+#: two calls per tick.
+#:
+#: Reusing a marginally stale index is SAFE IN ONE DIRECTION, which is what
+#: makes this sound rather than merely cheap: git history is append-only here,
+#: so an index built at an older main sha can only LACK markers that landed
+#: since — it can never contain a marker that is not on main.  A missing marker
+#: makes find_merge_marker return None, which is exactly its behaviour on a
+#: genuine miss: the gate declines to auto-done and the task dispatches
+#: normally, and the next tick sees the rebuilt index.  The failure mode is
+#: therefore a one-tick delay in an auto-done that has never once fired in
+#: production, not a false positive that could mark unlanded work complete.
+_MERGE_MARKER_INDEX_RECHECK_SECS = 2.0
+
+
+@functools.lru_cache(maxsize=8)
+def _merge_marker_pattern(main_branch: str) -> re.Pattern[str]:
+    """Compile the regex that recovers a branch name from a merge marker.
+
+    DERIVED FROM ``git_ops.py::_merge_subject`` rather than hand-written, so the
+    marker index and the merge-commit writer can never drift apart — the same
+    single-source-of-truth property that ``find_merge_marker``'s original
+    ``--grep`` spelling had by construction.  A sentinel is substituted for the
+    branch, then split back out, so only ``_merge_subject`` decides the literal
+    format.
+
+    The capture is ``\\S+`` because a git branch name can never contain
+    whitespace, and the pattern is deliberately UNANCHORED to mirror
+    ``git log --fixed-strings --grep=...``, which matches anywhere in the commit
+    message rather than only at the start of the subject.
+    """
+    sentinel = '\x00BRANCH\x00'
+    template = _merge_subject(sentinel, main_branch)
+    prefix, _, suffix = template.partition(sentinel)
+    return re.compile(re.escape(prefix) + r'(\S+)' + re.escape(suffix))
+
 
 @dataclass(frozen=True)
 class CommitEffectProbe:
@@ -2015,10 +2056,35 @@ async def _settled_lane_lock_holder_pids(
     For the two acquire-TIMEOUT sites only (:meth:`GitOps.merge_verify_lease`
     and :meth:`GitOps.reset_persistent_merge_worktree`).  Both used to read the
     kernel lock table exactly ONCE there and feed that snapshot to a predicate
-    and a message; this adds the missing read POLICY on top of the unchanged
-    reader, the way
+    and a message; this adds a read POLICY on top of the reader, the way
     :func:`~orchestrator.verify_cancel.lane_lock_holder_pids` is itself a thin
     policy wrapper over ``lane_lock_holder_pids_strict``.
+
+    TWO LAYERS, NOT A DUPLICATE OF ONE (task 4227 — read this before deleting
+    either).  They answer DIFFERENT questions on DIFFERENT time scales:
+
+    * READER layer (``lane_lock_holder_pids``, MICROSECONDS, never sleeps) —
+      recovers a record the CHUNKED READ dropped.  It reads the table K times
+      back-to-back and returns the union, so it heals a lossy read of a SINGLE
+      instant.  It applies to every consumer of the reader, unconditionally
+      and by construction.
+    * SETTLE layer (THIS helper, 0.5s, sleeps) — asks something no re-read of
+      one instant can answer: did the holder genuinely RELEASE between the
+      acquire timeout and the probe?  That is a question about the passage of
+      TIME, which is why its trigger is emptiness and why it stays after the
+      reader is fixed.
+
+    The reader layer strictly shrinks how often this one is reached — the very
+    first read below is now a K-read union, so a lossy read no longer starts a
+    0.5s poll by itself — and it hardens each of the ~25 iterations that a
+    genuinely empty table still costs.  It cannot REPLACE this layer: deleting
+    this helper as redundant would restore the "an empty read contradicts the
+    timeout that produced it" gap.  Deleting the reader's confirm loop would
+    re-expose both layers' reads AND the two ``holder_pids is None`` branches
+    below, which never had a settle layer — though be accurate about those
+    two: no production call site takes them (both acquire-timeout sites pass
+    *holder_pids* explicitly), so they are a test-reached seam whose tolerance
+    is inherited, not a live production exposure.
 
     WHAT IT ABSORBS.  ``/proc/locks`` is a seq_file the kernel serves one PAGE
     per ``read(2)`` regardless of the caller's buffer (a 13062-byte table took
@@ -2069,12 +2135,22 @@ async def _settled_lane_lock_holder_pids(
     THE BOUND (``_LANE_LOCK_HOLDER_SETTLE_SECS`` / ``..._INTERVAL_SECS``),
     derived from both sides:
 
-    * FLOOR — against the measured 1.54%-per-read loss, 0.5s at 0.02s gives
-      ~25 reads: ~1e-45 under independence, and ~3e-8 even at a deliberately
-      pessimistic 50%-per-read correlated-burst rate.  A re-read either
-      succeeds in microseconds or is structurally broken, so a wider bound
-      only delays a certain answer — the same reasoning that sized the test
-      side's ``_LANE_LOCK_STRICT_READ_SECS``.
+    * FLOOR — 0.5s at 0.02s gives ~25 POLL ITERATIONS, and the bound must
+      survive all of them losing the record.  Stated per ITERATION, because
+      task 4227 changed what one iteration is: each is now a K-read UNION in
+      the reader, so an iteration loses the record with probability p^K rather
+      than the per-READ p.  At the measured p = 1.54% and K = 3 that is ~4e-6
+      per iteration; even at a deliberately pessimistic 50%-per-read
+      correlated-burst rate it is 12.5%.  The old figures (~1e-45 and ~3e-8)
+      applied the per-READ rate directly across those ~25 iterations; they are
+      stale in DETAIL only, and in the SAFE direction — the total-loss
+      probability is now p^(K x 25), strictly smaller than either, so the
+      conclusion that this bound sits amply clear of the floor only gets
+      stronger.  Note the reader's confirm reads are a READ-COUNT bound
+      with no sleep, so they add microseconds and move NO wall-clock figure
+      here.  A re-read either succeeds in microseconds or is structurally
+      broken, so a wider bound only delays a certain answer — the same
+      reasoning that sized the test side's ``_LANE_LOCK_STRICT_READ_SECS``.
     * CEILING — this is what forbids simply copying that 2.0.  Every test that
       drives a contended raise inside a ``with foreign_lane_lock_holder(...)``
       block pays this bound ON TOP of that helper's 34.0s unconditional stack
@@ -2144,6 +2220,20 @@ def _lane_lock_holder_facts(
     rendered clause describes the very holder set the leak predicate evaluated;
     a second independent read could observe a different one and quietly
     misdescribe the decision during exactly the forensics this exists for.
+
+    ``None`` READS HERE, and that read is now CHUNK-TOLERANT (task 4227) — but
+    note WHO takes it.  Both production callers pass *holder_pids* positionally
+    for the reason above (task 3081), so this branch is reached only from
+    TESTS; what the reader fix buys in production is that the snapshot handed
+    in was itself read tolerantly, by :func:`_settled_lane_lock_holder_pids`.
+    The tolerance here is the same property arriving by a different route: a
+    chunked skip would otherwise degrade this clause to "the kernel reports no
+    FLOCK holder" precisely when the lane WAS contended, dropping the holder
+    pid+pgid — the one datum DF 3003/3081 had to reconstruct by hand.  Nothing
+    was rewired to get it; the tolerance lives in the reader every site here
+    binds, so all four consume it BY CONSTRUCTION and per-site divergence is
+    impossible.  That binding is itself pinned by
+    ``test_git_ops_binds_the_fail_safe_wrapper_not_the_strict_core``.
     """
     pids = lane_lock_holder_pids(lock_path) if holder_pids is None else holder_pids
     if not pids:
@@ -2609,6 +2699,21 @@ class GitOps:
         # that changes the answer, so a commit_sha-only key would freeze a
         # stale verdict across it.  See describe_commit_effect_in_main.
         self._effect_probe_memo: dict[tuple[str, str], CommitEffectProbe] = {}
+        # Merge-marker index: {branch: merge_commit_sha} for every marker on
+        # main, built in ONE `git log` pass and reused until main advances.
+        # Replaces a full-history `git log --grep` PER CANDIDATE — measured on
+        # this repo at ~2.0s a miss against 62,942 commits, x ~721 branch-absent
+        # candidates a tick, i.e. the whole ~14min scheduler tick.  One index
+        # build costs ~6.3s and serves every lookup at that main sha.
+        #
+        # Unbounded by design, unlike _effect_probe_memo above: its size is the
+        # number of merge markers in history (~3,000 here), not a function of
+        # how many candidates arrive, and exactly one index is live at a time.
+        # _merge_marker_index_checked_at is a time.monotonic() stamp guarding
+        # the rev-parse staleness check — see _MERGE_MARKER_INDEX_RECHECK_SECS.
+        self._merge_marker_index: dict[str, str] | None = None
+        self._merge_marker_index_sha: str | None = None
+        self._merge_marker_index_checked_at: float | None = None
         # Merge serialization is handled by MergeWorker in merge_queue.py.
         # See task 292 for design rationale (ghost loops, lock starvation,
         # branch drift at 64 max concurrency with external actors).
@@ -3222,6 +3327,44 @@ class GitOps:
         different holder sets, leaving the message describing a set the
         predicate never evaluated.  ``None`` reads the table here instead,
         keeping direct callers (and the tests) two-argument.
+
+        EVERY read behind this predicate IS CHUNK-TOLERANT (task 4227), and
+        that is where the production win is — NOT in the ``None`` branch below.
+        ``/proc/locks`` is served one page per ``read(2)`` with each read
+        restarting the walk from a positional index, so a single read can
+        silently DROP our row (measured: 1.54%, 144/9337, under 24 churners).
+        The lane lock is ``LOCK_EX``, so the target inode has at most ONE
+        holder row — losing it surfaces as ``[]``, layer (1) evaluates
+        ``self_pid not in []``, and a genuine self-owned B13 leak reads as
+        ordinary foreign contention.  That read SUCCEEDS, so no strict /
+        errno-keyed variant can see it.  BOTH production callers reach here
+        with *holder_pids* already supplied by
+        :func:`_settled_lane_lock_holder_pids`, so what the reader fix hardens
+        for them is that helper's OWN reads: its first read is now a K-read
+        union (so the 0.5s settle poll is ENTERED less often at all), and each
+        of the ~25 poll iterations behind it is tolerant in turn.
+
+        The ``None`` branch itself is reached only from TESTS today — every
+        production call site passes *holder_pids* explicitly, deliberately, for
+        the snapshot-sharing reason above.  Its coverage in
+        ``test_lane_lock_leak_guard`` is therefore a CONTRACT PIN on a
+        public-ish seam, not a fix for a live outage: it says that a direct
+        two-argument caller gets the same tolerance the settled path gets.
+        That equivalence is free rather than wired, and that is the point — the
+        fix went into the READER every site binds rather than into any site, so
+        all four are tolerant by construction and per-site divergence is
+        impossible.
+
+        WHY THE UNION IS SAFE FOR A LOUD PREDICATE.  The reader returns the
+        union of the pids seen across its K back-to-back reads, which can only
+        ADD an attribution that was TRUE OF THE KERNEL at some instant during
+        the query — a chunked read drops records, it never invents them.  So
+        layer (1) can only gain a true attribution, while layers (2) and (3)
+        are read AFTERWARDS and can only VETO: the same asymmetry task 3783's
+        poll already relies on.  The union's staleness window is microseconds
+        (no sleep) against that poll's 0.5s, so it is strictly less exposed to
+        the in-process-sibling race documented there and needs no new argument
+        of its own.
 
         *ctx* forwards ``operation``/``protected_path`` to the fault so it keeps
         the parent's full payload contract.
@@ -8556,6 +8699,15 @@ class GitOps:
         cannot appear inside ``'Merge task/10 into main'`` because the ``0``
         after ``task/1`` falls where the pattern has a space.
 
+        **Lookup is indexed, not re-scanned.** The search half delegates to
+        :meth:`_lookup_merge_marker`, which builds one branch→sha map per main
+        sha (:meth:`_build_merge_marker_index`) and answers from it.  The
+        per-call ``git log`` this replaces cost ~2.0s against 62,942 commits
+        and ran once per candidate on every scheduler dispatch tick;
+        :meth:`_scan_merge_marker` retains it verbatim as the fallback for when
+        an index cannot be built.  Verdicts are unchanged by construction — the
+        index reads full commit messages, exactly as ``--grep`` does.
+
         Args:
             branch: Full prefixed branch name, e.g. ``'task/123'``.
                     Same convention as ``is_ancestor`` and ``resolve_branch_sha``.
@@ -8570,8 +8722,22 @@ class GitOps:
         if gate_on_existing_ref and await self.resolve_branch_sha(branch) is not None:
             return None
 
-        # Branch is gone — search main for a merge commit with the expected subject.
-        # Pattern derivation shared with merge_to_main — see docstring for substring-safety argument.
+        # Branch is gone — resolve the marker from the shared index, which
+        # falls back to the direct scan whenever it cannot build one.
+        return await self._lookup_merge_marker(branch)
+
+    async def _scan_merge_marker(self, branch: str) -> str | None:
+        """Direct, uncached full-history scan for *branch*'s merge marker.
+
+        The original implementation of :meth:`find_merge_marker`'s search half,
+        preserved verbatim as the authoritative fallback whenever the index in
+        :meth:`_lookup_merge_marker` cannot be built (a git failure, or main
+        refusing to resolve).  Answers must agree exactly — the index is a
+        performance change, never a semantic one — so this is also what the
+        equivalence tests compare against.
+        """
+        # Pattern derivation shared with merge_to_main — see find_merge_marker's
+        # docstring for the substring-safety argument.
         grep_pattern = _merge_subject(branch, self.config.main_branch)
         rc, out, _ = await _run(
             [
@@ -8586,6 +8752,82 @@ class GitOps:
         if rc != 0 or not out:
             return None
         return out
+
+    async def _build_merge_marker_index(self) -> dict[str, str] | None:
+        """Scan main once and map every merged branch to its merge-commit sha.
+
+        Returns ``None`` on a git failure so the caller can fall back to
+        :meth:`_scan_merge_marker` rather than cache an empty index — the same
+        never-memoize-a-subprocess-failure rule as
+        :data:`_EFFECT_PROBE_TRANSIENT_FAILURES`, and for the same reason: a
+        cached empty index would pin a spurious marker-absent verdict for the
+        life of the current HEAD.
+
+        Reads the FULL commit message (``%B``), not just the subject, because
+        ``git log --grep`` matches anywhere in the message.  Measured on this
+        repo: 19 of 62,950 commits carry a marker only in the body, so a
+        subject-only index would silently change 19 verdicts.
+
+        ``git log`` walks newest-first and :meth:`find_merge_marker` passes
+        ``--max-count=1``, so the first match wins — ``setdefault`` reproduces
+        that for a branch merged more than once (measured: ``task/958``,
+        ``task/924`` and ``task/791`` each appear twice).
+        """
+        rc, out, _ = await _run(
+            [
+                'git', 'log', self.config.main_branch,
+                '--format=%H%x1f%B%x00',
+            ],
+            cwd=self.project_root,
+        )
+        if rc != 0:
+            return None
+        pattern = _merge_marker_pattern(self.config.main_branch)
+        index: dict[str, str] = {}
+        for record in out.split('\x00'):
+            sha, sep, message = record.partition('\x1f')
+            sha = sha.strip()
+            if not sep or not sha:
+                continue
+            for match in pattern.finditer(message):
+                index.setdefault(match.group(1), sha)
+        return index
+
+    async def _lookup_merge_marker(self, branch: str) -> str | None:
+        """Resolve *branch*'s merge marker from the per-main-sha index.
+
+        Rebuilds the index when main has advanced, but checks for that at most
+        once per :data:`_MERGE_MARKER_INDEX_RECHECK_SECS` — see that constant
+        for why a briefly stale index is safe (append-only history means it can
+        only miss markers, never invent them) and why the naive
+        rev-parse-per-candidate would cost more than the scan it replaces.
+
+        Falls back to :meth:`_scan_merge_marker` on any failure to resolve main
+        or build the index, so a git hiccup degrades to the previous behaviour
+        instead of failing the lookup.
+        """
+        now = time.monotonic()
+        checked_at = self._merge_marker_index_checked_at
+        recheck_due = (
+            self._merge_marker_index is None
+            or checked_at is None
+            or (now - checked_at) >= _MERGE_MARKER_INDEX_RECHECK_SECS
+        )
+        if recheck_due:
+            main_sha = await self.get_main_sha()
+            self._merge_marker_index_checked_at = now
+            if not main_sha:
+                # No HEAD to key an index on — do not cache, just scan.
+                return await self._scan_merge_marker(branch)
+            if main_sha != self._merge_marker_index_sha or self._merge_marker_index is None:
+                index = await self._build_merge_marker_index()
+                if index is None:
+                    return await self._scan_merge_marker(branch)
+                self._merge_marker_index = index
+                self._merge_marker_index_sha = main_sha
+        if self._merge_marker_index is None:
+            return await self._scan_merge_marker(branch)
+        return self._merge_marker_index.get(branch)
 
     async def find_task_citation_commit(
         self, tid: str, *, pattern_template: str | None = None,
@@ -9274,6 +9516,150 @@ class GitOps:
             cwd=self.project_root,
         )
         return rc == 0
+
+    async def net_diff_is_empty(
+        self, upstream: str, head: str, *, probe: dict[str, Any] | None = None,
+    ) -> bool | None:
+        """Does *head* contribute any NET change relative to its fork from *upstream*?
+
+        Answers the "no-op landing" question (task 4647, PRD
+        landed-not-done-recovery, Open question 2): a branch whose commits are
+        all real work but whose combined effect is nothing — added then
+        removed, or reverted within the branch — produces a genuine merge
+        marker on main while delivering no deliverable.  That is the task-1175
+        shape, and stamping it ``done`` records a task as delivered when
+        nothing shipped.
+
+        The computation is ``merge-base(upstream, head)..head``.  The PRD
+        Contract states the formula as ``merge-base(first_parent, tip)..tip``;
+        that is the SPECIAL CASE ``upstream = first_parent(head)``, which a
+        caller asking about a merge commit's own contribution passes directly.
+        The general ``(upstream, head)`` form is the one implemented because a
+        task branch's no-op question is about the BRANCH's net contribution to
+        main, not about its last commit's.
+
+        **TRI-STATE, deliberately, and never collapsed to a bool.** ``None``
+        means "could not be determined" — an unresolvable ref, an unreadable
+        commit, or two histories with no common ancestor.  A bool return would
+        force every git failure into one of the two answers about the TASK:
+        ``False`` would read as "the branch has real content" and ``True`` as
+        "the task delivered nothing", both of them a broken detector silently
+        re-decided as a fact.  ``branch_work_landed`` maps ``None`` to
+        ``LandingReason.git_error`` for exactly this reason.
+
+        ``git diff --quiet`` is used rather than ``--name-only``: the answer is
+        a yes/no, so no file list — and in a large landing no ~300-path set —
+        is ever materialised.  That also sidesteps the path-quoting hazard
+        :meth:`branch_content_in_main` documents below (it is NOT hardened with
+        ``-z`` / ``core.quotePath=false``, so a non-ASCII path can be
+        misparsed); a predicate that never builds a path list cannot have the
+        bug at all.
+
+        Contrast :meth:`branch_content_in_main` (the byte-identity containment
+        predicate, whose final ``git diff --quiet`` leg asks "are the touched
+        paths identical between branch and main *right now*"): that question
+        DECAYS — any later commit touching those paths flips it — whereas this
+        one asks only about the branch's own two endpoints and is unaffected by
+        anything that happens on main afterwards.
+
+        Args:
+            upstream: The ref the branch forked from (a branch name or a sha).
+            head: The branch tip (or any commit-ish) whose net contribution is
+                in question.
+            probe: Optional out-parameter.  When given, structured facts are
+                written into it for the caller's escalation body —
+                ``net_diff_head_parents`` (the head commit's parent shas, so a
+                reader can see whether the tip is a merge without re-running
+                git) and ``net_diff_merge_base``.  Optional so a caller that
+                only wants the answer need not construct a dict.
+
+        Returns:
+            ``True`` when the net diff is empty, ``False`` when it is not, and
+            ``None`` when it could not be determined.
+        """
+        # Head's parents, via the same inline `rev-list --parents -n 1` idiom
+        # _probe_commit_effect uses (there is no named get_commit_parents
+        # helper).  Its combined rc/empty-output guard is kept verbatim; where
+        # the original maps it to failure='unresolvable_commit', this maps it
+        # to the tri-state None.  This also doubles as head's resolvability
+        # check, so an unresolvable head never reaches merge-base.
+        rc, parents_out, _ = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', head],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not parents_out:
+            return None
+        parents = parents_out.split()[1:]
+        if probe is not None:
+            probe['net_diff_head_parents'] = parents
+
+        rc, merge_base, _ = await _run(
+            ['git', 'merge-base', upstream, head],
+            cwd=self.project_root,
+        )
+        merge_base = merge_base.strip()
+        if rc != 0 or not merge_base:
+            # An unresolvable upstream and two disconnected root histories are
+            # both indeterminate, not "not a no-op".
+            return None
+        if probe is not None:
+            probe['net_diff_merge_base'] = merge_base
+
+        rc, _, _ = await _run(
+            ['git', 'diff', '--quiet', merge_base, head],
+            cwd=self.project_root,
+        )
+        if rc == 0:
+            return True
+        if rc == 1:
+            return False
+        # git reserves rc 0/1 for "no differences" / "differences"; anything
+        # else is an error, and an error is not an answer.
+        return None
+
+    async def landing_merge_for(self, head: str, upstream: str) -> str | None:
+        """The MERGE COMMIT on *upstream* that brought *head* in, or None.
+
+        The oldest merge commit on the ANCESTRY PATH from *head* to
+        *upstream* — i.e. the first merge that has *head* as an ancestor.
+        Exists for one caller: :func:`~orchestrator.landing_evidence.
+        branch_work_landed`'s no-op guard, in the case where *head* is ALREADY
+        an ancestor of *upstream*.
+
+        **Why that case needs a different question.** The no-op guard asks
+        "does this branch contribute any net change relative to where it
+        forked?", and its natural baseline is ``merge-base(upstream, head)``.
+        Once the branch has merged, that formula DEGENERATES: *head* is an
+        ancestor of *upstream*, so the merge base IS *head* and the diff is
+        empty for EVERY landed branch — a landed task would be reported as a
+        no-op landing and re-dispatched forever, which is the precise defect
+        the landed-not-done PRD exists to fix.  Given this merge, the guard can
+        instead ask the PRD Contract's LITERAL form,
+        ``merge-base(first_parent, tip)..tip`` — "did this merge change
+        anything relative to main as it stood immediately before it?" — which
+        is well-defined after the fact and answers the same question.
+
+        ``--ancestry-path`` (not a plain ``--merges`` walk) is what makes the
+        result *this branch's* landing rather than merely the oldest merge in
+        the range: it restricts the walk to commits that are simultaneously
+        descendants of *head* and ancestors of *upstream*, so an unrelated
+        merge that happened to land in the same window is excluded.
+
+        Returns ``None`` when there is no such merge — a fast-forward or
+        rebase landing leaves none — and also on any git failure.  The two are
+        deliberately NOT distinguished here because the sole caller treats
+        both identically (it declines to answer the no-op question rather than
+        guessing), and it re-probes repo health itself before deciding whether
+        a refusal is ``not_landed`` or ``git_error``.
+        """
+        rc, out, _ = await _run(
+            ['git', 'rev-list', '--ancestry-path', '--merges', '--reverse',
+             f'{head}..{upstream}'],
+            cwd=self.project_root,
+        )
+        if rc != 0 or not out.strip():
+            return None
+        return out.split()[0]
 
     async def describe_commit_effect_in_main(
         self, commit_sha: str,
@@ -12226,14 +12612,16 @@ class GitOps:
     async def _interactive_worktree_landed(self, full_branch: str) -> bool:
         """True if a ``Merge {full_branch} into {main_branch}`` marker exists on main.
 
-        Reproduces :func:`find_merge_marker`'s grep core (``git log
-        <main_branch> --fixed-strings --grep=<subject> --max-count=1
-        --format=%H``) but deliberately WITHOUT its branch-existence gate:
-        :meth:`find_merge_marker` returns ``None`` immediately whenever the
-        branch ref still resolves, on the assumption that a live branch means
-        ``is_ancestor`` is the right check — but an ``_iact-*`` branch is
-        *always* still checked out in its own worktree at reap time, so that
-        gate would short-circuit to ``False`` here every single time.
+        Shares :meth:`_lookup_merge_marker` with :meth:`find_merge_marker` —
+        the same marker lookup, and deliberately WITHOUT the branch-existence
+        gate that :meth:`find_merge_marker` applies before delegating to it.
+        That gate returns ``None`` immediately whenever the branch ref still
+        resolves, on the assumption that a live branch means ``is_ancestor`` is
+        the right check — but an ``_iact-*`` branch is *always* still checked
+        out in its own worktree at reap time, so it would short-circuit to
+        ``False`` here every single time.  Calling the ungated lookup directly
+        is what preserves that distinction now that the grep core is no longer
+        duplicated here.
 
         Deliberately NOT ``is_ancestor(HEAD, main)``: a freshly-created
         ``_iact-*`` worktree has zero commits of its own, so its HEAD trivially
@@ -12245,18 +12633,7 @@ class GitOps:
         ``find_task_citation_commit`` for the same is_ancestor pitfall
         elsewhere in this module).
         """
-        grep_pattern = _merge_subject(full_branch, self.config.main_branch)
-        rc, out, _ = await _run(
-            [
-                'git', 'log', self.config.main_branch,
-                '--fixed-strings',
-                f'--grep={grep_pattern}',
-                '--max-count=1',
-                '--format=%H',
-            ],
-            cwd=self.project_root,
-        )
-        return rc == 0 and bool(out.strip())
+        return await self._lookup_merge_marker(full_branch) is not None
 
     async def _worktree_dirty(self, worktree: Path) -> bool:
         """True if *worktree* has uncommitted changes (``git status --porcelain``).

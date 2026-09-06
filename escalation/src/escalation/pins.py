@@ -234,7 +234,13 @@ def _classify_record(
     # JSON on disk can carry a null `severity` despite the `str` annotation.
     sev = str(record.severity or '').strip().lower()
 
-    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.
+    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Since
+    # task 3976, `escalation.server.promote_to_l2`'s inherited
+    # max(member severities) default can MINT a fresh L2 at severity='info'
+    # (previously the only info-severity L2s were ones `EscalationQueue.park()`
+    # promoted from an already-open L0/L1, never freshly filed ones), so this
+    # link now also decides an inherited-info L2 as NON_PINNING — see
+    # TestInfoAtL2Coupling in escalation/tests/test_pins.py (task 4402).
     if sev == 'info':
         return PinClass.NON_PINNING
 
@@ -330,10 +336,36 @@ def classify_pins(
     judged against THAT incarnation, never against "some workflow for this
     task is alive": a newer live incarnation never keeps a prior incarnation's
     unconsumed L0 alive.  ``None`` means "filing identity unknown" — legacy
-    records, and every producer not yet stamping it — which fails safe to
+    records, and producers that do not stamp it — which fails safe to
     PINNING, because the classifier may only convert an L0 when it can PROVE
     the filing incarnation is dead.  The identity is stored and compared
-    verbatim, never parsed.
+    verbatim, never parsed.  As of task 3550 the stamping producers are
+    ``orchestrator.workflow.TaskWorkflow``, ``orchestrator.harness.Harness``,
+    and the ``escalate_blocker``/``escalate_info`` chokepoint in
+    ``escalation.server`` (via its injected ``task_claimant_lookup``).  Still
+    NOT stamping: ``escalation.submit``'s detached CLI (a systemd OnFailure
+    entry point with no orchestrator run_id and no session, so it structurally
+    cannot, and which hardcodes ``level=2``),
+    ``orchestrator.deterministic_runner`` (all six sites ``level=2`` /
+    ``severity='critical'``) and the other level-1/2-only filers — where link
+    3 makes the identity moot.  The L0 ``severity='info'`` filers (e.g.
+    ``orchestrator.merge_skew_tripwire``, ``orchestrator.offline_lane``'s
+    risk notice, the ``_AMENDMENT_TRUNCATION``/``_ROOT_CAUSE_OVERFOLD``
+    anchors in ``escalation.server``) do not stamp either, but they are moot
+    via link 1, not link 3.
+
+    One residual L0 gap is NOT closed by the stamping above:
+    ``orchestrator/src/orchestrator/merge_queue.py::_file_main_health_escalation``
+    builds at the DEFAULT level 0 with ``severity='blocking'`` (category
+    ``preexisting_main_break``) against a real ``req.task_id``, so links
+    1/2/3/3b all fall through and its records still read as UNKNOWN at link 4
+    — failing safe to pinning.  It is a module-level function with no
+    per-task incarnation, so ``None`` is the honest value there; closing the
+    gap needs a caller-supplied identity, not a stamp.  A second non-stamping
+    L0 ``'blocking'`` producer,
+    ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._escalate``,
+    files against synthetic ``recon-<run_id>`` task ids on the reconciliation
+    queue, which no task-scoped pin read binds to.
 
     See the precedence chain above :func:`_classify_record` for the rules, and
     :class:`PinReport` for the buckets and the two derived predicates.

@@ -22,7 +22,9 @@ Output shape (per task) matches ``data.js`` mock fixtures:
                                     # claimant (null/blank claimant, or a heartbeat older than
                                     # STRANDED_HEARTBEAT_TTL). Independent of 'agent': a leftover
                                     # worktree makes 'agent' truthy while nothing is running.
-        'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot)
+        'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot);
+                                    # None when the entry's own started is None
+                                    # (per-task read failure)
         'loops': 2,                 # TaskRuntimeEntry.loops (runtime snapshot)
         'attempts': 3,              # TaskRuntimeEntry.attempts (runtime snapshot)
         'lane': '_lane-7',          # TaskRuntimeEntry.lane, or None
@@ -35,6 +37,16 @@ Output shape (per task) matches ``data.js`` mock fixtures:
                                      # runtime_offline False; a per-task read failure on an online
                                      # snapshot yields None fields with runtime_offline still False
                                      # (honest error != offline). See _runtime_fields.
+        'runtime_status': 'ok',     # WHY runtime_offline is what it is — see RuntimeStatus.
+                                     # runtime_offline alone cannot tell an operator whether the
+                                     # orchestrator is down ('unreachable'), the dashboard was too
+                                     # starved to ask within its own probe budget
+                                     # ('deadline_exceeded'), or no orchestrator is configured for
+                                     # this root at all ('not_configured') — three cases that
+                                     # demand opposite responses but render identically as blank
+                                     # cells. Collapsing them is what made the 2026-07-30 event get
+                                     # misdiagnosed as an orchestrator outage. runtime_offline is
+                                     # UNCHANGED: True for every non-'ok' member.
         'deps': [{'id': 'dark_factory/T-15', 'title': '...', 'done': True}, ...],
         'meta_files': ['src/...py', ...],  # taskmaster metadata.files; retained on API for
                                            # debugging/tooling — no frontend UI reads it directly
@@ -51,11 +63,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
+from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
 from dashboard.data.task_runtime import fetch_task_runtime
@@ -74,6 +88,27 @@ _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'defe
 # filter for the bounded terminal window, so this set is what crosses the wire
 # — keep it in step with the (status, cap) pairs iterated below.
 _TERMINAL_STATUSES = {'done', 'cancelled'}
+
+# Why a task row's runtime fields are what they are — the FAULT DOMAIN of the
+# runtime probe, not the task (task 3517). Mirrors the ``status``-discriminator
+# convention already used by ``app._probe_db`` and ``redux_api._shape_wal_status``.
+#
+# - 'ok'                the probe succeeded. Fields are real (or honest zeros
+#                       for a task absent from the snapshot, or honest Nones on
+#                       a PER-TASK read failure — the probe was still fine).
+# - 'not_configured'    no escalation URL for this project root, so nothing was
+#                       ever probed. Expected and permanent; NOT a fault.
+# - 'unreachable'       connect refused / HTTP error / malformed payload. The
+#                       ORCHESTRATOR is the fault domain; go look at it.
+# - 'deadline_exceeded' the probe's own budget fired. Likely the DASHBOARD's
+#                       fault under a starved event loop — the orchestrator may
+#                       be perfectly healthy (2026-07-30).
+# - 'unknown'           the snapshot said offline with no reason. Out-of-contract
+#                       for a dashboard-synthesized snapshot; the honest sentinel.
+#                       NEVER fabricate a diagnosis to fill this in.
+RuntimeStatus = Literal[
+    'ok', 'not_configured', 'unreachable', 'deadline_exceeded', 'unknown',
+]
 
 # Maximum done / cancelled tasks to include per project when the caller opts in
 # via ``max_done_per_project`` / ``max_cancelled_per_project``.
@@ -189,21 +224,36 @@ def _task_uid(project: str, task_id: int) -> str:
     return f'{project}/T-{task_id}'
 
 
-def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int:
-    """Whole minutes between *iso* and *now* (UTC). 0 on parse failure / future.
+def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int | None:
+    """Whole minutes between *iso* and *now* (UTC).
+
+    Returns ``None`` when *iso* is missing/empty — the start time is genuinely
+    UNKNOWN (the per-task artifact-read-failure signal on
+    ``TaskRuntimeEntry.started``), and fabricating ``0`` there would render as
+    '0m running' during precisely the failure this path exists to surface
+    (loud-over-silent-degradation; INV-2 structured-facts-at-failure).
+    Returns ``None`` on parse failure too — a present-but-unparseable *iso*
+    is upstream data damage (``TaskRuntimeEntry.started`` is typed
+    ``str | None`` but pydantic does not validate ISO format), and rendering
+    it as ``0`` would produce the identical misleading '0m running' the
+    missing-input case above exists to avoid. Returns ``0`` for a genuine
+    sub-minute-old start, and for a future timestamp (clamped by the
+    ``max(minutes, 0)`` below) — a ``0`` in the payload does NOT imply parse
+    failure or clock skew; only ``None`` signals an unknown start.
 
     *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
     pass an explicit value for deterministic results or to share one instant
     across multiple rows in an aggregation.
     """
     if not iso:
-        return 0
-    try:
-        ts = datetime.fromisoformat(iso.replace('Z', '+00:00'))
-    except ValueError:
-        return 0
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
+        return None
+    ts, ok = parse_timestamp_or_warn(iso, context='active_tasks._minutes_since')
+    if not ok:
+        # Logged once per call, not deduped/rate-limited: the docstring above
+        # notes there is no known producer of a damaged `started` today, so
+        # unbounded per-render volume is a theoretical concern, not an
+        # observed one. Revisit (e.g. a per-value seen-set) if that changes.
+        return None
     delta = resolve_now(now) - ts
     minutes = int(delta.total_seconds() // 60)
     return max(minutes, 0)
@@ -259,7 +309,7 @@ def _build_task_row(
 
     *rt* is the runtime-fields dict produced by :func:`_runtime_fields`
     (``agent``/``loops``/``attempts``/``lane``/``phase``/``lane_state``/
-    ``runtime_offline`` — ``started`` is handled separately by the caller,
+    ``runtime_offline``/``runtime_status`` — ``started`` is handled separately by the caller,
     since active rows use ``rt['started']`` while terminal rows hard-code
     ``0``). Missing keys default to ``None``/``False`` so a bare ``{}`` (used
     by direct unit tests of this function) is still valid.
@@ -306,6 +356,7 @@ def _build_task_row(
         'phase': rt.get('phase'),
         'lane_state': rt.get('lane_state'),
         'runtime_offline': rt.get('runtime_offline', False),
+        'runtime_status': rt.get('runtime_status', 'ok'),
         'claimant_run_id': task.get('claimant_run_id'),
         'heartbeat_at': task.get('heartbeat_at'),
         'stranded': task_is_stranded(task, now=now),
@@ -316,21 +367,48 @@ def _build_task_row(
     }
 
 
+def _probe_status(runtime: TaskRuntimeSnapshot | None) -> RuntimeStatus:
+    """Classify a project's runtime probe outcome — see :data:`RuntimeStatus`.
+
+    ``None`` means the project label never appeared in the fan-out result at
+    all, i.e. no escalation URL is configured for it and no probe was ever
+    attempted — distinct from a probe that was attempted and failed.
+
+    An ``offline=True`` snapshot with no ``offline_reason`` is out-of-contract
+    for one the dashboard synthesized, so it degrades to ``'unknown'`` rather
+    than being assigned a plausible-sounding reason we did not measure.
+    """
+    if runtime is None:
+        return 'not_configured'
+    if not runtime.offline:
+        return 'ok'
+    if runtime.offline_reason == 'deadline_exceeded':
+        return 'deadline_exceeded'
+    if runtime.offline_reason == 'unreachable':
+        return 'unreachable'
+    return 'unknown'
+
+
 def _runtime_fields(
     index: dict[int, TaskRuntimeEntry],
-    is_offline: bool,
+    status: RuntimeStatus,
     task_id: int,
     *,
     now: datetime | None = None,
 ) -> dict:
     """Derive a task row's runtime-sourced fields from the project's runtime snapshot.
 
+    *status* is this project's probe outcome from :func:`_probe_status`, and is
+    emitted verbatim as the row's ``runtime_status``. ``runtime_offline`` is
+    derived from it here as ``status != 'ok'`` — one source of truth — and keeps
+    its EXACT prior meaning, so no downstream consumer's semantics shift.
+
     Three cases:
 
-    - *is_offline* (the project's ``get_task_runtime_state`` snapshot reported
-      ``offline=True``, or no escalation URL is configured for this project at
-      all): every field is ``None`` — never a fabricated ``0`` — and
-      ``runtime_offline`` is ``True``.
+    - *status* is any non-``'ok'`` member (``'not_configured'``,
+      ``'unreachable'``, ``'deadline_exceeded'``, ``'unknown'`` — we have no
+      usable snapshot, whatever the cause): every field is ``None`` — never a
+      fabricated ``0`` — and ``runtime_offline`` is ``True``.
     - *task_id* absent from *index* (the project IS online, the task just has
       no entry in its snapshot): honest zeros (``loops``/``attempts``/
       ``started`` are ``0``; ``agent``/``lane``/``phase``/``lane_state`` are
@@ -338,20 +416,21 @@ def _runtime_fields(
     - *task_id* present in *index*: real fields from the ``TaskRuntimeEntry``,
       which may themselves be ``None`` on a per-task artifact read failure —
       an honest per-task error, not an offline project, so ``runtime_offline``
-      stays ``False`` either way.
+      stays ``False`` and ``runtime_status`` stays ``'ok'`` either way (the
+      PROBE succeeded; only this one task's artifact read did not).
     """
-    if is_offline:
+    if status != 'ok':
         return {
             'agent': None, 'loops': None, 'attempts': None, 'started': None,
             'lane': None, 'phase': None, 'lane_state': None,
-            'runtime_offline': True,
+            'runtime_offline': True, 'runtime_status': status,
         }
     entry = index.get(task_id)
     if entry is None:
         return {
             'agent': None, 'loops': 0, 'attempts': 0, 'started': 0,
             'lane': None, 'phase': None, 'lane_state': None,
-            'runtime_offline': False,
+            'runtime_offline': False, 'runtime_status': status,
         }
     return {
         # ``agent`` is a WORKTREE-PRESENCE signal, not evidence of liveness: it
@@ -368,6 +447,7 @@ def _runtime_fields(
         'phase': entry.phase,
         'lane_state': entry.lane_state,
         'runtime_offline': False,
+        'runtime_status': status,
     }
 
 
@@ -664,7 +744,7 @@ async def _shape_one_project(
     if not tasks:
         return [], False, done_count
 
-    is_runtime_offline = runtime is None or runtime.offline
+    runtime_status = _probe_status(runtime)
     runtime_index: dict[int, TaskRuntimeEntry] = (
         {e.task_id: e for e in runtime.tasks} if runtime is not None and not runtime.offline else {}
     )
@@ -680,7 +760,7 @@ async def _shape_one_project(
             continue
 
         task_id = task['id']
-        rt = _runtime_fields(runtime_index, is_runtime_offline, task_id, now=effective_now)
+        rt = _runtime_fields(runtime_index, runtime_status, task_id, now=effective_now)
 
         uid = _task_uid(project, task_id)
         row = _build_task_row(project, task, task_id, rt, uid, now=effective_now)
@@ -722,7 +802,7 @@ async def _shape_one_project(
             if beyond_cap:
                 exempted_count += 1
             uid = _task_uid(project, task_id)
-            rt = _runtime_fields(runtime_index, is_runtime_offline, task_id, now=effective_now)
+            rt = _runtime_fields(runtime_index, runtime_status, task_id, now=effective_now)
             row = _build_task_row(project, task, task_id, rt, uid, prd=prd, now=effective_now)
             # terminal rows: no meaningful start time; deps only for live-PRD
             # members (the terminal-member exemption), else unsurfaced.

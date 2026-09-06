@@ -32,6 +32,7 @@ from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.flake_recorder import record_merge_flake_suppression
 from orchestrator.git_ops import (
     PERSISTENT_MERGE_WORKTREE_NAME,
     AdvanceOutcome,
@@ -92,16 +93,20 @@ from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     MergeLivenessAssessment,
     MergeLivenessConfigError,
     PersistentWorktreeConfigError,
+    SerialLaneAssessment,
     _acquire_warm_verify_worktree,
     _alarm_verify_host_unreachable,
     _clear_verify_host_unreachable,
     _safety_valve_due,
     _verify_host_unreachable_sentinel,
     acquire_chain_build_lane,
+    alarm_serial_lane_breach,
     check_merge_liveness_margin,
+    check_serial_lane_tripwire,
     enforce_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
     newest_content_mtime,
+    per_host_inflight_bound,
     release_chain_build_lane,
 )
 from orchestrator.merge_request_ledger import (  # noqa: F401  re-export shim
@@ -327,6 +332,27 @@ which the prompt-invalidation cascade + the dispatch/adoption dead-base checks
 do promptly — so evicting very old entries is safe: a false-negative on an
 ancient dead commit is unreachable in practice (such an item is long since
 re-merged).  Overridable per-instance via ``worker._dead_base_commits_cap`` in tests."""
+
+_TRAIN_PREDECESSOR_SETTLE_POLL_SECS = 0.05
+"""Poll interval for :meth:`SpeculativeMergeWorker._await_unadvanced_predecessor`.
+
+Deliberately a poll rather than an await on the predecessor's result Future:
+that Future is owned by the verifier and may be cancelled or resolved with an
+exception, both of which surface through an ``await`` as exceptions that are
+indistinguishable from the merger's OWN cancellation.  A poll reads
+``done()`` and nothing else, and lets the loop honour ``self._running`` so a
+``stop()`` never leaves the merger parked.  At 20 wake-ups/second against a
+wait measured in minutes the cost is a rounding error.
+"""
+
+_TRAIN_PREDECESSOR_SETTLE_FALLBACK_SECS = 1800.0
+"""Settle-wait bound used when the request's config carries no
+``verify_command_timeout_secs`` — matches that field's own default."""
+
+_TRAIN_PREDECESSOR_SETTLE_SLACK_SECS = 120.0
+"""Added to the predecessor's verify budget so the settle wait expires only
+AFTER the verify it is waiting on has itself timed out — the wait must not be
+the thing that gives up first."""
 
 _MERGE_AHEAD_BOUND = 1
 """Maximum number of counted (non-speculative, non-train) items that may sit in
@@ -2436,6 +2462,49 @@ def _merge_boundary_module_configs(
     return effective_merge_module_configs(config, module_configs)
 
 
+def _record_flake_observation(
+    result: VerifyResult,
+    req: MergeRequest,
+    *,
+    merge_sha: str,
+    event_store: EventStore | None,
+    escalation_queue: Any,
+) -> None:
+    """Record whatever flake observation *result* carries (PRD task ε, §5.8).
+
+    Binds this call site's context once — project root, project id, merge SHA,
+    task id and both stores — so the two recording points below cannot drift
+    apart in what they attribute an observation to.
+
+    THE topology rule ε encodes: the DISCRIMINATOR runs where the WORKTREE is
+    (local host or remote runner — only there can the failing tests be re-run);
+    the RECORDER runs HERE, on the dispatcher, because ``_run_post_merge_verify``
+    is the only scope where a local OR remote ``VerifyResult`` sits alongside an
+    ``EventStore``, an escalation queue, ``project_root``, ``merge_sha`` and
+    ``task_id`` at once.
+
+    That co-location is what makes the three side-effects — the durable
+    ``flake_occurrence`` row, the ``merge_flake_suppressed`` fact and the INV-4
+    storm-streak bump — unconditional BY CONSTRUCTION rather than dependent on
+    which host happened to run the verify.  Before ε they fired inline inside the
+    producer, so a REMOTE verify landed none of the three: no ledger call existed
+    at all, the remote host has no event store, and its streak counter died with
+    its process.
+
+    Never raises (the recorder owns that guarantee), so a lost measurement can
+    never fail a verify or stall the merge queue.
+    """
+    record_merge_flake_suppression(
+        result,
+        project_root=req.config.project_root,
+        project_id=req.config.fused_memory.project_id,
+        merge_sha=merge_sha,
+        task_id=req.task_id,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -2796,10 +2865,12 @@ async def _run_post_merge_verify(
                 run_unscoped=_run_unscoped_typechecks,
                 task_id=req.task_id,
                 archive_root=req.config.project_root / 'data' / 'verify-logs',
-                # PRD task α: thread the fact-emission + storm-escalation stores
-                # into the merge-flake suppression gate (LocalRunner.run_merge_verify).
+                # INV-1 (task 2883): thread the dispatching store so run_scoped's
+                # merge gate emits trivial_pass_escalated.  The merge-flake gate's
+                # own side-effects are NOT threaded here — task ε moved them to the
+                # dispatcher (_run_post_merge_verify), driven off the
+                # FlakeSuppression the returned VerifyResult carries.
                 event_store=event_store,
-                escalation_queue=escalation_queue,
             )],
             event_store=event_store,
             task_id=req.task_id,
@@ -2841,6 +2912,25 @@ async def _run_post_merge_verify(
         ):
             await stack.enter_async_context(git_ops.merge_verify_lease())
 
+        # Task ε: attempts whose VERDICT is superseded by a retry below, but whose
+        # OBSERVATION is not.  §5.5 records the observation, not the remedy — and the
+        # compound case is real: `apply_merge_flake_suppression` runs on the SCOPED
+        # leg, so an attempt can suppress a scoped red (a genuine `passes_in_isolation`
+        # observation) and STILL come back failing because the unscoped gate then broke
+        # or the run hit ENOSPC.  That result is retried, `verify` is rebound, and
+        # recording only the settled verdict would silently drop the observation —
+        # exactly the load-correlated shape this PRD exists to measure, and one that
+        # WAS emitted inline (at the moment of observation) before ε moved recording to
+        # the dispatcher.  §8.3's `(test_id, observed_at, call_site)` dedup keeps a
+        # replay idempotent, and each attempt stamps its own `observed_at`, so every
+        # attempt contributes exactly one row per test.
+        superseded_observations: list[VerifyResult] = []
+
+        def _remember_superseded(v: VerifyResult) -> None:
+            """Stash *v* iff it carries an observation, just BEFORE `verify` is rebound."""
+            if getattr(v, 'flake_suppression', None) is not None:
+                superseded_observations.append(v)
+
         verify = await pool.dispatch(
             merge_sha, spec, depth=depth, speculative=speculative,
             chain_items=chain_items, chain_build_ms=chain_build_ms,
@@ -2863,6 +2953,7 @@ async def _run_post_merge_verify(
                     'stale merge worktree(s), retrying verify once',
                     req.task_id, len(pruned),
                 )
+                _remember_superseded(verify)
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
                     chain_items=chain_items, chain_build_ms=chain_build_ms,
@@ -2972,11 +3063,37 @@ async def _run_post_merge_verify(
                     '(category=%s); retrying verify (attempt=%d, budget=%d, narrowed=%s)',
                     req.task_id, verify.category, retries[req.task_id], budget, narrowed,
                 )
+                _remember_superseded(verify)
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=retries[req.task_id], depth=depth,
                     speculative=speculative, chain_items=chain_items,
                     chain_build_ms=chain_build_ms,
                 )
+
+    # Task ε: record EVERY attempt's flake observation, oldest first.
+    #
+    # Placed after BOTH retry loops (ENOSPC and infra-transient) have finished
+    # rebinding `verify`, so the recording order matches the observation order and
+    # a single pass covers both loops.  A superseded attempt's VERDICT is dead, but
+    # its OBSERVATION is not (§5.5 — record the observation, not the remedy): an
+    # attempt whose SCOPED red was suppressed can still come back failing on the
+    # unscoped gate or on ENOSPC and be retried, and that suppression is a real
+    # masked red that the inline pre-ε emit would have reported at the moment it
+    # happened.  `superseded_observations` is empty on every path where no retry
+    # carried an observation, which is the overwhelmingly common case.
+    for superseded in superseded_observations:
+        _record_flake_observation(
+            superseded, req,
+            merge_sha=merge_sha,
+            event_store=event_store,
+            escalation_queue=escalation_queue,
+        )
+    _record_flake_observation(
+        verify, req,
+        merge_sha=merge_sha,
+        event_store=event_store,
+        escalation_queue=escalation_queue,
+    )
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
@@ -3038,7 +3155,6 @@ async def _run_post_merge_verify(
             task_id=req.task_id,
             archive_root=req.config.project_root / 'data' / 'verify-logs',
             event_store=event_store,
-            escalation_queue=escalation_queue,
         )
         try:
             # task 2873: defense-in-depth lane-lock for the REMOTE-path
@@ -3064,6 +3180,18 @@ async def _run_post_merge_verify(
                         git_ops.merge_verify_lease(lane_dir=merge_wt)
                     )
                 local_verify = await cross_check_runner.run_merge_verify(merge_sha, spec)
+            # Task ε: the cross-check ran its OWN merge gate on the local trust
+            # anchor, so it can carry its own observation.  Its LocalRunner had
+            # both stores wired before ε and therefore emitted + bumped inline;
+            # recording it here is what keeps this detective-control path from
+            # regressing.  Inside the `try`, after the await, so a raised verify
+            # (handled below) records nothing — there is no verdict to record.
+            _record_flake_observation(
+                local_verify, req,
+                merge_sha=merge_sha,
+                event_store=event_store,
+                escalation_queue=escalation_queue,
+            )
         except RunnerUnavailable as exc:
             # Fail-safe: a closed/flaky laptop trust-anchor must never block a
             # remote green (symmetric with DriftDetector's Invariant 5).
@@ -8955,7 +9083,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # automatically safe the moment a remote runner is turned on. The BLIND
     # SPOT above (toolchains writing outside merge_wt) applies verbatim to
     # the cross-check leg of the REMOTE arm too.
-    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 1800.0
+    #
+    # INVARIANT (task 4659 incident, 2026-08-29): this budget MUST EXCEED the
+    # longest PER-COMMAND verify timeout the target can authorise, because a
+    # command that is still within its own sanctioned runtime is by definition
+    # healthy and must never be killed here. pytest writes its junit XML only
+    # at command COMPLETION, so a single verify command legitimately produces
+    # ZERO writes under merge_wt for its entire duration — the no-progress
+    # signal cannot distinguish that from a hang, and must not try to.
+    # dark-factory authorises up to `verify_command_timeout_secs: 3600` on the
+    # global fallback path (the path a zero-.py / cross-cutting diff routes
+    # to), above every per-module budget (max: scripts/ at 2400s). The old
+    # 1800.0 sat BELOW that 3600s ceiling, so this watchdog could fire on a
+    # verify with 30 minutes of authorised runtime still to go.
+    # It did: under host oversubscription (load 76-137 on 32 cores) three
+    # consecutive head-of-line verifies — tasks 4659, 4810, 4055 — were each
+    # killed at 1800s and re-queued, main took ZERO landings for 3+ hours, and
+    # the queue grew 1 -> 19 while the scheduler kept dispatching the task
+    # pytest runs that caused the contention. A livelock, not a hang.
+    # 5400s clears the 3600s ceiling with 1800s of headroom. Raise this again
+    # if any per-command budget is ever raised past 5400s; the ordering is the
+    # contract, not the number.
+    # Cost of the raise, accepted deliberately: a genuinely hung verify now
+    # holds the (single) verifier host 90min x MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+    # = 4.5h before resolving `blocked`, up from 1.5h. That is strictly better
+    # than the livelock above, which had no terminating condition at all.
+    INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 5400.0
     # Throttle for the newest_content_mtime() worktree-subtree walk that
     # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
     # the walk cost is bounded independently of the 10s abort-poll cadence.
@@ -9729,6 +9882,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # the last _maybe_coalesce_waiting_singles attempt (incl. no-viable-train
         # attempts).  Short-circuits when the waiting set is unchanged.
         self._last_coalesce_signature: frozenset[str] | None = None
+        # The most recent request whose merge commit was handed to the verifier
+        # and has NOT yet been finalized (verified + CAS-advanced).  Read ONLY by
+        # _await_unadvanced_predecessor, which parks a train behind it — see that
+        # method for why a train, unlike a single, cannot survive main moving
+        # under it.  Set at the post-put success site in _merger_loop; never
+        # explicitly cleared, because a finalized request's Future is already
+        # done and the wait is then a no-op.
+        self._last_merged_request: MergeRequest | None = None
         # δ/1720 one-strike registry — task_ids of members whose coalesce-formed
         # train derailed (MergeOutcome('blocked') on a train with train_id
         # startswith _COALESCE_TRAIN_ID_PREFIX).  Keyed by task_id so the marker
@@ -14988,13 +15149,88 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return f'recent_terminal_{rec["state"]}'
         return None
 
+    async def _await_unadvanced_predecessor(self, train_id: str) -> bool:
+        """Park a dequeued train until the previous merge has finalized.
+
+        Returns True when it actually waited (the caller must then re-read main).
+
+        Why a train needs this and a single does not.  Both CAS-advance main
+        against an ``expected_main`` captured before their verify, and
+        ``git_ops.py::GitOps.advance_main`` does NOT re-derive that value on a
+        CAS loss — its ``max_attempts`` loop only rebases the merge worktree
+        until the merge commit is a descendant; the ``update-ref --stdin``
+        compare-and-swap itself is one-shot and returns ``'cas_failed'``.  For a
+        SINGLE that is recoverable: the call site passes
+        ``reverify_on_rebase=True`` and ``_finalize_inflight``'s CAS loop
+        (``MAX_CAS_RETRIES``) re-merges and re-verifies.  For a TRAIN it is
+        terminal — ``_do_train_merge`` maps ``cas_failed`` straight to
+        ``MergeOutcome('blocked')`` + a ``train_derailed`` event, and every
+        absorbed member is re-driven to a solo merge.  So a train that starts
+        while a predecessor's merge commit is still unadvanced pays a full train
+        verify and then throws it away.
+
+        The window is not narrow: ``_do_train_merge`` reads main after its own
+        rebase and then holds it across the entire train verify, while the
+        predecessor's verify runs concurrently on the verifier coroutine.
+        Whichever finishes first advances main and the other loses the CAS.
+
+        Waiting costs no pipelining.  ``_do_train_merge`` is awaited INLINE on
+        the merger coroutine, so no further merge can start until the train
+        finishes either way — the only thing this defers is the train's own
+        start.  Fail-safe: on timeout it logs and proceeds, i.e. degrades to
+        exactly the pre-wait behaviour rather than stalling the merger forever.
+        """
+        pred = self._last_merged_request
+        if pred is None or pred.result.done():
+            return False
+        timeout = float(
+            getattr(pred.config, 'verify_command_timeout_secs', None)
+            or _TRAIN_PREDECESSOR_SETTLE_FALLBACK_SECS
+        ) + _TRAIN_PREDECESSOR_SETTLE_SLACK_SECS
+        logger.info(
+            'Train %s: parking behind unadvanced predecessor %s — a train '
+            'cannot recover from a lost CAS (timeout=%.0fs)',
+            train_id, pred.task_id, timeout,
+        )
+        t_wait = time.monotonic()
+        deadline = t_wait + timeout
+        while (
+            self._running
+            and not pred.result.done()
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(_TRAIN_PREDECESSOR_SETTLE_POLL_SECS)
+        if not pred.result.done():
+            logger.warning(
+                'Train %s: predecessor %s still unfinalized after %.1fs — '
+                'proceeding anyway; the train may lose the CAS and derail',
+                train_id, pred.task_id, time.monotonic() - t_wait,
+            )
+        else:
+            logger.info(
+                'Train %s: predecessor %s finalized after %.1fs — proceeding',
+                train_id, pred.task_id, time.monotonic() - t_wait,
+            )
+        return True
+
     async def _maybe_coalesce_waiting_singles(self) -> bool:
         """Attempt to coalesce waiting single MergeRequests into one GroupMergeRequest.
 
-        Called from _merger_loop at the pre-dequeue point when the pipeline is
-        idle (spec_base is None and prefetched is None) so a train is never
-        enqueued behind an unverified speculative merge commit (pipeline-ordering
-        contract, :5239 warning comment).
+        Called once per _merger_loop iteration, immediately after
+        ``SpeculationController.take_prefetched()`` has consumed any look-ahead
+        item, gated on ``SpeculationController.can_coalesce()`` — no look-ahead
+        item still in hand and no ARMED late-arrival attach.  It is
+        deliberately NOT gated on total speculation idleness
+        (``SpeculationController.is_idle()``, the pre-2026-08-28 gate): a
+        leftover ``spec_base`` is the normal steady state of a healthy
+        pipeline, so that gate made trains form only when merges were FAILING.
+        See ``merge_speculation_controller.py::SpeculationController.
+        can_coalesce`` for the full rationale.
+
+        Whichever request this iteration goes on to merge is already out of the
+        lane buffers when this runs (``_pop_next_pickable`` popped it, either
+        just now via ``_acquire_next_request`` or on a prior iteration via the
+        look-ahead), so it is structurally excluded from the candidate scan.
 
         Returns True when a GroupMergeRequest was formed and appended to
         _lane_buffers['normal']; False in all no-op / guard-exit cases.
@@ -15290,18 +15526,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         try:
             while self._running:
+                # Get next request: use pre-fetched (speculative) item if available,
+                # otherwise acquire from the lane-priority pick system.
+                req = self._speculation_controller.take_prefetched()
+                if req is not None:
+                    # MQ-invariants eta (task 1992): arm the request-liveness
+                    # ledger NOW rather than only at the shared hook below.  A
+                    # prefetched item is already out of the lane buffers, and
+                    # the coalescing pass immediately below awaits git work, so
+                    # without this the item would sit un-armed across that
+                    # await.  RequestLedger.on_dequeue is idempotent (it keeps
+                    # the earliest dequeued_at), so the shared hook below still
+                    # covers both branches and re-arming there is a no-op.
+                    self._request_ledger.on_dequeue(req, now=time.time())
+
                 # γ/1719 retroactive coalescing pass — design decisions summary:
-                # • DD1: runs at the pre-dequeue point, gated on a clean pipeline
-                #   (controller.is_idle(): spec_base=None and prefetched=None and
-                #   pending_spec_base=None) so a train is never enqueued behind an
-                #   unverified speculative merge commit (:5239 warning).  The
-                #   task-1862 retain path records the predecessor's commit in
-                #   pending_spec_base while spec_base remains None, so
-                #   pending_spec_base must also be tested here — otherwise
-                #   coalescing could form a GroupMergeRequest behind an in-flight
-                #   speculative predecessor and attach it to that predecessor's commit,
-                #   violating DD1's invariant.  (merge_train_coalesce_enabled=False by
-                #   default so this is latent; guard added for correctness when enabled.)
+                # • DD1: gated on controller.can_coalesce() — no prefetched item
+                #   still in hand and no ARMED late-arrival attach
+                #   (pending_spec_base whose predecessor is still in flight).
+                #   Runs HERE, straight after take_prefetched() rather than
+                #   before it as the pre-2026-08-28 gate did.  The move is half
+                #   the fix: at the old point `prefetched` (queue non-empty) or
+                #   `pending_spec_base` (queue dry) was set on EVERY iteration
+                #   that followed a successful merge, because _merger_loop ends
+                #   every successful merge with an unconditional look-ahead —
+                #   so the pass was unreachable in a healthy pipeline.  Consuming
+                #   the look-ahead item first is what opens it; dropping
+                #   `spec_base` from the predicate is the other half (see
+                #   SpeculationController.can_coalesce).  Whatever `req` is, it
+                #   is out of the lane buffers by now, so the candidate scan
+                #   cannot absorb the item this iteration is about to merge.
+                #   The old gate's stated invariant ("a train is never enqueued
+                #   behind an unverified speculative merge commit") is NOT
+                #   preserved, by decision: a coalesced train is appended to the
+                #   TAIL of the lane buffer, so the speculation state at
+                #   formation time says nothing about the state when the train
+                #   is eventually dequeued.  That dequeue-time case is the one
+                #   that actually matters, and it is enforced where it is
+                #   knowable — the GroupMergeRequest branch below parks the
+                #   train behind any unadvanced predecessor
+                #   (_await_unadvanced_predecessor).
                 # • DD2: idempotency via candidate filter (excludes GroupMergeRequests,
                 #   done/cancelled futures); no new MergeRequest field required.
                 # • DD3: debounce via _last_coalesce_signature prevents re-stacking an
@@ -15309,20 +15573,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 #   before the stack attempt, so a transient stack/worktree error
                 #   (survivors<2 due to env issue, not a deterministic rebase conflict)
                 #   permanently skips the set until the candidate composition changes.
-                #   Low priority given feature ships OFF; tracked for δ/ζ follow-up.
+                #   Tracked for δ/ζ follow-up.
                 # • DD6 (timing): absorbed members park merge-deferred asynchronously;
                 #   _do_train_merge's status pre-check may return TRAIN_INCOMPLETE on a
                 #   prematurely-dequeued train — same retryable 'blocked' the β/δ path
-                #   uses; full retry is left to δ/ζ.  Feature is OFF by default.
+                #   uses; full retry is left to δ/ζ.
                 # When merge_train_coalesce_enabled=False (default) the call has
-                # near-zero overhead: it drains the queue (already done at acquire
-                # time), builds the candidate list, reads the knob, and returns False.
-                if self._speculation_controller.is_idle():
+                # near-zero overhead: it drains the queue, builds the candidate
+                # list, reads the knob, and returns False.
+                if self._speculation_controller.can_coalesce():
                     await self._maybe_coalesce_waiting_singles()
 
-                # Get next request: use pre-fetched (speculative) item if available,
-                # otherwise acquire from the lane-priority pick system.
-                req = self._speculation_controller.take_prefetched()
                 if req is None:
                     req = await self._acquire_next_request()
                     if req is None:
@@ -15371,17 +15632,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # Known narrow blind spot: a speculative look-ahead item
                 # harvested by _pop_next_pickable() into the `prefetched` local
                 # (below, near the speculation-permit acquire) has already been
-                # removed from the lane buffers/`_queue` but is NOT armed here
-                # until it is consumed as `req` on the NEXT loop iteration — it
-                # is invisible to both snapshot() and the liveness ledger while
+                # removed from the lane buffers/`_queue` but is NOT armed until
+                # it is consumed as `req` on the NEXT loop iteration — it is
+                # invisible to both snapshot() and the liveness ledger while
                 # merely sitting in `prefetched`. This is intentionally left
-                # uncovered: the window is a single loop iteration (the very
-                # next thing the loop does with a non-None `prefetched` is
-                # consume it here), never spans an await, and prefetching only
-                # happens when the current `req` is itself already armed and
-                # being actively processed — so a hang cannot silently vanish,
-                # it will simply attribute to the request that owns the
-                # in-flight iteration until `prefetched` is consumed.
+                # uncovered: the window is a single loop iteration, never spans
+                # an await, and prefetching only happens when the current `req`
+                # is itself already armed and being actively processed — so a
+                # hang cannot silently vanish, it will simply attribute to the
+                # request that owns the in-flight iteration until `prefetched`
+                # is consumed.  Consumption itself is covered: the top of the
+                # loop arms a just-taken prefetched item BEFORE the coalescing
+                # pass's awaits, so the window never spans those either.
                 self._request_ledger.on_dequeue(req, now=time.time())
 
                 # MQ-reliability kappa-b (task 2435): no self._inflight_req
@@ -15433,21 +15695,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # verifier queue via immediate_outcome so the standard future-resolution
                     # path handles it.
                     #
-                    # Pipeline-ordering contract: trains should be enqueued (by δ₂) only
-                    # when the merge pipeline is idle.  If spec_base is set here, the
-                    # previous regular request's merge commit is on the verifier queue but
-                    # its advance_main has not yet run — the train will rebase and CAS
-                    # against a temporarily stale main.  advance_main's internal retry loop
-                    # absorbs the resulting CAS race, but adds latency and event noise.
+                    # Dequeue-time speculation overlap.  A coalesced train is
+                    # appended to the TAIL of the lane buffer and dequeued many
+                    # iterations later, so no enqueue-time gate can control the
+                    # speculation state it is dequeued into — the pre-2026-08-28
+                    # coalesce gate tried, and only succeeded in confining trains
+                    # to unhealthy pipelines (see
+                    # SpeculationController.can_coalesce).  Enforce it HERE, at
+                    # the dequeue, where the condition is actually knowable:
+                    # park the train until the previous merge commit has been
+                    # CAS-advanced, because a train — unlike a single — has no
+                    # recovery path from a lost CAS.  See
+                    # _await_unadvanced_predecessor.
                     if isinstance(req, GroupMergeRequest):
-                        if spec is not None:
-                            logger.warning(
-                                'Train %s: dequeued while speculative merge is '
-                                'in-flight (spec_base=%s); advance_main retries '
-                                'will absorb the CAS race — enqueuer should wait '
-                                'for an idle pipeline before submitting a train',
-                                req.train_id, spec[:12],
-                            )
+                        if await self._await_unadvanced_predecessor(req.train_id):
+                            # main moved (or the predecessor failed) while we
+                            # waited — actual_main above is stale, and it feeds
+                            # the train's DecidedItem base_sha and the
+                            # _redrive_coalesce_members is-ancestor checks.
+                            actual_main = await self._git_ops.get_main_sha()
                         outcome = await _do_train_merge(self, req)
                         # 1867: coalesce-train derail recovery.
                         # Both hooks below are gated on the coalesce prefix so
@@ -15729,6 +15995,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # ledger.live forever — same hazard as the
                     # on_transfer_terminal() sites above.
                     _real_item.permit = self._speculation_controller.on_transfer()
+                    # This request's merge commit is now on the verifier queue
+                    # and main has NOT advanced to it yet.  A train dequeued
+                    # before this Future resolves would CAS against a main that
+                    # is about to move — record it so the train can park behind
+                    # it (_await_unadvanced_predecessor).
+                    self._last_merged_request = req
                     self._note_transition(
                         req.request_id, ItemLifecycleState.MERGING,
                         ItemLifecycleState.AWAITING_VERIFY, live_obj=_real_item,
@@ -15933,6 +16205,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             ItemLifecycleState.VERIFYING, live_obj=entry,
         )
         self._inflight.append(entry)
+
+        # ── PRD C4 / task 2930 η: serial-lane tripwire (DETECTION ONLY) ──
+        # Runs AFTER the append (never before) so no existing transition or
+        # append semantics shift and the just-appended entry IS counted.
+        #
+        # `_frozen_inflight_entries()`, not a raw `self._inflight` scan:
+        # `_finalize_inflight` pops the head via `_inflight_popleft` BEFORE
+        # awaiting the long verify, so an entry can still be verifying while
+        # absent from `_inflight`.  Counting `_inflight` alone would MISS
+        # exactly the overlap C4 exists to catch.  Reusing the helper also
+        # avoids restating the frozen-window definition (INV-5).
+        #
+        # `self._host_allocator.host_names` is a PROPERTY ACCESS, NOT A CALL.
+        # `HostAllocator.host_names` is decorated `@property`; writing
+        # `host_names()` raises `TypeError: 'list' object is not callable`,
+        # which the fail-open arm below would SWALLOW SILENTLY — the tripwire
+        # would be permanently dead in production while unit tests that leave
+        # `_host_allocator = None` still passed.  This expression is lifted
+        # VERBATIM from this file's own `snapshot()` occupancy block, `is not
+        # None` guard included.  test_merge_serial_lane_tripwire.py's
+        # `test_real_host_allocator_does_not_break_the_hook` is the regression
+        # guard that keeps it honest.
+        #
+        # `except Exception` fail-open: merge_queue.py is the #1-reliability
+        # file and a tripwire bug must never wedge dispatch.  Two corollaries
+        # worth stating out loud: (i) enforcement can NEVER be added here by
+        # making the alarm raise — this arm would swallow it silently; and
+        # (ii) any future edit inside the `try` must be covered by a test that
+        # exercises it with a real allocator, or it can rot invisibly.
+        #
+        # No hard block: the append already happened above; this block has no
+        # `return`, no `raise`, and no veto.
+        try:
+            _local = sum(
+                1 for _e in self._frozen_inflight_entries()
+                if getattr(_e.lease, 'is_local', False)
+            )
+            _hosts = (
+                len(self._host_allocator.host_names)
+                if self._host_allocator is not None else 1
+            )
+            alarm_serial_lane_breach(
+                check_serial_lane_tripwire(
+                    _local,
+                    merge_ahead_bound=self._speculation_depth,
+                    num_hosts=_hosts,
+                ),
+                event_store=self._event_store,
+                task_id=entry.item.request.task_id,
+                branch=entry.item.request.branch.bare_id,
+                request_id=entry.item.request.request_id,
+                host=getattr(entry.lease, 'name', None),
+            )
+        except Exception:
+            logger.warning('serial-lane tripwire check failed', exc_info=True)
 
     def _inflight_popleft(self) -> InflightEntry:
         """Pop and return the head of ``self._inflight`` (verifier-owned single-writer choke point).
