@@ -5946,8 +5946,7 @@ class ReconciliationHarness:
                                 and _task_is_live(routed_task_id)
                             ):
                                 logger.info(
-                                    'reconciliation.integrity_escalation_'
-                                    'suppressed_live_workflow_routed_target',
+                                    'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',
                                     extra={
                                         'project_id': project_id,
                                         'run_id': run_id,
