@@ -68,14 +68,20 @@ Safety properties
 
 from __future__ import annotations
 
+import copy
+import logging
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 
+from escalation.dedupe import gate_backlog_fingerprint_key
 from escalation.models import Escalation
 
 from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
 )
+
+logger = logging.getLogger(__name__)
 
 GATE_BACKLOG_CATEGORY = 'reconciliation_stale_gate_backlog'
 """``Escalation.category`` this backfill acts on — the emitter's
@@ -227,3 +233,97 @@ def rebuild_detail(detail: str) -> str:
         lines[i] = _CANONICAL_AGE_PREFIX + line[len(_LEGACY_AGE_PREFIX):]
         return '\n'.join(lines)
     return detail
+
+
+@dataclass
+class Rewrite:
+    """One planned summary/detail rewrite, with both the before and the after."""
+
+    escalation_id: str
+    task_id: str
+    old_summary: str
+    new_summary: str
+    old_detail: str
+    new_detail: str
+    anchored: bool  # False = the anchor was unrecoverable; fallback summary used
+
+
+@dataclass
+class BackfillPlan:
+    """The full set of planned rewrites plus the counters the report projects."""
+
+    rewrites: list[Rewrite] = field(default_factory=list)
+    pending_total: int = 0
+    legacy_total: int = 0
+    anchored: int = 0
+    fallback: int = 0
+    skipped_fingerprint_drift: int = 0
+
+
+def plan_rewrites(pending: list[Escalation]) -> BackfillPlan:
+    """Decide what to rewrite.  PURE — no I/O, no mutation of *pending*.
+
+    Purity is what makes the dry-run path total BY CONSTRUCTION rather than by a
+    flag check: ``run()`` can build and report a plan without ``apply_rewrites``
+    ever being reachable, so there is no branch in which a dry run could write.
+
+    Every emitted rewrite is FINGERPRINT-PRESERVING BY MACHINE CHECK.  Before
+    emitting, the record's ``gate_backlog_fingerprint_key`` is recomputed on a
+    copy carrying the new detail and compared with the original's; any
+    difference — or a ``None`` on either side — logs a WARNING, skips the record
+    and increments ``skipped_fingerprint_drift``.
+
+    Why a check and not a comment: renaming a key on a LATER line cannot disturb
+    ``detail``'s line 0, which is that key's only recovery site — but "cannot" is
+    an argument, and a future edit to ``rebuild_detail`` (or a record with an
+    unexpected line ordering) could break it silently.  The failure mode is a
+    permanently non-folding parent that mints a duplicate every Stage-1 cycle,
+    so the guard FAILS CLOSED: a skipped record simply keeps its stale summary,
+    which is strictly recoverable.  This mirrors the surrounding code's
+    discipline — ``gate_backlog_fingerprint_key`` returns ``None`` rather than
+    guessing an identity, and ``stage1_stall_detector`` raises on an empty
+    fingerprint rather than filing anyway.
+    """
+    plan = BackfillPlan(pending_total=len(pending))
+    for esc in pending:
+        if not is_legacy_gate_backlog_record(esc):
+            continue
+        plan.legacy_total += 1
+
+        anchor = extract_gate_escalated_at(esc.detail)
+        new_summary = rebuild_summary(esc.task_id, anchor)
+        new_detail = rebuild_detail(esc.detail)
+
+        # Shallow copy carrying only the new detail: the key is derived from
+        # (dedupe_fingerprint, category, task_id, detail line 0), so this is the
+        # exact record-shape the fold path will see after the rewrite lands.
+        after = copy.copy(esc)
+        after.detail = new_detail
+        key_before = gate_backlog_fingerprint_key(esc)
+        key_after = gate_backlog_fingerprint_key(after)
+        if key_before is None or key_after is None or key_before != key_after:
+            logger.warning(
+                'Skipping %s: gate_backlog_fingerprint_key would change across the '
+                'rewrite (before=%r after=%r) — refusing to turn it into a '
+                'non-folding parent',
+                esc.id, key_before, key_after,
+            )
+            plan.skipped_fingerprint_drift += 1
+            continue
+
+        if anchor is not None:
+            plan.anchored += 1
+        else:
+            plan.fallback += 1
+        plan.rewrites.append(
+            Rewrite(
+                escalation_id=esc.id,
+                task_id=esc.task_id,
+                old_summary=esc.summary,
+                new_summary=new_summary,
+                old_detail=esc.detail,
+                new_detail=new_detail,
+                anchored=anchor is not None,
+            )
+        )
+    return plan
