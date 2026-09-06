@@ -53,6 +53,11 @@ __all__ = [
 #: cannot be half-honored by a consumer that typo'd the name.
 REIFY_ROOT_ENV = 'REIFY_ROOT'
 
+#: The one repo label `checkout_skip_reason`'s ``None`` arm can honestly
+#: describe.  That arm's wording is `reify_skip_reason`'s, which names reify and
+#: REIFY_ROOT literally, so it is a true statement about this repo and no other.
+_REIFY_REPO_LABEL = 'reify'
+
 
 class ReifyCheckout(NamedTuple):
     """A resolved reify checkout, together with WHERE that answer came from.
@@ -219,6 +224,8 @@ def checkout_skip_reason(repo: str, root: Path | None, *, marker: str | Path) ->
         ``reify/<marker>``, with REIFY_ROOT unset.  It is the SAME condition
         `reify_skip_reason` describes, so it is delegated there rather than
         restated: one wording for one condition, whatever gate is asking.
+        That delegation is also why this arm is reify-ONLY and raises
+        ``ValueError`` for any other *repo* — see below.
       * a *root* that is not a directory is an operator's REIFY_ROOT naming a
         path that is not there.  The override is honored verbatim rather than
         silently falling back to discovery, so the reason NAMES the path and a
@@ -232,6 +239,18 @@ def checkout_skip_reason(repo: str, root: Path | None, *, marker: str | Path) ->
     regular file is not a checkout, and admitting it would fail deep inside git
     rather than skip with a message naming the bad path.
 
+    *repo* is used verbatim on the set-but-absent arm, but the ``None`` arm
+    cannot honor it: the wording it delegates to names reify and REIFY_ROOT
+    literally, so answering a ``dark-factory`` caller with it would report the
+    wrong repo AND prescribe a remedy (``export REIFY_ROOT=...``) that cannot
+    fix a dark-factory problem — precisely the conflation this module exists to
+    remove, just one label over.  Rather than silently misattribute, a non-reify
+    *repo* with a ``None`` *root* raises ``ValueError``.  Nothing reachable does
+    that today: every non-reify call site resolves its root from ``__file__``
+    and so is never ``None``.  The guard is what keeps that true — a future
+    caller that broke it would get a loud error instead of reify wording for
+    another repo.
+
     *named_by_env* is hardcoded ``False`` on the delegated arm rather than being
     a parameter, and that is a fact about the resolver, not a simplification:
     `resolve_reify_checkout` returns a non-None ``Path(override)`` for the
@@ -241,6 +260,14 @@ def checkout_skip_reason(repo: str, root: Path | None, *, marker: str | Path) ->
     the parameter would invite a caller to claim one.
     """
     if root is None:
+        if repo != _REIFY_REPO_LABEL:
+            raise ValueError(
+                f'a None root is the reify discovery-MISS arm, whose wording '
+                f'names reify and {REIFY_ROOT_ENV} literally — it cannot '
+                f'honestly describe {repo!r}, and answering with it would name '
+                f'the wrong repo and prescribe a remedy that cannot fix a '
+                f'{repo} problem; pass the resolved {repo} root instead'
+            )
         reason = reify_skip_reason(marker, None, named_by_env=False)
         if not reason:
             raise RuntimeError(

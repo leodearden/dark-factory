@@ -594,17 +594,85 @@ class TestCheckoutSkipReason:
         )
 
     @pytest.mark.parametrize('repo', ['reify', 'dark-factory'])
-    def test_neither_non_none_arm_is_ever_empty(self, repo, tmp_path):
-        """Anti-vacuity across BOTH arms, for both labels.
+    def test_the_set_but_absent_arm_is_never_empty(self, repo, tmp_path):
+        """Anti-vacuity on the arm every label may take.
 
         A falsy-but-not-None reason would pass ``reason is not None`` and then
         skip with no message — or, at a truthiness-gating call site, not skip
         at all.
+
+        Only the set-but-absent arm is swept over both labels: the ``None`` arm
+        is reify-ONLY (it raises for any other label — see
+        `test_a_none_root_for_another_repo_is_refused`), so feeding
+        ``dark-factory`` through it here would have asserted non-emptiness on a
+        reason that names the WRONG repo.
         """
-        arms = [
-            checkout_skip_reason(repo, None, marker=_GUARD_MARKER),
-            checkout_skip_reason(repo, tmp_path / 'absent', marker=_GUARD_MARKER),
-        ]
-        for reason in arms:
-            assert reason is not None
-            assert reason != ''
+        reason = checkout_skip_reason(repo, tmp_path / 'absent', marker=_GUARD_MARKER)
+
+        assert reason is not None
+        assert reason != ''
+
+    def test_the_none_arm_is_never_empty(self):
+        """Anti-vacuity on the reify-only ``None`` arm."""
+        reason = checkout_skip_reason('reify', None, marker=_GUARD_MARKER)
+
+        assert reason is not None
+        assert reason != ''
+
+    @pytest.mark.parametrize('repo', ['dark-factory', 'graphiti', 'REIFY'])
+    def test_a_none_root_for_another_repo_is_refused(self, repo):
+        """The ``None`` arm cannot honor a non-reify label, so it REFUSES one.
+
+        The wording it delegates to names reify and REIFY_ROOT literally.
+        Answering a ``dark-factory`` caller with it would report the wrong repo
+        and prescribe ``export REIFY_ROOT=...`` — a remedy that cannot fix a
+        dark-factory problem.  That is the module's own conflation failure one
+        label over, so it raises rather than misattributes.
+
+        Unreachable from today's callers (every non-reify root is resolved from
+        ``__file__`` and so is never None); this guard is what keeps it so.  The
+        label match is exact — ``'REIFY'`` is not ``'reify'``, and a reason that
+        renders a label the caller did not pass is the same defect.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            checkout_skip_reason(repo, None, marker=_GUARD_MARKER)
+
+        message = str(excinfo.value)
+        assert repo in message, (
+            f'the refusal must name the label it cannot serve: {message!r}'
+        )
+        assert REIFY_ROOT_ENV in message, (
+            f'the refusal must say WHY — the wording is REIFY_ROOT-specific: '
+            f'{message!r}'
+        )
+
+    def test_reify_is_still_accepted_on_the_none_arm(self):
+        """The guard must not have closed the arm its callers actually use."""
+        assert checkout_skip_reason('reify', None, marker=_GUARD_MARKER)
+
+    def test_a_falsy_delegated_reason_raises_rather_than_passing_it_on(
+        self, monkeypatch
+    ):
+        """The ``None`` arm's anti-phantom-pass guard, exercised.
+
+        The guard is unreachable through the public surface — `reify_skip_reason`
+        returns a non-empty literal on every path where *root* is None — so the
+        only way to reach it is to break the delegate, which is exactly the
+        defect it exists to catch (a future edit inside this module).  Stubbing
+        it here is what makes the branch covered rather than permanently
+        untested dead code.
+
+        It must RAISE, not return: a falsy reason reaching a caller that gates
+        on truthiness does not skip at all, turning the skip into a phantom
+        pass.  ``RuntimeError``, not ``assert`` — an assert is stripped under
+        ``-O``, which is precisely when nobody is watching.
+        """
+        monkeypatch.setattr(shared.reify_checkout, 'reify_skip_reason', lambda *a, **k: '')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            checkout_skip_reason('reify', None, marker=_GUARD_MARKER)
+
+        assert 'reify' in str(excinfo.value), (
+            f'the failure must name the repo whose gate it just protected: '
+            f'{excinfo.value!r}'
+        )
