@@ -36,11 +36,61 @@ purity contract of the sibling module ``reconciliation/predicate_contradiction.p
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from typing import Any
 
 __all__ = [
+    'FINDING_TASK_ESCALATION_CATEGORY',
+    'build_finding_task_escalation_kwargs',
     'resolve_finding_task_target',
 ]
+
+# Escalation category for a Stage-3 finding routed onto its named task's
+# ORCHESTRATOR queue.  A new, honest, greppable name that deliberately does NOT
+# over-claim contradiction semantics: full semantic contradiction DETECTION is
+# out of scope for this arm (task 4764's own wording), so a category like
+# `recon_contradiction` would promise a calibration this plumbing does not have.
+#
+# REFACTOR TRIGGER, forwarded: `Escalation.category` in
+# `escalation/src/escalation/models.py` carries a task-3709 comment saying the
+# NEXT category addition should promote that prose vocabulary to an enum (or a
+# submit-time lint) rather than growing another line.  THIS IS THAT ADDITION.
+# Promoting it is out of scope here — it touches the shared `escalation`
+# package, whose filer/reader spelling contract is depended on by every
+# categorized detector — so the trigger is recorded rather than discharged.
+# Because nothing rejects a typo'd category at submit time, the name is
+# single-sourced through this constant: the filer and the `has_open_l1` dedupe
+# read the SAME symbol, which is the property the trigger's comment says the
+# dedup correctness of a categorized detector depends on.
+FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
+
+# Fixed routing fields for every record this module builds.
+#
+# `level=1` is required TWICE OVER: it routes to the auto-watcher (which
+# promotes to L2 when human judgement is needed — the ladder this arm exists to
+# reach), and `EscalationQueue.has_open_l1` reads level-1 records ONLY, so the
+# cross-cycle dedupe simply does not function at level 0.
+_ESCALATION_LEVEL = 1
+
+# `severity='info'`, NOT the 'blocking' used by the `_sweep_escalate_l1`
+# template this filer is otherwise transcribed from.  An open L1 is documented
+# (`EscalationQueue.has_open_l1`) as signalling that "the workflow must not
+# auto-requeue the task".  Asserting that for every persistent recon finding
+# that happens to name a task id would silently change task-blocking semantics
+# fleet-wide as a side effect of a PLUMBING change.  'info' still lands the
+# record queued and triaged — the entire acceptance criterion — while the
+# follow-up semantic-contradiction arm can file at 'blocking' on the narrower
+# population where it is warranted.  Matches the closest fused-memory precedent
+# for a code-path orchestrator-queue filing, `middleware/scope_violation_
+# escalator.py` (level 1, severity 'info').
+#
+# Severity is deliberately NOT derived from the finding's own
+# 'minor'/'moderate'/'serious' field: that vocabulary is LLM-authored free text
+# with no calibration against the escalation ladder's semantics.
+_ESCALATION_SEVERITY = 'info'
+
+_AGENT_ROLE = 'reconciliation-harness'
 
 
 def resolve_finding_task_target(
@@ -104,3 +154,81 @@ def resolve_finding_task_target(
         if candidate:
             return candidate
     return None
+
+
+def build_finding_task_escalation_kwargs(
+    finding: Mapping,
+    *,
+    task_id: str,
+    project_id: str,
+    run_id: str,
+    persistence: int,
+) -> dict[str, Any]:
+    """Build the ``Escalation(...)`` keyword arguments for *finding*.
+
+    *task_id* is the ALREADY-RESOLVED target from
+    :func:`resolve_finding_task_target` — the REAL task id, never the synthetic
+    ``recon-<run8>`` id that ``ReconciliationHarness._escalate`` puts on the
+    recon queue.  Carrying the real id is the entire point of this arm: it is
+    what makes ``get_by_task`` (which filters on the STORED ``task_id`` field)
+    surface the record on the task's own ladder.
+
+    Returns a dict whose keys are a strict subset of
+    ``Escalation.__dataclass_fields__`` MINUS ``id``:
+
+    - No ``id``: it must come from ``queue.make_id(...)``, a durable per-key
+      counter, which a pure function has no access to.
+    - No key outside the dataclass: ``Escalation.to_dict`` is a bare ``asdict``
+      and ``from_dict`` filters to ``__dataclass_fields__``, while
+      ``EscalationQueue.resolve`` rewrites the record from ``esc.to_json()`` —
+      so an extra key on disk is DESTROYED on the first resolve.  That is the
+      defect ``BacklogPolicy._restore_policy_keys`` exists to work around; ALL
+      provenance goes into ``detail`` (a real field) as JSON so we never need
+      that workaround.
+    - No ``dedupe_fingerprint``: nothing on the orchestrator queue folds on one
+      for this category — cross-cycle dedupe is ``has_open_l1``'s job — and
+      setting one risks unintended folding should a future ``submit_or_dedupe``
+      config ever name the category.  The recon-side fingerprint is preserved in
+      ``detail`` for correlation instead.
+    - No ``suggested_action``: it is left at its ``''`` default rather than
+      guessed from the ``expand_scope|create_followup_task|abort_task``
+      vocabulary, because the correct disposition is exactly what the ladder
+      exists to decide.  The finding's OWN ``suggested_action`` text is carried
+      in ``detail``.
+
+    Pure: no I/O, and *finding* is not mutated.
+    """
+    finding_category = str(finding.get('category') or '') or 'unknown'
+    description = str(finding.get('description') or '') or '(no description)'
+    summary = (
+        f'Recon finding on task {task_id} ({finding_category}, '
+        f'{persistence} cycles): {" ".join(description.split())}'
+    )
+
+    detail = json.dumps(
+        {
+            'finding_id': finding.get('finding_id'),
+            'category': finding.get('category'),
+            'severity': finding.get('severity'),
+            'description': finding.get('description'),
+            'suggested_action': finding.get('suggested_action'),
+            'actionable': finding.get('actionable'),
+            'affected_ids': finding.get('affected_ids'),
+            'cited_tasks': finding.get('cited_tasks'),
+            'run_id': run_id,
+            'project_id': project_id,
+            'persistence': persistence,
+        },
+        default=str,
+        indent=2,
+    )
+
+    return {
+        'task_id': task_id,
+        'agent_role': _AGENT_ROLE,
+        'severity': _ESCALATION_SEVERITY,
+        'category': FINDING_TASK_ESCALATION_CATEGORY,
+        'summary': summary,
+        'detail': detail,
+        'level': _ESCALATION_LEVEL,
+    }
