@@ -28,7 +28,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
-import errno
 import functools
 import inspect
 import json
@@ -36,7 +35,6 @@ import logging
 import stat
 import tempfile
 import textwrap
-import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
