@@ -967,10 +967,16 @@ class TestQuotedReportIsRepairable:
     ``TestRepairSpecimens``' S1-S4 are, NOT copied out of a fixture, so it
     documents the SHAPE rather than one captured byte string.
 
-    The three negative controls pass BOTH before and after the narrowing. They
+    Negative controls (a)-(c) pass BOTH before and after the narrowing. They
     exist because the naive rule — ambiguity alone, or schema membership alone
     — breaks exactly there, and it is far cheaper to read that as a red test
     than to rediscover it as a corpus surprise.
+
+    Control (d) is different in kind and is NOT a both-ways control: it FAILED
+    on the narrowing as first written (esc-4502-3) and passes only with the
+    fix. It pins the dialect mirror of (a), which (a) does not reach. Keep the
+    pair together — the gap existed precisely because one pairing was pinned
+    and its mirror was not.
     """
 
     # escalate_info's eleven parameters, and the five the corrupted call
@@ -1170,6 +1176,45 @@ class TestQuotedReportIsRepairable:
             schema_params=_SUBMIT_TASK_PARAMS,
             supplied={'project_root', 'title', 'description'},
         ) is None
+
+    def test_an_echo_opened_item_closed_canonically_is_still_refused(self):
+        """NEGATIVE CONTROL (d) — the MIRROR of (a), and a real regression.
+
+        Control (a) pins canonical-opener/echo-closer. This pins the opposite
+        pairing, echo-opener/CANONICAL-closer, which (a) does not reach. The
+        asymmetry was live: condition (i) tested ``inner_name in (name,
+        closer_name)``, and for an ECHO-dialect item ``closer_name`` IS the
+        item's own name, so the tuple collapsed to one entry and the canonical
+        ``parameter`` closer fell out of the block set entirely.
+
+        MEASURED before the fix (esc-4502-3): this exact value recovered
+        ``agent_id`` as ``'claude-interactive'`` + the canonical closer + the
+        whole trailing paragraph, reported as ``outcome=repaired`` — so under
+        FORWARD_REPAIR a corrupt ``agent_id`` carrying the head of the NEXT
+        tool call went straight into the tool's arguments. Probe (ii) cannot
+        save this: the trailing prose does not itself parse as pseudo-
+        parameters, which is the same argument control (a) makes.
+
+        The fix lists ``parameter`` categorically, independent of the item's
+        opener dialect, because ``_parse_body`` treats the canonical closer as
+        a UNIVERSAL terminator — a property of the parser, not of the opener.
+        """
+        clean = 'The reconciler re-reads the plan.'
+        value = (
+            clean
+            + _closer('description') + '\n'
+            + _opener('agent_id') + 'claude-interactive' + _CANONICAL_CLOSER
+            + ' ...and then a whole paragraph of the NEXT tool call fragment'
+            + ' that does not parse.'
+        )
+
+        assert repair(
+            value,
+            param='description',
+            schema_params=_SUBMIT_TASK_PARAMS,
+            supplied={'project_root', 'title', 'description'},
+        ) is None
+
 
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""

@@ -507,12 +507,34 @@ def _inner_closer_blocks(
 
     An inner closer naming ``N`` blocks recovery iff EITHER:
 
-    (i) ``N`` names the item ITSELF, the item's opener-dialect closer (the
-        canonical ``parameter``), or ``invoke`` — a cross-dialect or repeated
-        mis-close of this very item, or a tail spanning a tool-call boundary.
-        An item's own closing tag appearing inside its own value is a mis-close
-        BY DEFINITION, never prose about itself, so this may be stated
-        categorically; or
+    (i) ``N`` names the item ITSELF, EITHER dialect's closer for it — the
+        name-echoing ``closer_name`` AND the canonical ``parameter``, the
+        latter regardless of which dialect this item's OPENER used — or
+        ``invoke``: a cross-dialect or repeated mis-close of this very item,
+        or a tail spanning a tool-call boundary. An item's own closing tag
+        appearing inside its own value is a mis-close BY DEFINITION, never
+        prose about itself, so this may be stated categorically; or
+
+        ``parameter`` IS LISTED SEPARATELY FROM ``closer_name``, and dropping
+        it reintroduces a live corruption (task **4502**, esc-4502-3). The two
+        coincide only in the CANONICAL dialect; for an ECHO-dialect item
+        ``closer_name`` is the item's own name, so a bare ``(name,
+        closer_name)`` membership test collapses to a single entry and lets
+        ``parameter`` through. That is not a cosmetic gap: :func:`_parse_body`
+        treats the canonical ``parameter`` closer as a UNIVERSAL terminator, so
+        its appearance inside a value is ambiguous with the item's real
+        boundary in BOTH dialects — a fact about the parser, not about the
+        opener. The dialects also demonstrably BLEND (``_CLOSER_RE``'s
+        stray-quote tolerance exists for that measured shape). Measured before
+        the fix: a value opening echo-dialect for ``agent_id`` and closing with
+        the canonical ``parameter`` closer recovered ``agent_id`` as
+        ``'claude-interactive'`` plus that closer plus a whole trailing
+        next-tool-call paragraph, reported as ``outcome=repaired`` and, under
+        FORWARD_REPAIR, written straight into the tool's arguments — the exact
+        swallow-the-next-call failure this condition exists to prevent, reached
+        through the mirror image of negative control (a). The ambiguity probe
+        (ii) does not catch it, because that trailing prose does not itself
+        parse as pseudo-parameters; or
     (ii) reading that closer as this item's terminator ALSO yields a valid
         parse of the remainder — the genuine AMBIGUITY B5's own wording
         describes, where the item's boundary really is a guess.
@@ -545,7 +567,10 @@ def _inner_closer_blocks(
         if considered > _MAX_CANDIDATES:
             return True
         inner_name = inner.group(1)
-        if inner_name in (name, closer_name) or closer_for(inner_name) == INVOKE_CLOSER:
+        if (
+            inner_name in (name, closer_name, _NAME_PARAMETER)
+            or closer_for(inner_name) == INVOKE_CLOSER
+        ):
             return True  # (i) a mis-close of THIS item, or a call boundary
         if _parse_body(body[value_start + inner.end():], probe=True) is not None:
             return True  # (ii) the alternative boundary parses too — a guess
