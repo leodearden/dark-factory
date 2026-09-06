@@ -76,6 +76,7 @@ from datetime import datetime
 
 from escalation.dedupe import gate_backlog_fingerprint_key
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
@@ -327,3 +328,42 @@ def plan_rewrites(pending: list[Escalation]) -> BackfillPlan:
             )
         )
     return plan
+
+
+def apply_rewrites(queue: EscalationQueue, plan: BackfillPlan) -> dict:
+    """Persist *plan*'s rewrites.  Assigns ``summary`` and ``detail``, nothing else.
+
+    The record is read from the queue ROOT only — never the archive — mirroring
+    ``attach_dedupe_child``'s ``if not path.exists(): return None``, so a record
+    a steward resolved between planning and applying is skipped with no mutation
+    and counted under ``skipped_missing``.
+
+    NO OTHER FIELD IS ASSIGNED, and ``updated_at`` is deliberately NOT bumped.
+    ``updated_at`` is the "last-substantive-change marker"
+    (``escalation/src/escalation/models.py``) that the watcher's stamp-then-skip
+    protocol reads via its ``updated_at > triaged_at`` re-verify rule.
+    ``attach_dedupe_child`` bumps it because a fold genuinely changes the
+    record's substance; this backfill changes only the RENDERING of a fact the
+    record already asserted — the gate, and the instant it was escalated, are
+    identical before and after.  Bumping it across the whole backlog in one pass
+    would mass-invalidate existing triage stamps and force a full re-drain.
+
+    Returns a counters dict.
+    """
+    rewritten = 0
+    skipped_missing = 0
+    for rewrite in plan.rewrites:
+        path = queue.queue_dir / f'{rewrite.escalation_id}.json'
+        if not path.exists():
+            logger.info(
+                'Skipping %s: no longer in the queue root (resolved/archived '
+                'between planning and applying)', rewrite.escalation_id,
+            )
+            skipped_missing += 1
+            continue
+        esc = Escalation.from_json(path.read_text())
+        esc.summary = rewrite.new_summary
+        esc.detail = rewrite.new_detail
+        queue._rewrite(rewrite.escalation_id, esc)
+        rewritten += 1
+    return {'rewritten': rewritten, 'skipped_missing': skipped_missing}
