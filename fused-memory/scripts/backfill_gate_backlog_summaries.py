@@ -73,6 +73,10 @@ from datetime import datetime
 
 from escalation.models import Escalation
 
+from fused_memory.reconciliation.stage1_stall_detector import (
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+)
+
 GATE_BACKLOG_CATEGORY = 'reconciliation_stale_gate_backlog'
 """``Escalation.category`` this backfill acts on — the emitter's
 ``stage1_stall_detector._GATE_BACKLOG_ESCALATION_CATEGORY``."""
@@ -154,3 +158,39 @@ def extract_gate_escalated_at(detail: str) -> str | None:
             return None
         return value
     return None
+
+
+def rebuild_summary(
+    task_id: str,
+    gate_escalated_at: str | None,
+    threshold_secs: float = STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+) -> str:
+    """Render the post-3520 summary for *task_id*, exactly as the emitter would.
+
+    Source of truth:
+    ``fused_memory/reconciliation/stage1_stall_detector.py::maybe_escalate_stalled_gate_backlog``.
+    The two branches below mirror its two summary branches, and the branch
+    condition mirrors its ``age_hours is not None`` guard: that guard holds only
+    when the stamp parsed, so a record whose anchor cannot be recovered falls to
+    the threshold-only phrasing rather than having one guessed for it.
+
+    *threshold_secs* defaults to the emitter's own module constant rather than a
+    hardcoded 48 so the two cannot drift.  A comment cannot enforce that, though
+    — what actually keeps this in sync is the emitter-parity test, which mints a
+    record by CALLING the emitter and asserts this function reproduces its
+    summary byte-for-byte.
+
+    *gate_escalated_at* is interpolated VERBATIM (see
+    ``extract_gate_escalated_at``): it is already the exact string the emitter
+    would have written.
+    """
+    if gate_escalated_at is not None:
+        return (
+            f'Gate task {task_id} has awaited a human decision since '
+            f'{gate_escalated_at} (past the {threshold_secs / 3600:.0f}h '
+            f'gate-backlog threshold)'
+        )
+    return (
+        f'Gate task {task_id} has awaited a human decision beyond the '
+        f'{threshold_secs / 3600:.0f}h gate-backlog threshold'
+    )
