@@ -215,6 +215,8 @@ def _names_bound_to_the_aggregator(builder: ast.AST) -> set[str]:
         elif (
             isinstance(descendant, ast.AnnAssign)
             and isinstance(descendant.target, ast.Name)
+            # A bare annotation (``x: str``) has ``value=None`` and binds nothing.
+            and descendant.value is not None
             and _aggregator_call(descendant.value)
         ):
             bound.add(descendant.target.id)
