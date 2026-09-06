@@ -5063,3 +5063,66 @@ async def filter_style_only_authorship_flags(
         kept.append(flag)
 
     return kept
+
+
+# ---------------------------------------------------------------------------
+# Accounted duplicate-cluster-growth guard (task-3476)
+# ---------------------------------------------------------------------------
+
+#: ``flag_type`` spellings OBSERVED on Stage-1 duplicate-cluster-growth findings
+#: (task 3476).  Deliberately NOT a closed set: these two are the spellings the
+#: run-df364849-21e9-4f54-b802-a126a49eba97 / finding-96a14765 incident actually
+#: produced, and ``flag_type`` is LLM-authored with no committed schema entry
+#: (``grep -rn cluster_growth fused-memory/`` returned zero hits before this
+#: change).  Kept as documentation and as the drift log's reference point;
+#: :func:`_is_cluster_growth_flag_type` also accepts unlisted spellings that
+#: carry both the ``cluster`` and ``growth`` tokens.
+CLUSTER_GROWTH_FLAG_TYPES: frozenset[str] = frozenset({
+    'procedural_knowledge_cluster_growth',
+    'duplicate_procedural_knowledge_cluster_growth',
+})
+
+#: Precomputed canonical-family keys for :data:`CLUSTER_GROWTH_FLAG_TYPES` so a
+#: reworded / reordered / re-cased LLM spelling of a KNOWN flag_type still
+#: matches (mirrors :data:`_STALE_BULK_GET_STATUSES_FAMILIES`).
+_CLUSTER_GROWTH_FAMILIES: frozenset[str] = frozenset(
+    canonical_flag_type_family(ft) for ft in CLUSTER_GROWTH_FLAG_TYPES
+)
+
+
+def _is_cluster_growth_flag_type(flag_type: Any) -> bool:
+    """True iff *flag_type* names a duplicate-cluster-growth finding (task 3476).
+
+    Two independent arms:
+
+    1. :func:`canonical_flag_type_family` membership in
+       :data:`_CLUSTER_GROWTH_FAMILIES` -- catches case, separator, whitespace
+       and word-order variants of a spelling we have actually seen.
+    2. The TOKEN PAIR test: the casefolded flag_type, tokenized with
+       :data:`_FLAG_TYPE_TOKEN_SPLIT_RE`, contains BOTH ``'cluster'`` and
+       ``'growth'`` -- catches spellings we have not seen
+       (``'mem0_duplicate_cluster_growth'``, ``'memory_cluster_growth_detected'``).
+
+    Arm 2 is deliberately BROADER than the exact-family-set matching used by
+    the sibling filters (:func:`filter_terminal_metadata_flags`,
+    :func:`filter_stale_bulk_get_statuses_flags`,
+    :func:`filter_style_only_authorship_flags`).  Over-matching is safe HERE in
+    a way it is not for :func:`filter_suppressed`, whose family collisions can
+    hide a genuinely-recurring finding for cycles: this predicate only ever
+    admits a flag to :func:`filter_accounted_cluster_growth_flags`, which DROPS
+    solely after positively confirming that EVERY cited memory UUID is already
+    written into the referenced task's own description body.  A mis-classified
+    flag_type can therefore only ever reclassify a finding that is, by
+    construction, already accounted for -- never silence an unaccounted one.
+
+    Total over malformed LLM-authored input: a non-``str`` (``None``, an int, a
+    list) returns ``False`` rather than raising.
+
+    Pure, sync, no I/O.
+    """
+    if not isinstance(flag_type, str) or not flag_type:
+        return False
+    if canonical_flag_type_family(flag_type) in _CLUSTER_GROWTH_FAMILIES:
+        return True
+    tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
+    return 'cluster' in tokens and 'growth' in tokens
