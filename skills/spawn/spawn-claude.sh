@@ -494,10 +494,50 @@ _wait_sentinel_grace() {
   [ -f "$sentinel" ]
 }
 
+# True when $sentinel holds a settled exit code -- content, not mere
+# existence.
+#
+# THE DEFECT THIS CLOSES (esc-4389-4, task 5137). finish() used to read the
+# sentinel as `rc=$(cat "$sentinel" 2>/dev/null || echo 127)`. That fallback
+# fires only when `cat` FAILS -- but the payload's EXIT trap publishes with
+# `>`, which CREATES and TRUNCATES before the write lands, and `cat` on a
+# zero-length file SUCCEEDS and prints nothing. So a sentinel observed in
+# that window yielded rc="" and the `|| echo 127` never fired, handing the
+# empty string to both consumers: `session_registry exit --code ''`
+# (rejected by argparse, leaving the record un-updated) and `exit ""`
+# (bash usage error -> the caller sees exit 2, not a documented verdict).
+#
+# This is the same create-then-write defect class already fixed on the
+# Python side of this suite -- see
+# tests/scripts/test_spawn_claude.py::_wait_for_path (require_nonempty,
+# task 4776), whose docstring states the general principle: existence is
+# the wrong readiness signal for a file whose CONTENT is about to be
+# parsed. It is a DIFFERENT defect from task 1643 (sentinel never written
+# at all), where the file's ABSENCE is unambiguous and the old fallback
+# did fire correctly.
+#
+# "Settled" = a plain non-negative decimal integer. The only writer is
+# `echo "${ec:-$?}"`, which can emit nothing else, so any other content --
+# the empty string above all -- is by definition a partial or corrupt
+# read. No 0-255 range check: bash's `exit` already reduces mod 256 and
+# argparse's int() accepts any integer, so a range rejection would invent
+# a failure path with no caller benefit and newly reject values this
+# script has always accepted. A `case` glob rather than a regex keeps this
+# a POSIX builtin test with no subprocess, consistent with the macOS bash
+# 3.2 support this script commits to (see the mac-terminal note above).
+_sentinel_settled() {
+  # `local v` on its own line, NOT `local v=$(cat ...)` -- the combined
+  # form masks the substitution's exit status behind `local`'s own success.
+  local v
+  v=$(cat "$sentinel" 2>/dev/null) || return 1
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
+
 finish() {
   local rc=127
-  if [ -f "$sentinel" ]; then
-    rc=$(cat "$sentinel" 2>/dev/null || echo 127)
+  if _sentinel_settled; then
+    rc=$(cat "$sentinel")
   fi
   rm -f "$sentinel"
   # Session-registry: record the final exit code (task 2285). rc is already
