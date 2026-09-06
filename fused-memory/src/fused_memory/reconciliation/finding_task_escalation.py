@@ -53,13 +53,54 @@ def resolve_finding_task_target(
     ``finding_dict`` projection in ``fused_memory/server/recon_report.py`` (and
     as carried through the harness's remediation pass).
 
-    The bare ``finding['task_id']`` field is LLM-authored and copied verbatim by
-    that projection, so it is coerced with ``str()`` and stripped; an absent,
-    None, or blank-after-strip value yields None.
+    Two branches, in precedence order:
+
+    1. The bare ``finding['task_id']`` field, INTERPRETED as belonging to
+       *project_id* without being matched against it.
+    2. Otherwise, the first ``finding['cited_tasks']`` entry whose
+       ``project_id`` EQUALS *project_id*.
+
+    The asymmetry between them is deliberate and is the guard that keeps a
+    foreign project's task id out of this project's queue.  The task-4185
+    operator ruling recorded in ``fused_memory/server/recon_report.py`` (the
+    projectless-signature comment on the in-run signature index) states it
+    plainly: an ``add_finding(task_id='42', ...)`` call "carries no project
+    whatsoever", so a run containing two projects' findings about task 42 can
+    collapse there and no guard at that layer can tell that from a genuine
+    duplicate.  A bare ``task_id`` therefore NAMES no project and cannot be
+    project-matched — only interpreted.  A ``cited_tasks`` entry, by contrast,
+    IS project-qualified (``{project_id, task_id, title}``, written by
+    ``cite_task``), so it can be matched — and is, because routing a foreign
+    project's id onto this project's same-numbered task would file a record
+    that looks entirely well-formed while pointing at an unrelated task.
+
+    Cross-project routing (filing into the OTHER project's queue) is
+    deliberately not attempted: it would require resolving a second project's
+    root and reasoning about a second orchestrator's liveness.  A finding whose
+    only citations are foreign resolves to None and is simply not routed.
+
+    Both branches are LLM-authored input, so every value is coerced with
+    ``str()`` and stripped, and a malformed ``cited_tasks`` entry is SKIPPED
+    rather than raised — a bad citation must not abort the remediation pass.
     """
     raw = finding.get('task_id')
     if raw is not None:
         candidate = str(raw).strip()
+        if candidate:
+            return candidate
+
+    cited = finding.get('cited_tasks')
+    if not isinstance(cited, (list, tuple)):
+        return None
+    for entry in cited:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get('project_id') or '').strip() != project_id:
+            continue
+        entry_task_id = entry.get('task_id')
+        if entry_task_id is None:
+            continue
+        candidate = str(entry_task_id).strip()
         if candidate:
             return candidate
     return None
