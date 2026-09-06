@@ -854,6 +854,128 @@ def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
+# apply_refresh -- the PURE (no-I/O) half of refresh_record (task 4662)
+#
+# session_hooks performs three reads of one record.json per hook event; the
+# third is refresh_record's own internal read. Splitting the upsert body out
+# as a pure function lets a caller that ALREADY holds the record produce the
+# refreshed body without a second read, so one event can settle on ONE
+# snapshot and ONE write. These tests pin that the split half is genuinely
+# I/O-free and that refresh_record, re-expressed on top of it, is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _no_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ANY registry filesystem access explode.
+
+    apply_refresh is the seam session_hooks needs precisely because it
+    touches no disk; asserting "we passed no root" would not catch an
+    implementation that reached for the default root, so the read/write
+    entry points are booby-trapped instead.
+    """
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError('apply_refresh must perform no filesystem access')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+    monkeypatch.setattr(sr, 'write_record', _boom)
+
+
+def test_apply_refresh_updates_prior_in_place_and_does_no_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior = _make_record(status=sr.Status.LAUNCHING)
+    before = prior.to_dict()
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('unblock-df-2085-4242', prior, status=sr.Status.IDLE)
+
+    # In-place read-modify, exactly like refresh_record/update_status today.
+    assert result is prior
+    assert result.status is sr.Status.IDLE
+    # Every other field survives byte-identical.
+    after = result.to_dict()
+    del before['status'], after['status']
+    assert after == before
+
+
+def test_apply_refresh_with_no_status_is_a_pure_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status=None must leave the prior status alone.
+
+    This is the case the launch-window withhold path relies on: it wants the
+    mtime heartbeat bumped without promoting a still-LAUNCHING record.
+    """
+    prior = _make_record(status=sr.Status.LAUNCHING)
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('unblock-df-2085-4242', prior, status=None)
+
+    assert result is prior
+    assert result.status is sr.Status.LAUNCHING
+
+
+def test_apply_refresh_synthesizes_a_well_formed_record_when_prior_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('hand-launched-slug', None, status=sr.Status.RUNNING)
+
+    assert result.session_slug == 'hand-launched-slug'
+    assert result.status is sr.Status.RUNNING
+    assert result.schema_version == sr.SCHEMA_VERSION
+    # A parseable ISO-8601 start_ts, not merely a non-empty string.
+    assert result.start_ts
+    assert datetime.fromisoformat(result.start_ts)
+
+
+def test_apply_refresh_synthesis_defaults_to_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LAUNCHING is refresh_record's documented default for a new record."""
+    _no_io(monkeypatch)
+
+    result = sr.apply_refresh('hand-launched-slug', None, status=None)
+
+    assert result.status is sr.Status.LAUNCHING
+
+
+@pytest.mark.parametrize('status', [sr.Status.RUNNING, None])
+def test_refresh_record_equals_read_apply_write(
+    tmp_path: Path, status: sr.Status | None
+) -> None:
+    """refresh_record(...) == write_record(apply_refresh(read_record(...))).
+
+    The equivalence is the whole point of the split: session_hooks composes
+    the second spelling from a snapshot it already holds, so it must produce
+    a byte-identical body to the one refresh_record writes today.
+    """
+    seed = _make_record(status=sr.Status.LAUNCHING)
+    sr.write_record(seed, root=tmp_path)
+    via_refresh = sr.refresh_record(seed.session_slug, root=tmp_path, status=status)
+    refreshed_bytes = sr.record_path_for_slug(
+        seed.session_slug, root=tmp_path
+    ).read_text(encoding='utf-8')
+
+    # Re-seed and take the composed route over the same starting body.
+    sr.write_record(_make_record(status=sr.Status.LAUNCHING), root=tmp_path)
+    composed = sr.apply_refresh(
+        seed.session_slug,
+        sr.read_record(seed.session_slug, root=tmp_path),
+        status=status,
+    )
+    sr.write_record(composed, root=tmp_path)
+    composed_bytes = sr.record_path_for_slug(
+        seed.session_slug, root=tmp_path
+    ).read_text(encoding='utf-8')
+
+    assert composed_bytes == refreshed_bytes
+    assert composed.to_dict() == via_refresh.to_dict()
+
+
+# ---------------------------------------------------------------------------
 # Step-5: decision helpers (B2) -- Fleet Cockpit
 # ---------------------------------------------------------------------------
 

@@ -68,6 +68,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -191,6 +192,78 @@ def _is_owner_only_session_start(hook_input: Mapping[str, Any]) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _RecordSnapshot:
+    """One TRI-STATE read of ``<root>/sessions/<slug>/record.json``.
+
+    The three states, and why two of them are not one:
+
+    * PRESENT -- ``record`` is the body, ``unreadable`` False.
+    * ABSENT -- ``record`` None, ``unreadable`` False. No record exists at
+      this key yet. This state MAY be synthesized over: it is the ordinary
+      fresh-spawn / hand-launched first sight.
+    * UNREADABLE -- ``record`` None, ``unreadable`` True. A record EXISTS but
+      could not be parsed or read. This state may NOT be synthesized over.
+
+    Collapsing the last two into a bare ``record | None`` is the bug this
+    type exists to make unrepresentable. One read serves two consumers that
+    want opposite things from a fault: the ownership probe must fail soft to
+    "adopt" (see ``_env_slug_ownership``: "every failure mode resolves to
+    adopt (True), never to fork"), so it treats ABSENT and UNREADABLE alike;
+    the refresh must not, because
+    ``session_registry.py::refresh_record`` guarantees "a *corrupt* existing
+    body is NOT treated as absent -- it continues to raise
+    ``CorruptSessionRecord`` rather than silently overwriting data". A hook
+    that synthesized a fresh record over a corrupt body would destroy the
+    record carrying role/prompt/result_file -- the one spawn-claude.sh's
+    ``finish()`` writes ``exited`` to.
+
+    Frozen: a snapshot is ONE observation of the registry at one instant,
+    and the whole point of passing it around is that every decision derived
+    from it was derived from the same bytes.
+
+    ``slug`` travels with the body so a snapshot can never be applied to a
+    record it was not read from -- see ``_resolve_hook_slug``'s invariant.
+    """
+
+    slug: str
+    record: session_registry.SessionRecord | None
+    unreadable: bool = False
+
+
+def _read_record_snapshot(slug: str, root: Path | str | None) -> _RecordSnapshot:
+    """Read *slug*'s record once, as a tri-state ``_RecordSnapshot``.
+
+    NEVER raises. ``FileNotFoundError`` maps to ABSENT silently -- an
+    ordinary fresh spawn must log nothing -- and every other fault maps to
+    UNREADABLE with a WARNING, since a degradation that leaves no trace
+    violates the repo's no-silent-fail-soft norm.
+
+    This is the module's single reading seam. Both consumers -- the
+    ownership probe and the status refresh -- go through it, and a hook
+    event that reads the slug it writes reads it exactly ONCE, the snapshot
+    travelling forward on ``_HookSlugResolution``.
+
+    The refresh path needs both the prior status AND the prior binding to
+    recognise the launch window (see ``_in_unbound_launch_window``), which
+    is why the whole body travels rather than a single field.
+    """
+    try:
+        return _RecordSnapshot(slug, session_registry.read_record(slug, root=root))
+    except FileNotFoundError:
+        return _RecordSnapshot(slug, None)
+    except Exception:
+        # A corrupt body, an unreadable fleet root, anything. Callers choose
+        # what to do with it (the probe adopts, the refresh declines to
+        # synthesize over it) -- but nobody gets to be quiet about it.
+        logger.warning(
+            'session record read failed for slug %s; treating it as unreadable',
+            slug,
+            exc_info=True,
+        )
+        return _RecordSnapshot(slug, None, unreadable=True)
+
+
 def _env_slug_ownership(
     slug: str,
     hook_input: Mapping[str, Any],
@@ -198,10 +271,14 @@ def _env_slug_ownership(
     *,
     env: Mapping[str, str],
     allow_remint: bool = False,
-) -> tuple[bool, bool]:
+    probes: _EventProbes | None = None,
+) -> tuple[bool, bool, _RecordSnapshot | None]:
     """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
 
-    Returns ``(owned, may_bind)``. ``owned`` is the adopt/fork answer
+    Returns ``(owned, may_bind, snapshot)``. ``snapshot`` is the record read
+    performed to answer, so an adopting caller can reuse it instead of
+    reading the same record again -- None only on the early return that
+    reads nothing at all. ``owned`` is the adopt/fork answer
     documented below. ``may_bind`` is the SEPARATE question of whether this
     event may stamp its ``session_id`` onto the adopted record, and the two
     are deliberately not the same bit: adopting is fail-soft (it degrades to
@@ -262,33 +339,39 @@ def _env_slug_ownership(
     pid arm below: an owner pid missing on EITHER side is "cannot prove",
     not "disproved" -- forking there would split the owner's own record on
     every routine automatic compaction wherever ``/proc`` is unavailable.
+
+    *probes* is this event's ``_EventProbes`` memo, so the ownership walk it
+    performs here is the SAME observation ``_withhold_from_launching`` and
+    ``_bind_claude_session_id`` later consult -- see that class's docstring.
+    None builds a single-use memo, leaving a direct call unchanged.
+
+    The returned snapshot is the probe's own record read. On the adopt path
+    it is the event's ONLY read of the record it goes on to write: the
+    handlers take it forward through ``_HookSlugResolution.snapshot``
+    instead of reading again (task 4662).
     """
+    probes = probes or _EventProbes(env)
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
         # No discriminator at all, and nothing to bind either: the 'unknown'
-        # slug fallback is deliberately not a valid binding.
-        return True, True
-    try:
-        record = session_registry.read_record(slug, root=root)
-    except FileNotFoundError:
-        # No record yet: this hook event IS the slug's first sight. Its own
-        # arm, above the broad one, so an ordinary fresh spawn logs nothing.
-        # Binding still needs positive proof: an unbound slug with no record
-        # is the same open-for-its-owner shape as an unbound record.
-        return True, _owner_ppid_verdict(env) is True
-    except Exception:
+        # slug fallback is deliberately not a valid binding. Nothing is read
+        # here, so there is no snapshot to hand forward.
+        return True, True, None
+    snapshot = _read_record_snapshot(slug, root)
+    if snapshot.unreadable:
         # A corrupt body, an unreadable fleet root, anything: an ownership
         # probe that cannot answer must degrade to the pre-task-4193
         # behaviour (adopt) rather than fork a spurious record or raise --
         # the hook trio's hard rule is that a registry fault never breaks a
-        # session. Logged, never silent.
-        logger.warning(
-            'session-ownership probe failed for slug %s; adopting inherited '
-            'CLAUDE_SPAWN_SESSION_ID unchecked',
-            slug,
-            exc_info=True,
-        )
-        return True, False
+        # session. Logged (in _read_record_snapshot), never silent.
+        return True, False, snapshot
+    record = snapshot.record
+    if record is None:
+        # No record yet: this hook event IS the slug's first sight. Its own
+        # arm, above the broad one, so an ordinary fresh spawn logs nothing.
+        # Binding still needs positive proof: an unbound slug with no record
+        # is the same open-for-its-owner shape as an unbound record.
+        return True, probes.owner_ppid_verdict() is True, snapshot
     bound = (record.claude_session_id or '').strip()
     if not bound:
         # No binding yet, so the stdin session_id proves nothing: whoever
@@ -299,10 +382,10 @@ def _env_slug_ownership(
         # None) ADOPTS -- the fail-soft direction -- but does NOT bind, so
         # the record stays open for its true owner instead of being
         # captured by whoever happened to arrive first.
-        verdict = _owner_ppid_verdict(env)
-        return verdict is not False, verdict is True
+        verdict = probes.owner_ppid_verdict()
+        return verdict is not False, verdict is True, snapshot
     if bound == hook_session_id:
-        return True, True
+        return True, True, snapshot
     # A re-mint is forgiven only when the OWNING PROCESS is the one
     # presenting it. The `source` string alone proves the emitter holds *a*
     # session, not *this* one -- and automatic compaction fires
@@ -313,9 +396,9 @@ def _env_slug_ownership(
     if not (allow_remint and _is_owner_only_session_start(hook_input)):
         # Forked onto the hand-launched keying, whose slug embeds this very
         # session_id: binding there is tautological, never a capture.
-        return False, True
+        return False, True, snapshot
     owner_pid = record.claude_owner_pid
-    current_pid = _owning_claude_pid()
+    current_pid = probes.owning_claude_pid()
     if owner_pid is None or current_pid is None:
         # Legacy record bound before the pid existed, a bind where it could
         # not be resolved, or a platform with no /proc (macOS -- a
@@ -325,8 +408,8 @@ def _env_slug_ownership(
         # on every routine automatic compaction, a universal regression
         # strictly worse than the rare inversion it would prevent
         # (task 4193 L2 ruling item 4-ii).
-        return True, True
-    return owner_pid == current_pid, True
+        return True, True, snapshot
+    return owner_pid == current_pid, True, snapshot
 
 
 def _env_slug_is_owned(
@@ -336,6 +419,7 @@ def _env_slug_is_owned(
     *,
     env: Mapping[str, str],
     allow_remint: bool = False,
+    probes: _EventProbes | None = None,
 ) -> bool:
     """Adopt-or-fork half of ``_env_slug_ownership`` -- see its docstring.
 
@@ -344,8 +428,27 @@ def _env_slug_is_owned(
     ``_resolve_hook_slug``.
     """
     return _env_slug_ownership(
-        slug, hook_input, root, env=env, allow_remint=allow_remint
+        slug, hook_input, root, env=env, allow_remint=allow_remint, probes=probes
     )[0]
+
+
+@dataclass(frozen=True)
+class _HookSlugResolution:
+    """One hook event's resolved registry identity -- see ``_resolve_hook_slug``.
+
+    A frozen dataclass rather than a 4-tuple deliberately: this is the
+    surface task 4193 spent seven review cycles stabilizing, and named
+    fields make a mis-ordered unpack a type error rather than a silent
+    ownership inversion.
+
+    INVARIANT: ``snapshot is None or snapshot.slug == slug``. See
+    ``_resolve_hook_slug``'s docstring for why that is load-bearing.
+    """
+
+    slug: str
+    rejected_env_slug: str | None
+    may_bind: bool
+    snapshot: _RecordSnapshot | None
 
 
 def _resolve_hook_slug(
@@ -354,8 +457,9 @@ def _resolve_hook_slug(
     root: Path | str | None,
     *,
     allow_remint: bool = False,
-) -> tuple[str, str | None, bool]:
-    """Resolve ``(slug, rejected_env_slug, may_bind)`` for one hook event.
+    probes: _EventProbes | None = None,
+) -> _HookSlugResolution:
+    """Resolve this hook event's registry identity -- see ``_HookSlugResolution``.
 
     ``slug`` is exactly what ``hook_session_slug`` returns -- see its
     docstring for the adoption / fall-through contract.
@@ -380,8 +484,23 @@ def _resolve_hook_slug(
     docstring). Callers that would bind must honour it; callers that only
     need an identity can ignore it.
 
+    ``snapshot`` is the record read the ownership probe already performed,
+    handed forward so the caller need not read the same record again -- the
+    single-read collapse this whole path exists to enable. It is attached
+    ONLY on the adopt branch, where the slug READ is the slug RETURNED.
+
+    That restriction is load-bearing, not tidiness. On the FORK branch the
+    slug returned is the hand-launched one -- a DIFFERENT record.json --
+    and handing the rejected spawner's snapshot forward would apply a
+    nested ``claude``'s status/question/binding decision to the SPAWNING
+    session's record: exactly the ownership inversion tasks 4193 and 2511
+    exist to prevent, re-introduced through a plumbing shortcut. Every
+    other branch (fork, no env slug, and the blank-stdin-session_id early
+    return that reads nothing) carries ``snapshot=None``.
+
     *allow_remint* is forwarded to ``_env_slug_ownership``; SessionStart is
-    the only caller that sets it.
+    the only caller that sets it. *probes* is likewise forwarded, so the
+    resolution's ownership walk is shared with the rest of the event.
     """
     spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
     rejected: str | None = None
@@ -390,11 +509,18 @@ def _resolve_hook_slug(
         # (task 4112) intact, and means an adversarial env token can no more
         # escape sessions_dir when READ than when written.
         candidate = session_registry.sanitize_slug(spawn_session_id)
-        owned, may_bind = _env_slug_ownership(
-            candidate, hook_input, root, env=env, allow_remint=allow_remint
+        owned, may_bind, snapshot = _env_slug_ownership(
+            candidate,
+            hook_input,
+            root,
+            env=env,
+            allow_remint=allow_remint,
+            probes=probes,
         )
         if owned:
-            return candidate, None, may_bind
+            # The slug READ is the slug RETURNED, so the snapshot describes
+            # exactly the record the caller is about to refresh.
+            return _HookSlugResolution(candidate, None, may_bind, snapshot)
         rejected = candidate
 
     identity = resolve_hook_identity(hook_input, env)
@@ -410,7 +536,8 @@ def _resolve_hook_slug(
         session_id,  # type: ignore[arg-type]
     )
     # This slug embeds session_id itself, so binding it is tautological.
-    return slug, rejected, True
+    # No snapshot: any read above was of a DIFFERENT record than this slug.
+    return _HookSlugResolution(slug, rejected, True, None)
 
 
 def hook_session_slug(
@@ -460,11 +587,14 @@ def hook_session_slug(
     the record instead of forking -- see ``_env_slug_is_owned``.
 
     Thin wrapper over ``_resolve_hook_slug``, which additionally reports
-    WHETHER an inherited env slug was rejected and whether this event may
-    BIND the record it resolved to; callers that enrich or bind a record
-    need those bits, callers that only need an identity do not.
+    WHETHER an inherited env slug was rejected, whether this event may BIND
+    the record it resolved to, and the record SNAPSHOT the ownership probe
+    read; callers that enrich, bind or refresh a record need those bits,
+    callers that only need an identity do not. This wrapper discards them,
+    so calling it re-reads what the probe already read -- the handlers go
+    through ``_resolve_hook_slug`` directly for exactly that reason.
     """
-    return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint)[0]
+    return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint).slug
 
 
 def _bind_claude_session_id(
@@ -472,6 +602,7 @@ def _bind_claude_session_id(
     hook_input: Mapping[str, Any],
     *,
     allow_rebind: bool = False,
+    probes: _EventProbes | None = None,
 ) -> bool:
     """Stamp this hook's Claude Code session_id onto an unbound *record*.
 
@@ -489,6 +620,10 @@ def _bind_claude_session_id(
     ``_is_owner_only_session_start`` says no nested ``claude`` could have
     produced this event -- never on the Notification/Stop refresh path,
     where no such ``source`` field exists to vouch for the caller.
+
+    *probes* supplies the owning pid from this event's memo, so the stamp
+    reads the SAME process-tree observation the adopt/fork decision was made
+    from rather than walking ``/proc`` a third time.
     """
     hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
@@ -504,7 +639,7 @@ def _bind_claude_session_id(
     # told apart from a nested claude presenting a different id. None when
     # it cannot be resolved -- recorded honestly rather than guessed, and
     # read back as "cannot prove ownership".
-    record.claude_owner_pid = _owning_claude_pid()
+    record.claude_owner_pid = (probes or _EventProbes({})).owning_claude_pid()
     return True
 
 
@@ -661,6 +796,11 @@ def _owning_claude_pid() -> int | None:
     found within ``_MAX_CLAUDE_ANCESTOR_HOPS`` (no ``/proc`` on macOS, a
     mid-read race, a reparented hook). Callers treat None as "cannot prove
     ownership" and take the fail-safe branch.
+
+    Memoized per hook event by ``_EventProbes``, so the adopt/fork decision,
+    the launch-window withhold decision and ``_bind_claude_session_id``'s
+    ``claude_owner_pid`` stamp all read ONE walk of the tree. Call the memo,
+    not this, from anywhere inside an event that already holds one.
     """
     pid: int | None = os.getppid()
     for _ in range(_MAX_CLAUDE_ANCESTOR_HOPS):
@@ -672,7 +812,64 @@ def _owning_claude_pid() -> int | None:
     return None
 
 
-def _owner_ppid_verdict(env: Mapping[str, str]) -> bool | None:
+#: Sentinel for "this probe has not been resolved yet", distinct from None --
+#: which is a legitimate RESOLVED answer for both memoized probes (no
+#: ``claude`` ancestor found; no ownership verdict available).
+_UNRESOLVED: Any = object()
+
+
+class _EventProbes:
+    """Per-event memo for this module's two ``/proc`` ownership probes.
+
+    ONE hook event consults ``_owner_ppid_verdict`` TWICE -- once to decide
+    whether to adopt the inherited ``CLAUDE_SPAWN_SESSION_ID`` slug
+    (``_env_slug_ownership``) and again to decide whether to withhold a
+    status from a still-LAUNCHING record (``_withhold_from_launching``) --
+    and reads ``_owning_claude_pid`` a third time to stamp
+    ``claude_owner_pid`` at bind time (``_bind_claude_session_id``). All
+    three fire together on exactly the case that matters most: the owner's
+    own pre-SessionStart Notification against an unbound LAUNCHING record
+    (task 4193 L2 ruling item 4-iii).
+
+    Each walk costs up to ``_MAX_CLAUDE_ANCESTOR_HOPS`` (6) hops x 2
+    ``/proc`` reads, charged against the hard ``_HOOK_TIMEOUT_SECS`` = 10s
+    budget this module's own ``_resolve_wm_window_id`` already prices at
+    ~10.8s in the pathological case. Memoizing pays that once.
+
+    Efficiency is not the only reason. Memoizing also closes a TOCTOU gap on
+    the verdict itself: the adopt/fork decision and the withhold decision
+    are now made from ONE observation of the process tree, so they can no
+    longer disagree because the tree changed between two walks. One
+    decision from one observation is a correctness property.
+
+    Scope is exactly one hook event -- construct it at the top of a handler
+    and thread it down. It deliberately does NOT cache across events; the
+    process tree is live state, and the memo's whole safety argument is that
+    its lifetime is shorter than any interval over which that state can
+    meaningfully change.
+    """
+
+    def __init__(self, env: Mapping[str, str]) -> None:
+        self._env = env
+        self._pid: Any = _UNRESOLVED
+        self._verdict: Any = _UNRESOLVED
+
+    def owning_claude_pid(self) -> int | None:
+        """``_owning_claude_pid()``, walked at most once per event."""
+        if self._pid is _UNRESOLVED:
+            self._pid = _owning_claude_pid()
+        return self._pid
+
+    def owner_ppid_verdict(self) -> bool | None:
+        """``_owner_ppid_verdict(env)``, computed at most once per event."""
+        if self._verdict is _UNRESOLVED:
+            self._verdict = _owner_ppid_verdict(self._env, probes=self)
+        return self._verdict
+
+
+def _owner_ppid_verdict(
+    env: Mapping[str, str], *, probes: _EventProbes | None = None
+) -> bool | None:
     """Does this event come from the claude spawn-claude.sh actually launched?
 
     Returns True (positively the owner), False (positively an inheritor), or
@@ -709,6 +906,19 @@ def _owner_ppid_verdict(env: Mapping[str, str]) -> bool | None:
     pre-task-4193 spawn-claude.sh), an unresolvable owning pid, or a platform
     with no ``/proc`` (macOS -- a first-class lane, cf. task 4058). Callers
     treat None as "adopt", the fail-soft direction this module documents.
+
+    *probes* is this event's ``_EventProbes`` memo when the caller holds one,
+    so the owning-pid walk is shared with the event's other consumers rather
+    than repeated. Omitting it builds a single-use memo, which resolves
+    through the module-level ``_owning_claude_pid`` exactly as before -- so a
+    bare ``_owner_ppid_verdict(env)`` call is semantically unchanged.
+
+    Within one hook event this verdict is computed ONCE and reused by the
+    adopt/fork decision (``_env_slug_ownership``) and the launch-window
+    withhold decision (``_withhold_from_launching``). That is a correctness
+    property before it is an efficiency one: two decisions taken from one
+    observation of the process tree cannot disagree because the tree moved
+    in between.
     """
     raw = (env.get('CLAUDE_SPAWN_OWNER_PPID') or '').strip()
     if not raw:
@@ -720,7 +930,7 @@ def _owner_ppid_verdict(env: Mapping[str, str]) -> bool | None:
         return None
     if expected <= 1:
         return None
-    owner_pid = _owning_claude_pid()
+    owner_pid = (probes or _EventProbes(env)).owning_claude_pid()
     if owner_pid is None:
         return None
     actual = _parent_pid_of(owner_pid)
@@ -729,7 +939,7 @@ def _owner_ppid_verdict(env: Mapping[str, str]) -> bool | None:
     return actual == expected
 
 
-def _nested_claude_liveness_pid() -> int:
+def _nested_claude_liveness_pid(*, probes: _EventProbes | None = None) -> int:
     """A liveness pid that actually DIES with a forked inheritor's session.
 
     ``_hand_launched_liveness_pid``'s ``os.getsid(0)`` is deliberately the
@@ -760,8 +970,12 @@ def _nested_claude_liveness_pid() -> int:
     than guessing. Note the fallback is only ever *coarser*: ``stale_pid``
     also requires ``NON_TERMINAL_HEARTBEAT_TTL`` of silence, so a
     mis-resolved pid cannot reap a record that is still being written to.
+
+    *probes* supplies the owning pid from this event's memo rather than
+    walking ``/proc`` again -- the fork path has already resolved it once to
+    reach the ownership verdict that sent it here.
     """
-    return _owning_claude_pid() or _hand_launched_liveness_pid()
+    return (probes or _EventProbes({})).owning_claude_pid() or _hand_launched_liveness_pid()
 
 
 def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
@@ -974,6 +1188,14 @@ def run_session_start(
     from ``TMUX``/``WINDOWID``, see ``_resolve_display``) before a single
     ``write_record`` call, which bumps the record's mtime heartbeat.
 
+    The record is read exactly ONCE per event (task 4662): on the adopt path
+    the ownership probe already read it, and that snapshot travels forward
+    on ``_HookSlugResolution.snapshot`` rather than being re-read here, so
+    the ownership/remint decision and the body written derive from the same
+    observation. An UNREADABLE body is the one exception -- it is re-read so
+    the fault propagates rather than being synthesized over; see
+    ``_RecordSnapshot``.
+
     RESOLVED dual-record split for SPAWNED sessions (task 2511): this slug
     used to be keyed on the Claude Code ``session_id`` (module docstring),
     while spawn-claude.sh's own ``launching`` write keys ITS record on the
@@ -1020,19 +1242,39 @@ def run_session_start(
     ``_resolve_display``) and ``launcher_pid`` comes from
     ``_nested_claude_liveness_pid`` so the forked record stays reapable.
     """
+    probes = _EventProbes(env)
     identity = resolve_hook_identity(hook_input, env)
-    slug, forked_from, may_bind = _resolve_hook_slug(
-        hook_input, env, root, allow_remint=True
+    resolution = _resolve_hook_slug(
+        hook_input, env, root, allow_remint=True, probes=probes
     )
-    try:
-        record = session_registry.read_record(slug, root=root)
-    except FileNotFoundError:
+    slug, forked_from, may_bind = (
+        resolution.slug,
+        resolution.rejected_env_slug,
+        resolution.may_bind,
+    )
+    # THE event's only read of the slug it writes: on the adopt path the
+    # ownership probe already read this very record, so its snapshot is
+    # handed forward rather than re-read (task 4662).
+    snapshot = resolution.snapshot or _read_record_snapshot(slug, root)
+    record = snapshot.record
+    if record is None and snapshot.unreadable:
+        # UNREADABLE, not ABSENT: a record EXISTS but could not be parsed or
+        # read, and synthesizing over it would destroy the body holding
+        # role/prompt/result_file. Re-read so a CorruptSessionRecord/OSError
+        # propagates to main()'s blanket except exactly as it does today --
+        # deliberately neither swallowed here nor written past. A
+        # FileNotFoundError here instead means the fault was transient over
+        # a record that is simply absent, which falls through to the capture
+        # below, again exactly as today.
+        with contextlib.suppress(FileNotFoundError):
+            record = session_registry.read_record(slug, root=root)
+    if record is None:
         cwd = str(hook_input.get('cwd') or os.getcwd())
         launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
         if forked_from is not None:
             # An inherited CLAUDE_SPAWN_LAUNCHER_PID would be the SPAWNER's,
             # and the terminal's session leader outlives this nested claude.
-            launcher_pid = _nested_claude_liveness_pid()
+            launcher_pid = _nested_claude_liveness_pid(probes=probes)
         elif launcher_pid_raw:
             launcher_pid = int(launcher_pid_raw)
         else:
@@ -1072,7 +1314,10 @@ def run_session_start(
     # side (esc-4193-10).
     if may_bind:
         _bind_claude_session_id(
-            record, hook_input, allow_rebind=_is_owner_only_session_start(hook_input)
+            record,
+            hook_input,
+            allow_rebind=_is_owner_only_session_start(hook_input),
+            probes=probes,
         )
     session_registry.write_record(record, root=root)
     return record
@@ -1095,34 +1340,6 @@ def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Questio
     if not message or not str(message).strip():
         return None
     return session_registry.Question(text=str(message), asked_at=datetime.now(UTC).isoformat())
-
-
-def _prior_record_or_none(
-    slug: str,
-    root: Path | str | None,
-) -> session_registry.SessionRecord | None:
-    """The record at *slug* as it stood BEFORE this event refreshes it.
-
-    None when there is no record yet (the ordinary forked/hand-launched
-    first sight) and, fail-soft, when it cannot be read at all -- the same
-    hard rule the ownership probe follows: a registry fault degrades to the
-    prior behaviour instead of breaking a session. Logged, never silent.
-
-    Callers need both the prior status AND the prior binding to recognise
-    the launch window (see ``_in_unbound_launch_window``), so this returns
-    the whole snapshot rather than a single field.
-    """
-    try:
-        return session_registry.read_record(slug, root=root)
-    except FileNotFoundError:
-        return None
-    except Exception:
-        logger.warning(
-            'pre-refresh record read failed for slug %s; treating it as unsighted',
-            slug,
-            exc_info=True,
-        )
-        return None
 
 
 _LAUNCH_WINDOW_WITHHOLD_MAX_SECS = 600.0
@@ -1204,6 +1421,8 @@ def _in_unbound_launch_window(
 def _withhold_from_launching(
     prior: session_registry.SessionRecord,
     env: Mapping[str, str],
+    *,
+    probes: _EventProbes | None = None,
 ) -> bool:
     """Given a record in the unbound launch window, withhold this event?
 
@@ -1221,8 +1440,12 @@ def _withhold_from_launching(
 
     Otherwise the event's provenance is genuinely unknowable and nothing it
     carries may land on the spawn-created record.
+
+    *probes* shares the event's single ownership observation with the
+    adopt/fork decision, so the two can never disagree because the process
+    tree changed between two walks.
     """
-    if _owner_ppid_verdict(env) is True:
+    if (probes or _EventProbes(env)).owner_ppid_verdict() is True:
         return False
     return not _launch_window_withholding_expired(prior)
 
@@ -1240,11 +1463,49 @@ def _run_status_refresh_and_retitle(
     Resolves the record through the ownership check (task 4193), so a
     nested ``claude`` that merely inherited ``CLAUDE_SPAWN_SESSION_ID``
     refreshes its OWN record rather than flipping the spawning session's
-    status mid-turn. Binding an as-yet-unbound record is folded into the
-    same conditional write the pending question already used, so an
-    ordinary bound-record event still performs exactly one registry write
-    (``refresh_record``'s own); the extra write happens only on the single
-    event that first binds a legacy record.
+    status mid-turn.
+
+    ONE READ, ONE DECISION, ONE WRITE (task 4662). The event reads the slug
+    it writes exactly once -- on the adopt path that read is the ownership
+    probe's own, handed forward on ``_HookSlugResolution.snapshot`` -- and
+    issues exactly ONE ``write_record`` carrying status, question and
+    binding together. That last part used to be a claim the shape did not
+    deliver: the status came from ``refresh_record``'s write and the
+    question/binding from a conditional second one.
+
+    ONE BLOCK, ALL LANES. Every lane -- adopt, fork, hand-launched, and the
+    UNREADABLE fault -- shares the single withhold / refresh / bind /
+    question / write block below. The unreadable case differs ONLY in where
+    its snapshot came from: it spends one extra ``read_record`` and then
+    falls through, exactly as ``run_session_start``'s unreadable arm does,
+    so the two handlers are structurally symmetric.
+
+    Do NOT re-fork that lane. A second copy of this policy is precisely how
+    the task-4193 withhold guard went missing: the fault lane reproduced
+    this block's WRITE policy (refresh, bind, stamp the question) while
+    silently omitting its DECISION policy, and a lane that writes without
+    evaluating ``_in_unbound_launch_window`` inverts ownership on a nested
+    ``claude``'s event. Measured before the lanes were merged, same scenario
+    both sides: the two-read shape withheld (``launching``, no question),
+    the duplicated lane did not (``awaiting-input``, the nested session's
+    prompt landed on the SPAWNING session's record). The pre-task-4662
+    shape was only accidentally robust here -- it made TWO independent
+    reads, so a transient fault on the probe's read left the second free to
+    succeed and the guard still ran.
+
+    It also closes a TOCTOU gap. The withhold decision used to be computed
+    from a snapshot taken BEFORE ``refresh_record``'s own internal re-read,
+    so the body written was not the body decided on and two racing events
+    could decide against stale state while writing against fresh state. Both
+    now derive from one snapshot.
+
+    NON-GOAL, deliberate: registry writes remain last-writer-wins.
+    ``session_registry.py::write_record`` is an atomic whole-body replace
+    with no compare-and-swap, so folding two writes into one strictly
+    NARROWS the clobber surface without eliminating it. A CAS/mtime protocol
+    would change the write contract for every registry caller
+    (spawn-claude.sh's launching/exit/refresh/set-display verbs, the reaper,
+    the cockpit) and belongs in its own change.
 
     While the record is still LAUNCHING AND unbound, this event's provenance
     is UNKNOWABLE (``_in_unbound_launch_window``), so NOTHING it carries is
@@ -1265,31 +1526,59 @@ def _run_status_refresh_and_retitle(
     which would misroute the OWNER's session whenever its SessionStart is
     merely slow -- trading a rare stale status for a routine wrong one.
     """
+    probes = _EventProbes(env)
     identity = resolve_hook_identity(hook_input, env)
-    slug, _rejected, may_bind = _resolve_hook_slug(hook_input, env, root)
-    prior = _prior_record_or_none(slug, root)
-    # Decide the launch window BEFORE the refresh: refresh_record is a
-    # read-modify-WRITE, so passing the status here at all would already have
-    # mutated the spawn-created record by the time any later guard ran.
-    # status=None makes it a pure heartbeat bump, leaving status untouched.
-    in_launch_window = prior is not None and _in_unbound_launch_window(
-        prior
-    ) and _withhold_from_launching(prior, env)
-    record = session_registry.refresh_record(
-        slug, root=root, status=None if in_launch_window else status
+    resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
+    slug, may_bind = resolution.slug, resolution.may_bind
+    # THE event's only read of the slug it writes: the ownership probe
+    # already read this record on the adopt path, so reuse its snapshot;
+    # every other path (fork, hand-launched) reads here for the first time.
+    snapshot = resolution.snapshot or _read_record_snapshot(slug, root)
+
+    prior = snapshot.record
+    if prior is None and snapshot.unreadable:
+        # UNREADABLE, not ABSENT: a record EXISTS but could not be read, and
+        # deciding from NO observation is what silently disarmed the
+        # task-4193 launch-window withhold. Re-read, then fall through to the
+        # one shared block below. A transient fault on the probe's read must
+        # not cost this event its withhold decision; a genuinely corrupt body
+        # must still not be synthesized over, so CorruptSessionRecord/OSError
+        # propagates to main()'s blanket except exactly as refresh_record's
+        # contract requires. FileNotFoundError means the fault was transient
+        # over an absent record, which is ABSENT -- suppressed, and
+        # synthesized below.
+        with contextlib.suppress(FileNotFoundError):
+            prior = session_registry.read_record(slug, root=root)
+    # Decide the launch window BEFORE applying the status: the decision and
+    # the body written below both derive from THIS one snapshot, so they can
+    # never disagree. status=None makes the refresh a pure heartbeat bump,
+    # leaving the spawn-created record's status untouched.
+    # The `prior is not None` leg is redundant at runtime --
+    # _in_unbound_launch_window already answers False for None -- but it is
+    # what narrows the Optional for the type checker before
+    # _withhold_from_launching, which takes a record, not a maybe-record.
+    in_launch_window = (
+        prior is not None
+        and _in_unbound_launch_window(prior)
+        and _withhold_from_launching(prior, env, probes=probes)
     )
-    # Bind on the record refresh_record RETURNED (post-status-flip), and write
-    # after both mutations, so status, question and binding land atomically.
-    bound = (
-        not in_launch_window
-        and may_bind
-        and _bind_claude_session_id(record, hook_input)
+    record = session_registry.apply_refresh(
+        slug, prior, status=None if in_launch_window else status
     )
-    stamp_question = question is not None and not in_launch_window
-    if stamp_question:
+    # Bind on the post-status-flip record and write after every mutation, so
+    # status, question and binding land in ONE body -- atomically in fact,
+    # not merely in intent. The guards are unchanged: a withheld event never
+    # binds, and an adopted-but-UNPROVEN one (may_bind False) never claims
+    # the record. Only the return value is now unused -- the single write
+    # below is unconditional, so nothing has to ask whether it bound.
+    if not in_launch_window and may_bind:
+        _bind_claude_session_id(record, hook_input, probes=probes)
+    if question is not None and not in_launch_window:
         record.question = question
-    if stamp_question or bound:
-        session_registry.write_record(record, root=root)
+    # Unconditional: apply_refresh no longer writes the mtime heartbeat
+    # itself, and that bump is owed on EVERY event, a withheld one included
+    # -- it is the whole point of withholding rather than skipping.
+    session_registry.write_record(record, root=root)
     title = hook_display_title(identity, env, record)
     return osc_retitle_sequence(status, title)
 
