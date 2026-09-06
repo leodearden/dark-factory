@@ -146,6 +146,39 @@ _MAX_AMENDMENT_LINE_CHARS = 300
 _MAX_AMENDMENT_DETAIL_CHARS = 1200
 _MAX_AMENDMENT_OPTIONS = 6
 
+# Hard cap on the NUMBER of Escalation.late_resolutions entries — the
+# substantive resolutions that arrived after an automated sweep had already
+# closed the record (task 4495; see `_is_late_resolution_worth_capturing` for
+# why that is rare).  Same sole-writer/sole-trimmer, oldest-shed,
+# count-every-drop policy as `_MAX_AMENDMENTS` above: `resolve()`'s
+# already-terminal branch owns both, and each shed entry increments the
+# record's `late_resolutions_truncated` so the TRUE total
+# (`len(list) + truncated`) never plateaus.
+#
+# OLDEST-shed is right here for the same reason it is right for `amendments`:
+# these entries are strictly ADDITIONAL to the record's own immutable
+# status/resolution/resolved_by, so nothing anchoring is stored only in this
+# list, and a reader triaging NOW wants the most recent finding.
+#
+# SIZED SMALLER THAN `_MAX_AMENDMENTS` (20) on purpose: an L2 folds repeatedly
+# by design, but a SECOND late resolution on one already-swept record means the
+# race recurred on the same escalation — a shape that should be exceptional, so
+# a low cap costs nothing real and keeps the envelope tight.
+#   whole list <= 8 * (1200 kept + ~70 marker + ~180 timestamp/keys) ~= 11 KB
+# — the same order as `root_cause_variants` (~7 KB), far under `amendments`.
+_MAX_LATE_RESOLUTIONS = 8
+
+# Per-ENTRY character cap on a captured `resolution`.  An entry count alone is
+# NOT a size bound: `resolution` is unbounded caller free text (an agent's full
+# finding), so 8 uncapped entries could add hundreds of KB to a record every
+# reader of a full record then parses.  Shares `_MAX_AMENDMENT_DETAIL_CHARS`'s
+# sizing — both are the "prose" field of their entry — and the same in-band
+# marked elision, with the dropped characters counted on the record in
+# `late_resolutions_chars_elided` exactly as shed ENTRIES are counted in
+# `late_resolutions_truncated`.  The loss is a durable structured fact either
+# way, never log-only (INV-8).
+_MAX_LATE_RESOLUTION_CHARS = _MAX_AMENDMENT_DETAIL_CHARS
+
 # Hard cap on the NUMBER of Escalation.root_cause_variants entries — the DISTINCT
 # pre-canonical root_cause spellings one L2 has been addressed by (task 3998).
 # Same sole-writer/sole-trimmer, oldest-shed, count-every-drop policy as
@@ -268,20 +301,25 @@ class ResolveOutcome(TypedDict):
     resolution_class_corrected: str | None  # the stamp this call re-derived, or None
 
 
-def _elide(text: str, limit: int) -> tuple[str, int]:
+def _elide(text: str, limit: int, what: str = 'amendment field') -> tuple[str, int]:
     """Return (*text* capped at *limit*, characters dropped).
 
     The elision is MARKED IN-BAND and names both the count and the cap, so a
     human reading a preserved framing can tell "this is all of it" from "this
     is the head of it" without cross-referencing anything.  Silent truncation
     of decision context would be the loud-over-silent norm inverted.
+
+    *what* names WHICH cap did the eliding, so a reader of a marker on a
+    late-resolution entry is not told it hit an "amendment field cap" it has
+    nothing to do with.  It defaults to the amendment wording, keeping every
+    pre-existing caller's output byte-identical.
     """
     if len(text) <= limit:
         return text, 0
     dropped = len(text) - limit
     return (
         f'{text[:limit]}\n[... {dropped} char(s) elided at the '
-        f'{limit}-char amendment field cap ...]'
+        f'{limit}-char {what} cap ...]'
     ), dropped
 
 
@@ -329,6 +367,36 @@ def _is_late_resolution_worth_capturing(
     if classify_resolver_tier(resolved_by) == 'reaper-sweep':
         return False
     return bool(resolution) and resolution != esc.resolution
+
+
+def _build_late_resolution(
+    *, resolution: str, resolved_by: str | None, resolution_action: str | None,
+    dismiss: bool, prior_resolution_class: str | None, timestamp: str,
+) -> tuple[LateResolution, int]:
+    """Build one :class:`~escalation.models.LateResolution`, size-bounded.
+
+    Modelled on :func:`_build_amendment`: the single site that maps a
+    ``resolve()`` argument set onto the entry's key names, and the single site
+    that applies the per-entry character cap (``_MAX_LATE_RESOLUTION_CHARS``)
+    that turns ``_MAX_LATE_RESOLUTIONS`` from an entry count into an actual size
+    bound.  Elision is marked in-band and the dropped total is returned so the
+    caller can make it durable on the record rather than log-only.
+
+    *timestamp* is passed in rather than read here so the queue's write
+    chokepoint owns the clock — a caller can never backdate a capture.
+
+    Returns ``(entry, chars_elided)``.
+    """
+    kept, lost = _elide(resolution, _MAX_LATE_RESOLUTION_CHARS, 'late-resolution')
+    entry: LateResolution = {
+        'timestamp': timestamp,
+        'resolution': kept,
+        'resolved_by': resolved_by,
+        'resolution_action': resolution_action,
+        'dismiss': dismiss,
+        'prior_resolution_class': prior_resolution_class,
+    }
+    return entry, lost
 
 
 def _build_amendment(
@@ -1296,17 +1364,32 @@ class EscalationQueue:
                         # incoming value is already known-legal here.
                         corrected = resolution_class or 'actionable'
 
-                    entry: LateResolution = {
-                        'timestamp': datetime.now(UTC).isoformat(),
-                        'resolution': resolution,
-                        'resolved_by': resolved_by,
-                        'resolution_action': None,
-                        'dismiss': dismiss,
+                    entry, chars_elided = _build_late_resolution(
+                        resolution=resolution,
+                        resolved_by=resolved_by,
+                        resolution_action=None,
+                        dismiss=dismiss,
                         # Preserved so the correction destroys nothing and the
                         # original derivation stays auditable.
-                        'prior_resolution_class': prior_class if corrected else None,
-                    }
+                        prior_resolution_class=prior_class if corrected else None,
+                        timestamp=datetime.now(UTC).isoformat(),
+                    )
+                    prior_list = list(esc.late_resolutions)
+                    prior_truncated = esc.late_resolutions_truncated
+                    prior_elided = esc.late_resolutions_chars_elided
+
                     esc.late_resolutions.append(entry)
+                    esc.late_resolutions_chars_elided += chars_elided
+                    # Trim in the SAME critical section and the SAME single
+                    # write as the append, so no over-cap list is ever durable.
+                    # OLDEST-shed: these entries are strictly additional to the
+                    # record's own immutable terminal state, and a reader
+                    # triaging NOW wants the most recent finding.
+                    dropped_entries = 0
+                    if len(esc.late_resolutions) > _MAX_LATE_RESOLUTIONS:
+                        dropped_entries = len(esc.late_resolutions) - _MAX_LATE_RESOLUTIONS
+                        esc.late_resolutions = esc.late_resolutions[dropped_entries:]
+                        esc.late_resolutions_truncated += dropped_entries
                     if corrected is not None:
                         esc.resolution_class = corrected
 
@@ -1327,11 +1410,31 @@ class EscalationQueue:
                             ) if corrected is not None else '',
                             resolution[:200],
                         )
+                        if dropped_entries:
+                            logger.warning(
+                                'resolve: %s shed %d oldest late resolution(s) at '
+                                'the _MAX_LATE_RESOLUTIONS=%d cap (running total '
+                                "truncated=%d); the record's own terminal state is "
+                                'unaffected',
+                                escalation_id, dropped_entries, _MAX_LATE_RESOLUTIONS,
+                                esc.late_resolutions_truncated,
+                            )
+                        if chars_elided:
+                            logger.warning(
+                                'resolve: %s elided %d char(s) from a captured late '
+                                'resolution at the _MAX_LATE_RESOLUTION_CHARS=%d cap '
+                                '(running total elided=%d); the kept text is the HEAD '
+                                'of what was submitted and says so in-band',
+                                escalation_id, chars_elided, _MAX_LATE_RESOLUTION_CHARS,
+                                esc.late_resolutions_chars_elided,
+                            )
                     else:
                         # The write did not land, so nothing may be reported as
                         # captured — roll the in-memory record back to what is
-                        # actually on disk.
-                        esc.late_resolutions.pop()
+                        # actually on disk, bookkeeping counters included.
+                        esc.late_resolutions = prior_list
+                        esc.late_resolutions_truncated = prior_truncated
+                        esc.late_resolutions_chars_elided = prior_elided
                         esc.resolution_class = prior_class
                 return esc
 

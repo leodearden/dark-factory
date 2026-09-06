@@ -7323,6 +7323,7 @@ class TestResolveCapturesLateResolution:
         dismissed = queue.get('esc-3902-1')
         assert dismissed is not None
         stored_resolved_at = dismissed.resolved_at
+        assert stored_resolved_at is not None, 'setup: the dismissal must be stamped'
 
         out: ResolveOutcome = {
             'applied': True, 'prior_status': None, 'prior_resolved_by': None,
@@ -7604,7 +7605,8 @@ class TestLateResolutionCorrectsResolutionClass:
         """(a)(d)(e) The derived stamp is re-stamped, the prior one preserved."""
         queue = self._auto_dismissed(tmp_path)
         seeded = queue.get('esc-3902-1')
-        assert seeded is not None and seeded.resolution_class == 'benign', (
+        assert seeded is not None
+        assert seeded.resolution_class == 'benign', (
             f'setup: the auto-dismiss must derive benign, got {seeded.resolution_class!r}'
         )
 

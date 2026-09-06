@@ -505,6 +505,11 @@ class Escalation:
     # passthroughs or RMW-on-hydrated-record).
     late_resolutions: list[LateResolution] = field(default_factory=list)
     late_resolutions_truncated: int = 0
+    # BYTE-side counterpart of late_resolutions_truncated: characters dropped by
+    # the per-entry cap that makes the list's SIZE (not merely its length)
+    # bounded.  Exactly mirrors the amendments_truncated / amendments_chars_elided
+    # pair above, and has the same zero-migration story as the two fields above.
+    late_resolutions_chars_elided: int = 0
     # The DISTINCT PRE-CANONICAL root_cause spellings that have folded into this
     # L2 (task 3998), the record's own spelling seeded first.  Canonicalising the
     # root-cause match makes MORE promotes fold BY DESIGN, so its failure mode is

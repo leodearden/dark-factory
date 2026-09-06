@@ -1402,6 +1402,10 @@ class TestEscalationLateResolutions:
             f'late_resolutions_truncated must default to 0: '
             f'{fresh.late_resolutions_truncated!r}'
         )
+        assert fresh.late_resolutions_chars_elided == 0, (
+            f'late_resolutions_chars_elided must default to 0: '
+            f'{fresh.late_resolutions_chars_elided!r}'
+        )
 
         # --- (b) ROUND-TRIP: the entry dict and the counter survive verbatim,
         # through BOTH the dict pair and the JSON pair (the on-disk path).
@@ -1413,7 +1417,11 @@ class TestEscalationLateResolutions:
             'dismiss': False,
             'prior_resolution_class': 'benign',
         }
-        esc = self._seeded(late_resolutions=[entry], late_resolutions_truncated=2)
+        esc = self._seeded(
+            late_resolutions=[entry],
+            late_resolutions_truncated=2,
+            late_resolutions_chars_elided=417,
+        )
 
         via_dict = Escalation.from_dict(esc.to_dict())
         assert via_dict.late_resolutions == [entry], (
@@ -1431,6 +1439,12 @@ class TestEscalationLateResolutions:
         assert restored.late_resolutions_truncated == 2, (
             f'truncation counter lost: {restored.late_resolutions_truncated!r}'
         )
+        # The BYTE-side counter is what makes the per-entry elision's loss
+        # assertable from the record rather than log-only (INV-8), so it has to
+        # survive the round-trip too.
+        assert restored.late_resolutions_chars_elided == 417, (
+            f'elision counter lost: {restored.late_resolutions_chars_elided!r}'
+        )
         # The record's OWN terminal state is a separate thing and is untouched by
         # the capture — that separation is the whole point of appending.
         assert restored.status == 'dismissed'
@@ -1441,6 +1455,7 @@ class TestEscalationLateResolutions:
         legacy = esc.to_dict()
         del legacy['late_resolutions']
         del legacy['late_resolutions_truncated']
+        del legacy['late_resolutions_chars_elided']
 
         from_legacy = Escalation.from_dict(legacy)
 
@@ -1451,6 +1466,10 @@ class TestEscalationLateResolutions:
         assert from_legacy.late_resolutions_truncated == 0, (
             f'legacy record without the key must default to 0: '
             f'{from_legacy.late_resolutions_truncated!r}'
+        )
+        assert from_legacy.late_resolutions_chars_elided == 0, (
+            f'legacy record without the key must default to 0: '
+            f'{from_legacy.late_resolutions_chars_elided!r}'
         )
 
     def test_default_late_resolutions_list_is_per_instance(self):
