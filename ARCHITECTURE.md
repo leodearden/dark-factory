@@ -942,13 +942,18 @@ a defense is active when it isn't:
   subsystem, not covered by this caveat.)
 - **An agent's shell in a worktree can import first-party code from main,
   not the worktree.** Each worktree gets its own independent root `.venv`,
-  built by `verify_cold_preprovision_command` (`uv sync --all-packages &&
-  npm ci …`) once cold-verified — none before that, so this is not a
-  shared virtualenv. The real edge: an agent's Bash subprocess inherits
-  the orchestrator's environment verbatim, including main's
-  `VIRTUAL_ENV` (`orchestrator/src/orchestrator/agents/invoke.py`), so a
-  first-party `import` there can resolve main's editable source instead
-  of the worktree's edits. Verify is unaffected —
+  never a shared one, once cold-verified. A project can set
+  `verify_cold_preprovision_command` to build it explicitly (this repo's
+  value is `uv sync --all-packages && npm ci …`); the knob defaults to
+  empty, in which case the `.venv` is instead materialized as a side
+  effect of the verify test leg's `cd <module> && uv run pytest`
+  (`orchestrator/src/orchestrator/verify.py::_preprovision_shared_venv`).
+  Either way, there's no `.venv` at all before that first cold verify.
+  The real edge: an agent's Bash subprocess inherits a copy of the
+  orchestrator's environment, including main's `VIRTUAL_ENV`
+  (`orchestrator/src/orchestrator/agents/invoke.py`), so a first-party
+  `import` there can resolve main's editable source instead of the
+  worktree's edits. Verify is unaffected —
   `orchestrator/src/orchestrator/verify.py::_target_subprocess_env` strips
   `VIRTUAL_ENV` so the target always resolves its own `.venv`. See
   `### Locating installed code` in `CLAUDE.md` for the one-line
