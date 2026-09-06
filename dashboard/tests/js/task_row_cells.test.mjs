@@ -27,17 +27,18 @@ import { createRequire } from 'node:module';
 
 import cells from '../../src/dashboard/static/redux/task_row_cells.js';
 
-const { strandBadgeState, agentCellState, STRAND_TITLE } = cells;
+const { strandBadgeState, agentCellState, STRAND_TITLE, MUTED_COLOR } = cells;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/task_row_cells.js';
 const EXPECTED_FUNCTION_NAMES = ['strandBadgeState', 'agentCellState'];
-const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'STRAND_TITLE'];
+const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'STRAND_TITLE', 'MUTED_COLOR'];
 
 test('default-imported module exposes the task-row render decisions', () => {
   for (const name of EXPECTED_FUNCTION_NAMES) {
     assert.equal(typeof cells[name], 'function', `cells.${name} should be a function`);
   }
   assert.equal(typeof cells.STRAND_TITLE, 'string', 'cells.STRAND_TITLE should be a string');
+  assert.equal(typeof cells.MUTED_COLOR, 'string', 'cells.MUTED_COLOR should be a string');
 });
 
 test('module also assigns window.DF_TASK_ROW_CELLS (browser dual-export)', () => {
@@ -156,23 +157,63 @@ test('strandBadgeState: a NON-stranded task with no agent still renders nothing'
 // agentCellState — the cell the badge sits beside, and stays distinct from
 // ---------------------------------------------------------------------------
 
-test('agentCellState: an assigned agent renders its own name, unmuted', () => {
-  assert.deepEqual(agentCellState({ agent: 'x' }), { text: 'x', muted: false });
+test('agentCellState: an assigned agent renders its own name, with no colour override', () => {
+  assert.deepEqual(agentCellState({ agent: 'x' }), { text: 'x', color: null });
 });
 
 test('agentCellState: no agent falls back to the default "unassigned" placeholder', () => {
-  assert.deepEqual(agentCellState({}), { text: 'unassigned', muted: true });
-  assert.deepEqual(agentCellState({ agent: null }), { text: 'unassigned', muted: true });
-  assert.deepEqual(agentCellState({ agent: '' }), { text: 'unassigned', muted: true });
-  assert.deepEqual(agentCellState(null), { text: 'unassigned', muted: true });
+  assert.deepEqual(agentCellState({}), { text: 'unassigned', color: MUTED_COLOR });
+  assert.deepEqual(agentCellState({ agent: null }), { text: 'unassigned', color: MUTED_COLOR });
+  assert.deepEqual(agentCellState({ agent: '' }), { text: 'unassigned', color: MUTED_COLOR });
+  assert.deepEqual(agentCellState(null), { text: 'unassigned', color: MUTED_COLOR });
 });
 
-test('agentCellState: the placeholder is a parameter, because the two sites disagree', () => {
+test('agentCellState: the placeholder STRING is a parameter, because the two sites disagree', () => {
   // tab_tasks.jsx TaskDetail renders the word 'unassigned'; tabs.jsx OrchTab
   // renders an em-dash. Both are pinned so the extraction cannot silently
   // change either one.
-  assert.deepEqual(agentCellState({}, { placeholder: '—' }), { text: '—', muted: true });
-  assert.deepEqual(agentCellState({ agent: 'x' }, { placeholder: '—' }), { text: 'x', muted: false });
+  assert.deepEqual(agentCellState({}, { placeholder: '—' }), { text: '—', color: MUTED_COLOR });
+  assert.deepEqual(agentCellState({ agent: 'x' }, { placeholder: '—' }), { text: 'x', color: null });
+});
+
+test('agentCellState: the placeholder STYLING is NOT a parameter — one mute colour, both sites', () => {
+  // The invariant task 4408 establishes. WHICH WORD stands in for an absent
+  // agent is per-site; HOW DIM it renders is not. Both sites must receive the
+  // MUTED_COLOR reference itself rather than a re-spelled copy — the same
+  // single-source rigour as `STRAND_TITLE is the single source for every site`
+  // below, applied to the colour instead of the tooltip.
+  assert.equal(agentCellState({}, { placeholder: '—' }).color, agentCellState({}).color);
+  assert.equal(agentCellState({}, { placeholder: '—' }).color, MUTED_COLOR);
+  assert.equal(agentCellState({}).color, MUTED_COLOR);
+});
+
+test('agentCellState: `color` is PRESENT-and-null for a real agent, never absent', () => {
+  // The inverse of the `!('marginLeft' in compact)` rigour above, and resolved
+  // the other way ON PURPOSE: the badge descriptor gets SPREAD, so a
+  // present-but-undefined key there would emit a stray style attribute —
+  // whereas the agent-cell sites BRANCH on this field. A key that is always
+  // present is what makes their `ac.color ? <span style=...> : ac.text` a
+  // total function over a stable shape, and keeps "no colour override" an
+  // affirmative decision rather than an absent key.
+  assert.ok(
+    'color' in agentCellState({ agent: 'x' }),
+    'a real agent must still carry an explicit color key, valued null',
+  );
+  assert.ok('color' in agentCellState({}), 'a placeholder must carry an explicit color key');
+  assert.equal(agentCellState({ agent: 'x' }).color, null);
+});
+
+test('agentCellState: `muted` is gone — one bit must not live in two discardable fields', () => {
+  // The defect task 4408 closes. `muted` was returned to two call sites and
+  // honoured by exactly one; OrchTab took `.text` and dropped it silently.
+  // Returning the colour instead means the field carrying the placeholder-ness
+  // IS the field a site must read to render at all, so dropping it is visible.
+  // Keeping both would re-create the same failure mode one layer down.
+  assert.ok(!('muted' in agentCellState({})), 'placeholder descriptor must not carry `muted`');
+  assert.ok(
+    !('muted' in agentCellState({ agent: 'x' })),
+    'assigned-agent descriptor must not carry `muted`',
+  );
 });
 
 test('agentCellState and strandBadgeState share no field values — they are distinct surfaces', () => {
@@ -210,4 +251,22 @@ test('STRAND_TITLE is the single source for every site that renders the badge', 
   assert.equal(strandBadgeState({ stranded: true }).title, STRAND_TITLE);
   assert.equal(strandBadgeState({ stranded: true }, { compact: true }).title, STRAND_TITLE);
   assert.equal(strandBadgeState({ stranded: true }, { marginLeft: 4 }).title, STRAND_TITLE);
+});
+
+// ---------------------------------------------------------------------------
+// MUTED_COLOR — exported once so the two agent-cell sites cannot drift apart
+// ---------------------------------------------------------------------------
+
+test('MUTED_COLOR is one non-empty exported string constant', () => {
+  assert.equal(typeof MUTED_COLOR, 'string');
+  assert.ok(MUTED_COLOR.length > 0, 'MUTED_COLOR must not be empty');
+});
+
+test('MUTED_COLOR is the dim tertiary custom property TaskDetail already rendered', () => {
+  // Pinned BY VALUE, not merely by shape. TaskDetail hand-wrote 'var(--fg-3)'
+  // in its JSX before this extraction, and the extraction must not silently
+  // re-colour it while moving it: styles.css defines --fg-3 at L=0.62 against
+  // the OrchTab agent cell's inherited --fg-2 at L=0.72, which is what makes
+  // the mute visible there at all.
+  assert.equal(MUTED_COLOR, 'var(--fg-3)');
 });
