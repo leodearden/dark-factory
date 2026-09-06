@@ -25,6 +25,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from fused_memory.reconciliation.stage1_stall_detector import (
+    _GATE_BACKLOG_ESCALATION_CATEGORY,
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
     maybe_escalate_stalled_gate_backlog,
 )
@@ -42,8 +43,12 @@ plan_rewrites = _mod.plan_rewrites
 Rewrite = _mod.Rewrite
 BackfillPlan = _mod.BackfillPlan
 apply_rewrites = _mod.apply_rewrites
+fingerprint_preserved = _mod.fingerprint_preserved
 run = _mod.run
 main = _mod.main
+EXIT_OK = _mod.EXIT_OK
+EXIT_BAD_QUEUE_DIR = _mod.EXIT_BAD_QUEUE_DIR
+EXIT_FINGERPRINT_DRIFT = _mod.EXIT_FINGERPRINT_DRIFT
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +119,19 @@ class TestIsLegacyGateBacklogRecord:
     """Selection predicate: the record's own OLD-SUMMARY SHAPE, nothing else."""
 
     def test_category_constant_matches_the_emitter(self):
+        """Compare against the EMITTER's constant, not a copy of its literal.
+
+        The script deliberately declares the category as a literal rather than
+        importing ``_GATE_BACKLOG_ESCALATION_CATEGORY`` — it matches records
+        already ON DISK, whose category was frozen at filing time, so an
+        emitter-side value change must not silently retarget the backfill away
+        from them (it would report ``legacy_total: 0``, indistinguishable from
+        a finished run).  This assertion is what pins the two together in place
+        of that import: if they ever diverge the suite fails loudly and a human
+        decides which side moved.
+        """
+        assert GATE_BACKLOG_CATEGORY == _GATE_BACKLOG_ESCALATION_CATEGORY
+        # And the on-disk value the live legacy records actually carry.
         assert GATE_BACKLOG_CATEGORY == 'reconciliation_stale_gate_backlog'
 
     def test_legacy_record_is_selected(self):
@@ -148,6 +166,29 @@ class TestIsLegacyGateBacklogRecord:
     def test_empty_summary_is_not_selected(self):
         esc = _legacy_esc(summary='')
         assert is_legacy_gate_backlog_record(esc) is False
+
+    def test_summary_naming_a_different_task_is_not_selected(self):
+        """The regex's captured id must AGREE with the record's own task_id.
+
+        ``rebuild_summary`` re-renders the text around ``esc.task_id``, so a
+        record whose summary names a different gate would have that reference
+        silently changed by the rewrite.  The emitter always writes the same id
+        into both, so such a record is not something it produced — fail closed
+        and leave the (still human-readable) stale summary alone.
+        """
+        esc = _legacy_esc(
+            task_id='166',
+            summary='Gate task 999 has awaited a human decision for 48.7h',
+        )
+        assert is_legacy_gate_backlog_record(esc) is False
+
+    def test_matching_task_ids_are_selected(self):
+        """The positive half of the agreement check — a non-default id still passes."""
+        esc = _legacy_esc(
+            task_id='4021',
+            summary='Gate task 4021 has awaited a human decision for 91.2h',
+        )
+        assert is_legacy_gate_backlog_record(esc) is True
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +308,48 @@ class TestRebuildSummary:
         minted = pending[0]
 
         assert rebuild_summary('166', ANCHOR) == minted.summary
+
+    @pytest.mark.asyncio
+    async def test_fallback_matches_a_freshly_minted_record_byte_for_byte(
+        self, tmp_path: Path
+    ):
+        """The fallback branch gets the SAME emitter-parity treatment as the anchored one.
+
+        This is the branch taken for records whose anchor is unrecoverable —
+        precisely the ones an operator can least easily eyeball for correctness
+        — so pinning it to a literal copied into this module would let an
+        emitter-side edit diverge with a green suite.  Mint a real record with
+        NO ``gate_escalated_at`` in its metadata, which drives the emitter's
+        ``age_hours is None`` branch, and compare byte-for-byte.
+        """
+        queue = EscalationQueue(tmp_path)
+        task_by_id = {
+            '166': {
+                'id': '166',
+                'status': 'blocked',
+                'title': 'Gate task 166',
+                # No gate_escalated_at: gate_escalated_age_secs returns None, so
+                # the emitter cannot name an anchor and falls back.
+                'metadata': {'operational_mode': 'gate'},
+            }
+        }
+
+        escalated = await maybe_escalate_stalled_gate_backlog(
+            queue,
+            project_id='dark_factory',
+            run_id='r1',
+            stalled_task_ids=['166'],
+            task_by_id=task_by_id,
+            now=datetime.fromisoformat(ANCHOR) + timedelta(hours=48.7),
+        )
+        assert escalated == ['166'], 'the emitter must have filed a NEW record'
+
+        pending = queue.get_pending()
+        assert len(pending) == 1
+        minted = pending[0]
+
+        assert 'beyond the' in minted.summary, 'expected the emitter fallback branch'
+        assert rebuild_summary('166', None) == minted.summary
 
     def test_fallback_branch_when_the_anchor_is_unrecoverable(self):
         assert rebuild_summary('166', None) == FALLBACK_SUMMARY
@@ -686,6 +769,80 @@ class TestApplyRewritesLockDiscipline:
         assert after['detail'].endswith('\nnote: appended after planning')
 
 
+class TestApplyRewritesFaultIsolation:
+    """One unreadable record costs one record — never the whole pass."""
+
+    def test_the_in_lock_fingerprint_guard_rechecks_the_bytes_being_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """plan_rewrites checks the PLANNED detail; apply writes a RECOMPUTED one.
+
+        The apply path deliberately rebuilds from the freshly-read record so a
+        concurrent detail change is not clobbered — which means the bytes it
+        writes were never the bytes the planner validated.  Plan with the real
+        rebuild_detail, then swap in one that disturbs line 0 (the fingerprint's
+        only recovery site) and assert the apply-side guard catches it.
+        """
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        raw = tmp_path / 'esc-166-1.json'
+        plan = plan_rewrites(queue.get_pending())
+        assert len(plan.rewrites) == 1
+        before = raw.read_bytes()
+
+        monkeypatch.setattr(
+            _mod,
+            'rebuild_detail',
+            lambda detail: detail.replace('project_id: dark_factory', 'project_id: reify'),
+        )
+        report = apply_rewrites(queue, plan)
+
+        assert report['rewritten'] == 0
+        assert report['skipped_fingerprint_drift_at_apply'] == 1
+        assert raw.read_bytes() == before, 'a drifting record must not be written'
+
+    def test_fingerprint_preserved_is_the_shared_helper(self):
+        """Both sides call the SAME check, so they cannot drift apart."""
+        esc = _legacy_esc()
+        assert fingerprint_preserved(esc, rebuild_detail(LEGACY_DETAIL)) is True
+        assert fingerprint_preserved(
+            esc, LEGACY_DETAIL.replace('project_id: dark_factory', 'project_id: reify')
+        ) is False
+
+    def test_a_corrupt_record_costs_one_record_not_the_run(self, tmp_path: Path):
+        """get_pending() tolerates corrupt records; the apply side must too.
+
+        Without per-record isolation, a record that became unreadable between
+        planning and applying aborts the loop and the operator loses the report
+        for everything already rewritten.
+        """
+        queue = _seeded_queue(tmp_path, *_mixed_pending())
+        plan = plan_rewrites(queue.get_pending())
+        # get_pending() does not promise an order, so assert the SET.
+        assert {r.escalation_id for r in plan.rewrites} == {'esc-166-1', 'esc-167-1'}
+
+        # One of the two planned records goes corrupt after planning.
+        (tmp_path / 'esc-166-1.json').write_text('{not json at all')
+
+        report = apply_rewrites(queue, plan)
+
+        assert report['skipped_error'] == 1
+        assert report['rewritten'] == 1, 'the second record must still land'
+        after = json.loads((tmp_path / 'esc-167-1.json').read_text())
+        assert after['summary'] == rebuild_summary('167', ANCHOR)
+
+    def test_counters_are_all_zero_on_a_clean_pass(self, tmp_path: Path):
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        report = apply_rewrites(queue, plan_rewrites(queue.get_pending()))
+
+        assert report == {
+            'rewritten': 1,
+            'skipped_missing': 0,
+            'skipped_no_longer_legacy': 0,
+            'skipped_fingerprint_drift_at_apply': 0,
+            'skipped_error': 0,
+        }
+
+
 # ---------------------------------------------------------------------------
 # run() / main() — end to end
 # ---------------------------------------------------------------------------
@@ -721,6 +878,8 @@ class TestRunAndMain:
         assert 'rewritten' not in report
         assert 'skipped_missing' not in report
         assert 'skipped_no_longer_legacy' not in report
+        assert 'skipped_fingerprint_drift_at_apply' not in report
+        assert 'skipped_error' not in report
 
     def test_apply_rewrites_exactly_the_legacy_records(self, tmp_path: Path):
         _seeded_queue(tmp_path, *_mixed_pending())
@@ -773,8 +932,125 @@ class TestRunAndMain:
     def test_main_apply_performs_the_writes(self, tmp_path: Path, capsys):
         _seeded_queue(tmp_path, *_mixed_pending())
 
-        assert main(['--queue-dir', str(tmp_path), '--apply']) == 0
+        assert main(['--queue-dir', str(tmp_path), '--apply']) == EXIT_OK
 
         report = json.loads(capsys.readouterr().out)
         assert report['dry_run'] is False
         assert report['rewritten'] == 2
+
+
+class TestQueueDirValidation:
+    """A typo'd --queue-dir must FAIL, not be created as an empty queue."""
+
+    def test_run_refuses_a_nonexistent_directory_and_does_not_create_it(
+        self, tmp_path: Path
+    ):
+        """EscalationQueue.__init__ mkdirs — so validate BEFORE constructing it.
+
+        Otherwise a typo reports ``pending_total: 0, legacy_total: 0``, which is
+        indistinguishable from a completed backfill and makes the operator
+        procedure's step-5 idempotence check vacuously pass.  It would also make
+        a supposedly read-only dry run mutate the filesystem.
+        """
+        missing = tmp_path / 'escalatons'  # deliberate typo
+
+        with pytest.raises(FileNotFoundError, match='escalatons'):
+            run(missing)
+
+        assert not missing.exists(), 'a dry run must not CREATE the queue directory'
+
+    def test_run_refuses_a_path_that_is_not_a_directory(self, tmp_path: Path):
+        not_a_dir = tmp_path / 'queue.json'
+        not_a_dir.write_text('{}')
+
+        with pytest.raises(NotADirectoryError, match='queue.json'):
+            run(not_a_dir)
+
+    def test_main_exits_nonzero_and_names_the_path(self, tmp_path: Path, capsys):
+        missing = tmp_path / 'escalatons'
+
+        assert main(['--queue-dir', str(missing)]) == EXIT_BAD_QUEUE_DIR
+
+        assert capsys.readouterr().out == '', 'no report is printed for a bad path'
+        assert not missing.exists()
+
+
+class TestExitCodes:
+    """skipped_fingerprint_drift is a stop-and-investigate signal, so exit != 0."""
+
+    def test_drift_exits_nonzero_but_still_prints_the_report(
+        self, tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A wrapper, cron or ``&&`` chain must not read a drifting run as success."""
+        _seeded_queue(tmp_path, *_mixed_pending())
+        monkeypatch.setattr(
+            _mod,
+            'rebuild_detail',
+            lambda detail: detail.replace('project_id: dark_factory', 'project_id: reify'),
+        )
+
+        code = main(['--queue-dir', str(tmp_path)])
+
+        assert code == EXIT_FINGERPRINT_DRIFT
+        assert code != EXIT_OK
+        # The report is still printed: the operator needs it to investigate.
+        report = json.loads(capsys.readouterr().out)
+        assert report['skipped_fingerprint_drift'] == 2
+
+    def test_apply_side_drift_also_exits_nonzero(
+        self, tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The apply-path counter feeds the same exit-code decision."""
+        _seeded_queue(tmp_path, _folded_legacy_esc())
+        real_rebuild_detail = _mod.rebuild_detail
+        calls = {'n': 0}
+
+        def drifting_after_planning(detail: str) -> str:
+            # Planning sees the real rewrite; the apply path sees a drifting one.
+            calls['n'] += 1
+            if calls['n'] <= 1:
+                return real_rebuild_detail(detail)
+            return detail.replace('project_id: dark_factory', 'project_id: reify')
+
+        monkeypatch.setattr(_mod, 'rebuild_detail', drifting_after_planning)
+
+        code = main(['--queue-dir', str(tmp_path), '--apply'])
+
+        report = json.loads(capsys.readouterr().out)
+        assert report['skipped_fingerprint_drift'] == 0
+        assert report['skipped_fingerprint_drift_at_apply'] == 1
+        assert code == EXIT_FINGERPRINT_DRIFT
+
+    def test_benign_skip_counters_do_not_change_the_exit_code(
+        self, tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Only DRIFT is escalated to an exit code — the other skips are benign.
+
+        ``skipped_missing`` means a steward resolved the record and
+        ``skipped_no_longer_legacy`` that a concurrent write already fixed it;
+        ``skipped_error`` is self-healing because the pass is idempotent.  None
+        of those means the rewrite itself is unsafe, so none of them should make
+        a wrapper treat the run as failed.
+        """
+        _seeded_queue(tmp_path, *_mixed_pending())
+        monkeypatch.setattr(
+            _mod,
+            'apply_rewrites',
+            lambda queue, plan: {
+                'rewritten': 0,
+                'skipped_missing': 1,
+                'skipped_no_longer_legacy': 1,
+                'skipped_fingerprint_drift_at_apply': 0,
+                'skipped_error': 1,
+            },
+        )
+
+        code = main(['--queue-dir', str(tmp_path), '--apply'])
+
+        report = json.loads(capsys.readouterr().out)
+        assert (report['skipped_missing'], report['skipped_error']) == (1, 1)
+        assert code == EXIT_OK
+
+    def test_the_exit_codes_are_distinct_and_avoid_argparses_2(self):
+        """argparse exits 2 on a usage error; our codes must not collide with it."""
+        assert {EXIT_OK, EXIT_BAD_QUEUE_DIR, EXIT_FINGERPRINT_DRIFT} == {0, 1, 3}
