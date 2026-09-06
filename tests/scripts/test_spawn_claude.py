@@ -4212,3 +4212,91 @@ def test_mac_terminal_sibling_open_failure_yields_127_not_a_running_record(
         f"record must stay LAUNCHING for the stale-pid reaper, got "
         f"{record.status}"
     )
+
+
+# ===========================================================================
+# task-5137: a CREATED-but-EMPTY sentinel must never yield an empty exit code
+# ===========================================================================
+# esc-4389-4. spawn-claude.sh's finish() read the sentinel with
+# `rc=$(cat "$sentinel" 2>/dev/null || echo 127)`. The `|| echo 127` fallback
+# only fires when `cat` FAILS -- but `cat` on a zero-length file SUCCEEDS and
+# prints nothing, so rc became the empty string and was propagated into both
+# consumers verbatim:
+#
+#     usage: session_registry exit [-h] --record RECORD --code CODE
+#     session_registry exit: error: argument --code: invalid int value: ''
+#     ./skills/spawn/spawn-claude.sh: line 509: exit: : numeric argument required
+#     exit=2
+#
+# Two distinct damages: the caller sees bash's own usage code 2 instead of a
+# documented spawn verdict, and the session-registry record is left
+# un-updated because the CLI died in argument parsing.
+#
+# The gap is real because `>` creates and truncates BEFORE the write lands,
+# and every readiness gate in the script tests `[ -f "$sentinel" ]` only --
+# the create-then-write defect class _wait_for_path(require_nonempty=...)
+# (task 4776) already names on the Python side of this file. It is NOT task
+# 1643's defect (sentinel never written at all), where absence is
+# unambiguous and the `|| echo 127` fallback does fire.
+
+
+def test_zero_length_sentinel_never_yields_empty_code_or_nonnumeric_exit(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sentinel that exists but never settles must yield 127, not bash's 2.
+
+    Drives the shortest deterministic path into finish(): the `custom-term`
+    dispatch branch -> resolve_detached with launch_rc==0 -> await_sentinel
+    returns immediately because the file exists -> finish(). The terminal
+    plants the zero-length sentinel itself and never runs the payload, so
+    "exists, zero-length, never settles" is a precondition rather than a race
+    outcome and the test is deterministic in both directions.
+
+    127 is the right verdict here: the script's documented "no usable exit
+    code recovered" code, whose meaning this widens by exactly one clause
+    (the sentinel appeared but never settled to a numeric code) rather than
+    inventing a new one.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    # delay=None: the sentinel is created empty and NEVER settles.
+    _write_sentinel_planting_terminal(bin_dir, "custom-term")
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    # Verbatim observed failure (esc-4389-4), inlined so a future RED is
+    # self-explaining without digging the escalation out.
+    observed = (
+        "esc-4389-4 observed, verbatim:\n"
+        "  session_registry exit: error: argument --code: invalid int value: ''\n"
+        "  ./skills/spawn/spawn-claude.sh: line 509: exit: : numeric "
+        "argument required\n"
+        "  exit=2\n"
+        f"this run: rc={result.returncode}\nstderr:\n{stderr}"
+    )
+
+    assert b"numeric argument required" not in result.stderr, (
+        f"finish() must never run `exit \"\"` -- it read an empty sentinel as "
+        f"the exit code.\n{observed}"
+    )
+    assert b"invalid int value: ''" not in result.stderr, (
+        f"session_registry must never be handed an empty --code.\n{observed}"
+    )
+    assert result.returncode == 127, (
+        f"an unsettled sentinel must yield the documented 127 "
+        f"(no usable exit code recovered), never bash's usage code 2.\n"
+        f"{observed}"
+    )
+
+    # The registry half of the defect, which the exit code alone cannot see:
+    # asserting the record was actually UPDATED is strictly stronger than
+    # grepping stderr, because a CLI call that dies in argument parsing
+    # leaves the record stale rather than absent.
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.exit_code == 127, (
+        f"the session record must carry a well-formed integer exit code, got "
+        f"{record.exit_code!r} (status {record.status}).\n{observed}"
+    )
