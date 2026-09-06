@@ -82,8 +82,16 @@ __all__ = [
     'worktree_layout',
 ]
 
-#: Name every planted copy is written under, inside the planted tests dir.
-_COPY_FILENAME = 'test_copy_probe.py'
+#: Stem every planted copy's filename is built from, inside the planted tests
+#: dir.  The source's own stem is appended so two sources planted at the SAME
+#: layout under one ``tmp_path`` land in DIFFERENT files -- file-level
+#: isolation matching the ``sys.modules`` uniqueness `plant_reify_layout`
+#: already promises.  A single fixed name would leave the first copy's
+#: ``__file__`` pointing at the second copy's SOURCE, so a traceback,
+#: ``linecache`` read or ``inspect.getsource`` for the first would render the
+#: second's code -- actively misleading in exactly the import-time-failure
+#: debugging this harness exists for.
+_COPY_FILENAME_STEM = 'test_copy_probe'
 
 #: Prefix for the derived, temporary ``sys.modules`` key of a planted copy.
 _MODULE_NAME_PREFIX = '_reify_layout_probe_'
@@ -197,7 +205,12 @@ def plant_reify_layout(
     than supplied by each caller.  That is what keeps two suites' copies of the
     same layout from clobbering each other in ``sys.modules`` without either
     suite having to remember to pick a distinct prefix — uniqueness is a
-    property of this harness, not of every caller.
+    property of this harness, not of every caller.  The copy's FILENAME carries
+    *source*'s stem for the same reason and must stay in step with it: two
+    sources planted at one layout under one ``tmp_path`` would otherwise share
+    a file, leaving the first module's ``__file__`` pointing at the second's
+    source — distinct in ``sys.modules``, silently clobbered on disk, and so
+    rendering the wrong code in any traceback or ``inspect.getsource`` for it.
     """
     src = tmp_path / 'src'
     if plant_marker:
@@ -205,9 +218,10 @@ def plant_reify_layout(
         planted.parent.mkdir(parents=True, exist_ok=True)
         planted.write_text(_MARKER_STUB)
 
+    source_slug = re.sub(r'\W+', '_', Path(source).stem)
     tests_dir = src / tests_relpath
     tests_dir.mkdir(parents=True, exist_ok=True)
-    copied = tests_dir / _COPY_FILENAME
+    copied = tests_dir / f'{_COPY_FILENAME_STEM}_{source_slug}.py'
     shutil.copy2(source, copied)
 
     if not plant_marker:

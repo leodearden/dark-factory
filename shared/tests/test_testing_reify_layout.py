@@ -107,7 +107,9 @@ class TestPlantReifyLayout:
             source, tmp_path, bare_layout('shared'), marker=_VERIFY_MARKER
         )
 
-        expected = _tests_dir(tmp_path, bare_layout('shared')) / 'test_copy_probe.py'
+        expected = (
+            _tests_dir(tmp_path, bare_layout('shared')) / 'test_copy_probe_alpha_probe.py'
+        )
         assert mod.__file__ is not None, f'{mod!r} was loaded from a file and must have one'
         assert Path(mod.__file__) == expected, (
             f'the copy must be loaded from the PLANTED path {expected!r}, not '
@@ -209,9 +211,18 @@ class TestPlantReifyLayout:
     def test_two_sources_at_one_layout_get_distinct_module_names(self, tmp_path):
         """Two suites planting the same layout must not clobber each other.
 
-        The internal module name is DERIVED from the source and the layout
-        rather than supplied by each caller, so uniqueness is a property of the
-        harness instead of every caller remembering to pick a distinct prefix.
+        The internal module name AND the copy's filename are both DERIVED from
+        the source and the layout rather than supplied by each caller, so
+        uniqueness is a property of the harness instead of every caller
+        remembering to pick a distinct prefix.
+
+        Both halves are pinned, and the FILE half is the one an in-memory-only
+        check misses: the first module is already exec'd by the time the second
+        is planted, so a shared filename leaves `first` perfectly usable while
+        its ``__file__`` names a file whose contents are now the SECOND probe's
+        source.  Every after-the-fact read of that path — a traceback frame,
+        ``linecache``, ``inspect.getsource`` — then renders the wrong module,
+        in exactly the import-time-failure debugging this harness exists for.
         """
         first_source = _write_probe(tmp_path, 'epsilon_probe')
         second_source = _write_probe(tmp_path, 'zeta_probe')
@@ -226,6 +237,20 @@ class TestPlantReifyLayout:
             f'copy can clobber another\'s in sys.modules'
         )
         assert (first.PROBE_ID, second.PROBE_ID) == ('epsilon_probe', 'zeta_probe')
+
+        assert first.__file__ is not None and second.__file__ is not None
+        first_file, second_file = Path(first.__file__), Path(second.__file__)
+        assert first_file != second_file, (
+            f'both copies were written to {first_file!r}, so the second '
+            f'overwrote the first on disk even though their sys.modules keys '
+            f'differ — the first module now reports a __file__ whose contents '
+            f'are a DIFFERENT module'
+        )
+        assert 'epsilon_probe' in first_file.read_text(), (
+            f'{first_file!r} must still hold its own source after a second '
+            f'copy was planted at the same layout'
+        )
+        assert 'zeta_probe' in second_file.read_text()
 
 
 class TestLayoutBuilders:
