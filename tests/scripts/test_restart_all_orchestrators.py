@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -37,7 +38,12 @@ REPO_ROOT = Path(__file__).parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from df_pytest_isolation import assert_synthetic_units  # noqa: E402
+from df_pytest_isolation import (  # noqa: E402
+    CLOCK_PROVENANCE_SESSION_KEY,
+    CLOCK_PROVENANCE_SOURCE_KEY,
+    PYTEST_SESSION_TOKEN_ENV,
+    assert_synthetic_units,
+)
 
 SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"
 # The ORIGINAL synthetic literal, and the precedent task 3799's allowlist prefix
@@ -265,3 +271,115 @@ def test_unit_never_fresh_through_grace_still_fails(tmp_path: Path) -> None:
     assert clock_file.read_text() == sentinel, (
         f"clock file must be byte-identical after a failed verify; got {clock_file.read_text()!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 4823: the stamp carries its own provenance
+#
+# The clock guard in df_pytest_isolation could only see that a protected clock
+# moved, never who moved it, so a REAL redeploy straddling a suite was
+# indistinguishable from a test falsifying the clock. These pin the WRITE side
+# of the fix, end-to-end through the real script.
+#
+# Every assertion below names the key through the df_pytest_isolation constants
+# rather than through a string of its own. That is what makes this a drift pin
+# rather than a tautology: the pytest guard reads the keys it defines, so if
+# this script's literals ever diverged from them, the guard would stop
+# recognising production writes and go back to failing innocent runs — with
+# every test here still green if they compared literals to literals.
+# ---------------------------------------------------------------------------
+
+# The `source` value this script must claim: its own filename, which is what an
+# operator reading the clock file by hand needs in order to know which of the
+# two writers stamped it.
+_EXPECTED_SOURCE = "restart-all-orchestrators.sh"
+
+
+def test_the_stamp_carries_its_writer_and_this_sessions_token(tmp_path: Path) -> None:
+    """A test-spawned stamp is TAGGED as test-spawned — the whole discriminator.
+
+    The script inherits the ambient token because _run_script builds its child
+    env from dict(os.environ), which is the same free-tagging property the
+    drain-leak guard relies on. This is the write that must keep failing a run
+    (task 3797's exact defect: a test driving the REAL script against a fake
+    systemctl), and it is now self-evidently that rather than an inference from
+    "the bytes moved".
+    """
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+
+    result = _run_script(tmp_path, scenario="fresh", clock_file=clock_file)
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    stamped = json.loads(clock_file.read_text())
+    assert stamped[CLOCK_PROVENANCE_SOURCE_KEY] == _EXPECTED_SOURCE
+    assert stamped[CLOCK_PROVENANCE_SESSION_KEY] == os.environ[PYTEST_SESSION_TOKEN_ENV]
+
+
+def test_a_production_stamp_carries_an_empty_session_token(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The shape every GENUINE machine-operated redeploy writes.
+
+    An empty token is a positive statement — "no pytest session was an ancestor
+    of this write" — not an omission, which is why the key is always present.
+    An omitted key would be indistinguishable from a pre-4823 writer and would
+    (correctly, but uselessly) keep failing the innocent runs this task exists
+    to unblock. This is the exact input to the guard's external_redeploy verdict.
+    """
+    monkeypatch.delenv(PYTEST_SESSION_TOKEN_ENV, raising=False)
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+
+    result = _run_script(tmp_path, scenario="fresh", clock_file=clock_file)
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    stamped = json.loads(clock_file.read_text())
+    assert CLOCK_PROVENANCE_SESSION_KEY in stamped, (
+        f"the key must be PRESENT and empty, not omitted; got {stamped!r}"
+    )
+    assert stamped[CLOCK_PROVENANCE_SESSION_KEY] == ""
+    assert stamped[CLOCK_PROVENANCE_SOURCE_KEY] == _EXPECTED_SOURCE
+
+
+def test_the_uuid_token_survives_the_stamp_byte_for_byte(tmp_path: Path) -> None:
+    """The sanitiser must be a NO-OP for a real token.
+
+    The script sanitises before interpolating (printf cannot escape JSON), and a
+    sanitiser that mangled the ordinary case would break attribution silently:
+    the guard compares tokens for equality, so a single dropped character turns
+    "this run wrote it" into "some other session wrote it" — still a failure, but
+    the wrong one, with a misleading message.
+    """
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+    ambient = os.environ[PYTEST_SESSION_TOKEN_ENV]
+    assert re.fullmatch(r"[0-9a-f]{32}", ambient), (
+        f"the session token should be a uuid4().hex; got {ambient!r}"
+    )
+
+    result = _run_script(tmp_path, scenario="fresh", clock_file=clock_file)
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    stamped = json.loads(clock_file.read_text())
+    assert stamped[CLOCK_PROVENANCE_SESSION_KEY] == ambient
+
+
+def test_the_stamp_is_still_well_formed_json_for_a_hostile_token(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A corrupt clock body would be strictly WORSE than the bug being fixed.
+
+    printf cannot escape JSON, so an env value carrying a quote, a backslash, a
+    newline or a brace could otherwise produce a syntactically broken file --
+    and _read_clock_epoch fails OPEN on a corrupt body, which would disarm the
+    very min-interval cap this stamp exists to arm. The token's own value is not
+    asserted here (the sanitiser may drop characters from it); only that the
+    file a reader gets is still parseable and still carries a usable `ts`.
+    """
+    monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, 'ab"cd\\ef\ngh}ij')
+    clock_file = tmp_path / "last_redeploy_orchestrator.json"
+
+    result = _run_script(tmp_path, scenario="fresh", clock_file=clock_file)
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    stamped = json.loads(clock_file.read_text())
+    assert isinstance(stamped["ts"], (int, float)), f"ts must stay numeric; got {stamped!r}"
+    assert isinstance(stamped[CLOCK_PROVENANCE_SESSION_KEY], str)
