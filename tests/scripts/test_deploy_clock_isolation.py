@@ -974,6 +974,51 @@ class TestGuardIsLiveInThisRun:
                 pytrace=False,
             )
 
+    def test_this_session_carries_a_token_in_the_ambient_environment(self) -> None:
+        """The attribution mechanism is ARMED in this very process (task 4823).
+
+        The guard is autouse and session-scoped, so by the time any test runs it
+        has already stamped ``$DF_PYTEST_SESSION_TOKEN``. That ambient value is
+        the whole mechanism: every spawner here builds its child env from
+        ``dict(os.environ)``, so descendants — including the ones nobody has
+        written yet — are tagged for free, exactly as
+        :data:`df_pytest_isolation.LEAK_TOKEN_ENV` does for the drain-leak guard.
+        A stamper that stopped stamping would leave every clock write reading as
+        external, silently re-opening task 3797; nothing else in this file would
+        notice.
+        """
+        token = os.environ.get(PYTEST_SESSION_TOKEN_ENV)
+
+        assert token, (
+            f'${PYTEST_SESSION_TOKEN_ENV} is unset in a run where the guard '
+            'fixture is live; no clock write in this session can be attributed '
+            'to it, so a real falsification would read as an external redeploy.'
+        )
+
+    def test_the_benign_verdict_has_its_own_warning_class(self) -> None:
+        """A dedicated ``UserWarning`` subclass, deliberately not a bare
+        ``Warning`` and not a ``RuntimeWarning``.
+
+        The downgrade must stay a WARNING in every suite that imports this
+        module. This repo's only ``filterwarnings`` entries are targeted
+        ``error:<message-regex>:<category>`` pairs on ``RuntimeWarning`` /
+        ``PytestUnraisableExceptionWarning`` / ``PytestWarning``; a fresh
+        ``UserWarning`` subclass matches none of them, so the benign path cannot
+        be silently re-escalated into the failure it exists to replace.
+        """
+        warning_cls = getattr(df_pytest_isolation, 'DeployClockRedeployWarning', None)
+
+        assert warning_cls is not None, (
+            'df_pytest_isolation defines no DeployClockRedeployWarning; the '
+            'benign verdict has no channel to surface on.'
+        )
+        assert issubclass(warning_cls, UserWarning), (
+            f'{warning_cls!r} must subclass UserWarning'
+        )
+        assert not issubclass(warning_cls, RuntimeWarning), (
+            'RuntimeWarning is filtered to an error by orchestrator/pyproject.toml'
+        )
+
 
 # ---------------------------------------------------------------------------
 # The guard's FAILURE contract, exercised through a real nested pytest run.
@@ -1000,50 +1045,88 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from df_pytest_isolation import _df_deploy_clocks_unwritten  # noqa: F401
 '''
 
+_NESTED_STAMP_TS = 1786033966
+_NESTED_STAMP_ISO = '2026-08-06T16:32:46+00:00'
+# The pre-4823 body: no provenance, hence unattributable, hence a violation.
 _NESTED_STAMP_BODY = '{"ts": 1786033966, "iso": "2026-08-06T16:32:46+00:00"}'
 
+# What the nested test does to the protected clock. Named scenarios rather than
+# the original boolean, because task 4823 split "the clock moved" into three
+# outcomes that only a real run can tell apart: no write (exit 0), an
+# unattributable write (exit non-zero), and an attributed one (exit 0 WITH a
+# warning). A boolean cannot express the last two at once.
+_NESTED_SCENARIOS = ('clean', 'violating', 'external', 'own_token')
 
-def _nested_test_source(*, writes_clock: bool) -> str:
-    """Source for the nested test module — which PASSES either way.
 
-    Built by concatenation rather than ``str.format``: the stamp body is JSON, so
-    a template would have to escape its braces, and a mis-escaped one would
-    silently write a different file than the guard watches.
+def _nested_test_source(*, scenario: str) -> str:
+    """Source for the nested test module — which PASSES in every scenario.
+
+    The stamp bodies are built with ``json.dumps`` from THIS module's imported
+    key constants rather than from literals, so a key rename cannot leave the
+    nested writer emitting the old spelling while still looking right — the
+    failure mode that would make an ``external`` run silently fail closed and
+    read as a guard regression.
     """
-    body = (
-        (
-            '    clock = Path(__file__).resolve().parent / RELPATH\n'
-            '    clock.parent.mkdir(parents=True, exist_ok=True)\n'
-            f'    clock.write_text({_NESTED_STAMP_BODY!r})\n'
-        )
-        if writes_clock
-        else '    pass\n'
-    )
+    write = {
+        'clean': '    pass\n',
+        'violating': '    _stamp(LEGACY_BODY)\n',
+        # A genuine machine-operated redeploy: provenance, no pytest ancestor.
+        'external': "    _stamp(_provenance(''))\n",
+        # A test falsifying the clock, caught red-handed: the write inherits
+        # THIS nested session's own token through the ambient environment.
+        'own_token': '    _stamp(_provenance(os.environ[TOKEN_ENV]))\n',
+    }[scenario]
     return (
+        'import json\n'
+        'import os\n'
         'from pathlib import Path\n'
         '\n'
         f'RELPATH = {_FLEET_RELPATH!r}\n'
+        f'TOKEN_ENV = {PYTEST_SESSION_TOKEN_ENV!r}\n'
+        f'LEGACY_BODY = {_NESTED_STAMP_BODY!r}\n'
+        '\n'
+        '\n'
+        'def _stamp(body):\n'
+        '    clock = Path(__file__).resolve().parent / RELPATH\n'
+        '    clock.parent.mkdir(parents=True, exist_ok=True)\n'
+        '    clock.write_text(body)\n'
+        '\n'
+        '\n'
+        'def _provenance(session):\n'
+        '    return json.dumps({\n'
+        f'        "ts": {_NESTED_STAMP_TS}, "iso": {_NESTED_STAMP_ISO!r},\n'
+        f'        {CLOCK_PROVENANCE_SOURCE_KEY!r}: {_FLEET_SOURCE!r},\n'
+        f'        {CLOCK_PROVENANCE_SESSION_KEY!r}: session,\n'
+        '    })\n'
         '\n'
         '\n'
         'def test_a_forgetful_spawner():\n'
         '    """PASSES. The damage is to the checkout, not to this result."""\n'
-        + body
+        + write
     )
 
 
-def _nested_run(tmp_path: Path, *, writes_clock: bool) -> subprocess.CompletedProcess[str]:
+def _nested_run(tmp_path: Path, *, scenario: str) -> subprocess.CompletedProcess[str]:
     """Run a throwaway pytest session wired to the guard, in its own tmp checkout.
 
     The copied ``df_pytest_isolation.py`` sits at the tmp tree's root, so the
     guard's ``Path(__file__).resolve().parent`` resolves THERE and the protected
     clocks it watches are the tmp ones — the real checkout is never involved.
+
+    No ``env=``: the child inherits this session's environment, which is the
+    point.  The nested session's own guard fixture overwrites
+    ``$DF_PYTEST_SESSION_TOKEN`` with a fresh uuid and restores the prior value
+    on teardown, so the ``own_token`` scenario genuinely reads the NESTED token
+    rather than this one's — which is what makes it a test of attribution rather
+    than of inheritance.
     """
-    root = tmp_path / ('violating' if writes_clock else 'clean')
+    assert scenario in _NESTED_SCENARIOS, scenario
+    root = tmp_path / scenario
     root.mkdir()
     shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
     (root / 'pytest.ini').write_text(_NESTED_INI)
     (root / 'conftest.py').write_text(_NESTED_CONFTEST)
-    (root / 'test_forgetful.py').write_text(_nested_test_source(writes_clock=writes_clock))
+    (root / 'test_forgetful.py').write_text(_nested_test_source(scenario=scenario))
     return subprocess.run(
         [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
         cwd=root, capture_output=True, text=True, timeout=300,
@@ -1056,7 +1139,7 @@ class TestTheGuardFailsTheRunEndToEnd:
     def test_a_stamped_clock_fails_a_session_whose_tests_all_passed(
         self, tmp_path: Path,
     ) -> None:
-        result = _nested_run(tmp_path, writes_clock=True)
+        result = _nested_run(tmp_path, scenario='violating')
         combined = result.stdout + result.stderr
 
         assert result.returncode != 0, (
@@ -1079,13 +1162,73 @@ class TestTheGuardFailsTheRunEndToEnd:
         Without it the failure above could be any nested-harness breakage — a
         bad ini, an unimportable module, a missing pytest.
         """
-        result = _nested_run(tmp_path, writes_clock=False)
+        result = _nested_run(tmp_path, scenario='clean')
 
         assert result.returncode == 0, (
             f'the control run failed for an unrelated reason: '
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
         assert 'falsified a REAL deploy clock' not in result.stdout
+
+
+class TestTheGuardAttributesTheStampEndToEnd:
+    """THE FIX, observed where it actually matters: the RUN's exit code.
+
+    Task 4823. Everything above pins helpers and messages; none of it can show
+    that a run whose protected clock MOVED nonetheless exits 0 — a fixture
+    cannot pass or fail its own session, so only a nested run can observe it.
+    These two scenarios are the two halves of the discriminator, driven through
+    the real fixture rather than through the helper.
+    """
+
+    def test_an_external_redeploy_warns_and_leaves_the_run_green(
+        self, tmp_path: Path,
+    ) -> None:
+        """A REAL redeploy straddling the run must cost the run NOTHING.
+
+        This is the whole point of the task: on a busy merge queue a post-merge
+        verify runs for tens of minutes against a documented 8h redeploy
+        cadence, and the old guard's fail-closed default blocked four innocent
+        branches across two recovery sessions.
+
+        The warning must SURFACE, not merely be raised — a warning nobody sees
+        is the silent fail-soft this repo's invariants forbid — so the assertion
+        is on the nested run's own output, which is where an operator would read
+        it.
+        """
+        result = _nested_run(tmp_path, scenario='external')
+        combined = result.stdout + result.stderr
+
+        assert result.returncode == 0, (
+            'an attributed external redeploy still failed the run — the '
+            f'downgrade is not wired. output={combined!r}'
+        )
+        assert '1 passed' in combined, combined
+        assert 'a REAL deploy stamped a protected clock' in combined, (
+            'the benign verdict was not surfaced in the run output; a warning '
+            f'nobody can read is indistinguishable from silence. output={combined!r}'
+        )
+        assert 'falsified a REAL deploy clock' not in combined, combined
+
+    def test_a_write_carrying_the_sessions_own_token_still_fails_the_run(
+        self, tmp_path: Path,
+    ) -> None:
+        """Task 3797, preserved and STRENGTHENED: now proven, not inferred.
+
+        The nested test reads ``$DF_PYTEST_SESSION_TOKEN`` at run time, so the
+        stamp carries the NESTED session's own token — the exact signature of a
+        test spawning a writer that forgot to redirect its clock. The run must
+        still end non-zero even though its only test passed.
+        """
+        result = _nested_run(tmp_path, scenario='own_token')
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a run that stamped a protected clock with its OWN session token '
+            f'exited 0 — the 3797 defence is disarmed. output={combined!r}'
+        )
+        assert '1 passed' in combined, combined
+        assert 'falsified a REAL deploy clock' in combined, combined
 
 
 # The sibling that used to reach into THIS module for the marker helper. Named
