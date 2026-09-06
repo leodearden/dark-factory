@@ -60,15 +60,25 @@ def _cutoff(days: int, *, now: datetime | None = None) -> str:
     The ISO-with-offset return value is load-bearing, not cosmetic: it is
     compared against ``task_results.completed_at``, which orchestrator
     writes via ``datetime.now(UTC).isoformat()`` (``run_store.py::save_run``).
-    A SQLite-side ``datetime()`` call passed a ``'now'`` modifier renders
-    SPACE-separated with no offset, so a lexical TEXT comparison against it
-    short-circuits at index 10 on ``'T'`` (0x54) vs ``' '`` (0x20) and
-    silently degrades to DATE granularity — over-including up to a full
-    extra day (task 4624).
+    A SQLite-side ``datetime('now', ...)`` call renders SPACE-separated with
+    no offset, so a lexical TEXT comparison against it short-circuits at
+    index 10 on ``'T'`` (0x54) vs ``' '`` (0x20) and silently degrades to
+    DATE granularity — over-including up to a full extra day (task 4624).
     """
     return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
+# KNOWN RESIDUAL EXPOSURE (task 4624, deliberately out of scope — see design
+# decision): `datetime(MAX(completed_at), '-{days} days')` below is the same
+# defect family task 4624 fixed elsewhere in this module. SQLite renders it
+# SPACE-separated with no UTC offset, and callers below compare it lexically
+# against the ISO-with-offset `completed_at` column, which silently degrades
+# to DATE granularity and over-includes rows up to a full extra day. Not
+# fixed here because the semantics differ (anchored to per-project
+# MAX(completed_at), not to `now`) and it would change results for the four
+# panels that consume `_project_cutoffs`. Follow-up filed:
+# tkt_0RTBEQD6PKQPD5P7N30DAXTFFQ (a fused-memory ticket; the curator
+# converts it to a task_id asynchronously).
 _WINDOW_SQL = """\
 SELECT project_id,
        datetime(MAX(completed_at), '-{days} days') AS cutoff
@@ -656,11 +666,11 @@ async def _hour_bucketed_history(
             default) resolves to the current UTC clock.
     """
     # The cutoff is bound as a TEXT parameter (via _cutoff) rather than
-    # computed SQL-side via a datetime() call passed a 'now' modifier:
-    # SQLite's datetime() renders SPACE-separated with no UTC offset, which
-    # — compared lexically against the ISO-with-offset `completed_at`
-    # column — short-circuits at index 10 and silently degrades to DATE
-    # granularity, over-including up to a full extra day (task 4624).
+    # computed SQL-side via datetime('now', ...): SQLite's datetime()
+    # renders SPACE-separated with no UTC offset, which — compared
+    # lexically against the ISO-with-offset `completed_at` column —
+    # short-circuits at index 10 and silently degrades to DATE granularity,
+    # over-including up to a full extra day (task 4624).
     # Binding the cutoff instead keeps idx_task_results_project (project_id
     # + completed_at) usable as a covering index for the WHERE clause —
     # re-confirmed via EXPLAIN QUERY PLAN and pinned by
@@ -746,8 +756,8 @@ async def _per_db_history(
     The cache key deliberately excludes ``now``/the derived cutoff: this
     endpoint is polled every 3s with ``now=None``, so keying on the cutoff
     would make every request miss and defeat the cache's purpose. This is
-    not a new staleness risk — the previous SQL-side cutoff (a datetime()
-    call passed a 'now' modifier) already moved between calls while the key
+    not a new staleness risk — the previous SQL-side cutoff
+    (``datetime('now', ...)``) already moved between calls while the key
     stayed fixed, so omitting ``now`` here preserves that existing
     behaviour exactly (see design decision, task 4624). Callers that vary
     ``now`` across calls on the same ``db`` (i.e. tests) must clear

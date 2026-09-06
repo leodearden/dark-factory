@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import sqlite3
@@ -2096,10 +2097,47 @@ class TestAggregatePerformanceHistoryWindowBoundary:
             )
 
         assert captured, 'Expected _cutoff to be called at least once'
+        assert len(captured) >= 2, (
+            f'Expected at least 2 calls (discovery leg + at least one '
+            f'per-project bucketing leg) so this test cannot pass '
+            f'vacuously off the discovery call alone; got {captured!r}'
+        )
         assert all(now == fixed_now for now in captured), (
             f'Expected every _cutoff call to receive now={fixed_now!r} '
             f'(never None), got {captured!r}'
         )
+
+
+def _iter_non_docstring_string_literals(tree: ast.AST):
+    """Yield every string-literal ``ast.Constant`` node in *tree*, excluding
+    module/class/function docstrings.
+
+    Used to restrict a source-scanning guard to string content that could
+    actually reach SQLite as a query, rather than every physical source
+    line. Comments are never part of the AST at all, so walking the tree
+    already excludes them; explicitly excluding docstring nodes here closes
+    the other gap -- a naive whole-file substring scan flags both, which is
+    why prose in performance.py previously had to avoid spelling out the
+    forbidden pattern literally.
+    """
+    docstring_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                docstring_ids.add(id(body[0].value))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstring_ids
+        ):
+            yield node
 
 
 def test_no_sql_side_clock_reads_in_data_layer():
@@ -2107,20 +2145,39 @@ def test_no_sql_side_clock_reads_in_data_layer():
     SQL-side `datetime('now', ...)` call (task 4624 -- its 4th recorded
     sighting of this defect class).
 
-    Modelled on test_clock_discipline.py:157-175's source-scanning guard. A
-    SQL-side clock read renders SPACE-separated with no UTC offset and is
-    then compared lexically against ISO-with-offset TEXT -- exactly the
-    defect this task fixes. Does not fire on `_project_cutoffs`
-    (performance.py), which uses `datetime(MAX(completed_at), ...)` and is
-    deliberately out of scope for this task (see design decision).
+    Modelled on test_clock_discipline.py:157-175's source-scanning guard,
+    but restricted to non-docstring string literals (via
+    `_iter_non_docstring_string_literals`) rather than every physical
+    source line -- so a comment or docstring *naming* the forbidden pattern
+    in prose (as performance.py's do) cannot trip a false positive; only
+    string literals that could actually reach SQLite as a query are
+    inspected. Does not fire on `_project_cutoffs` (performance.py), which
+    uses `datetime(MAX(completed_at), ...)` and is deliberately out of
+    scope for this task (see design decision).
+
+    Placement note: this guard belongs conceptually next to
+    `test_clock_discipline.py::test_no_bare_clock_reads_in_data_modules`,
+    which already owns the `_DATA_DIR` scan root this test re-derives. It
+    stays here rather than being relocated because `test_clock_discipline.py`
+    is not one of the modules this task holds a lock on
+    (`dashboard/src/dashboard/data/performance.py` and this file only); the
+    move is filed as a follow-up instead of being done here.
     """
     data_dir = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'data'
     violations: list[str] = []
     for path in sorted(data_dir.glob('*.py')):
         rel = path.relative_to(data_dir.parent.parent)
-        for lineno, text in enumerate(path.read_text().splitlines(), start=1):
-            if "datetime('now'" in text or 'datetime("now"' in text:
-                violations.append(f'{rel}:{lineno}: {text.strip()}')
+        source = path.read_text()
+        source_lines = source.splitlines()
+        tree = ast.parse(source, filename=str(path))
+        for node in _iter_non_docstring_string_literals(tree):
+            if "datetime('now'" not in node.value and 'datetime("now"' not in node.value:
+                continue
+            start, end = node.lineno, getattr(node, 'end_lineno', node.lineno)
+            for lineno in range(start, end + 1):
+                text = source_lines[lineno - 1] if 0 < lineno <= len(source_lines) else ''
+                if "datetime('now'" in text or 'datetime("now"' in text:
+                    violations.append(f'{rel}:{lineno}: {text.strip()}')
 
     assert not violations, (
         "SQL-side datetime('now', ...) clock read(s) found -- compute the "
