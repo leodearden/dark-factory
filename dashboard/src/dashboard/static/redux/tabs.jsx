@@ -303,9 +303,21 @@ function OrchTab({ projectFilter, search }) {
                             <td style={{ color: isDone ? 'var(--fg-2)' : 'var(--fg-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.title}>{t.title}</td>
                             {/* `agent` is worktree presence, not liveness. The strand
                                 verdict (task 3543) rides alongside it, gated on its own
-                                server-computed field — never on the agent value. */}
+                                server-computed field — never on the agent value.
+
+                                The em-dash placeholder is DIMMED (task 4408) because it
+                                sits directly beside that badge, which is the one place an
+                                operator scans for "is anything actually claiming this
+                                task" — an undimmed placeholder renders at exactly the
+                                colour a real agent name would and reads as a claimant.
+                                The sibling lane/phase/state cells below keep rtCell's
+                                undimmed em-dash at var(--fg-2) ON PURPOSE: theirs marks an
+                                OFFLINE-snapshot degradation, a different meaning, with
+                                nothing beside it an operator reads as a claim signal.
+                                This cell is the deliberate exception, not the start of a
+                                sweep. */}
                             <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {agentCellState(t, { placeholder: '—' }).text}
+                              {(() => { const ac = agentCellState(t, { placeholder: '—' }); return ac.color ? <span style={{ color: ac.color }}>{ac.text}</span> : ac.text; })()}
                               {(() => { const sb = strandBadgeState(t, { marginLeft: 4 }); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}
                             </td>
                             <td className="num">{rtCell(t.loops)}</td>
