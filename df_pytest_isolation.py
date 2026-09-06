@@ -62,6 +62,47 @@ its fused-memory clock and the fleet script it spawns land in the main checkout
 whichever worktree invoked them.  One root would have left the second protected
 path watched-but-unwritable-to, i.e. green and useless.
 
+THAT SECOND ROOT IS ALSO WHAT MADE THE GUARD ACCUSE THE INNOCENT, and task 4823
+is the fix.  The main checkout is machine-operated, so a GENUINE redeploy there
+moves a clock a worktree suite is watching — and the original guard could see
+only that the bytes moved.  Its own message named the benign reading ("a REAL
+fleet redeploy fired while this suite was running") but had no way to rule it
+IN, so it failed closed on every change.  Correct as a default; wrong often
+enough in practice that a post-merge orchestrator verify (26-41 min) run against
+a documented 8h redeploy cadence blocked FOUR innocent branches across two
+independent recovery sessions, with 17 occurrences in the archived verify logs.
+
+The discriminator is provenance, carried in the stamp itself.  Both writers now
+emit ``source`` (which writer) and ``pytest_session`` (the ambient
+``DF_PYTEST_SESSION_TOKEN``, empty when no pytest session was an ancestor of the
+write) alongside ``ts``/``iso``; ``clock_stamp_provenance`` parses it and
+``deploy_clock_change_report`` decides.  The ambient token is the SAME mechanism
+``df_pytest_isolation.py::LEAK_TOKEN_ENV`` established for the drain-leak guard
+one task earlier, for the same reason and with the same save/restore-``prior``
+stamping: every spawner here builds its child env from ``dict(os.environ)``, so
+descendants are tagged for free — including the ones nobody has written yet.
+``df_pytest_isolation.py::_df_no_leaked_drain_processes``' docstring names THIS
+guard as the one that could not attribute what it found; that is no longer true.
+
+Only a POSITIVELY attributed external write is downgraded (to a
+``DeployClockRedeployWarning``, run still green).  Everything else — a
+provenance-free or unparseable body, a DELETED file, an unstamped token, or a
+token belonging to a DIFFERENT pytest session — still fails, exactly as before.
+Fail-closed on ambiguity is what keeps this from being a blanket weakening of a
+defence whose whole point is that a silently-disarmed 8h backstop is invisible,
+and it is what makes the change safe to land with no coordinated writer rollout:
+a stamp from any writer not yet taught provenance reads as unattributable.
+
+THE RESIDUAL GAP, stated plainly rather than left to be rediscovered: a test
+that spawns a clock writer through an env-SCRUBBING seam — a fake
+``systemd-run`` transient unit, say — loses the token, so its write would carry
+an empty ``pytest_session`` and read as external.  Accepted, on two grounds.
+3797's actual defect class is a spawner that copies ``dict(os.environ)`` and
+merely forgets the clock var, which is covered in full; and the measured cost of
+the old behaviour was four innocent branches blocked.  If a scrubbing spawner is
+ever added, the fix is to thread the token through it, not to retire the
+downgrade.
+
 THIRD DEFENCE — a test's spawn timeout can never leak a process group.
 
 Task 3798.  Both pytest harnesses that drive
@@ -463,11 +504,17 @@ def deploy_clock_guard_roots(
     clock was being falsified, which is the same "green and useless" failure the
     relpath drift pin exists to prevent.
 
-    The cost is accepted deliberately: a GENUINE concurrent redeploy in the
-    machine-operated main checkout now fails a worktree suite too, not just a
-    main-checkout one.  That is the loud-over-silent trade this whole defence is
-    built on, and it is why the failure message prints the absolute path plus
-    both observed bodies — so "real redeploy" is one glance away from "test bug".
+    The cost was accepted deliberately, and task 4823 has since REMOVED most of
+    it: a GENUINE concurrent redeploy in the machine-operated main checkout used
+    to fail a worktree suite too, not just a main-checkout one.  That is the
+    loud-over-silent trade this whole defence is built on, and it is why the
+    message prints the absolute path plus both observed bodies — so "real
+    redeploy" is one glance away from "test bug".  Since 4823 a stamp bearing
+    provenance no longer needs that glance: it is attributed and downgraded to a
+    :class:`DeployClockRedeployWarning`.  The cost paragraph still holds
+    unchanged for any stamp that does NOT bear provenance, which is the
+    fail-closed default — so widening the guarded roots is still a decision
+    about how loudly to fail on an unattributable change.
 
     Own checkout FIRST and deduped, so the message names the run's own checkout
     when both were touched, and so a suite running in the main checkout (where
@@ -525,6 +572,26 @@ def deploy_clock_snapshot(
 PYTEST_SESSION_TOKEN_ENV = 'DF_PYTEST_SESSION_TOKEN'
 CLOCK_PROVENANCE_SOURCE_KEY = 'source'
 CLOCK_PROVENANCE_SESSION_KEY = 'pytest_session'
+
+
+class DeployClockRedeployWarning(UserWarning):
+    """A REAL deploy stamped a protected clock while a test run was in flight.
+
+    The BENIGN reading of a moved clock, and the one
+    :func:`_df_deploy_clocks_unwritten` could name but never rule in before task
+    4823.  Seeing this in a verify or merge-lane run means a genuine fleet or
+    component redeploy straddled that run: the branch is not at fault, no test
+    or spawner wrote the file, and there is nothing to fix.
+
+    A ``UserWarning`` subclass on purpose.  This repo's only ``filterwarnings``
+    entries (``orchestrator/pyproject.toml``) are targeted
+    ``error:<message-regex>:<category>`` pairs on ``RuntimeWarning`` /
+    ``PytestUnraisableExceptionWarning`` / ``PytestWarning``; a fresh
+    ``UserWarning`` subclass matches none of them, so the downgrade cannot be
+    silently re-escalated back into the failure it replaces.  Dedicated rather
+    than a bare ``UserWarning`` so a suite that wants the old strictness can
+    filter exactly this one to an error.
+    """
 
 
 def clock_stamp_provenance(entry: tuple[bytes, int] | None) -> dict[str, str] | None:
@@ -861,6 +928,25 @@ def _df_deploy_clocks_unwritten():
     spawned it.  So the guard watches exactly the files a forgetful spawner would
     hit, in every checkout it could hit them in.
 
+    ATTRIBUTES, since task 4823 — it no longer fails every change it sees.  It
+    stamps a fresh per-session token into :data:`PYTEST_SESSION_TOKEN_ENV` and
+    reads it back out of the stamp at teardown, so a moved clock is answered
+    with WHO moved it: this run (fail), an unattributable writer (fail, the
+    unchanged default), or a provenance-bearing writer with no pytest ancestor —
+    a real redeploy — which warns with :class:`DeployClockRedeployWarning` and
+    leaves the run green.  See :func:`deploy_clock_change_report` for the full
+    verdict table and :func:`clock_stamp_provenance` for why the discriminator
+    is the token and never the writer's ``source``.
+
+    The token lives in the ENVIRONMENT for the same reason
+    :data:`LEAK_TOKEN_ENV` does, and that fixture established the mechanism:
+    every spawner here builds its child env from ``dict(os.environ)``, so
+    descendants are tagged for free — including the ones nobody has written yet,
+    which is the whole population this defence exists for.  The prior value is
+    saved and restored exactly (popped when it was absent), because conftests
+    nest and this module's own end-to-end tests run nested pytest sessions that
+    must read THEIR token, not an outer one.
+
     SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp``
     documents — cost (a function-scoped autouse fixture runs once per test,
     times every xdist worker) and coverage (a write from a module- or
@@ -873,24 +959,40 @@ def _df_deploy_clocks_unwritten():
     while a suite runs there.  A restoring guard would silently roll back a
     GENUINE fleet-deploy stamp, re-opening the very 8h window this defence
     exists to close — and doing it invisibly, which is strictly worse than the
-    bug.  Hence the failure message names the benign concurrent-redeploy
-    reading alongside the test-bug one.
+    bug.  Attribution does not change that: knowing a stamp is genuine is a
+    reason to leave it alone, not a licence to touch it.
 
     A failure raised in teardown surfaces as a run-level ERROR with a non-zero
     exit code even when every test passed.  That is the intended loudness: the
     damage is to production state, not to any one test's result.
     """
+    token = uuid.uuid4().hex
+    prior = os.environ.get(PYTEST_SESSION_TOKEN_ENV)
+    os.environ[PYTEST_SESSION_TOKEN_ENV] = token
     roots = deploy_clock_guard_roots(Path(__file__).resolve().parent)
     before = [(root, deploy_clock_snapshot(root)) for root in roots]
     try:
         yield
     finally:
+        # Restore BEFORE evaluating: nested sessions (this module's own
+        # end-to-end tests run some) must not inherit a token that has stopped
+        # being current. Mirrors _df_no_leaked_drain_processes exactly.
+        if prior is None:
+            os.environ.pop(PYTEST_SESSION_TOKEN_ENV, None)
+        else:
+            os.environ[PYTEST_SESSION_TOKEN_ENV] = prior
         for root, snapshot in before:
-            reason = deploy_clock_violation_reason(
-                snapshot, deploy_clock_snapshot(root), root=root,
+            report = deploy_clock_change_report(
+                snapshot, deploy_clock_snapshot(root),
+                session_token=token, root=root,
             )
-            if reason is not None:
-                pytest.fail(reason, pytrace=False)
+            if report is None:
+                continue
+            verdict, message = report
+            if verdict == 'external_redeploy':
+                warnings.warn(message, DeployClockRedeployWarning, stacklevel=1)
+                continue
+            pytest.fail(message, pytrace=False)
 
 
 # ---------------------------------------------------------------------------
