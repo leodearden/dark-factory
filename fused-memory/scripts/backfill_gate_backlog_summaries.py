@@ -76,7 +76,7 @@ from datetime import datetime
 
 from escalation.dedupe import gate_backlog_fingerprint_key
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue
+from escalation.queue import EscalationQueue, escalation_id_lock
 
 from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
@@ -352,18 +352,57 @@ def apply_rewrites(queue: EscalationQueue, plan: BackfillPlan) -> dict:
     """
     rewritten = 0
     skipped_missing = 0
+    skipped_no_longer_legacy = 0
     for rewrite in plan.rewrites:
-        path = queue.queue_dir / f'{rewrite.escalation_id}.json'
-        if not path.exists():
-            logger.info(
-                'Skipping %s: no longer in the queue root (resolved/archived '
-                'between planning and applying)', rewrite.escalation_id,
-            )
-            skipped_missing += 1
-            continue
-        esc = Escalation.from_json(path.read_text())
-        esc.summary = rewrite.new_summary
-        esc.detail = rewrite.new_detail
-        queue._rewrite(rewrite.escalation_id, esc)
-        rewritten += 1
-    return {'rewritten': rewritten, 'skipped_missing': skipped_missing}
+        # Lock-scoped read-modify-write.  These records are LIVE fold targets:
+        # every Stage-1 cycle folds repeats into them via attach_dedupe_child,
+        # which mutates dedupe_count/dedupe_children/severity/updated_at.  A
+        # lock-free read-then-write would silently REVERT a fold that landed in
+        # between — i.e. it would touch exactly the fields this backfill is
+        # forbidden to touch.  escalation/src/escalation/sweep.py is the
+        # in-repo precedent for an external module importing the exported lock
+        # and doing raw lock-scoped file work.
+        with escalation_id_lock(queue.queue_dir, rewrite.escalation_id):
+            path = queue.queue_dir / f'{rewrite.escalation_id}.json'
+            if not path.exists():
+                logger.info(
+                    'Skipping %s: no longer in the queue root (resolved/archived '
+                    'between planning and applying)', rewrite.escalation_id,
+                )
+                skipped_missing += 1
+                continue
+            esc = Escalation.from_json(path.read_text())
+
+            # Re-check INSIDE the lock, closing the TOCTOU window exactly as
+            # sweep._relocate_terminal re-checks its target.  A record that
+            # stopped being legacy since planning (a concurrent rewrite, or a
+            # resolution flipping status) must be left alone, not overwritten.
+            if not is_legacy_gate_backlog_record(esc):
+                logger.info(
+                    'Skipping %s: no longer matches the legacy shape at apply time',
+                    rewrite.escalation_id,
+                )
+                skipped_no_longer_legacy += 1
+                continue
+
+            # Rebuild from the FRESHLY READ record rather than reusing the
+            # planned strings, so a detail change that landed since planning is
+            # carried forward instead of being clobbered by stale text.
+            esc.summary = rebuild_summary(esc.task_id, extract_gate_escalated_at(esc.detail))
+            esc.detail = rebuild_detail(esc.detail)
+            # ONLY the two assignments above.  updated_at stays as found — see
+            # this function's docstring.
+            #
+            # queue._rewrite, not queue.submit(): escalation_id_lock opens a
+            # FRESH fd per call and flock is per-open-file-description, so
+            # submit()'s own escalation_id_lock would take a second LOCK_EX on a
+            # second fd and SELF-DEADLOCK inside ours (measured).  _rewrite is
+            # the same unlocked atomic writer attach_dedupe_child calls inside
+            # its own lock.
+            queue._rewrite(rewrite.escalation_id, esc)
+            rewritten += 1
+    return {
+        'rewritten': rewritten,
+        'skipped_missing': skipped_missing,
+        'skipped_no_longer_legacy': skipped_no_longer_legacy,
+    }
