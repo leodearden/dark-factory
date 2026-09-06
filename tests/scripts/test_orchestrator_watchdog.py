@@ -37,7 +37,10 @@ if str(REPO_ROOT.resolve()) not in sys.path:
     sys.path.append(str(REPO_ROOT.resolve()))
 
 from df_pytest_isolation import (  # noqa: E402
+    CLOCK_PROVENANCE_SESSION_KEY,
+    CLOCK_PROVENANCE_SOURCE_KEY,
     PIPE_CLOSING_LEAKER_SRC,
+    PYTEST_SESSION_TOKEN_ENV,
     assert_synthetic_units,
     load_scaled_grace,
     read_leaked_pid,
@@ -6513,6 +6516,111 @@ def test_stamp_and_read_fm_deploy_clock_roundtrip(
     assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
     assert wdog._read_last_fm_deploy_epoch() == pytest.approx(1783000000.0)
     assert isinstance(wdog._read_last_fm_deploy_epoch(), float)
+
+
+# ---------------------------------------------------------------------------
+# task 4823: the clock stamp carries its own provenance
+#
+# The watchdog is the SECOND of the two clock writers (restart-all-orchestrators.sh
+# is the first) and it owns three clocks through one _stamp_clock primitive. The
+# pytest-side deploy-clock guard could previously see only that a protected clock
+# had MOVED, never who moved it, so a real redeploy straddling a suite failed
+# innocent runs. These pin this writer's half of the contract.
+#
+# Every key is named through the df_pytest_isolation constants rather than a
+# literal of this file's own: that is what makes these drift pins rather than
+# tautologies, since the guard reads the keys IT defines and neither tier can
+# import the other (the watchdog is stdlib-only, and df_pytest_isolation is
+# stdlib+pytest-only because every subproject conftest imports it).
+# ---------------------------------------------------------------------------
+
+# A stand-in for a real uuid4().hex; the shape a live session actually stamps.
+_SESSION_TOKEN_SENTINEL = "3f9c1a8b2d7e4f60a5b3c1d9e7f50246"
+
+
+def test_stamp_clock_records_its_writer_and_the_ambient_session_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A test-spawned stamp is TAGGED as test-spawned.
+
+    The token is read from the ambient environment at write time, which is what
+    lets a suite-wide guard attribute a write it did not make itself: every
+    spawner in this repo builds its child env from dict(os.environ), so
+    descendants inherit it for free.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _SESSION_TOKEN_SENTINEL)
+    clock_file = tmp_path / "clock.json"
+
+    assert wdog._stamp_clock(str(clock_file)) is True
+
+    body = json.loads(clock_file.read_text())
+    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
+    assert body[CLOCK_PROVENANCE_SESSION_KEY] == _SESSION_TOKEN_SENTINEL
+
+
+def test_stamp_clock_records_an_empty_token_outside_a_pytest_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The shape every GENUINE deploy writes — and the guard's one forgiving input.
+
+    ALWAYS present, never omitted: an empty string is the positive statement "no
+    pytest session was an ancestor of this write", whereas a missing key is
+    indistinguishable from a pre-4823 writer and correctly keeps failing closed.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.delenv(PYTEST_SESSION_TOKEN_ENV, raising=False)
+    clock_file = tmp_path / "clock.json"
+
+    wdog._stamp_clock(str(clock_file))
+
+    body = json.loads(clock_file.read_text())
+    assert CLOCK_PROVENANCE_SESSION_KEY in body, (
+        f"the key must be PRESENT and empty, not omitted; got {body!r}"
+    )
+    assert body[CLOCK_PROVENANCE_SESSION_KEY] == ""
+    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
+
+
+def test_stamp_clock_keeps_ts_and_iso_readable(tmp_path: pathlib.Path) -> None:
+    """The additive-schema guarantee the three readers depend on.
+
+    Every reader extracts `ts` and nothing else, so the two new keys must be
+    inert to all of them. Asserted through the real reader rather than by
+    eyeballing the body: a schema change that broke _read_clock_epoch would
+    disarm all three min-interval caps at once.
+    """
+    wdog = _load_watchdog()
+    clock_file = tmp_path / "clock.json"
+
+    wdog._stamp_clock(str(clock_file))
+
+    epoch = wdog._read_clock_epoch(str(clock_file), "test clock")
+    assert epoch is not None
+    assert epoch == pytest.approx(time.time(), abs=60)
+    assert isinstance(json.loads(clock_file.read_text())["iso"], str)
+
+
+def test_the_fm_deploy_clock_stamp_carries_provenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The fm clock covered EXPLICITLY, not by inheritance from _stamp_clock.
+
+    It is the second PROTECTED_DEPLOY_CLOCK_RELPATHS entry and the one the
+    measured 2026-08-28 incidents actually pointed at — the genuine event there
+    was a fused-memory component redeploy, not an orchestrator one — so the path
+    that stamps it must be shown to carry provenance in its own right.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _SESSION_TOKEN_SENTINEL)
+    clock_file = tmp_path / "data" / "fused-memory" / "last_redeploy_fused_memory.json"
+    monkeypatch.setattr(wdog, "FM_DEPLOY_CLOCK_PATH", str(clock_file))
+
+    wdog._stamp_fm_deploy_clock()
+
+    body = json.loads(clock_file.read_text())
+    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
+    assert body[CLOCK_PROVENANCE_SESSION_KEY] == _SESSION_TOKEN_SENTINEL
 
 
 def test_read_last_fm_deploy_epoch_missing_file_returns_none(
