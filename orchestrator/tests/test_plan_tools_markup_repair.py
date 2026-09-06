@@ -825,8 +825,32 @@ class TestRepairableFieldTable:
         ``reuse``), and per :func:`_alternate_writer_changed_the_cell`'s
         contract a refusal is conclusive proof the cell was not written;
         only an OBSERVED, UNDECLARED change fails this test.
+
+        The failure message is assembled HERE rather than left to pytest's
+        set-of-tuples diff: the whole value of this check to the next person
+        who trips it is knowing WHICH row to edit, so each finding names the
+        row's schema owner, that row's current ``also_written_by``, and the
+        one-word remedy.
         """
-        assert _undeclared_alternates(tmp_path, monkeypatch) == set()
+        undeclared = _undeclared_alternates(tmp_path, monkeypatch)
+        rows = {(r.collection, r.field): r for r in plan_tools._REPAIRABLE_PLAN_FIELDS}
+        findings = []
+        for tool_name, collection, field in sorted(
+            undeclared, key=lambda triple: (triple[1] or '', triple[2], triple[0])
+        ):
+            record = rows[(collection, field)]
+            address = f'{collection}.{field}' if collection else f'{field} (top level)'
+            findings.append(
+                f'  {tool_name} was OBSERVED writing {address}, whose row names '
+                f'schema owner {_COLLECTION_SCHEMA_TOOL_NAME[collection]!r} and '
+                f'also_written_by {tuple(record.also_written_by)!r} — add '
+                f'{tool_name!r} to that row\'s also_written_by'
+            )
+        assert not undeclared, (
+            'the table under-reports a real writer — a fact about the cell '
+            'would send a triager to its schema owner, which is not where the '
+            'corruption could have come from:\n' + '\n'.join(findings)
+        )
 
     def test_no_non_prose_parameter_is_ever_a_recovery_target(self):
         """Identifiers, enums and lists may never receive a recovered string.
