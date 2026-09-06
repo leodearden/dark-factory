@@ -404,6 +404,37 @@ class TestReconConfigDirHelpers:
         # sibling accidentally created under the cwd by the rmtree call.
         assert recon_config_base_dir(Path('data/reconciliation')).is_absolute()
 
+    def test_a_mock_data_dir_touches_no_filesystem(self, tmp_path, monkeypatch):
+        """A mock journal's data_dir must not become a real directory.
+
+        Many stage tests in this suite drive BaseStage with an AsyncMock journal,
+        so ``self.journal.data_dir`` is a mock rather than a Path. That is fine
+        only as long as this function leaves it alone: MagicMock and AsyncMock
+        both implement ``__fspath__``, so ``Path(mock)`` coerces silently to the
+        RELATIVE path ``AsyncMock/mock.data_dir/<id>`` — which absolutization
+        would anchor at the cwd and ``TaskConfigDir.__init__`` would really
+        ``mkdir(parents=True)``, littering the repo with junk directories on
+        every suite run (and sweeping them into any subsequent ``git add``).
+
+        Used as given, the mock's own ``__truediv__`` returns another mock and
+        nothing reaches the filesystem. This leaf pins that, composing the chain
+        exactly as ``stages/base.py::BaseStage.run`` does.
+        """
+        from shared.config_dir import TaskConfigDir
+
+        from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
+
+        journal = MagicMock()
+        monkeypatch.chdir(tmp_path)
+        TaskConfigDir(
+            task_id='run-x', base_dir=recon_config_base_dir(journal.data_dir),
+        )
+
+        assert list(tmp_path.iterdir()) == [], (
+            f'A mock data_dir must not be coerced into a real path; the chain '
+            f'created {[p.name for p in tmp_path.iterdir()]!r} under the cwd'
+        )
+
     def test_production_chain_yields_an_absolute_config_dir(
         self, tmp_path, monkeypatch
     ):

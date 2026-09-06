@@ -494,12 +494,28 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     realpaths both sides of the containment comparison, which is the semantics
     Landlock itself uses (it resolves rules by O_PATH fd).
 
+    ``data_dir`` is used AS GIVEN rather than re-wrapped in ``Path(...)``, which
+    honours the annotation instead of widening it to "anything os.PathLike".
+    Both production construction sites already pass a real ``Path``
+    (``fused-memory/src/fused_memory/server/main.py`` and
+    ``fused-memory/scripts/repair_recon_citation.py`` each build
+    ``Path(config.reconciliation.data_dir)`` before handing it to
+    ``ReconciliationJournal``), so the wrap would buy nothing there — while
+    costing something real elsewhere: ``MagicMock``/``AsyncMock`` implement
+    ``__fspath__``, so ``Path(mock)`` silently coerces a mock journal's
+    ``data_dir`` into the RELATIVE path ``AsyncMock/mock.data_dir/<id>``, which
+    this function would then anchor at the cwd and ``TaskConfigDir.__init__``
+    would really ``mkdir(parents=True)`` — littering the repo with directories on
+    every suite run. Used as given, a mock's ``__truediv__`` returns another mock
+    and nothing reaches the filesystem, exactly as before this function
+    absolutized anything.
+
     Shape precedent:
     ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._start_escalation_server``.
     ``gc_run_config_dir`` inherits the fix for free — it derives its rmtree target
     from this function.
     """
-    base = Path(data_dir)
+    base = data_dir
     if not base.is_absolute():
         base = Path.cwd() / base
     return base / 'recon-config'
