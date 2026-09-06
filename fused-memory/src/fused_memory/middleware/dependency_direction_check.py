@@ -40,6 +40,7 @@ Same convention as ``middleware/candidate_key.py`` and
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from fused_memory.reconciliation.task_filter import (
@@ -203,3 +204,114 @@ def extract_dependency_assertions(fact: object) -> list[DependencyAssertion]:
             else:
                 assertions.append(DependencyAssertion(second, first, phrase))
     return assertions
+
+
+@dataclass(frozen=True)
+class DependencyIndex:
+    """The ground-truth dependency graph, in the three shapes the classifier needs.
+
+    ``direct``     — ``{task: frozenset(its own declared dependencies)}``
+    ``dependents`` — the REVERSE adjacency, ``{task: frozenset(tasks that
+                     depend on it)}``
+    ``closure``    — the TRANSITIVE reachability set, ``{task: frozenset(every
+                     task it transitively waits for)}``
+
+    Every node appearing in EITHER edge column is a key in all three maps, so a
+    leaf that nothing depends on is still a KNOWN node — that is what keeps the
+    classifier's unknown-id fail-safe from firing on a perfectly ordinary leaf.
+
+    Values are ``frozenset`` and the dataclass is frozen: a finding produced
+    against this index may retire a Graphiti edge, so the graph it was justified
+    against must not be widenable after the fact.
+    """
+
+    direct: Mapping[int, frozenset[int]]
+    dependents: Mapping[int, frozenset[int]]
+    closure: Mapping[int, frozenset[int]]
+
+
+def build_dependency_index(edges: Mapping[int, Iterable[int]]) -> DependencyIndex:
+    """Build a :class:`DependencyIndex` from a ``{task_id: [depends_on, ...]}`` map.
+
+    Accepts the exact shape ``SqliteTaskBackend.get_dependency_edges`` returns —
+    including its inherited contract that a task with NO dependencies is simply
+    ABSENT from the map rather than present with an empty list. Nodes are
+    therefore seeded from BOTH edge columns, so such a task is still a known
+    node with an empty ``closure`` and a populated ``dependents``.
+
+    The closure is computed by a memoized DFS carrying an on-stack set.
+    Cycle-safety is a real requirement, not defensive padding: ``add_dependency``
+    rejects only self-loops, not longer cycles, and there is no other
+    transitive-closure or cycle-detection code over task dependencies anywhere in
+    the repo (every existing consumer is strictly 1-hop). A malformed graph must
+    TERMINATE the walk rather than blow the stack inside the Graphiti write-path
+    identity lock. When a cycle is present each node on it reports the whole
+    cycle as reachable, itself included — the honest answer for a graph that
+    should not exist.
+
+    Pure: no I/O, and the caller's mapping is never mutated.
+    """
+    direct: dict[int, set[int]] = {}
+    dependents: dict[int, set[int]] = {}
+    for task_id, deps in (edges or {}).items():
+        node = int(task_id)
+        direct.setdefault(node, set())
+        dependents.setdefault(node, set())
+        for raw_dep in deps or ():
+            dep = int(raw_dep)
+            direct[node].add(dep)
+            # Seed from the VALUE column too: a task nothing depends on must
+            # still be a known node, or the classifier's unknown-id fail-safe
+            # would fire on every leaf.
+            direct.setdefault(dep, set())
+            dependents.setdefault(dep, set()).add(node)
+
+    closure: dict[int, frozenset[int]] = {}
+    #: Nodes currently being expanded, mapped to their DFS stack depth. This is
+    #: the on-stack set that makes the walk cycle-safe; the depth is what makes
+    #: memoization safe in the presence of one.
+    on_stack: dict[int, int] = {}
+
+    def _closure_of(node: int, depth: int) -> tuple[frozenset[int], int]:
+        # Returns (reachable set, lowlink) where lowlink is the SHALLOWEST
+        # stack depth any back-edge in this subtree pointed at. A frame whose
+        # lowlink is its own depth saw no back-edge to a STRICT ANCESTOR, so
+        # its set is complete and may be memoized; a frame truncated by such a
+        # back-edge is correct only for this particular walk (its ancestor's
+        # own frame supplies the rest) and must NOT be cached as that node's
+        # answer. Without this distinction a cyclic graph memoizes a truncated
+        # closure and the classifier then reads a real dependency as absent —
+        # under-flagging silently instead of terminating loudly.
+        cached = closure.get(node)
+        if cached is not None:
+            return cached, depth
+        on_stack[node] = depth
+        reachable: set[int] = set()
+        lowlink = depth
+        for dep in direct.get(node, ()):
+            reachable.add(dep)
+            ancestor_depth = on_stack.get(dep)
+            if ancestor_depth is not None:
+                # Back edge: this arm is already being expanded further up the
+                # stack. Stop rather than recurse — that is what terminates a
+                # malformed cyclic graph.
+                lowlink = min(lowlink, ancestor_depth)
+                continue
+            sub, sub_lowlink = _closure_of(dep, depth + 1)
+            reachable |= sub
+            lowlink = min(lowlink, sub_lowlink)
+        del on_stack[node]
+        result = frozenset(reachable)
+        if lowlink >= depth:
+            closure[node] = result
+        return result, lowlink
+
+    for node in direct:
+        if node not in closure:
+            _closure_of(node, 0)
+
+    return DependencyIndex(
+        direct={k: frozenset(v) for k, v in direct.items()},
+        dependents={k: frozenset(v) for k, v in dependents.items()},
+        closure=dict(closure),
+    )
