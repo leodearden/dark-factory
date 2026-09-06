@@ -69,6 +69,7 @@ Safety properties
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 from escalation.models import Escalation
 
@@ -107,3 +108,49 @@ def is_legacy_gate_backlog_record(esc: Escalation) -> bool:
         and esc.status == 'pending'
         and LEGACY_SUMMARY_RE.match(esc.summary or '') is not None
     )
+
+
+def extract_gate_escalated_at(detail: str) -> str | None:
+    """Recover the ``gate_escalated_at`` anchor from a record's *detail*, VERBATIM.
+
+    Returns the remainder of the FIRST line starting with
+    ``_GATE_ESCALATED_AT_PREFIX``, with only a trailing ``\\r`` (from a CRLF
+    detail) dropped — mirroring ``gate_backlog_fingerprint_key``'s handling of
+    the ``project_id: `` remainder, and for the same reason: turning a parse
+    ambiguity into a silently DIFFERENT value is the worse failure.
+
+    The ISO parse below is a validity GATE and NEVER a reformatter.  The emitter
+    interpolated ``metadata['gate_escalated_at']`` unmodified into both this
+    detail line and the same-cycle summary, so the verbatim remainder is
+    byte-for-byte the string the post-3520 emitter would have written.
+    Re-serialising through ``datetime.isoformat()`` would normalise a ``Z``
+    suffix and microsecond precision and produce a summary the emitter never
+    emits — breaking the byte-parity the emitter-parity test pins.  The ``Z``
+    normalisation below is therefore applied to a THROWAWAY COPY, used only to
+    decide validity.
+
+    Fails CLOSED — returns ``None``, never a guess — when the line is absent or
+    its value is empty, the literal token ``None`` (the emitter's unguarded
+    ``f'gate_escalated_at: {gate_escalated_at}'`` renders a missing stamp that
+    way), or unparseable as ISO-8601.  A ``None`` here is not an error: it
+    selects ``rebuild_summary``'s threshold-only fallback branch, exactly as the
+    emitter's own ``age_hours is not None`` condition does.
+
+    Matching is on a LINE-START prefix, not a substring search: a record's
+    multi-line ``description:`` block can itself quote a ``gate_escalated_at: ``
+    line, and a blob-wide search would let that decoy displace the real one.
+    """
+    for line in (detail or '').split('\n'):
+        if not line.startswith(_GATE_ESCALATED_AT_PREFIX):
+            continue
+        value = line[len(_GATE_ESCALATED_AT_PREFIX):].rstrip('\r')
+        if not value or value == 'None':
+            return None
+        try:
+            # Throwaway parse for validity only — the RETURNED value is the
+            # untouched verbatim string above.
+            datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        return value
+    return None
