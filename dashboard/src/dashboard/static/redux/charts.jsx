@@ -23,6 +23,7 @@ const {
   stepPaths: sparkStepPaths,
   plottableMax,
   axisY,
+  formatCountTick,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -105,11 +106,24 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
 }
 
 // NOTE — this formatY default deliberately does NOT round, while
-// StackedAreaChart's below does; both hand formatY the RAW tick, only the
-// defaults differ. So an integer-count series renders `1.75` / `3.5` here but
-// `2` / `4` there. Aligning them means auditing every LineChart caller
-// (tabs.jsx:538, tabs.jsx:1109, tab_overview.jsx:231, the analytics tab) — out
-// of scope for task 4059, which only fixed the pre-rounding defect below.
+// StackedAreaChart's below does. Both hand formatY the RAW tick; only the
+// DEFAULTS differ, and that asymmetry is now a decision on the record rather
+// than an accident.
+//
+// Task 4232 ran the caller audit task 4059 deferred. Eight call sites; four
+// pass no formatY and rely on this default. THREE of those are integer counts
+// (memory reads/writes per hour, merge attempts per 15-minute bucket,
+// escalation re-filings per day) — but the FOURTH,
+// tab_escalation_analytics.jsx's escalations-per-done chart, plots
+// `filings / done` (escalation_analytics.py::_esc_per_done), a genuine
+// fraction. Rounding by default would collapse that ratio axis exactly the way
+// pre-4059 pre-rounding collapsed WorkflowPanel's 100%-normalized stack — i.e.
+// it would re-file its own predecessor's defect one primitive over.
+//
+// So the default stays `(v) => String(v)`, and the three count callers opt in
+// explicitly with `formatY={formatCountTick}` (spark_path.js, where its
+// blank-don't-round rule is behaviourally tested). Do not "align" these two
+// defaults without redoing that audit.
 function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -570,4 +584,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries };
+window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick };
