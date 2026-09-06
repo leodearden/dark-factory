@@ -5247,7 +5247,16 @@ async def filter_accounted_cluster_growth_flags(
     its cited memory UUIDs (case-insensitive substring).  Bodies are never
     UNIONED across tasks: "uuid-A is in 3417 and uuid-B is in 3468" does not
     establish that the cluster is fully tracked anywhere -- only one task
-    listing the whole cited set does.
+    listing the whole cited set does.  A candidate id that errors or resolves
+    to no body simply contributes nothing, so it can neither confirm a drop nor
+    veto a sibling id that does.
+
+    **Candidate task ids are used WITHOUT filtering on ``project_id``.**  Unlike
+    :func:`_cited_task_corroborated`, which must title-match because per-project
+    sequential task ids collide across projects constantly, the thing matched
+    here is a Mem0 point-id: a globally unique random UUID.  A task body that
+    literally contains one IS that memory's tracker whichever project owns the
+    task, so cross-project id collision cannot produce a false drop.
 
     **Fail-safe direction is KEEP.**  This filter drops the only signal that an
     un-gated duplicate cluster is growing, so it drops ONLY on positive
