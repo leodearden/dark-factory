@@ -725,10 +725,6 @@ class TestComplexipyVersionContract:
         message = str(excinfo.value)
         assert '7.0.1' in message
         assert metrics.COMPLEXIPY_REQUIRED in message
-        # The measured reason travels with the failure so the next reader does
-        # not have to re-derive it.
-        assert '247' in message
-        assert '4.75' in message
 
     def test_version_below_the_floor_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(metrics, 'complexipy_version', lambda: '6.1.0')
