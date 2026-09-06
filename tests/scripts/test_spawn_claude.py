@@ -10,6 +10,9 @@ from __future__ import annotations
 import math
 import os
 import pathlib
+import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -134,6 +137,69 @@ _STRESS_DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     # claude binary once spawn-claude.sh has armed the EXIT/HUP/TERM traps)
     # is the synchronization gate, not a blind sleep.
     echo "$leader_pid" > {pidfile}
+    exit 0
+""")
+
+# Sentinel-planting DETACHING terminal (task 5137, esc-4389-4).
+#
+# WHY THIS EXISTS. spawn-claude.sh's payload publishes claude's exit code by
+# writing it into a `$TMPDIR/spawn-claude-XXXXXX.done` sentinel, and finish()
+# reads that file to decide both the script's own exit status and the
+# `--code` it hands session_registry. Every readiness gate around it,
+# however, tests only `[ -f "$sentinel" ]`. Existence is the WRONG readiness
+# signal for a file whose CONTENT is about to be parsed: `>` creates and
+# truncates before the write lands, so a reader can observe the sentinel
+# existing and ZERO-LENGTH and read back the empty string. This is the exact
+# create-then-write defect class already fixed on the Python side of this
+# very file -- see _wait_for_path(require_nonempty=...) below (task 4776),
+# whose docstring states the general principle; task 5137 applies it to the
+# shell side. It is a DIFFERENT defect from task 1643 (sentinel never
+# written at all), where the file's absence is unambiguous.
+#
+# Racing a real payload to catch that window would produce a test that is
+# itself flaky and can never go reliably RED. This terminal instead makes
+# the state under test a PRECONDITION: it plants the zero-length sentinel
+# itself and exits 0 WITHOUT ever running the payload, so "sentinel exists,
+# content not yet settled" is deterministic in both directions. The
+# exit-0-without-payload idiom is lifted from
+# test_failed_to_start_detected_on_detached_exit0, which uses it to drive
+# the same resolve_detached launch_rc==0 branch.
+#
+# The sentinel path is recovered from the payload text rather than guessed,
+# because spawn-claude.sh picks it with `mktemp -u` and never tells the
+# caller. MEASURED: the regex below yields the same path against BOTH the
+# pre-fix payload (`> /tmp/x.done`) and the post-fix atomic-publish payload
+# (`> /tmp/x.done.tmp && mv -f ...`), because the match stops at `.done` --
+# so this helper is stable across the writer change and needs no rework.
+#
+# {delayed_write} -- one of three: a no-op (the sentinel never settles), a
+#                    SYNCHRONOUS write before the launcher exits (delay=0 --
+#                    used to plant non-numeric content deterministically),
+#                    or a backgrounded `( sleep N; printf C > "$s" )` that
+#                    publishes a real code late, the faithful reproduction of
+#                    the production race.
+_SENTINEL_PLANTING_TERM_TEMPLATE = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    # Find 'bash' in argv so $3 is the payload, whatever the branch's argv shape.
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "bash" ]]; then
+        break
+      fi
+      shift
+    done
+    # $1=bash  $2=-c  $3=<inner payload>
+    s=$(grep -oE '[^ ]*spawn-claude-[A-Za-z0-9]+\\.done' <<<"$3" | head -1)
+    if [[ -z "$s" ]]; then
+      echo "sentinel-planting terminal: no sentinel path in payload" >&2
+      exit 1
+    fi
+    # Create it ZERO-LENGTH: exactly what `>` leaves behind between the
+    # open()-truncate and the write that has not landed yet.
+    : > "$s"
+    {delayed_write}
+    # Exit 0 WITHOUT running the payload: the launcher reports success, so
+    # resolve_detached takes its launch_rc==0 branch -> await_sentinel
+    # returns immediately (the file exists) -> finish().
     exit 0
 """)
 
@@ -376,6 +442,60 @@ def _write_detaching_terminal(
     p.chmod(0o755)
 
 
+def _write_sentinel_planting_terminal(
+    bin_dir: pathlib.Path,
+    name: str,
+    *,
+    delay: float | None = None,
+    code: int | str | None = None,
+) -> None:
+    """Write a fake detaching terminal that plants a ZERO-LENGTH sentinel.
+
+    Same shape as _write_detaching_terminal: format the module-level
+    template, write it into *bin_dir*, chmod it executable.
+
+    delay=None (the default) -- the sentinel is created empty and NEVER
+    settles, so finish() must fall back to its documented "no usable exit
+    code recovered" verdict rather than propagating the empty string.
+
+    delay>0 with *code* -- create the sentinel empty, then publish *code*
+    into it *delay* seconds later from a backgrounded subshell. This is the
+    faithful reproduction of the production race (esc-4389-4): the real
+    session's exit code IS on its way, and a reader that gives up on the
+    first empty read destroys it.
+
+    delay=0 with *code* -- publish *code* SYNCHRONOUSLY, before the launcher
+    returns, so the content is already in place the first time finish() reads
+    it. That is what makes a NON-NUMERIC *code* (which `_sentinel_settled`
+    must reject through its `*[!0-9]*` arm, not its `''` arm) deterministic:
+    a backgrounded writer would race finish()'s first poll and the test could
+    pass by reading the file while still empty, leaving the arm it exists to
+    cover untested. *code* is typed `int | str` for exactly that case and is
+    shell-quoted, so a garbage payload cannot inject shell syntax.
+
+    All three modes exist because existence is the wrong readiness gate for a
+    parsed file -- the same reasoning _wait_for_path(require_nonempty=...)
+    records for the Python side of this suite (task 4776).
+    """
+    if (delay is None) != (code is None):
+        raise AssertionError("delay and code must be given together, or neither")
+    if delay is None:
+        delayed_write = ": # no delayed write -- the sentinel never settles"
+    elif delay == 0:
+        delayed_write = f"printf '%s\\n' {shlex.quote(str(code))} > \"$s\""
+    else:
+        # Fully detached from this shell's stdio so the launcher can exit 0
+        # immediately; spawn-claude.sh's own `wait $!` must not block on it.
+        delayed_write = (
+            f"( sleep {delay}; printf '%s\\n' {shlex.quote(str(code))} > \"$s\" ) "
+            "</dev/null >/dev/null 2>&1 &"
+        )
+    script = _SENTINEL_PLANTING_TERM_TEMPLATE.format(delayed_write=delayed_write)
+    p = bin_dir / name
+    p.write_text(script)
+    p.chmod(0o755)
+
+
 def _hermetic_environ() -> dict[str, str]:
     """Return a copy of the process environment with every known ambient
     leak scrubbed -- the shared base for every env-construction site in
@@ -418,6 +538,31 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     # watchdog never scans (or finds stray evidence in) the real
     # ~/.claude/projects tree.
     env["CLAUDE_PROJECTS_DIR"] = str(bin_dir.parent / "projects")
+    return env
+
+
+def _sentinel_test_env(
+    bin_dir: pathlib.Path, terminal_name: str, tmp_path: pathlib.Path
+) -> dict[str, str]:
+    """_base_env plus a test-owned TMPDIR, for the sentinel-content tests.
+
+    spawn-claude.sh picks its sentinel with `mktemp -u -t
+    spawn-claude-XXXXXX.done`, which honours $TMPDIR. Overriding it keeps
+    every sentinel (and the spawn_ref / fts_marker written beside it) inside
+    the test's own tree instead of the host's real /tmp, which matters twice
+    here: these tests deliberately drive paths that leave a sentinel behind,
+    and the atomic-publish test asserts that no `*.done.tmp` REMAINS
+    afterwards -- an assertion that would be meaningless, and could be
+    poisoned by an unrelated concurrent spawn, against a shared /tmp.
+
+    The directory is a plain lowercase-and-hyphen name under *tmp_path* so
+    the resulting sentinel path contains nothing `printf %q` would quote --
+    the payload string is what the planting terminal greps for the path.
+    """
+    env = _base_env(bin_dir, terminal_name)
+    spawn_tmp = tmp_path / "spawntmp"
+    spawn_tmp.mkdir(exist_ok=True)
+    env["TMPDIR"] = str(spawn_tmp)
     return env
 
 
@@ -4083,4 +4228,377 @@ def test_mac_terminal_sibling_open_failure_yields_127_not_a_running_record(
         f"a session that never launched must not be stamped RUNNING -- the "
         f"record must stay LAUNCHING for the stale-pid reaper, got "
         f"{record.status}"
+    )
+
+
+# ===========================================================================
+# task-5137: a CREATED-but-EMPTY sentinel must never yield an empty exit code
+# ===========================================================================
+# esc-4389-4. spawn-claude.sh's finish() read the sentinel with
+# `rc=$(cat "$sentinel" 2>/dev/null || echo 127)`. The `|| echo 127` fallback
+# only fires when `cat` FAILS -- but `cat` on a zero-length file SUCCEEDS and
+# prints nothing, so rc became the empty string and was propagated into both
+# consumers verbatim:
+#
+#     usage: session_registry exit [-h] --record RECORD --code CODE
+#     session_registry exit: error: argument --code: invalid int value: ''
+#     ./skills/spawn/spawn-claude.sh: line 509: exit: : numeric argument required
+#     exit=2
+#
+# Two distinct damages: the caller sees bash's own usage code 2 instead of a
+# documented spawn verdict, and the session-registry record is left
+# un-updated because the CLI died in argument parsing.
+#
+# The gap is real because `>` creates and truncates BEFORE the write lands,
+# and every readiness gate in the script tests `[ -f "$sentinel" ]` only --
+# the create-then-write defect class _wait_for_path(require_nonempty=...)
+# (task 4776) already names on the Python side of this file. It is NOT task
+# 1643's defect (sentinel never written at all), where absence is
+# unambiguous and the `|| echo 127` fallback does fire.
+
+
+def test_zero_length_sentinel_never_yields_empty_code_or_nonnumeric_exit(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sentinel that exists but never settles must yield 127, not bash's 2.
+
+    Drives the shortest deterministic path into finish(): the `custom-term`
+    dispatch branch -> resolve_detached with launch_rc==0 -> await_sentinel
+    returns immediately because the file exists -> finish(). The terminal
+    plants the zero-length sentinel itself and never runs the payload, so
+    "exists, zero-length, never settles" is a precondition rather than a race
+    outcome and the test is deterministic in both directions.
+
+    127 is the right verdict here: the script's documented "no usable exit
+    code recovered" code, whose meaning this widens by exactly one clause
+    (the sentinel appeared but never settled to a numeric code) rather than
+    inventing a new one.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    # delay=None: the sentinel is created empty and NEVER settles.
+    _write_sentinel_planting_terminal(bin_dir, "custom-term")
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    # Verbatim observed failure (esc-4389-4), inlined so a future RED is
+    # self-explaining without digging the escalation out.
+    observed = (
+        "esc-4389-4 observed, verbatim:\n"
+        "  session_registry exit: error: argument --code: invalid int value: ''\n"
+        "  ./skills/spawn/spawn-claude.sh: line 509: exit: : numeric "
+        "argument required\n"
+        "  exit=2\n"
+        f"this run: rc={result.returncode}\nstderr:\n{stderr}"
+    )
+
+    assert b"numeric argument required" not in result.stderr, (
+        f"finish() must never run `exit \"\"` -- it read an empty sentinel as "
+        f"the exit code.\n{observed}"
+    )
+    assert b"invalid int value: ''" not in result.stderr, (
+        f"session_registry must never be handed an empty --code.\n{observed}"
+    )
+    assert result.returncode == 127, (
+        f"an unsettled sentinel must yield the documented 127 "
+        f"(no usable exit code recovered), never bash's usage code 2.\n"
+        f"{observed}"
+    )
+
+    # The registry half of the defect, which the exit code alone cannot see:
+    # asserting the record was actually UPDATED is strictly stronger than
+    # grepping stderr, because a CLI call that dies in argument parsing
+    # leaves the record stale rather than absent.
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.exit_code == 127, (
+        f"the session record must carry a well-formed integer exit code, got "
+        f"{record.exit_code!r} (status {record.status}).\n{observed}"
+    )
+
+
+# The sibling of the test above, covering _sentinel_settled's OTHER rejection
+# arm. Its predicate rejects two things -- the empty string (`''`) and any
+# non-numeric byte (`*[!0-9]*`) -- and the empty arm is what the never-settling
+# and late-settling tests exercise. Without this test, deleting `*[!0-9]*` from
+# the case glob leaves the whole suite green while `exit garbage` /
+# `--code garbage` reproduces the very class of crash this task closes: bash's
+# "numeric argument required" -> exit 2, and an argparse rejection that leaves
+# the record un-updated. Non-numeric content is what a truncated or corrupt
+# read looks like when it is not zero-length.
+
+
+def test_non_numeric_sentinel_is_rejected_like_an_empty_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sentinel holding non-numeric content must yield 127, not bash's 2.
+
+    Same deterministic `custom-term` path as the never-settling test, but the
+    planting terminal writes the garbage SYNCHRONOUSLY (delay=0) before
+    exiting, so the content is already in place the first time finish() reads
+    it. A backgrounded writer would race finish()'s first poll and could pass
+    by reading the file while still empty -- i.e. through the `''` arm, never
+    touching the arm this test exists to cover.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    GARBAGE = "garbage"
+    _write_sentinel_planting_terminal(
+        bin_dir, "custom-term", delay=0, code=GARBAGE
+    )
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    context = f"planted sentinel content={GARBAGE!r}, rc={result.returncode}\nstderr:\n{stderr}"
+
+    assert b"numeric argument required" not in result.stderr, (
+        f"finish() must never run `exit` on non-numeric sentinel content -- "
+        f"the `*[!0-9]*` rejection arm of _sentinel_settled is what prevents "
+        f"it.\n{context}"
+    )
+    assert b"invalid int value" not in result.stderr, (
+        f"session_registry must never be handed a non-integer --code.\n{context}"
+    )
+    assert result.returncode == 127, (
+        f"a sentinel that never settles to a NUMERIC code must yield the "
+        f"documented 127, never bash's usage code 2.\n{context}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.exit_code == 127, (
+        f"the session record must carry a well-formed integer exit code, got "
+        f"{record.exit_code!r} (status {record.status}).\n{context}"
+    )
+
+
+# The counterpart to the never-settling test, and the reason step-2's fallback
+# alone is not the whole fix: degrading EVERY racing spawn to 127 would
+# silently destroy the session's real exit code -- a liveness-signal regression traded
+# for the crash. This is the faithful reproduction of the production race:
+# the code IS on its way, and a reader that gives up on the first empty read
+# throws it away. MEASURED against the pre-fix script this exits 2; against
+# the content-aware read alone it exits 127; only a bounded re-poll recovers 3.
+
+
+def test_late_settling_sentinel_recovers_the_sessions_own_code_not_127(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sentinel that settles late must yield the session's OWN code.
+
+    Same deterministic `custom-term` path as the test above, but the planting
+    terminal backgrounds a delayed `echo 3 > "$s"` after creating the file
+    empty -- so finish() observes exactly the production window (sentinel
+    exists, content not yet there) with a real code arriving shortly after.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+
+    # Timing budget -- DERIVED, not guessed, and deliberately not inherited.
+    #
+    # WRITE_DELAY is a *deliberately injected* wall-clock sleep inside the
+    # fake terminal: it does NOT stretch with host load, which is exactly the
+    # situation _wait_for_path_scaled's `extra_secs` parameter documents. The
+    # grace it must fit inside DOES need to stretch, so it is set explicitly
+    # via _load_scaled_grace(5) rather than inheriting _base_env's fixed
+    # SPAWN_LAUNCH_GRACE_SECS="2" pin. On an idle host that floor gives 5s
+    # against a 0.5s write -- 10x margin -- and it only grows under load.
+    WRITE_DELAY = 0.5
+    SESSION_EXIT_CODE = 3
+
+    _write_sentinel_planting_terminal(
+        bin_dir, "custom-term", delay=WRITE_DELAY, code=SESSION_EXIT_CODE
+    )
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+    grace = _load_scaled_grace(5)
+    env["SPAWN_LAUNCH_GRACE_SECS"] = str(grace)
+
+    # `grace` is ALREADY load-scaled, so per _run_spawn's docstring this must
+    # be passed with scale_timeout=False -- scaling it a second time would
+    # discard this site's own derivation instead of honoring it. The margin
+    # covers the grace the script may spend re-polling plus the injected
+    # sleep plus normal subprocess startup.
+    result = _run_spawn(
+        env,
+        tmp_path,
+        timeout=int(grace + WRITE_DELAY + _spawn_run_budget(20)),
+        scale_timeout=False,
+    )
+
+    stderr = result.stderr.decode()
+    context = (
+        f"rc={result.returncode}, grace={grace}s, injected write delay="
+        f"{WRITE_DELAY}s\nstderr:\n{stderr}"
+    )
+
+    # Same guards as the never-settling test: neither consumer may ever see
+    # the empty string, whatever else this run does.
+    assert b"numeric argument required" not in result.stderr, (
+        f"finish() must never run `exit \"\"`.\n{context}"
+    )
+    assert b"invalid int value: ''" not in result.stderr, (
+        f"session_registry must never be handed an empty --code.\n{context}"
+    )
+
+    assert result.returncode == SESSION_EXIT_CODE, (
+        f"a sentinel that settles within the launch grace must yield the "
+        f"session's OWN exit code {SESSION_EXIT_CODE} -- not 127 (the "
+        f"content-aware read giving up on the first empty poll, destroying a "
+        f"live exit code) and not 2 (the pre-fix empty-string crash).\n"
+        f"{context}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.exit_code == SESSION_EXIT_CODE, (
+        f"the session record must carry the session's own exit code, got "
+        f"{record.exit_code!r} (status {record.status}).\n{context}"
+    )
+
+
+# The WRITER half of task 5137. The two tests above harden the READER against
+# any writer we do not control; this one closes the window at the source for
+# OUR payload, which is what makes it correct to leave all eight `-f`
+# existence gates in spawn-claude.sh untouched: a same-directory rename means
+# the sentinel PATH only ever appears fully written, so every one of them is
+# content-correct without being rewritten.
+#
+# Asserted at RUNTIME via a PATH-shadowed `mv` recorder, not by grepping the
+# script. The two obvious alternatives both fail: grepping the source for
+# `mv`/`.tmp` pins the author's wording rather than the program's behaviour
+# and would pass against a commented-out line; polling the sentinel path
+# during a real spawn hoping to catch it existing-and-empty can only fail
+# probabilistically, so it could never go reliably RED -- a flaky test
+# shipped to fix a flake. The recorder observes an actual runtime fact and is
+# deterministic in both directions.
+
+
+# Terminator line between recorded `mv` calls. Argv is logged ONE ITEM PER
+# LINE rather than space-joined, so a path containing whitespace cannot be
+# silently re-split into two fields by the parse below -- pytest's tmp_path is
+# derived from the test name and is safe today, but that is not a property
+# this file controls.
+_MV_CALL_END = "--end-of-mv-call--"
+
+
+def _write_mv_recorder(bin_dir: pathlib.Path, log: pathlib.Path) -> None:
+    """Shadow `mv` on the payload's PATH, recording argv then renaming for real.
+
+    _base_env already puts *bin_dir* first on PATH and the payload inherits
+    it, so this shim sees every rename the payload performs.
+
+    The real `mv` is resolved ONCE here with shutil.which and interpolated as
+    an absolute path, rather than re-resolved in the shim against a pinned
+    ``PATH=/usr/bin:/bin``. That pin is not where `mv` lives on every platform
+    this repo could run on (a Nix-style tree, say), and there the payload's
+    publish would break and surface as an unrelated exit-code mismatch. An
+    absolute exec also cannot recurse back into this shim, which is what the
+    PATH reset was for.
+
+    Both interpolated paths are shell-quoted; see _MV_CALL_END for why argv is
+    recorded one item per line.
+    """
+    real_mv = shutil.which("mv")
+    assert real_mv is not None, "no real `mv` on PATH to delegate to"
+    # shutil.which reads THIS process's PATH, which never contains bin_dir
+    # (only the spawn subprocess's env does) -- assert it anyway, since a
+    # shim exec'ing itself would fork-bomb rather than fail a assertion.
+    assert not real_mv.startswith(str(bin_dir)), (
+        f"the recorder must delegate to the real mv, not itself: {real_mv!r}"
+    )
+    p = bin_dir / "mv"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "{ printf '%s\\n' \"$@\"; printf '%s\\n' "
+        f"{shlex.quote(_MV_CALL_END)}; }} >> {shlex.quote(str(log))}\n"
+        f"exec {shlex.quote(real_mv)} \"$@\"\n"
+    )
+    p.chmod(0o755)
+
+
+def _read_mv_calls(log: pathlib.Path) -> list[list[str]]:
+    """Parse _write_mv_recorder's log into one argv list per recorded call."""
+    if not log.exists():
+        return []
+    calls: list[list[str]] = []
+    current: list[str] = []
+    for line in log.read_text().splitlines():
+        if line == _MV_CALL_END:
+            calls.append(current)
+            current = []
+        else:
+            current.append(line)
+    return calls
+
+
+def test_payload_publishes_sentinel_by_atomic_rename(tmp_path: pathlib.Path) -> None:
+    """The payload must publish the sentinel by rename, never by a direct `>`.
+
+    A NORMAL happy-path spawn -- the real foreground terminal and a fake
+    claude exiting 3 -- so the genuine $inner EXIT trap runs and the assertion
+    is about the shipped payload, not a stand-in.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    SESSION_EXIT_CODE = 3
+    _write_fake_claude(bin_dir, exit_code=SESSION_EXIT_CODE)
+    _write_foreground_terminal(bin_dir, "xterm")
+    mv_log = tmp_path / "mv_argv"
+    _write_mv_recorder(bin_dir, mv_log)
+    env = _sentinel_test_env(bin_dir, "xterm", tmp_path)
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == SESSION_EXIT_CODE, (
+        f"the atomic publish must be additive to the exit-code contract: "
+        f"expected {SESSION_EXIT_CODE}, got {result.returncode}\n"
+        f"stderr: {result.stderr.decode()}"
+    )
+
+    recorded = _read_mv_calls(mv_log)
+    # The destination is `mv`'s last argv item, so match on that alone -- no
+    # re-splitting of a joined line, and no ambiguity with the `.done.tmp`
+    # source (which this pattern's anchored `.done` end does not match).
+    sentinel_renames = [
+        call
+        for call in recorded
+        if call and re.search(r"spawn-claude-\w+\.done$", call[-1])
+    ]
+    assert len(sentinel_renames) == 1, (
+        f"the payload must publish the sentinel with exactly one rename; "
+        f"recorded mv calls: {recorded!r}\n"
+        f"an EMPTY log is the pre-fix state: the payload wrote the sentinel "
+        f"directly with `>`, which creates and truncates before the write "
+        f"lands, so any `-f` gate can observe it existing and zero-length."
+    )
+
+    # Source and destination must be the tmp path and the sentinel itself --
+    # i.e. the sentinel appears via rename, never via a direct write to its
+    # own path, and the rename is same-directory (hence atomic).
+    fields = sentinel_renames[0]
+    assert len(fields) >= 2, (
+        f"a rename must carry at least a source and a destination, got "
+        f"{fields!r}"
+    )
+    dest = fields[-1]
+    source = fields[-2]
+    assert dest.endswith(".done"), (
+        f"the rename DESTINATION must be the sentinel path, got {dest!r} "
+        f"(full argv: {sentinel_renames[0]!r})"
+    )
+    assert source != dest and source.startswith(dest), (
+        f"the rename SOURCE must be a different path prefixed by the "
+        f"sentinel (a same-directory temp), got source={source!r} "
+        f"dest={dest!r}"
+    )
+
+    # A failed or half-done publish must not leak: nothing may survive.
+    spawn_tmp = pathlib.Path(env["TMPDIR"])
+    leftovers = list(spawn_tmp.glob("spawn-claude-*.done.tmp"))
+    assert not leftovers, (
+        f"the two-step publish must leave no temp file behind, found "
+        f"{leftovers!r}"
     )
