@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import shutil
 import socket
@@ -709,3 +710,107 @@ class TestRelativePathContainment:
                 f'An absolute config dir must be accepted from any parent cwd; '
                 f'refused while standing in {standing_in}'
             )
+
+    def test_relative_writable_extra_is_not_a_writable_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Face B: a relative EXTRA must not satisfy containment either.
+
+        This survives the config-dir fix and reproduces the identical false PASS.
+        ``_writable_roots`` computes each root with ``os.path.realpath`` in the
+        PARENT's cwd, but the resulting ``--writable <path>`` token is consumed by
+        ``landlock-exec`` / ``bwrap`` inside the wrapped argv, which
+        ``shared/src/shared/cli_invoke.py::_run_subprocess`` spawns with
+        ``cwd=str(cwd)`` — the CHILD's cwd. So a relative extra grants a DIFFERENT
+        directory than the one this function verified: a vacuous grant, the same
+        class as the existing "extra that does not exist" filter and rejected for
+        the same reason.
+        """
+        parent_cwd = tmp_path / 'parent'
+        parent_cwd.mkdir()
+        (parent_cwd / 'relextra').mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        roots = _writable_roots(tmp_path / 'child', ['relextra'])  # type: ignore[possibly-unbound]
+
+        assert os.path.realpath(str(parent_cwd / 'relextra')) not in roots, (
+            f'A relative extra must not become a writable root — the parent '
+            f'resolved it here, but the child would resolve it under its own '
+            f'cwd; got {roots!r}'
+        )
+        # Control: the unconditional `<cwd>/.task` root is untouched by the filter.
+        assert os.path.realpath(str(tmp_path / 'child' / '.task')) in roots, (
+            f'`<cwd>/.task` must remain a writable root; got {roots!r}'
+        )
+
+    def test_absolute_config_dir_inside_a_relative_extra_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The end-to-end consequence: a perfectly ABSOLUTE config dir is not saved
+        by living under a relative extra.
+
+        Step 4's assertion is satisfied (the config dir is absolute), so this leaf
+        isolates Face B exactly. Today it returns a wrap: the parent judges the
+        config dir contained by a root the child never actually grants, and every
+        CLI write is denied while the fail-closed check reports PASS.
+        """
+        parent_cwd = tmp_path / 'parent'
+        parent_cwd.mkdir()
+        config_dir = parent_cwd / 'relextra' / 'claude-config-x'
+        config_dir.mkdir(parents=True)
+
+        monkeypatch.chdir(parent_cwd)
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ), pytest.raises(RemediationSandboxUnavailable):  # type: ignore[possibly-unbound]
+            resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                tmp_path / 'child', ['relextra'], config_dir=config_dir,
+            )
+
+    def test_relative_writable_extra_is_logged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Dropping an operator-configured grant must be LOUD.
+
+        Silently discarding it is exactly the fail-soft this module was written to
+        end — its own docstring says "a comment claiming the dir was writable
+        existed the entire time; only a check can hold an invariant a comment
+        cannot". An operator who configured sandbox_recon_writable_extras and got
+        no grant needs to be told which entry was dropped and why.
+        """
+        parent_cwd = tmp_path / 'parent'
+        parent_cwd.mkdir()
+        (parent_cwd / 'relextra').mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.sandbox_guard',
+        ):
+            _writable_roots(tmp_path / 'child', ['relextra'])  # type: ignore[possibly-unbound]
+
+        assert any('relextra' in rec.getMessage() for rec in caplog.records), (
+            f'Dropping a relative extra must emit a warning naming it; got '
+            f'{[rec.getMessage() for rec in caplog.records]!r}'
+        )
+
+    def test_absolute_extra_is_still_a_writable_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Control: the new filter is scoped to relativity, not a blanket narrowing.
+
+        An existing ABSOLUTE extra still becomes a root — including from a parent
+        cwd that has nothing to do with it.
+        """
+        parent_cwd = tmp_path / 'parent'
+        parent_cwd.mkdir()
+        extra = tmp_path / 'absextra'
+        extra.mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        roots = _writable_roots(tmp_path / 'child', [str(extra)])  # type: ignore[possibly-unbound]
+
+        assert os.path.realpath(str(extra)) in roots, (
+            f'An existing absolute extra must remain a writable root; got {roots!r}'
+        )
