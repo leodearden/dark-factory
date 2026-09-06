@@ -522,7 +522,20 @@ def test_classify_reply_truth_table():
     # applied `repr` unconditionally ("... str: 'boom'"). Nothing parses this
     # detail, and unquoted reads better for an operator staring at a
     # stringified error page. Pinned so the next reader sees it was decided.
-    assert classify_reply("boom").detail == "server reply was not a dict: str: boom"
+    #
+    # BY COMPONENT, NOT BY WHOLE STRING, deliberately. The prose belongs to
+    # migrate's `_clip`; asserting it verbatim from this side would recreate —
+    # in a test — the exact message-wording coupling classify_reply's docstring
+    # refuses to take on in code, so a reword made entirely in the sibling file
+    # would turn THIS file red. The three clauses below are the decision itself:
+    # the type is named, the value survives, and it is NOT `repr`-quoted. The
+    # exact wording is pinned once where `_clip` lives, at tests/scripts/
+    # test_migrate_metadata_modules_to_files.py::
+    # test_clip_passes_a_str_through_unquoted_and_reprs_everything_else.
+    detail = classify_reply("boom").detail or ""
+    assert "str" in detail
+    assert "boom" in detail
+    assert "'boom'" not in detail
 
     # Empty dict -> unanswered, non-empty detail naming the emptiness: `{}`
     # carries no positive write signal and must not be read as success.
@@ -785,6 +798,34 @@ def test_repair_one_treats_an_empty_reply_as_failed():
 
     assert result.disposition == FAILED
     assert result.detail
+
+
+def test_repair_one_treats_a_transport_stamped_reply_as_failed():
+    """The closed hole on the WRITE path, asserted as a DISPOSITION.
+
+    Both shapes are NON-EMPTY dicts carrying neither `error` nor `success`, so
+    the transcribed twin classify_reply used to be fell straight through to its
+    ok branch and this function returned REPAIR — a repair reported against a
+    reply the transport could not even read, in a script that writes live task
+    metadata. Task 4608's delegation closed it; this pins the outcome an
+    operator actually reads, one level above the truth table.
+
+    The keys are IMPORTED, never re-spelled as `'_raw'` / `'_mcp_is_error'`
+    literals: a transcribed literal would keep passing if the migrate module
+    renamed the marker it stamps.
+    """
+    from migrate_metadata_modules_to_files import MCP_IS_ERROR_KEY, RAW_REPLY_KEY
+
+    for payload in (
+        {RAW_REPLY_KEY: "Error calling tool update_task: boom"},
+        {MCP_IS_ERROR_KEY: True, "id": "2464"},
+    ):
+        client = _FakeClient(returns=payload)
+
+        result = asyncio.run(repair_one(client, _ROOT, _candidate(5), now_iso=_NOW))
+
+        assert result.disposition == FAILED, payload
+        assert result.detail, payload
 
 
 def test_repair_one_accepts_a_plain_success_shape():
@@ -1369,6 +1410,49 @@ def test_repair_project_reports_an_unanswered_live_reread_as_failed_live_read(tm
 
     assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
     assert [name for name, _ in client.calls] == ["get_task"]
+
+
+def test_repair_project_reports_a_transport_stamped_live_reread_as_failed_live_read(
+    tmp_path,
+):
+    """THE HOLE TASK 4608 CLOSED, ASSERTED WHERE IT ACTUALLY BIT.
+
+    Both shapes are NON-EMPTY dicts carrying neither `error` nor `success`, so
+    before the delegation `classify_reply` called them ok and the reply flowed
+    straight on into `classify_live_task(_unwrap_task(live), candidate)` —
+    where, having no `status` key, it was judged as though the server had
+    answered. A run could therefore file a benign skip, or attempt a WRITE,
+    against a reply the transport could not read at all.
+
+    The truth table above pins the VERDICT; this pins the DISPOSITION, which is
+    what the summary prints and what the exit code is derived from. They are
+    not the same guard: a refactor of the `if not verdict.ok:` arm, or of
+    `_unwrap_task`, could regress this end-to-end behaviour with every unit
+    test still green.
+
+    `get_task` is asserted to be the ONLY call: an unreadable re-read must stop
+    the candidate before the write, not merely relabel it afterwards. Distinct
+    project names per iteration because `_wiped_project` builds a real tree.
+
+    The keys are IMPORTED, never re-spelled — same reason as the truth table's.
+    """
+    from migrate_metadata_modules_to_files import MCP_IS_ERROR_KEY, RAW_REPLY_KEY
+
+    replies = (
+        {RAW_REPLY_KEY: "Error calling tool get_task: boom"},
+        {MCP_IS_ERROR_KEY: True, "id": "9"},
+    )
+    for index, reply in enumerate(replies):
+        root = _wiped_project(tmp_path, name=f"proj{index}")
+        client = _FakeClient(returns=reply)
+
+        result = asyncio.run(
+            repair_project(client, str(root), apply=True, now_iso=_NOW)
+        )
+
+        assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ], reply
+        assert [name for name, _ in client.calls] == ["get_task"], reply
+        assert result.outcomes[0].detail, reply
 
 
 def test_repair_project_still_skips_a_genuinely_missing_task_as_skip_missing(tmp_path):
