@@ -1134,6 +1134,21 @@ merge_train_max_members: 3
 # serialized), accepted against the oversubscription-flake churn it removes.
 merge_verify_max_concurrent_modules: 1
 
+# Pre-merge rebase-and-reverify: run it ONCE and never repeat it (Leo, 2026-09-06).
+# workflow.py's merge phase rebases the task branch onto main and runs a full
+# task-role scoped verify (admission-gated, 3 slots on this box) BEFORE submitting
+# to the merge queue; the stock loop repeats that whole cycle up to
+# max_pre_merge_retries times whenever main moved during the verify. MEASURED
+# 2026-09-06: "main moved during pre-merge rebase, retrying" fired 29 times in one
+# day on this host, each retry a 40-90 min verify under load, and task 5050 sat ~15h
+# in that step. With 1 the loop runs one rebase+verify; if main moved meanwhile the
+# task submits anyway with pre_rebased=False and the merge queue's own rebase +
+# post-merge verify (which happens regardless) is the one that lands it. This
+# knob is NOT in RELOADABLE_FIELDS — it takes effect at the next orchestrator
+# restart. Follow-up lever (policy PRD, task 5098): whether the pre-merge verify
+# should run at all when the queue re-verifies on landing.
+max_pre_merge_retries: 1
+
 # Config-driven off-hot-path offline lane — dark-factory qdrant-integration
 # instance (plans/integration-test-lane-prd.md, task beta). Restores the
 # qdrant-client/mem0 version-compat coverage that task 2773 removes from the
