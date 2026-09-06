@@ -13,6 +13,7 @@ import pytest
 
 from dashboard.data.performance import (
     _cutoff,
+    _hour_bucketed_history,
     _load_escalations,
     aggregate_completion_paths,
     aggregate_escalation_rates,
@@ -1904,3 +1905,98 @@ class Test_Cutoff:
         lower = (before - timedelta(days=7)).isoformat()
         upper = (after - timedelta(days=7)).isoformat()
         assert lower <= result <= upper
+
+
+# ---------------------------------------------------------------------------
+# TestHourBucketedHistoryWindowBoundary (step-3)
+# ---------------------------------------------------------------------------
+
+
+class TestHourBucketedHistoryWindowBoundary:
+    """_hour_bucketed_history must exclude rows before the cutoff INSTANT,
+    not merely rows that share an earlier calendar DATE with the cutoff
+    (task 4624).
+
+    now=2026-05-15T12:00:00+00:00, days=7 -> cutoff instant is exactly
+    2026-05-08T12:00:00+00:00.
+    """
+
+    NOW = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+    DAYS = 7
+
+    @pytest.fixture()
+    def boundary_db(self, tmp_path):
+        rows = [
+            # (run_id, task_id, project_id, title, outcome, cost_usd, duration_ms,
+            #  agent_invocations, execute_iterations, verify_attempts, review_cycles,
+            #  steward_cost_usd, steward_invocations, completed_at)
+            (
+                'r1', 't1', 'proj-a', None, 'done', 0.0, 1111,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-08T00:30:00+00:00',
+            ),  # same calendar date as cutoff, 11h30m BEFORE the cutoff instant
+            (
+                'r2', 't2', 'proj-a', None, 'done', 0.0, 2222,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-08T13:00:00+00:00',
+            ),  # 1h after the cutoff instant -- must be included
+            (
+                'r3', 't3', 'proj-a', None, 'done', 0.0, 3333,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-14T09:00:00+00:00',
+            ),  # comfortably inside the window -- must be included
+            (
+                'r4', 't4', 'proj-a', None, 'done', 0.0, 4444,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-07T23:00:00+00:00',
+            ),  # previous calendar date -- control row, excluded either way
+        ]
+        return _make_runs_db(tmp_path, 'boundary.db', rows)
+
+    @pytest.fixture()
+    async def boundary_conn(self, boundary_db):
+        async with aiosqlite.connect(str(boundary_db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            yield conn
+
+    @pytest.mark.asyncio
+    async def test_row_before_cutoff_on_boundary_day_is_excluded(self, boundary_conn):
+        result = await _hour_bucketed_history(
+            boundary_conn, 'proj-a', days=self.DAYS, now=self.NOW
+        )
+        assert '2026-05-08T00:00' not in result['labels'], (
+            f"Boundary-day row 11h30m before the cutoff instant must be "
+            f"excluded; got labels {result['labels']}"
+        )
+        assert '2026-05-08T13:00' in result['labels']
+        assert '2026-05-14T09:00' in result['labels']
+        assert len(result['labels']) == 2, result['labels']
+
+    @pytest.mark.asyncio
+    async def test_binds_cutoff_as_parameter_and_keeps_covering_index(self, boundary_conn):
+        """The cutoff must be a bound TEXT parameter (not a SQL-side
+        datetime('now') call), and binding it must not defeat
+        idx_task_results_project as a covering index (performance.py:630-632).
+        """
+        captured: list[tuple[str, tuple]] = []
+        real_execute_fetchall = boundary_conn.execute_fetchall
+
+        async def spy(sql, params=()):
+            captured.append((sql, params))
+            return await real_execute_fetchall(sql, params)
+
+        boundary_conn.execute_fetchall = spy
+        await _hour_bucketed_history(boundary_conn, 'proj-a', days=self.DAYS, now=self.NOW)
+
+        assert len(captured) == 1, captured
+        sql, params = captured[0]
+        assert "datetime('now'" not in sql, sql
+
+        expected_cutoff = _cutoff(self.DAYS, now=self.NOW)
+        assert expected_cutoff in params, (
+            f'Expected bound cutoff {expected_cutoff!r} in params {params!r}'
+        )
+
+        plan_rows = await real_execute_fetchall(f'EXPLAIN QUERY PLAN {sql}', params)
+        plan_text = ' '.join(str(cell) for row in plan_rows for cell in row)
+        assert 'idx_task_results_project' in plan_text, plan_text
