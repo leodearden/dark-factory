@@ -14,6 +14,7 @@ rather than a local ``spec_from_file_location`` copy — see the mandate in
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -40,6 +41,7 @@ rebuild_detail = _mod.rebuild_detail
 plan_rewrites = _mod.plan_rewrites
 Rewrite = _mod.Rewrite
 BackfillPlan = _mod.BackfillPlan
+apply_rewrites = _mod.apply_rewrites
 
 
 # ---------------------------------------------------------------------------
@@ -498,3 +500,101 @@ class TestPlanRewrites:
         assert plan.rewrites == []
         assert plan.pending_total == 0
         assert plan.legacy_total == 0
+
+
+# ---------------------------------------------------------------------------
+# apply_rewrites — the FROZEN-FIELD contract
+# ---------------------------------------------------------------------------
+
+FROZEN_TIMESTAMP = '2026-08-01T18:18:50.294218+00:00'
+FROZEN_UPDATED_AT = '2026-08-02T00:00:00+00:00'
+
+
+def _seeded_queue(tmp_path: Path, *escalations: Escalation) -> EscalationQueue:
+    queue = EscalationQueue(tmp_path)
+    for esc in escalations:
+        queue.submit(esc)
+    return queue
+
+
+def _folded_legacy_esc(**kwargs) -> Escalation:
+    """A legacy record carrying non-default values on every FROZEN field."""
+    fields: dict = {
+        'dedupe_count': 7,
+        'dedupe_children': ['esc-166-2', 'esc-166-3'],
+        'dedupe_fingerprint': None,
+        'level': 1,
+        'severity': 'blocking',
+        'timestamp': FROZEN_TIMESTAMP,
+        'updated_at': FROZEN_UPDATED_AT,
+    }
+    fields.update(kwargs)
+    return _legacy_esc(**fields)
+
+
+class TestApplyRewritesFrozenFields:
+    """Only ``summary`` and ``detail`` may change.  Everything else is frozen."""
+
+    def test_every_other_field_is_byte_identical_on_disk(self, tmp_path: Path):
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        raw = tmp_path / 'esc-166-1.json'
+        before = json.loads(raw.read_text())
+
+        plan = plan_rewrites(queue.get_pending())
+        report = apply_rewrites(queue, plan)
+
+        after = json.loads(raw.read_text())
+        assert after['summary'] == rebuild_summary('166', ANCHOR)
+        assert after['detail'] == rebuild_detail(LEGACY_DETAIL)
+        assert report['rewritten'] == 1
+
+        # TOTAL assertion: pop the two mutable fields and require the rest to be
+        # identical, so a field added to Escalation later is covered with no
+        # edit here.
+        for d in (before, after):
+            d.pop('summary')
+            d.pop('detail')
+        assert after == before
+
+    def test_dedupe_fingerprint_is_not_opportunistically_stamped(self, tmp_path: Path):
+        """3522's tested steady state is UNSTAMPED — recomputed deterministically."""
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        apply_rewrites(queue, plan_rewrites(queue.get_pending()))
+
+        after = json.loads((tmp_path / 'esc-166-1.json').read_text())
+        assert after['dedupe_fingerprint'] is None
+
+    def test_updated_at_is_not_bumped(self, tmp_path: Path):
+        """A display-only correction is not a substantive change (models.py:392).
+
+        Bumping it on 67 records would mass-invalidate the watcher's triage
+        stamps via the ``updated_at > triaged_at`` re-verify rule and force a
+        full re-drain of the backlog.
+        """
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        apply_rewrites(queue, plan_rewrites(queue.get_pending()))
+
+        after = json.loads((tmp_path / 'esc-166-1.json').read_text())
+        assert after['updated_at'] == FROZEN_UPDATED_AT
+
+    def test_fold_state_survives(self, tmp_path: Path):
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        apply_rewrites(queue, plan_rewrites(queue.get_pending()))
+
+        after = json.loads((tmp_path / 'esc-166-1.json').read_text())
+        assert after['dedupe_count'] == 7
+        assert after['dedupe_children'] == ['esc-166-2', 'esc-166-3']
+
+    def test_record_archived_between_planning_and_applying_is_skipped(
+        self, tmp_path: Path
+    ):
+        """Root only, never the archive — mirrors attach_dedupe_child's guard."""
+        queue = _seeded_queue(tmp_path, _folded_legacy_esc())
+        plan = plan_rewrites(queue.get_pending())
+
+        # A steward resolved it; sweep relocated the file out of the root.
+        (tmp_path / 'esc-166-1.json').unlink()
+
+        report = apply_rewrites(queue, plan)
+        assert report['rewritten'] == 0
+        assert report['skipped_missing'] == 1
