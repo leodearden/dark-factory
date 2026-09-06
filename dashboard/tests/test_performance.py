@@ -7,17 +7,21 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
 
+from dashboard.data import performance
 from dashboard.data.performance import (
+    _HISTORY_CACHE,
     _cutoff,
     _hour_bucketed_history,
     _load_escalations,
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
+    aggregate_performance_history,
     aggregate_time_centiles,
     get_completion_paths,
     get_escalation_rates,
@@ -2000,3 +2004,127 @@ class TestHourBucketedHistoryWindowBoundary:
         plan_rows = await real_execute_fetchall(f'EXPLAIN QUERY PLAN {sql}', params)
         plan_text = ' '.join(str(cell) for row in plan_rows for cell in row)
         assert 'idx_task_results_project' in plan_text, plan_text
+
+
+# ---------------------------------------------------------------------------
+# TestAggregatePerformanceHistoryWindowBoundary (step-5)
+# ---------------------------------------------------------------------------
+
+
+class TestAggregatePerformanceHistoryWindowBoundary:
+    """aggregate_performance_history must not discover a project whose only
+    activity is before the cutoff INSTANT but on the cutoff's calendar DATE
+    (task 4624, defect site 2 — the SELECT DISTINCT project_id discovery
+    query).
+
+    now=2026-05-15T12:00:00+00:00, days=7 -> cutoff instant is exactly
+    2026-05-08T12:00:00+00:00 (same anchoring as step-3).
+    """
+
+    NOW = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
+    DAYS = 7
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        """The cache key (id(db), project_id, days, max_ts) excludes `now`
+        (see design decision), so tests that vary `now` across runs must
+        clear it explicitly to avoid reading a stale entry from another
+        test's db (whose id(db) could, in principle, be reused by the
+        allocator once the earlier db object is garbage collected).
+        """
+        _HISTORY_CACHE.clear()
+
+    @pytest.fixture()
+    async def boundary_only_conn(self, tmp_path):
+        rows = [
+            (
+                'r1', 't1', 'proj-inside', None, 'done', 0.0, 1000,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-14T09:00:00+00:00',
+            ),
+            (
+                'r2', 't2', 'proj-boundary', None, 'done', 0.0, 2000,
+                0, 0, 0, 0, 0.0, 0,
+                '2026-05-08T00:30:00+00:00',
+            ),  # same calendar date as cutoff, before the cutoff instant --
+            # proj-boundary's ONLY row.
+        ]
+        db_path = _make_runs_db(tmp_path, 'boundary_only.db', rows)
+        db = await aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True)
+        db.row_factory = aiosqlite.Row
+        try:
+            yield db
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_boundary_only_project_is_not_discovered(self, boundary_only_conn):
+        """Discriminates site 784 specifically: if only site 642 were fixed,
+        'proj-boundary' would still be discovered (its only row passes the
+        buggy lexical comparison) and would appear in the output carrying
+        empty label/value lists -- so `not in` would fail. With both sites
+        fixed the key is absent entirely.
+        """
+        result = await aggregate_performance_history(
+            [boundary_only_conn], days=self.DAYS, now=self.NOW
+        )
+        assert 'proj-inside' in result, result
+        assert 'proj-boundary' not in result, (
+            f"proj-boundary's only row is before the cutoff instant and "
+            f'must not be discovered at all; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_now_is_resolved_once_and_threaded(self, boundary_only_conn):
+        """The discovery query and the per-project bucketing leg must share
+        one resolved cutoff instant rather than each reading the clock
+        independently and risking a straddled boundary.
+
+        Mirrors the spy pattern at test_costs_data.py:2296.
+        """
+        fixed_now = self.NOW
+        captured: list = []
+        real_cutoff = performance._cutoff
+
+        def spy(days, *, now=None):
+            captured.append(now)
+            return real_cutoff(days, now=now)
+
+        with patch.object(performance, '_cutoff', side_effect=spy):
+            await aggregate_performance_history(
+                [boundary_only_conn], days=self.DAYS, now=fixed_now
+            )
+
+        assert captured, 'Expected _cutoff to be called at least once'
+        assert all(now == fixed_now for now in captured), (
+            f'Expected every _cutoff call to receive now={fixed_now!r} '
+            f'(never None), got {captured!r}'
+        )
+
+
+def test_no_sql_side_clock_reads_in_data_layer():
+    """No `dashboard/src/dashboard/data/*.py` module computes a cutoff via a
+    SQL-side `datetime('now', ...)` call (task 4624 -- its 4th recorded
+    sighting of this defect class).
+
+    Modelled on test_clock_discipline.py:157-175's source-scanning guard. A
+    SQL-side clock read renders SPACE-separated with no UTC offset and is
+    then compared lexically against ISO-with-offset TEXT -- exactly the
+    defect this task fixes. Does not fire on `_project_cutoffs`
+    (performance.py), which uses `datetime(MAX(completed_at), ...)` and is
+    deliberately out of scope for this task (see design decision).
+    """
+    data_dir = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'data'
+    violations: list[str] = []
+    for path in sorted(data_dir.glob('*.py')):
+        rel = path.relative_to(data_dir.parent.parent)
+        for lineno, text in enumerate(path.read_text().splitlines(), start=1):
+            if "datetime('now'" in text or 'datetime("now"' in text:
+                violations.append(f'{rel}:{lineno}: {text.strip()}')
+
+    assert not violations, (
+        "SQL-side datetime('now', ...) clock read(s) found -- compute the "
+        'cutoff in Python instead via a module-local `_cutoff(days, *, '
+        'now=None)` helper routed through dashboard.data.utils.resolve_now '
+        '(see dashboard.data.performance._cutoff):\n' + '\n'.join(violations)
+    )

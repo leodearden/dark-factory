@@ -60,10 +60,11 @@ def _cutoff(days: int, *, now: datetime | None = None) -> str:
     The ISO-with-offset return value is load-bearing, not cosmetic: it is
     compared against ``task_results.completed_at``, which orchestrator
     writes via ``datetime.now(UTC).isoformat()`` (``run_store.py::save_run``).
-    A SQLite-side ``datetime('now', ...)`` renders SPACE-separated with no
-    offset, so a lexical TEXT comparison against it short-circuits at index
-    10 on ``'T'`` (0x54) vs ``' '`` (0x20) and silently degrades to DATE
-    granularity — over-including up to a full extra day (task 4624).
+    A SQLite-side ``datetime()`` call passed a ``'now'`` modifier renders
+    SPACE-separated with no offset, so a lexical TEXT comparison against it
+    short-circuits at index 10 on ``'T'`` (0x54) vs ``' '`` (0x20) and
+    silently degrades to DATE granularity — over-including up to a full
+    extra day (task 4624).
     """
     return (resolve_now(now) - timedelta(days=days)).isoformat()
 
@@ -655,14 +656,14 @@ async def _hour_bucketed_history(
             default) resolves to the current UTC clock.
     """
     # The cutoff is bound as a TEXT parameter (via _cutoff) rather than
-    # computed SQL-side with datetime('now', ...): SQLite's datetime()
-    # renders SPACE-separated with no UTC offset, which — compared lexically
-    # against the ISO-with-offset `completed_at` column — short-circuits at
-    # index 10 and silently degrades to DATE granularity, over-including up
-    # to a full extra day (task 4624). Binding the cutoff instead keeps
-    # idx_task_results_project (project_id + completed_at) usable as a
-    # covering index for the WHERE clause — re-confirmed via EXPLAIN QUERY
-    # PLAN and pinned by
+    # computed SQL-side via a datetime() call passed a 'now' modifier:
+    # SQLite's datetime() renders SPACE-separated with no UTC offset, which
+    # — compared lexically against the ISO-with-offset `completed_at`
+    # column — short-circuits at index 10 and silently degrades to DATE
+    # granularity, over-including up to a full extra day (task 4624).
+    # Binding the cutoff instead keeps idx_task_results_project (project_id
+    # + completed_at) usable as a covering index for the WHERE clause —
+    # re-confirmed via EXPLAIN QUERY PLAN and pinned by
     # TestHourBucketedHistoryWindowBoundary::test_binds_cutoff_as_parameter_and_keeps_covering_index.
     # strftime appears only in the SELECT/ORDER BY, not the WHERE clause, so
     # it does not defeat the index either.
