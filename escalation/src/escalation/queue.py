@@ -227,6 +227,41 @@ class AmendmentOutcome(TypedDict):
     variants: int
 
 
+class ResolveOutcome(TypedDict):
+    """What ONE :meth:`EscalationQueue.resolve` call actually DID (task 4495).
+
+    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: the
+    ``Escalation`` is ``resolve()``'s primary return value and every existing
+    call site reads it directly, so widening the return into a tuple would churn
+    all of them — the member cascade, ``dismiss_all_pending``, the steward, the
+    five workflow auto-dismiss backstops — for a fact only ``server.resolve_issue``
+    wants.
+
+    WHY IT EXISTS: ``resolve()``'s already-terminal branch is a no-op, so a caller
+    whose text did NOT apply gets back a perfectly healthy-looking ``Escalation``
+    and is told nothing.  That is the esc-3902-1 harm: an agent's substantive
+    resolution lands microseconds after an automated sweep dismissed the record,
+    and the agent is told "success".
+
+    Re-deriving these facts in the server from a pre-call ``queue.get`` would cost
+    a second full read+parse on every resolve AND be a real TOCTOU: this queue is
+    explicitly built for cross-process mutators (the sidecar flocks), so an
+    auto-dismiss landing between the pre-read and the call makes the reported flag
+    wrong in either direction — reading "pending, so my text will apply" for a
+    call that is about to no-op.  Computed INSIDE ``escalation_id_lock``, where
+    the check-and-set itself happens, these are exact.
+
+    Every key is populated on EVERY return path — including the not-found early
+    return — so a caller never reads a stale or missing key.
+    """
+
+    applied: bool                          # THIS call wrote the incoming resolution
+    prior_status: str | None               # the record's status BEFORE this call; None if absent
+    prior_resolved_by: str | None          # who had already closed it, when applied is False
+    late_resolution_captured: bool         # the text was preserved in `late_resolutions` instead
+    resolution_class_corrected: str | None  # the stamp this call re-derived, or None
+
+
 def _elide(text: str, limit: int) -> tuple[str, int]:
     """Return (*text* capped at *limit*, characters dropped).
 
@@ -1087,6 +1122,7 @@ class EscalationQueue:
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
+        outcome: ResolveOutcome | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
 
@@ -1104,6 +1140,13 @@ class EscalationQueue:
         nothing is persisted (INV-1). When ``None``, the stamp defaults per
         the caller's ``resolved_by`` (see ``escalation.classify.
         default_resolution_class_for_resolver``).
+
+        ``outcome`` (task 4495): an optional :class:`ResolveOutcome` dict filled
+        in place with what this call DID — whether the resolution was actually
+        applied, and the prior status/resolver when it was not.  Every key is
+        written on every return path.  Read it rather than assuming a non-None
+        return means the text took effect: the already-terminal branch below
+        returns the STORED record unchanged.
 
         Concurrency: the get → status-check → mutate → _atomic_write →
         _archive_resolved critical section is serialized under
@@ -1145,16 +1188,35 @@ class EscalationQueue:
                 f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
             )
 
+        # Seed BEFORE the lock so the early returns below leave a complete dict
+        # rather than a stale caller-supplied one (the add_members_to_l2
+        # convention).  Note this runs AFTER the resolution_class validation
+        # above, so an INV-1 rejection leaves the caller's dict untouched —
+        # nothing is persisted and nothing is reported.
+        if outcome is not None:
+            outcome['applied'] = False
+            outcome['prior_status'] = None
+            outcome['prior_resolved_by'] = None
+            outcome['late_resolution_captured'] = False
+            outcome['resolution_class_corrected'] = None
+
         with escalation_id_lock(self.queue_dir, escalation_id):
             esc = self.get(escalation_id)
             if esc is None:
                 return None
 
             if esc.status != 'pending':
+                if outcome is not None:
+                    outcome['prior_status'] = esc.status
+                    outcome['prior_resolved_by'] = esc.resolved_by
                 logger.info(
                     f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
                 )
                 return esc
+
+            if outcome is not None:
+                outcome['applied'] = True
+                outcome['prior_status'] = esc.status
 
             esc.status = 'dismissed' if dismiss else 'resolved'
             esc.resolution = resolution
