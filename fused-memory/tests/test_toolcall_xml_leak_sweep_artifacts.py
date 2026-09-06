@@ -613,16 +613,19 @@ class TestProvenanceSidecar:
     """Every report must be attributable to a real, identified run.
 
     The sidecar exists for a specific reason beyond bookkeeping. ``new_progress()``
-    (script line ~532) seeds ``collection`` to ``''`` and the field can land
-    BLANK in the emitted report — which it did for this capture, and which is
-    exactly the defect task 3243 (still pending) will fix upstream. A report
-    that does not say which collection it swept cannot be trusted as a
-    measurement of that collection.
+    (script line ~663) seeds ``collection`` to ``''``, and at the time these
+    captures were taken nothing ever overwrote it: ``Mem0Backend.scan_payload_text``
+    did not return a ``collection`` key, so ``run()``'s ``scan.get('collection',
+    '')`` resolved to ``''`` on every run. A report that does not say which
+    collection it swept cannot be trusted as a measurement of that collection.
 
-    Recording the collection out-of-band here closes that gap LOCALLY, for this
-    capture, without editing the sweep script — which would duplicate and
-    probably conflict with 3243's work, and would put production-code changes
-    inside a task whose whole point is an operational run.
+    That upstream defect HAS since been fixed (task 3243): the scan now reports
+    the collection it walked, and ``run()`` logs a WARNING if it ever comes back
+    blank again. These 2026-08-05 captures still carry ``collection: ""`` because
+    they PREDATE the fix — a frozen historical fact about what was emitted, not
+    something to be back-filled — so the sidecar remains the only thing
+    identifying what those particular runs swept, and both assertions below
+    stay exactly as they were.
     """
 
     def test_sidecar_exists(self, path: Path) -> None:
@@ -640,9 +643,9 @@ class TestProvenanceSidecar:
         assert isinstance(collection, str)
         assert collection.strip(), (
             'provenance.collection is blank. This field is the whole reason the '
-            "sidecar exists: the sweep's own report can emit collection='' "
-            '(task 3243), so if the sidecar is blank too, nothing identifies '
-            'what was swept.'
+            "sidecar exists: these captures' own reports emit collection='' "
+            '(the pre-task-3243 shape), so if the sidecar is blank too, nothing '
+            'identifies what was swept.'
         )
 
     def test_point_counts_bracket_the_run(self, path: Path) -> None:
