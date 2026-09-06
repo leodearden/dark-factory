@@ -12851,3 +12851,151 @@ class TestFilterAccountedClusterGrowthFlags:
             'the drift log must name CLUSTER_GROWTH_FLAG_TYPES as its reference '
             f'point; got {drift[0]!r}'
         )
+
+    # -- task 3476 step-9: multi-task resolution ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_task_id_resolved_from_cited_tasks_only(self):
+        """(a) The gate task appears ONLY in cited_tasks -> still resolved and DROPPED."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            task_id=None,
+            memory_ids=[self._UUID_3468],
+            cited_tasks=[{
+                'project_id': 'dark_factory',
+                'task_id': '3468',
+                'title': 'Human gate: consolidate the verify-lane cluster',
+            }],
+        )
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            task_id=3468,
+            description=f'Cluster UUIDs (mem0):\n  - {self._UUID_3468}\n',
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'a task id present only in cited_tasks must still be resolved and '
+            f'the flag DROPPED; got {result!r}'
+        )
+        taskmaster.get_task.assert_awaited_once_with('3468', '/df')
+
+    @pytest.mark.asyncio
+    async def test_comma_joined_task_id_drops_when_the_second_task_accounts(self):
+        """(b) Some-task-accounts-for-all: '3417,3468' where only 3468 lists it."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            task_id='3417,3468', memory_ids=[self._UUID_3468],
+        )
+        bodies = {
+            '3417': self._make_task_record(description='nothing relevant here'),
+            '3468': self._make_task_record(
+                task_id=3468,
+                description=f'Cluster UUIDs (mem0):\n  - {self._UUID_3468}\n',
+            ),
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=lambda tid, _root: bodies[tid])
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'SOME candidate task accounting for every cited UUID is sufficient; '
+            f'got {result!r}'
+        )
+        assert taskmaster.get_task.await_count == 2, (
+            'both components of the comma-joined task_id must be resolved; '
+            f'got {taskmaster.get_task.await_count} awaits'
+        )
+
+    @pytest.mark.asyncio
+    async def test_bodies_are_never_unioned_across_candidate_tasks(self):
+        """(c) 3417 has uuid-A, 3468 has uuid-B, flag cites both -> KEPT.
+
+        The all-present test must be satisfied by a SINGLE task's body.
+        "uuid-A is in 3417 and uuid-B is in 3468" does not establish that the
+        cluster this finding is about is fully tracked anywhere.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(
+            task_id='3417,3468',
+            memory_ids=[self._UUID_3417, self._UUID_3468],
+        )
+        bodies = {
+            '3417': self._make_task_record(
+                description=f'tracked: {self._UUID_3417}',
+            ),
+            '3468': self._make_task_record(
+                task_id=3468, description=f'tracked: {self._UUID_3468}',
+            ),
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=lambda tid, _root: bodies[tid])
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [flag], (
+            'neither task lists BOTH cited UUIDs; unioning bodies across tasks '
+            f'would be a false DROP, so the flag must be KEPT; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_uuid_present_only_in_details_drops(self):
+        """(d) The body under test is description + details.
+
+        Mirrors the live 3417 record, whose `details` genuinely carries UUIDs
+        (e.g. 4a4daa2d, 190731b1) that the description does not.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=self._make_task_record(
+            description='',
+            details=f'Secondary entries:\n  - mem0 {self._UUID_3417}\n',
+        ))
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'a UUID present only in `details` still accounts for the growth — '
+            f'the body is description+details; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_positive_confirmation_survives_a_sibling_lookup_error(self):
+        """(e) An error on one candidate id must not veto another's confirmation."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_accounted_cluster_growth_flags,
+        )
+
+        flag = self._make_growth_flag(task_id='3417,3468')
+
+        def _get(tid, _root):
+            if tid == '3417':
+                raise Exception('backend hiccup')
+            return self._make_task_record(
+                task_id=3468, description=f'tracked: {self._UUID_3417}',
+            )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get)
+
+        result = await filter_accounted_cluster_growth_flags(taskmaster, '/df', [flag])
+
+        assert result == [], (
+            'one positive confirmation is sufficient; an erroring sibling id '
+            f'contributes no body and must not veto it; got {result!r}'
+        )
