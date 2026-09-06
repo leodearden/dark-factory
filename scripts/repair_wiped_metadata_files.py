@@ -424,10 +424,14 @@ def classify_reply(result: object) -> ReplyVerdict:
     hypothetical, and reading it as success reports a REPAIR THAT NEVER
     HAPPENED against live task metadata.
 
-    THE ``ok`` DECISION IS NOT MADE HERE. All four load-bearing checks and the
-    order they run in live once, in
+    THE ``ok`` DECISION IS NOT MADE HERE. The WHOLE CASCADE — every
+    load-bearing check, in the order it runs — lives once, in
     ``scripts/migrate_metadata_modules_to_files.py::write_failure_reason``;
-    this function calls it and wraps the returned ``str | None``. Until task
+    this function calls it and wraps the returned ``str | None``. No COUNT of
+    those checks is given here on purpose: it was four while this was a
+    transcribed twin and is six today, and a number restated on this side goes
+    stale the moment a probe is added over there — which is the same
+    keep-two-copies-in-step failure the delegation exists to end. Until task
     4608 this was a TRANSCRIBED TWIN of that cascade, and the copy had already
     drifted: task 4528 closed two transport-stamped holes over there that never
     reached the copy, so ``{RAW_REPLY_KEY: ...}`` (a reply the transport could
