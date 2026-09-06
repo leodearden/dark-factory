@@ -416,6 +416,12 @@ _ECHO_OPENER_RE = re.compile(r'\x3c(' + _TAG_NAME + r')"?>')
 # by construction instead. Both ceilings are far above any real call: no MCP
 # tool has 64 parameters, and a value carrying 64 qualifying closers is prose
 # about markup, not a leak.
+#
+# A BOUNDED STEP COUNT IS ONLY A BOUND ON COST WHILE EACH STEP STAYS CHEAP, and
+# these ceilings MULTIPLY: candidates x tail items x inner closers. Task 4502's
+# ambiguity probe briefly made the innermost step O(len(body)) by slicing, which
+# these ceilings do not contain — see :func:`_parse_body`'s *start* parameter.
+# Anything added inside these loops must be O(1) in the input length.
 _MAX_CANDIDATES = 64
 _MAX_TAIL_ITEMS = 64
 
@@ -554,7 +560,10 @@ def _inner_closer_blocks(
     worse than the ``None`` returned today.
 
     *value_start* is *item_value*'s offset within *body*, so the probe can read
-    the remainder from the shared string rather than re-slicing the caller's.
+    the remainder from the shared string rather than copying it: it is passed
+    as :func:`_parse_body`'s *start*, NOT used to slice. That is a performance
+    contract, not a stylistic one — see *start*'s own docstring for the
+    measurement and for why slicing here is super-linear on the request path.
 
     Bounded like everything else here: at most :data:`_MAX_CANDIDATES` inner
     closers are considered, and the probe runs at depth 1 with the blanket
@@ -572,7 +581,7 @@ def _inner_closer_blocks(
             or closer_for(inner_name) == INVOKE_CLOSER
         ):
             return True  # (i) a mis-close of THIS item, or a call boundary
-        if _parse_body(body[value_start + inner.end():], probe=True) is not None:
+        if _parse_body(body, probe=True, start=value_start + inner.end()) is not None:
             return True  # (ii) the alternative boundary parses too — a guess
     # The prefilter fired but no WELL-FORMED closer is present, so there is
     # nothing to reason about: keep B5's original answer rather than widening
@@ -580,7 +589,7 @@ def _inner_closer_blocks(
     return considered == 0
 
 
-def _parse_body(body: str, *, probe: bool) -> dict[str, str] | None:
+def _parse_body(body: str, *, probe: bool, start: int = 0) -> dict[str, str] | None:
     """The item loop of :func:`_parse_tail`, after the invoke closer is stripped.
 
     Factored out (task **4502**) so :func:`_inner_closer_blocks` can ask whether
@@ -590,10 +599,25 @@ def _parse_body(body: str, *, probe: bool) -> dict[str, str] | None:
     construction — deliberately a flag rather than a depth counter, because
     there is exactly one legal depth and a counter would invite a second.
 
+    *start* is where in *body* to begin, and is what keeps the probe CHEAP. It
+    exists instead of the obvious ``_parse_body(body[offset:], ...)`` because
+    that slice is O(len(body)) and runs once per inner closer per tail item per
+    candidate, while the probe itself almost always answers in O(1) — the
+    remainder starts mid-prose, neither opener matches at *pos*, and it returns
+    immediately. Measured on the sliced version at a CONSTANT 1024 probes,
+    growing only the body: 216 KB -> 0.0042 s, 3.2 MB -> 0.0496 s, i.e. linear
+    in a length the parse work does not depend on, and :func:`repair` pays that
+    up to :data:`_MAX_CANDIDATES` times over. Since :func:`repair` runs
+    synchronously on the middleware's request path, a large leaked argument
+    stalled the server for the duration. DO NOT "simplify" *start* back into a
+    slice: no regex here is anchored (see :data:`_CANONICAL_OPENER_RE`,
+    :data:`_ECHO_OPENER_RE`, :func:`_closer_re` — none uses ``^`` or a
+    lookbehind), so passing a position is exactly equivalent and merely free.
+
     ``None`` means the body did not parse with ZERO leftover.
     """
     recovered: dict[str, str] = {}
-    pos = 0
+    pos = start
     for _ in range(_MAX_TAIL_ITEMS):
         while pos < len(body) and body[pos].isspace():
             pos += 1
