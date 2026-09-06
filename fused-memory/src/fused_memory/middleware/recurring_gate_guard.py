@@ -38,6 +38,7 @@ from shared.task_statuses import TERMINAL
 __all__ = [
     'GATE_SUBJECT_ALIASES',
     'GATE_SUBJECT_KEY',
+    'GATE_SUBJECT_SUBMISSION_ALIASES',
     'extract_gate_subject',
     'find_open_gate',
     'is_gate_submission',
@@ -58,16 +59,51 @@ GetTasksFn = Callable[[], Awaitable[Any]]
 # reconciliation/recon_self_model.py::render_source_completion_section.
 GATE_SUBJECT_KEY = 'gate_subject'
 
-# Resolution order. The two trailing names are READ-SIDE aliases honoured for
-# already-filed carriers (5902/5916/5929 key their subject via
-# ``stranded_task_id``); no already-filed task's metadata is ever rewritten,
-# and the canonical key always wins when both are present. They are also
-# honoured on the INCOMING submission so a Stage-2 run that has not yet
-# internalized the new prompt is deduped anyway.
+# STORED-side resolution order, used when reading an ALREADY-FILED carrier.
+# The two trailing names are the older invented spellings: 5902/5916/5929 key
+# their subject via ``stranded_task_id``, and dark-factory's own gates 3240,
+# 3361 and 3463 key theirs via ``related_task_id``. No already-filed task's
+# metadata is ever rewritten, so both must stay readable here; the canonical
+# key always wins when several are present. Reading a stored row is safe
+# because :func:`find_open_gate` additionally requires the row to BE a gate,
+# so a non-gate task that merely carries a ``related_task_id`` cross-reference
+# (measured: 3042 -> 2885 and 3046 -> 3045, both ``code_tdd``) can never be
+# mistaken for a carrier.
 GATE_SUBJECT_ALIASES: tuple[str, ...] = (
     GATE_SUBJECT_KEY,
     'stranded_task_id',
     'related_task_id',
+)
+
+# INCOMING-side resolution order, used on the submission being filed.
+# Deliberately NARROWER than the stored order, and the difference is
+# load-bearing rather than cosmetic (amended after review; the original
+# design decision honoured all three on both sides on the premise that the
+# incoming half was "strictly additive and costs nothing" — measurement
+# refutes that premise for ``related_task_id`` specifically).
+#
+# ``related_task_id`` is demonstrably a GENERIC cross-reference pointer in the
+# live corpus, not a gate-subject key: tasks 3042 -> 2885 and 3046 -> 3045 use
+# it as a plain "see also" on ``code_tdd`` work, while gates 3240/3361/3463 use
+# it as a subject. The incoming side cannot tell those apart, and unlike the
+# stored side it has no is-a-gate check to fall back on — the submission is
+# already known to be a gate, which is how it reached this resolution at all.
+# So honouring it here means a genuinely novel gate that carries
+# ``related_task_id`` merely as a see-also is HARD-REJECTED against a carrier
+# it has nothing to do with, with rejection prose asserting the two share a
+# subject. That failure direction is the expensive one — a novel human
+# decision never reaches a human — and it is the one asymmetry this otherwise
+# fail-open guard must not take.
+#
+# ``stranded_task_id`` is kept: it is only ever a subject (never a see-also),
+# and it is the transition window the design decision's rationale actually
+# names — a Stage-2 run that has not yet internalized the new prompt and still
+# emits that spelling is deduped anyway. The prompt authority already tells
+# the filing agent both aliases are "read-side only: never use either for a
+# NEW filing", so this narrowing moves the code TOWARD the prompt, not away.
+GATE_SUBJECT_SUBMISSION_ALIASES: tuple[str, ...] = (
+    GATE_SUBJECT_KEY,
+    'stranded_task_id',
 )
 
 
@@ -106,19 +142,28 @@ def _parse_metadata(metadata: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def extract_gate_subject(metadata: str | dict[str, Any] | None) -> str | None:
+def extract_gate_subject(
+    metadata: str | dict[str, Any] | None,
+    *,
+    aliases: tuple[str, ...] = GATE_SUBJECT_ALIASES,
+) -> str | None:
     """Return the dedupe subject declared by *metadata*, or ``None``.
 
-    Walks :data:`GATE_SUBJECT_ALIASES` in order and returns the first
-    non-empty scalar, stripped and coerced to ``str``. Only ``str`` and
-    ``int`` are accepted — ``bool`` is excluded EXPLICITLY because it is an
-    ``int`` subclass, so ``gate_subject=True`` would otherwise become the
-    subject ``'True'`` and dedupe two unrelated gates against each other.
-    Dicts, lists and ``None`` are likewise not subjects; a key holding one
-    is skipped so a later alias can still answer.
+    Walks *aliases* in order and returns the first non-empty scalar,
+    stripped and coerced to ``str``. Only ``str`` and ``int`` are accepted —
+    ``bool`` is excluded EXPLICITLY because it is an ``int`` subclass, so
+    ``gate_subject=True`` would otherwise become the subject ``'True'`` and
+    dedupe two unrelated gates against each other. Dicts, lists and ``None``
+    are likewise not subjects; a key holding one is skipped so a later alias
+    can still answer.
+
+    *aliases* defaults to the STORED order (:data:`GATE_SUBJECT_ALIASES`),
+    which is what reading an already-filed carrier wants. Resolving an
+    INCOMING submission must pass :data:`GATE_SUBJECT_SUBMISSION_ALIASES`
+    instead — see that constant for why the two orders differ.
     """
     meta = _parse_metadata(metadata)
-    for key in GATE_SUBJECT_ALIASES:
+    for key in aliases:
         value = meta.get(key)
         if isinstance(value, bool) or not isinstance(value, (str, int)):
             continue
@@ -282,6 +327,14 @@ async def recurring_gate_guard_error(
     NON-TERMINAL carrier, and ``None`` otherwise — including for every
     non-recon caller, which is never enforced.
 
+    The submission's own subject is resolved through the NARROW
+    :data:`GATE_SUBJECT_SUBMISSION_ALIASES` order, while stored carriers are
+    matched through the wider :data:`GATE_SUBJECT_ALIASES` order inside
+    :func:`find_open_gate`. A submission carrying ``related_task_id`` purely
+    as a see-also therefore resolves NO subject and is not enforced against
+    at all — it short-circuits before the corpus read, so it also costs no
+    I/O.
+
     Gates run cheapest-first, so the extra task read is issued ONLY on the
     narrow recon gate-filing path: a non-recon caller costs one string
     ``startswith`` and nothing else. ``fetch_tasks`` is awaited at most once.
@@ -316,7 +369,9 @@ async def recurring_gate_guard_error(
     if not is_gate_submission(meta):
         return None
 
-    subject = extract_gate_subject(meta)
+    subject = extract_gate_subject(
+        meta, aliases=GATE_SUBJECT_SUBMISSION_ALIASES
+    )
     if subject is None:
         # No dedupe key => nothing to enforce, and nothing to read.
         return None

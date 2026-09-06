@@ -134,6 +134,50 @@ class TestSubmitTaskRecurringGateWiring:
         mock_ti.submit_task.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_incoming_see_also_related_task_id_is_not_rejected(self):
+        """A submission whose `related_task_id` is a see-also must get through.
+
+        `related_task_id` is a generic cross-reference in the live corpus
+        (3042 -> 2885, 3046 -> 3045, both code_tdd) as well as a gate subject
+        (3240/3361/3463), so the incoming side cannot treat it as a subject.
+        Rejecting here would keep a genuinely novel human decision from ever
+        reaching a human — the one failure direction this otherwise fail-open
+        guard must not take.
+        """
+        server, mock_ti = self._server(_carrier())
+
+        result = await server._tool_manager.call_tool(
+            'submit_task',
+            _submission(
+                metadata={
+                    'execution_class': 'operational',
+                    'operational_mode': 'gate',
+                    'related_task_id': '5879',
+                }
+            ),
+        )
+
+        parsed = _parse_tool_result(result)
+        assert 'error' not in parsed, f'got {parsed!r}'
+        mock_ti.submit_task.assert_awaited_once()
+        # No subject resolved => the corpus read is never issued either.
+        mock_ti.get_tasks.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stored_related_task_id_carrier_is_matched_at_the_boundary(self):
+        # dark-factory's own gates 3240/3361/3463 key their subject via
+        # related_task_id, so the STORED side must keep reading it.
+        server, mock_ti = self._server(
+            _carrier(task_id='3463', subject_key='related_task_id')
+        )
+
+        result = await server._tool_manager.call_tool('submit_task', _submission())
+
+        parsed = _parse_tool_result(result)
+        assert parsed.get('existing_gate_task_id') == '3463', f'got {parsed!r}'
+        mock_ti.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_cancelled_carrier_does_not_block(self):
         server, mock_ti = self._server(_carrier(status='cancelled'))
 

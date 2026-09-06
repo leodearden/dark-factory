@@ -78,11 +78,53 @@ class TestGateSubjectKeyConstants:
     def test_aliases_cover_the_already_filed_carrier_spellings(self):
         from fused_memory.middleware.recurring_gate_guard import GATE_SUBJECT_ALIASES
 
-        # 5902/5916/5929 key their subject via stranded_task_id; related_task_id
-        # is the singular sibling spelling. History is never rewritten, so both
-        # must be readable.
+        # 5902/5916/5929 key their subject via stranded_task_id; dark-factory's
+        # own gates 3240/3361/3463 key theirs via related_task_id. History is
+        # never rewritten, so both must stay readable on the STORED side.
         assert 'stranded_task_id' in GATE_SUBJECT_ALIASES
         assert 'related_task_id' in GATE_SUBJECT_ALIASES
+
+    def test_submission_aliases_exclude_related_task_id(self):
+        """The INCOMING order must not honour the see-also spelling.
+
+        Measured in the live corpus: `related_task_id` is a generic
+        cross-reference on non-gate work (3042 -> 2885, 3046 -> 3045, both
+        code_tdd) as well as a subject on gates. The stored side survives that
+        ambiguity because find_open_gate also requires the row to BE a gate;
+        the incoming side has no such fallback, so honouring it there would
+        hard-reject a novel gate against an unrelated carrier.
+        """
+        from fused_memory.middleware.recurring_gate_guard import (
+            GATE_SUBJECT_SUBMISSION_ALIASES,
+        )
+
+        assert 'related_task_id' not in GATE_SUBJECT_SUBMISSION_ALIASES
+
+    def test_submission_aliases_are_ordered_canonical_first_then_stranded(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            GATE_SUBJECT_KEY,
+            GATE_SUBJECT_SUBMISSION_ALIASES,
+        )
+
+        assert isinstance(GATE_SUBJECT_SUBMISSION_ALIASES, tuple)
+        assert GATE_SUBJECT_SUBMISSION_ALIASES[0] == GATE_SUBJECT_KEY
+        # stranded_task_id is only ever a subject, never a see-also, so it is
+        # the one legacy spelling the transition window keeps.
+        assert 'stranded_task_id' in GATE_SUBJECT_SUBMISSION_ALIASES
+
+    def test_submission_aliases_are_a_subset_of_the_stored_order(self):
+        """Narrower, never wider: every incoming key must also read stored rows.
+
+        A key honoured on the incoming side but not the stored side could
+        resolve a subject that no carrier could ever match, silently disabling
+        the dedupe for that spelling.
+        """
+        from fused_memory.middleware.recurring_gate_guard import (
+            GATE_SUBJECT_ALIASES,
+            GATE_SUBJECT_SUBMISSION_ALIASES,
+        )
+
+        assert set(GATE_SUBJECT_SUBMISSION_ALIASES) <= set(GATE_SUBJECT_ALIASES)
 
 
 class TestExtractGateSubject:
@@ -103,7 +145,29 @@ class TestExtractGateSubject:
     def test_falls_back_to_related_task_id(self):
         from fused_memory.middleware.recurring_gate_guard import extract_gate_subject
 
+        # Default order is the STORED one, which still reads this spelling.
         assert extract_gate_subject({'related_task_id': '5879'}) == '5879'
+
+    def test_explicit_alias_tuple_narrows_resolution(self):
+        from fused_memory.middleware.recurring_gate_guard import (
+            GATE_SUBJECT_SUBMISSION_ALIASES,
+            extract_gate_subject,
+        )
+
+        assert (
+            extract_gate_subject(
+                {'related_task_id': '5879'},
+                aliases=GATE_SUBJECT_SUBMISSION_ALIASES,
+            )
+            is None
+        )
+        assert (
+            extract_gate_subject(
+                {'stranded_task_id': '5879'},
+                aliases=GATE_SUBJECT_SUBMISSION_ALIASES,
+            )
+            == '5879'
+        )
 
     def test_alias_order_stranded_beats_related(self):
         from fused_memory.middleware.recurring_gate_guard import extract_gate_subject
@@ -641,6 +705,60 @@ class TestRecurringGateGuardError:
         )
         assert err is not None
         assert err['existing_gate_task_id'] == '5902'
+
+    @pytest.mark.asyncio
+    async def test_incoming_see_also_related_task_id_is_not_a_subject(self):
+        """A see-also pointer must never become the dedupe subject.
+
+        The expensive failure direction: a genuinely novel human decision is
+        hard-rejected against a carrier it has nothing to do with, and the
+        rejection prose asserts the two share a subject. Asserting
+        `await_count == 0` also pins that this resolves to "no subject" and
+        short-circuits, rather than reading the corpus and missing.
+        """
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        # The incoming gate is about something else entirely; 5879 is only a
+        # cross-reference. An open carrier for 5879 exists in the corpus.
+        incoming = _gate_meta(subject=None, related_task_id='5879')
+        fetch = self._corpus(_row(task_id='5902'))
+        assert (
+            await recurring_gate_guard_error(
+                incoming, 'recon-stage-task_knowledge_sync', '/p', fetch_tasks=fetch
+            )
+            is None
+        )
+        assert fetch.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_incoming_canonical_matches_stored_related_task_id(self):
+        """dark-factory gates 3240/3361/3463 key their subject this way.
+
+        The stored side keeps the wider alias order precisely so those real
+        carriers stay matchable; only the incoming side was narrowed.
+        """
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        stored = _row(
+            task_id='3463',
+            metadata={
+                'execution_class': 'operational',
+                'operational_mode': 'gate',
+                'related_task_id': '5879',
+            },
+        )
+        err = await recurring_gate_guard_error(
+            _gate_meta(),
+            'recon-stage-task_knowledge_sync',
+            '/p',
+            fetch_tasks=self._corpus(stored),
+        )
+        assert err is not None
+        assert err['existing_gate_task_id'] == '3463'
 
     @pytest.mark.asyncio
     async def test_incoming_canonical_matches_stored_alias(self):
