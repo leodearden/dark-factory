@@ -12,6 +12,7 @@ import copy
 import json
 import logging
 from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -19,6 +20,7 @@ from escalation.queue import iter_all_escalation_paths
 
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,26 @@ def _load_escalations(escalations_dir: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Time-window helper
 # ---------------------------------------------------------------------------
+
+
+def _cutoff(days: int, *, now: datetime | None = None) -> str:
+    """Return ISO-format cutoff datetime for the given look-back window.
+
+    Local copy of :func:`dashboard.data.costs._cutoff` — kept independent
+    rather than imported so this module has no cross-module dependency on
+    another data module's private helper (mirrors
+    :func:`dashboard.data.model_role._cutoff`).
+
+    The ISO-with-offset return value is load-bearing, not cosmetic: it is
+    compared against ``task_results.completed_at``, which orchestrator
+    writes via ``datetime.now(UTC).isoformat()`` (``run_store.py::save_run``).
+    A SQLite-side ``datetime('now', ...)`` renders SPACE-separated with no
+    offset, so a lexical TEXT comparison against it short-circuits at index
+    10 on ``'T'`` (0x54) vs ``' '`` (0x20) and silently degrades to DATE
+    granularity — over-including up to a full extra day (task 4624).
+    """
+    return (resolve_now(now) - timedelta(days=days)).isoformat()
+
 
 _WINDOW_SQL = """\
 SELECT project_id,
