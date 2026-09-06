@@ -1279,28 +1279,60 @@ class EscalationQueue:
                 # predicate is narrow.  Still inside escalation_id_lock, so the
                 # capture is atomic with the check-and-set it follows.
                 if _is_late_resolution_worth_capturing(esc, resolution, resolved_by):
+                    prior_class = esc.resolution_class
+                    # Correct the stamp ONLY when it is the one the automated
+                    # dismissal DERIVED.  `default_resolution_class_for_resolver`
+                    # maps the reaper-sweep tier to 'benign' — i.e. the sweep
+                    # asserted "nothing actionable here" about a record whose
+                    # real resolution is the text we are capturing, which is the
+                    # esc-3902-1 harm.  An 'actionable' stamp is already the
+                    # truth this aims at, and 'moot-terminal-subject' (task 2724)
+                    # says something specific about WHY the record was closed
+                    # that flattening would destroy — neither is touched.
+                    corrected: str | None = None
+                    if esc.resolution_class == 'benign':
+                        # `resolution_class` was validated against
+                        # RESOLUTION_CLASSES at the top of this method, so the
+                        # incoming value is already known-legal here.
+                        corrected = resolution_class or 'actionable'
+
                     entry: LateResolution = {
                         'timestamp': datetime.now(UTC).isoformat(),
                         'resolution': resolution,
                         'resolved_by': resolved_by,
                         'resolution_action': None,
                         'dismiss': dismiss,
-                        'prior_resolution_class': None,
+                        # Preserved so the correction destroys nothing and the
+                        # original derivation stays auditable.
+                        'prior_resolution_class': prior_class if corrected else None,
                     }
                     esc.late_resolutions.append(entry)
+                    if corrected is not None:
+                        esc.resolution_class = corrected
+
                     if self._write_late_resolution(escalation_id, esc):
                         if outcome is not None:
                             outcome['late_resolution_captured'] = True
+                            outcome['resolution_class_corrected'] = corrected
                         logger.warning(
                             'Escalation %s was already dismissed by %r; a LATE '
                             'resolution from %r arrived after that automated '
                             'dismissal and has been CAPTURED in late_resolutions '
-                            '(the record\'s terminal state is unchanged): %s',
+                            '(the record\'s terminal state is unchanged'
+                            '%s): %s',
                             escalation_id, esc.resolved_by, resolved_by,
+                            (
+                                f'; resolution_class corrected {prior_class!r} -> '
+                                f'{corrected!r}'
+                            ) if corrected is not None else '',
                             resolution[:200],
                         )
                     else:
+                        # The write did not land, so nothing may be reported as
+                        # captured — roll the in-memory record back to what is
+                        # actually on disk.
                         esc.late_resolutions.pop()
+                        esc.resolution_class = prior_class
                 return esc
 
             if outcome is not None:
