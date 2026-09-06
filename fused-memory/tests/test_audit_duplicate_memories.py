@@ -5249,14 +5249,12 @@ class TestLivenessSubjectFactsFallback:
     carrying no readable assignment, and a clause boundary landing inside a
     quoted value.
 
-    An earlier reading of this class claimed the rescope "can only ADD recall
-    if a subject the clauses say nothing about keeps exactly the key it had
-    BEFORE the rescope". That condition is real but NOT sufficient, and
-    believing it shipped a regression: a subject whose clause named only SOME
-    of the record's fields keyed on a partial fact instead, silently vacating
-    the whole-record bucket it used to share -- an empty-set-only fallback
-    never fires for it. The invariant that actually holds is the unconditional
-    one above; `TestLivenessSubjectFactsIsAdditive` pins the
+    An empty-set-only fallback is NOT sufficient on its own: a subject whose
+    clause names only SOME of the record's fields keys on a partial fact
+    instead, silently vacating the whole-record bucket it shared -- a shape
+    an empty-set test never reaches. Every subject keys on *core_fact*
+    unconditionally, and a clause-scoped key is ADDED beside it, never
+    substituted for it; `TestLivenessSubjectFactsIsAdditive` pins the
     non-empty-but-incomplete half this class does not reach.
 
     Because every pre-rescope bucket membership therefore survives, nothing is
