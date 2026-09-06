@@ -14,10 +14,18 @@ rather than a local ``spec_from_file_location`` copy — see the mandate in
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
 from _fm_helpers import load_script_module
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
+
+from fused_memory.reconciliation.stage1_stall_detector import (
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+    maybe_escalate_stalled_gate_backlog,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'backfill_gate_backlog_summaries.py'
 
@@ -26,6 +34,7 @@ _mod = load_script_module(SCRIPT_PATH, mod_name='backfill_gate_backlog_summaries
 GATE_BACKLOG_CATEGORY = _mod.GATE_BACKLOG_CATEGORY
 is_legacy_gate_backlog_record = _mod.is_legacy_gate_backlog_record
 extract_gate_escalated_at = _mod.extract_gate_escalated_at
+rebuild_summary = _mod.rebuild_summary
 
 
 # ---------------------------------------------------------------------------
@@ -204,3 +213,72 @@ class TestExtractGateEscalatedAt:
             'description: the record had gate_escalated_at: 1999-01-01T00:00:00+00:00 set',
         ])
         assert extract_gate_escalated_at(detail) is None
+
+
+# ---------------------------------------------------------------------------
+# rebuild_summary — EMITTER PARITY
+# ---------------------------------------------------------------------------
+
+
+class TestRebuildSummary:
+    """The rebuilt summary must be byte-identical to what the live emitter writes."""
+
+    @pytest.mark.asyncio
+    async def test_matches_a_freshly_minted_record_byte_for_byte(self, tmp_path: Path):
+        """Parity is pinned to the EMITTER, not to a copied literal.
+
+        Mint a record by actually calling
+        ``stage1_stall_detector.maybe_escalate_stalled_gate_backlog`` against a
+        real ``EscalationQueue``, then assert ``rebuild_summary`` reproduces its
+        summary exactly.  A future edit to either f-string breaks this test.
+        """
+        queue = EscalationQueue(tmp_path)
+        now = datetime.fromisoformat(ANCHOR) + timedelta(hours=48.7)
+        task_by_id = {
+            '166': {
+                'id': '166',
+                'status': 'blocked',
+                'title': 'Gate task 166',
+                'metadata': {'operational_mode': 'gate', 'gate_escalated_at': ANCHOR},
+            }
+        }
+
+        escalated = await maybe_escalate_stalled_gate_backlog(
+            queue,
+            project_id='dark_factory',
+            run_id='r1',
+            stalled_task_ids=['166'],
+            task_by_id=task_by_id,
+            now=now,
+        )
+        assert escalated == ['166'], 'the emitter must have filed a NEW record'
+
+        pending = queue.get_pending()
+        assert len(pending) == 1
+        minted = pending[0]
+
+        assert rebuild_summary('166', ANCHOR) == minted.summary
+
+    def test_fallback_branch_when_the_anchor_is_unrecoverable(self):
+        assert rebuild_summary('166', None) == FALLBACK_SUMMARY
+
+    def test_anchored_branch_shape(self):
+        assert rebuild_summary('166', ANCHOR) == ANCHORED_SUMMARY
+
+    def test_threshold_renders_from_the_shared_constant_not_a_literal(self):
+        assert 'past the 72h gate-backlog threshold' in rebuild_summary(
+            '166', ANCHOR, threshold_secs=72 * 3600
+        )
+
+    def test_default_threshold_is_the_emitters_constant(self):
+        """The default must BE the shared constant, not a copy that can drift."""
+        assert rebuild_summary('166', ANCHOR) == rebuild_summary(
+            '166', ANCHOR, threshold_secs=STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS
+        )
+
+    def test_anchor_is_interpolated_verbatim(self):
+        """A ``Z``-suffixed anchor is not silently normalised on the way in."""
+        assert rebuild_summary('166', '2026-08-01T18:18:50Z') == (
+            'Gate task 166 has awaited a human decision since '
+            '2026-08-01T18:18:50Z (past the 48h gate-backlog threshold)'
+        )
