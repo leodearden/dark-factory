@@ -20022,3 +20022,85 @@ def test_resolved_prior_record_does_not_suppress_a_refile(
         f'a resolved prior record must not suppress a refile, got {second!r}'
     )
     assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [second]
+
+
+def test_dead_orchestrator_files_nothing_and_creates_no_queue_directory(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """No live orchestrator -> no filing, and NO `data/escalations` directory.
+
+    The directory assertion is what pins LAZY queue construction:
+    `EscalationQueue.__init__` does `mkdir(parents=True, exist_ok=True)`, so a
+    queue built before the gates would leave a spurious directory under every
+    project that never files.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch, live=False)
+
+    assert harness._file_finding_task_escalation(
+        'test-project', 'run-1', _orch_finding(), 4,
+    ) is None
+    assert not queue_dir.exists(), (
+        f'the queue must be constructed lazily, but {queue_dir} was created'
+    )
+
+
+def test_finding_with_no_same_project_target_files_nothing(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """No bare task_id and only a FOREIGN-project citation -> no filing."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    finding = _orch_finding(
+        task_id=None,
+        cited_tasks=[{'project_id': 'some-other-project', 'task_id': '4458', 'title': 'x'}],
+    )
+
+    assert harness._file_finding_task_escalation('test-project', 'run-1', finding, 4) is None
+    assert not queue_dir.exists()
+
+
+def test_unregistered_project_files_nothing(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A project absent from `_known_projects` fails safe to no-file.
+
+    `_resolve_known_root` returns None on a miss (rather than raising, as
+    `_known_project_scope_for` does), so an unregistered project cannot cause a
+    filing to land under a guessed root.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    assert harness._resolve_known_root('never-registered') is None
+    assert harness._file_finding_task_escalation(
+        'never-registered', 'run-1', _orch_finding(), 4,
+    ) is None
+    assert not _orch_queue_dir(tmp_path).exists()
+
+
+def test_queue_submit_failure_is_swallowed_and_warned(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+):
+    """A queue hiccup must never abort a reconciliation cycle."""
+    import escalation.queue as _eq  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    def _boom(self, escalation):
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(_eq.EscalationQueue, 'submit', _boom)
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        result = harness._file_finding_task_escalation(
+            'test-project', 'run-1', _orch_finding(), 4,
+        )
+
+    assert result is None
+    assert not list(queue_dir.glob('esc-*.json')), 'no record should have landed'
+    assert any('disk on fire' in r.getMessage() for r in caplog.records), (
+        f'expected a warning naming the failure, got: {[r.getMessage() for r in caplog.records]}'
+    )
