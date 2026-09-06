@@ -83,7 +83,7 @@ rather than a look-alike.
 
 What is NOT here yet: the COMPARISON core (read this before assuming it is)
 --------------------------------------------------------------------------
-Three lifts have happened, and this module deliberately does not yet read as
+Four lifts have happened, and this module deliberately does not yet read as
 the home for everything shared.  Still duplicated across the consumers, and NOT
 because nobody noticed:
 
@@ -92,6 +92,36 @@ because nobody noticed:
   checker deliberately has NEITHER: it compares by full symmetric equality over
   the union of sections and keys, with no curated registry, and its own
   docstring argues for that.
+
+- The ``[override]`` drop-in REPORT BLOCK is duplicated across ALL FOUR
+  checkers -- ``check_dashboard_unit_parity.py``,
+  ``check_orchestrator_unit_parity.py``, ``check_lms_unit_parity.py``, and (as
+  of task 4882) ``check_fused_memory_unit_parity.py``'s ``_report_override``.
+  They share the same two sentences, so a reader of THIS list would otherwise
+  conclude the override reporter is already shared: it is not, and the reason
+  is ``compare_unit``'s, not oversight.  The block IS report text, and all four
+  suites assert on its content.  MEASURED 2026-09-06, the four copies already
+  differ four ways:
+
+  * fused-memory is SINGLE-unit -- it takes ``--installed <FILE>``, so it
+    prints ``  {dropin}`` from a standalone ``_report_override()``; the three
+    siblings are multi-unit, print ``  {name}: {dropin}``, and inline the block
+    in their report function.
+  * the "Inspect ..." tail names a different unit in each: ``<unit>`` plus a
+    parenthetical remedy (dashboard, orchestrator), ``lms-arm@<arm>.service``
+    (lms), ``fused-memory.service`` (fused-memory).
+  * lms and fused-memory add a "Nothing was removed" paragraph the other two
+    do not, and those two paragraphs are themselves different: lms names
+    ``scripts/remove-lms-arm-worktree-dropin.sh``, fused-memory instead
+    explains why its ``--fix`` cannot resolve an override.
+  * fused-memory's ``_log`` tags EVERY physical line (its own docstring gives
+    the reason) while the siblings tag once per call, so a shared renderer
+    would be emitting through three different logging contracts.
+
+  A shared renderer would therefore need a per-checker unit name and two
+  optional paragraphs before it saved a line, and would change the text of
+  whichever copies lost.  Left duplicated on purpose, recorded here so the
+  absence is a decision rather than a gap.
 
 ``environment_map`` is deliberately NOT a counter-example to this list. It moved
 because it had a second consumer that could not reach it any other way (see
