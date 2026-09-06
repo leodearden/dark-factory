@@ -43,7 +43,8 @@
 # Exit codes:
 #   0..125 — claude's own exit code (recovered from sentinel)
 #   126    — no usable launcher (no terminal emulator found / tmux missing in tmux mode)
-#   127    — launcher itself failed (emulator exited before writing the sentinel)
+#   127    — launcher itself failed (emulator exited before writing the sentinel,
+#            or the sentinel never settled to a numeric exit code within the launch grace)
 #   129    — terminal window closed while the session was alive (SIGHUP)
 #   144    — Claude never started within the started-grace window (registry marked failed-to-start)
 #   2      — bad usage
