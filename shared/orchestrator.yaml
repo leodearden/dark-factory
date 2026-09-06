@@ -57,7 +57,7 @@ type_check_command: "uv run --directory shared pyright src/ tests/"
 #
 # SUPERSEDED EPOCH, kept for history and no longer sized against: four runs
 # at base main 5a7770d239 (2026-08-06), all rc=0, all reporting 3222 passed /
-# 12 skipped / 9 deselected (3243 collected — 49% fewer than today's 4802):
+# 12 skipped / 9 deselected (3243 collected — today's 4802 is ~48% more):
 #
 #     79.04s wall / 74.43s pytest  @ loadavg  85.78
 #     96.17s wall / 88.34s pytest  @ loadavg 133.65
@@ -156,7 +156,7 @@ type_check_command: "uv run --directory shared pyright src/ tests/"
 # 800s, a 4.5x narrowing (was 6x at the now-superseded 600s). It does NOT
 # make the suite faster and does not detect suite growth — see the GATED-BY
 # guard's own scope note. That gap is precisely why this re-measurement
-# needed to be a TASK (5131): the suite grew 3243 -> 4802 collected (+49%)
+# needed to be a TASK (5131): the suite grew 3243 -> 4802 collected (+48%)
 # with no mechanism to notice, until esc-4502-1 surfaced it as a false
 # infra_timeout instead.
 #
@@ -207,7 +207,7 @@ type_check_command: "uv run --directory shared pyright src/ tests/"
 # and was caught only by a reviewer.
 #
 #   IT HAS NOW FIRED ONCE, and this records how it was discharged (task
-#   5131). The suite grew 3243 -> 4802 collected (+49%) between the
+#   5131). The suite grew 3243 -> 4802 collected (+48%) between the
 #   5a7770d239 epoch and base 1b3c50e98f, and esc-4502-1 hit a 601.4s false
 #   infra_timeout at ~44% completion under that growth. A RE-MEASURE — ten
 #   VERBATIM runs, table in (1) above — moved W 219.08 -> 296.88s (+35.5%)
@@ -219,10 +219,13 @@ type_check_command: "uv run --directory shared pyright src/ tests/"
 #   findings shape how the NEXT re-measure must be run, not just this one:
 #
 #     * LINEAR SCALING IN TEST COUNT OVER-PREDICTS WALL CLOCK HERE. The
-#       task's own sizing sketch (219.08 x 4802/3243 -> ~849s) assumed wall
-#       clock scales with collected-test count; the actual worst-run growth
-#       was only ~35.5%, against 49% more tests. Do not scale a stale W by a
-#       test-count ratio — RE-MEASURE.
+#       task's own sizing sketch, spelled fully, is (219.08 x 4802/3243 ->
+#       ~324s W, x2.6 -> ~849s budget) — the ~849s end figure is reached only
+#       after the 2.6x multiple is ALSO applied; on its own the count ratio
+#       predicts a W of ~324s. The honest over-prediction is therefore ~324s
+#       predicted vs 296.88s measured (~9% over), not 849 vs 296.88. The
+#       actual worst-run growth was only ~35.5%, against 48% more tests. Do
+#       not scale a stale W by a test-count ratio — RE-MEASURE.
 #     * LOADAVG DOES NOT PREDICT WALL CLOCK ON THIS HOST — the same finding
 #       task 4320 recorded for tests/scripts. The architect's run 5 STARTED
 #       at this sweep's HIGHEST load (165.93, ending at 357.09) and was the
@@ -251,7 +254,22 @@ type_check_command: "uv run --directory shared pyright src/ tests/"
 #         integration'` filter — so it is this module's own FALLBACK-PATH
 #         figure, the same shape tests/scripts/orchestrator.yaml already
 #         keeps separate from its sizing table, not a larger VERBATIM figure
-#         this block failed to use.
+#         this block failed to use. KEPT OUT OF THE W TABLE FOR THAT REASON,
+#         but it is NOT unrelated to this budget: verify.py's ENV_TRANSIENT
+#         recovery path re-runs a timed-out test leg via `_serial_pytest_str`/
+#         `_run_or_skip_timed` under this SAME resolved
+#         verify_command_timeout_secs, and that rewrite also blanks the `-m
+#         'not integration'` filter — so the recovery leg is strictly LARGER
+#         than the verbatim command and genuinely shares this budget. Against
+#         the new 800s, this one observed run leaves only 800/646.13 =
+#         ~1.24x headroom, on a host this block documents producing a ~2.1x
+#         run-to-run spread on the verbatim command alone (141.81s-296.88s
+#         across ten runs) — so the recovery leg could plausibly manufacture
+#         a false infra_timeout even though the verbatim leg now has 2.69x
+#         (800/296.88). Filed as a follow-up (tkt_0RTA9VTCQ7W92QZBK2QB94XJJN)
+#         rather than fixed here: treating 646.13s as a second sizing input,
+#         or giving the recovery path its own bound, is a design change
+#         beyond this task's re-measurement scope.
 #
 # (8) GATED BY tests/scripts/test_module_verify_budgets.py::
 # test_module_carries_its_own_measured_verify_budget[shared].
