@@ -42,6 +42,8 @@ plan_rewrites = _mod.plan_rewrites
 Rewrite = _mod.Rewrite
 BackfillPlan = _mod.BackfillPlan
 apply_rewrites = _mod.apply_rewrites
+run = _mod.run
+main = _mod.main
 
 
 # ---------------------------------------------------------------------------
@@ -682,3 +684,97 @@ class TestApplyRewritesLockDiscipline:
         after = json.loads(raw.read_text())
         assert after['detail'] == rebuild_detail(fresh_detail)
         assert after['detail'].endswith('\nnote: appended after planning')
+
+
+# ---------------------------------------------------------------------------
+# run() / main() — end to end
+# ---------------------------------------------------------------------------
+
+
+def _snapshot(tmp_path: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in sorted(tmp_path.glob('*.json'))}
+
+
+class TestRunAndMain:
+    """Dry-run is the default and is TOTAL; --apply is exact and idempotent."""
+
+    def test_dry_run_is_the_default_and_writes_nothing(self, tmp_path: Path):
+        _seeded_queue(tmp_path, *_mixed_pending())
+        before = _snapshot(tmp_path)
+
+        report = run(tmp_path)
+
+        assert report['dry_run'] is True
+        assert report['pending_total'] == 5
+        assert report['legacy_total'] == 2
+        assert _snapshot(tmp_path) == before, 'a dry run must not write ANY file'
+
+    def test_report_carries_the_planning_counters(self, tmp_path: Path):
+        _seeded_queue(tmp_path, *_mixed_pending())
+        report = run(tmp_path)
+
+        assert report['queue_dir'] == str(tmp_path)
+        assert report['anchored'] == 2
+        assert report['fallback'] == 0
+        assert report['skipped_fingerprint_drift'] == 0
+        # Apply-only counters must be absent from a dry run's report.
+        assert 'rewritten' not in report
+        assert 'skipped_missing' not in report
+        assert 'skipped_no_longer_legacy' not in report
+
+    def test_apply_rewrites_exactly_the_legacy_records(self, tmp_path: Path):
+        _seeded_queue(tmp_path, *_mixed_pending())
+
+        report = run(tmp_path, apply=True)
+
+        assert report['dry_run'] is False
+        assert report['rewritten'] == 2
+        assert report['skipped_missing'] == 0
+        assert report['skipped_no_longer_legacy'] == 0
+        after = json.loads((tmp_path / 'esc-166-1.json').read_text())
+        assert after['summary'] == rebuild_summary('166', ANCHOR)
+
+    def test_non_targets_are_byte_identical_after_an_apply(self, tmp_path: Path):
+        _seeded_queue(tmp_path, *_mixed_pending())
+        before = _snapshot(tmp_path)
+
+        run(tmp_path, apply=True)
+
+        after = _snapshot(tmp_path)
+        for name in ('esc-168-1.json', 'esc-169-1.json', 'esc-170-1.json'):
+            assert after[name] == before[name], f'{name} must not be touched'
+        for name in ('esc-166-1.json', 'esc-167-1.json'):
+            assert after[name] != before[name]
+
+    def test_second_apply_is_a_structural_no_op(self, tmp_path: Path):
+        _seeded_queue(tmp_path, *_mixed_pending())
+        run(tmp_path, apply=True)
+        after_first = _snapshot(tmp_path)
+
+        report = run(tmp_path, apply=True)
+
+        assert report['legacy_total'] == 0
+        assert report['rewritten'] == 0
+        assert _snapshot(tmp_path) == after_first
+
+    def test_main_dry_run_returns_0_prints_json_and_writes_nothing(
+        self, tmp_path: Path, capsys
+    ):
+        _seeded_queue(tmp_path, *_mixed_pending())
+        before = _snapshot(tmp_path)
+
+        assert main(['--queue-dir', str(tmp_path)]) == 0
+
+        report = json.loads(capsys.readouterr().out)
+        assert report['dry_run'] is True
+        assert report['legacy_total'] == 2
+        assert _snapshot(tmp_path) == before
+
+    def test_main_apply_performs_the_writes(self, tmp_path: Path, capsys):
+        _seeded_queue(tmp_path, *_mixed_pending())
+
+        assert main(['--queue-dir', str(tmp_path), '--apply']) == 0
+
+        report = json.loads(capsys.readouterr().out)
+        assert report['dry_run'] is False
+        assert report['rewritten'] == 2
