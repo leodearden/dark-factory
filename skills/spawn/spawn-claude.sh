@@ -372,12 +372,31 @@ sentinel="$(mktemp -u -t spawn-claude-XXXXXX.done)"
 q_cwd=$(printf %q "$cwd")
 q_prompt=$(printf %q "$prompt")
 q_sentinel=$(printf %q "$sentinel")
+q_sentinel_tmp=$(printf %q "$sentinel.tmp")
 
 # Payload that runs inside the new terminal.  Traps ensure the sentinel is
 # written even when the terminal window is closed (SIGHUP/TERM) while the
 # session is alive:
 #   - EXIT trap: always writes ${ec:-$?} — claude's real code on normal exit,
 #     or a 128+signo default when pre-empted.
+#
+# ATOMIC PUBLISH (task 5137, esc-4389-4). The EXIT trap writes the code to
+# "$sentinel.tmp" and then renames it onto $sentinel, rather than
+# redirecting straight at $sentinel. `>` creates and TRUNCATES before the
+# write lands, so a plain redirect leaves the sentinel path observable
+# existing-and-zero-length; a reader in that window read back the empty
+# string (see _sentinel_settled below for the damage that caused). A
+# same-directory rename is atomic on every POSIX filesystem this script
+# already targets, so the sentinel PATH only ever appears fully written.
+#
+# That is what keeps every `-f "$sentinel"` existence gate in this script
+# content-correct WITHOUT changing any of them — await_sentinel,
+# _wait_sentinel_grace, _failed_to_start_pending, _started_watchdog (x2),
+# resolve_foreground, resolve_detached, and the mac-terminal branch. Auditing
+# and rewriting eight call sites would be a far larger and riskier change
+# than closing the window at the single writer. `mv` is coreutils — no
+# heavier a dependency than the mktemp/find/python3 this script already
+# requires.
 #   - HUP trap: converts SIGHUP into exit 129 so the EXIT trap records 129
 #     (distinguishable "window closed while alive" code).
 #   - TERM trap: converts SIGTERM into exit 143 (128+15).
@@ -471,7 +490,7 @@ sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
 # a Python layer that does not read it is unaffected.
 owner_ppid_export="export CLAUDE_SPAWN_OWNER_PPID=\$\$; "
 
-inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
+inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel_tmp && mv -f $q_sentinel_tmp $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
 ${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
@@ -567,7 +586,7 @@ finish() {
       rc=$(cat "$sentinel")
     fi
   fi
-  rm -f "$sentinel"
+  rm -f "$sentinel" "$sentinel.tmp"
   # Session-registry: record the final exit code (task 2285). rc is already
   # fully determined from the sentinel above, independent of this call, so a
   # registry fault here can never change the spawn's exit-code contract.
@@ -592,7 +611,7 @@ _failed_to_start_pending() {
 finish_failed_to_start() {
   local code
   code=$(cat "$fts_marker" 2>/dev/null || echo "$EXIT_FAILED_TO_START")
-  rm -f "$fts_marker" "$sentinel"
+  rm -f "$fts_marker" "$sentinel" "$sentinel.tmp"
   exit "$code"
 }
 
@@ -837,13 +856,16 @@ resolve_detached() {
 #
 # KNOWN LEAK (deliberate -- same shape as the mac-terminal tmpscript leak
 # further below): $inner's EXIT trap (see the `inner=` assignment above)
-# still writes `${ec:-$?}` to $sentinel whenever the detached child
+# still publishes `${ec:-$?}` to $sentinel whenever the detached child
 # eventually exits, but by then this script has long since returned via the
 # `exit 0` below. finish() and finish_failed_to_start() are the only two
 # removers of $sentinel, and sibling mode reaches neither, so one stale
-# "*.done" file per sibling spawn accumulates in TMPDIR. Not worth chasing
-# for a few stray bytes in TMPDIR -- reclaimed by normal OS tmp-dir cleanup,
-# same as the mac-terminal tmpscript leak.
+# "*.done" file per sibling spawn accumulates in TMPDIR. Still exactly ONE
+# file per spawn after the task-5137 atomic publish: the trap writes
+# "$sentinel.tmp" and RENAMES it onto $sentinel, so the temp is consumed by
+# the rename rather than added to this leak. Not worth chasing for a few
+# stray bytes in TMPDIR -- reclaimed by normal OS tmp-dir cleanup, same as
+# the mac-terminal tmpscript leak.
 #
 # KNOWN LIMITATION (started-verification watchdog does not apply here): the
 # _started_watchdog background job (forked below, before the emulator case
@@ -1058,11 +1080,11 @@ case "$first_word" in
       if open -a Terminal "$tmpscript" </dev/null >/dev/null 2>&1; then
         resolve_sibling
       else
-        rm -f "$sentinel"
+        rm -f "$sentinel" "$sentinel.tmp"
         exit 127
       fi
     else
-      open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel"; exit 127; }
+      open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel" "$sentinel.tmp"; exit 127; }
       await_sentinel
       rm -f "$tmpscript"
       if _failed_to_start_pending; then
