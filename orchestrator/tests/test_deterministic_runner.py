@@ -303,6 +303,8 @@ def _predicate_task(
     cwd: str = '/tmp',
     timeout_secs: int | float = 30,
     gate_escalated_at: str | None = None,
+    recurrence: dict | None = None,
+    milestone: dict | None = None,
 ) -> dict:
     """Build a deterministic PREDICATE task dict (before_done.kind='predicate', γ-predicate).
 
@@ -311,6 +313,14 @@ def _predicate_task(
     shape, minus the unit to deploy against).  ``gate_escalated_at``, when
     given, seeds ``metadata['gate_escalated_at']`` for the resume/quiescence
     tests (mirrors ``_gate_task``'s same-named parameter).
+
+    ``recurrence`` and ``milestone`` (task 4678 / r3) are seeded into
+    ``metadata`` ONLY when given — exactly like ``gate_escalated_at`` above —
+    so every pre-existing call site keeps producing a byte-identical
+    NON-carrier task and remains the control for the carrier/non-carrier
+    split.  Together with ``task_kind='deterministic'`` and
+    ``before_done['kind'] == 'predicate'``, passing both makes the real
+    PRD C-1 carrier shape.
     """
     before_done: dict = {
         'script': script,
@@ -328,6 +338,10 @@ def _predicate_task(
     }
     if gate_escalated_at is not None:
         metadata['gate_escalated_at'] = gate_escalated_at
+    if recurrence is not None:
+        metadata['recurrence'] = recurrence
+    if milestone is not None:
+        metadata['milestone'] = milestone
     return {
         'id': task_id,
         'title': title,
@@ -9703,6 +9717,105 @@ class TestPredicateModeFailPath:
 
 
 # ---------------------------------------------------------------------------
+# Task 4678 (r3) — RED: the recurrence-carrier discriminator's boundary matrix.
+#
+# PRD docs/prds/recurring-deterministic-tasks.md decision R-D6 / contract C-5:
+# every failure leg of a RECURRENCE CARRIER's deterministic run must land in
+# the deny-listed, discriminable `milestone_check_failed` category rather than
+# the crowded `infra_issue` bucket.  `_is_recurrence_carrier` is the one
+# predicate that decides which population a task belongs to, so its whole
+# truth table is pinned here, at unit level, independent of the runner.
+# ---------------------------------------------------------------------------
+
+class TestIsRecurrenceCarrier:
+    """`_is_recurrence_carrier` — presence of a non-empty `metadata.recurrence` dict.
+
+    Task 4678.  The predicate answers "does this task CARRY a recurrence?",
+    deliberately NOT "is this a valid carrier?" — its output selects an
+    escalation LABEL, not a mint (see the production docstring for why the two
+    have opposite failure costs).
+    """
+
+    def test_absent_recurrence_is_not_a_carrier(self):
+        """The overwhelmingly common shape — a plain deterministic task."""
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier({}) is False
+        assert _is_recurrence_carrier(
+            {'task_kind': 'deterministic', 'always_escalates': False}
+        ) is False
+
+    def test_empty_recurrence_dict_is_not_a_carrier(self):
+        """An empty dict carries no chain link — it is not a carrier.
+
+        Reachable only by a hand edit or an `update_task` that cleared the
+        payload; the submit guard rejects it.  Failing it closed here keeps
+        the discriminator's boundary at "a chain link is actually present".
+        """
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier({'recurrence': {}}) is False
+
+    @pytest.mark.parametrize(
+        'value',
+        ['daily', True, 86400, ['reify-closure-staleness'], None],
+        ids=['str', 'bool', 'int', 'list', 'none'],
+    )
+    def test_non_dict_recurrence_is_not_a_carrier(self, value):
+        """A stray `recurrence: 'daily'` hand edit must not read as a carrier.
+
+        The Recurrence model is an object; anything scalar is a malformed hand
+        edit, and reading it as a chain link would relabel an ordinary
+        predicate's infra faults for no reason.
+        """
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier({'recurrence': value}) is False
+
+    def test_hand_written_recurrence_dict_is_a_carrier(self):
+        """The as-authored seed shape (no `minted_from` key at all)."""
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier(
+            {'recurrence': {'key': 'reify-closure-staleness', 'interval_secs': 86400}}
+        ) is True
+
+    def test_round_tripped_recurrence_model_is_a_carrier(self):
+        """The ROUND-TRIPPED shape, built from r1's own model so it cannot drift.
+
+        `Recurrence.minted_from` is declared with a `None` default, so
+        `model_dump()` materialises an explicit `'minted_from': None` on a seed
+        link an author wrote without one — the shape the `Recurrence` docstring
+        warns consumers to read "by VALUE, never key presence".  Both forms are
+        carriers.
+        """
+        from shared.task_metadata import Recurrence
+
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        dumped = Recurrence(key='reify-closure-staleness', interval_secs=86400).model_dump()
+        assert dumped['minted_from'] is None, (
+            'this test only pins the round-tripped shape while model_dump() '
+            f'still materialises an explicit minted_from: {dumped!r}'
+        )
+        assert _is_recurrence_carrier({'recurrence': dumped}) is True
+
+    def test_malformed_but_present_recurrence_is_still_a_carrier(self):
+        """A `recurrence` missing its required `key` is STILL read as a carrier.
+
+        The submit guard rejects this shape, so it is reachable only by a hand
+        edit or a raw `update_task`.  Deliberate: this predicate tests presence,
+        not validity — mislabelling a malformed carrier's escalation is inert
+        (both categories are born-at-L2, `orchestrator-deterministic`, severity
+        critical, task blocked), whereas failing closed would silently drop a
+        real recurring job's failure into the crowded `infra_issue` bucket.
+        """
+        from orchestrator.deterministic_runner import _is_recurrence_carrier
+
+        assert _is_recurrence_carrier({'recurrence': {'interval_secs': 86400}}) is True
+
+
+# ---------------------------------------------------------------------------
 # Step-5: RED — B9 predicate timeout/unexpected-error -> infra_issue + blocked
 # (RED until step-6 wraps _run_predicate's asyncio.wait_for call in the
 # deploy path's except-TimeoutError / except-Exception outer-guard branches)
@@ -9981,6 +10094,504 @@ class TestPredicateDefaultRunnerInnerTimeout:
             'a verdict must still stamp gate_escalated_at (resolve-to-done path)'
         )
         scheduler.set_task_status.assert_awaited_once_with('705', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 4678 (r3) — RED: a RECURRENCE CARRIER's no-verdict legs file
+# `milestone_check_failed`, not `infra_issue`.
+#
+# PRD B7 / decision R-D6 / contract C-5.  The classes ABOVE are the controls:
+# `TestPredicateModeTimeout` (task ids 702/703) and
+# `TestPredicateDefaultRunnerInnerTimeout` (704) drive the SAME arms with no
+# `metadata.recurrence` and must stay `infra_issue`, untouched.
+#
+# What must NOT change with the category: a no-verdict leg still writes NO
+# `gate_escalated_at` stamp (task 4065), so the read-only check is simply
+# re-attempted on the next dispatch rather than latched into section-1's
+# resolve-to-done path.  Every case below asserts the stamp's ABSENCE.
+# ---------------------------------------------------------------------------
+
+def _carrier_recurrence(key: str = 'carrier-timeout-probe') -> dict:
+    """The `metadata.recurrence` payload for a carrier fixture (task 4678).
+
+    Built from r1's own `shared.task_metadata.Recurrence` (task 4676) and
+    round-tripped through `model_dump()` rather than hand-rolled, so a carrier
+    fixture cannot drift from the validated model — and so the round-tripped
+    form (which materialises an explicit `'minted_from': None`) is what the
+    runner actually sees.
+    """
+    from shared.task_metadata import Recurrence
+
+    return Recurrence(key=key, interval_secs=86400).model_dump()
+
+
+def _carrier_dated_milestone() -> dict:
+    """The dated `metadata.milestone` of a C-1 carrier (task 4678).
+
+    Inert for the runner — `DeterministicRunner` never reads
+    `metadata.milestone` (due-ness is a scheduler-eligibility concern) — but
+    carried so the fixture is a FAITHFUL C-1 carrier rather than a
+    `recurrence`-only approximation.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    return {'mode': 'dated', 'at': (datetime.now(UTC) + timedelta(days=1)).isoformat()}
+
+
+@pytest.mark.asyncio
+class TestCarrierPredicateNoVerdictCategory:
+    """DeterministicRunner — a recurrence carrier's no-verdict legs file
+    ``milestone_check_failed`` (task 4678 / r3, PRD B7 + R-D6 + C-5).
+
+    A carrier is one link of a recurring chain.  Contract C-5: EVERY escalation
+    a carrier's deterministic run files carries
+    ``category='milestone_check_failed'`` — the deny-listed
+    (``escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES``), discriminable
+    category — so a recurring job's failures never disappear into the crowded
+    ``infra_issue`` bucket.  The verdict leg (``rc != 0``) already did; these
+    tests are about the three arms that produce NO verdict.
+
+    r3 is a CATEGORY change ONLY.  Each case therefore pins:
+      * the summary is BYTE-IDENTICAL to the non-carrier arm — the summary is
+        the only thing telling a human WHICH guard fired, and diverging it for
+        carriers would double the arm vocabulary from three strings to six;
+      * ``update_task`` is never awaited — no ``gate_escalated_at`` stamp.
+    """
+
+    async def test_carrier_outer_guard_timeout_files_milestone_check_failed(
+        self, tmp_path: Path,
+    ):
+        """A carrier whose predicate seam HANGS files ``milestone_check_failed``.
+
+        Today's identical setup MINUS ``recurrence`` files ``infra_issue``
+        (``test_predicate_hang_files_infra_issue_and_blocks``, task 702, same
+        hanging runner and the same ``run_timeout_grace_secs=0.05``) — that
+        pairing is PRD B7's observable difference.
+
+        RED until ``_run_predicate``'s ``except TimeoutError`` arm resolves its
+        category from the carrier discriminator.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(
+            task_id='4678_1',
+            timeout_secs=0,
+            milestone=_carrier_dated_milestone(),
+            recurrence=_carrier_recurrence(),
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        # Hang tripwire: if the outer guard regresses, fail loudly instead of
+        # stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4678_1', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed', (
+            f'a RECURRENCE CARRIER\'s failure legs all sit in the deny-listed '
+            f'category (C-5) — the identical non-carrier setup at task 702 '
+            f'yields infra_issue: {esc.category!r}'
+        )
+
+        # Everything else about the escalation is unchanged by the category swap.
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.summary == 'Predicate check timed out (subprocess hung)', (
+            f'the arm-discriminating summary must survive the category swap '
+            f'byte-for-byte: {esc.summary!r}'
+        )
+
+        # The CATEGORY moved; task 4065's no-stamp semantics did NOT.  A
+        # no-verdict leg must never latch the task into section-1's
+        # resolve-to-done path.
+        scheduler.update_task.assert_not_awaited()
+        scheduler.set_task_status.assert_awaited_once_with('4678_1', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+    async def test_carrier_inner_script_timeout_files_milestone_check_failed(
+        self, tmp_path: Path,
+    ):
+        """A carrier whose REAL predicate script overruns its own
+        ``timeout_secs`` files ``milestone_check_failed`` (task 4065's arm).
+
+        Mirrors ``test_default_runner_inner_timeout_files_infra_issue_not_
+        milestone_check_failed`` (task 704) — same real subprocess path
+        (``script_runner=None``), same 30s sleep against ``timeout_secs=1``,
+        same DEFAULT ``run_timeout_grace_secs`` so the outer guard sits at
+        ``1 + 30 = 31s`` and the INNER 1s timeout provably wins — differing
+        only by ``metadata.recurrence``.
+
+        This arm's detail today asserts the escalation is "an INFRA fault,
+        deliberately not milestone_check_failed" — a sentence that would
+        CONTRADICT the very category the record is filed under for a carrier,
+        telling a human reading the escalation the opposite of what it says.
+        So the stale phrasing must be gone and the R-D6 reason named instead.
+        """
+        import asyncio
+        import time
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-carrier-predicate.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        task = _predicate_task(
+            task_id='4678_2',
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+            milestone=_carrier_dated_milestone(),
+            recurrence=_carrier_recurrence(),
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        # run_timeout_grace_secs left at its default so the outer guard
+        # (1 + 30 = 31s) provably CANNOT be what fires.
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        started = time.monotonic()
+        # Hang tripwire: fail loudly instead of stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 15, (
+            f'the INNER 1s timeout must be what fires, not the 31s outer '
+            f'guard — run took {elapsed:.1f}s'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4678_2', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed', (
+            f'C-5: a carrier\'s inner-timeout leg is deny-listed too — the '
+            f'identical non-carrier setup at task 704 yields infra_issue: '
+            f'{esc.category!r}'
+        )
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.summary == 'Predicate check script timed out (no verdict produced)', (
+            f'the arm discriminator must survive the category swap '
+            f'byte-for-byte: {esc.summary!r}'
+        )
+
+        # The one piece of wording that MUST change: the old sentence asserts
+        # the opposite of the category the record now carries.
+        assert 'deliberately not milestone_check_failed' not in esc.detail, (
+            f'the detail would contradict its own category for a carrier: '
+            f'{esc.detail!r}'
+        )
+        assert 'recurrence' in esc.detail, (
+            f'the detail must name WHY this carrier got the deny-listed '
+            f'category: {esc.detail!r}'
+        )
+        assert 'R-D6' in esc.detail, (
+            f'the detail must cite the decision that put every failure leg of '
+            f'a recurring chain in one category: {esc.detail!r}'
+        )
+        # Unchanged facts the old sentence also carried, which must survive.
+        assert 'no verdict' in esc.detail.lower(), (
+            f'still a no-verdict leg — the category moved, not the semantics: '
+            f'{esc.detail!r}'
+        )
+        assert 'gate_escalated_at' in esc.detail, (
+            f'the detail must still say no stamp is written: {esc.detail!r}'
+        )
+
+        scheduler.update_task.assert_not_awaited()  # no gate_escalated_at stamp
+        scheduler.set_task_status.assert_awaited_once_with('4678_2', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+    async def test_carrier_unexpected_run_fn_error_files_milestone_check_failed(
+        self, tmp_path: Path,
+    ):
+        """A carrier whose seam raises an unexpected error files
+        ``milestone_check_failed``.
+
+        The third no-verdict arm.  Mirrors
+        ``test_predicate_unexpected_exception_files_infra_issue_and_blocks``
+        (task 703) — the same ``RuntimeError('predicate script spawn
+        exploded')`` — differing only by ``metadata.recurrence``.  Included
+        because C-5 says EVERY escalation a carrier's deterministic run files
+        carries the deny-listed category, and because the three arms are
+        documented as distinguishable ONLY by their wording: splitting two into
+        one category and leaving the third in another would break that property
+        asymmetrically for carriers.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(
+            task_id='4678_3',
+            milestone=_carrier_dated_milestone(),
+            recurrence=_carrier_recurrence(),
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _boom(_before_done):
+            raise RuntimeError('predicate script spawn exploded')
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_boom,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4678_3', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed', (
+            f'C-5: a carrier\'s unexpected-error leg is deny-listed too — the '
+            f'identical non-carrier setup at task 703 yields infra_issue: '
+            f'{esc.category!r}'
+        )
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.summary == 'Predicate check run_fn failed (unexpected error)', (
+            f'the arm discriminator must survive the category swap '
+            f'byte-for-byte: {esc.summary!r}'
+        )
+
+        scheduler.update_task.assert_not_awaited()  # no gate_escalated_at stamp
+        scheduler.set_task_status.assert_awaited_once_with('4678_3', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 4678 (r3) — the SCOPE and LEG-DISTINCTION pins.
+#
+# Green by construction after the carrier routing lands, exactly like the
+# precedent pin `test_custom_script_runner_nonzero_rc_is_still_a_verdict`
+# ("green before and after task 4065").  They exist so the scoping the PRD
+# mandates is a MACHINE-CHECKED invariant rather than a comment.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestCarrierCategoryScope:
+    """PINS: the carrier category reaches predicate NO-VERDICT legs, and nothing else.
+
+    Task 4678 / PRD "SCOPE STRICTLY TO CARRIERS".  Three boundaries, each with
+    a different consumer that would be harmed by a leak:
+
+    * the DEPLOY population must stay ``infra_issue`` — ``Harness._revalidate_
+      open_deterministic_escalation`` (the deterministic-recon sweep's Source
+      B) keys on ``category == 'infra_issue'`` to auto-close deploy-stranded
+      escalations, so a leak would make that population un-auto-closable;
+    * a NON-carrier predicate must stay ``infra_issue`` — the discriminator's
+      documented boundary, pinned here through the RUNNER rather than only
+      through ``TestIsRecurrenceCarrier``'s unit matrix;
+    * a carrier's VERDICT leg must keep BOTH the category and the
+      ``gate_escalated_at`` stamp — r3 unified the LABEL across a carrier's
+      legs without collapsing the verdict/no-verdict distinction, which stays
+      discriminable by the stamp.
+    """
+
+    async def test_deploy_task_with_recurrence_still_files_infra_issue(
+        self, tmp_path: Path,
+    ):
+        """A DEPLOY-shaped task carrying a `recurrence` dict still files
+        ``infra_issue`` on its outer-guard timeout.
+
+        The submit guard rejects this combination (C-1 scopes carriers to
+        predicates), but a hand edit or a raw ``update_task`` can still produce
+        it — so the pin drives the state rather than assuming it unreachable.
+
+        Two independent guarantees hold it: the ``category`` override is passed
+        only from ``_run_predicate``, which no deploy branch reaches; and
+        Source B additionally requires ``before_done_ran_at`` (or
+        ``deploy_state.phase == RAN``), which a read-only predicate never
+        writes, so its designed population is structurally out of reach from
+        the predicate path either way.  This test pins the first.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4678_deploy', target_unit=None, timeout_secs=0)
+        # Hand-attached, deliberately: this is the shape a hand edit produces,
+        # and _deploy_task has no `recurrence` parameter precisely because the
+        # combination is never legitimately authored.
+        task['metadata']['recurrence'] = _carrier_recurrence('deploy-shaped-hand-edit')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4678_deploy', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue', (
+            f'the carrier rule must not leak into the deploy population that '
+            f"Harness._revalidate_open_deterministic_escalation auto-closes on "
+            f'category == infra_issue: {pending[0].category!r}'
+        )
+
+    async def test_predicate_with_empty_recurrence_still_files_infra_issue(
+        self, tmp_path: Path,
+    ):
+        """A predicate carrying ``recurrence={}`` is NOT a carrier — still
+        ``infra_issue`` on a hang.
+
+        The discriminator's documented boundary (an empty dict carries no chain
+        link), pinned through the real ``run()`` rather than only through
+        ``TestIsRecurrenceCarrier``.  Tasks 702/703/704 and integration 9003
+        remain the plain no-``recurrence`` controls.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='4678_empty', timeout_secs=0, recurrence={})
+        assert task['metadata']['recurrence'] == {}, (
+            'the fixture must actually carry the empty dict, not drop the key'
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        async def _hang(_before_done):
+            await asyncio.Event().wait()
+
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=_hang,
+            run_timeout_grace_secs=0.05,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4678_empty', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue', (
+            f'an empty recurrence dict is not a chain link: {pending[0].category!r}'
+        )
+        scheduler.update_task.assert_not_awaited()
+
+    async def test_carrier_nonzero_rc_still_stamps_gate_escalated_at(self, tmp_path: Path):
+        """A carrier's VERDICT leg keeps BOTH ``milestone_check_failed`` AND
+        the ``gate_escalated_at`` stamp.
+
+        r3 unified the LABEL across a carrier's legs; it did NOT collapse the
+        verdict/no-verdict distinction.  Read together with the
+        ``update_task.assert_not_awaited()`` assertions on the three no-verdict
+        arms, this pins C-5's "both legs, one category" while keeping the two
+        legs discriminable by the STAMP — which is what decides whether a human
+        resolving the escalation drives the task to done (verdict) or merely
+        lets the check be re-attempted (no verdict).
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(
+            task_id='4678_verdict',
+            milestone=_carrier_dated_milestone(),
+            recurrence=_carrier_recurrence(),
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=AsyncMock(return_value=(1, 'VIOLATED: flakiness 0.08 > 0.05')),
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4678_verdict', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed'
+        assert esc.summary == 'Milestone predicate check failed (rc=1)', (
+            f'the VERDICT arm keeps its own summary — the leg is still '
+            f'discriminable from the three no-verdict arms: {esc.summary!r}'
+        )
+
+        # THE distinction from the no-verdict legs: this one stamps.
+        scheduler.update_task.assert_awaited_once()
+        stamp_call = scheduler.update_task.call_args
+        metadata_update = (
+            stamp_call.args[1] if len(stamp_call.args) > 1
+            else stamp_call.kwargs.get('metadata', {})
+        )
+        assert metadata_update.get('gate_escalated_at'), (
+            f'a VERDICT must still latch the task into section-1\'s '
+            f'resolve-to-done path: {metadata_update!r}'
+        )
+        scheduler.set_task_status.assert_awaited_once_with('4678_verdict', 'blocked')
         unit_inspector.assert_not_awaited()
 
 

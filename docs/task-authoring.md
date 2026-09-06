@@ -715,7 +715,13 @@ script and decides by **exit code only** — it parses no output:
 |---|---|
 | `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (a **bounded structured verdict** carried as `note` — see below) |
 | non-`0` | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
-| timeout | born-at-L2 `infra_issue` escalation (existing timeout path) + task `blocked`, **no** `gate_escalated_at` stamp |
+| timeout / runner error (**no verdict**) | born-at-L2 escalation + task `blocked`, **no** `gate_escalated_at` stamp in *either* case — the check is simply re-attempted on the next dispatch. Category is `infra_issue` for an ordinary predicate, `milestone_check_failed` for a task carrying `metadata.recurrence` (§6.1) |
+
+The last row covers **three** ways a run produces no exit code — the outer
+wall-clock guard, the script overrunning its own `before_done.timeout_secs`,
+and an unexpected error in the runner seam. Only a **non-zero exit** — a real
+verdict — stamps `gate_escalated_at` and thereby latches the task into the
+resume/resolve-to-done path.
 
 **What the `rc == 0` `note` carries (task 3286):** `predicate check passed
 (rc=0)`, plus — when the script emitted one — a single extracted payload:
@@ -894,10 +900,22 @@ restriction; until one exists, the rejection *is* the contract.
 }
 ```
 
-**Not live yet.** Only the metadata contract above is implemented. The
-mint-on-terminal step, the chain-state gauge, and the carrier's timeout
-category are separate PRD tasks. Filing a carrier today therefore gets you a
-*validated, time-withheld one-shot link* — not an auto-renewing chain.
+**What a carrier gets today.** Every escalation a carrier's deterministic
+run files carries `category='milestone_check_failed'` — the deny-listed
+category (`escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`),
+so a recurring job's failures are discriminable instead of disappearing into
+the crowded `infra_issue` bucket. That covers the no-verdict legs in §6's
+table as well as the non-zero-exit verdict; the **stamp** rule in that table
+is unchanged either way. A non-carrier predicate's no-verdict legs stay
+`infra_issue`, and so do `kind='deploy'` deterministic tasks — the
+deterministic-recon sweep's Source B auto-closer keys on that category to
+resolve deploy-stranded escalations, so widening the carrier rule to deploys
+would make that population un-auto-closable.
+
+**Not fully live yet.** The mint-on-terminal step and the chain-state gauge
+are separate PRD tasks. Filing a carrier today therefore gets you a
+*validated, time-withheld one-shot link* whose failures are correctly
+categorised — not an auto-renewing chain.
 
 ---
 
