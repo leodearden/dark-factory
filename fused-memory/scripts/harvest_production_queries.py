@@ -77,6 +77,13 @@ USAGE
     ./harvest_production_queries.py \
         --journal /home/leo/src/dark-factory/data/reconciliation/write_journal.db \
         --out fused-memory/tests/fixtures/production_query_sample.jsonl
+
+Run it FROM THE MAIN CHECKOUT. ``_repo_relative`` anchors ``_REPO_ROOT`` on
+this file's location, and the live journal sits under the main checkout's
+gitignored ``/data/``, so the same command run from a ``.worktrees/<id>``
+lane records the journal's ABSOLUTE path -- re-introducing the home-directory
+leak, and reddening
+``test_the_committed_sidecar_records_a_repo_relative_journal_path``.
 """
 from __future__ import annotations
 
@@ -127,6 +134,11 @@ DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_jou
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 #: sqlite's busy timeout for the journal connection, in SECONDS.
+#: NAMED after sqlite3's ``connect(timeout=)`` kwarg, which despite that
+#: spelling is the BUSY timeout and NOTHING else: it bounds how long a
+#: statement waits for a concurrent writer's lock, never how long opening
+#: the file may take.  A harvest does not give up 30s after failing to open
+#: the journal; `_connect_readonly`'s docstring states the same axis.
 #: sqlite3's implicit default is 5.0; this raises it because the journal
 #: is a live multi-gigabyte file a running fused-memory server is
 #: appending to, so a writer holding a lock is the expected case, not an
@@ -406,20 +418,35 @@ def _repo_relative(path: Path | str) -> str:
 
     An artifact naming an absolute checkout is neither reproducible nor
     readable by anyone else, and it leaks the worktree the run happened
-    in -- the same rule this change set states for `fixture_digests`
-    (`fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`).
+    in -- the rule
+    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
+    already states.
 
     Paths outside the repo are returned RESOLVED-ABSOLUTE, not shortened
     to a bare filename: they are genuinely checkout-independent, and a
     journal parked outside the tree must stay identifiable.
 
+    THIRD copy of this helper under `fused-memory/scripts/`, and the three
+    DISAGREE on exactly that fallback -- so copy deliberately rather than by
+    proximity.  `census_memory_metadata.py::_repo_relative` also falls back
+    to resolved-absolute (this one is shaped after it), and pairs with a
+    READING-side `census_memory_metadata.py::_resolved_repo_path` that
+    re-anchors a recorded relative value at the repo root; this module has
+    no such reader because nothing reads `journal_path` back, so a future
+    consumer would have to add one.  `bake_off_storage_shape.py::_repo_relative`
+    falls back to `resolved.name` instead.  Each stays private: these
+    scripts are loaded via `_fm_helpers.load_script_module`, not imported
+    as a package.
+
     `_REPO_ROOT` is derived from this file's location, so it differs
     between the main checkout and every `.worktrees/<id>` lane -- the
     caveat `census_memory_metadata.py::_repo_relative` already records.
     The live journal sits under the main checkout's gitignored `/data/`,
-    so a harvest run from a worktree correctly falls through to the
-    absolute branch; the committed sidecar's relative value is what a
-    MAIN-checkout run emits.
+    so a harvest run from a worktree falls through to the absolute branch.
+    That is correct for the VALUE and a hazard for REGENERATION: re-running
+    the harvest from a lane re-emits the home-directory path this exists to
+    remove.  Regenerate from the MAIN checkout, which is where the committed
+    sidecar's relative value comes from.
     """
     resolved = Path(path).resolve()
     try:
@@ -488,6 +515,19 @@ def harvest(
             # multi-gigabyte and the committed sidecar records 431,621 search
             # ops, so materializing the `params` blobs is a multi-hundred-MB
             # peak allocation for a stream consumed exactly once.
+            #
+            # The TRADE, stated in full: peak RSS is bounded, at the cost of
+            # holding the read snapshot open across `json.loads` of every
+            # blob rather than for the fetch alone.  The journal is WAL
+            # (`fused-memory/src/fused_memory/services/write_journal.py::WriteJournal`),
+            # so writers are never blocked -- but frames newer than the
+            # oldest open reader snapshot cannot be reclaimed, so the
+            # server's `PRAGMA wal_checkpoint(TRUNCATE)`
+            # (`write_journal.py::WriteJournal.checkpoint`) is starved and
+            # the WAL grows for the whole scan.  Worth it against a
+            # multi-hundred-MB allocation, and `fetchmany()` chunking is not
+            # an improvement: it would cap memory identically without
+            # releasing the snapshot any earlier.
             for (params,) in con.execute(
                 "SELECT params FROM write_ops WHERE operation = 'search'"
             ):
