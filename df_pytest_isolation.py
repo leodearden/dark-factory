@@ -621,12 +621,209 @@ def _describe_clock_entry(entry: tuple[bytes, int] | None) -> str:
     return f'{text!r} st_mtime_ns={mtime_ns}'
 
 
+def deploy_clock_change_report(
+    before: dict[str, tuple[bytes, int] | None],
+    after: dict[str, tuple[bytes, int] | None],
+    *,
+    session_token: str | None,
+    root: str | os.PathLike[str] | None = None,
+) -> tuple[str, str] | None:
+    """Attribute the FIRST changed protected clock, or ``None`` if none changed.
+
+    Returns ``(verdict, message)``, where *verdict* is:
+
+    ``'falsified'``
+        The change cannot be attributed to anything but this run, or cannot be
+        attributed at all.  This is the DEFAULT — today's behaviour, unchanged —
+        and it covers a provenance-free (pre-4823) body, an unparseable one, a
+        DELETED file, a missing *session_token*, a stamp carrying THIS session's
+        token, and a stamp carrying some other pytest session's token.
+    ``'external_redeploy'``
+        A provenance-aware writer stamped the clock with an EMPTY session token,
+        i.e. no pytest session was an ancestor of the write.  A REAL fleet or
+        component redeploy straddled this run; the run is not at fault.
+
+    Task 4823.  The pre-existing guard could see only that the bytes moved, so
+    the benign reading its own message names ("a REAL fleet redeploy fired while
+    this suite was running") could be raised but never RULED IN.  It therefore
+    failed closed on every change — correct as a default, and wrong often enough
+    on a busy merge queue that four innocent branches were blocked across two
+    recovery sessions.  *session_token* is what removes the ambiguity: see
+    :func:`clock_stamp_provenance` for why the discriminator is the token and
+    never the writer's ``source``.
+
+    FAIL-CLOSED ON A FALSY *session_token*, mirroring
+    :func:`leaked_drain_processes` on its own token: an unstamped token must
+    never be read as "nothing can be ours, so everything is external", which
+    would silently forgive every write the first time the fixture failed to
+    stamp one.
+
+    A FOREIGN token is deliberately left failing rather than downgraded to
+    "somebody else's problem".  Under ``merge_verify_breadth: "full"`` many
+    worktrees run this suite against the same main checkout, so a foreign token
+    means another session falsified a shared clock — but that session's OWN
+    guard sees its own token and fails, so the signal is never lost, and this
+    run must not become the arbiter of another run's bug on the strength of a
+    token it cannot verify.
+
+    *root* is optional and cosmetic-but-load-bearing in BOTH verdicts: pass the
+    checkout the snapshots were taken against and the message names the ABSOLUTE
+    file.  A run guards more than one checkout (see
+    :func:`deploy_clock_guard_roots`), so a bare relpath leaves the reader unable
+    to tell which one moved.
+    """
+    for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
+        before_entry, after_entry = before.get(relpath), after.get(relpath)
+        kind = _clock_change_kind(before_entry, after_entry)
+        if kind is None:
+            continue
+        where = relpath if root is None else str(Path(root) / relpath)
+        observed = (
+            f'observed before: {_describe_clock_entry(before_entry)}\n'
+            f'observed after:  {_describe_clock_entry(after_entry)}\n'
+        )
+        provenance = clock_stamp_provenance(after_entry)
+        if provenance is not None and session_token and not provenance[
+            CLOCK_PROVENANCE_SESSION_KEY
+        ]:
+            return (
+                'external_redeploy',
+                _external_redeploy_message(
+                    where, kind, observed, provenance[CLOCK_PROVENANCE_SOURCE_KEY],
+                ),
+            )
+        return (
+            'falsified',
+            _falsified_message(
+                relpath, where, kind, observed, provenance, session_token,
+            ),
+        )
+    return None
+
+
+def _clock_attribution_line(
+    provenance: dict[str, str] | None, session_token: str | None,
+) -> str:
+    """One line saying what provenance the stamp carried and why it did not clear.
+
+    Appended to the falsified message so a reader is never left guessing whether
+    attribution was attempted — the difference between "this write is provably
+    yours" and "nothing in this file says who wrote it" is the whole reason the
+    two readings below can be told apart at all.
+    """
+    if provenance is None:
+        return (
+            'Attribution: the stamp carries no usable provenance (no '
+            f'{CLOCK_PROVENANCE_SOURCE_KEY!r}/{CLOCK_PROVENANCE_SESSION_KEY!r} '
+            'pair of strings), so it cannot be told apart from a test stamp and '
+            'is treated as one. A provenance-bearing stamp written outside a '
+            'pytest session would have been reported as a benign redeploy.'
+        )
+    source = provenance[CLOCK_PROVENANCE_SOURCE_KEY]
+    token = provenance[CLOCK_PROVENANCE_SESSION_KEY]
+    if not session_token:
+        return (
+            f'Attribution: the stamp names {source!r} as its writer, but this '
+            f'run has no ${PYTEST_SESSION_TOKEN_ENV} of its own to compare it '
+            'against, so nothing here can be cleared. Fail-closed by design — '
+            'an unstamped token must never read as "every write is external".'
+        )
+    if token == session_token:
+        return (
+            f'Attribution: {source!r} wrote this stamp FROM INSIDE this run — it '
+            f'carries this run\'s own ${PYTEST_SESSION_TOKEN_ENV}, so a real '
+            'redeploy is ruled out and a test spawned the writer.'
+        )
+    return (
+        f'Attribution: {source!r} wrote this stamp from inside another pytest '
+        f'session (its ${PYTEST_SESSION_TOKEN_ENV} is not this run\'s). That '
+        'session\'s own guard fails on it too, so the signal is not lost here; '
+        'this run reports it rather than absolving a token it cannot verify.'
+    )
+
+
+def _falsified_message(
+    relpath: str,
+    where: str,
+    kind: str,
+    observed: str,
+    provenance: dict[str, str] | None,
+    session_token: str | None,
+) -> str:
+    """The accusing message — VERBATIM as before task 4823, plus one attribution line.
+
+    Kept byte-for-byte because it is the message four years of triage notes,
+    ``OPERATIONS.md`` and two end-to-end tests key on: the literal
+    ``'falsified a REAL deploy clock'`` is what
+    ``TestTheGuardFailsTheRunEndToEnd`` asserts on, in both directions.
+    """
+    env_var = (
+        'FM_DEPLOY_CLOCK' if 'fused-memory' in relpath else 'ORCH_FLEET_DEPLOY_CLOCK'
+    )
+    return (
+        f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
+        + observed
+        + 'scripts/orchestrator-watchdog.py reads that file as "this component '
+        'was redeployed at <ts>" and SKIPS its staleness pass while the '
+        'min-interval window is open (8h by default), so the stamp silently '
+        'disarms staleness recovery for the rest of the day.\n'
+        f'Fix (the usual cause): a test spawned a process that resolved its '
+        f'clock path from the environment and defaulted to the live checkout. '
+        f'Point {env_var} at a tmp file for the whole suite, as '
+        'scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect does, or '
+        'per call, as tests/scripts/test_orchestrator_watchdog.py::'
+        '_boundary_run_drain_script does with its REQUIRED clock_file '
+        'parameter.\n'
+        'Benign alternative, worth ruling out first in a machine-operated '
+        'checkout: a REAL fleet redeploy (the deployed watchdog, or an '
+        'operator running restart-all-orchestrators.sh --drain) fired while '
+        'this suite was running. That is a genuine stamp and not a test bug — '
+        'the two bodies printed above ARE that comparison: check the {ts, iso} '
+        'against the deploy you expect.\n'
+        + _clock_attribution_line(provenance, session_token)
+    )
+
+
+def _external_redeploy_message(
+    where: str, kind: str, observed: str, source: str,
+) -> str:
+    """The benign message: a real redeploy straddled the run.
+
+    Self-contained triage, because it is read in a merge-lane verify log by
+    someone who did not run the suite: the absolute file, the change kind, both
+    observed bodies and the writer.  It must NOT contain
+    ``'falsified a REAL deploy clock'`` — that string is the accusing verdict's
+    signature and two end-to-end tests distinguish the two paths by it.
+    """
+    return (
+        f'a REAL deploy stamped a protected clock while this run was in flight: '
+        f'{where} was {kind}.\n'
+        'This run is NOT at fault — no branch, test or spawner here caused it.\n'
+        + observed
+        + f'writer: {source} (its {CLOCK_PROVENANCE_SESSION_KEY!r} is empty, '
+        f'i.e. no pytest session was an ancestor of that write — a test-spawned '
+        f'writer would have inherited this run\'s ${PYTEST_SESSION_TOKEN_ENV} '
+        'and been reported as a falsification instead).\n'
+        'Nothing to do: the clock now holds a genuine deploy time, which is '
+        'what scripts/orchestrator-watchdog.py should read. This is reported '
+        'rather than swallowed so an unexpected redeploy is still visible.'
+    )
+
+
 def deploy_clock_violation_reason(
     before: dict[str, tuple[bytes, int] | None],
     after: dict[str, tuple[bytes, int] | None],
     root: str | os.PathLike[str] | None = None,
 ) -> str | None:
     """Explain which protected deploy clock the run falsified, or ``None``.
+
+    The ``'falsified'``-only half of :func:`deploy_clock_change_report`, which is
+    the attributing entry point and the one the fixture calls — a change this
+    function passes over is not necessarily unchanged, it may have been
+    attributed to a REAL redeploy.  Kept at its original three-argument
+    signature, so the session token can only come from the ambient
+    :data:`PYTEST_SESSION_TOKEN_ENV`, which is exactly where every spawner picks
+    it up.
 
     Reports the FIRST offending relpath in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`
     order, what happened to it, the before/after readings actually observed, and
@@ -640,38 +837,14 @@ def deploy_clock_violation_reason(
     guards more than one checkout (see :func:`deploy_clock_guard_roots`), so a
     bare relpath leaves the reader unable to tell which one was falsified.
     """
-    for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
-        before_entry, after_entry = before.get(relpath), after.get(relpath)
-        kind = _clock_change_kind(before_entry, after_entry)
-        if kind is None:
-            continue
-        env_var = (
-            'FM_DEPLOY_CLOCK' if 'fused-memory' in relpath else 'ORCH_FLEET_DEPLOY_CLOCK'
-        )
-        where = relpath if root is None else str(Path(root) / relpath)
-        return (
-            f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
-            f'observed before: {_describe_clock_entry(before_entry)}\n'
-            f'observed after:  {_describe_clock_entry(after_entry)}\n'
-            'scripts/orchestrator-watchdog.py reads that file as "this component '
-            'was redeployed at <ts>" and SKIPS its staleness pass while the '
-            'min-interval window is open (8h by default), so the stamp silently '
-            'disarms staleness recovery for the rest of the day.\n'
-            f'Fix (the usual cause): a test spawned a process that resolved its '
-            f'clock path from the environment and defaulted to the live checkout. '
-            f'Point {env_var} at a tmp file for the whole suite, as '
-            'scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect does, or '
-            'per call, as tests/scripts/test_orchestrator_watchdog.py::'
-            '_boundary_run_drain_script does with its REQUIRED clock_file '
-            'parameter.\n'
-            'Benign alternative, worth ruling out first in a machine-operated '
-            'checkout: a REAL fleet redeploy (the deployed watchdog, or an '
-            'operator running restart-all-orchestrators.sh --drain) fired while '
-            'this suite was running. That is a genuine stamp and not a test bug — '
-            'the two bodies printed above ARE that comparison: check the {ts, iso} '
-            'against the deploy you expect.'
-        )
-    return None
+    report = deploy_clock_change_report(
+        before, after,
+        session_token=os.environ.get(PYTEST_SESSION_TOKEN_ENV),
+        root=root,
+    )
+    if report is None or report[0] != 'falsified':
+        return None
+    return report[1]
 
 
 @pytest.fixture(scope='session', autouse=True)

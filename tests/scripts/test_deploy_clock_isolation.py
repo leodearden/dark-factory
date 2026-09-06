@@ -860,7 +860,18 @@ class TestViolationReasonIsTheFalsifiedHalfOfTheReport:
     what lets the fixture pass the run.
     """
 
-    def test_an_external_stamp_is_not_a_violation(self, tmp_path: Path) -> None:
+    def test_an_external_stamp_is_not_a_violation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The token is SET explicitly rather than inherited from the live run.
+
+        The guard fixture does stamp one for the whole session, but a test that
+        leaned on that would be pinning the fixture's wiring (which
+        ``TestGuardIsLiveInThisRun`` owns) instead of this function's contract,
+        and would flip to green for the wrong reason — an absent token fails
+        CLOSED here, which is a different pinned behaviour entirely.
+        """
+        monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _THIS_SESSION)
         before = deploy_clock_snapshot(tmp_path)
         _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
 
@@ -868,8 +879,11 @@ class TestViolationReasonIsTheFalsifiedHalfOfTheReport:
             before, deploy_clock_snapshot(tmp_path),
         ) is None
 
-    def test_a_provenance_free_stamp_is_still_a_violation(self, tmp_path: Path) -> None:
+    def test_a_provenance_free_stamp_is_still_a_violation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Non-vacuity control for the test above, in the same harness."""
+        monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _THIS_SESSION)
         before = deploy_clock_snapshot(tmp_path)
         _write(tmp_path, _FLEET_RELPATH, b'{"ts": 1, "iso": "x"}\n')
 
@@ -877,6 +891,21 @@ class TestViolationReasonIsTheFalsifiedHalfOfTheReport:
 
         assert reason is not None
         assert 'falsified a REAL deploy clock' in reason
+
+    def test_an_absent_ambient_token_fails_closed(self, tmp_path: Path, monkeypatch) -> None:
+        """The fail-closed default, at the wrapper's own boundary.
+
+        If the guard fixture ever stopped stamping the token, every write would
+        read as unattributable and keep failing — noisily wrong, never silently
+        permissive. That direction is the one worth pinning.
+        """
+        monkeypatch.delenv(PYTEST_SESSION_TOKEN_ENV, raising=False)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+
+        assert deploy_clock_violation_reason(
+            before, deploy_clock_snapshot(tmp_path),
+        ) is not None
 
     def test_it_reads_this_sessions_token_from_the_environment(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
