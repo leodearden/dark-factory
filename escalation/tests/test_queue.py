@@ -7424,3 +7424,143 @@ class TestResolveCapturesLateResolution:
             f'the capture did not reach disk: {on_disk.late_resolutions!r}'
         )
         assert on_disk.late_resolutions[0]['resolution'] == self.LATE_TEXT
+
+
+class TestLateResolutionCapturePredicate:
+    """The NEGATIVES: the capture stays narrow, so it cannot become noise.
+
+    A high-signal forensic field is only high-signal while it stays rare.  Each
+    case below is a shape that ALREADY happens routinely in this system; if any
+    of them captured, `late_resolutions` would fill with entries nobody filed a
+    race about, and the one entry that matters would be indistinguishable.
+
+    Every case also re-asserts `TestResolveIdempotent`'s no-orphan-archive
+    guarantee: a suppressed capture must write NOTHING, not write a no-change
+    record to a fresh path.
+    """
+
+    LATE_TEXT = "the steward's real finding"
+
+    def _archive_state(self, queue: EscalationQueue, esc_id: str) -> tuple[list[Path], list[str]]:
+        """(archive paths, their bytes) — the on-disk footprint of *esc_id*."""
+        paths = sorted((queue.queue_dir / 'archive').rglob(f'{esc_id}.json'))
+        return paths, [p.read_text() for p in paths]
+
+    def _assert_nothing_written(
+        self, queue: EscalationQueue, esc_id: str,
+        before: tuple[list[Path], list[str]],
+    ) -> None:
+        """No entry appended, no orphan copy, and the on-disk BYTES unchanged."""
+        record = queue.get(esc_id)
+        assert record is not None
+        assert record.late_resolutions == [], (
+            f'capture must be suppressed for this shape: {record.late_resolutions!r}'
+        )
+        after = self._archive_state(queue, esc_id)
+        assert after[0] == before[0], (
+            f'archive layout changed: {before[0]} -> {after[0]}'
+        )
+        assert after[1] == before[1], 'on-disk bytes changed despite a suppressed capture'
+        assert not (queue.queue_dir / f'{esc_id}.json').exists(), (
+            'a suppressed capture resurrected a queue-root copy of an archived record'
+        )
+
+    def _seeded(
+        self, tmp_path: Path, *, dismiss: bool, resolved_by: str, resolution: str,
+    ) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve('esc-3902-1', resolution, dismiss=dismiss, resolved_by=resolved_by)
+        return queue
+
+    def test_stored_human_resolver_does_not_capture(self, tmp_path: Path):
+        """(a) A HUMAN closed it, so a second resolve is an ordinary double-close.
+
+        `resolved_by='interactive'` classifies as tier 'human', not
+        'reaper-sweep'.  Without this conjunct every idempotent re-resolve of a
+        human-closed record would append an entry.
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='interactive', resolution='closed by hand',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_stored_resolved_status_does_not_capture(self, tmp_path: Path):
+        """(b) Only a DISMISSAL loses information — a resolve already carries a finding."""
+        queue = self._seeded(
+            tmp_path, dismiss=False, resolved_by='auto-dismissed', resolution='closed',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_incoming_automated_dismissal_does_not_capture(self, tmp_path: Path):
+        """(c) An auto-dismisser re-closing an auto-dismissed record is routine.
+
+        THIS is the conjunct that keeps workflow.py's five idempotent
+        auto-dismiss backstops and test_workflow_escalated_steward_stall.py's
+        deliberate re-dismissals silent.  Without it they would each append an
+        entry every time they re-closed an already-closed record.
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed',
+            resolution='Auto-dismissed: steward interrupted',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: workflow backstop',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_other_reaper_sweep_resolvers_are_also_excluded_incoming(self, tmp_path: Path):
+        """(c cont.) The exclusion is the TIER, not the literal 'auto-dismissed'.
+
+        Both sides derive from `classify.classify_resolver_tier`, so a future
+        member added to `_REAPER_SWEEP_RESOLVERS` is covered automatically
+        rather than silently starting to generate noise (INV-5).
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='harness-orphan-reaper',
+            resolution='swept: orphaned',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve(
+            'esc-3902-1', 'swept again: orphaned',
+            dismiss=True, resolved_by='harness-escalation-revalidation-sweep',
+        )
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_empty_incoming_resolution_does_not_capture(self, tmp_path: Path):
+        """(d) There is nothing to preserve."""
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed',
+            resolution='Auto-dismissed: steward interrupted',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', '', resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_identical_incoming_resolution_does_not_capture(self, tmp_path: Path):
+        """(d cont.) A byte-identical retry preserves nothing the record lacks."""
+        stored = 'Auto-dismissed: steward interrupted (attempt cap)'
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed', resolution=stored,
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', stored, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
