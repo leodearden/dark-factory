@@ -5216,3 +5216,92 @@ def _cluster_growth_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
             if isinstance(entry, dict):
                 _add(entry.get('task_id'))
     return ids
+
+
+async def filter_accounted_cluster_growth_flags(
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop duplicate-cluster-growth flags already accounted for by their task.
+
+    Stage 1 emits a "cluster has grown beyond what gate task N tracks" finding
+    by diffing a newly-observed Mem0 cluster member against a title-derived /
+    remembered COUNT rather than against the gate task's CURRENT description
+    body -- so an addendum appended to the body since the title was written
+    reads as unaccounted growth.
+
+    This filter re-runs that claim against the body: a flag is DROPPED iff SOME
+    candidate task's current ``description`` + ``details`` contains EVERY one
+    of the flag's cited memory UUIDs (case-insensitive substring).
+
+    Args:
+        taskmaster: Object with an async ``get_task(task_id, project_root)``
+            method, typically ``self.taskmaster`` in MemoryConsolidator.
+        project_root: Project root path passed through to get_task.
+        flags: List of flag dicts from Stage 1 ``items_flagged``.
+
+    Returns:
+        A new list, in input order, with accounted-for growth flags removed.
+    """
+    candidate_positions: list[int] = []
+    cited_by_pos: dict[int, list[str]] = {}
+    task_ids_by_pos: dict[int, list[str]] = {}
+
+    for i, flag in enumerate(flags):
+        if not _is_cluster_growth_flag_type(flag.get('flag_type')):
+            continue
+        memory_ids = _cluster_growth_cited_memory_ids(flag)
+        if not memory_ids:
+            continue
+        task_ids = _cluster_growth_candidate_task_ids(flag)
+        if not task_ids:
+            continue
+        candidate_positions.append(i)
+        cited_by_pos[i] = memory_ids
+        task_ids_by_pos[i] = task_ids
+
+    # Resolve each distinct task id exactly ONCE per call, however many flags
+    # in the batch cite it.
+    wanted_task_ids: list[str] = []
+    seen_task_ids: set[str] = set()
+    for i in candidate_positions:
+        for tid in task_ids_by_pos[i]:
+            if tid not in seen_task_ids:
+                seen_task_ids.add(tid)
+                wanted_task_ids.append(tid)
+
+    lookup_results: list[Any] = await asyncio.gather(
+        *[taskmaster.get_task(tid, project_root) for tid in wanted_task_ids]
+    )
+    body_by_task: dict[str, str] = {}
+    for tid, result in zip(wanted_task_ids, lookup_results, strict=True):
+        if not isinstance(result, dict):
+            continue
+        body = f"{result.get('description') or ''}\n{result.get('details') or ''}"
+        body_by_task[tid] = body.casefold()
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        if i not in cited_by_pos:
+            kept.append(flag)
+            continue
+        memory_ids = [m.casefold() for m in cited_by_pos[i]]
+        matched_task_id = next(
+            (
+                tid
+                for tid in task_ids_by_pos[i]
+                if tid in body_by_task
+                and all(uid in body_by_task[tid] for uid in memory_ids)
+            ),
+            None,
+        )
+        if matched_task_id is None:
+            kept.append(flag)
+            continue
+        logger.info(
+            'reconciliation.accounted_cluster_growth_flag_dropped '
+            'task_id=%s matched_task_id=%s memory_ids=%s',
+            flag.get('task_id'), matched_task_id, cited_by_pos[i],
+        )
+    return kept
