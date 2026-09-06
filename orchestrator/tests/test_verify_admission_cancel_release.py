@@ -218,7 +218,8 @@ class _GatedRaisingAcquire:
 @pytest.mark.real_verify_admission
 @pytest.mark.asyncio
 async def test_cancel_mid_acquire_does_not_exit_a_cm_whose_enter_raised(tmp_path):
-    # slots_dir need not exist -- the fake never touches the filesystem.
+    # slots_dir is created by _admission_slot's own mkdir leg; the fake
+    # acquire then never reads it.
     slots_dir = tmp_path / 'slots'
     config = OrchestratorConfig(
         verify_admission_slots_dir=str(slots_dir),
@@ -227,41 +228,49 @@ async def test_cancel_mid_acquire_does_not_exit_a_cm_whose_enter_raised(tmp_path
     fake = _GatedRaisingAcquire()
     body_ran = False
     loop_errors: list[Any] = []
-    asyncio.get_running_loop().set_exception_handler(
-        lambda loop, context: loop_errors.append(context),
-    )
+    loop = asyncio.get_running_loop()
+    prior_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
 
     async def _run() -> None:
         nonlocal body_ran
         async with _admission_slot('task', config):
             body_ran = True
 
-    with patch('orchestrator.verify.acquire_task_slot', fake):
-        task = asyncio.create_task(_run())
-        try:
-            await _await_flag(fake.started, msg='worker thread never started __enter__')
+    try:
+        with patch('orchestrator.verify.acquire_task_slot', fake):
+            task = asyncio.create_task(_run())
+            try:
+                await _await_flag(fake.started, msg='worker thread never started __enter__')
 
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            assert body_ran is False, (
-                'CM body must never run on the cancelled-mid-acquire path'
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert body_ran is False, (
+                    'CM body must never run on the cancelled-mid-acquire path'
+                )
+            finally:
+                # Unblock the worker thread even if an assertion above failed, so
+                # it never sits parked in the process-lifetime _admission_executor().
+                fake.gate.set()
+
+            await _await_flag(
+                fake.raised, msg='worker thread never reached the simulated OSError',
             )
-        finally:
-            # Unblock the worker thread even if an assertion above failed, so
-            # it never sits parked in the process-lifetime _admission_executor().
-            fake.gate.set()
+            # Bounded settle window (not a bare sleep): fake.raised already proves
+            # the future resolved and the done-callback was scheduled; this just
+            # gives it a fair chance to run before we assert on its absence of
+            # effect. This is a fixed drain, not a positive completion signal for
+            # the callback itself, so the assertion's power to catch a regression
+            # could in principle degrade on a heavily loaded box (this suite runs
+            # -n auto); sized to 0.5s for headroom over the ~0.2s precedent
+            # elsewhere in this suite (test_lane_lock_leak_guard.py).
+            for _ in range(50):
+                await asyncio.sleep(0.01)
 
-        await _await_flag(
-            fake.raised, msg='worker thread never reached the simulated OSError',
+        assert fake.exit_calls == 0, '__exit__ called on a CM that never entered'
+        assert loop_errors == [], (
+            f'expected no unretrieved-exception loop errors, got {loop_errors!r}'
         )
-        # Bounded settle window (not a bare sleep): fake.raised already proves the
-        # future resolved and the done-callback was scheduled; this just gives it
-        # a fair chance to run before we assert on its absence of effect.
-        for _ in range(20):
-            await asyncio.sleep(0.01)
-
-    assert fake.exit_calls == 0, '__exit__ called on a CM that never entered'
-    assert loop_errors == [], (
-        f'expected no unretrieved-exception loop errors, got {loop_errors!r}'
-    )
+    finally:
+        loop.set_exception_handler(prior_handler)
