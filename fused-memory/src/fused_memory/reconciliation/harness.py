@@ -5705,6 +5705,81 @@ class ReconciliationHarness:
                 except Exception:
                     _orch_started = None
 
+                def _task_is_live(tid: str) -> bool:
+                    """Is task *tid* covered by a live workflow right now?
+
+                    Extracted verbatim (task 4821) from the per-cited-task body
+                    of the live-workflow gate below so a SECOND consumer — the
+                    routed-filing gate on the escalate branch — asks the exact
+                    same question of the exact same inputs.  A re-implementation
+                    would be free to drift; a shared helper cannot.
+
+                    Closes over the four pass-local, loop-constant inputs
+                    (`task_by_id`, `_tasks_snapshot_at`, `_sched_state`,
+                    `_orch_started`) plus `project_root`, so the caller supplies
+                    only the task id.
+
+                    Fail-safe direction is UNCHANGED from the inline version it
+                    replaces: a corroboration error leaves the gate inert
+                    (`corroborated=None`), and a detector error is treated as
+                    NOT live — biasing toward escalating rather than toward
+                    silencing a genuine stranded-work escalation.
+                    """
+                    _task = task_by_id.get(tid)
+                    _metadata = _task.get('metadata') if _task else None
+                    _status = _task.get('status') if _task else None
+                    # In-progress-only, mirroring the renderer's
+                    # `task.get('status') == 'in-progress'` guard so all
+                    # three consumers gate corroboration identically.
+                    corroborated: bool | None = None
+                    if _status == 'in-progress' and _task is not None:
+                        try:
+                            corroborated = corroboration_for_task(
+                                _task, tid,
+                                # The snapshot's own clock, NOT now() — see
+                                # the _tasks_snapshot_at comment above: the
+                                # heartbeat being aged came from that same
+                                # read, and the 10-minute TTL is comparable
+                                # to a remediation pass.
+                                now=_tasks_snapshot_at,
+                                scheduler_state=_sched_state,
+                                orchestrator_started_at=_orch_started,
+                            )
+                        except Exception as _corr_exc:
+                            logger.debug(
+                                'corroboration_for_task error for task %s; '
+                                'leaving the gate inert: %s',
+                                tid, _corr_exc,
+                            )
+                    try:
+                        return bool(is_workflow_live_for_task(
+                            tid, project_root,
+                            status=_status,
+                            task_kind=(
+                                _metadata.get('task_kind')
+                                if isinstance(_metadata, dict) else None
+                            ),
+                            # Task 3751 rule 5 (pending + deterministic +
+                            # pure gate). is_pure_gate_metadata's own
+                            # non-Mapping -> False contract is the guard,
+                            # so an absent or malformed blob degrades
+                            # toward live with no extra check here. This
+                            # completes the input parity: this consumer,
+                            # recon_write_policy Gate 2 and
+                            # _render_live_workflow_section now all pass
+                            # the identical status/task_kind/pure_gate/
+                            # corroborated tuple — the invariant task 2964
+                            # exists to establish.
+                            pure_gate=is_pure_gate_metadata(_metadata),
+                            corroborated=corroborated,
+                        ))
+                    except Exception as _det_exc:
+                        logger.debug(
+                            'live_workflow_detector error for task %s; treating as not-live: %s',
+                            tid, _det_exc,
+                        )
+                        return False
+
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
@@ -5764,61 +5839,9 @@ class ReconciliationHarness:
                         ]
                         any_live = False
                         for tid in cited_task_ids:
-                            _task = task_by_id.get(tid)
-                            _metadata = _task.get('metadata') if _task else None
-                            _status = _task.get('status') if _task else None
-                            # In-progress-only, mirroring the renderer's
-                            # `task.get('status') == 'in-progress'` guard so all
-                            # three consumers gate corroboration identically.
-                            corroborated: bool | None = None
-                            if _status == 'in-progress' and _task is not None:
-                                try:
-                                    corroborated = corroboration_for_task(
-                                        _task, tid,
-                                        # The snapshot's own clock, NOT now() — see
-                                        # the _tasks_snapshot_at comment above: the
-                                        # heartbeat being aged came from that same
-                                        # read, and the 10-minute TTL is comparable
-                                        # to a remediation pass.
-                                        now=_tasks_snapshot_at,
-                                        scheduler_state=_sched_state,
-                                        orchestrator_started_at=_orch_started,
-                                    )
-                                except Exception as _corr_exc:
-                                    logger.debug(
-                                        'corroboration_for_task error for task %s; '
-                                        'leaving the gate inert: %s',
-                                        tid, _corr_exc,
-                                    )
-                            try:
-                                if is_workflow_live_for_task(
-                                    tid, project_root,
-                                    status=_status,
-                                    task_kind=(
-                                        _metadata.get('task_kind')
-                                        if isinstance(_metadata, dict) else None
-                                    ),
-                                    # Task 3751 rule 5 (pending + deterministic +
-                                    # pure gate). is_pure_gate_metadata's own
-                                    # non-Mapping -> False contract is the guard,
-                                    # so an absent or malformed blob degrades
-                                    # toward live with no extra check here. This
-                                    # completes the input parity: this consumer,
-                                    # recon_write_policy Gate 2 and
-                                    # _render_live_workflow_section now all pass
-                                    # the identical status/task_kind/pure_gate/
-                                    # corroborated tuple — the invariant task 2964
-                                    # exists to establish.
-                                    pure_gate=is_pure_gate_metadata(_metadata),
-                                    corroborated=corroborated,
-                                ):
-                                    any_live = True
-                                    break
-                            except Exception as _det_exc:
-                                logger.debug(
-                                    'live_workflow_detector error for task %s; treating as not-live: %s',
-                                    tid, _det_exc,
-                                )
+                            if _task_is_live(tid):
+                                any_live = True
+                                break
                         if any_live:
                             logger.info(
                                 'reconciliation.integrity_escalation_suppressed_live_workflow',
@@ -5853,22 +5876,63 @@ class ReconciliationHarness:
                             # different readers).
                             #
                             # Placement is load-bearing: sitting on this exact
-                            # branch inherits every existing suppression layer
+                            # branch inherits MOST existing suppression layers
                             # structurally, with no duplicated logic that could
                             # drift.  A finding only reaches here having already
                             # survived the non-actionable partition, the
                             # `_finding_has_reference` placeholder drop, the
                             # open-recon-escalation check, the
                             # `_INTEGRITY_FINDING_RECURRENCE_THRESHOLD`
-                            # persistence bar, and the live-workflow gate.  The
-                            # consequence worth stating: VOLUME PARITY — at most
-                            # one orchestrator L1 per finding that already files
-                            # one recon escalation today, folded across later
-                            # cycles by `has_open_l1`.  This plumbing cannot
-                            # flood the orchestrator ladder.
-                            self._file_finding_task_escalation(
-                                project_id, run_id, finding, persistence,
-                            )
+                            # persistence bar, and the live-workflow gate AS
+                            # APPLIED TO CITED TASKS.
+                            #
+                            # That last one is NOT inherited in full, and the
+                            # difference is the whole reason for the explicit
+                            # check below.  The gate above iterates
+                            # `cited_task_ids` — findings' `cited_tasks`
+                            # citations — while `resolve_finding_task_target`
+                            # ALSO honours the bare `finding['task_id']` field,
+                            # which the gate never sees.  The two are different
+                            # SETS, not the same set reached two ways: a finding
+                            # carrying only a bare `task_id` leaves
+                            # `cited_task_ids` empty, so `any_live` is VACUOUSLY
+                            # False and this branch is reached even when the
+                            # named task has live work in flight.  Gate the
+                            # resolved target explicitly, skipping the recheck
+                            # when it is already a cited id (the loop above just
+                            # proved that one not-live, and a recheck would spend
+                            # git subprocess calls to re-derive the same answer).
+                            #
+                            # The `_escalate` gate above is deliberately NOT
+                            # widened to the resolved target: that would silence
+                            # recon-queue escalations that file today, a
+                            # behaviour change outside this arm's scope.
+                            routed_task_id = resolve_finding_task_target(finding, project_id)
+                            if (
+                                routed_task_id is not None
+                                and routed_task_id not in cited_task_ids
+                                and _task_is_live(routed_task_id)
+                            ):
+                                logger.info(
+                                    'reconciliation.integrity_escalation_'
+                                    'suppressed_live_workflow_routed_target',
+                                    extra={
+                                        'project_id': project_id,
+                                        'run_id': run_id,
+                                        'task_id': routed_task_id,
+                                        'description': finding.get('description', ''),
+                                        'finding_category': finding.get('category', ''),
+                                    },
+                                )
+                            else:
+                                # VOLUME PARITY: at most one orchestrator L1 per
+                                # finding that already files one recon escalation
+                                # today, folded across later cycles by the filer's
+                                # own dedupe.  This plumbing cannot flood the
+                                # orchestrator ladder.
+                                self._file_finding_task_escalation(
+                                    project_id, run_id, finding, persistence,
+                                )
                     else:
                         logger.info(
                             'reconciliation.unresolved_after_remediation_suppressed',
