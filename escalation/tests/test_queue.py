@@ -29,6 +29,7 @@ from escalation.queue import (
     _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
+    ResolveOutcome,
     iter_all_escalation_paths,
 )
 
@@ -7168,3 +7169,113 @@ class TestNoteSuppressedRefile:
         assert record.status == 'resolved', (
             f'the concurrent bumps disturbed the adjudication: {record.status!r}'
         )
+
+
+class TestResolveOutcomeOutParam:
+    """`resolve(..., outcome=...)` reports what the call DID, on every return path.
+
+    An OUT-PARAM for the same reason `AmendmentOutcome` is one (see its
+    docstring): the `Escalation` is `resolve()`'s primary return value and every
+    existing call site reads it directly, and the facts a caller wants —
+    "did my text actually apply?" — are only exact when computed INSIDE
+    `escalation_id_lock`.  Re-deriving them in `server.resolve_issue` from a
+    pre-call `queue.get` would be a real TOCTOU: this queue is built for
+    cross-process mutators, so a concurrent auto-dismiss landing between the
+    pre-read and the call makes the reported flag wrong.
+    """
+
+    @staticmethod
+    def _poisoned() -> ResolveOutcome:
+        """A pre-seeded outcome whose every key is WRONG.
+
+        Seeding the opposite of the expected value is what makes "the key was
+        left stale on this return path" distinguishable from "the key happens
+        to already hold the right value".
+        """
+        return {
+            'applied': True,
+            'prior_status': 'poison',
+            'prior_resolved_by': 'poison',
+            'late_resolution_captured': True,
+            'resolution_class_corrected': 'poison',
+        }
+
+    def test_unknown_id_reports_not_applied_with_no_prior_state(self, tmp_path: Path):
+        """(a) The not-found early return still resets every key."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        out = self._poisoned()
+
+        assert queue.resolve('esc-nope-1', 'never lands', outcome=out) is None
+
+        assert out['applied'] is False, f'nothing was applied: {out}'
+        assert out['prior_status'] is None, f'there was no prior record: {out}'
+        assert out['prior_resolved_by'] is None, f'there was no prior record: {out}'
+        assert out['late_resolution_captured'] is False, f'nothing was captured: {out}'
+        assert out['resolution_class_corrected'] is None, f'nothing was corrected: {out}'
+
+    def test_pending_record_reports_applied(self, tmp_path: Path):
+        """(b) The ordinary path: the resolution took effect."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        out = self._poisoned()
+
+        result = queue.resolve('esc-1-1', 'Fixed', resolved_by='interactive', outcome=out)
+
+        assert result is not None and result.status == 'resolved'
+        assert out['applied'] is True, f'a pending record accepts the resolve: {out}'
+        assert out['prior_status'] == 'pending', f'prior status must be exact: {out}'
+        assert out['prior_resolved_by'] is None, (
+            f'an unresolved record has no prior resolver: {out}'
+        )
+        assert out['late_resolution_captured'] is False, (
+            f'nothing was captured — the text APPLIED: {out}'
+        )
+        assert out['resolution_class_corrected'] is None, f'nothing was corrected: {out}'
+
+    def test_already_terminal_record_reports_not_applied_and_echoes_prior_state(
+        self, tmp_path: Path,
+    ):
+        """(c) The already-terminal branch reports the state that WON the race."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'Fixed once', resolved_by='interactive')
+
+        out = self._poisoned()
+        result = queue.resolve('esc-1-1', 'Fixed again', resolved_by='interactive', outcome=out)
+
+        # The stored record is still what comes back — the contract
+        # `TestResolveIdempotent` pins is unchanged.
+        assert result is not None
+        assert result.resolution == 'Fixed once'
+        assert out['applied'] is False, (
+            f'the second resolve is a no-op and must say so: {out}'
+        )
+        assert out['prior_status'] == 'resolved', (
+            f'prior_status names the state that won: {out}'
+        )
+        assert out['prior_resolved_by'] == 'interactive', (
+            f'prior_resolved_by names WHO won: {out}'
+        )
+
+    def test_outcome_is_keyword_only_with_a_none_default(self, tmp_path: Path):
+        """(d) Every existing call site stays byte-compatible.
+
+        `resolve()` has callers that pass positionally (`resolve(id, text,
+        dismiss)`), plus its own member cascade and `dismiss_all_pending` — none
+        of which want the out-param.  Keyword-only with a None default is what
+        keeps them untouched.
+        """
+        import inspect
+
+        param = inspect.signature(EscalationQueue.resolve).parameters['outcome']
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f'outcome must be keyword-only, not {param.kind!r} — a positional '
+            'parameter would shift the meaning of existing positional args'
+        )
+        assert param.default is None, f'outcome must default to None, got {param.default!r}'
+
+        # And the no-out-param call still behaves exactly as before.
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        result = queue.resolve('esc-1-1', 'Fixed', dismiss=True)
+        assert result is not None and result.status == 'dismissed'
