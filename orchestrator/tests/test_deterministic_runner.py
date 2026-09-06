@@ -5344,15 +5344,9 @@ class TestFileInfraIssueSkipsRedundantEscalatedAdvance:
 
 
 # ---------------------------------------------------------------------------
-# Task 4048 (recovered task-2240 review suggestion): _file_milestone_gate_
-# and_block has the same pinned-illegal self-loop exposure as
-# _file_infra_issue_and_block above (ESCALATED->ESCALATED / DONE->ESCALATED)
-# but never got the guard — this is that sibling's pair. Unlike the infra
-# guard, the skip path must still stamp gate_escalated_at (a stamp-only
-# update_task, dropping only the illegal deploy_state half of the advance's
-# payload) rather than dropping the write entirely: that stamp is what
-# routes the next resume through section-1 quiescence (see
-# _file_milestone_gate_and_block's docstring).
+# Task 4048 (recovered task-2240 review suggestion): pairs with
+# TestFileInfraIssueSkipsRedundantEscalatedAdvance above — see
+# _file_milestone_gate_and_block's docstring for the full rationale.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -5407,6 +5401,7 @@ class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
             and 'deploy_state' not in c.args[1]
         ]
         assert len(stamp_calls) == 1
+        assert stamp_calls[0].kwargs.get('metadata_mode') == 'merge'
         assert scheduler.update_task.call_count == 1
         scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
 
@@ -5513,14 +5508,18 @@ class TestFileMilestoneGateAdvanceIsBestEffort:
         warned = '\n'.join(
             r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
         )
-        assert 'deploy_state phase-escalated advance failed' in warned
+        # Task 4048 amendment: message differentiated per arm (reviewer
+        # suggestion) — this is the full-advance arm's wording.
+        assert 'milestone_gate deploy_state ESCALATED advance failed' in warned
 
     @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
     async def test_transient_stamp_failure_on_skip_path_does_not_propagate(
-        self, tmp_path: Path, seeded_phase: str,
+        self, tmp_path: Path, seeded_phase: str, caplog,
     ) -> None:
         """Already-at-target phase: the step-2 stamp-only fallback arm is
         taken and its update_task fails."""
+        import logging
+
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
@@ -5530,9 +5529,10 @@ class TestFileMilestoneGateAdvanceIsBestEffort:
         scheduler.update_task = AsyncMock(side_effect=RuntimeError('connection severed'))
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
 
-        outcome = await runner._file_milestone_gate_and_block(
-            '4048', task, task['metadata'],
-        )
+        with caplog.at_level(logging.WARNING, logger='orchestrator.deterministic_runner'):
+            outcome = await runner._file_milestone_gate_and_block(
+                '4048', task, task['metadata'],
+            )
 
         assert outcome == WorkflowOutcome.BLOCKED
         gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
@@ -5543,6 +5543,13 @@ class TestFileMilestoneGateAdvanceIsBestEffort:
         ]
         assert illegal_escs == []
         scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+        # Task 4048 amendment (reviewer suggestion): the skip arm must also
+        # be observably logged, not silently swallowed — and its wording
+        # must be distinguishable from the full-advance arm's above.
+        warned = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'milestone_gate gate_escalated_at stamp-only write failed' in warned
 
 
 # ---------------------------------------------------------------------------

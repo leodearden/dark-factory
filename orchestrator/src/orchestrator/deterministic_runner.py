@@ -2387,35 +2387,25 @@ class DeterministicRunner:
         # (before_done=None) is not a deploy and gets no deploy_state.
         now_iso = datetime.now(UTC).isoformat()
         if metadata.get('before_done') is not None:
-            _current_deploy_state = DeployState.from_metadata(metadata)
-            _already_at_target = (
-                _current_deploy_state is not None
-                and _current_deploy_state.phase in (DeployPhase.ESCALATED, DeployPhase.DONE)
-            )
+            # Task 4048 amendment: pre-bind so both names are defined on every
+            # path into `except` below, including one raised by the
+            # DeployState.from_metadata read itself (see next comment).
+            _already_at_target = False
             try:
+                # Task 4048 amendment: the read lives inside this try (not
+                # before it) so a corrupted/hand-edited deploy_state slice
+                # (pydantic ValidationError from DeployState.from_metadata)
+                # is caught by the except below instead of escaping — the
+                # write is simply skipped entirely in that case.
+                _current_deploy_state = DeployState.from_metadata(metadata)
+                _already_at_target = (
+                    _current_deploy_state is not None
+                    and _current_deploy_state.phase in (DeployPhase.ESCALATED, DeployPhase.DONE)
+                )
                 if _already_at_target:
                     assert _current_deploy_state is not None  # implied by _already_at_target (short-circuit `and` above)
-                    # Task 4048 (recovered task-2240 review suggestion):
-                    # already at (or past) ESCALATED — e.g. this is the rare
-                    # crash-resume edge where a prior
-                    # _file_infra_issue_and_block advanced phase to
-                    # ESCALATED without stamping gate_escalated_at, and a
-                    # later always_escalates=True dispatch reaches this
-                    # milestone-gate path again. A bare re-advance would
-                    # attempt an illegal ESCALATED->ESCALATED (or
-                    # DONE->ESCALATED) self-loop — neither edge is in
-                    # _LEGAL — filing a SPURIOUS born-at-L2
-                    # illegal_deploy_transition escalation on top of the
-                    # milestone_gate one just filed above. Skip the
-                    # redundant advance, but — unlike
-                    # _file_infra_issue_and_block's equivalent guard — still
-                    # stamp gate_escalated_at (stamp-only, no deploy_state
-                    # payload): that stamp is what routes the next dispatch
-                    # through section-1 quiescence/resolve-to-done, so
-                    # dropping it here would permanently deny the task that
-                    # fork rather than merely delay it. Mirrors the
-                    # stamp-only fallback precedent in
-                    # DeterministicRunner._writeback_deploy_success.
+                    # Task 4048: stamp-only skip of a redundant ESCALATED
+                    # advance — see docstring above for the full rationale.
                     logger.debug(
                         'DeterministicRunner: task %s deploy_state already at '
                         'phase=%s — skipping redundant ESCALATED advance, '
@@ -2432,12 +2422,21 @@ class DeterministicRunner:
                         phase_timestamp=now_iso,
                     )
             except Exception as exc:
-                logger.warning(
-                    'DeterministicRunner: task %s deploy_state phase-escalated '
-                    'advance failed (%s: %s) — the milestone_gate escalation '
-                    'above is already durable regardless',
-                    task_id, type(exc).__name__, exc,
-                )
+                if _already_at_target:
+                    logger.warning(
+                        'DeterministicRunner: task %s milestone_gate '
+                        'gate_escalated_at stamp-only write failed (deploy_state '
+                        'already at target phase) (%s: %s) — the milestone_gate '
+                        'escalation above is already durable regardless',
+                        task_id, type(exc).__name__, exc,
+                    )
+                else:
+                    logger.warning(
+                        'DeterministicRunner: task %s milestone_gate deploy_state '
+                        'ESCALATED advance failed (%s: %s) — the milestone_gate '
+                        'escalation above is already durable regardless',
+                        task_id, type(exc).__name__, exc,
+                    )
         else:
             await self.scheduler.update_task(
                 task_id,
