@@ -551,7 +551,7 @@ function TaskDetail({ task, allTasks }) {
               columns; deliberately INDEPENDENT of `agent` below, which is only
               worktree presence and stays truthy after the agent dies. */}
           {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
-        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.muted ? <span style={{ color: 'var(--fg-3)' }}>{ac.text}</span> : ac.text; })()}</span>
+        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.color ? <span style={{ color: ac.color }}>{ac.text}</span> : ac.text; })()}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
         <span className="k">lane</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane)}</span>
