@@ -447,8 +447,62 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     (``BaseStage.run``) and the GC (``harness``) derive the same path from
     ``(journal.data_dir, run_id)`` without passing a ``TaskConfigDir`` across
     scopes.
+
+    The returned root is always ABSOLUTE, and that is load-bearing (task 4592).
+    It becomes ``TaskConfigDir.path``, which is BOTH the ``CLAUDE_CONFIG_DIR``
+    handed to the CLI child (``shared/src/shared/cli_invoke.py::invoke_claude_agent``
+    sets ``env['CLAUDE_CONFIG_DIR'] = str(config_dir)``) and the path the parent
+    verifies for sandbox containment
+    (``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``).
+    A RELATIVE string is resolved against two DIFFERENT cwds: the child's — the
+    wrapped argv is spawned with ``cwd=`` ``config.explore_codebase_root``, see
+    ``run_stage_via_cli`` below — and the parent's, where every
+    ``os.path.realpath`` in the guard runs. Verified path A, written path B: the
+    fail-closed containment check reports PASS while the kernel denies every
+    transcript write, which is exactly the 2026-07-18 -> 2026-08-11 silent
+    transcript loss that task 4003's check exists to make impossible.
+    ``data_dir`` really can be relative: ``fused-memory/config/config.yaml``
+    supplies ``./data/reconciliation`` whenever ``RECONCILIATION_DATA_DIR`` is
+    unset, which ``scripts/fused-memory.service.template`` does not set. The two
+    cwds agree today only because that unit sets ``WorkingDirectory`` ==
+    ``PROJECT_ROOT``.
+
+    The anchor is ``Path.cwd()`` and deliberately NOT
+    ``config.explore_codebase_root``. This function's job is only to make the
+    parent and the child NAME THE SAME DIRECTORY, which either anchor achieves
+    once the path is absolute — so the tie-break is "relocate no byte". The
+    process cwd is the anchor every existing ``data_dir`` consumer already uses
+    implicitly: ``fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal.initialize``
+    mkdirs ``data_dir`` and opens ``reconciliation.db`` under it, and
+    ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
+    (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
+    the dead-letter JSONL) the same way. Anchoring here therefore renames nothing
+    on disk; anchoring at ``explore_codebase_root`` would silently relocate the
+    per-run config dirs into a different tree from the journal DB they are keyed
+    to whenever the two diverge — trading a silent write-denial for a silent
+    relocation. Capturing ``Path.cwd()`` per call is safe because ``os.chdir``
+    appears nowhere in ``shared/src``, ``orchestrator/src`` or
+    ``fused-memory/src``, so the process cwd is stable for the life of a run.
+
+    ``Path.cwd() / base`` rather than ``.resolve()`` / ``.absolute()`` is also
+    deliberate: it leaves an already-absolute input BYTE-IDENTICAL. ``.resolve()``
+    would additionally collapse symlink components, rewriting the string handed to
+    the child and to ``landlock-exec`` for every existing absolute deployment
+    (including the XDG ``RECONCILIATION_DATA_DIR`` that
+    ``orchestrator/src/orchestrator/mcp_lifecycle.py`` injects under a managed
+    spawn). Symlink resolution is not needed here anyway — ``sandbox_guard``
+    realpaths both sides of the containment comparison, which is the semantics
+    Landlock itself uses (it resolves rules by O_PATH fd).
+
+    Shape precedent:
+    ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._start_escalation_server``.
+    ``gc_run_config_dir`` inherits the fix for free — it derives its rmtree target
+    from this function.
     """
-    return data_dir / 'recon-config'
+    base = Path(data_dir)
+    if not base.is_absolute():
+        base = Path.cwd() / base
+    return base / 'recon-config'
 
 
 def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
