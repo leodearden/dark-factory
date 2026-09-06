@@ -10,6 +10,8 @@ from __future__ import annotations
 import pytest
 
 from fused_memory.reconciliation.finding_task_escalation import (
+    FINDING_TASK_ESCALATION_CATEGORY,
+    build_finding_task_escalation_kwargs,
     resolve_finding_task_target,
 )
 
@@ -156,3 +158,133 @@ class TestResolveFindingTaskTargetPrecedence:
             'cited_tasks': [_citation('dark_factory', '4458')],
         }
         assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
+
+
+def _finding_with_task() -> dict:
+    """A realistic actionable Stage-3 finding naming a task id."""
+    return {
+        'finding_id': 'f-001',
+        'severity': 'serious',
+        'category': 'memory_contradiction',
+        'description': 'Operator ruled Option A on esc-4458-87; commit did the opposite',
+        'suggested_action': 'Re-read the operator ruling before closing',
+        'actionable': True,
+        'task_id': '4458',
+        'cited_tasks': [_citation('dark_factory', '4458', 'Reify 4458')],
+    }
+
+
+class TestBuildFindingTaskEscalationKwargs:
+    """The pure payload builder."""
+
+    def _build(self, finding=None, **over):
+        kwargs = {
+            'task_id': '4458',
+            'project_id': 'dark_factory',
+            'run_id': 'abcdef0123456789',
+            'persistence': 4,
+        }
+        kwargs.update(over)
+        return build_finding_task_escalation_kwargs(finding or _finding_with_task(), **kwargs)
+
+    def test_carries_the_real_task_id_never_a_synthetic_recon_id(self):
+        """The whole point of the arm: the REAL id reaches the orchestrator queue.
+
+        `_escalate` files to the recon queue under a synthetic `recon-<run8>`
+        task id, which is why a finding naming a task currently dead-ends.
+        """
+        payload = self._build()
+        assert payload['task_id'] == '4458'
+        assert not payload['task_id'].startswith('recon-')
+
+    def test_fixed_routing_fields(self):
+        payload = self._build()
+        assert payload['agent_role'] == 'reconciliation-harness'
+        assert payload['severity'] == 'info'
+        assert payload['level'] == 1
+        assert payload['category'] == FINDING_TASK_ESCALATION_CATEGORY
+        assert FINDING_TASK_ESCALATION_CATEGORY == 'recon_task_finding'
+
+    def test_summary_is_one_line_naming_the_task_and_finding_category(self):
+        payload = self._build()
+        summary = payload['summary']
+        assert '\n' not in summary, f'summary must be one line, got: {summary!r}'
+        assert '4458' in summary
+        assert 'memory_contradiction' in summary
+
+    def test_detail_is_json_carrying_the_full_finding_provenance(self):
+        import json
+
+        finding = _finding_with_task()
+        payload = self._build(finding)
+        detail = json.loads(payload['detail'])
+        assert detail['finding_id'] == 'f-001'
+        assert detail['category'] == 'memory_contradiction'
+        assert detail['severity'] == 'serious'
+        assert detail['description'] == finding['description']
+        assert detail['suggested_action'] == finding['suggested_action']
+        assert detail['run_id'] == 'abcdef0123456789'
+        assert detail['project_id'] == 'dark_factory'
+        assert detail['persistence'] == 4
+        assert detail['cited_tasks'] == finding['cited_tasks']
+
+    def test_detail_survives_non_json_serialisable_finding_values(self):
+        import json
+        from datetime import UTC, datetime
+
+        finding = _finding_with_task()
+        finding['description'] = datetime.now(UTC)  # type: ignore[assignment]
+        payload = self._build(finding)
+        json.loads(payload['detail'])  # must not raise
+
+    def test_no_key_outside_the_escalation_dataclass_can_be_introduced(self):
+        """CRITICAL GUARD (constraint (d) of task 4821).
+
+        `Escalation.to_dict` is a bare `asdict` and `from_dict` filters to
+        `__dataclass_fields__`, while `queue.resolve()` rewrites the file from
+        `esc.to_json()`. Any non-dataclass key on disk is therefore DESTROYED on
+        the first resolve -- the exact bug `_POLICY_ONLY_KEYS` /
+        `BacklogPolicy._restore_policy_keys` exists to work around. Carrying all
+        provenance in `detail` (a real field) means we never need that
+        workaround, and this test is what keeps it that way.
+        """
+        from escalation.models import Escalation  # type: ignore[import-untyped]
+
+        payload = self._build()
+        allowed = set(Escalation.__dataclass_fields__) - {'id'}
+        assert set(payload) <= allowed, (
+            f'payload introduces non-Escalation keys: {sorted(set(payload) - allowed)}'
+        )
+
+    def test_id_is_not_supplied_only_the_filer_can_mint_it(self):
+        # `id` must come from `queue.make_id(...)`, a durable per-key counter --
+        # a pure function has no queue and must not guess a sequence number.
+        assert 'id' not in self._build()
+
+    def test_dedupe_fingerprint_is_not_set(self):
+        # Nothing on the orchestrator queue folds on a fingerprint for this
+        # category; cross-cycle dedupe is `has_open_l1`'s job. Setting one
+        # risks unintended folding if a future submit_or_dedupe config ever
+        # names the category.
+        payload = self._build()
+        assert payload.get('dedupe_fingerprint') is None
+
+    def test_suggested_action_is_left_empty(self):
+        # The correct disposition is exactly what the ladder exists to decide;
+        # the finding's own suggested_action is carried in `detail`.
+        assert self._build().get('suggested_action', '') == ''
+
+    def test_builder_does_not_mutate_the_finding(self):
+        finding = _finding_with_task()
+        before = dict(finding)
+        self._build(finding)
+        assert finding == before
+
+    def test_missing_finding_fields_degrade_rather_than_raise(self):
+        import json
+
+        payload = build_finding_task_escalation_kwargs(
+            {}, task_id='4458', project_id='dark_factory', run_id='r', persistence=4,
+        )
+        assert payload['task_id'] == '4458'
+        json.loads(payload['detail'])
