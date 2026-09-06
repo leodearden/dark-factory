@@ -535,9 +535,37 @@ _sentinel_settled() {
 }
 
 finish() {
+  # Bounded re-poll for a sentinel that EXISTS but has not settled yet --
+  # the faithful production race: the payload's write is in flight and the
+  # real exit code is on its way, so giving up on the first empty read
+  # would trade the empty-string crash for a silently destroyed exit code.
+  # Mirrors _wait_sentinel_grace's idiom exactly (same $SECONDS arithmetic,
+  # same 0.1s cadence, same budget); the only difference is the readiness
+  # predicate -- existence there, content here.
+  #
+  # Three properties, all load-bearing:
+  #   - Entered ONLY when the sentinel already exists, so the happy path
+  #     (settled on the first read) pays nothing and no caller's wall clock
+  #     moves.
+  #   - BOUNDED, with a 127 fallback. It must never become an unbounded
+  #     wait: that is precisely why the same hardening deliberately does
+  #     NOT go into await_sentinel, which has no other escape hatch and
+  #     would hang forever on a permanently-empty sentinel (truncated
+  #     write, ENOSPC) -- the failure mode the started-watchdog exists to
+  #     prevent.
+  #   - Reuses the existing SPAWN_LAUNCH_GRACE_SECS rather than adding a
+  #     new env knob. It is already this script's "how long to tolerate a
+  #     hair-late sentinel write" tunable -- semantically the identical
+  #     question.
   local rc=127
-  if _sentinel_settled; then
-    rc=$(cat "$sentinel")
+  if [ -f "$sentinel" ]; then
+    local end=$(( SECONDS + SPAWN_LAUNCH_GRACE_SECS ))
+    while ! _sentinel_settled && [ "$SECONDS" -lt "$end" ]; do
+      sleep 0.1
+    done
+    if _sentinel_settled; then
+      rc=$(cat "$sentinel")
+    fi
   fi
   rm -f "$sentinel"
   # Session-registry: record the final exit code (task 2285). rc is already
@@ -700,6 +728,21 @@ _started_watchdog() {
   # for a background job.
   trap - EXIT HUP TERM
 
+  # DELIBERATE ASYMMETRY with finish() (task 5137): both sentinel checks
+  # below stay EXISTENCE tests, and must not be "unified" with finish()'s
+  # content-aware _sentinel_settled. The two gates ask different questions.
+  # finish() asks "what exit code did the session report?", which requires
+  # CONTENT. This watchdog asks "did the payload ever start?", and the
+  # sentinel path being created AT ALL already proves it did -- the file can
+  # only come into existence because $inner's EXIT trap fired, which happens
+  # strictly after the payload shell started. Requiring non-empty here would
+  # be more conservative than the evidence warrants and could, at the grace
+  # boundary, flag a live session failed-to-start (exit 144, a loud
+  # caller-visible stderr line, and a registry status that cannot be
+  # retracted) purely because a write was mid-flight. With the atomic
+  # publish in $inner the two readings coincide anyway -- so the distinction
+  # costs nothing, but leaving it undocumented would invite exactly that
+  # unification.
   local end
   end=$(( $(date +%s) + SPAWN_STARTED_GRACE_SECS ))
   while [ "$(date +%s)" -lt "$end" ]; do
