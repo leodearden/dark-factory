@@ -93,9 +93,12 @@ The producer-side fix — absolutizing the root exactly once — lives at
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class RemediationSandboxUnavailable(RuntimeError):
@@ -148,13 +151,35 @@ def _writable_roots(cwd: Path, writable_extras: list[str] | None) -> list[str]:
       that as fatal, every reconciliation stage would return an error. That is a
       live foot-gun: relocating the recon config dir under ``<cwd>/.task/`` is the
       alternative the PRD's open question 5 explicitly considers.
+    - A non-absolute extra is DROPPED, and said out loud (task 4592). The
+      ``--writable`` tokens are resolved by ``landlock-exec`` / ``bwrap`` inside
+      the wrapped argv, which ``shared/src/shared/cli_invoke.py::_run_subprocess``
+      spawns with the CHILD's cwd, while every ``os.path.realpath`` in this
+      function runs in the PARENT's. A relative extra therefore names one
+      directory to the verifier and another to the grantor, and counting it would
+      manufacture exactly the false PASS this function exists to prevent — a
+      config dir judged contained by a root the child never grants. ``isabs`` is
+      tested BEFORE ``isdir`` on purpose: ``isdir`` on a relative path is itself a
+      parent-cwd resolution, so letting it decide inclusion would answer the
+      question in the wrong process's frame. Dropping is silent-proof rather than
+      silent because discarding an operator-configured grant without a word is
+      the fail-soft this module was written to end.
     """
     roots = [os.path.realpath(os.path.join(str(Path(cwd).resolve()), '.task'))]
-    roots += [
-        os.path.realpath(extra)
-        for extra in (writable_extras or [])
-        if os.path.isdir(extra)
-    ]
+    for extra in writable_extras or []:
+        if not os.path.isabs(extra):
+            logger.warning(
+                'sandbox_guard: dropping non-absolute writable extra %r — the '
+                'parent resolves it against ITS cwd (%s) while landlock-exec / '
+                'bwrap resolve the granted --writable token against the CHILD\'s '
+                '(%s), so counting it would certify a directory the child never '
+                'grants. Make the entry in '
+                'reconciliation.sandbox_recon_writable_extras an absolute path.',
+                extra, os.getcwd(), cwd,
+            )
+            continue
+        if os.path.isdir(extra):
+            roots.append(os.path.realpath(extra))
     return roots
 
 
