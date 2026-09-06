@@ -14,6 +14,56 @@ That is why a prompt-only rule is insufficient and this needs a code
 chokepoint: the LLM's awareness of the duplicates was not the binding
 constraint.
 
+## Dedupe identity: ONE open gate per subject (accepted constraint)
+
+The dedupe key is the SUBJECT ALONE — not ``(subject, kind of decision)``.
+An open gate about subject X therefore refuses every later gate about X,
+even one asking a genuinely different question: an open "task 5879 is
+stranded, rule on it" carrier refuses a later "5879's merge conflict needs
+a ruling" gate. The prescribed remedy — amend the existing carrier — then
+merges two unrelated human decisions into one carrier, the shape the
+consolidation-gate closure check elsewhere in the system tries to avoid.
+
+This is DELIBERATE, not an oversight. Widening the key to ``(subject,
+kind)`` would hand the filing agent a free-text discriminator, and the
+measured failure mode is precisely an agent that knew about its
+predecessors and filed anyway (5929 carried
+``prior_escalation_tasks=[5916, 5902]``) — a per-cycle reworded "kind"
+would reopen the exact hole this guard closes, while satisfying the
+widened key. Bounding the carrier population is the goal: one carrier
+naming two questions is strictly better for the human than three carriers
+naming one each. The escape hatch is stated in the rejection ``hint`` and
+needs no code change — close the existing carrier (``done``/``cancelled``)
+and the next filing goes straight through.
+
+## What this guard does NOT do (named residuals)
+
+1. RECURRENCE IS NOT RECORDED DETERMINISTICALLY. On rejection this logs a
+   WARNING and returns an error; refreshing the carrier's evidence and
+   bumping ``metadata.recurrence_count`` is left to the agent following the
+   ``hint`` — the same trust the "measured evidence" section above argues
+   is unwarranted. If the agent does not comply, the human sees a stale
+   carrier with no sign the condition recurred for N more cycles, whereas
+   pre-guard the N duplicate carriers at least made the recurrence visible.
+   So this bounds the carrier population but can reduce the signal reaching
+   the operator. No regression has been measured; it is a reasoned risk.
+   Stamping the carrier here would need a WRITE callable injected alongside
+   ``fetch_tasks`` plus a policy for a failed stamp on a rejection path
+   (this guard is fail-open everywhere else, so a failed stamp must not
+   become a raised ``submit_task``) — a second design, filed as an
+   agent-followup candidate rather than done inline. Until then the
+   greppable WARNING is the durable trace.
+
+2. TOCTOU / within-cycle double-submit. The check is read-then-write with
+   nothing enforcing subject uniqueness at persistence, so two CONCURRENT
+   recon submissions for the same subject can both pass this read and both
+   land. Distinct from — and not covered by — the ticket-path residual
+   recorded at the ``tools.py`` call site, though both bottom out in the
+   same place: this is a cross-cycle dedupe keyed on committed task rows,
+   and the measured failure mode is one carrier per CYCLE, hours to days
+   apart. Closing either window means reaching past a leaf guard into the
+   persistence path.
+
 ## Leaf contract
 
 This is a LEAF ``middleware`` module: it imports nothing from

@@ -8757,13 +8757,30 @@ def create_mcp_server(
         # carrier deliberately does NOT block: the condition genuinely
         # recurred after closure, and a fresh gate is the right outcome.
         #
+        # COST, MEASURED — this read is O(active corpus), NOT O(1). Even
+        # narrowed to ACTIVE it materialises the whole non-terminal corpus to
+        # answer one metadata-key lookup: 1,153 rows / 6,531,198 bytes of
+        # description+details+metadata on this repo's store (counted directly
+        # against .taskmaster/tasks/tasks.db on 2026-09-06), each row passed
+        # through _row_to_task's per-row JSON metadata parse plus a
+        # _fetch_dependencies query, and all of it discarded except the one
+        # match. That is ~1000x the information needed. It is bounded by the
+        # recon gate-FILING rate (not the submit_task rate — see WHY
+        # RECON-SCOPED above) and matches the _check_escalation_idempotency
+        # precedent, so it is not a regression; but a narrower backend read (a
+        # projection of id/status/title/metadata in the spirit of
+        # get_statuses_raw, or a metadata LIKE prefilter) is the right shape if
+        # this ever moves off the gate-filing path. Left as get_tasks here
+        # because every narrower option lives in backend/interceptor files
+        # outside task 3588's charter.
+        #
         # FAILS OPEN. A raising lookup logs a WARNING and lets the
         # submission through (see the guard's docstring): failing closed on a
         # transient blip would block every recon human gate including
         # genuinely novel ones, while failing open costs at most one
         # duplicate — the bounded cost this guard is reducing.
         #
-        # NAMED RESIDUAL. This is a CROSS-CYCLE dedupe keyed on committed
+        # NAMED RESIDUAL 1. This is a CROSS-CYCLE dedupe keyed on committed
         # task rows. In the non-planning_mode path submit_task returns only
         # {'ticket': ...} and the row does not exist until the curator
         # resolves it, so a second submission whose predecessor is still an
@@ -8771,6 +8788,21 @@ def create_mcp_server(
         # decision: the measured failure mode is one carrier per CYCLE
         # (5902 -> 5916 -> 5929 for subject 5879), hours-to-days apart, by
         # which time the predecessor is a committed row this guard sees.
+        #
+        # NAMED RESIDUAL 2 — RECURRENCE IS NOT RECORDED DETERMINISTICALLY.
+        # A rejection logs a WARNING and returns the error; refreshing the
+        # existing carrier's evidence and bumping metadata.recurrence_count is
+        # left to the agent following the error's `hint`. If it does not
+        # comply the human sees a stale carrier with no sign the condition
+        # recurred for N more cycles — pre-guard, the N duplicate carriers at
+        # least made the recurrence visible. So this bounds the carrier
+        # population but can reduce the signal reaching the operator. Stamping
+        # the carrier from here would need a write callable injected alongside
+        # fetch_tasks plus a failure policy on a rejection path; out of scope
+        # for 3588 and filed as an agent-followup candidate. See the guard's
+        # "What this guard does NOT do" docstring section, which also records
+        # the TOCTOU residual (two CONCURRENT submissions for one subject can
+        # both pass this read).
         _gate_err = await recurring_gate_guard_error(
             metadata,
             agent_id,
