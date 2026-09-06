@@ -302,6 +302,33 @@ _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
 #: rewriting the plan, never taking a ``description`` argument at all, so a
 #: signature-based check would have rejected it as an alternate despite it
 #: being a real one.
+#:
+#: That check is SOUNDNESS only — it cannot catch a writer left OUT of this
+#: mapping. COMPLETENESS is the converse check,
+#: ``TestRepairableFieldTable::test_no_plan_writing_tool_is_an_undeclared_alternate``:
+#: it sweeps every row here against a candidate set DERIVED from this module's
+#: own plan-mutating surface INTERSECTED WITH the tool surface
+#: ``create_server`` actually registers (``_plan_writing_tool_names()`` in the
+#: test file, not a hand-maintained list). The intersection is load-bearing:
+#: an INTERNAL helper may legitimately rewrite plan.json without being a
+#: probeable MCP tool — ``_read_plan_repaired`` does, on its read-repair
+#: write-back path — so "writes plan.json" alone was never sufficient to make
+#: something a sweep candidate, and adding such a helper does NOT drag it into
+#: the behavioural probe. A new plan-writing TOOL, by contrast, is swept
+#: automatically and that test fails until its impact on ``also_written_by``
+#: is audited. Hand-adding a name here is therefore never required to be
+#: *seen* by the sweep — only to make it pass once seen.
+#:
+#: "Automatically" holds for a tool that follows this module's own conventions
+#: — a module-level ``_<tool_name>`` impl that persists through a
+#: ``TaskArtifacts`` method — and BOTH conventions are themselves pinned, so
+#: a tool that follows neither still cannot pass unnoticed: it fails the
+#: non-vacuity floor in
+#: ``TestRepairableFieldTable::test_the_derived_candidate_set_cannot_silently_collapse``,
+#: which requires every registered non-``report_*`` tool to be a sweep
+#: candidate and does not care HOW a tool writes. The outcome is loud in
+#: every case; only the remedy differs (audit the row, or teach the
+#: derivation about the new shape).
 _DESCRIPTION_ALSO: tuple[str, ...] = ('replace_plan_step', 'mark_step_committed')
 _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 
