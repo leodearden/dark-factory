@@ -289,7 +289,7 @@ def _json_type_name(value: Any) -> str | None:
     return None
 
 
-def _quoted_markup_params(recovered: Mapping[str, str]) -> list[str]:
+def _quoted_markup_params(recovered: Mapping[str, str]) -> tuple[str, ...]:
     """The recovered names whose value STILL trips :func:`detect`, sorted.
 
     WHY THIS EXISTS, not just what it does. A faithful REPORT of a markup leak
@@ -339,9 +339,19 @@ def _quoted_markup_params(recovered: Mapping[str, str]) -> list[str]:
     shipped EMPTY for its entire measured population while every test passed.
 
     The unrepairable path has no recovery to inspect at all, so it publishes
-    the EMPTY list without calling this function — present-and-empty for the
+    the EMPTY census without calling this function — present-and-empty for the
     same reason ``misclose`` is present-and-null there: a consumer must never
     have to tell "none quoted" apart from "that emitter forgot the key".
+
+    RETURNS A TUPLE, and every publication site materializes its own ``list``
+    from it. One census is taken and threaded to three payloads — the fact
+    handed to an arbitrary injected sink, the reject payload, and the forward
+    meta returned to the caller — so a single shared ``list`` would let a sink
+    that retains its record, or a caller that mutates the meta it was handed,
+    alter another boundary's view of the same census. Immutable in transit is
+    the same hygiene ``unrecovered_params`` already gets (threaded as a tuple,
+    copied with ``list()`` where it is published) and that ``recovered_params``
+    gets by building a fresh ``sorted()`` at each of its own three sites.
 
     Related, and deliberately NOT reopened here: this module passes no
     ``schema_params`` at its :func:`detect_for` call site, leaving a cross-field
@@ -350,11 +360,11 @@ def _quoted_markup_params(recovered: Mapping[str, str]) -> list[str]:
     (``TestSelfNameCloserIsSeenAtTheBoundary``); task 4502 ruled it an explicit
     non-goal rather than re-litigating a landed decision.
     """
-    return sorted(
+    return tuple(sorted(
         name
         for name, value in recovered.items()
         if isinstance(value, str) and detect(value) is not None
-    )
+    ))
 
 
 def _coerce_recovered(
@@ -1012,7 +1022,7 @@ class MarkupGuardMiddleware(Middleware):
                 # No recovery exists at all, so nothing of the caller's text was
                 # inspected: present-and-empty, the same convention ``misclose``
                 # is present-and-null on this path for.
-                quoting=[],
+                quoting=(),
             )
             storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity, subject)
             await self._refuse_unrepairable(
@@ -1035,12 +1045,25 @@ class MarkupGuardMiddleware(Middleware):
         # every test in the suite stayed green.
         #
         # DO NOT "TIDY" THIS LINE DOWNWARD past the ``_coerce_recovered`` call.
-        # Doing so re-introduces that defect silently, with nothing failing:
-        # the unit pins that would catch it must drive a NON-string declared
-        # type, and the corpus replay's synthetic tools declare every parameter
-        # ``str | None``. The real-server pin is
-        # ``escalation/tests/test_markup_middleware_registration.py``'s
-        # ``TestTheQuotedMarkupCensusAgainstTheREALSchema``.
+        # The ordering IS pinned, at BOTH levels, and each fails loudly —
+        # measured by moving this line below the coercion:
+        #
+        #  * unit: ``shared/tests/test_mcp_markup_middleware.py``'s
+        #    ``TestQuotedMarkupIsSurfacedForANonStringParameter``, five
+        #    failures. It is the one class there that drives a NON-string
+        #    declared type, through the ``escalate_info_typed`` toy whose
+        #    ``evidence`` is ``list[dict[str, Any]] | None``. Every OTHER
+        #    quoting recovery asserted in that file is ``str``-typed, where
+        #    the pre- and post-coercion views are the same object and this
+        #    ordering is invisible; the corpus replay cannot help either,
+        #    since its synthetic tools declare every parameter ``str | None``.
+        #
+        #  * real server: ``escalation/tests/test_markup_middleware_registration.py``'s
+        #    ``TestTheQuotedMarkupCensusAgainstTheREALSchema``.
+        #
+        # BOTH, not either. The toy's signature is a hand-kept COPY of the
+        # real one, so the unit class goes on passing if the real declared
+        # type drifts away from it; the real-server class is what fails then.
         #
         # Taken ONCE and threaded to all three publication sites rather than
         # recomputed at each — same INV-5 reason the coercion has one
@@ -1187,7 +1210,7 @@ class MarkupGuardMiddleware(Middleware):
         outcome: str,
         misclose: str | None,
         recovered: Any,
-        quoting: list[str],
+        quoting: tuple[str, ...],
     ) -> None:
         """Emit one ``markup_detected`` (INV-2), and never change an outcome.
 
@@ -1241,7 +1264,10 @@ class MarkupGuardMiddleware(Middleware):
             # absorbing parameter. Not necessarily a subset of
             # ``recovered_params``: on the FORWARD_REPAIR path an untypable name
             # is dropped from the delivered map while its text still quoted.
-            'quoted_markup_params': quoting,
+            # A FRESH list, as at each of the three publication sites: this
+            # record goes to an arbitrary injected sink that may retain or
+            # mutate it, and the same census is published twice more.
+            'quoted_markup_params': list(quoting),
             'agent_id': agent_id,
             'project': project,
         }
@@ -1624,7 +1650,9 @@ class MarkupGuardMiddleware(Middleware):
             })
         return residue_id
 
-    def _reject(self, name, arguments, param, fix, storm, quoting) -> NoReturn:
+    def _reject(
+        self, name, arguments, param, fix, storm, quoting: tuple[str, ...]
+    ) -> NoReturn:
         """Write nothing; bounce the caller with the repaired argument map.
 
         RAISES rather than short-circuiting with a middleware-authored
@@ -1672,7 +1700,7 @@ class MarkupGuardMiddleware(Middleware):
             # resubmission, and a recovered value that quotes a literal makes
             # that retry bounce again — naming it is what turns an infinite
             # mechanical retry into an adjudicable report (task 4502).
-            'quoted_markup_params': quoting,
+            'quoted_markup_params': list(quoting),
             'repaired_call': repaired_call,
             'hint': _REJECT_HINT,
         }, storm)))
@@ -1680,7 +1708,7 @@ class MarkupGuardMiddleware(Middleware):
     async def _forward(
         self, context, call_next, arguments, param, fix, storm,
         *, unrecovered: tuple[str, ...] = (), residue_id: str | None = None,
-        quoting: list[str],
+        quoting: tuple[str, ...],
     ):
         """Repair in place, let the call through, and say so.
 
@@ -1732,7 +1760,9 @@ class MarkupGuardMiddleware(Middleware):
             # below: this one answers "did anything I was handed still carry a
             # literal", and an absent key would read as "no" while actually
             # meaning "this emitter is older than task 4502".
-            'quoted_markup_params': quoting,
+            # ``list(...)`` for the same reason ``unrecovered_params`` below
+            # is copied: this dict is handed back to the caller.
+            'quoted_markup_params': list(quoting),
             'hint': _FORWARD_HINT,
         }, storm)
         # Omitted when empty, the same convention `storm` follows: a key that is

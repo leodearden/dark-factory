@@ -258,7 +258,7 @@ class TestLiveEscalateInfoLandsRepaired:
 class TestTheQuotedMarkupCensusAgainstTheREALSchema:
     """Task **4502**: ``quoted_markup_params`` for a REAL declared type.
 
-    THE ONE HOME FOR THIS PIN. The census exists for the leak REPORT — a
+    THE PIN AGAINST THE REAL SCHEMA. The census exists for the leak REPORT — a
     faithful account of a markup leak necessarily quotes the pattern that
     tripped, so a recovered value legitimately carries a literal and the
     guard publishes which parameters those are. On this server the parameter
@@ -266,11 +266,21 @@ class TestTheQuotedMarkupCensusAgainstTheREALSchema:
     ``list[dict[str, Any]] | None`` (``escalation/src/escalation/server.py``,
     ``escalate_info``), which pydantic emits as ``anyOf: [array, null]``.
 
-    That declared type is precisely why the pin cannot live anywhere else:
+    That declared type is why this class is not redundant with the unit suite —
+    though it is NOT, as this docstring once claimed, the only home for the pin:
 
-    * every unit-level pin in ``shared/tests/test_mcp_markup_middleware.py``
-      whose recovered value quotes is ``str``-typed, where the middleware's
-      pre- and post-coercion views of the recovered map are the same object;
+    * ``shared/tests/test_mcp_markup_middleware.py``'s
+      ``TestQuotedMarkupIsSurfacedForANonStringParameter`` reaches the decode
+      branch too (task **4502**), driving the ``escalate_info_typed`` toy whose
+      ``evidence`` carries this same signature. Measured: moving the middleware's
+      census below its coercion fails five tests there. But that toy is a COPY
+      of the real signature named above, kept in step BY HAND — so it is this
+      class, not that one, that fails if the real server's declared type ever
+      drifts away from the copy;
+
+    * every OTHER unit-level pin in that file whose recovered value quotes is
+      ``str``-typed, where the middleware's pre- and post-coercion views of the
+      recovered map are the same object;
 
     * the corpus replay in ``shared/tests/test_mcp_markup_middleware_corpus.py``
       declares EVERY parameter of its synthetic tools ``str | None`` (stated in
@@ -278,10 +288,10 @@ class TestTheQuotedMarkupCensusAgainstTheREALSchema:
       ``_coerce_recovered``'s decode branch either.
 
     So a census that read the DELIVERED map — where ``evidence`` is a decoded
-    ``list`` rather than text — would satisfy every one of those tests and
-    still report ``[]`` here, for the sole measured population the carve-out
-    was written about. Only a run against the real server's real schema
-    distinguishes the two.
+    ``list`` rather than text — would satisfy every pin in the last two bullets
+    and still report ``[]`` here, for the sole measured population the carve-out
+    was written about. Only a run against the real server's real schema keeps
+    that answer honest once the copy and the original can diverge.
 
     Both halves are asserted together on purpose: the census must be right
     WHILE the declared-type delivery stays right. A guard that simply stopped

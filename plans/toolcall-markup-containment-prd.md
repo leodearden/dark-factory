@@ -641,8 +641,16 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > passed throughout. **A schema-directed mechanism needs at least one pin driven
 > through a REAL declared type**, and the real-server replay is where it belongs —
 > here, `escalation/tests/test_markup_middleware_registration.py`'s
-> `TestTheQuotedMarkupCensusAgainstTheREALSchema`. The FINDING 2 ruling above is
-> unchanged.
+> `TestTheQuotedMarkupCensusAgainstTheREALSchema`. That pin ended up at BOTH
+> levels rather than only there, and saying so is the accurate version of this
+> paragraph: `shared/tests/test_mcp_markup_middleware.py`'s
+> `TestQuotedMarkupIsSurfacedForANonStringParameter` drives the same shape through
+> the `escalate_info_typed` toy, which carries that declared type verbatim —
+> measured, moving the census below the coercion fails five tests there. The
+> real-server class stays load-bearing for a different reason than "nowhere else
+> can host it": the toy is a hand-kept **copy**, so the real-server class is the
+> one that fails when the original drifts away from the copy. The FINDING 2 ruling
+> above is unchanged.
 *Evidence:* each corpus record carries its **expected outcome** (`repaired` with the expected recovered-parameter names, or `unrepairable`), committed alongside the specimens; replay asserts the repairer matches every committed expectation, that replay is byte-identical across two runs, and that D5 holds for every repaired case (`clean_value` is a prefix of the input; every recovered value is a verbatim substring).
 *G6 note — deliberately not a bare threshold.* The reference implementation scores **308 repaired / 26 unrepairable (92.2%)**, and that is the basis for expecting a high rate; but the signal is agreement-with-committed-expectations, not a literal count. A correct implementation that repairs *more* of the 26 ambiguous cases must update the expectation file in the same commit — which is a reviewable improvement, not a RED test. Pinning the literal 308 would make a better repairer look like a regression.
 
