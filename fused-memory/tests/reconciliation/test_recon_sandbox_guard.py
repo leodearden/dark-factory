@@ -615,3 +615,97 @@ class TestConfigDirContainment:
             )
         finally:
             shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.mark.skipif(not _SANDBOX_GUARD_AVAILABLE, reason='sandbox_guard not yet implemented')
+class TestRelativePathContainment:
+    """Containment is undecidable for a RELATIVE path — refuse it (task 4592).
+
+    Every ``os.path.realpath`` in this module runs in the PARENT's cwd, but the
+    two things the verdict is about are resolved in the CHILD's:
+    ``shared/src/shared/cli_invoke.py::invoke_claude_agent`` writes
+    ``env['CLAUDE_CONFIG_DIR'] = str(config_dir)`` and ``_run_subprocess`` spawns
+    the wrapped argv with ``cwd=str(cwd)`` — which
+    ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::run_stage_via_cli``
+    sets to ``config.explore_codebase_root``. The ``--writable <path>`` grant
+    tokens inside that argv are likewise consumed by ``landlock-exec`` / ``bwrap``
+    in the child.
+
+    So a relative string names one directory to the verifier here and a different
+    one to the grantor there. The check would report PASS while the kernel denies
+    every session-JSONL write — ``count_transcript_turns`` None forever, the
+    liveness watchdog inert, every cap-retry force-freshing instead of resuming.
+    That is precisely the 2026-07-18 -> 2026-08-11 silent-transcript-loss defect
+    this module's fail-closed check (task 4003) exists to make impossible,
+    re-entering through the relative-path door.
+
+    The two cwds agree in production today only because the installed unit sets
+    ``WorkingDirectory`` == ``PROJECT_ROOT``
+    (``scripts/fused-memory.service.template``); nothing enforced that.
+    """
+
+    def test_relative_config_dir_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A relative config_dir raises instead of resolving against the parent's cwd.
+
+        Constructs the exact FALSE PASS: ``_writable_roots`` realpaths ``'relcfg'``
+        to ``<parent_cwd>/relcfg`` and ``_assert_config_dir_writable`` realpaths the
+        config dir to the same string, so containment passes — while the child,
+        spawned with ``cwd=child_root``, would resolve ``CLAUDE_CONFIG_DIR='relcfg'``
+        to ``<child_root>/relcfg``, a directory nothing ever granted.
+        """
+        parent_cwd = tmp_path / 'parent'
+        child_root = tmp_path / 'child'
+        parent_cwd.mkdir()
+        child_root.mkdir()
+        (parent_cwd / 'relcfg').mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ), pytest.raises(RemediationSandboxUnavailable) as excinfo:  # type: ignore[possibly-unbound]
+            resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                child_root, ['relcfg'], config_dir=Path('relcfg'),
+            )
+
+        msg = str(excinfo.value)
+        # The operator's only signal — a raise here halts every recon stage, so
+        # the message must be actionable, not a bare refusal.
+        assert 'relcfg' in msg, (
+            f'Error must name the offending config dir; got {msg!r}'
+        )
+        assert 'absolute' in msg.lower(), (
+            f'Error must say the path has to be absolute — that is the remedy; '
+            f'got {msg!r}'
+        )
+
+    def test_absolute_config_dir_verdict_is_cwd_independent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The positive half: an absolute verdict does not depend on where the parent stands.
+
+        Must stay green for the whole task — the refusal above is scoped to
+        RELATIVITY, not a blanket narrowing of what counts as contained.
+        """
+        parent_cwd = tmp_path / 'parent'
+        child_root = tmp_path / 'child'
+        parent_cwd.mkdir()
+        child_root.mkdir()
+        cfg = parent_cwd / 'relcfg'
+        cfg.mkdir()
+
+        for standing_in in (parent_cwd, child_root):
+            monkeypatch.chdir(standing_in)
+            with patch(
+                'orchestrator.agents.landlock.is_landlock_available',
+                return_value=True,
+            ):
+                wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                    child_root, [str(cfg)], config_dir=cfg,
+                )
+            assert callable(wrap), (
+                f'An absolute config dir must be accepted from any parent cwd; '
+                f'refused while standing in {standing_in}'
+            )
