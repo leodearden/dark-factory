@@ -1360,6 +1360,15 @@ def test_gate_still_names_fix_for_plain_directive_drift(tmp_path: pathlib.Path):
 
     The unit is drop-in free on purpose: this is the arm's OTHER input, and
     --fix genuinely is the remedy for it.
+
+    What the pin does NOT say: that `DRIFT detected` must be the arm's whole
+    headline. It is now a disjunction — "DRIFT detected or unverifiable state"
+    — because the same arm also fires for a drop-in override, where nothing
+    drifted and --fix cannot help; the two remedies are named UNDER their own
+    conditions on the lines below it. The assertions here are TOKEN presence,
+    which is the part that must survive any such rewording: an operator whose
+    unit is genuinely missing a directive must still be told the word for what
+    happened and the command that repairs it.
     """
     repo = _gate_repo(tmp_path)
     unit_dir = _gate_unit_dir(tmp_path, content=_MISSING_MEM0_UNIT)

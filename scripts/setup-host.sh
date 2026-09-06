@@ -1298,11 +1298,29 @@ else
     # only --fix here would collapse that distinction back and point at a
     # command that CANNOT help — --fix appends to the unit FILE and can
     # neither synthesize nor resolve an override living in a different one.
-    # Same wording the dashboard and orchestrator gates already carry.
-    warn "Fused-memory unit: DRIFT detected — run: python3 $_fm_parity_script --fix"
-    warn "  This verdict also covers a drop-in override, which --fix cannot"
-    warn "  resolve and which needs manual removal — see the"
+    #
+    # The HEADLINE therefore has to be true for BOTH inputs, which is why the
+    # dashboard and orchestrator gates lead with "drift or unverifiable state"
+    # rather than with drift alone. This one follows them: leading with "DRIFT
+    # detected — run --fix" and only then conceding it might be an override
+    # states something false in the override case (every required directive
+    # matched; nothing drifted) and points first at the command that cannot
+    # help. A follow-up line cannot retract a headline the operator has
+    # already acted on. The remedies are each named UNDER their own condition
+    # instead.
+    #
+    # "DRIFT" stays capitalised where the siblings lowercase it: it is the
+    # checker's own report vocabulary, and two tests in
+    # tests/scripts/test_check_fused_memory_unit_parity.py pin the literal
+    # token (::test_gate_reports_drift_when_a_required_directive_is_missing
+    # and ::test_gate_still_names_fix_for_plain_directive_drift, whose
+    # docstring states the pin is a CONSTRAINT on exactly this rewording).
+    warn "Fused-memory unit: DRIFT detected or unverifiable state — see the"
     warn "  [fused_memory_unit_parity] report above for which it was."
+    warn "  Missing directives: run python3 $_fm_parity_script --fix."
+    warn "  A drop-in override: --fix CANNOT resolve it — it appends to the"
+    warn "  unit FILE and the override lives in a different one, so it needs"
+    warn "  manual removal (or move the setting into the committed template)."
     ;;
   esac
 fi
