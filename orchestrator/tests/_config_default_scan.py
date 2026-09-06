@@ -102,8 +102,13 @@ def _attr_chain(node: ast.AST) -> tuple[str, str] | None:
     return node.id, '.'.join(reversed(parts))
 
 
-def _is_bare_config_call(node: ast.AST) -> bool:
-    """True for exactly ``OrchestratorConfig()`` — no args, no keywords."""
+def _is_bare_config_call(node: ast.AST | None) -> bool:
+    """True for exactly ``OrchestratorConfig()`` — no args, no keywords.
+
+    Accepts ``None`` so callers can pass an ``ast.AnnAssign.value`` directly: a
+    value-less annotation (``config: OrchestratorConfig``) binds nothing, and
+    is therefore not a bare construction.
+    """
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)

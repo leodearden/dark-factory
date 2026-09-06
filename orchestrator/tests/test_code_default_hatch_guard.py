@@ -415,8 +415,11 @@ class TestHatchIsNotAutouse:
 
     def test_fixture_marker_is_not_autouse(self):
         conftest = sys.modules['conftest']
-        assert Path(conftest.__file__).parent == Path(__file__).parent, (
-            f'resolved the wrong conftest: {conftest.__file__}'
+        conftest_file = conftest.__file__
+        assert conftest_file is not None and (
+            Path(conftest_file).parent == Path(__file__).parent
+        ), (
+            f'resolved the wrong conftest: {conftest_file}'
         )
         marker = conftest.code_default_config._fixture_function_marker
         assert marker.autouse is False, (
