@@ -912,47 +912,22 @@ class TestSkipUnlessCheckout:
         assert reason == reify_checkout.reify_skip_reason(
             _REIFY_GUARD_RELPATH, None, named_by_env=False
         ), 'the discovery-miss wording must come from the shared builder, not a local string'
+        assert reason == reify_checkout.checkout_skip_reason(
+            'reify', None, marker=_REIFY_GUARD_RELPATH
+        ), (
+            'and it must route through `checkout_skip_reason`, so BOTH arms of '
+            'one skip decision keep a single home'
+        )
 
     def test_set_but_absent_root_skips_naming_the_path(self, tmp_path):
         """A REIFY_ROOT-shaped path that is not on disk must be NAMED in the
         skip reason, so an operator's typo is self-evident in `pytest -rs`
         output instead of silently falling back to discovery.
-        """
-        missing = tmp_path / 'no-such-reify-checkout'
 
-        with pytest.raises(pytest.skip.Exception) as excinfo:
-            _skip_unless_checkout('reify', missing)
-
-        reason = str(excinfo.value)
-        assert str(missing) in reason, (
-            f'the skip reason must name the bad path so a REIFY_ROOT typo is '
-            f'self-evident: {reason!r}'
-        )
-
-    def test_present_directory_is_returned_unchanged(self, tmp_path):
-        """A real directory must be RETURNED, not skipped.
-
-        Otherwise the helper could skip everything vacuously and the sweeps
-        it guards would never run against a real checkout.
-        """
-        assert _skip_unless_checkout('reify', tmp_path) == tmp_path
-
-    def test_set_but_absent_wording_comes_from_the_shared_builder(self, tmp_path):
-        """The set-but-absent arm must be the SHARED builder's output.
-
-        Checked the two ways this file's `test_module_constants_track_the_resolver`
-        documents: the INDEPENDENT invariant first (the reason names the bad
-        path), then the recomputed-call equality.
-
-        Green either side of step-6 by construction — the local f-string it
-        replaces spells exactly what `checkout_skip_reason` returns — and that
-        is the point rather than a gap: a coincidental match is indistinguishable
-        from delegation from the outside, which is how the two hand-rolled
-        copies (here and in fused-memory/tests/test_lock_charter_guard.py) stayed
-        identical for as long as they did.  What this case adds is that the two
-        cannot drift apart afterwards.  `test_skip_unless_checkout_delegates_to_
-        the_shared_builder` below is the genuinely-RED companion that pins the
-        call actually happening.
+        Same two-way shape as the case above, and as
+        `test_module_constants_track_the_resolver` documents: the INDEPENDENT
+        invariant first (the reason names the bad path), then the
+        recomputed-call equality against the shared builder.
         """
         missing = tmp_path / 'no-such-reify-checkout'
 
@@ -971,24 +946,13 @@ class TestSkipUnlessCheckout:
             'a local f-string'
         )
 
-    def test_none_arm_wording_comes_from_the_shared_builder(self):
-        """The discovery-miss arm must route through the SAME shared builder.
+    def test_present_directory_is_returned_unchanged(self, tmp_path):
+        """A real directory must be RETURNED, not skipped.
 
-        The existing `test_discovery_miss_skips_with_the_shared_wording` above
-        pins the wording against `reify_skip_reason`; this pins it against
-        `checkout_skip_reason`, so both arms of one skip decision keep a single
-        home.  Green either side of step-6 for the same reason as the case
-        above — `checkout_skip_reason` delegates its None arm to
-        `reify_skip_reason`, so the two spellings agree by construction.
+        Otherwise the helper could skip everything vacuously and the sweeps
+        it guards would never run against a real checkout.
         """
-        with pytest.raises(pytest.skip.Exception) as excinfo:
-            _skip_unless_checkout('reify', None)
-
-        reason = str(excinfo.value)
-        assert isinstance(reason, str) and reason
-        assert reason == reify_checkout.checkout_skip_reason(
-            'reify', None, marker=_REIFY_GUARD_RELPATH
-        )
+        assert _skip_unless_checkout('reify', tmp_path) == tmp_path
 
     def test_skip_unless_checkout_delegates_to_the_shared_builder(
         self, tmp_path, monkeypatch
@@ -997,9 +961,11 @@ class TestSkipUnlessCheckout:
 
         The genuinely-RED pin for this helper, in the shape
         `TestReifyCheckoutAdapter::test_resolver_delegates_to_the_shared_single_source`
-        established: the two recomputed-equality cases above cannot tell
-        delegation from a hand-rolled string that happens to agree, so they stay
-        green whether or not the call is made.  This one cannot: it patches the
+        established: the recomputed-equality assertions in the two cases above
+        cannot tell delegation from a hand-rolled string that happens to agree,
+        so they stay green whether or not the call is made — which is why they
+        ride along with those cases' independent invariants rather than
+        standing as cases of their own.  This one CAN tell: it patches the
         shared builder to answer for a root that is a perfectly good directory,
         which a local implementation would ADMIT.
 
