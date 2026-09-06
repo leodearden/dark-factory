@@ -3548,7 +3548,39 @@ class ReconciliationHarness:
                 await self._flush_cycle_summaries(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
-                await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                # Shielded against a second cancellation arriving mid-write;
+                # the write keeps running to completion in its own Task.
+                # asyncio.shield only protects work once its coroutine exists
+                # as its own Task — on the already-being-cancelled path this
+                # whole finally exists to serve, an unshielded await here
+                # would re-raise the very CancelledError the backstop arms
+                # above just survived, discarding the stage_reports copy
+                # (including the markers _flush_cycle_summaries just
+                # stamped) before it ever reaches the DB (task 4431).
+                # Materialized explicitly (rather than handed to
+                # asyncio.shield as a bare coroutine) so a done-callback can
+                # log a failure that survives a second cancellation instead
+                # of vanishing silently (task 4431).
+                stage_reports_write = asyncio.ensure_future(
+                    self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                )
+                stage_reports_write.add_done_callback(
+                    lambda t: self._log_stage_reports_write_failure(run_id, t)
+                )
+                await asyncio.shield(stage_reports_write)
+                # Known residual (task 4431): asyncio.shield protects the
+                # WRITE, not this awaiting frame — a second cancellation
+                # still raises CancelledError HERE, so the gc_run_config_dir
+                # block below remains unreachable on that path, exactly as
+                # before this fix (not a regression). A try/finally around
+                # this await (finally: run the gc block) would make it
+                # reachable WITHOUT swallowing the CancelledError —
+                # gc_run_config_dir is synchronous filesystem work with no
+                # awaits, so it cannot itself be re-interrupted. Left
+                # unaddressed here by scope, not necessity: this task's
+                # remit is the shield alone (design decision 3), so the
+                # reachability fix is deferred to a follow-up task rather
+                # than folded in here.
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
                 # exit path (success/failure) EXCEPT an interrupted (resumable) run —
                 # its transcript must survive on disk for the startup --resume pass.
@@ -3820,6 +3852,31 @@ class ReconciliationHarness:
             run, run_id, project_id, anchor,
         )
 
+    def _log_stage_reports_write_failure(
+        self, run_id: str, task: asyncio.Task,
+    ) -> None:
+        """Done-callback for the ``update_run_stage_reports`` write once
+        ``asyncio.shield`` has detached it into its own Task, in
+        :meth:`run_full_cycle`'s and :meth:`_run_remediation_pass`'s
+        ``finally`` blocks (task 4431). Once detached, a second
+        cancellation leaves nothing else awaiting that Task again.
+        ``asyncio.shield`` itself retrieves the inner Task's exception once
+        it is done (to suppress the generic "exception was never
+        retrieved" GC warning) but discards it without logging anything —
+        so today a real exception raised inside this write (e.g. a DB
+        error, not a cancellation) leaves no trace at all. Calling
+        ``task.exception()`` here first gives it a normal, structured log
+        line instead.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                'update_run_stage_reports failed for run %s (second-'
+                'cancellation write path): %r', run_id, exc,
+            )
+
     async def _ensure_stage1_cycle_summary(
         self,
         run: ReconciliationRun,
@@ -3919,7 +3976,10 @@ class ReconciliationHarness:
         whatever exception is already propagating and skip that persistence
         call, so the body swallows ``BaseException`` and each write itself
         runs under ``asyncio.shield`` to survive a second cancellation
-        arriving mid-write.
+        arriving mid-write. ``update_run_stage_reports`` itself is now also
+        shielded (task 4431), so the persisted copy this guarantee protects
+        actually reaches the DB instead of being discarded by a second
+        cancellation landing at that next, previously-unshielded await.
         """
         s1_key = StageId.memory_consolidator.value
         s1_report = run.stage_reports.get(s1_key)
@@ -3969,7 +4029,8 @@ class ReconciliationHarness:
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
             # narrow, bounded best-effort upsert, and letting any of those
             # interrupt the finally risks skipping the update_run_stage_reports
-            # call that follows (see docstring).
+            # call that follows — itself now shielded against a second
+            # cancellation too (task 4431; see docstring).
             logger.warning(
                 'reconciliation.stage1_cycle_summary_backstop_failed',
                 exc_info=True,
@@ -4098,7 +4159,10 @@ class ReconciliationHarness:
         exception is already propagating and skip that persistence call, so
         the body swallows ``BaseException`` and each write itself runs under
         ``asyncio.shield`` to survive a second cancellation arriving
-        mid-write.
+        mid-write. ``update_run_stage_reports`` itself is now also shielded
+        (task 4431), so the persisted copy this guarantee protects actually
+        reaches the DB instead of being discarded by a second cancellation
+        landing at that next, previously-unshielded await.
         """
         s2_key = StageId.task_knowledge_sync.value
         s2_report = run.stage_reports.get(s2_key)
@@ -4157,7 +4221,8 @@ class ReconciliationHarness:
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
             # narrow, bounded best-effort upsert, and letting any of those
             # interrupt the finally risks skipping the update_run_stage_reports
-            # call that follows (see docstring).
+            # call that follows — itself now shielded against a second
+            # cancellation too (task 4431; see docstring).
             logger.warning(
                 'reconciliation.stage2_cycle_summary_backstop_failed',
                 exc_info=True,
@@ -5461,11 +5526,38 @@ class ReconciliationHarness:
             # by explicit design, so a lost row here is a genuine gap. Anchored
             # at run.started_at (this driver has no separate cycle_start_time
             # local), and placed strictly before update_run_stage_reports so the
-            # persisted copy captures whatever markers either arm stamped.
+            # persisted copy captures whatever markers either arm stamped —
+            # and that call is itself shielded against a second cancellation
+            # arriving mid-write, the identical mirror-site fix applied to
+            # run_full_cycle's finally: asyncio.shield only protects work
+            # once its coroutine exists as its own Task, so this driver needs
+            # the same guard for the same reason (task 4431).
             await self._flush_cycle_summaries(
                 run, run_id, project_id, current_stage_name, run.started_at,
             )
-            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            # Materialized explicitly (rather than handed to asyncio.shield
+            # as a bare coroutine) so a done-callback can log a failure that
+            # survives a second cancellation instead of vanishing silently
+            # (task 4431).
+            stage_reports_write = asyncio.ensure_future(
+                self.journal.update_run_stage_reports(run_id, run.stage_reports)
+            )
+            stage_reports_write.add_done_callback(
+                lambda t: self._log_stage_reports_write_failure(run_id, t)
+            )
+            await asyncio.shield(stage_reports_write)
+            # Known residual (task 4431): asyncio.shield protects the WRITE,
+            # not this awaiting frame — a second cancellation still raises
+            # CancelledError HERE, so the gc_run_config_dir block below
+            # remains unreachable on that path, exactly as before this fix
+            # (not a regression). A try/finally around this await (finally:
+            # run the gc block) would make it reachable WITHOUT swallowing
+            # the CancelledError — gc_run_config_dir is synchronous
+            # filesystem work with no awaits, so it cannot itself be
+            # re-interrupted. Left unaddressed here by scope, not necessity:
+            # this task's remit is the shield alone (design decision 3), so
+            # the reachability fix is deferred to a follow-up task rather
+            # than folded in here.
             # Task 2744: GC this remediation run's per-run recon CLI config dir on
             # every exit path. Defensive — never mask the run's terminal outcome.
             try:
