@@ -481,13 +481,16 @@ def test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry():
 #
 # `ok` mirrors fused_memory.middleware.task_interceptor.
 # interceptor_write_succeeded (fused-memory/src/fused_memory/middleware/
-# task_interceptor.py:5829-5868) — see classify_reply's own docstring
-# (scripts/repair_wiped_metadata_files.py) for why this is a transcribed
-# mirror, not an import, and for the full rule. The canonical predicate's own
-# contract is independently pinned at fused-memory/tests/test_task_interceptor.py:
-# 10863+ ("task-1184: interceptor_write_succeeded helper contract") —
-# auditing one copy for drift means reading both, since neither can change
-# silently without its OWN table going red.
+# task_interceptor.py:5829-5868) — but NOT by transcribing it. As of task 4608
+# classify_reply DELEGATES the whole `ok` decision to
+# scripts/migrate_metadata_modules_to_files.py::write_failure_reason and only
+# wraps the returned `str | None` in a ReplyVerdict; see classify_reply's own
+# docstring for why delegation runs in that direction. The canonical predicate
+# both descend from is still not importable from a scripts/ runtime context,
+# and its own contract is independently pinned at
+# fused-memory/tests/test_task_interceptor.py:10863+ ("task-1184:
+# interceptor_write_succeeded helper contract") — auditing for drift means
+# reading it too, since it can change without this table going red.
 #
 # `answered` is the second axis `interceptor_write_succeeded` has no need of:
 # whether the server explained ITSELF (an explicit error/success:False
@@ -500,12 +503,26 @@ def test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry():
 
 def test_classify_reply_truth_table():
     """One table, both axes, so `ok` and `answered` are read off one place."""
+    from migrate_metadata_modules_to_files import (
+        MCP_IS_ERROR_KEY,
+        RAW_REPLY_KEY,
+    )
+
     # Not a dict at all -> unanswered, non-empty detail naming what arrived.
     for reply in (None, "ok", []):
         verdict = classify_reply(reply)
         assert verdict.ok is False, reply
         assert verdict.answered is False, reply
         assert verdict.detail, reply
+
+    # The detail for a non-dict names the type and carries the VALUE UNQUOTED
+    # for a str. That wording was CHOSEN, not overlooked: delegating the
+    # not-a-dict branch routes through migrate's `_clip`, which returns a `str`
+    # as-is and only `repr`s non-strings, where the deleted transcription
+    # applied `repr` unconditionally ("... str: 'boom'"). Nothing parses this
+    # detail, and unquoted reads better for an operator staring at a
+    # stringified error page. Pinned so the next reader sees it was decided.
+    assert classify_reply("boom").detail == "server reply was not a dict: str: boom"
 
     # Empty dict -> unanswered, non-empty detail naming the emptiness: `{}`
     # carries no positive write signal and must not be read as success.
@@ -554,6 +571,80 @@ def test_classify_reply_truth_table():
         assert verdict.ok is True, reply
         assert verdict.answered is True, reply
         assert verdict.detail is None, reply
+
+    # THE TWO TRANSPORT-STAMPED SHAPES, closed by task 4608's delegation. Both
+    # are NON-EMPTY dicts with no `error` and no `success` key, so the deleted
+    # transcription fell straight through to its ok branch and reported each as
+    # a REPAIR THAT NEVER HAPPENED — in a script that writes live task
+    # metadata. `answered is False` because a transport stamp is not the server
+    # explaining ITSELF: `_raw` is by construction a reply this script could not
+    # read as structured JSON, and `_mcp_is_error` is the ENVELOPE's flag rather
+    # than the tool body's verdict. The keys are IMPORTED, never re-spelled as
+    # `'_raw'` / `'_mcp_is_error'` literals — a transcribed literal would keep
+    # passing if migrate renamed a key, reintroducing at the test layer the very
+    # drift class this task removes from the source.
+    for reply in (
+        {RAW_REPLY_KEY: "Error calling tool update_task: boom"},
+        {MCP_IS_ERROR_KEY: True, "id": "9"},
+    ):
+        verdict = classify_reply(reply)
+        assert verdict.ok is False, reply
+        assert verdict.answered is False, reply
+        assert verdict.detail, reply
+
+
+def test_classify_reply_delegates_to_the_migrations_predicate_rather_than_restating_it(
+    monkeypatch,
+):
+    """THE STRUCTURAL GUARD: one implementation, not two that currently agree.
+
+    The truth table above pins WHAT classify_reply decides; a faithful
+    re-transcription of write_failure_reason's cascade would satisfy every row
+    of it. That is exactly the state task 4608 removed and exactly the state it
+    must stay out of: the copy drifted once already, missing both transport
+    checks for the whole life of task 4528's fix.
+
+    So this pins WHERE the decision is made, by substitution — the same
+    can-not-be-satisfied-by-a-copy shape as
+    ``test_repair_client_does_not_restate_the_parents_handshake`` below, one
+    level down. Method identity is unavailable for a module-level function
+    reached through a caller, so the equivalent handle is monkeypatching the
+    attribute on the migrate module and checking that classify_reply FOLLOWS
+    it. This works because the import is function-scoped: ``from X import Y``
+    inside the body re-reads the attribute off the module object on every call.
+    A module-level import would bind the name once and silently make this test
+    vacuous, which is why the source keeps the import where it is.
+
+    Asserted in BOTH directions, so neither an unconditional pre-check nor an
+    unconditional post-check can pass: a substitute that FAILS an ordinary
+    success shape must be obeyed, and a substitute that PASSES `{}` — a shape
+    every copy of this cascade rejects — must be obeyed too.
+    """
+    import migrate_metadata_modules_to_files as migrate_mod
+
+    guidance = (
+        "classify_reply stopped routing this shape through "
+        "migrate_metadata_modules_to_files.write_failure_reason. If splitting "
+        "them is deliberate and justified, DELETE THIS TEST in the same commit "
+        "and say why in the message — do NOT satisfy it by re-transcribing the "
+        "cascade into classify_reply, which is the exact silent-drift copy "
+        "task 4608 removed (it had already lost both transport-stamped checks). "
+        "The truth table above stays either way; it is what catches a copy that "
+        "has drifted, but only AFTER it drifts."
+    )
+
+    sentinel = "the delegate said no"
+    monkeypatch.setattr(
+        migrate_mod, "write_failure_reason", lambda reply: sentinel,
+    )
+    verdict = classify_reply({"id": "9", "status": "done"})
+    assert verdict.ok is False, guidance
+    assert verdict.detail == sentinel, guidance
+
+    monkeypatch.setattr(migrate_mod, "write_failure_reason", lambda reply: None)
+    verdict = classify_reply({})
+    assert verdict.ok is True, guidance
+    assert verdict.detail is None, guidance
 
 
 # ---------------------------------------------------------------------------

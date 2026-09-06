@@ -588,11 +588,12 @@ REJECTION_REPLIES = [
 ]
 
 #: The two shapes the TRANSPORT stamps rather than the tool body — kept in
-#: their own vector because the sibling script's classifier does NOT yet reject
-#: them (see the drift guard at the bottom of this file). Both are NON-EMPTY
-#: dicts with no `error` and no `success` key, so before these checks existed
-#: they reached the success branch: a silent success inside the very predicate
-#: added to abolish silent successes.
+#: their own vector because they entered this predicate later than the four
+#: above and are the shapes the sibling script's classifier USED to accept
+#: (task 4608 closed that by delegation; see the drift guard at the bottom of
+#: this file). Both are NON-EMPTY dicts with no `error` and no `success` key,
+#: so before these checks existed they reached the success branch: a silent
+#: success inside the very predicate added to abolish silent successes.
 TRANSPORT_REJECTION_REPLIES = [
     # `call_tool`'s not-JSON fallback. FastMCP-level failures that never enter
     # an `@mcp_tool_errors`-decorated body — argument validation, the
@@ -1202,21 +1203,24 @@ def test_call_tool_leaves_an_ordinary_success_reply_unmarked():
 
 
 def test_the_two_reply_classifiers_agree_on_every_shared_shape():
-    """DRIFT GUARD. ``write_failure_reason`` and ``classify_reply`` are twins.
+    """DRIFT GUARD. ``write_failure_reason`` is the one implementation.
 
-    ``scripts/repair_wiped_metadata_files.py:classify_reply`` implements the
-    same four load-bearing checks in the same order, with the same
-    ``error_type`` naming and the same falsy-``success`` rule. Deduplicating
-    them is not available in the obvious direction — repair imports
-    :class:`FusedMemoryClient` FROM this script's module, so importing back
-    would invert the layering — and the reverse (repair delegating to this one)
-    is a change to a file this task holds no lock on.
+    ``scripts/repair_wiped_metadata_files.py::classify_reply`` used to be a
+    TRANSCRIBED TWIN — the same four load-bearing checks in the same order,
+    with the same ``error_type`` naming and the same falsy-``success`` rule.
+    Task 4608 deduplicated them: it now DELEGATES to this function and wraps
+    the ``str | None`` in its own ``ReplyVerdict``. Delegation runs in that
+    direction and not the reverse because repair imports
+    :class:`FusedMemoryClient` FROM this script's module — importing
+    ``classify_reply`` back would make this base module depend on its
+    subclass's module.
 
-    So the copies stay, and this pins them together instead: the house pattern
-    already used for the other deliberate duplicate in this repo
-    (``shared/locking`` vs ``lock_charter_guard.py``, held by explicit equality
-    drift-guard tests). Feed the shared vector through both, assert the
-    verdicts match. Without it, one copy can move and nothing goes red.
+    So this no longer guards a second copy of the cascade; it guards the
+    WRAPPER, which is still repair-side code that could short-circuit ahead of
+    the delegate or mis-map its result. Feed the shared vector through both,
+    assert the verdicts match. Without it, the wrapper can move and nothing
+    goes red. It is also the STABLE CONTROL for task 4608's own change: these
+    shapes were never the drift, so this test stays green throughout.
     """
     for reply, name in zip(REJECTION_REPLIES, _reply_ids(), strict=True):
         assert migrate_mod.write_failure_reason(reply) is not None, name
@@ -1227,24 +1231,31 @@ def test_the_two_reply_classifiers_agree_on_every_shared_shape():
         assert classify_reply(reply).ok is True, reply
 
 
-def test_the_known_divergence_between_the_two_classifiers_is_pinned_not_assumed():
-    """The drift the guard above cannot fix, recorded as an executable fact.
+def test_the_two_classifiers_now_agree_on_the_transport_stamped_shapes_too():
+    """The drift the guard above could not fix, now closed — and kept red-able.
 
-    This script's classifier is STRICTLY STRICTER than the sibling's: it
-    rejects the two transport-stamped shapes, and ``classify_reply`` still
-    passes them. That is real drift and it is one-directional — the sibling has
-    the hole this amendment closed here.
+    This script's classifier used to be STRICTLY STRICTER than the sibling's:
+    it rejects the two transport-stamped shapes, and ``classify_reply``
+    accepted them, so a script that repairs LIVE task metadata reported both as
+    a repair that never happened. That divergence was pinned here as an
+    executable fact rather than left implicit, precisely so the follow-up would
+    have to flip it instead of changing behaviour silently.
 
-    Pinned rather than left implicit so the follow-up that makes
-    ``classify_reply`` delegate to :func:`write_failure_reason` FLIPS these
-    assertions and is forced to notice, instead of a silent behaviour change in
-    a script that repairs live task metadata. The divergence is safe in the
-    meantime because it is one-way: nothing this script accepts is rejected
-    over there.
+    Task 4608 is that follow-up: ``classify_reply`` now delegates to
+    :func:`write_failure_reason`, so the hole closed by construction and these
+    assertions flipped.
+
+    The vector is KEPT rather than folded into the agreement guard above,
+    because these are the shapes that WERE the hole: this is the executable
+    record that both of them reach the sibling's classifier as FAILURES. A
+    future author who "simplifies" the delegation back into a transcribed copy
+    goes red here as well as in that script's own structural delegation guard
+    (tests/scripts/test_repair_wiped_metadata_files.py::
+    test_classify_reply_delegates_to_the_migrations_predicate_rather_than_restating_it).
     """
     for reply, name in zip(
         TRANSPORT_REJECTION_REPLIES, _transport_reply_ids(), strict=True,
     ):
         assert migrate_mod.write_failure_reason(reply) is not None, name
-        # The DEBT, asserted: the sibling copy still reads these as successes.
-        assert classify_reply(reply).ok is True, name
+        # The closed hole, asserted: the sibling rejects these too now.
+        assert classify_reply(reply).ok is False, name
