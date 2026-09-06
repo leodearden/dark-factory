@@ -23,15 +23,29 @@ plan.json design_decisions).
 Selection
 ---------
 A record is rewritten iff it is a PENDING ``reconciliation_stale_gate_backlog``
-whose summary matches the pre-3520 shape (``LEGACY_SUMMARY_RE``).  Selection is
-deliberately NOT ``dedupe_fingerprint is None`` and NOT a hardcoded count:
-measured on the live queue, of 132 pending gate-backlog records 78 are
-unstamped but only 67 carry the old summary.  The other 11 were filed in the
-window between 3520 landing and 3522's stamp landing — their summary is ALREADY
-correct and rewriting them would be a pointless mutation of live production
-records.  Gating on the summary shape also buys idempotence for free: after a
-rewrite the summary no longer matches, so a second ``--apply`` is a structural
-no-op.
+whose summary matches the pre-3520 shape (``LEGACY_SUMMARY_RE``).
+
+Selection is deliberately NOT ``dedupe_fingerprint is None`` and NOT a hardcoded
+count.  MEASURED on the live queue (2026-09-06), of 132 pending gate-backlog
+records:
+
+===  ==========================================  =========================
+  n  shape                                       disposition
+===  ==========================================  =========================
+ 67  pre-3520 summary, ``age_hours:``, unstamped  REWRITTEN by this script
+ 11  3520-anchored, ``age_hours_at_filing:``,     out of scope
+     unstamped
+ 54  3520-anchored, stamped                       out of scope
+===  ==========================================  =========================
+
+67 + 11 = 78 is the unstamped population — which is why "unstamped" is the wrong
+gate.  Those 11 were filed in the window between 3520 landing and 3522's stamp
+landing, so their summary is ALREADY correct and rewriting them would be a
+pointless mutation of live production records.  A hardcoded 67 would rot too: it
+is a snapshot that can only shrink as stewards drain the queue, not an invariant.
+
+Gating on the summary shape also buys idempotence for free: after a rewrite the
+summary no longer matches, so a second ``--apply`` is a structural no-op.
 
 Usage
 -----
@@ -44,11 +58,31 @@ Usage
   # Commit the rewrites.  OPERATOR ACTION — see below.
   python scripts/backfill_gate_backlog_summaries.py --apply
 
+Operator procedure for ``--apply``
+----------------------------------
 ``--apply`` mutates live production escalation records that are NOT under git,
 so it is neither visible in a diff nor revertable by a merge-lane rollback.  It
-is deliberately an operator step, not something the implementing branch runs:
-review the dry-run report first, confirm ``skipped_fingerprint_drift`` is 0 and
-``legacy_total`` matches the population you expect, then re-run with ``--apply``.
+is deliberately an operator step, and was NOT run by the branch that added this
+script (task 4314).
+
+1. Dry-run first and read the report::
+
+     python scripts/backfill_gate_backlog_summaries.py \
+         --queue-dir /home/leo/src/dark-factory/data/reconciliation/escalations
+
+2. Confirm ``skipped_fingerprint_drift`` is **0**.  Any non-zero value means a
+   record's fold identity would move across the rewrite; investigate that record
+   before proceeding rather than applying the rest.
+3. Confirm ``legacy_total`` is in the range you expect.  It shrinks over time as
+   stewards drain the backlog; it should never GROW, because nothing files the
+   pre-3520 shape any more.  A growing count means the emitter regressed.
+4. Re-run the identical command with ``--apply`` appended.
+5. Re-run the dry run once more.  ``legacy_total`` must now be 0 — the
+   idempotence check.
+
+The rewrite is safe to run while reconciliation is live: every record is
+mutated under its own ``escalation_id_lock``, so a concurrent Stage-1 fold is
+never reverted.  There is no need to halt the scheduler or drain the queue.
 
 Safety properties
 -----------------
@@ -63,16 +97,27 @@ Safety properties
   is never reverted.
 - The rewrite is fingerprint-preserving by MACHINE CHECK, not by argument:
   ``plan_rewrites`` fails closed on any record whose
-  ``gate_backlog_fingerprint_key`` would change.
+  ``gate_backlog_fingerprint_key`` would change, so a record can never be turned
+  into a non-folding parent that mints a duplicate every cycle.
+- The dry-run path is read-only BY CONSTRUCTION, not by a flag check inside the
+  writer: ``plan_rewrites`` is pure, and ``run()`` simply does not reach
+  ``apply_rewrites`` unless ``apply`` is True.
+- Records outside the selection — the 11 already-anchored unstamped and the 54
+  stamped ones above, and every non-gate-backlog category — are byte-identical
+  across an ``--apply`` run.
 """
 
 from __future__ import annotations
 
+import argparse
 import copy
+import json
 import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from escalation.dedupe import gate_backlog_fingerprint_key
 from escalation.models import Escalation
@@ -406,3 +451,67 @@ def apply_rewrites(queue: EscalationQueue, plan: BackfillPlan) -> dict:
         'skipped_missing': skipped_missing,
         'skipped_no_longer_legacy': skipped_no_longer_legacy,
     }
+
+
+def run(queue_dir: str | Path, *, apply: bool = False) -> dict:
+    """Plan the backfill for *queue_dir* and, only when *apply*, execute it.
+
+    Returns a report dict.  When ``apply`` is False (dry-run, the default) the
+    ``apply_rewrites`` call is not reached at all — ``plan_rewrites`` is pure, so
+    a dry run is read-only by construction rather than by a flag check inside
+    the writer.
+    """
+    queue = EscalationQueue(Path(queue_dir))
+    plan = plan_rewrites(queue.get_pending())
+
+    report: dict = {
+        'queue_dir': str(queue_dir),
+        'pending_total': plan.pending_total,
+        'legacy_total': plan.legacy_total,
+        'anchored': plan.anchored,
+        'fallback': plan.fallback,
+        'skipped_fingerprint_drift': plan.skipped_fingerprint_drift,
+        'dry_run': not apply,
+    }
+
+    if apply:
+        report.update(apply_rewrites(queue, plan))
+
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.  Returns an exit code."""
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message)s')
+
+    parser = argparse.ArgumentParser(
+        description=(
+            'Backfill: re-anchor legacy (pre-3520) reconciliation_stale_gate_backlog '
+            'summaries onto the absolute `since <ISO>` form.'
+        ),
+    )
+    parser.add_argument(
+        '--queue-dir',
+        default='./data/reconciliation/escalations',
+        help='Path to the escalation queue directory (default: ./data/reconciliation/escalations).',
+    )
+    parser.add_argument(
+        '--apply',
+        action='store_true',
+        default=False,
+        help=(
+            'Perform writes. Without this flag the script is a dry run. '
+            'OPERATOR ACTION: --apply mutates live escalation records that are '
+            'not under git, so review the dry-run report first (expect '
+            'skipped_fingerprint_drift: 0).'
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    report = run(args.queue_dir, apply=args.apply)
+    print(json.dumps(report, indent=2, default=str))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
