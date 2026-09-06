@@ -5823,6 +5823,32 @@ class ReconciliationHarness:
                                 finding=finding,
                                 resolved_fps=resolved_fps,
                             )
+                            # Task 4821 (task 4764 arm 3): additionally route a
+                            # finding that NAMES a task onto that task's own
+                            # ORCHESTRATOR ladder, so it stops dead-ending in a
+                            # queue nobody reading the task would look at.  The
+                            # `_escalate` call above stays FIRST and
+                            # unconditional — this path adds a filing, it never
+                            # displaces the recon-queue one (the two queues have
+                            # different readers).
+                            #
+                            # Placement is load-bearing: sitting on this exact
+                            # branch inherits every existing suppression layer
+                            # structurally, with no duplicated logic that could
+                            # drift.  A finding only reaches here having already
+                            # survived the non-actionable partition, the
+                            # `_finding_has_reference` placeholder drop, the
+                            # open-recon-escalation check, the
+                            # `_INTEGRITY_FINDING_RECURRENCE_THRESHOLD`
+                            # persistence bar, and the live-workflow gate.  The
+                            # consequence worth stating: VOLUME PARITY — at most
+                            # one orchestrator L1 per finding that already files
+                            # one recon escalation today, folded across later
+                            # cycles by `has_open_l1`.  This plumbing cannot
+                            # flood the orchestrator ladder.
+                            self._file_finding_task_escalation(
+                                project_id, run_id, finding, persistence,
+                            )
                     else:
                         logger.info(
                             'reconciliation.unresolved_after_remediation_suppressed',
