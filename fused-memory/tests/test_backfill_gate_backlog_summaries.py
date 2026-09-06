@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -36,6 +37,9 @@ is_legacy_gate_backlog_record = _mod.is_legacy_gate_backlog_record
 extract_gate_escalated_at = _mod.extract_gate_escalated_at
 rebuild_summary = _mod.rebuild_summary
 rebuild_detail = _mod.rebuild_detail
+plan_rewrites = _mod.plan_rewrites
+Rewrite = _mod.Rewrite
+BackfillPlan = _mod.BackfillPlan
 
 
 # ---------------------------------------------------------------------------
@@ -362,3 +366,135 @@ class TestRebuildDetail:
             'age_hours_at_filing: 1.0',
             'age_hours_at_filing: 48.7',
         ]
+
+
+# ---------------------------------------------------------------------------
+# plan_rewrites
+# ---------------------------------------------------------------------------
+
+
+def _anchored_esc(**kwargs) -> Escalation:
+    """A post-3520 record whose summary is ALREADY correct."""
+    detail = LEGACY_DETAIL.replace('age_hours: 48.7', 'age_hours_at_filing: 48.7')
+    return _legacy_esc(summary=ANCHORED_SUMMARY, detail=detail, **kwargs)
+
+
+def _mixed_pending() -> list[Escalation]:
+    """The live queue's shape in miniature: 2 legacy + 3 records to leave alone."""
+    stamped = compute_content_fingerprint(
+        GATE_BACKLOG_CATEGORY, '', ['dark_factory:169'], ''
+    )
+    return [
+        _legacy_esc(id='esc-166-1', task_id='166'),
+        _legacy_esc(
+            id='esc-167-1',
+            task_id='167',
+            summary='Gate task 167 has awaited a human decision for 91.2h',
+            detail=LEGACY_DETAIL.replace('task_id: 166', 'task_id: 167'),
+        ),
+        # The measured 11-record population: unstamped, but already anchored.
+        _anchored_esc(id='esc-168-1', task_id='168'),
+        # The measured 54-record population: anchored AND stamped.
+        _anchored_esc(id='esc-169-1', task_id='169', dedupe_fingerprint=stamped),
+        _legacy_esc(id='esc-170-1', task_id='170', category='recon_integrity_issue'),
+    ]
+
+
+class TestPlanRewrites:
+    """Pure planning: which records get rewritten, and to what."""
+
+    def test_selects_only_the_legacy_records(self):
+        plan = plan_rewrites(_mixed_pending())
+
+        assert isinstance(plan, BackfillPlan)
+        assert [r.escalation_id for r in plan.rewrites] == ['esc-166-1', 'esc-167-1']
+        assert plan.pending_total == 5
+        assert plan.legacy_total == 2
+        assert plan.skipped_fingerprint_drift == 0
+
+    def test_already_anchored_unstamped_record_is_never_touched(self):
+        """The 11 records filed between 3520 landing and 3522's stamp landing."""
+        plan = plan_rewrites(_mixed_pending())
+        assert 'esc-168-1' not in {r.escalation_id for r in plan.rewrites}
+
+    def test_rewrite_carries_the_before_and_after_of_both_fields(self):
+        plan = plan_rewrites(_mixed_pending())
+        rw = plan.rewrites[0]
+
+        assert isinstance(rw, Rewrite)
+        assert rw.escalation_id == 'esc-166-1'
+        assert rw.task_id == '166'
+        assert rw.old_summary == LEGACY_SUMMARY
+        assert rw.new_summary == rebuild_summary('166', ANCHOR)
+        assert rw.old_detail == LEGACY_DETAIL
+        assert rw.new_detail == rebuild_detail(LEGACY_DETAIL)
+        assert rw.anchored is True
+
+    def test_counters_split_anchored_from_fallback(self):
+        plan = plan_rewrites(_mixed_pending())
+        assert plan.anchored == 2
+        assert plan.fallback == 0
+
+    def test_unrecoverable_anchor_falls_back_and_is_counted(self):
+        esc = _legacy_esc(
+            detail=LEGACY_DETAIL.replace(
+                f'gate_escalated_at: {ANCHOR}', 'gate_escalated_at: None'
+            )
+        )
+        plan = plan_rewrites([esc])
+
+        assert plan.legacy_total == 1
+        assert plan.anchored == 0
+        assert plan.fallback == 1
+        assert len(plan.rewrites) == 1
+        assert plan.rewrites[0].anchored is False
+        assert plan.rewrites[0].new_summary == FALLBACK_SUMMARY
+
+    def test_fingerprint_is_preserved_across_every_emitted_rewrite(self):
+        """The positive form of the machine-checked invariant."""
+        pending = _mixed_pending()
+        by_id = {e.id: e for e in pending}
+        plan = plan_rewrites(pending)
+
+        assert plan.rewrites, 'expected at least one rewrite to check'
+        for rw in plan.rewrites:
+            before = by_id[rw.escalation_id]
+            after = _legacy_esc(
+                id=before.id,
+                task_id=before.task_id,
+                summary=rw.new_summary,
+                detail=rw.new_detail,
+                dedupe_fingerprint=before.dedupe_fingerprint,
+            )
+            key_before = gate_backlog_fingerprint_key(before)
+            key_after = gate_backlog_fingerprint_key(after)
+            assert key_before is not None
+            assert key_after is not None
+            assert key_before == key_after
+
+    def test_fails_closed_when_the_rewrite_would_move_the_fingerprint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A rebuild_detail that disturbs line 0 must emit NO rewrite at all.
+
+        The failure mode this guards is a permanently non-folding parent that
+        mints a duplicate every Stage-1 cycle — so the guard fails CLOSED
+        (record keeps its stale summary, a strictly recoverable outcome) rather
+        than rewriting and hoping.
+        """
+        monkeypatch.setattr(
+            _mod,
+            'rebuild_detail',
+            lambda detail: detail.replace('project_id: dark_factory', 'project_id: reify'),
+        )
+        plan = plan_rewrites([_legacy_esc()])
+
+        assert plan.legacy_total == 1
+        assert plan.rewrites == []
+        assert plan.skipped_fingerprint_drift == 1
+
+    def test_empty_pending_list_yields_an_empty_plan(self):
+        plan = plan_rewrites([])
+        assert plan.rewrites == []
+        assert plan.pending_total == 0
+        assert plan.legacy_total == 0
