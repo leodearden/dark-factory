@@ -52,6 +52,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
+    _ESCALATION_LEVEL as FINDING_TASK_ESCALATION_LEVEL,
+)
+from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
     resolve_finding_task_target,
@@ -2819,14 +2822,32 @@ class ReconciliationHarness:
             # Cross-cycle dedupe.  The `_sweep_escalate_l1` template omits this
             # and can refile on every sweep — fine for a one-shot cancellation
             # event, wrong for a filer that re-evaluates each reconciliation
-            # cycle.  `category=` is NOT optional: per has_open_l1's own
-            # docstring (task 2757) the filter is what lets a NEW root cause
-            # escape being silently suppressed by an UNRELATED open L1 — without
-            # it, a lingering `scope_violation` on the task would swallow every
-            # recon finding for it forever.  Pending-only by construction, so a
-            # finding that recurs after a human adjudicated the last record
-            # reaches the ladder again.
-            if queue.has_open_l1(task_id, category=FINDING_TASK_ESCALATION_CATEGORY):
+            # cycle.
+            #
+            # NOT `has_open_l1`: that helper is LEVEL-1-ONLY, and these records
+            # are level 0 precisely so they stay off the orchestrator's L1 guard
+            # surface, so it would see nothing and the filer would refile every
+            # cycle.  This is the level-0 pending-scan idiom transcribed from
+            # `orchestrator/harness.py::_file_warm_base_hard_down_notice`.
+            #
+            # BOTH filters are load-bearing.  `category` is the task-2757
+            # property in its level-0 form: it lets a NEW root cause escape
+            # being silently suppressed by an UNRELATED open record — without
+            # it, a lingering starvation INFO on the task would swallow every
+            # recon finding for it forever.  `level` keeps a human's promotion
+            # of a prior record to L1 from suppressing the next finding, which
+            # would otherwise silence the ladder exactly when someone is
+            # already engaged with it.  Both constants are IMPORTED, never
+            # re-spelled, so the scan and the builder cannot drift apart.
+            #
+            # `status='pending'` skips the archive by construction, so a finding
+            # that recurs after a human adjudicated the last record reaches the
+            # ladder again.
+            if [
+                e for e in queue.get_by_task(task_id, status='pending')
+                if e.level == FINDING_TASK_ESCALATION_LEVEL
+                and e.category == FINDING_TASK_ESCALATION_CATEGORY
+            ]:
                 logger.info(
                     'reconciliation.finding_task_escalation_deduped',
                     extra={

@@ -71,7 +71,7 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # promotes to L2 when human judgement is needed — the ladder this arm exists to
 # reach), and `EscalationQueue.has_open_l1` reads level-1 records ONLY, so the
 # cross-cycle dedupe simply does not function at level 0.
-_ESCALATION_LEVEL = 1
+_ESCALATION_LEVEL = 0
 
 # `severity='info'`, NOT the 'blocking' used by the `_sweep_escalate_l1`
 # template this filer is otherwise transcribed from.  An open L1 is documented
