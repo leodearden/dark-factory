@@ -145,15 +145,17 @@ except ImportError:
 #     that owns that record, so this invariant is not contradicted.
 #   - Dedup folds on the way IN only, via submit_or_dedupe + _RECON_DEDUP_CONFIG.
 #   - Task 4821: the harness now ALSO WRITES (and never resolves)
-#     `recon_task_finding` L1s to the per-project ORCHESTRATOR queue
-#     <project_root>/data/escalations/ — see
+#     `recon_task_finding` LEVEL-0 records to the per-project ORCHESTRATOR
+#     queue <project_root>/data/escalations/ — see
 #     ReconciliationHarness._file_finding_task_escalation.  This is NOT an A7b
 #     violation, on exactly the task-2998 scope note above that already
 #     sanctions BacklogPolicy's judge-halt write there: the invariant governs
 #     the RECON queue (config.escalation_queue_dir), and that is a DIFFERENT
 #     queue with a different reader.  Unlike BacklogPolicy, this filer does not
-#     close its own records either — an operator or the auto-watcher does, via
-#     the ordinary L1 ladder.
+#     close its own records either.  Level 0 keeps them off the orchestrator's
+#     level-1-only has_open_l1 guard surface; an unattended one still reaches
+#     L1 on its own, promoted by Harness._reap_orphan_l0_escalations once it
+#     ages past orphan_l0_timeout_secs with no live workflow on the task.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
     dataclasses.replace(
@@ -2742,7 +2744,7 @@ class ReconciliationHarness:
         finding: dict,
         persistence: int,
     ) -> str | None:
-        """File an L1 for *finding* on its named task's ORCHESTRATOR queue.
+        """File a level-0 record for *finding* on its named task's ORCHESTRATOR queue.
 
         The counterpart to :meth:`_escalate`, and deliberately NOT a
         replacement for it (task 4821 / task 4764 arm 3).  ``_escalate`` writes
@@ -2761,7 +2763,16 @@ class ReconciliationHarness:
         - the project is not registered in ``_known_projects``;
         - no orchestrator is live for that root, so nothing would drain the
           record;
-        - an open L1 of this same category is already pending on the task.
+        - a pending record of this same (level, category) is already on the
+          task.
+
+        LEVEL 0, deliberately: `EscalationQueue.has_open_l1` is level-1-only
+        and is what a spread of orchestrator guards read as "a human is already
+        on this task", so an L1 here would turn a passive observation into a
+        gate on dispatch.  See the `_ESCALATION_LEVEL` comment block in
+        `finding_task_escalation.py` for the full guard-site population and for
+        why an unattended record still reaches L1 (via
+        `Harness._reap_orphan_l0_escalations`) without this filer asserting it.
 
         FAIL-SAFE: a queue hiccup is logged and swallowed — a reconciliation
         cycle is never aborted by a failed filing (mirroring
@@ -2871,7 +2882,7 @@ class ReconciliationHarness:
             esc_id: str = queue.submit(esc)
         except Exception as e:
             logger.warning(
-                'reconciliation: orchestrator-queue L1 filing failed for task %s '
+                'reconciliation: orchestrator-queue filing failed for task %s '
                 '(project %s, run %s): %s',
                 task_id, project_id, run_id, e,
             )
@@ -5946,11 +5957,11 @@ class ReconciliationHarness:
                                     },
                                 )
                             else:
-                                # VOLUME PARITY: at most one orchestrator L1 per
-                                # finding that already files one recon escalation
-                                # today, folded across later cycles by the filer's
-                                # own dedupe.  This plumbing cannot flood the
-                                # orchestrator ladder.
+                                # VOLUME PARITY: at most one orchestrator-queue
+                                # record per finding that already files one recon
+                                # escalation today, folded across later cycles by
+                                # the filer's own dedupe.  This plumbing cannot
+                                # flood the orchestrator ladder.
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
                                 )

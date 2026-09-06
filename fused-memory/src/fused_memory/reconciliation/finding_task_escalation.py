@@ -67,23 +67,64 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 
 # Fixed routing fields for every record this module builds.
 #
-# `level=1` is required TWICE OVER: it routes to the auto-watcher (which
-# promotes to L2 when human judgement is needed — the ladder this arm exists to
-# reach), and `EscalationQueue.has_open_l1` reads level-1 records ONLY, so the
-# cross-cycle dedupe simply does not function at level 0.
+# `level=0`, and the argument for it is STRUCTURAL, not a matter of degree.
+#
+# Every orchestrator guard that a recon-authored record could hijack reaches
+# the escalation queue through ONE helper — `EscalationQueue.has_open_l1`
+# (`escalation/src/escalation/queue.py`), which filters on `level` + `status`
+# and an OPTIONAL `category`, and is documented as answering "a human is
+# already on this task, so the workflow must not auto-requeue it".  Crucially
+# it never reads `.severity` at all, so a severity choice cannot mitigate the
+# collision — only the level can.  It is level-1-ONLY, so a level-0 record is
+# invisible to every one of them by construction:
+#
+#   - `orchestrator/harness.py::_file_external_dep_block` and the sibling
+#     cross-repo and substrate-flip filers, each of which skips filing when an
+#     L1 is already open;
+#   - `orchestrator/harness.py::_reap_orphan_l0_escalations`, which DISMISSES
+#     an orphan L0 rather than promoting it when an L1 is open;
+#   - `orchestrator/workflow.py::_await_steward_completion` and the
+#     requeue-diversion source-of-truth override, which divert a task's
+#     workflow on the strength of an open L1.
+#
+# That is the population this closes.  A passive observation must not start
+# gating dispatch as a side effect of a PLUMBING change, and level 0 is the
+# only spelling that guarantees it — pinned executably by
+# `test_routed_record_is_invisible_to_the_orchestrator_l1_guards`.
+#
+# Routing note: filed at `severity='info', level=0`.  Level-0 records are
+# surfaced via the steward's pending-escalation view and any external monitor
+# polling the queue.  UNLIKE the notes on
+# `orchestrator/harness.py::_file_starvation_info` and
+# `::_file_warm_base_hard_down_notice`, which claim level-0 records "do NOT
+# auto-promote", this one does not: `Harness._reap_orphan_l0_escalations` DOES
+# promote a pending L0 to L1 once it is older than
+# `config.orphan_l0_timeout_secs`, gated on the task having no running workflow
+# (`_escalation_events`), not being `scheduler.is_actively_held`, and having no
+# already-open L1 — in which last case it DISMISSES the L0 instead, as a
+# duplicate of the record the human is already handling.
+#
+# The consequence is the good one, and it is why no escalate-if-unattended
+# behaviour needs asserting here: an unattended routed finding reaches L1 on
+# its own, delivered by the component that OWNS strand-detection semantics
+# (liveness, hold state, duplicate suppression), while an attended one is
+# correctly folded away.  Re-deriving any of that at this filer would mean
+# re-deriving all three signals from a process that cannot see them.
 _ESCALATION_LEVEL = 0
 
 # `severity='info'`, NOT the 'blocking' used by the `_sweep_escalate_l1`
-# template this filer is otherwise transcribed from.  An open L1 is documented
-# (`EscalationQueue.has_open_l1`) as signalling that "the workflow must not
-# auto-requeue the task".  Asserting that for every persistent recon finding
-# that happens to name a task id would silently change task-blocking semantics
-# fleet-wide as a side effect of a PLUMBING change.  'info' still lands the
-# record queued and triaged — the entire acceptance criterion — while the
-# follow-up semantic-contradiction arm can file at 'blocking' on the narrower
-# population where it is warranted.  Matches the closest fused-memory precedent
-# for a code-path orchestrator-queue filing, `middleware/scope_violation_
-# escalator.py` (level 1, severity 'info').
+# template this filer is otherwise transcribed from.  This is an OBSERVATION
+# about a task, not a claim that the task is broken: the finding is
+# LLM-authored and this arm ships the plumbing only, with semantic
+# contradiction DETECTION explicitly out of scope (task 4764's own wording).
+# The follow-up arm can file at 'blocking' on the narrower population where
+# that is warranted.  Matches the closest fused-memory precedent for a
+# code-path orchestrator-queue filing, `middleware/scope_violation_
+# escalator.py`, in its severity choice.
+#
+# Note that severity is NOT what keeps this record off the orchestrator's guard
+# surface — `has_open_l1` never reads it.  `_ESCALATION_LEVEL` above does that
+# work, alone.
 #
 # Severity is deliberately NOT derived from the finding's own
 # 'minor'/'moderate'/'serious' field: that vocabulary is LLM-authored free text
@@ -186,7 +227,8 @@ def build_finding_task_escalation_kwargs(
       provenance goes into ``detail`` (a real field) as JSON so we never need
       that workaround.
     - No ``dedupe_fingerprint``: nothing on the orchestrator queue folds on one
-      for this category — cross-cycle dedupe is ``has_open_l1``'s job — and
+      for this category — cross-cycle dedupe is the filer's own pending-scan
+      on ``(level, category)``, see ``_file_finding_task_escalation`` — and
       setting one risks unintended folding should a future ``submit_or_dedupe``
       config ever name the category.  The recon-side fingerprint is preserved in
       ``detail`` for correlation instead.
