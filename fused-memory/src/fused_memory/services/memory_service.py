@@ -5974,13 +5974,17 @@ class MemoryService:
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         # task 3561: this id is minted HERE, at enqueue time, before the queued
         # write executes and therefore before any Graphiti node exists. It is a
-        # CORRELATION id for the queued write, never an episode uuid — the
-        # 'corr_' prefix enforces that at runtime rather than leaving it to a
-        # docstring, so a caller who copies it into e.g. delete_episode fails
-        # self-describingly instead of getting a silent no-op against a
-        # nonexistent node. The real uuid is minted by graphiti_core and read
-        # back off result.episode.uuid in _execute_graphiti_write, which logs
-        # the two together so the mapping is recoverable.
+        # CORRELATION id for the queued write, never an episode uuid. The
+        # 'corr_' prefix is a legibility aid, not a validated guard: nothing
+        # rejects a 'corr_' id, but a caller who copies this value into e.g.
+        # delete_episode sees it verbatim in the resulting NodeNotFoundError
+        # (remove_episode loads by uuid first, so an unresolvable id — prefixed
+        # or bare — always failed loudly) and can tell at a glance WHY it
+        # failed. The bare uuid4 this used to return failed just as loudly
+        # while looking exactly like a real node uuid. The real uuid is minted
+        # by graphiti_core and read back off result.episode.uuid in
+        # _execute_graphiti_write, which logs the two together so the mapping
+        # is recoverable.
         correlation_uuid = str(uuid_mod.uuid4())
         episode_id = f'corr_{correlation_uuid}'
         write_op_id = str(uuid_mod.uuid4())

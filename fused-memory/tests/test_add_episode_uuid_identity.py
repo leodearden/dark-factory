@@ -591,12 +591,16 @@ _EPISODE_NAME_RE = re.compile(r'^episode_[0-9a-f]{8}$')
 class TestEpisodeIdIsACorrelationId:
     """``episode_id`` is returned at ENQUEUE time, before any node uuid exists.
 
-    Leaving it silently returning a uuid that matches nothing is the status quo
-    this task removes: today a caller who copies ``episode_id`` into
-    ``delete_episode`` gets a silent no-op against a nonexistent node.  The
-    resolution is to demote it to a correlation id, enforced at RUNTIME by a
-    ``corr_`` prefix rather than by a docstring promise — so a ``corr_``-prefixed
-    id fails self-describingly instead.
+    The status quo this task removes is a bare uuid4 that matches no node while
+    looking exactly like one that does: a caller who copied it into
+    ``delete_episode`` got a ``NodeNotFoundError`` naming a plausible-looking
+    uuid, with nothing to say the id had never been resolvable at all.  The
+    resolution is to demote it to a correlation id carrying a ``corr_`` prefix
+    — a legibility marker, not a validated guard (nothing anywhere rejects a
+    ``corr_`` id, and ``remove_episode`` raised for the bare uuid4 just as
+    loudly).  The tests below pin the prefix, the ``correlation_id`` payload
+    key and the INFO tie-back, because those are what a regression would
+    silently undo.
     """
 
     @pytest.mark.asyncio

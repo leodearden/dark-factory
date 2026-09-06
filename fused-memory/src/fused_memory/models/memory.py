@@ -57,16 +57,28 @@ class AddEpisodeResponse(BaseModel):
     # node exists yet; the real uuid is minted by graphiti_core when the queued
     # write executes, and _execute_graphiti_write logs the two together.
     #
-    # The 'corr_' prefix is the runtime enforcement of that: a caller who copies
-    # this value into delete_episode fails self-describingly rather than getting
-    # a silent no-op against a nonexistent node, which is what happened while
-    # this field returned a bare uuid4.
+    # The 'corr_' prefix is a LEGIBILITY aid, not an enforced guard — nothing
+    # validates or rejects it. It makes the value self-describing in logs and
+    # in error messages: a caller who copies it into delete_episode reads
+    # `corr_...` back in the resulting NodeNotFoundError and can see at a
+    # glance that it passed a correlation id where an episode uuid was needed.
+    # The failure is loud either way — remove_episode's first statement is
+    # EpisodicNode.get_by_uuid (backends/graphiti_client.py::GraphitiBackend.remove_episode),
+    # which raises for ANY unresolvable uuid, prefixed or bare — so the bare
+    # uuid4 this field used to return failed identically, just without saying
+    # why. The prefix changes an opaque failure into a self-explaining one; it
+    # does not change a silent one into a loud one.
     #
-    # The field NAME stays `episode_id`: it is part of the published MCP
-    # response schema and of the write-journal `result_summary` shape
-    # (services/journal.py), so renaming it is a breaking change. The
-    # description below is a Field(...) rather than a comment so the demotion
-    # travels with the MCP schema instead of living only in source.
+    # The field NAME stays `episode_id`: the key is on the wire in the
+    # add_episode MCP tool's returned dict (server/tools.py returns
+    # `result.model_dump()`), and in the write-journal `result_summary` shape
+    # written by services/write_journal.py::WriteJournal.log_write_op and read
+    # by reconciliation/journal.py, so renaming it is a breaking change. The
+    # description below is a Field(...) rather than a comment for the source
+    # reader's benefit only: that tool is annotated `-> dict[str, Any]`, so
+    # this model's JSON schema is NOT published to MCP clients. The
+    # caller-visible channel for the demotion is the `message` string
+    # add_episode returns (services/memory_service.py::MemoryService.add_episode).
     episode_id: str | None = Field(
         default=None,
         description=(
