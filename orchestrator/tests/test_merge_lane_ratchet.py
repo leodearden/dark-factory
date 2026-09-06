@@ -566,14 +566,41 @@ class TestReexportNames:
         reported = set(metrics.reexport_names(source, path=str(path)))
         assert reported
 
-        annotated_linenos = {57, 64, 89, 112, 118, 150, 154, 188, 198}
+        # The annotated blocks are DERIVED, never line-pinned. This test used to
+        # carry `annotated_linenos = {57, 64, ...}` -- nine hard line numbers
+        # into merge_queue.py, which is both the hottest file in the repo and
+        # the explicit refactor target of this very PRD (gamma1..gamma10,
+        # zeta1/zeta2). Inserting one line above 198 shifted every pin and
+        # reddened the whole orchestrator suite on a change that had nothing to
+        # do with shims -- a false-failure generator inside a gate, and against
+        # CLAUDE.md's `path::symbol` citation convention.
+        #
+        # `_comment_lines` (stdlib tokenize) decides what is REALLY a comment,
+        # so a string literal merely mentioning the marker cannot qualify; the
+        # marker text is then matched on those lines only. Matching anywhere in
+        # the node's line SPAN, not just `node.lineno`, keeps a block annotated
+        # on a continuation line in the set.
+        #
+        # Verified equivalent when it replaced the pins: this derivation
+        # reproduced exactly {57, 64, 89, 112, 118, 150, 154, 188, 198} -- same
+        # nine blocks, 127 names, 63 structurally unused, 8 blocks hit.
+        source_lines = source.splitlines()
+        marked = {
+            lineno
+            for lineno in metrics._comment_lines(source, path=str(path))
+            if 'noqa: F401' in source_lines[lineno - 1]
+        }
+        assert marked, 'no `noqa: F401` annotated blocks found in merge_queue.py'
         tree = _ast.parse(source)
         blocks = [
             {a.asname or a.name for a in node.names}
             for node in tree.body
-            if isinstance(node, _ast.ImportFrom) and node.lineno in annotated_linenos
+            if isinstance(node, _ast.ImportFrom)
+            and marked & set(range(node.lineno, (node.end_lineno or node.lineno) + 1))
         ]
-        assert len(blocks) == len(annotated_linenos), 'shim block line numbers drifted'
+        # FLOORS, not exact counts -- the PRD exists to lower these, and this
+        # module's live-tree anchors are one-sided by convention (d54acca456).
+        assert len(blocks) >= 6, f'only {len(blocks)} annotated shim blocks found'
         hit_blocks = [names for names in blocks if names & reported]
         assert len(hit_blocks) >= 6, f'{len(hit_blocks)}/{len(blocks)} annotated blocks hit'
         annotated_names = set().union(*blocks)
@@ -1332,14 +1359,21 @@ class TestRenderBaseline:
         twice = metrics.render_baseline(json.loads(once))
         assert twice == once
 
-    def test_leads_with_a_readme_key_stating_the_regeneration_rule(self) -> None:
+    def test_leads_with_a_readme_key(self) -> None:
+        # STRUCTURE only. This used to also assert three substrings of
+        # BASELINE_README ('ratchet baseline', 'regenerate', 'same commit'),
+        # which pinned the constant's PROSE: rewording it to "refresh the frozen
+        # numbers in the landing commit" would have reddened the suite with
+        # nothing executable changed. Those bought no coverage either --
+        # TestRenderBaseline::test_round_trips_without_dropping_a_measure
+        # already proves BASELINE_README is exactly what gets emitted. If the
+        # README's guidance matters, fix the constant; do not lock its phrasing.
         rendered = metrics.render_baseline(_synthetic_report())
         first_key_line = rendered.splitlines()[1]
         assert first_key_line.lstrip().startswith('"_README":')
-        readme = metrics.BASELINE_README.lower()
-        assert 'ratchet baseline' in readme
-        assert 'regenerate' in readme or 'regenerated' in readme
-        assert 'same commit' in readme
+        # Non-vacuity only, in this module's floor idiom: the key must not be
+        # emitted empty. No wording is constrained.
+        assert len(metrics.BASELINE_README) >= 100
 
 
 class TestBaselineIO:
