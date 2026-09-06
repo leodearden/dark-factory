@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -404,27 +404,43 @@ class TestReconConfigDirHelpers:
         # sibling accidentally created under the cwd by the rmtree call.
         assert recon_config_base_dir(Path('data/reconciliation')).is_absolute()
 
-    def test_a_mock_data_dir_touches_no_filesystem(self, tmp_path, monkeypatch):
-        """A mock journal's data_dir must not become a real directory.
+    @pytest.mark.parametrize('mock_cls', [MagicMock, AsyncMock])
+    def test_a_mock_data_dir_touches_no_filesystem(
+        self, tmp_path, monkeypatch, mock_cls
+    ):
+        """A mock journal's data_dir must be left strictly alone — not coerced, not called.
 
-        Many stage tests in this suite drive BaseStage with an AsyncMock journal,
-        so ``self.journal.data_dir`` is a mock rather than a Path. That is fine
-        only as long as this function leaves it alone: MagicMock and AsyncMock
-        both implement ``__fspath__``, so ``Path(mock)`` coerces silently to the
-        RELATIVE path ``AsyncMock/mock.data_dir/<id>`` — which absolutization
-        would anchor at the cwd and ``TaskConfigDir.__init__`` would really
-        ``mkdir(parents=True)``, littering the repo with junk directories on
-        every suite run (and sweeping them into any subsequent ``git add``).
+        Many stage tests in this suite drive BaseStage with an ``AsyncMock``
+        journal (``test_base_stage_cutover.py``), so ``self.journal.data_dir`` is a
+        mock rather than a Path. Two distinct hazards, which is why both mock
+        classes are parametrized rather than only the convenient one:
 
-        Used as given, the mock's own ``__truediv__`` returns another mock and
-        nothing reaches the filesystem. This leaf pins that, composing the chain
-        exactly as ``stages/base.py::BaseStage.run`` does.
+        - COERCION. Both classes implement ``__fspath__``, so ``Path(mock)``
+          silently becomes the RELATIVE path ``AsyncMock/mock.data_dir/<id>``,
+          which absolutization would anchor at the cwd and
+          ``TaskConfigDir.__init__`` would really ``mkdir(parents=True)`` —
+          littering the repo with junk dirs on every suite run (and sweeping them
+          into any subsequent ``git add``).
+        - INVOCATION. Calling ``is_absolute()`` on an ``AsyncMock`` returns a
+          COROUTINE, not a bool. It is truthy, so the branch is skipped and no
+          directory appears — the filesystem assertion below passes either way —
+          but the coroutine is never awaited and CPython emits ``RuntimeWarning:
+          coroutine 'AsyncMockMixin._execute_mock_call' was never awaited``, which
+          ``orchestrator/pyproject.toml`` already promotes to an error in its
+          ``filterwarnings``. That is why the ``assert_not_called`` leaf below is
+          the load-bearing one for the AsyncMock parameter: a filesystem-only
+          assertion cannot see this hazard at all.
+
+        ``recon_config_base_dir`` guards on ``isinstance(base, PurePath)``, so a
+        non-Path duck type is neither wrapped nor called; the mock's own
+        ``__truediv__`` returns another mock and nothing reaches the filesystem.
+        Composes the chain exactly as ``stages/base.py::BaseStage.run`` does.
         """
         from shared.config_dir import TaskConfigDir
 
         from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
 
-        journal = MagicMock()
+        journal = mock_cls()
         monkeypatch.chdir(tmp_path)
         TaskConfigDir(
             task_id='run-x', base_dir=recon_config_base_dir(journal.data_dir),
@@ -434,6 +450,7 @@ class TestReconConfigDirHelpers:
             f'A mock data_dir must not be coerced into a real path; the chain '
             f'created {[p.name for p in tmp_path.iterdir()]!r} under the cwd'
         )
+        journal.data_dir.is_absolute.assert_not_called()
 
     def test_production_chain_yields_an_absolute_config_dir(
         self, tmp_path, monkeypatch

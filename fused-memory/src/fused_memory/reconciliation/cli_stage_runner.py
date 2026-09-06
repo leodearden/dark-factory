@@ -7,7 +7,7 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
@@ -510,13 +510,27 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     and nothing reaches the filesystem, exactly as before this function
     absolutized anything.
 
+    The ``isinstance(base, PurePath)`` guard extends that "leave a duck type
+    strictly alone" contract from the coercion to the CALL. Without it,
+    ``is_absolute()`` is invoked on the mock, and for the ``AsyncMock`` journal
+    the stage suite actually uses (``fused-memory/tests/reconciliation/test_base_stage_cutover.py``)
+    that returns a COROUTINE, not a bool: truthy, so the branch is skipped and no
+    directory is created, but the coroutine is never awaited and CPython emits
+    ``RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never
+    awaited``. ``orchestrator/pyproject.toml`` already promotes that exact
+    warning to an error in its ``filterwarnings``, so leaking one here would
+    plant an anti-pattern the repo has decided to fail on — and would break
+    fused-memory's suite the day it adopts the same filters. Testing the type
+    first also states the real precondition: absolutization is a ``PurePath``
+    operation, and anything else is none of this function's business.
+
     Shape precedent:
     ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._start_escalation_server``.
     ``gc_run_config_dir`` inherits the fix for free — it derives its rmtree target
     from this function.
     """
     base = data_dir
-    if not base.is_absolute():
+    if isinstance(base, PurePath) and not base.is_absolute():
         base = Path.cwd() / base
     return base / 'recon-config'
 
