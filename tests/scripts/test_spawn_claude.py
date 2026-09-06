@@ -137,6 +137,66 @@ _STRESS_DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     exit 0
 """)
 
+# Sentinel-planting DETACHING terminal (task 5137, esc-4389-4).
+#
+# WHY THIS EXISTS. spawn-claude.sh's payload publishes claude's exit code by
+# writing it into a `$TMPDIR/spawn-claude-XXXXXX.done` sentinel, and finish()
+# reads that file to decide both the script's own exit status and the
+# `--code` it hands session_registry. Every readiness gate around it,
+# however, tests only `[ -f "$sentinel" ]`. Existence is the WRONG readiness
+# signal for a file whose CONTENT is about to be parsed: `>` creates and
+# truncates before the write lands, so a reader can observe the sentinel
+# existing and ZERO-LENGTH and read back the empty string. This is the exact
+# create-then-write defect class already fixed on the Python side of this
+# very file -- see _wait_for_path(require_nonempty=...) below (task 4776),
+# whose docstring states the general principle; task 5137 applies it to the
+# shell side. It is a DIFFERENT defect from task 1643 (sentinel never
+# written at all), where the file's absence is unambiguous.
+#
+# Racing a real payload to catch that window would produce a test that is
+# itself flaky and can never go reliably RED. This terminal instead makes
+# the state under test a PRECONDITION: it plants the zero-length sentinel
+# itself and exits 0 WITHOUT ever running the payload, so "sentinel exists,
+# content not yet settled" is deterministic in both directions. The
+# exit-0-without-payload idiom is lifted from
+# test_failed_to_start_detected_on_detached_exit0, which uses it to drive
+# the same resolve_detached launch_rc==0 branch.
+#
+# The sentinel path is recovered from the payload text rather than guessed,
+# because spawn-claude.sh picks it with `mktemp -u` and never tells the
+# caller. MEASURED: the regex below yields the same path against BOTH the
+# pre-fix payload (`> /tmp/x.done`) and the post-fix atomic-publish payload
+# (`> /tmp/x.done.tmp && mv -f ...`), because the match stops at `.done` --
+# so this helper is stable across the writer change and needs no rework.
+#
+# {delayed_write} -- either empty (sentinel never settles) or a backgrounded
+#                    `( sleep N; echo C > "$s" )` that publishes a real code
+#                    late, the faithful reproduction of the production race.
+_SENTINEL_PLANTING_TERM_TEMPLATE = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    # Find 'bash' in argv so $3 is the payload, whatever the branch's argv shape.
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "bash" ]]; then
+        break
+      fi
+      shift
+    done
+    # $1=bash  $2=-c  $3=<inner payload>
+    s=$(grep -oE '[^ ]*spawn-claude-[A-Za-z0-9]+\\.done' <<<"$3" | head -1)
+    if [[ -z "$s" ]]; then
+      echo "sentinel-planting terminal: no sentinel path in payload" >&2
+      exit 1
+    fi
+    # Create it ZERO-LENGTH: exactly what `>` leaves behind between the
+    # open()-truncate and the write that has not landed yet.
+    : > "$s"
+    {delayed_write}
+    # Exit 0 WITHOUT running the payload: the launcher reports success, so
+    # resolve_detached takes its launch_rc==0 branch -> await_sentinel
+    # returns immediately (the file exists) -> finish().
+    exit 0
+""")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -376,6 +436,49 @@ def _write_detaching_terminal(
     p.chmod(0o755)
 
 
+def _write_sentinel_planting_terminal(
+    bin_dir: pathlib.Path,
+    name: str,
+    *,
+    delay: float | None = None,
+    code: int | None = None,
+) -> None:
+    """Write a fake detaching terminal that plants a ZERO-LENGTH sentinel.
+
+    Same shape as _write_detaching_terminal: format the module-level
+    template, write it into *bin_dir*, chmod it executable.
+
+    delay=None (the default) -- the sentinel is created empty and NEVER
+    settles, so finish() must fall back to its documented "no usable exit
+    code recovered" verdict rather than propagating the empty string.
+
+    delay/code together -- create the sentinel empty, then publish *code*
+    into it *delay* seconds later from a backgrounded subshell. This is the
+    faithful reproduction of the production race (esc-4389-4): the real
+    session's exit code IS on its way, and a reader that gives up on the
+    first empty read destroys it.
+
+    Both halves exist because existence is the wrong readiness gate for a
+    parsed file -- the same reasoning _wait_for_path(require_nonempty=...)
+    records for the Python side of this suite (task 4776).
+    """
+    if (delay is None) != (code is None):
+        raise AssertionError("delay and code must be given together, or neither")
+    if delay is None:
+        delayed_write = ": # no delayed write -- the sentinel never settles"
+    else:
+        # Fully detached from this shell's stdio so the launcher can exit 0
+        # immediately; spawn-claude.sh's own `wait $!` must not block on it.
+        delayed_write = (
+            f'( sleep {delay}; echo {code} > "$s" ) '
+            "</dev/null >/dev/null 2>&1 &"
+        )
+    script = _SENTINEL_PLANTING_TERM_TEMPLATE.format(delayed_write=delayed_write)
+    p = bin_dir / name
+    p.write_text(script)
+    p.chmod(0o755)
+
+
 def _hermetic_environ() -> dict[str, str]:
     """Return a copy of the process environment with every known ambient
     leak scrubbed -- the shared base for every env-construction site in
@@ -418,6 +521,31 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     # watchdog never scans (or finds stray evidence in) the real
     # ~/.claude/projects tree.
     env["CLAUDE_PROJECTS_DIR"] = str(bin_dir.parent / "projects")
+    return env
+
+
+def _sentinel_test_env(
+    bin_dir: pathlib.Path, terminal_name: str, tmp_path: pathlib.Path
+) -> dict[str, str]:
+    """_base_env plus a test-owned TMPDIR, for the sentinel-content tests.
+
+    spawn-claude.sh picks its sentinel with `mktemp -u -t
+    spawn-claude-XXXXXX.done`, which honours $TMPDIR. Overriding it keeps
+    every sentinel (and the spawn_ref / fts_marker written beside it) inside
+    the test's own tree instead of the host's real /tmp, which matters twice
+    here: these tests deliberately drive paths that leave a sentinel behind,
+    and the atomic-publish test asserts that no `*.done.tmp` REMAINS
+    afterwards -- an assertion that would be meaningless, and could be
+    poisoned by an unrelated concurrent spawn, against a shared /tmp.
+
+    The directory is a plain lowercase-and-hyphen name under *tmp_path* so
+    the resulting sentinel path contains nothing `printf %q` would quote --
+    the payload string is what the planting terminal greps for the path.
+    """
+    env = _base_env(bin_dir, terminal_name)
+    spawn_tmp = tmp_path / "spawntmp"
+    spawn_tmp.mkdir(exist_ok=True)
+    env["TMPDIR"] = str(spawn_tmp)
     return env
 
 
