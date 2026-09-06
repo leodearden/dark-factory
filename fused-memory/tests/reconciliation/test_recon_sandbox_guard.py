@@ -750,9 +750,15 @@ class TestRelativePathContainment:
         by living under a relative extra.
 
         Step 4's assertion is satisfied (the config dir is absolute), so this leaf
-        isolates Face B exactly. Today it returns a wrap: the parent judges the
-        config dir contained by a root the child never actually grants, and every
-        CLI write is denied while the fail-closed check reports PASS.
+        isolates Face B exactly: the ONLY thing standing between the config dir
+        and containment is the relative extra it sits under. That extra is not
+        counted as a writable root, so containment fails and
+        ``resolve_recon_sandbox_wrap`` raises.
+
+        Failing closed here is the point. The alternative — counting the extra —
+        would have the parent judge the config dir contained by a root the child
+        never actually grants, so every CLI write would be denied while the
+        fail-closed check reported PASS.
         """
         parent_cwd = tmp_path / 'parent'
         parent_cwd.mkdir()
@@ -793,6 +799,55 @@ class TestRelativePathContainment:
         assert any('relextra' in rec.getMessage() for rec in caplog.records), (
             f'Dropping a relative extra must emit a warning naming it; got '
             f'{[rec.getMessage() for rec in caplog.records]!r}'
+        )
+
+    def test_a_relative_extra_is_dropped_from_the_grant_not_only_the_verdict(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The verification set and the grant set must not disagree.
+
+        ``_writable_roots`` refusing to COUNT a relative extra is only half the
+        invariant. ``resolve_recon_sandbox_wrap`` also builds the argv, and
+        ``build_landlock_command`` appends each extra VERBATIM — it does no
+        parent-side resolution — so forwarding the unfiltered list would still
+        emit a ``--writable relextra`` token that ``landlock-exec`` honours,
+        resolved in the CHILD's frame. The parent would then be deliberately
+        blind to a grant the child does make, and the drop warning would be a
+        lie about what happened.
+
+        Asserts on the real argv rather than a patched builder: the token is the
+        artefact that actually crosses the process boundary.
+        """
+        parent_cwd = tmp_path / 'parent'
+        child_root = tmp_path / 'child'
+        parent_cwd.mkdir()
+        child_root.mkdir()
+        (parent_cwd / 'relextra').mkdir()
+        absextra = tmp_path / 'absextra'
+        absextra.mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                child_root, ['relextra', str(absextra)],
+            )
+        wrapped = wrap(['claude', '--print'])
+
+        writable_vals = [
+            wrapped[i + 1] for i, tok in enumerate(wrapped) if tok == '--writable'
+        ]
+        assert 'relextra' not in writable_vals, (
+            f'A relative extra must not reach the backend as a --writable token '
+            f'— landlock-exec would resolve it in the child frame, granting a '
+            f'directory the parent never verified; got {writable_vals!r}'
+        )
+        # Control: the absolute sibling is still granted, so the filter is
+        # scoped to relativity and did not narrow the grant wholesale.
+        assert str(absextra) in writable_vals, (
+            f'An absolute extra must still be granted; got {writable_vals!r}'
         )
 
     def test_absolute_extra_is_still_a_writable_root(

@@ -151,36 +151,72 @@ def _writable_roots(cwd: Path, writable_extras: list[str] | None) -> list[str]:
       that as fatal, every reconciliation stage would return an error. That is a
       live foot-gun: relocating the recon config dir under ``<cwd>/.task/`` is the
       alternative the PRD's open question 5 explicitly considers.
-    - A non-absolute extra is DROPPED, and said out loud (task 4592). The
-      ``--writable`` tokens are resolved by ``landlock-exec`` / ``bwrap`` inside
-      the wrapped argv, which ``shared/src/shared/cli_invoke.py::_run_subprocess``
-      spawns with the CHILD's cwd, while every ``os.path.realpath`` in this
-      function runs in the PARENT's. A relative extra therefore names one
-      directory to the verifier and another to the grantor, and counting it would
-      manufacture exactly the false PASS this function exists to prevent — a
-      config dir judged contained by a root the child never grants. ``isabs`` is
-      tested BEFORE ``isdir`` on purpose: ``isdir`` on a relative path is itself a
-      parent-cwd resolution, so letting it decide inclusion would answer the
-      question in the wrong process's frame. Dropping is silent-proof rather than
-      silent because discarding an operator-configured grant without a word is
-      the fail-soft this module was written to end.
+    - A non-absolute extra is DROPPED before any of this, by
+      ``_absolute_writable_extras`` — see there for why, and note that
+      ``resolve_recon_sandbox_wrap`` applies the SAME filter to what it grants, so
+      this function's roots describe the set the child actually gets. The filter
+      runs BEFORE the ``isdir`` test on purpose: ``isdir`` on a relative path is
+      itself a parent-cwd resolution, so letting it decide inclusion would answer
+      the question in the wrong process's frame.
     """
     roots = [os.path.realpath(os.path.join(str(Path(cwd).resolve()), '.task'))]
-    for extra in writable_extras or []:
-        if not os.path.isabs(extra):
-            logger.warning(
-                'sandbox_guard: dropping non-absolute writable extra %r — the '
-                'parent resolves it against ITS cwd (%s) while landlock-exec / '
-                'bwrap resolve the granted --writable token against the CHILD\'s '
-                '(%s), so counting it would certify a directory the child never '
-                'grants. Make the entry in '
-                'reconciliation.sandbox_recon_writable_extras an absolute path.',
-                extra, os.getcwd(), cwd,
-            )
-            continue
+    for extra in _absolute_writable_extras(writable_extras, cwd):
         if os.path.isdir(extra):
             roots.append(os.path.realpath(extra))
     return roots
+
+
+def _absolute_writable_extras(
+    writable_extras: list[str] | None,
+    cwd: Path,
+) -> list[str]:
+    """Return only the ABSOLUTE entries of *writable_extras*, saying so on each drop.
+
+    ONE filter, applied to BOTH sides (task 4592). ``_writable_roots`` uses it to
+    decide what may satisfy containment, and ``resolve_recon_sandbox_wrap`` uses
+    it to decide what is actually handed to ``build_landlock_command`` /
+    ``build_bwrap_command``. That sharing is the point, not an incidental reuse:
+    a relative entry filtered out of the VERDICT but still forwarded to the
+    backend would still be emitted as a ``--writable <rel>`` token, and
+    ``build_landlock_command`` appends each extra VERBATIM (measured — it does no
+    parent-side resolution), so ``landlock-exec`` / ``bwrap`` would still grant
+    it, resolved in the CHILD's frame. The parent would then be deliberately
+    blind to a grant the child does make — conservative in the containment
+    direction, but a state this module has no way to reason about, and it would
+    make this function's own warning a lie about what happened.
+
+    Because the two cwds differ, an honest choice must be made about WHICH frame
+    a relative entry means, and neither answer is safe to guess: resolving it in
+    the parent's frame grants a directory the operator may not have meant, and
+    resolving it in the child's silently re-points the grant whenever
+    ``explore_codebase_root`` moves. So it is dropped from both sides and the
+    operator is told to state the absolute path they meant. The alternative
+    considered and rejected — a raising pydantic validator on
+    ``reconciliation.sandbox_recon_writable_extras`` — would refuse to LOAD a
+    config that starts fine today, taking the whole fused-memory server down on a
+    setting that is empty by default; a per-launch warning has the right blast
+    radius for a defect nobody has yet hit.
+
+    Dropping is loud rather than silent because discarding an operator-configured
+    grant without a word is the fail-soft this module was written to end.
+    """
+    kept: list[str] = []
+    for extra in writable_extras or []:
+        if not os.path.isabs(extra):
+            logger.warning(
+                'sandbox_guard: dropping non-absolute writable extra %r — from '
+                'the containment accounting AND from the --writable grant handed '
+                'to landlock-exec / bwrap. The parent resolves it against ITS '
+                'cwd (%s) while the backends resolve the granted token against '
+                'the CHILD\'s (%s), so honouring it would grant one directory '
+                'and certify another. Make the entry in '
+                'reconciliation.sandbox_recon_writable_extras an absolute path; '
+                'nothing is granted for it until you do.',
+                extra, os.getcwd(), cwd,
+            )
+            continue
+        kept.append(extra)
+    return kept
 
 
 def _assert_config_dir_writable(
@@ -288,14 +324,18 @@ def resolve_recon_sandbox_wrap(
              set (e.g. a uvx/pip cache dir used by a stdio MCP server, or —
              for recon stages — the per-run ``CLAUDE_CONFIG_DIR``, appended by
              ``cli_stage_runner.run_stage_via_cli``).
-             These are passed through to the underlying backend's
-             ``writable_extras`` parameter.
+             ABSOLUTE entries are passed through to the underlying backend's
+             ``writable_extras`` parameter; non-absolute ones are dropped with a
+             warning, from the grant AND from the containment verdict alike (see
+             ``_absolute_writable_extras``).
         config_dir: Optional per-run ``CLAUDE_CONFIG_DIR`` (task 4003). When
              given, this function VERIFIES that the path is contained in the
              writable set that will be built and raises otherwise — it does not
              grant it; granting is the caller's job (policy in the caller,
-             verification here). ``None`` skips the check entirely, keeping the
-             generic and non-recon call sites byte-identical.
+             verification here). ``None`` skips the check entirely. The
+             absolute-extras filter above still applies when ``config_dir`` is
+             ``None`` — it governs the grant, not the check — so a caller passing
+             only absolute extras (every one in this repo) is unaffected.
 
     Returns:
         A ``Callable[[list[str]], list[str]]`` that wraps the inner argv.
@@ -311,8 +351,17 @@ def resolve_recon_sandbox_wrap(
     # each existing extra — notably NOT /tmp, which bwrap replaces with a fresh
     # tmpfs; see `_writable_roots`). Checking here rather than inside each branch
     # means a future third backend cannot be added without inheriting it.
+    #
+    # The filter runs ONCE, before both, so the set this function VERIFIES and
+    # the set it GRANTS are the same object (task 4592 amendment). Forwarding the
+    # unfiltered list to the backends while verifying the filtered one would
+    # leave the parent blind to a real grant: `build_landlock_command` appends
+    # each extra verbatim, so a relative `--writable <rel>` token would still
+    # reach `landlock-exec` and still be honoured — in the CHILD's frame.
+    granted_extras = _absolute_writable_extras(writable_extras, cwd)
+
     if config_dir is not None:
-        _assert_config_dir_writable(config_dir, cwd, writable_extras)
+        _assert_config_dir_writable(config_dir, cwd, granted_extras)
 
     # ── Landlock branch ───────────────────────────────────────────────────────
     try:
@@ -334,7 +383,7 @@ def resolve_recon_sandbox_wrap(
         # built-in scratch (/tmp, ~/.claude, /dev) and the gitignored .task/
         # subdirectory of cwd (added unconditionally by build_landlock_command).
         def _landlock_wrap(cmd: list[str]) -> list[str]:
-            return build_landlock_command(cmd, cwd, [], writable_extras=writable_extras)
+            return build_landlock_command(cmd, cwd, [], writable_extras=granted_extras)
         return _landlock_wrap
 
     # ── bwrap fallback ────────────────────────────────────────────────────────
@@ -352,7 +401,7 @@ def resolve_recon_sandbox_wrap(
 
     if is_bwrap_available():
         def _bwrap_wrap(cmd: list[str]) -> list[str]:
-            return build_bwrap_command(cmd, cwd, [], writable_extras=writable_extras)
+            return build_bwrap_command(cmd, cwd, [], writable_extras=granted_extras)
         return _bwrap_wrap
 
     # ── Fail-closed: neither backend available ────────────────────────────────
