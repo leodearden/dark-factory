@@ -194,3 +194,36 @@ def rebuild_summary(
         f'Gate task {task_id} has awaited a human decision beyond the '
         f'{threshold_secs / 3600:.0f}h gate-backlog threshold'
     )
+
+
+def rebuild_detail(detail: str) -> str:
+    """Rename the legacy ``age_hours: `` key to ``age_hours_at_filing: ``.
+
+    Renames the FIRST such line's KEY only.  The value remainder, the line's
+    position, the line count, and EVERY other line are byte-identical — line 0
+    above all, because ``escalation/src/escalation/dedupe.py::gate_backlog_fingerprint_key``
+    recovers a legacy record's entire fold identity from
+    ``detail.split('\\n', 1)[0]``.  Disturbing that line would make the record a
+    permanently non-folding parent that mints a duplicate every Stage-1 cycle.
+    (That is not left to inspection: ``plan_rewrites`` machine-checks the
+    fingerprint across the rewrite and fails closed.)
+
+    The value is renamed rather than recomputed: post-3520 the emitter writes
+    ``age_hours_at_filing``, a FILING-TIME forensic value that goes stale on
+    purpose, so the number this record already carries is the correct one — the
+    old key merely misnamed it as if it were current.
+
+    Matching is a line-start prefix test with an explicit
+    ``_CANONICAL_AGE_PREFIX`` exclusion.  ``'age_hours_at_filing: 1.0'`` also
+    starts with ``'age_hours'``, so without the exclusion an already-normalised
+    line would be re-prefixed into ``age_hours_at_filing_at_filing:``; with it,
+    the already-normalised case is a true no-op and the whole function is
+    idempotent.  Returns *detail* unchanged when no legacy line exists.
+    """
+    lines = (detail or '').split('\n')
+    for i, line in enumerate(lines):
+        if line.startswith(_CANONICAL_AGE_PREFIX) or not line.startswith(_LEGACY_AGE_PREFIX):
+            continue
+        lines[i] = _CANONICAL_AGE_PREFIX + line[len(_LEGACY_AGE_PREFIX):]
+        return '\n'.join(lines)
+    return detail
