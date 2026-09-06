@@ -51,6 +51,10 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_config_base_dir,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.finding_task_escalation import (
+    build_finding_task_escalation_kwargs,
+    resolve_finding_task_target,
+)
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -94,7 +98,10 @@ from fused_memory.services.live_workflow_detector import (
     is_workflow_live_for_task,
 )
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.services.orchestrator_detector import orchestrator_started_at
+from fused_memory.services.orchestrator_detector import (
+    is_orchestrator_live_for,
+    orchestrator_started_at,
+)
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -206,6 +213,13 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # escalates within a watchable window (≈ 10–180 minutes depending on cycle
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
+
+# Task 4821: the per-project ORCHESTRATOR escalation queue, relative to a
+# project_root.  DISTINCT from the recon queue (`config.escalation_queue_dir`,
+# drained by the port-8103 watcher) that `_escalate` writes to.  Same spelling
+# and same convention as `targeted.py::_ESCALATION_QUEUE_DIRNAME`,
+# `scope_violation_escalator.py` and `ticket_janitor.py`.
+_ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME = 'data/escalations'
 
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
@@ -2696,6 +2710,120 @@ class ReconciliationHarness:
             submit_or_dedupe(queue, esc, _RECON_DEDUP_CONFIG)  # type: ignore[possibly-undefined]
         except Exception as e:
             logger.warning(f'Failed to submit escalation: {e}')
+
+    def _file_finding_task_escalation(
+        self,
+        project_id: str,
+        run_id: str,
+        finding: dict,
+        persistence: int,
+    ) -> str | None:
+        """File an L1 for *finding* on its named task's ORCHESTRATOR queue.
+
+        The counterpart to :meth:`_escalate`, and deliberately NOT a
+        replacement for it (task 4821 / task 4764 arm 3).  ``_escalate`` writes
+        the RECON queue (``config.escalation_queue_dir``, port-8103 watcher)
+        under a synthetic ``recon-<run8>`` task id; this writes
+        ``<project_root>/data/escalations`` — the per-project ORCHESTRATOR
+        queue — under the finding's REAL task id, so a finding that names a
+        task surfaces on that task's own ladder instead of dead-ending in a
+        queue nobody reading the task would look at.
+
+        Returns the escalation id, or None when nothing was filed.  Every
+        no-file path is a deliberate gate:
+
+        - the finding names no same-project task (see
+          :func:`~fused_memory.reconciliation.finding_task_escalation.resolve_finding_task_target`);
+        - the project is not registered in ``_known_projects``;
+        - no orchestrator is live for that root, so nothing would drain the
+          record.
+
+        FAIL-SAFE: a queue hiccup is logged and swallowed — a reconciliation
+        cycle is never aborted by a failed filing (mirroring
+        ``targeted.py::ReconciliationHandler._sweep_escalate_l1``, from which
+        this is otherwise transcribed).
+
+        A7b note: this WRITES but never RESOLVES, and the queue it writes is
+        NOT the recon queue the A7b invariant governs — see the contract block
+        at the top of this module.
+        """
+        # Mirrors _escalate's guard: on ImportError the module-level names are
+        # left UNBOUND (not set to None as in targeted.py), so `HAS_ESCALATION`
+        # is the only safe check here and the accesses below carry
+        # `possibly-undefined` ignores.
+        if not HAS_ESCALATION:
+            return None
+
+        task_id = resolve_finding_task_target(finding, project_id)
+        if task_id is None:
+            logger.debug(
+                'reconciliation.finding_task_escalation_no_target',
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'finding_category': finding.get('category', ''),
+                },
+            )
+            return None
+
+        project_root = self._resolve_known_root(project_id)
+        if project_root is None:
+            logger.debug(
+                'reconciliation.finding_task_escalation_unknown_project',
+                extra={'project_id': project_id, 'run_id': run_id, 'task_id': task_id},
+            )
+            return None
+
+        # Do not pile records into a queue no orchestrator is draining.  This
+        # probe never raises and fails safe to False (missing lock file,
+        # unparseable PID, dead PID), so an ambiguous environment yields no
+        # filing rather than a spurious one.
+        if not is_orchestrator_live_for(project_root):
+            logger.debug(
+                'reconciliation.finding_task_escalation_orchestrator_not_live',
+                extra={'project_id': project_id, 'run_id': run_id, 'task_id': task_id},
+            )
+            return None
+
+        try:
+            # Constructed LAZILY, only after every gate above has passed:
+            # `EscalationQueue.__init__` does a `mkdir(parents=True,
+            # exist_ok=True)`, so building it earlier would create a spurious
+            # `data/escalations` directory under a project that never files
+            # (targeted.py defers construction for exactly this reason).
+            queue = EscalationQueue(  # type: ignore[possibly-undefined]
+                Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
+            )
+            esc = Escalation(  # type: ignore[possibly-undefined]
+                id=queue.make_id(task_id),
+                **build_finding_task_escalation_kwargs(
+                    finding,
+                    task_id=task_id,
+                    project_id=project_id,
+                    run_id=run_id,
+                    persistence=persistence,
+                ),
+            )
+            esc_id: str = queue.submit(esc)
+        except Exception as e:
+            logger.warning(
+                'reconciliation: orchestrator-queue L1 filing failed for task %s '
+                '(project %s, run %s): %s',
+                task_id, project_id, run_id, e,
+            )
+            return None
+        logger.info(
+            'reconciliation.finding_task_escalation_filed',
+            extra={
+                'project_id': project_id,
+                'run_id': run_id,
+                'task_id': task_id,
+                'escalation_id': esc_id,
+                'finding_category': finding.get('category', ''),
+                'persistence': persistence,
+            },
+        )
+        return esc_id
 
     # ── Tier selection ─────────────────────────────────────────────────
 
