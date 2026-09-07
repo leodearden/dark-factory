@@ -3260,9 +3260,10 @@ def create_mcp_server(
         DETECTS that your write contradicts the memory it names, it does not
         adjudicate which of the two is right. Your full text is stored and
         readable in the canonical's grouped document (amendment text is
-        digested there; sighting text is only counted), the flag is picked up
-        by the existing gate machinery, and the memory you contradict is left
-        untouched for a human to settle. Getting a ``contested`` ack is not a
+        digested there; sighting text is only counted) and marked as
+        contesting it, and the memory you contradict is left untouched. No
+        adjudication is scheduled and nothing is escalated: the flag is a
+        marker a human reads, not a work item anything picks up. Getting a ``contested`` ack is not a
         rejection and needs no action from you — but it is the ack worth
         reading, because it says the corpus now holds two claims that cannot
         both be true.
@@ -3696,9 +3697,16 @@ def create_mcp_server(
                 # flagged in a way nothing reads.
                 #
                 # Triage DETECTS the contradiction; it does not adjudicate it
-                # (D3). The flag is a marker for the existing gate machinery
-                # and a human, and the canonical it contradicts is left
-                # exactly as it was.
+                # (D3). What the flag actually does, measured rather than
+                # assumed: the only consumer of CONTESTED_METADATA_KEY /
+                # is_contested_child is grouped_read's READ-SIDE suppression,
+                # which keeps the submitted text visible and digested in the
+                # canonical's grouped document while marking it as contesting.
+                # There is no gate, no escalation and no operator surface --
+                # reconciliation/consolidation_gate.py keys on a DIFFERENT
+                # metadata key (x_recon_consolidation_gate) and never reads
+                # this one. The canonical it contradicts is left exactly as it
+                # was, and nothing is scheduled to settle the disagreement.
                 write_meta[CONTESTED_METADATA_KEY] = True
         try:
             result = await memory_service.add_memory(
