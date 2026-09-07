@@ -467,6 +467,55 @@ since the last verified fleet deploy, and whether a merge is currently
 in-flight (which would defer the next drain-aware redeploy) — reach for it
 before manually restarting anything.
 
+## 12. Optional: a remote merge-verify host
+
+By default every merge verify runs locally, on the same host as the
+orchestrator. A project under enough load to want a second machine's CPU can
+instead register a `verify_runners` entry (workstation-side config — see
+"What stays on the workstation" below) that dispatches merge verification to
+a second host over ssh. This is an optional throughput lever, not a
+requirement for a working install — skip this section unless you need it.
+
+### What lives on the remote host
+
+- **The project checkout**, at a fixed path (e.g. `~/src/<project>`), kept in
+  sync with the dispatching workstation's `main` (see "Provisioning the
+  remote host" below for how it gets refreshed). It is a full clone that the
+  remote runs commands directly against, not a worktree.
+- **`receive.denyCurrentBranch = updateInstead`**, set on that checkout
+  (`git config receive.denyCurrentBranch updateInstead`). This is required
+  because the dispatcher's best-effort keep-alive push targets
+  `main:refs/heads/main` — the branch the remote checkout has checked out,
+  which git refuses to accept a push to by default. `updateInstead` tells
+  git to update the working tree in place instead of rejecting the push. The
+  **load-bearing** push — the actual commit under verification — goes to a
+  separate, namespaced ref instead, `refs/merge-verify/<request-id>`, which
+  is never checked out and so needs no such configuration.
+- **A PATH wrapper** for the orchestrator CLI (e.g.
+  `/usr/local/bin/orchestrator`), needed because a non-interactive
+  `ssh host cmd` does not source `~/.bashrc`/`~/.profile`, so a bare
+  `orchestrator` would not otherwise resolve on PATH. The wrapper only needs
+  to export the directories the verify subprocesses require (toolchain
+  bins, package-manager shims, …) and `exec` the checkout's own venv entry
+  point:
+  ```bash
+  #!/bin/bash
+  export PATH="<toolchain-bin-dirs>:$PATH"
+  exec <path-to-checkout>/.venv/bin/orchestrator "$@"
+  ```
+  Keep the wrapper bare — the liveness probe the dispatcher uses
+  (`orchestrator verify-merge --help`, unqualified) is deliberately
+  unqualified so it exercises the exact same PATH resolution a real dispatch
+  does; wrapping the probe in `uv run` or an absolute `.venv/bin` path would
+  test something weaker than what actually runs.
+
+**A Dark-Factory code checkout on a shared verify host backs every project
+whose `verify_runners` entry points at it.** Refreshing the checkout (the
+next subsection) upgrades all of them at once, atomically, whether they are
+ready for it or not — and must never be done while a verify is in flight on
+that host, since the checkout is the code a live verify is currently
+executing.
+
 ---
 
 For hot-reloading config without a restart, understanding the fleet-redeploy
