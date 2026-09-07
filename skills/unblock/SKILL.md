@@ -430,8 +430,19 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # (dropping it here would resurrect the spin-forever bug this tuple exists to fix), but it
      # is submission-scoped ONLY on the request_id arm — on branch/task_id it is subject to the
      # same UNSCOPED-HANDLE STALENESS GUARD as every other non-done terminal below.
-     terminal = ("done", "conflict", "blocked", "abandoned", "superseded") if poll_by == "branch" \
-         else ("done", "conflict", "blocked", "abandoned", "unknown", "superseded")
+     # merge-state-vocab:begin partition=TERMINAL_STATES
+     #   Mirrors shared/src/shared/merge_state.py::TERMINAL_STATES. Pinned by
+     #   scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+     #   and this tuple goes red until it matches.
+     if poll_by == "branch":
+         terminal = ("done", "conflict", "blocked", "abandoned", "superseded")
+     # merge-state-vocab:end
+     # merge-state-vocab:begin partition=POLL_STOP_STATES
+     #   Mirrors shared/src/shared/merge_state.py::POLL_STOP_STATES (TERMINAL_STATES
+     #   plus `unknown`). Pinned by the same guard.
+     else:
+         terminal = ("done", "conflict", "blocked", "abandoned", "unknown", "superseded")
+     # merge-state-vocab:end
      # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
      # terminal `done` (see accept_terminal), and a durable tier re-serves the same stale
      # record every tick, so without a floor the loop would spin forever. request_id is
