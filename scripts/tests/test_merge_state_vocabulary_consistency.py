@@ -1268,3 +1268,140 @@ def test_tracked_skill_markdown_fails_loudly_without_the_git_oracle(tmp_path: Pa
         tracked_skill_markdown(root=tmp_path)
 
     assert str(tmp_path) in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# LIVE assertions. Every one re-reads the committed artifact fresh — never a
+# snapshot taken at import time — and is parametrised over `PINNED_SITES` so a
+# failure names the file that drifted rather than "some site".
+# ---------------------------------------------------------------------------
+
+
+def _is_tracked(relative_path: str) -> bool:
+    """Is *relative_path* in the repo's index?
+
+    Uses the same tracked-file oracle as the registry scan, so a registered site
+    and a scanned one cannot disagree about what "exists" means.
+    """
+    completed = subprocess.run(
+        ["git", "ls-files", "-z", "--", relative_path],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+        env=_scrubbed_git_env(),
+    )
+    return bool(completed.stdout.strip("\0").strip())
+
+
+@pytest.mark.parametrize("relative_path", sorted(PINNED_SITES))
+def test_pinned_sites_all_exist(relative_path: str) -> None:
+    """Every registered path is tracked and present.
+
+    A renamed or deleted site must not silently drop out of the registry: with
+    the path gone, its span assertions would either error for an unrelated
+    reason or — worse, if the registry were ever made forgiving — quietly stop
+    checking a file that still restates the vocabulary under a new name.
+    """
+    assert _is_tracked(relative_path), (
+        f"{relative_path} is in PINNED_SITES but is not tracked by git (task 4829) — "
+        f"{PINNED_SITES[relative_path]}. Either the file was renamed (update the "
+        f"registry) or it was deleted (drop the entry)."
+    )
+    assert (REPO_ROOT / relative_path).is_file(), (
+        f"{relative_path} is tracked but missing from the worktree (task 4829)."
+    )
+
+
+@pytest.mark.parametrize("relative_path", sorted(PINNED_SITES))
+def test_every_pinned_site_carries_at_least_one_span(relative_path: str) -> None:
+    """Each registered site still carries its `merge-state-vocab` markers.
+
+    Separated from the equality check below because the two failures mean
+    different things: a MISSING span means the pin itself was lost (the list is
+    now free to drift with nothing red), while a mismatched span means the pin
+    is working and caught something.
+    """
+    text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+    spans = extract_spans(text, source=relative_path)
+
+    assert spans, f"{relative_path}: no spans — {PINNED_SITES[relative_path]}"
+
+
+@pytest.mark.parametrize("relative_path", sorted(PINNED_SITES))
+def test_every_span_matches_its_partition(relative_path: str) -> None:
+    """THE drift assertion (PRD B9): every pinned list equals its partition exactly.
+
+    This is the mechanism the capability manifest binds. Because every partition
+    in `shared/src/shared/merge_state.py` is DERIVED rather than hand-listed, and
+    `OUTCOME_STATES | EPISTEMIC_STATES` is asserted exhaustive and disjoint over
+    `MergeState` in `shared/tests/test_merge_state.py`, adding a member to either
+    enum forces a partition assignment — which in turn reddens every prose span
+    pinned to that partition. The chain runs through the partitions, so no
+    hand-copied master list sits anywhere in it.
+    """
+    partitions = load_vocabulary()
+    values_filter = vocabulary_values(partitions)
+    text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+    for partition_name, body in extract_spans(text, source=relative_path):
+        values = extract_values(body, values_filter, source=relative_path)
+        assert_span_matches(
+            values,
+            partitions[partition_name],
+            source=relative_path,
+            partition_name=partition_name,
+        )
+
+
+def test_registry_is_complete() -> None:
+    """No tracked `skills/` markdown enumerates the vocabulary without being pinned.
+
+    The registry is not trusted — it is checked against a scan. This is what stops
+    this guard from developing the very defect it exists to prevent: a new runbook
+    restating the vocabulary, green today, stale on the next member.
+    """
+    unregistered = find_unregistered_sites()
+
+    if unregistered:
+        discriminating = discriminating_tokens(load_vocabulary())
+        detail = []
+        for label in unregistered:
+            text = (REPO_ROOT / label).read_text(encoding="utf-8")
+            found = sorted({t for t in _TOKEN_RE.findall(text) if t in discriminating})
+            detail.append(f"{label}: {len(found)} distinct — {found!r}")
+        raise AssertionError(
+            "tracked `skills/` markdown enumerating >= "
+            f"{_ENUMERATION_THRESHOLD} distinct discriminating merge-state values "
+            f"without being registered (task 4829):\n  " + "\n  ".join(detail) + "\n"
+            "Either wrap each list in a `merge-state-vocab` span and add the file to "
+            "PINNED_SITES, or — if the list is a deliberately NARROWED arm rule "
+            "rather than a copy of a vocabulary — add it to _UNPINNED_RULE_SITES "
+            "with the reason, as `skills/orchestrate/SKILL.md` is."
+        )
+
+
+@pytest.mark.parametrize("relative_path", sorted(_UNPINNED_RULE_SITES))
+def test_declared_rule_sites_are_tracked_and_span_free(relative_path: str) -> None:
+    """The rule-site exclusion cannot silently absorb a real pinned list.
+
+    Two ways an escape hatch rots, both closed here: the file is renamed and the
+    exclusion starts covering nothing (checked as trackedness), or somebody wraps
+    a genuine vocabulary list in that file and the exclusion keeps the registry
+    scan from ever noticing (checked by requiring NO span — a file with a span
+    belongs in PINNED_SITES, where its span is compared against its partition).
+    """
+    assert _is_tracked(relative_path), (
+        f"{relative_path} is in _UNPINNED_RULE_SITES but is not tracked (task 4829) — "
+        f"{_UNPINNED_RULE_SITES[relative_path]}. A stale exclusion covers nothing "
+        f"while reading as though the file were reviewed."
+    )
+    text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    assert _BEGIN_MARKER not in text, (
+        f"{relative_path} is excluded from the registry scan as an arm-rule site, but "
+        f"now carries a `{_BEGIN_MARKER}` span (task 4829). A file with a span must be "
+        f"in PINNED_SITES so the span is actually compared against its partition — "
+        f"otherwise the span is decoration. Move the entry."
+    )
