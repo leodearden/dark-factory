@@ -146,7 +146,9 @@ _TASK_NODE_NAME_PATTERN = re.compile(
 # the character onward as data, which is why the fix is an explicit class and
 # not re.ASCII: re.ASCII would re-scope '\d', '\s' and '\w' at once, three
 # separately-reasoned axes for the price of one.
-_QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*([0-9]+)\s*$')
+_QUALIFIED_NODE_NAME_PATTERN = re.compile(
+    r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)\s*$'
+)
 
 # Task-vocabulary words are never project ids. Matched with fullmatch() against
 # the CANONICALIZED qualifier, so every spelling ('Task', 'TASK', 'sub-task',
