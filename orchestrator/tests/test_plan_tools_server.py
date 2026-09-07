@@ -12,7 +12,7 @@ import pytest
 from fastmcp import FastMCP
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_markup_stamp, plan_tools
 from orchestrator.mcp.plan_tools import (
     _add_design_decision,
     _add_plan_step,
@@ -547,6 +547,89 @@ class TestConfirmPlan:
         assert result['status'] == 'error'
         assert 'files' in result['message'].lower()
         assert '_finalized_at' not in artifacts.read_plan()
+
+
+class TestConfirmPlanSurfacesTheRejectionCounter:
+    """The architect's LAST tool result is where a loss reaches the transcript.
+
+    Task 4597. The block is already on disk by the time confirm_plan runs, but
+    a plan-tools tool result lands in the durable agent transcript — and that
+    is the one surface where the architect itself, mid-session, can still see
+    that calls it believed it made were refused. Hence a compact summary here
+    despite the block sitting two keys away in the document.
+    """
+
+    def _stamp(self, artifacts, **overrides):
+        """Put a rejection block on the plan, through the real algebra."""
+        plan = artifacts.read_plan()
+        block = plan_markup_stamp.merge_block(
+            plan_markup_stamp.block_of({
+                'ts': '2026-09-07T00:00:00+00:00',
+                'tool': 'add_design_decision',
+                'param': 'decision',
+                'outcome': 'rejected',
+            }),
+            plan_markup_stamp.block_of({
+                'ts': '2026-09-07T00:00:05+00:00',
+                'tool': 'add_reuse_item',
+                'param': 'how',
+                'outcome': 'unrepairable',
+            }),
+        )
+        block.update(overrides)
+        plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = block
+        artifacts.write_plan(plan)
+
+    def test_a_stamped_plan_reports_count_and_by_tool(self, artifacts):
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'ok'
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_the_summary_carries_no_events_and_no_note(self, artifacts):
+        """A SIGNAL to the architect, not a second copy of the block.
+
+        Echoing the events back would put the block's bulk into the response
+        that is already the largest thing the architect reads at the end of a
+        session, to say something the two numbers already say.
+        """
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert set(result['markup_rejections']) == {'count', 'by_tool'}
+
+    def test_it_composes_with_the_existing_response_keys(self, artifacts):
+        """Purely ADDITIVE — the documented envelope keeps its keys."""
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['finalized'] is True
+        assert result['steps'] == 3
+        assert result['files'] == 2
+
+    def test_an_unstamped_plan_response_is_byte_identical_to_today(self, artifacts):
+        """The omit-when-absent convention ``_with_markup_repairs`` keeps.
+
+        Absent, not present-and-zero. The overwhelming majority of plans refuse
+        nothing, and those responses must stay exactly what every existing
+        caller and every existing assertion already sees.
+        """
+        _setup_full_plan(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert 'markup_rejections' not in result
+        assert set(result) == {'status', 'finalized', 'steps', 'files'}
 
 
 class TestReportBlockingDependency:
