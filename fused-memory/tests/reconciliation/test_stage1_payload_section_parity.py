@@ -87,7 +87,7 @@ from fused_memory.reconciliation.stages.memory_consolidator import (
     RequiredSection,
 )
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
-from reconciliation.test_stage1 import _make_consolidator
+from reconciliation.consolidator_fixtures import make_consolidator
 
 CONSOLIDATOR_SRC = pathlib.Path(consolidator_module.__file__)
 AGGREGATOR = '_render_required_sections'
@@ -343,7 +343,7 @@ class TestRenderRequiredSections:
 
         monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
 
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree(
             [
                 {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'},
@@ -383,7 +383,7 @@ class TestRenderRequiredSections:
         their real headers is pinned by
         :meth:`test_renders_every_registry_header_when_all_sections_apply`.
         """
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
         # Instance attributes, so getattr(self, section.renderer)() dispatches to
         # them exactly as it does to real bound methods.
         monkeypatch.setattr(stage, '_stub_alpha', lambda: '\n### Alpha\nfirst\n', raising=False)
@@ -409,9 +409,9 @@ class TestRenderRequiredSections:
         )
 
     def test_returns_empty_string_when_no_section_applies(self):
-        # filtered_task_tree left at the _make_consolidator default (None), so
+        # filtered_task_tree left at the make_consolidator default (None), so
         # every registry renderer's guard fails.
-        stage = _make_consolidator(project_root='/project')
+        stage = make_consolidator(project_root='/project')
 
         rendered = stage._render_required_sections()
 
