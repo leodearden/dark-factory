@@ -2268,6 +2268,151 @@ class TestSessionResumeReasons:
         assert reasons == frozenset()
 
 
+    # ── δ (task 3730 / D3): the absolute backstop — "archive outranks age"
+    #    must not become "no age limit at all" ────────────────────────────
+
+    def _aged(self, cfg: SessionResumeConfig, age_secs: float) -> dict:
+        """A sidecar back-dated *age_secs*, driven off the config knobs."""
+        return {
+            'session_id': 'uuid-aged',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=age_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+
+    def test_aged_out_rejects_even_an_archived_session(self, harness: Harness):
+        """(a) B9 HEADLINE — reachability outranks FRESHNESS, not the BACKSTOP.
+
+        Past absolute_resume_age_secs a session is rejected however reachable
+        it is, and reports 'aged_out'. Without this leg D2 would read as "an
+        archive exempts a session from age entirely", and a sidecar surviving
+        an arbitrarily long outage would resume into a world that had moved on.
+
+        Back-dated off the CONFIG FIELD rather than a literal, so a re-tuned
+        bound re-tunes this row with it.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = self._aged(cfg, 2 * cfg.absolute_resume_age_secs)
+
+        reasons = harness._session_resume_reasons(
+            session, None, archive_available=True
+        )
+
+        assert 'aged_out' in reasons
+        assert reasons  # ineligible, whatever else co-occurs
+
+    def test_aged_out_boundary_is_closed_at_the_bound(self, harness: Harness):
+        """(b) `>=`, matching the freshness leg's existing convention.
+
+        AT the bound is rejected; comfortably below it, with an archive, is
+        eligible — which also proves this row is exercising the BACKSTOP and
+        not the freshness window it sits above.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+
+        at_bound = harness._session_resume_reasons(
+            self._aged(cfg, cfg.absolute_resume_age_secs),
+            None,
+            archive_available=True,
+        )
+        assert 'aged_out' in at_bound
+
+        below = harness._session_resume_reasons(
+            self._aged(cfg, cfg.absolute_resume_age_secs - 3600),
+            None,
+            archive_available=True,
+        )
+        assert below == frozenset()
+
+    def test_aged_out_co_occurs_rather_than_replacing(self, harness: Harness):
+        """(c) D5 survives the new token: aged out AND capped reports BOTH.
+
+        The predicate accumulates; a new leg that returned early would undo
+        exactly the co-occurrence reporting task 3728 exists to provide.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = self._aged(cfg, 2 * cfg.absolute_resume_age_secs)
+        session['resume_count'] = cfg.max_resumes_per_task
+
+        reasons = harness._session_resume_reasons(
+            session, None, archive_available=True
+        )
+
+        assert 'aged_out' in reasons
+        assert 'capped' in reasons
+
+    @pytest.mark.parametrize(
+        'started_at',
+        ['not-a-date', None, 12345, ['2026-01-01']],
+        ids=['unparseable', 'none', 'int', 'list'],
+    )
+    def test_an_undateable_session_is_never_laundered_by_the_archive(
+        self, harness: Harness, started_at
+    ):
+        """(d) THE FAIL-SAFE CARVE-OUT — an archive cannot redeem an UNDATEABLE
+        sidecar.
+
+        D2's argument for suppressing 'stale' is that an archived transcript
+        does not decay with wall-clock, so age is the wrong question. That
+        applies only to a session whose age we KNOW. With started_at missing,
+        unparseable or the wrong type the age is unknown, so nothing bounds it
+        — and the D3 backstop cannot be evaluated either, because there is no
+        age to compare against. Suppressing 'stale' here would make an
+        undateable sidecar FULLY ELIGIBLE on the strength of an archive: a
+        fail-OPEN regression against the I3 contract.
+
+        The sharpest way to get δ wrong is to write the suppression as a
+        single `if not archive_available` around the whole freshness leg,
+        which passes every other row in this class. This is the row that
+        catches it.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {'session_id': 'uuid-undateable', 'role': 'r',
+                   'resume_count': 0}
+        if started_at is not None:
+            session['started_at'] = started_at
+
+        reasons = harness._session_resume_reasons(
+            session, None, archive_available=True
+        )
+
+        assert 'stale' in reasons, (
+            'an undateable sidecar must stay ineligible however reachable it '
+            'is: its age cannot be bounded and the absolute backstop cannot '
+            'be evaluated, so nothing is left to stop it resuming'
+        )
+        # ...and the backstop is NOT claimed, because nothing was compared.
+        assert 'aged_out' not in reasons
+
+    def test_no_archive_reports_both_thresholds_separately(self, harness: Harness):
+        """(e) On the no-archive path an aged-out session reports 'stale' AND
+        'aged_out', so a runs.db census can still tell the two apart.
+
+        They answer different operator questions and are actioned differently:
+        'stale' is "old, with no archive to redeem it" (worth asking why the
+        archive is missing — the U2 population), 'aged_out' is "old past the
+        point resuming is safe regardless of reachability" (the backstop
+        working). Collapsing them into one token would destroy the
+        co-occurrence census D5 built the reason SET to enable.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+
+        reasons = harness._session_resume_reasons(
+            self._aged(cfg, 2 * cfg.absolute_resume_age_secs),
+            None,
+            archive_available=False,
+        )
+
+        assert 'stale' in reasons
+        assert 'aged_out' in reasons
+
+
 @pytest.mark.asyncio
 class TestSessionResumeGuard:
     """γ eligibility guard in _run_slot (task 2774): an ineligible recovered
