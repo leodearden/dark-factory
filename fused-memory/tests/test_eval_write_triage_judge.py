@@ -409,6 +409,30 @@ def _cases(*specs: tuple[str, str]) -> list[dict]:
     return out
 
 
+class TestEvalOutcomes:
+    """The confusion table's OTHER axis, and why it is a tuple too.
+
+    `EVAL_CLASSES` already exists for the class axis, with a comment saying
+    one list feeding two consumers is what keeps "not measured" and "measured
+    perfect" distinguishable. `TRIAGE_OUTCOMES` is a frozenset, whose
+    iteration order varies with PYTHONHASHSEED — and this script's output is a
+    COMMITTED artifact read by an operator at the task-3169 flip gate. Item 2
+    of `scripts/check_write_triage_flip_preconditions.sh` is exactly this.
+    """
+
+    def test_the_outcome_order_is_derived_and_sorted(self) -> None:
+        assert _mod().EVAL_OUTCOMES == tuple(sorted(TRIAGE_OUTCOMES))
+
+    def test_no_outcome_is_added_or_dropped_on_the_way(self) -> None:
+        """Derived, not hand-written: a fifth outcome joins the report itself.
+
+        A hand-spelled tuple would be a second list to keep in sync with
+        `write_triage.TRIAGE_OUTCOMES` — the very drift `EVAL_CLASSES`' own
+        comment says the shared list prevents.
+        """
+        assert set(_mod().EVAL_OUTCOMES) == set(TRIAGE_OUTCOMES)
+
+
 class TestScoreCases:
     """Counting only — every judgment call was made in the table above."""
 
@@ -448,6 +472,19 @@ class TestScoreCases:
         cases = _cases(('a', 'duplicate'), ('b', 'pseudo_contradiction'))
         got = _mod().score_cases(cases, [OUTCOME_STORED, OUTCOME_CONTESTED])
         assert set(got['confusion']) == set(_mod().EVAL_CLASSES)
+
+    def test_every_confusion_row_is_keyed_in_eval_outcome_order(self) -> None:
+        """Order, not membership: `list(row)`, never `set(row)`.
+
+        The rows are serialized to the committed JSON verbatim, so a row whose
+        key order follows a frozenset's iteration order makes two identical
+        runs produce two different artifacts — and the markdown the operator
+        reads stops being provably the render of the JSON beside it.
+        """
+        cases = _cases(('a', 'duplicate'), ('b', 'distinct'))
+        got = _mod().score_cases(cases, [OUTCOME_RESTATED, OUTCOME_STORED])
+        for name, row in got['confusion'].items():
+            assert list(row) == list(_mod().EVAL_OUTCOMES), name
         for name, row in got['confusion'].items():
             assert set(row) == set(TRIAGE_OUTCOMES), name
         assert got['confusion']['duplicate'][OUTCOME_STORED] == 1
@@ -668,6 +705,54 @@ class TestRenderMarkdown:
             _mod().build_report(scored=scored, provenance=dict(_PROVENANCE)),
         )
         assert self._row_cells(md, 'distinct')['accuracy'] == 'None'
+
+    @staticmethod
+    def _section(md: str, heading: str) -> str:
+        """The lines under ``## heading``, up to the next ``## `` heading.
+
+        The document carries two tables whose rows both start ``| <class> |``,
+        so anything reading a row has to say WHICH table it means.
+        """
+        lines = md.splitlines()
+        start = next(
+            i for i, ln in enumerate(lines) if ln.startswith(f'## {heading}')
+        )
+        rest = lines[start + 1:]
+        end = next(
+            (i for i, ln in enumerate(rest) if ln.startswith('## ')), len(rest),
+        )
+        return '\n'.join(rest[:end])
+
+    def test_the_confusion_columns_are_the_eval_outcome_order(self) -> None:
+        """The committed markdown's column order must be reproducible.
+
+        Measured 2026-08-27: the committed `.md` header and the committed
+        `.json` confusion keys DISAGREE, which is only possible because both
+        were rendered from a frozenset whose order moved between processes.
+        """
+        section = self._section(self._md(), 'Confusion')
+        header = next(ln for ln in section.splitlines() if ln.startswith('| class |'))
+        assert self._cells(header) == ['class', *_mod().EVAL_OUTCOMES]
+
+    def test_each_confusion_row_lines_up_with_that_header(self) -> None:
+        """A cell read by position is only a measurement if the columns bind."""
+        md = self._md()
+        section = self._section(md, 'Confusion')
+        header = next(ln for ln in section.splitlines() if ln.startswith('| class |'))
+        columns = self._cells(header)
+        scored = _mod().score_cases(
+            _mod().build_judge_cases(_corpus(), distractors=2),
+            [OUTCOME_RESTATED] * len(_mod().build_judge_cases(_corpus(), distractors=2)),
+        )
+        for name in _mod().EVAL_CLASSES:
+            row = next(
+                ln for ln in section.splitlines() if ln.startswith(f'| {name} |')
+            )
+            cells = dict(zip(columns, self._cells(row), strict=True))
+            for outcome in _mod().EVAL_OUTCOMES:
+                assert cells[outcome] == str(scored['confusion'][name][outcome]), (
+                    f'{name}/{outcome}'
+                )
 
     def test_every_caveat_reaches_the_markdown_as_its_own_bullet(self) -> None:
         """Every ``CAVEATS`` entry renders verbatim, so none is silently dropped.
@@ -1061,6 +1146,30 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         assert report is not None and resolved is not None
         sibling = resolved.with_suffix('.md')
         assert sibling.exists(), f'no markdown sibling at {sibling}'
+
+    def test_the_committed_markdown_is_the_render_of_the_committed_json(
+        self,
+    ) -> None:
+        """The operator reads the `.md`; the `.json` is what a reviewer diffs.
+
+        `run_judge_eval` writes both from ONE report dict in ONE process, so
+        a committed pair that disagrees provably did not come from a single
+        run — and the markdown the task-3169 flip operator acts on is then
+        not the render of the evidence beside it. Measured 2026-08-27: the
+        committed `.json` keyed its confusion rows
+        `[stored, amended, contested, restated]` while the committed `.md`
+        header read `| class | stored | restated | amended | contested |`,
+        which is a frozenset's iteration order moving between two processes.
+        """
+        _block, report, resolved = self._committed()
+        assert report is not None and resolved is not None
+        sibling = resolved.with_suffix('.md')
+        assert sibling.exists(), f'no markdown sibling at {sibling}'
+        assert sibling.read_text() == _mod().render_markdown(report), (
+            f'{sibling.name} is not the render of {resolved.name} — the '
+            f'markdown the task-3169 operator reads must provably be the '
+            f'render of the committed JSON, not a second artifact that drifted'
+        )
 
     def test_the_committed_report_is_a_full_measurement(self) -> None:
         """Not a `--dry-run` stub, and not a truncated `--limit` smoke.
