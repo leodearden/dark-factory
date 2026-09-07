@@ -2312,3 +2312,213 @@ class TestNoLiveCorpusCountIsPinned:
                 imported.add(node.module or '')
 
         assert not [m for m in imported if m.startswith('fused_memory')], imported
+
+
+# ===========================================================================
+# End to end — every disposition at once, over both corpora
+# ===========================================================================
+
+def _stateful_gate_client(tasks: list[dict]) -> MagicMock:
+    """A ``FusedMemoryClient`` double that actually APPLIES the gate patch.
+
+    Stateful for the same reason :class:`_FakeCorpus` is: the second-run
+    idempotence claim is only meaningful if the first run's gate move is
+    visible to it.  A client that acknowledged and forgot would let a sweep
+    that never moved the block look idempotent.
+    """
+    by_id = {str(t['id']): t for t in tasks}
+
+    async def _call_tool(name, payload):
+        assert name == 'update_task', name
+        task = by_id.get(str(payload['id']))
+        if task is None:
+            return {'success': False, 'error': 'task_not_found'}
+        assert payload['metadata_mode'] == 'merge'
+        task['metadata'].update(payload['metadata'])
+        return {'id': payload['id'], 'updated': True, 'message': 'ok'}
+
+    client = MagicMock()
+    client.call_tool = AsyncMock(side_effect=_call_tool)
+    return client
+
+
+def _e2e_corpus() -> tuple[dict[str, list[dict]], list[dict]]:
+    """Every disposition this sweep can reach, present at once.
+
+    Deliberately built as ONE fixture rather than six: the seams between
+    enumeration, planning, collision refusal, renaming, the gate lockstep and
+    the residue probe are where a per-function suite cannot look, and a
+    corpus that exercises one disposition at a time never puts two of them in
+    the same scroll page.
+    """
+    records = {
+        'dark_factory': [
+            _crec('df1', 'good-topic'),                       # conforming
+            _crec('df2', 'clean_slug'),                       # renames
+            _crec('df3', 'clean_slug',                        # ... across TWO
+                  category='observations_and_summaries'),     #     categories
+            _crec('df4', 'dup_topic'),                        # collides
+            _crec('df5', 'dup-topic'),                        # ... with this
+            _crec('df6', '!!!'),                              # unfoldable
+            _crec('df7', 'gate_slug'),                        # gate-backed
+            _crec('df8', None),                               # no topic at all
+        ],
+        'reify': [
+            _crec('rf1', 'good-topic'),
+            _crec('rf2', 'other_slug'),
+            _crec('rf3', None),
+        ],
+    }
+    gates = [_gate_task('4220', 'gate_slug', project_id='dark_factory')]
+    return records, gates
+
+
+_E2E_RENAMED = {'df2', 'df3', 'df7', 'rf2'}
+_E2E_UNTOUCHED = {
+    'df1': 'good-topic', 'df4': 'dup_topic', 'df5': 'dup-topic',
+    'df6': '!!!', 'rf1': 'good-topic',
+}
+
+
+class TestEndToEnd:
+    """The whole pipeline as one act, over both default projects."""
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_reports_every_bucket_and_writes_nothing(self):
+        records, gates = _e2e_corpus()
+        service, corpus = _run_service(records)
+        client = _stateful_gate_client(gates)
+
+        report = await run_sweep(
+            service, projects=('dark_factory', 'reify'),
+            apply=False, client=client, gate_tasks=gates)
+
+        assert report['outcomes'].get('would_rename') == len(_E2E_RENAMED)
+        assert len(report['skips']['slug_collision']) == 1
+        assert len(report['skips']['topic_unfoldable']) == 1
+        assert report['skips']['orphan_gate_topic'] == []
+        assert report['skips']['legacy_slug_residue'] == []
+        assert corpus.writes == []
+        client.call_tool.assert_not_awaited()
+        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_slug'
+
+    @pytest.mark.asyncio
+    async def test_an_apply_run_moves_exactly_the_renameable_records(self):
+        records, gates = _e2e_corpus()
+        service, corpus = _run_service(records)
+
+        report = await run_sweep(
+            service, projects=('dark_factory', 'reify'), apply=True,
+            client=_stateful_gate_client(gates), gate_tasks=gates)
+
+        assert report['outcomes'].get('renamed') == len(_E2E_RENAMED)
+        assert {mid for mid, _patch in corpus.writes} == _E2E_RENAMED
+        assert corpus.topic_of('dark_factory', 'df2') == 'clean-slug'
+        assert corpus.topic_of('dark_factory', 'df3') == 'clean-slug'
+        assert corpus.topic_of('dark_factory', 'df7') == 'gate-slug'
+        assert corpus.topic_of('reify', 'rf2') == 'other-slug'
+
+    @pytest.mark.asyncio
+    async def test_the_refusals_leave_their_records_exactly_as_found(self):
+        records, gates = _e2e_corpus()
+        service, corpus = _run_service(records)
+
+        await run_sweep(
+            service, projects=('dark_factory', 'reify'), apply=True,
+            client=_stateful_gate_client(gates), gate_tasks=gates)
+
+        for memory_id, topic in _E2E_UNTOUCHED.items():
+            project = 'reify' if memory_id.startswith('rf') else 'dark_factory'
+            assert corpus.topic_of(project, memory_id) == topic, memory_id
+
+    @pytest.mark.asyncio
+    async def test_the_gate_block_moves_in_lockstep(self):
+        records, gates = _e2e_corpus()
+        service, _corpus = _run_service(records)
+
+        report = await run_sweep(
+            service, projects=('dark_factory', 'reify'), apply=True,
+            client=_stateful_gate_client(gates), gate_tasks=gates)
+
+        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate-slug'
+        assert [r['outcome'] for r in report['gate_results']] == ['gate_patched']
+
+    @pytest.mark.asyncio
+    async def test_the_renamed_old_slugs_drain_to_zero(self):
+        records, gates = _e2e_corpus()
+        service, _corpus = _run_service(records)
+
+        report = await run_sweep(
+            service, projects=('dark_factory', 'reify'), apply=True,
+            client=_stateful_gate_client(gates), gate_tasks=gates)
+
+        assert report['skips']['legacy_slug_residue'] == []
+
+    @pytest.mark.asyncio
+    async def test_the_run_exits_one_because_refusals_remain(self):
+        records, gates = _e2e_corpus()
+        service, _corpus = _run_service(records)
+
+        report = await run_sweep(
+            service, projects=('dark_factory', 'reify'), apply=True,
+            client=_stateful_gate_client(gates), gate_tasks=gates)
+
+        assert resolve_exit(report) == 1
+        assert report['outcomes'].get('slug_collision') == 1
+
+    @pytest.mark.asyncio
+    async def test_a_second_apply_run_plans_nothing_and_fails_for_the_same_reason(self):
+        """Idempotence, and the refusal to 'resolve' a refusal by re-running."""
+        records, gates = _e2e_corpus()
+        service, corpus = _run_service(records)
+        client = _stateful_gate_client(gates)
+
+        first = await run_sweep(
+            service, projects=('dark_factory', 'reify'), apply=True,
+            client=client, gate_tasks=gates)
+        writes_after_first = len(corpus.writes)
+        second = await run_sweep(
+            service, projects=('dark_factory', 'reify'), apply=True,
+            client=client, gate_tasks=gates)
+
+        assert writes_after_first == len(_E2E_RENAMED)
+        assert len(corpus.writes) == writes_after_first
+        assert second['rename_count'] == 0
+        assert second['outcomes'].get('renamed') is None
+        assert resolve_exit(second) == resolve_exit(first) == 1
+        assert len(second['skips']['slug_collision']) == 1
+        assert len(second['skips']['topic_unfoldable']) == 1
+        # The gate moved with the records, so it is not an orphan afterwards.
+        assert second['skips']['orphan_gate_topic'] == []
+
+    @pytest.mark.asyncio
+    async def test_the_baseline_delta_measures_distinct_values_across_both(self):
+        records, gates = _e2e_corpus()
+        service, _corpus = _run_service(records)
+
+        report = await run_sweep(
+            service, projects=('dark_factory', 'reify'),
+            client=_stateful_gate_client(gates), gate_tasks=gates)
+
+        # clean_slug, dup_topic, '!!!', gate_slug in dark_factory; other_slug
+        # in reify -- five distinct VALUES over six non-conforming records.
+        assert report['baseline_delta']['measured_by_project'] == {
+            'dark_factory': 4, 'reify': 1,
+        }
+        assert report['baseline_delta']['delta'] == 5 - 103
+
+    @pytest.mark.asyncio
+    async def test_both_artifacts_render_over_a_real_report(self):
+        """A report shape no renderer has seen is where a renderer breaks."""
+        records, gates = _e2e_corpus()
+        service, _corpus = _run_service(records)
+
+        report = await run_sweep(
+            service, projects=('dark_factory', 'reify'), apply=True,
+            client=_stateful_gate_client(gates), gate_tasks=gates)
+
+        rendered = _mod.render_markdown(report)
+        assert '### slug_collision: 1' in rendered
+        assert '### topic_unfoldable: 1' in rendered
+        assert 'gate-slug' in rendered
+        assert _mod.render_json(report) == _mod.render_json(report)
