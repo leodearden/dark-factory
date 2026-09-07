@@ -850,6 +850,179 @@ class TestDeployClockChangeReport:
         assert PROTECTED_DEPLOY_CLOCK_RELPATHS[0] in report[1]
 
 
+class TestAFalsificationIsNeverMaskedByABenignChange:
+    """A benign change to an EARLIER clock must not hide a falsified LATER one.
+
+    The two protected clocks have DIFFERENT writers —
+    ``scripts/restart-all-orchestrators.sh`` stamps the fleet clock,
+    ``scripts/orchestrator-watchdog.py`` the fused-memory one — so within a
+    single run they can genuinely disagree about who wrote them. A real fleet
+    redeploy (documented 8h cadence) straddling a 26-41 min post-merge verify is
+    the NORMAL case this task exists for, not a corner; if a test falsifies the
+    fm clock during that same window, the fleet clock's benign attribution must
+    not buy the run an exemption it did not earn.
+
+    The precedence rule these pin: ``falsified`` anywhere outranks
+    ``external_redeploy`` anywhere. One clock being provably external is no
+    evidence at all about a DIFFERENT file — the benign verdict is a statement
+    about the run's innocence, and a run that falsified something is not
+    innocent.
+
+    ``test_the_first_offender_in_protected_order_is_reported`` cannot catch this:
+    it writes provenance-free bodies to BOTH clocks, so both are ``falsified``
+    and reporting the first IS correct there. That contract still holds and that
+    test stays green — first-offender-wins applies among EQUALS.
+    """
+
+    def _report(
+        self, tmp_path: Path, before: dict[str, tuple[bytes, int] | None],
+    ) -> tuple[str, str] | None:
+        return deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path),
+            session_token=_THIS_SESSION, root=tmp_path,
+        )
+
+    def test_a_benign_fleet_stamp_does_not_mask_our_own_token_on_the_fm_clock(
+        self, tmp_path: Path,
+    ) -> None:
+        """The direct regression pin: exactly the merge-queue event, plus a bug.
+
+        A genuine redeploy stamps ``PROTECTED_DEPLOY_CLOCK_RELPATHS[0]`` while a
+        test falsifies ``[1]`` with this run's own token. Task 3797's defence
+        must survive a real redeploy being in flight.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(
+            tmp_path, _FM_RELPATH,
+            _stamp(token=_THIS_SESSION, source=_WATCHDOG_SOURCE),
+        )
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        verdict, message = report
+        assert verdict == 'falsified', (
+            'a real redeploy on the fleet clock masked a self-stamped '
+            f'falsification of the fm clock. report={report!r}'
+        )
+        assert str(tmp_path / _FM_RELPATH) in message, (
+            'the message names the benign clock instead of the falsified one, '
+            f'which sends triage to the wrong file. message={message!r}'
+        )
+
+    def test_a_benign_fleet_stamp_does_not_mask_a_foreign_token_on_the_fm_clock(
+        self, tmp_path: Path,
+    ) -> None:
+        """Foreign tokens fail closed (design decision 3) and must not be maskable
+        either — a downgrade reachable only by ordering is not a policy.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(
+            tmp_path, _FM_RELPATH,
+            _stamp(token=_OTHER_SESSION, source=_WATCHDOG_SOURCE),
+        )
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        assert report[0] == 'falsified', report
+        assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
+
+    def test_a_benign_fleet_stamp_does_not_mask_an_unattributable_fm_write(
+        self, tmp_path: Path,
+    ) -> None:
+        """The most likely real shape: the falsifying spawner predates provenance.
+
+        A pre-4823 writer, or any writer that never learned to stamp, leaves a
+        body nothing can attribute. That is the case the fail-closed default
+        exists for, so it is the one masking hurts most.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(tmp_path, _FM_RELPATH, _LEGACY_BODY)
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        assert report[0] == 'falsified', report
+        assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
+
+    def test_a_benign_fleet_stamp_does_not_mask_a_deleted_fm_clock(
+        self, tmp_path: Path,
+    ) -> None:
+        """A DELETED clock has no body to attribute, so it can never be benign."""
+        _write(tmp_path, _FM_RELPATH, _stamp(token='', source=_WATCHDOG_SOURCE))
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        (tmp_path / _FM_RELPATH).unlink()
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        assert report[0] == 'falsified', report
+        assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
+
+    def test_the_benign_verdict_survives_only_when_every_change_is_attributed(
+        self, tmp_path: Path,
+    ) -> None:
+        """Non-vacuity control: the fix must not turn every multi-clock change
+        into a failure. Two genuinely external stamps stay benign, and the report
+        still names the FIRST in protected order.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(tmp_path, _FM_RELPATH, _stamp(token='', source=_WATCHDOG_SOURCE))
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        verdict, message = report
+        assert verdict == 'external_redeploy', report
+        assert str(tmp_path / PROTECTED_DEPLOY_CLOCK_RELPATHS[0]) in message, message
+
+    def test_a_falsified_fleet_clock_still_outranks_a_benign_fm_one(
+        self, tmp_path: Path,
+    ) -> None:
+        """The already-correct direction, pinned so the fix cannot invert it."""
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _LEGACY_BODY)
+        _write(tmp_path, _FM_RELPATH, _stamp(token='', source=_WATCHDOG_SOURCE))
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        assert report[0] == 'falsified', report
+        assert str(tmp_path / _FLEET_RELPATH) in report[1], report[1]
+
+    def test_the_public_wrapper_is_not_maskable_either(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The fixture's failure path and every pre-4823 caller go through
+        ``deploy_clock_violation_reason``, so the fix has to be observable THERE
+        and not only in the report it now delegates to.
+        """
+        monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _THIS_SESSION)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(
+            tmp_path, _FM_RELPATH,
+            _stamp(token=_THIS_SESSION, source=_WATCHDOG_SOURCE),
+        )
+
+        reason = deploy_clock_violation_reason(
+            before, deploy_clock_snapshot(tmp_path), root=tmp_path,
+        )
+
+        assert reason is not None, (
+            'the wrapper returned None for a run that stamped the fm clock with '
+            'its own token, because a real redeploy had moved the fleet clock '
+            'first — task 3797 is disarmed whenever a deploy is in flight.'
+        )
+        assert str(tmp_path / _FM_RELPATH) in reason, reason
+
+
 class TestViolationReasonIsTheFalsifiedHalfOfTheReport:
     """The old entry point keeps its signature and narrows to one verdict.
 
@@ -1055,7 +1228,9 @@ _NESTED_STAMP_BODY = '{"ts": 1786033966, "iso": "2026-08-06T16:32:46+00:00"}'
 # outcomes that only a real run can tell apart: no write (exit 0), an
 # unattributable write (exit non-zero), and an attributed one (exit 0 WITH a
 # warning). A boolean cannot express the last two at once.
-_NESTED_SCENARIOS = ('clean', 'violating', 'external', 'own_token')
+_NESTED_SCENARIOS = (
+    'clean', 'violating', 'external', 'own_token', 'external_plus_own_token',
+)
 
 
 def _nested_test_source(*, scenario: str) -> str:
@@ -1069,12 +1244,20 @@ def _nested_test_source(*, scenario: str) -> str:
     """
     write = {
         'clean': '    pass\n',
-        'violating': '    _stamp(LEGACY_BODY)\n',
+        'violating': '    _stamp(RELPATH, LEGACY_BODY)\n',
         # A genuine machine-operated redeploy: provenance, no pytest ancestor.
-        'external': "    _stamp(_provenance(''))\n",
+        'external': "    _stamp(RELPATH, _provenance(''))\n",
         # A test falsifying the clock, caught red-handed: the write inherits
         # THIS nested session's own token through the ambient environment.
-        'own_token': '    _stamp(_provenance(os.environ[TOKEN_ENV]))\n',
+        'own_token': '    _stamp(RELPATH, _provenance(os.environ[TOKEN_ENV]))\n',
+        # BOTH at once, in PROTECTED_DEPLOY_CLOCK_RELPATHS order: a real fleet
+        # redeploy moves the FIRST clock while a test falsifies the SECOND. A
+        # guard that stops at the first CHANGED clock warns and exits 0, never
+        # having looked at the falsification. Task 4823 amendment.
+        'external_plus_own_token': (
+            "    _stamp(RELPATH, _provenance(''))\n"
+            "    _stamp(FM_RELPATH, _provenance(os.environ[TOKEN_ENV]))\n"
+        ),
     }[scenario]
     return (
         'import json\n'
@@ -1082,12 +1265,13 @@ def _nested_test_source(*, scenario: str) -> str:
         'from pathlib import Path\n'
         '\n'
         f'RELPATH = {_FLEET_RELPATH!r}\n'
+        f'FM_RELPATH = {_FM_RELPATH!r}\n'
         f'TOKEN_ENV = {PYTEST_SESSION_TOKEN_ENV!r}\n'
         f'LEGACY_BODY = {_NESTED_STAMP_BODY!r}\n'
         '\n'
         '\n'
-        'def _stamp(body):\n'
-        '    clock = Path(__file__).resolve().parent / RELPATH\n'
+        'def _stamp(relpath, body):\n'
+        '    clock = Path(__file__).resolve().parent / relpath\n'
         '    clock.parent.mkdir(parents=True, exist_ok=True)\n'
         '    clock.write_text(body)\n'
         '\n'
@@ -1229,6 +1413,34 @@ class TestTheGuardAttributesTheStampEndToEnd:
         )
         assert '1 passed' in combined, combined
         assert 'falsified a REAL deploy clock' in combined, combined
+
+    def test_a_real_redeploy_in_flight_does_not_buy_a_falsification_a_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Both at once, end to end — the only construction that proves the RUN
+        exits non-zero while a genuine redeploy is in flight.
+
+        The nested test stamps the fleet clock as a real deploy would (empty
+        session token) and the fm clock with its OWN token, in
+        ``PROTECTED_DEPLOY_CLOCK_RELPATHS`` order. If the guard stops at the
+        first CHANGED clock it sees only the benign one, warns, and exits 0 —
+        so task 3797's defence would be disarmed for the whole 8h window after
+        every fleet redeploy, which is precisely the window this task's benign
+        downgrade is designed to serve.
+        """
+        result = _nested_run(tmp_path, scenario='external_plus_own_token')
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a real redeploy on the fleet clock masked a self-stamped '
+            'falsification of the fm clock and the run exited 0 — the benign '
+            f'downgrade is being applied per-clock, not per-run. output={combined!r}'
+        )
+        assert '1 passed' in combined, combined
+        assert 'falsified a REAL deploy clock' in combined, combined
+        # The BASENAME, for the same wrapping reason as the sibling assertions
+        # above: the failure must name the clock that was actually falsified.
+        assert Path(_FM_RELPATH).name in combined, combined
 
 
 # The sibling that used to reach into THIS module for the marker helper. Named
