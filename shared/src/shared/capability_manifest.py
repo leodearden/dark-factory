@@ -281,9 +281,26 @@ class ManifestCapability(BaseModel):
 class ManifestTask(BaseModel):
     """A single manifest task block — one per PRD Greek-label task (PRD §Contract).
 
-    ``task_id`` is ``int | None``: ``None`` at authoring time, stamped by
-    ``commit_planning`` — never author-supplied for a real batch. ``title``
-    is a human aid, not load-bearing.
+    A block declares exactly one of THREE binding states, naming which
+    registry (if any) holds the task that produces its capabilities:
+
+    - ``task_id`` set — the producer is a LOCAL dark-factory task, stamped
+      by ``commit_planning``; never author-supplied for a real batch. This
+      is the ordinary case, and the only one whose ``delivered_check``\\ s
+      this project's dispatch gate evaluates.
+    - ``external_task_id`` set — the producer lives in ANOTHER project's
+      registry, named in the repo's canonical qualified
+      ``"project_id:task_id"`` form (``docs/task-authoring.md`` §3.2, the
+      same spelling as ``metadata.external_deps``), e.g. ``"reify:5613"``.
+      ``commit_planning`` never stamps such a block: its step-4 write-back
+      only touches labels present in the batch being committed, and a
+      foreign producer is by construction not in a dark-factory batch.
+    - both ``None`` — authoring time; the block binds nothing yet.
+
+    The two id fields are MUTUALLY EXCLUSIVE (enforced below): a block that
+    named both would claim two different producers in two different
+    registries, which is exactly the misattribution this field exists to
+    prevent. ``title`` is a human aid, not load-bearing.
 
     ``note`` is durable task-level provenance — why a label was split,
     renamed or re-homed. It is a DECLARED field rather than a YAML comment
@@ -304,6 +321,7 @@ class ManifestTask(BaseModel):
 
     label: str = Field(min_length=1)
     task_id: int | None = None
+    external_task_id: str | None = None
     title: str | None = None
     note: str | None = None
     capabilities: list[ManifestCapability]
