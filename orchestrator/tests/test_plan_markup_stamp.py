@@ -55,9 +55,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from shared.mcp_markup_middleware import FACT_MARKUP_DETECTED
 from shared.toolcall_markup import ENVELOPE_LITERALS, detect
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_markup_stamp
 
 # ---------------------------------------------------------------------------
@@ -111,6 +113,14 @@ _assert_no_raw_sentinels()
 #: leaked markup itself, which is why they are BUILT rather than written.
 _MISCLOSE = _close('decision')
 _PATTERN = _open_param('rationale')
+
+#: The prose the leak ABSORBED — the caller's own bytes. It appears in no fact
+#: field this stamp copies, which is exactly what the artifact-level control
+#: asserts: the refused payload has one owner, the residue escalation.
+_RATIONALE_LEAK_PROSE = (
+    'The two layers guard different populations: arguments being sent now, '
+    'versus damage already stored in plan.json.'
+)
 
 
 def make_fact(**overrides: Any) -> dict[str, Any]:
@@ -586,3 +596,201 @@ class TestSummaryIsTheCompactView:
             assert plan_markup_stamp.summary(plan) is None, (
                 f'{mangled!r} must not reach a tool response half-formed'
             )
+
+
+# ---------------------------------------------------------------------------
+# make_plan_stamp — the sink, over a real TaskArtifacts.
+# ---------------------------------------------------------------------------
+
+
+#: Every field an AGENT authored, plus the writer's own ``_schema_version``.
+#: The narrowed contract is stated in these terms: a refusal leaves each of
+#: them identical, and the block is the ONLY difference.
+AUTHORED_KEYS = (
+    'task_id', 'title', 'analysis', 'files', 'prerequisites', 'steps',
+    'design_decisions', 'reuse', '_schema_version',
+)
+
+
+@pytest.fixture()
+def artifacts(tmp_path) -> TaskArtifacts:
+    """TaskArtifacts over a temp worktree — mirrors ``test_plan_tools_server``."""
+    a = TaskArtifacts(tmp_path)
+    a.init('test-1', 'Test task', 'A test')
+    return a
+
+
+def seed_plan(artifacts: TaskArtifacts) -> dict[str, Any]:
+    """A plan built through the REAL writer, as ``_create_plan`` builds one."""
+    from orchestrator.mcp import plan_tools
+
+    plan_tools._create_plan(
+        artifacts,
+        'test-1',
+        'A clean plan',
+        'Clean analysis prose describing the approach.',
+        ['orchestrator/src/orchestrator/mcp/plan_tools.py'],
+    )
+    plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A clean step.')
+    return artifacts.read_plan()
+
+
+def plan_on_disk(artifacts: TaskArtifacts) -> dict[str, Any]:
+    """``plan.json`` parsed straight off disk, bypassing any normalisation."""
+    return json.loads(
+        (artifacts.root / 'plan.json').read_text(encoding='utf-8')
+    )
+
+
+class TestThePlanStampRecordsTheRefusal:
+    """The sink's happy path: one fact in, one accumulated block on disk."""
+
+    @pytest.mark.asyncio
+    async def test_one_fact_lands_as_a_one_event_block(self, artifacts: TaskArtifacts):
+        seed_plan(artifacts)
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        locator = await stamp(make_fact())
+
+        block = plan_on_disk(artifacts)[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 1
+        assert block['by_tool'] == {'add_design_decision': 1}
+        assert len(block['events']) == 1
+        assert block['events'][0]['param'] == 'decision'
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+        assert locator == str(artifacts.root / 'plan.json'), (
+            'the locator names the artifact, as the journal sink names its file'
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_authored_field_survives_untouched(
+        self, artifacts: TaskArtifacts
+    ):
+        """THE NARROWED CONTRACT, asserted directly.
+
+        The old pin was "a refused call leaves plan.json byte-identical". It
+        was a proxy for a property about VALUES — the registration comment
+        justifies the reject policy as preventing "a guessed-at document that
+        every later reader inherits", and the middleware header says "no
+        middleware-repaired value can ever reach plan.json". That property is
+        preserved intact and is what this asserts: the block is the only
+        difference, and it holds no caller-supplied bytes at all.
+        """
+        seed_plan(artifacts)
+        before = plan_on_disk(artifacts)
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY not in before
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        await stamp(make_fact())
+
+        after = plan_on_disk(artifacts)
+        assert after.pop(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY)
+        assert after == before, 'the block is the ONLY difference'
+        for key in AUTHORED_KEYS:
+            assert after[key] == before[key], f'{key} was disturbed'
+
+    @pytest.mark.asyncio
+    async def test_a_second_refusal_accumulates_rather_than_replacing(
+        self, artifacts: TaskArtifacts
+    ):
+        seed_plan(artifacts)
+        clock = _Clock()
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=clock)
+
+        await stamp(make_fact())
+        clock.advance(5.0)
+        await stamp(make_fact(tool='add_reuse_item', param='how'))
+
+        block = plan_on_disk(artifacts)[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 2
+        assert block['by_tool'] == {'add_design_decision': 1, 'add_reuse_item': 1}
+        assert len(block['events']) == 2
+        assert block['first_at'] != block['last_at'], 'the window has two ends'
+
+    @pytest.mark.asyncio
+    async def test_the_stamped_block_carries_no_envelope_markup(
+        self, artifacts: TaskArtifacts
+    ):
+        """The negative control, asserted on the ARTIFACT rather than the event.
+
+        ``plan.json`` is the thing embedded verbatim into four architect-facing
+        prompts and walked recursively by the dead-lane sweep, so the predicate
+        that matters is the one applied to the file.
+        """
+        seed_plan(artifacts)
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        await stamp(make_fact())
+
+        text = (artifacts.root / 'plan.json').read_text(encoding='utf-8')
+        for sequence in _FORBIDDEN_SEQUENCES:
+            assert sequence not in text, (
+                f'the stamped plan carries the raw sentinel {sequence!r}'
+            )
+        assert _RATIONALE_LEAK_PROSE not in text, (
+            'the refused payload has exactly one owner, the residue escalation'
+        )
+
+
+class TestThePlanStampNeverRaises:
+    """A sink outage costs visibility, never an outcome.
+
+    The call is already DECIDED by the time this runs, so the whole channel is
+    additive — the same never-raises contract ``markup_journal`` and
+    ``markup_sink`` keep, and for the same reason.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failing_write_is_swallowed_and_the_plan_is_left_alone(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        seed_plan(artifacts)
+        before = (artifacts.root / 'plan.json').read_bytes()
+
+        def boom(plan):
+            raise OSError('the plan is unwritable')
+
+        monkeypatch.setattr(artifacts, 'write_plan', boom)
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        assert await stamp(make_fact()) is None
+        assert (artifacts.root / 'plan.json').read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_a_failing_read_is_swallowed(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        seed_plan(artifacts)
+
+        def boom():
+            raise ValueError('plan.json is not parseable')
+
+        monkeypatch.setattr(artifacts, 'read_plan', boom)
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        assert await stamp(make_fact()) is None
+
+    @pytest.mark.asyncio
+    async def test_a_fact_missing_keys_still_stamps_something(
+        self, artifacts: TaskArtifacts
+    ):
+        """A degraded record beats a dropped one.
+
+        The middleware builds one complete record on every path, but this sink
+        must not be the thing that turns a shape surprise into a lost event —
+        that is the exact fail-soft the containment PRD exists to end.
+        """
+        seed_plan(artifacts)
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        assert await stamp({}) is not None
+
+        block = plan_on_disk(artifacts)[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 1, 'the event is recorded even when unnamed'
+
+    @pytest.mark.asyncio
+    async def test_a_non_dict_fact_never_propagates(self, artifacts: TaskArtifacts):
+        seed_plan(artifacts)
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        assert await stamp('not a record at all') is None
