@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -278,6 +280,93 @@ class TestLeaseDirIsEnvironmentIndependent:
         seen_second = mod.lease_dir()
 
         assert (seen_first, seen_second) == (first, second)
+
+
+class TestHoldLease:
+    """A holder publishes exactly one file and always takes it away again.
+
+    Publishing is the easy half.  The half that matters is that a holder
+    which crashes cannot leave a file behind that holds the 6-hourly cron
+    off forever, and that two holders — the xdist case, where ``-n auto``
+    workers each seed their own corpus — never share a file, so one
+    finishing cannot un-guard the others.
+    """
+
+    @staticmethod
+    def _names(directory) -> list[str]:
+        """Lease filenames currently published, or [] if nothing exists."""
+        if not directory.exists():
+            return []
+        return sorted(path.name for path in directory.iterdir())
+
+    def test_it_yields_true_and_publishes_one_file_naming_the_holder(
+        self, lease_dir,
+    ):
+        """The body is diagnostics for whoever probes next: an operator
+        reading cron mail has to be able to attribute a held-off sweep to a
+        specific run rather than guess."""
+        mod = _mod()
+
+        with mod.hold_lease(owner='e2-bake-off gw3') as held:
+            assert held is True
+            published = list(lease_dir.iterdir())
+            assert len(published) == 1
+            body = json.loads(published[0].read_text())
+
+        assert body['owner'] == 'e2-bake-off gw3'
+        assert body['pid'] == os.getpid()
+
+    def test_it_removes_the_file_on_a_normal_exit(self, lease_dir):
+        mod = _mod()
+
+        with mod.hold_lease(owner='e2-bake-off'):
+            assert len(self._names(lease_dir)) == 1
+
+        assert self._names(lease_dir) == []
+
+    def test_it_removes_the_file_and_re_raises_when_the_block_raises(
+        self, lease_dir,
+    ):
+        """A failed bake-off must not hold the cron off.  Re-raised
+        UNCHANGED, identity included: a lease that swallowed or wrapped the
+        run's own failure would be a far worse bug than the one it guards."""
+        mod = _mod()
+        boom = RuntimeError('the bake-off fell over mid-seed')
+
+        with pytest.raises(RuntimeError) as caught, mod.hold_lease(owner='e2'):
+            assert len(self._names(lease_dir)) == 1
+            raise boom
+
+        assert caught.value is boom
+        assert self._names(lease_dir) == []
+
+    def test_it_creates_the_lease_directory_when_it_is_absent(self, lease_dir):
+        """First holder after a reboot: nothing has made the directory yet."""
+        mod = _mod()
+        assert not lease_dir.exists()
+
+        with mod.hold_lease(owner='first-after-boot'):
+            assert lease_dir.is_dir()
+            assert len(self._names(lease_dir)) == 1
+
+    def test_two_holders_get_distinct_files_and_release_independently(
+        self, lease_dir,
+    ):
+        """The xdist case.  Under ``-n auto`` several workers seed at once,
+        each holding its own lease; the first to finish must not un-guard
+        the ones still running."""
+        mod = _mod()
+
+        with mod.hold_lease(owner='worker-gw0'):
+            outer = self._names(lease_dir)
+            with mod.hold_lease(owner='worker-gw1'):
+                both = self._names(lease_dir)
+            after_inner_released = self._names(lease_dir)
+
+        assert len(outer) == 1
+        assert len(both) == 2
+        assert after_inner_released == outer
+        assert self._names(lease_dir) == []
 
 
 class TestSweep:
