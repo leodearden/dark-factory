@@ -3119,6 +3119,103 @@ class GitOps:
         """
         return self._refuse_foreign_band(path, owned, context)
 
+    async def _worktree_add_with_retry(
+        self, path: Path, ref: str, *, label: str,
+    ) -> tuple[int, str, str, int]:
+        """Run ``git worktree add --detach <path> <ref>`` with bounded retry.
+
+        The SINGLE shared driver for both worktree-minting sites —
+        git_ops.py::GitOps._create_merge_worktree and
+        git_ops.py::GitOps.ephemeral_worktree — so exactly one retry loop
+        exists in this module. Up to :data:`_WORKTREE_ADD_MAX_ATTEMPTS`
+        attempts against the SAME *path* (the caller mints one uuid per
+        call, not per attempt), with ``0.5 * attempt`` seconds of linear
+        backoff between them: ``[0.5, 1.0]``.
+
+        Retryability is decided by
+        git_ops.py::_worktree_add_failure_is_retryable — retry by default,
+        break IMMEDIATELY on a known non-transient cause (ENOSPC), because
+        a full disk does not heal in 1.5s of backoff.
+
+        Returns:
+            ``(rc, stdout, stderr, attempts)`` from the LAST attempt made,
+            where *attempts* is how many adds were actually issued (1 on a
+            first-try success or an ENOSPC fast-fail, up to
+            :data:`_WORKTREE_ADD_MAX_ATTEMPTS` otherwise).
+
+        This method NEVER raises on a failed add — it returns a non-zero
+        *rc* and lets each caller shape its own exception type, since the
+        two call sites raise different ones (``RuntimeError`` for the merge
+        worktree, whose callers catch broadly on it, vs the typed
+        :class:`EphemeralWorktreeError` that verify.py's two probes
+        pattern-match on and that has a :class:`BlockDisposition` row).
+        A driver that raised would force one of them to
+        catch-and-retranslate, losing the rc/streams the caller needs to
+        build its own message.
+
+        :class:`WorktreeMissing` (which ``_run`` raises when ``cwd`` has
+        vanished) and any bare ``OSError`` from ``create_subprocess_exec``
+        under EMFILE/ENOMEM deliberately propagate UNRETRIED: neither is a
+        ``git worktree add`` failure — the child never ran — so retrying
+        would burn backoff on a condition that cannot heal, and both are
+        already handled as their own typed signals upstream.
+
+        Args:
+            path: The worktree path to mint. Reused across every attempt.
+            ref: Commit-ish to pin the detached worktree at.
+            label: Caller-supplied diagnostic prefix, named in the WARNING
+                emitted for each absorbed retry so an operator can grep
+                which minting site flaked.
+
+        Note:
+            Issues NO other git subprocess between attempts. No ``git
+            worktree prune`` — categorically forbidden under DD5, since a
+            broad prune deregisters every concurrently-active sibling
+            probe/merge worktree (the 2026-07-04 warm-lane
+            registration-wipe incident, df 2097-2100). And no scoped ``git
+            worktree remove --force`` either: nothing was successfully
+            registered from THIS call's perspective, so removing is at
+            best a no-op and at worst acts on state we did not create —
+            and test_ephemeral_worktree.py's
+            ``test_raises_ephemeral_worktree_error_after_exhausting_retries``
+            pins ``remove_calls == []`` when the add never succeeded.
+        """
+        rc, out, err, attempt = 1, '', 'not attempted', 0
+        for attempt in range(1, _WORKTREE_ADD_MAX_ATTEMPTS + 1):
+            rc, out, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(path), ref],
+                cwd=self.project_root,
+            )
+            if rc == 0:
+                return rc, out, err, attempt
+            if not _worktree_add_failure_is_retryable(rc, out, err):
+                break
+            if attempt < _WORKTREE_ADD_MAX_ATTEMPTS:
+                # An absorbed flake must stay greppable — otherwise the
+                # retry silently hides the very recurring failure rate
+                # this driver exists to measure.
+                logger.warning(
+                    '%s: git worktree add failed (rc=%d, attempt %d/%d) for %s '
+                    'at %s; retrying after backoff. stderr=%r stdout=%r',
+                    label, rc, attempt, _WORKTREE_ADD_MAX_ATTEMPTS, path, ref,
+                    err, out,
+                )
+                # Real `git worktree add` creates its target directory
+                # early, before it can fail (pinned by
+                # test_ephemeral_worktree.py::
+                # test_add_failure_leaves_no_leaked_directory_under_worktree_base).
+                # Without clearing that residue the next attempt against
+                # the same path fails deterministically with "'<path>'
+                # already exists" — turning a bounded retry into a
+                # GUARANTEED second failure that names a self-inflicted
+                # cause instead of the real one. `ignore_errors=True`
+                # inside `suppress` because a failed cleanup must never
+                # mask the add failure being retried.
+                with contextlib.suppress(Exception):
+                    shutil.rmtree(path, ignore_errors=True)
+                await asyncio.sleep(0.5 * attempt)
+        return rc, out, err, attempt
+
     @contextlib.asynccontextmanager
     async def ephemeral_worktree(
         self, kind: WorktreeKind, sha: str, *, warm_seed: bool = False,
