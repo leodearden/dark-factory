@@ -641,6 +641,43 @@ class _QueryFnGraph:
         return SimpleNamespace(result_set=rows)
 
 
+class _EnumerationResult(tuple):
+    """The ``(facts, complete)`` pair, plus the census bracket it was judged on.
+
+    A tuple SUBCLASS rather than a new return type, deliberately: the
+    completeness band is DERIVED from the two census readings, so an artifact
+    reporting `complete: false` without them cannot be audited — a reader
+    cannot tell a corpus that grew from one that was truncated, which is the
+    entire distinction the band exists to draw. The readings therefore have to
+    leave this function rather than live only in a log line on an operator's
+    terminal.
+
+    Carrying them as ATTRIBUTES on the existing pair keeps every caller and
+    every enumeration test unpacking exactly what it unpacked before, so this
+    change is to the completeness RULE and to nothing else. It is a stepping
+    stone: the typed ``EnumerationOutcome`` that also carries the failure
+    reason and kind replaces it, and this class goes away with it.
+    """
+
+    # No ``__slots__``: CPython rejects a non-empty one on a tuple subtype
+    # ("nonempty __slots__ not supported for subtype of 'tuple'"), since the
+    # variable-length tuple storage and a slot layout cannot coexist. The
+    # per-instance dict is the cost, and it is paid once per graph per run.
+
+    def __new__(
+        cls,
+        facts: dict[str, str],
+        complete: bool,
+        *,
+        census_before: int | None,
+        census_after: int | None,
+    ) -> _EnumerationResult:
+        self = super().__new__(cls, (facts, complete))
+        self.census_before = census_before
+        self.census_after = census_after
+        return self
+
+
 async def enumerate_valid_edge_facts(
     query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
     *,
@@ -664,10 +701,11 @@ async def enumerate_valid_edge_facts(
     uuid legitimately arrives more than once (documented on
     get_all_valid_edges). A NULL fact is coerced to ''.
 
-    Returns ``(facts_by_uuid, complete)``. The flag is the fail-closed hook:
-    an under-enumerated corpus must be reported as a FAILURE rather than as a
-    smaller report, because the headline result is a zero and a truncated
-    zero is worthless.
+    Returns an ``_EnumerationResult``: the ``(facts_by_uuid, complete)`` pair,
+    carrying the two census readings the verdict was derived from. The flag is
+    the fail-closed hook: an under-enumerated corpus must be reported as a
+    FAILURE rather than as a smaller report, because the headline result is a
+    zero and a truncated zero is worthless.
 
     ``complete`` is FALSE — and every one of these paths logs a WARNING
     naming the numbers, so a shortfall is never silent — when:
@@ -683,28 +721,52 @@ async def enumerate_valid_edge_facts(
        — a suspected shortfall, reported rather than swallowed.
        (``INCOMPLETE_PAGE_CAP``.)
     3. Either census probe did not answer with a usable count. An unavailable
-       proof is not a passing proof.
-    4. The corpus MOVED during enumeration — the census answers a different
-       number before and after paging.
-    5. A STABLE census count and the number enumerated disagree.
+       proof is not a passing proof, and a band needs both ends.
+    4. Fewer distinct edges were enumerated than ``min(census_before,
+       census_after)``.
 
     (1) and (2) are STRUCTURAL — ``INCOMPLETE_STRUCTURAL_KINDS``, which this
-    function treats as never tolerable; (3), (4) and (5) are EMPIRICAL, and
-    the two kinds are deliberately independent rather than redundant. The
-    shipped engine names the same split for the same reason.
+    function treats as never tolerable; (3) and (4) are EMPIRICAL, and the two
+    kinds are deliberately independent rather than redundant. The shipped
+    engine names the same split for the same reason.
 
     THE CORPUS IS LIVE AND IS BEING WRITTEN WHILE THIS RUNS. The graphs
     measured here are the orchestrator's and the reconciler's working memory,
-    so an add or an invalidate can land between the census probe and the last
-    page. That makes a count disagreement a genuinely ambiguous observation,
-    which is why the census is probed TWICE — once before paging (inside
-    ``_paged_ro_query``, surfaced as ``PagedRead.expected_rows``) and once
-    after. A shortfall against a count that MOVED is a benign, retryable
-    race; a shortfall against a count that held still is evidence of
-    truncation or of dropped rows. Both fail closed, but they are reported as
-    different things, because handing an operator 'suspected server cap' for
-    what is actually a concurrent write sends them to configuration they do
-    not need to change.
+    so adds and invalidates land between the census probe and the last page —
+    on a full run paging tens of thousands of edges across dozens of queries,
+    a census that moves is the ORDINARY case, not the exotic one.
+
+    THE TOLERANCE BAND, and why it is derived rather than tuned. An earlier
+    rule failed the run whenever the two census readings disagreed at all. On
+    these graphs that is a hair trigger rather than a check: one edge written
+    by an unrelated cycle anywhere in the window flipped a 43-graph run to
+    INCOMPLETE and exit 1, and told the operator to re-run something that was
+    already right.
+
+    The replacement comes from set semantics. The edges present for the WHOLE
+    run are a subset of the corpus at the first census AND of the corpus at
+    the second, so there are at most ``min(before, after)`` of them. Reading
+    at least that many therefore means nothing continuously present went
+    unread — which is precisely the claim `complete` is making. Growth is
+    tolerated; shrinkage is tolerated exactly down to the post-census and no
+    further; a STABLE census that disagrees is still a shortfall, which is
+    what stops the tolerance becoming the answer to every mismatch.
+
+    There is deliberately NO magnitude threshold — no '1% drift is fine'. A
+    percentage would be a tuned constant with no achievability basis, it
+    would need re-tuning as the corpus grows, and it would silently excuse a
+    shortfall of exactly the size someone once guessed was benign. This band
+    is derived from what the numbers mean and needs no tuning at all. Movement
+    is not swallowed either: it is DISCLOSED, logged at INFO and recorded in
+    the artifact as the census pair, so a reader sees it rather than inferring
+    it from a verdict.
+
+    This aligns with the shipped precedent rather than inventing a policy:
+    ``_paged_ro_query`` judges its own reads on ``rows_seen >= expected_rows``
+    for the same reason, and its docstring says so — 'a corpus that grew
+    between the census probe and the last page is not a truncation'. The band
+    here is the two-ended form of that rule, which this function can afford
+    because it takes the second reading the shipped engine does not.
 
     WHY COMPLETENESS IS RE-DERIVED HERE rather than read off ``paged.complete``.
     The two flags are stated in DIFFERENT UNITS and are not interchangeable:
@@ -739,22 +801,30 @@ async def enumerate_valid_edge_facts(
             continue
         facts[edge_uuid] = row[1] or ''
 
-    expected = paged.expected_rows
-    # Re-probed AFTER paging, through the SHIPPED census helper. The pre-count
-    # alone cannot tell a truncated enumeration from one that raced a
-    # concurrent write, and those two want opposite responses from the
-    # operator (fix the config vs just re-run). Skipped when the pre-count was
-    # unavailable: there is nothing to compare it against.
-    post_expected = (
-        None if expected is None else await _shipped_census_count(graph, _EDGE_COUNT_CYPHER)
-    )
-    corpus_moved = (
-        expected is not None
-        and post_expected is not None
-        and post_expected != expected
+    census_before = paged.expected_rows
+    # Re-probed AFTER paging, through the SHIPPED census helper. One reading
+    # cannot bound what was continuously present on a graph being written to,
+    # and the two readings are what the tolerance band below is derived from.
+    # Skipped when the pre-count was unavailable: a band needs both ends.
+    census_after = (
+        None
+        if census_before is None
+        else await _shipped_census_count(graph, _EDGE_COUNT_CYPHER)
     )
 
     structurally_incomplete = paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS
+    # The largest number of edges that can have been present for the WHOLE
+    # run. See the docstring: this is set semantics, not a tuned threshold.
+    floor = (
+        None
+        if census_before is None or census_after is None
+        else min(census_before, census_after)
+    )
+    corpus_moved = (
+        census_before is not None
+        and census_after is not None
+        and census_before != census_after
+    )
 
     if structurally_incomplete:
         logger.warning(
@@ -763,68 +833,85 @@ async def enumerate_valid_edge_facts(
             'is incomplete. Re-run with a larger --page-size.',
             max_pages, page_size, len(facts),
         )
-    elif expected is None:
+    elif census_before is None:
         logger.warning(
             'enumerate_valid_edge_facts: the census probe returned no usable '
             'count, so completeness cannot be proven. Reporting INCOMPLETE — '
             'an unavailable proof is not a passing one.',
         )
-    elif post_expected is None:
+    elif census_after is None:
         logger.warning(
             'enumerate_valid_edge_facts: the post-enumeration census probe '
-            'returned no usable count, so a shortfall could not be told apart '
-            'from a concurrent write. Reporting INCOMPLETE — an unavailable '
-            'proof is not a passing one.',
+            'returned no usable count, so the tolerance band has only one '
+            'end and completeness cannot be proven. Reporting INCOMPLETE — '
+            'an unavailable proof is not a passing one.',
         )
+    elif len(facts) < floor:
+        if corpus_moved:
+            logger.warning(
+                'enumerate_valid_edge_facts: enumerated %d distinct edges, '
+                'short of %d — the smaller of a census that read %d before '
+                'paging and %d after (page_size=%d). At least %d edges were '
+                'present for the WHOLE run and went unread, which concurrent '
+                'writing does not explain. Reporting INCOMPLETE.',
+                len(facts), floor, census_before, census_after, page_size,
+                floor - len(facts),
+            )
+        else:
+            logger.warning(
+                'enumerate_valid_edge_facts: enumerated %d distinct edges but '
+                'the census reports %d, stable across the whole run '
+                '(page_size=%d) — the enumeration is SHORT and the corpus did '
+                'not move under it. The most likely cause is a server '
+                'result-set cap below the assumed %d; unstable page '
+                'boundaries would do it too. Reporting INCOMPLETE.',
+                len(facts), census_before, page_size, resultset_size,
+            )
     elif corpus_moved:
-        logger.warning(
-            'enumerate_valid_edge_facts: the corpus CHANGED MID-ENUMERATION — '
-            'the census reported %d distinct edges before paging and %d after '
-            '(enumerated=%d, page_size=%d). These graphs are written live by '
-            'the orchestrator and the reconciler, so this is an ordinary '
-            'race, NOT a truncation: nothing is misconfigured. Reporting '
-            'INCOMPLETE — re-run.',
-            expected, post_expected, len(facts), page_size,
-        )
-    elif len(facts) != expected:
-        logger.warning(
-            'enumerate_valid_edge_facts: enumerated %d distinct edges but the '
-            'census reports %d, stable across the whole run (page_size=%d) — '
-            'the enumeration is SHORT and the corpus did not move under it. '
-            'The most likely cause is a server result-set cap below the '
-            'assumed %d; unstable page boundaries would do it too. Reporting '
-            'INCOMPLETE.',
-            len(facts), expected, page_size, resultset_size,
+        # DISCLOSED, not failed. These graphs are the orchestrator's and the
+        # reconciler's working memory, so a census that moves under a run
+        # paging tens of thousands of edges is the ordinary case. Everything
+        # present throughout was read; both readings go into the artifact so
+        # a reader can see the movement rather than infer it from a verdict.
+        logger.info(
+            'enumerate_valid_edge_facts: the corpus MOVED under the '
+            'enumeration — the census read %d distinct edges before paging '
+            'and %d after, and %d were enumerated (page_size=%d). Everything '
+            'present for the whole run was read, so this is a COMPLETE '
+            'enumeration of a moving corpus, not a shortfall. Both readings '
+            'are recorded in the report.',
+            census_before, census_after, len(facts), page_size,
         )
 
     complete = (
         not structurally_incomplete
-        and expected is not None
-        and post_expected is not None
-        and not corpus_moved
-        and len(facts) == expected
+        and floor is not None
+        and len(facts) >= floor
     )
 
     if paged.incomplete_kind == INCOMPLETE_SHORT_READ and complete:
         # The shipped layer already logged a WARNING naming a suspected
         # result-set cap, and this function has just concluded there was no
         # shortfall. Both can be true at once — they count different things
-        # (rows fetched vs distinct edges) — so say so explicitly. Left
-        # unstated, an operator reading the log would take a WARNING from the
-        # layer below as this probe's verdict, which is the reverse of what
-        # the artifact reports.
+        # (rows fetched against the PRE-census only, vs distinct edges against
+        # the band) — so say so explicitly. Left unstated, an operator reading
+        # the log would take a WARNING from the layer below as this probe's
+        # verdict, which is the reverse of what the artifact reports.
         logger.info(
             'enumerate_valid_edge_facts: _paged_ro_query reported a short '
             'read (rows_seen=%s, expected_rows=%s) but this probe enumerated '
-            '%d distinct edges against a census of %s and finds no shortfall. '
-            'The two are counted in different units — rows fetched vs '
-            'distinct edge uuids — so the WARNING above is NOT this probe\'s '
+            '%d distinct edges, at or above the %s-edge floor of a census '
+            'that read %s then %s. The two are counted in different units — '
+            'rows fetched against the pre-census, vs distinct edge uuids '
+            'against the band — so the WARNING above is NOT this probe\'s '
             'verdict. Reason given below: %s',
-            paged.rows_seen, paged.expected_rows, len(facts), post_expected,
-            paged.reason,
+            paged.rows_seen, paged.expected_rows, len(facts), floor,
+            census_before, census_after, paged.reason,
         )
 
-    return facts, complete
+    return _EnumerationResult(
+        facts, complete, census_before=census_before, census_after=census_after,
+    )
 
 
 # ---------------------------------------------------------------------------
