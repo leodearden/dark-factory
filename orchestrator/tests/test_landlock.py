@@ -65,12 +65,14 @@ def _var_tmp_writable() -> bool:
 def _skip_var_tmp() -> bool:
     """Whether /var/tmp-dependent tests should be skipped in this environment.
 
-    Under ``DF_REQUIRE_SANDBOX_TESTS=1`` — set by CI jobs known to have a
-    writable /var/tmp and a landlock-capable kernel — an unwritable /var/tmp is
-    an environment regression, not a reason to skip: quietly dropping the
-    real-kernel enforcement surface (TestLandlockEnforcement, TestLandlockRefer,
-    TestLandlockClaudeHomeNarrowing, all 12 matrix rows) would leave the suite
-    green while every denial assertion stopped running. Fail loudly there.
+    Under ``DF_REQUIRE_SANDBOX_TESTS=1`` — armed via ``verify_env`` in the
+    top-level ``dark-factory-orchestrator.yaml`` (task 4635) on hosts known to
+    have a writable /var/tmp and a landlock-capable kernel — an unwritable
+    /var/tmp is an environment regression, not a reason to skip: quietly
+    dropping the real-kernel enforcement surface (TestLandlockEnforcement,
+    TestLandlockRefer, TestLandlockClaudeHomeNarrowing, all 12 matrix rows)
+    would leave the suite green while every denial assertion stopped running.
+    Fail loudly there.
     """
     if _var_tmp_writable():
         return False

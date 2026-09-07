@@ -1006,6 +1006,54 @@ verify_env:
   # A/B arm: PYTEST_XDIST_AUTO_NUM_WORKERS set to "8" at 2026-09-10T12:42:14Z by scripts/merge-pytest-n-ab-switch.sh
   PYTEST_XDIST_AUTO_NUM_WORKERS: "8"
 
+# ARM THE REAL-KERNEL SANDBOX ENFORCEMENT SURFACE (task 4635, esc-4559-9).
+#
+# THE GAP THIS CLOSES. orchestrator/tests/test_landlock.py and
+# test_sandbox_enforcement_matrix.py each probe /var/tmp with an actual
+# ``tempfile.mkdtemp(dir='/var/tmp')`` write before running the real-kernel
+# Landlock enforcement rows (TestLandlockEnforcement, TestLandlockRefer,
+# TestLandlockClaudeHomeNarrowing, all 12 matrix rows — 30 tests total).
+# An AGENT sandbox denies that write via a syscall filter (EACCES) even
+# though /var/tmp's own mode is 1777, so a run launched from inside an
+# agent's own sandboxed shell silently SKIPS all ~15 mkdtemp-rooted tests
+# and still reports green — root-caused as the mechanism behind a reported
+# skip-count delta (1 -> 16) between two full suite runs. Both files already
+# contain the correct escape hatch: under DF_REQUIRE_SANDBOX_TESTS=1, a
+# probe failure is ``pytest.fail``-ed instead of silently skipped. Nothing
+# in the repo ever SET that variable, so the hatch was dead code and no
+# configuration guaranteed the surface ever ran.
+#
+# PRECONDITION CONFIRMED before arming, per this key's own guard rationale:
+# /var/tmp measured writable (mode 1777) from an UNSANDBOXED shell on the
+# verify host, and the 30-test surface passed there in 11.10s. The
+# orchestrator's own verify subprocess is unsandboxed (verify.py's
+# _target_subprocess_env only strips venv/PATH activation vars — it never
+# wraps the verify command itself in landlock), which is exactly why the
+# gate has kept passing this surface all along (measured: attempt-1 /
+# attempt-2 verify logs show only 1 skip) even though an AGENT's own shell
+# sees /var/tmp EACCES. Arming this key only changes behavior on a HOST
+# where that precondition stops holding — it turns a silent 15-test
+# disappearance into a loud, named failure there, per the tests' own
+# docstrings.
+#
+# SCOPE DECISION (explicit, not left implicit): fused-memory/tests/
+# reconciliation/test_recon_sandbox_guard.py carries a verbatim-duplicated
+# copy of the same _var_tmp_writable/_skip_var_tmp guard and reads this
+# same DF_REQUIRE_SANDBOX_TESTS variable. verify._resolve_verify_env
+# ALWAYS starts from THIS file's top-level verify_env unconditionally, then
+# merges any module_config.verify_env on top (SETUP.md "verify_env behaves
+# differently…"; verify.py::_resolve_verify_env). Neither
+# orchestrator/orchestrator.yaml nor fused-memory/orchestrator.yaml declares
+# its own verify_env, so this single top-level key already reaches BOTH
+# packages' copies of the guard — no separate fused-memory/orchestrator.yaml
+# entry is needed, and adding one would only be a second copy to drift.
+#
+# Does NOT touch task 3247's skip behaviour for ordinary agent-sandboxed
+# runs — those still skip quietly, as 3247 deliberately decided. This only
+# arms the override for the one context (the verify host) already known-good.
+verify_env:
+  DF_REQUIRE_SANDBOX_TESTS: "1"
+
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
 fused_memory:
