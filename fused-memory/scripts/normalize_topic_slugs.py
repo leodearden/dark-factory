@@ -41,9 +41,54 @@ snake_case slug alone because the operator would then also have to discover
 that this migration caused it.  So the two halves are planned as a pair and
 refused as a pair.
 
-Dry run is the default
-----------------------
-Nothing is written without ``--apply``.  See the operator runbook below.
+Dry run is the default — the operator runbook
+--------------------------------------------
+1. **Dry run**, from anywhere::
+
+       uv run --project fused-memory python \
+           fused-memory/scripts/normalize_topic_slugs.py
+
+   Writes ``plans/topic-slug-normalization-report.{json,md}`` and prints the
+   markdown.  Nothing is modified.
+
+2. **Read the refusal buckets and resolve them BY HAND.**  ``slug_collision``,
+   ``canonical_collision`` and ``topic_unfoldable`` are the buckets this
+   script deliberately will not decide for you: the first two would merge two
+   topic namespaces (and, in the canonical case, manufacture the second
+   canonical ``_check_canonical_uniqueness`` exists to prevent), and the third
+   has no honest fold, so any value the script picked would be a guess written
+   across the whole corpus.  Also check ``under_enumerated`` /
+   ``scroll_budget_exhausted``: a run with either populated is a LOWER BOUND,
+   and a clean residue probe over it proves nothing.
+
+3. **Apply**, as an OPERATOR::
+
+       ... normalize_topic_slugs.py --apply
+
+   This is an operator action, not an agent one.  The store-mutation preflight
+   fails closed for any process that cannot write mem0's history directory,
+   which is the normal posture inside an agent sandbox — so a dry run is what
+   an agent can deliver, and the deliverable of task 4878 is THIS INSTRUMENT
+   PLUS A VERIFIED DRY RUN, not the live mutation.
+
+4. **Re-measure** with the standing instrument and compare against the
+   committed baseline::
+
+       ... census_memory_metadata.py   # read coverage.topic_coverage.slug_non_conforming
+
+   The report's ``baseline_delta`` block already carries the arithmetic; step 4
+   is how you confirm it against the corpus rather than against this run's own
+   enumeration.
+
+Scope boundary
+--------------
+This script is the DATA migration and nothing else.  Flipping
+``memory_metadata.enforce`` from warn to reject belongs to task 3626, and
+changing the writer instructions so new records are born conforming belongs to
+task 3202.  Normalizing the existing corpus is worth doing regardless of
+whether either ever lands: it is what makes an exact-match ``{'topic': T}``
+read return the whole cluster instead of whichever spelling the caller
+guessed.
 """
 from __future__ import annotations
 
@@ -85,6 +130,8 @@ _CENSUS_SCRIPT_PATH = (
 # defined locally.  This script is loaded by path via ``importlib`` and cannot
 # be imported from, so its ``__all__`` grants the shared rule no second home.
 __all__ = [
+    'BASELINE_DISTINCT_NON_CONFORMING',
+    'BASELINE_HISTORY',
     'DEFAULT_JSON_OUT',
     'DEFAULT_MAX_PAGES',
     'DEFAULT_MD_OUT',
@@ -113,6 +160,7 @@ __all__ = [
     'load_census_module',
     'main',
     'plan_renames',
+    'REMEASURE_COMMAND',
     'render_json',
     'render_markdown',
     'resolve_exit_code',
@@ -1259,6 +1307,39 @@ async def verify_old_slugs_drained(memory_service, results, skips) -> None:
 # The sweep
 # ---------------------------------------------------------------------------
 
+#: Distinct NON-CONFORMING ``topic`` values across both corpora at the
+#: baseline measurement — dark_factory 49 of 105 distinct, reify 54 of 279.
+#:
+#: PROVENANCE: memory ad707e72, measured 2026-08-04.  Committed as a constant,
+#: with its date, precisely because the live number moves on its own: PRD leaf
+#: alpha measured 98 and ad707e72 measured 103 while ``memory_metadata.enforce``
+#: sat in warn mode.  A dated measurement is something a reader can evaluate;
+#: a live count pinned in a test is a scheduled failure.
+#:
+#: Re-measure with the standing instrument, never by re-deriving here — see
+#: :data:`REMEASURE_COMMAND`.
+BASELINE_DISTINCT_NON_CONFORMING = 103
+
+#: The baseline's own history, carried into the report so a reader sees the
+#: DIRECTION of travel rather than a bare number to compare against.
+BASELINE_HISTORY = (
+    'PRD leaf alpha measured 98 distinct non-conforming topic values; memory '
+    'ad707e72 measured 103 on 2026-08-04 — the population GREW by 5 while '
+    'memory_metadata.enforce sat in warn mode, which is why this baseline is '
+    'committed with a date rather than re-derived, and why no test pins a '
+    'live count.'
+)
+
+#: Where the authoritative re-measurement lives.  ``census_memory_metadata.py``
+#: already emits ``slug_non_conforming`` as gate 3626's named standing
+#: re-measurement, so this script CITES it rather than growing a second,
+#: divergent definition of "non-conforming" (INV-5).
+REMEASURE_COMMAND = (
+    'uv run --project fused-memory python fused-memory/scripts/'
+    'census_memory_metadata.py  # then read '
+    'coverage.topic_coverage.slug_non_conforming'
+)
+
 #: Both live corpora.  ``--project`` REPLACES this list; see
 #: :func:`resolve_projects` for why that matters.
 DEFAULT_PROJECTS: tuple[str, ...] = ('dark_factory', 'reify')
@@ -1351,6 +1432,12 @@ async def run(
     coverage_complete = True
     all_renames: list[Rename] = []
     candidate_count = 0
+    # Distinct non-conforming VALUES per project -- the census's own item-3
+    # partition (``_build_topic_coverage``), not a record count.  A legacy
+    # slug on eight records is ONE non-conforming value; counting records
+    # would be measured against a baseline of distinct values and would
+    # manufacture a growth that never happened.
+    measured_by_project: dict[str, int] = {}
 
     for project_id in projects:
         enumerated = await enumerate_topic_bearing(
@@ -1359,6 +1446,9 @@ async def run(
         coverage[project_id] = enumerated['coverage']
         coverage_complete = coverage_complete and enumerated['complete']
         candidate_count += len(enumerated['records'])
+        measured_by_project[project_id] = len({
+            (r.get('metadata') or {}).get('topic') for r in enumerated['records']
+        })
         _record_skips(enumerated['skips'])
 
         renames, plan_skips = plan_renames(
@@ -1433,6 +1523,29 @@ async def run(
         'results': results,
         'gate_results': gate_results,
         'skips': skips,
+        # Scope item 4: the delta, computed here so the next reader inherits
+        # it instead of re-deriving it (and re-deriving it differently).
+        'baseline_delta': {
+            'baseline_distinct_non_conforming': BASELINE_DISTINCT_NON_CONFORMING,
+            'baseline_source': (
+                'memory ad707e72, measured 2026-08-04 (dark_factory 49 of 105 '
+                'distinct topic values, reify 54 of 279)'
+            ),
+            'baseline_history': BASELINE_HISTORY,
+            'measured_distinct_non_conforming': sum(measured_by_project.values()),
+            'measured_by_project': measured_by_project,
+            'delta': (
+                sum(measured_by_project.values())
+                - BASELINE_DISTINCT_NON_CONFORMING
+            ),
+            'remeasure_command': REMEASURE_COMMAND,
+            'note': (
+                'measured is a distinct-VALUE count over the projects THIS run '
+                'swept, matching the census partition; it is comparable to the '
+                'baseline only when both corpora were swept and coverage is '
+                'complete'
+            ),
+        },
     }
 
 
@@ -1572,6 +1685,26 @@ def render_markdown(report: dict) -> str:
             )
     else:
         lines.append('_no gate-backed topic in this sweep_')
+
+    baseline = report.get('baseline_delta') or {}
+    if baseline:
+        lines += [
+            '',
+            '## Baseline delta (scope item 4)',
+            '',
+            f'**Baseline (distinct non-conforming topic values):** '
+            f'{baseline.get("baseline_distinct_non_conforming")}  ',
+            f'**Baseline source:** {baseline.get("baseline_source")}  ',
+            f'**Measured this run:** '
+            f'{baseline.get("measured_distinct_non_conforming")} '
+            f'({", ".join(f"{p}={n}" for p, n in sorted((baseline.get("measured_by_project") or {}).items()))})  ',
+            f'**Delta:** {baseline.get("delta")}  ',
+            '',
+            f'History: {baseline.get("baseline_history")}',
+            '',
+            f'Re-measure with the standing instrument: `'
+            f'{baseline.get("remeasure_command")}`',
+        ]
 
     lines += ['', '## Skips', '']
     skips = report.get('skips') or {}
