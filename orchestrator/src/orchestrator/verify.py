@@ -1101,6 +1101,7 @@ def _extract_cause_hint(output: str) -> str:
     """Extract a one-line failure hint from command output.
 
     Uses a pattern ladder (first match wins):
+    0. xdist WORKER-DEATH TRUNCATION — see below; pre-empts the whole ladder
     1. ``FAILED test::name`` — pytest failure lines (start of line)
     2. ``INTERNALERROR>`` — pytest collection / plugin errors
     3. ``===== N failed in Xs =====`` — pytest summary line
@@ -1113,11 +1114,53 @@ def _extract_cause_hint(output: str) -> str:
     10. fallback: last non-blank line of output, with pytest progress lines
         filtered. If only progress lines remain, returns an opaque-exit message.
 
+    RUNG 0 (task 5082) fires only when `_is_worker_death_truncated_session`
+    confirms xdist ABANDONED the rest of the suite, and it must precede two
+    specific rungs for two specific reasons:
+
+    * Ahead of RUNG 1, because the ``FAILED`` line a truncated session carries
+      is typically the one xdist FABRICATED for the test the dead worker had
+      in flight (`dsession.py::handle_crashitem`, ``outcome="failed"`` /
+      ``when="???"``).  That test is innocent — esc-4292-3 measured that it
+      passes in isolation — so rung 1 would name it as the cause and send the
+      debugger after a failure that never happened.
+    * Ahead of RUNG 3, because the tally after `triggershutdown()` counts only
+      the tests that had already run.  Quoting it reads as a complete result
+      (esc-4176-6: ``1 failed, 728 passed`` truncated vs ``19622 passed`` on a
+      clean re-run of the identical command).
+
+    Inside the gate BOTH facts are reported, never just one.  A ``FAILED``
+    line whose node-id is NOT crash-attributed is a genuine independent
+    failure and is named alongside the abort marker: suppressing every
+    ``FAILED`` line on truncation would recreate task 4066's incident (8 real
+    failures silently hidden), while returning only the surviving line would
+    let the ladder quote a partial tally as though it were complete.  When no
+    such line survives, the bailout line itself is quoted, so the hint always
+    says WHY there is no verdict.
+
+    Every other rung is untouched, so output with no bailout marker takes a
+    byte-identical path to today's.
+
     Returns ``''`` for None, empty, or whitespace-only input.
     Result is stripped to a single line and capped at 200 chars.
     """
     if not output or not output.strip():
         return ''
+
+    # Rung 0 — see the docstring above for why this pre-empts the ladder.
+    if _is_worker_death_truncated_session(output):
+        crash_attributed = _crash_attributed_nodeids(output)
+        for line in _PYTEST_FAILED_LINE_RE.findall(output):
+            match = _FAILED_LINE_NODEID_RE.match(line)
+            if match is not None and match.group(1) in crash_attributed:
+                continue
+            return (
+                f'{WORKER_DEATH_SUMMARY_MARKER}; first surviving failure: '
+                f'{line.strip()}'
+            ).strip()[:200]
+        bailout = _XDIST_SESSION_ABORTED_RE.search(output)
+        detail = bailout.group(0).strip() if bailout else ''
+        return f'{WORKER_DEATH_SUMMARY_MARKER}; {detail}'.strip()[:200]
 
     _HINT_PATTERNS = [
         _PYTEST_FAILED_LINE_RE,
@@ -1799,6 +1842,24 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
 # test_verify.py::TestKillNoteIsOneAggregationFragment, which fails at the
 # producer rather than letting the consumer degrade quietly.
 SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
+
+# The SECOND cause of a verdict-less leg, and the second marker the
+# `_aggregate_results` carry-through below must know about (task 5082).
+#
+# An external kill (above) means the process was stopped before it could emit
+# a single diagnostic.  This one means something narrower but just as
+# verdict-destroying: a pytest-xdist worker died, the `--max-worker-restart`
+# cap was exceeded, and `xdist/dsession.py` called `triggershutdown()` — so
+# every test still queued on every worker was ABANDONED and the tally pytest
+# printed counts only what had already run.  Measured (esc-4176-6): a
+# truncated run reported ``1 failed, 728 passed, 1 skipped`` where a clean
+# re-run of the identical command reported ``19622 passed, 17 skipped`` —
+# ~97% of the suite never ran, yet the shape is structurally
+# indistinguishable from an ordinary complete red run.
+#
+# Same CONSTRAINT ON PRODUCERS as above: a fragment bearing this marker must
+# not contain ', '.  See `_worker_death_leg_note`.
+WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 
 
 def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
