@@ -315,3 +315,80 @@ def build_dependency_index(edges: Mapping[int, Iterable[int]]) -> DependencyInde
         dependents={k: frozenset(v) for k, v in dependents.items()},
         closure=dict(closure),
     )
+
+
+#: THE closed classification vocabulary — the single normative site. A
+#: classification is REGISTERED here, never spelled as a bare string at a call
+#: site, so the finding record, the log line and every test read one vocabulary
+#: rather than three that are free to drift.
+#: An extraction that inverted a transitive chain: the ground truth runs the
+#: OTHER way (``dependency`` reaches ``dependent``).
+REVERSED = 'reversed'
+#: An extraction that FLATTENED a parallel relation into a sequential one: the
+#: two tasks are co-siblings, neither waits for the other.
+SIBLING_SEQUENTIAL = 'sibling_sequential'
+#: Both ids are known, no path runs either way, and they are not co-siblings —
+#: the ground truth supports no relation between them at all.
+UNSUPPORTED = 'unsupported'
+
+
+def classify_dependency_assertion(
+    assertion: DependencyAssertion, index: DependencyIndex
+) -> str | None:
+    """Classify *assertion* against ground truth, or ``None`` when it is fine.
+
+    ``None`` means "do not flag" — either the claim is SUPPORTED, or it cannot
+    be adjudicated and the fail-safe direction is to leave it alone.
+
+    THE ORDER BELOW IS LOAD-BEARING. It is behaviour pinned by its own test, not
+    an implementation detail a refactor may reorder:
+
+    1. Either id absent from the index, or ``dependent == dependency`` -> ``None``.
+       An unknown id means UNKNOWN, not WRONG. This mirrors
+       ``stale_status_snapshot_edge_sweep``'s invalidate-only-on-positively-
+       terminal doctrine: a transient or partial ground-truth read must be able
+       to UNDER-flag (self-healing on the next write) rather than wrongly retire
+       a true fact.
+    2. ``dependency in closure[dependent]`` -> ``None``. SUPPORTED, directly or
+       transitively.
+    3. ``dependent in closure[dependency]`` -> ``REVERSED``. The chain runs the
+       other way. Checked against the CLOSURE, not ``direct``, because the live
+       inversion this exists to catch is invisible at one hop: "Task 3618 waits
+       behind task 3578" is wrong precisely because 3578 reaches 3618 (via 3619)
+       while 3618 depends on nothing.
+    4. Co-sibling in EITHER DAG direction -> ``SIBLING_SEQUENTIAL``.
+    5. Otherwise -> ``UNSUPPORTED``.
+
+    WHY STEP 4 SPANS BOTH DAG DIRECTIONS. The escalation summarises the sibling
+    case as "two tasks that share a dependent". Measured against the graph as of
+    the bad extraction, that literal predicate catches 1 of the 3 known errors,
+    not the 2 required: 3619/3727 do share the dependent 3578, but 3730/3733
+    shared NO dependent at all — they shared the DEPENDENCIES {3728, 3578}. The
+    task description's own prose gives both shapes explicitly ("both are
+    dependencies of 3578" vs. "both depend on 3728 and 3578"), so covering both
+    honours the stated intent rather than departing from it.
+
+    WHY STEP 2 MUST PRECEDE STEP 4. ``direct[3730] & direct[3728] == {3727}``,
+    so 3730 and 3728 ARE co-siblings under the shared-dependency arm — and
+    ``3730 -> 3728`` is nonetheless a REAL direct edge. Evaluating the sibling
+    arm first would flag a true fact, which is exactly the false-positive class
+    the task's companion assertion forbids. Supported always wins.
+    """
+    dependent, dependency = assertion.dependent, assertion.dependency
+    if dependent == dependency:
+        return None
+    if dependent not in index.closure or dependency not in index.closure:
+        return None
+    if dependency in index.closure[dependent]:
+        return None
+    if dependent in index.closure[dependency]:
+        return REVERSED
+    shares_dependent = index.dependents.get(dependent, frozenset()) & index.dependents.get(
+        dependency, frozenset()
+    )
+    shares_dependency = index.direct.get(dependent, frozenset()) & index.direct.get(
+        dependency, frozenset()
+    )
+    if shares_dependent or shares_dependency:
+        return SIBLING_SEQUENTIAL
+    return UNSUPPORTED
