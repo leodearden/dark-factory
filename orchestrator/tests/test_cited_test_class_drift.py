@@ -332,6 +332,30 @@ class TestDefinedTestClasses:
             _defined_test_classes([tmp_path], {'TestFooBarBaz'})
 
 
+def _wrapped_candidates(source: str, name: str) -> set[str]:
+    """Names *name* might be, if its citation was WRAPPED across a line break.
+
+    A CANDIDATE GENERATOR ONLY, and deliberately unsound. Joining line-wraps
+    during EXTRACTION was measured to invent names that exist nowhere: in
+    ``shared.locking`` a comment line ends with ``...::TestFileExtensionsDriftGuard``
+    and the next begins ``# Drift guard (...)``, which this join turns into
+    ``TestFileExtensionsDriftGuardDrift``
+    (``test_the_false_positive_that_decided_the_design`` pins exactly that).
+    Applied as an extraction rule it would red-wall the guard on arrival with
+    pure fabrications.
+
+    What makes an unsound generator safe is the CALLER, not the generator:
+    ``_dangling_citations`` invokes this only for a name that has ALREADY
+    failed to resolve, and honours a candidate only when the joined string is
+    itself an AST-confirmed test class. The fabricated name above can never be
+    produced there, because its bare first half resolves on its own and the
+    join is therefore never attempted. Do not "simplify" this back into an
+    extraction rule, and never call it during extraction.
+    """
+    joiner = re.compile(re.escape(name) + r'-?[ \t]*\n[ \t]*#?[ \t]*([A-Z][A-Za-z0-9_]*)')
+    return {name + match.group(1) for match in joiner.finditer(source)}
+
+
 class TestWrappedCandidates:
     """Unit tests for the line-wrap JOIN generator ``_wrapped_candidates``.
 
