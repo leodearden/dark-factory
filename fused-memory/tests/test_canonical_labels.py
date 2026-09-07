@@ -609,6 +609,62 @@ class TestQualifiedRefNeverSpansALineBreak:
             ], content
 
 
+class TestQualifiedNodeNameNeverSpansALineBreak:
+    """The ANCHORED twin of :class:`TestQualifiedRefNeverSpansALineBreak`
+    above: the same '[ \\t]'-not-'\\s' colon narrowing, applied to
+    :data:`_QUALIFIED_NODE_NAME_PATTERN` (used by :func:`parse_node_name`)
+    instead of :data:`_QUALIFIED_REF_PATTERN` (used by :func:`scan_content`).
+    Read the two classes together: that one pins the UNANCHORED (prose-scan)
+    half of the invariant, this one the ANCHORED (whole-name) half.
+
+    Direction of safety: this pattern mints ONLY foreign referents. Every
+    local spelling is already claimed earlier inside :func:`parse_node_name`
+    by :data:`_TASK_NODE_NAME_PATTERN`, which is tried first, so nothing that
+    reaches this pattern is ever a local task. For a consumer performing
+    destructive edge surgery on the referent this mints, a missed ref is
+    recoverable — the node is simply left untouched — while a misattributed
+    one is not: it renames or re-attaches edges on the WRONG node. So
+    narrowing what this pattern accepts is the safe direction, exactly as it
+    is for _QUALIFIED_REF_PATTERN above.
+    """
+
+    def test_colon_followed_by_newline_is_not_a_qualified_node_name(self):
+        """Measured RED before the fix: parse_node_name('reify:\\n132')
+        returned Referent(project_id='reify', number='132') — an entity NAME
+        containing a hard line break parsed as a project-qualified label."""
+        assert parse_node_name('reify:\n132') is None
+
+    def test_newline_before_the_colon_is_not_a_qualified_node_name(self):
+        """BOTH halves are narrowed: the '\\s*' preceding the colon spans a
+        newline exactly as the trailing one does, so fixing only the trailing
+        half would leave the stated invariant half-true. Measured RED:
+        parse_node_name('reify\\n:132') also returned
+        Referent(project_id='reify', number='132')."""
+        assert parse_node_name('reify\n:132') is None
+
+    def test_blank_line_between_qualifier_and_number_is_not_a_qualified_node_name(self):
+        """The paragraph-break shape: two newlines rather than one."""
+        assert parse_node_name('reify:\n\n132') is None
+
+    def test_same_line_spellings_are_unaffected(self):
+        """Regression guard, green before AND after: the padding still
+        tolerates the spaces and tabs humans actually write around a colon,
+        which is what proves this change narrows ONLY across line breaks and
+        is not an undeclared tightening of human spacing. Asserts on
+        ``.node_name``, not just non-None, so a referent that parsed to the
+        WRONG thing would still fail this."""
+        for name in (
+            'reify:132',
+            'reify: 132',
+            'reify :132',
+            'reify : 132',
+            'reify\t:\t132',
+        ):
+            referent = parse_node_name(name)
+            assert referent is not None, name
+            assert referent.node_name == 'reify:132', name
+
+
 class TestScanContentOrderingAndDedup:
     """Positional first-seen order, de-duplicated on (kind, project_id, number)
     — so the result is deterministic and a consumer can rely on it."""
