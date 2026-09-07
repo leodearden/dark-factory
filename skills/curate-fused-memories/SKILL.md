@@ -444,10 +444,11 @@ For each gate with real work, in this order:
   write.** `add_memory` enforces two guards of different scope: a
   topic-cluster guard (covering BOTH categories) rejects a known-contradictory
   topic match (`ProceduralKnowledgeKnownTopicClusterWriteRejected`); a cosine
-  guard stays `procedural_knowledge`-only. Override either with
-  `allow_near_duplicate: True` for genuinely distinct content — see
-  CLAUDE.md's Memory Usage section. A curation sitting that itself plants a
-  near-duplicate is the ouroboros.
+  guard, `procedural_knowledge`-only, soft-blocks a write matching an existing
+  entry at high similarity (`ProceduralKnowledgeNearDuplicateWriteRejected`).
+  Override either with `allow_near_duplicate: True` for genuinely distinct
+  content — see CLAUDE.md's Memory Usage section. A curation sitting that
+  itself plants a near-duplicate is the ouroboros.
 - **Never run `git stash`** in any dark-factory checkout — `refs/stash` is
   shared across worktrees and the merge worker consumes it (incident
   `13674d3c68`). This sitting should not need git at all; if it somehow does,
