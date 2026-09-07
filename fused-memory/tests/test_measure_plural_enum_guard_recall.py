@@ -33,6 +33,11 @@ from reconciliation.plural_enum_shapes import (
     SUBJECT_POSITIVE_SHAPES,
 )
 
+# The SHIPPED pagination engine, imported for the same reason the guard below
+# is: the probe delegates to it, and identity checks against the real objects
+# are the only way to catch the probe quietly growing a private copy back.
+from fused_memory.backends import graphiti_client
+
 # The PRODUCTION guard object, imported the same way the sweep suite imports
 # it. Held here only so the baseline test can assert the probe's 'shipped'
 # candidate IS this object rather than a drifted copy — an identity check that
@@ -40,11 +45,6 @@ from reconciliation.plural_enum_shapes import (
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _enumeration_is_prepositional_complement,
 )
-
-# The SHIPPED pagination engine, imported for the same reason the guard above
-# is: the probe delegates to it, and identity checks against the real objects
-# are the only way to catch the probe quietly growing a private copy back.
-from fused_memory.backends import graphiti_client
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'measure_plural_enum_guard_recall.py'
@@ -1007,36 +1007,125 @@ class _FakeMovingCorpusQuery(_FakeCappedEdgeQuery):
 
 
 @pytest.mark.asyncio
-async def test_a_corpus_that_moves_mid_enumeration_is_reported_as_a_race(caplog):
-    """A concurrent write must not be diagnosed as a server misconfiguration.
+async def test_a_corpus_that_only_grew_is_still_a_complete_enumeration(caplog):
+    """Growth is not a shortfall, and must not fail a 43-graph run.
 
-    With one census probe, ANY write landing during the run makes
-    ``len(facts) != expected`` and the operator is told the most likely cause
-    is 'a server result-set cap below the assumed 10000'. On a busy graph that
-    is the LEAST likely cause, and it sends them to configuration they do not
-    need to change — while the actual remedy is simply to re-run.
+    The rule this replaces was ``post_expected != expected`` — ANY census
+    delta, in either direction, by any magnitude, forced INCOMPLETE. On the
+    graphs this probe measures that is a hair trigger rather than a check:
+    they are the orchestrator's and the reconciler's live working memory,
+    written continuously, and a full run pages tens of thousands of edges
+    across dozens of queries. One edge added by an unrelated cycle anywhere
+    in that window flipped the whole run to INCOMPLETE and exit 1.
 
-    Fail-closed either way (an enumeration that raced a write is not a proven
-    one); what this pins is that the two are reported as DIFFERENT things.
+    The band is DERIVED from set semantics rather than guessed. The edges
+    present for the WHOLE run are a subset of both censuses, so their count
+    is at most ``min(before, after)``; reading at least that many means
+    nothing continuously present went unread. Here 50 edges were enumerated
+    against censuses of 50 and 51 — everything that existed when the run
+    started was read, and the 51st arrived after the count that would have
+    included it. That is a COMPLETE enumeration of a corpus that grew, and
+    the growth is DISCLOSED (both readings are carried out of the function
+    and land in the artifact) rather than used to fail the run.
     """
     query_fn = _FakeMovingCorpusQuery(
         _fake_rows(50), cap=_PAGE_SIZE, counts=[50, 51],
     )
 
-    with caplog.at_level('WARNING'):
-        facts, complete = await enumerate_valid_edge_facts(
-            query_fn, page_size=_PAGE_SIZE,
-        )
+    with caplog.at_level('INFO'):
+        result = await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
+    facts, complete = result
 
-    # The enumeration itself was fine — 50 fetched against a pre-count of 50.
     assert len(facts) == 50
-    assert complete is False, 'a raced enumeration is not a proven one'
+    assert complete is True, (
+        'every edge that existed for the whole run was read; a corpus that '
+        'GREW under the enumeration is not a truncated one'
+    )
 
-    warnings = '\n'.join(r.getMessage() for r in caplog.records)
-    assert 'CHANGED MID-ENUMERATION' in warnings
-    assert 're-run' in warnings.lower()
-    assert 'result-set cap' not in warnings, (
-        'a concurrent write must not be reported as a suspected truncation'
+    # Both readings leave the function — an artifact reporting a census-derived
+    # verdict without the two numbers behind it cannot be audited.
+    assert result.census_before == 50
+    assert result.census_after == 51
+
+    # Disclosed at INFO, not failed at WARNING.
+    assert [r for r in caplog.records if r.levelname == 'WARNING'] == [], (
+        'a growing corpus is the ordinary case on these graphs, not a defect'
+    )
+    messages = '\n'.join(r.getMessage() for r in caplog.records)
+    assert '50' in messages and '51' in messages, messages
+    assert 'CHANGED MID-ENUMERATION' not in messages, (
+        'the old text told the operator to re-run a run that was already good'
+    )
+    assert 'INCOMPLETE' not in messages
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_that_shrank_is_tolerated_only_down_to_the_post_census(caplog):
+    """Shrinkage is tolerated EXACTLY as far as the post-census, and no further.
+
+    ``min(before, after)`` is not a symmetric fudge factor — it is the largest
+    number of edges that can have been continuously present. With a census of
+    51 before and 50 after, at most 50 edges existed for the whole run, so
+    reading 50 leaves nothing continuously present unread. Reading 49 would.
+
+    This is also the case where the shipped layer and this probe legitimately
+    disagree out loud: ``_paged_ro_query`` compares rows fetched against the
+    PRE-census only, so it reports a short read and warns about a suspected
+    result-set cap. That warning is about a different quantity, and the probe
+    says so at INFO rather than leaving a reader to take a WARNING from the
+    layer below as this probe's verdict.
+    """
+    query_fn = _FakeMovingCorpusQuery(
+        _fake_rows(50), cap=_PAGE_SIZE, counts=[51, 50],
+    )
+
+    with caplog.at_level('INFO'):
+        result = await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
+    facts, complete = result
+
+    assert len(facts) == 50
+    assert complete is True, '50 >= min(51, 50) — nothing continuously present was missed'
+    assert result.census_before == 51
+    assert result.census_after == 50
+
+    infos = '\n'.join(
+        r.getMessage() for r in caplog.records if r.levelname == 'INFO'
+    )
+    assert 'different units' in infos, (
+        "the layer below warned about a short read; the probe must say that "
+        "warning is not its own verdict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_enumeration_short_of_both_censuses_is_still_a_shortfall(caplog):
+    """The tolerance must not become the answer to every mismatch.
+
+    A corpus that moved does NOT excuse a read that came up short of the
+    SMALLER of the two counts: 40 edges against censuses of 50 and 51 means
+    at least ten edges that were present for the entire run were never read,
+    and no amount of concurrent writing explains that. Fail closed, and name
+    both readings so the operator can see the band the verdict was made
+    against rather than a single number.
+    """
+    query_fn = _FakeMovingCorpusQuery(
+        _fake_rows(40), cap=_PAGE_SIZE, counts=[50, 51],
+    )
+
+    with caplog.at_level('WARNING'):
+        result = await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
+    facts, complete = result
+
+    assert len(facts) == 40
+    assert complete is False, '40 < min(50, 51) — ten edges present throughout went unread'
+    assert result.census_before == 50
+    assert result.census_after == 51
+
+    warnings = '\n'.join(
+        r.getMessage() for r in caplog.records if r.levelname == 'WARNING'
+    )
+    assert '50' in warnings and '51' in warnings, (
+        'both census readings must be named, not just the one that was compared'
     )
 
 
