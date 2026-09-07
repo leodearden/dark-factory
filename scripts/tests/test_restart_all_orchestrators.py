@@ -848,6 +848,62 @@ def _heartbeat_timeline(fleet_dir, unit, timeline):
                 )
 
 
+def test_fired_records_elapsed_wall_clock_not_script_reachability(tmp_path):
+    """`fired` is a WALL-CLOCK observation of the TEST process -- not a record
+    of what the spawned script actually reached.
+
+    `_heartbeat_timeline` arms one `threading.Timer` per transition IN THIS
+    process and cancels them only once the with-block exits, so a label
+    lands in `fired` iff the BODY was still inside the block when that
+    timer's delay elapsed -- whether or not anything ever read the heartbeat
+    the transition wrote. The body below proves the decoupling: it finishes
+    everything it cares about in its first statement (reading the
+    pre-transition heartbeat), then merely LINGERS past the transition's
+    delay, standing in for a subprocess still running under host load. The
+    label lands anyway.
+
+    That is why a NEGATIVE `assert <label> not in fired` cannot be a
+    behavioural assertion: it asserts only "the with-body returned in under
+    <delay> seconds", which on a contended host is a property of the LOAD,
+    not of the code under test (task 4890). The POSITIVE `<label> in fired`
+    non-vacuity checks elsewhere in this file are a different claim and are
+    unaffected -- they assert a transition a test depends on did land.
+
+    Load-independent in the direction that matters: it asserts a label IS
+    present after lingering PAST the delay, so extra host load can only make
+    it more true, never flaky. In-process and sub-second; spawns no
+    subprocess and shims no PATH.
+    """
+    fleet_dir = tmp_path / "fleet"
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
+    trap_delay_secs = 0.2
+
+    with _heartbeat_timeline(
+        fleet_dir, UNIT_R, [("trap", trap_delay_secs, _HB_IDLE)],
+    ) as fired:
+        # The body's OWN business, complete in one statement: it reads the
+        # heartbeat and gets the pre-transition value. Nothing below ever
+        # looks at the file again, so nothing here observes the trap.
+        observed = json.loads((fleet_dir / f"{UNIT_R}.json").read_text())
+        # From here the body only LINGERS -- the stand-in for `_run_script`
+        # still blocking on a child that host load has slowed down.
+        time.sleep(trap_delay_secs * 2)
+        # Bounded top-up wait: under heavy load the timer THREAD may not have
+        # been scheduled by the time that sleep returns. Waiting on the
+        # CONDITION rather than trusting one fixed sleep is what keeps this
+        # test's own assertion load-independent -- extra load makes it wait
+        # longer, never fail. The bound only caps a genuine hang.
+        deadline = time.monotonic() + 30
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    assert "trap" in fired, (
+        f"the trap label must land purely because the BODY lingered past "
+        f"{trap_delay_secs}s, with nothing having read the heartbeat it "
+        f"wrote; got fired={fired!r} body_observed={observed!r}"
+    )
+
+
 def _busy_unit_drain_run(tmp_path, timeline, *, spawn_timeout, **knobs):
     """Shared preamble + spawn for the busy-unit drain-gate timeline tests
     below (reviewer_comprehensive #4).
