@@ -20,17 +20,24 @@ Covers:
 - CANONICAL_HUMAN_GATE_ACTION / GATE_OWNED_ACTION_NORM_HEADING /
   render_gate_owned_action_norm: the ONE sentence both halves quote, its
   exported heading, and the Stage-1 prompt section that carries it.
+- normalize_gate_owned_suggested_actions: the deterministic post-processor
+  that prepends that sentence to every gate-owned finding, whatever the model
+  wrote — the half that actually removes Stage 2's per-cycle catch.
 """
 
 from __future__ import annotations
 
+import copy
+
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     GATE_RESOLUTION_FLAG_TYPE,
+    build_gate_resolution_flag,
 )
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     CANONICAL_HUMAN_GATE_ACTION,
     GATE_OWNED_ACTION_NORM_HEADING,
     extract_human_gated_task_ids,
+    normalize_gate_owned_suggested_actions,
     render_gate_owned_action_norm,
 )
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
@@ -364,3 +371,274 @@ class TestCanonicalHumanGateAction:
             "test_recon_report_guidance_drift.py's balanced-paren run_id scan "
             'for no benefit'
         )
+
+
+#: The ambiguous phrasing observed in autopilot_video run 8b2d3371 (Stage 1
+#: finding 640d4ceb, cited task 645) — the exact defect this normalizer exists
+#: to correct.
+_AMBIGUOUS_ACTION = (
+    'Stage 2 or operator should decide whether to enumerate the remaining '
+    'members and extend the gate.'
+)
+
+
+def _gate_owned_flag(**overrides):
+    """A minimal LLM-shaped finding citing gate task 645, plus *overrides*."""
+    flag = {
+        'description': 'Gate 645 has an unresolved membership question.',
+        'severity': 'moderate',
+        'actionable': True,
+        'task_id': '645',
+        'flag_type': 'task_memory_divergence',
+        'category': 'task_memory_mismatch',
+        'suggested_action': _AMBIGUOUS_ACTION,
+    }
+    flag.update(overrides)
+    return flag
+
+
+class TestNormalizeGateOwnedSuggestedActions:
+    """normalize_gate_owned_suggested_actions(flags, gate_task_ids) -> (flags, count).
+
+    Half B of task 4814 — the deterministic half, and the one that actually
+    removes Stage 2's per-cycle catch.  It keys on the STRUCTURED gate fact
+    rather than on the model's prose: "is this phrasing ambiguous?" has no
+    reliable regex, while gate-ownership is a metadata fact already sitting in
+    ``filtered_task_tree.active_tasks``.  Keying on the fact means the
+    correction fires on every gate-owned finding regardless of how the model
+    phrased it — including phrasings nobody has seen yet — where a wording
+    detector would only catch the three offenders the task enumerates.
+
+    It never drops, never reorders, and never rewrites the model's own text:
+    the canonical sentence is PREPENDED and the original follows, which keeps
+    the evidence intact and makes the transformation reviewable and
+    idempotent.
+    """
+
+    def test_prepends_canonical_action_for_a_gate_owned_task_id(self):
+        """A flag whose top-level task_id is a gate id is corrected and counted."""
+        result, count = normalize_gate_owned_suggested_actions(
+            [_gate_owned_flag()], ['645'],
+        )
+
+        assert count == 1, f'one gate-owned flag must count 1, got {count!r}'
+        action = result[0]['suggested_action']
+        assert action.startswith(CANONICAL_HUMAN_GATE_ACTION), (
+            'the canonical sentence must lead the suggested_action so a Stage-2 '
+            f'reader meets it first; got {action[:120]!r}'
+        )
+        assert _AMBIGUOUS_ACTION in action, (
+            "the model's original text must be PRESERVED after the prefix — it "
+            'is the finding evidence, and dropping it would make the correction '
+            'lossy and unreviewable'
+        )
+        assert result[0]['gate_owned_action_normalized'] is True, (
+            'a corrected flag must carry gate_owned_action_normalized=True so '
+            'the divergence from the durable recon_report row is explicit and '
+            'greppable rather than silent'
+        )
+
+    def test_normalizes_via_cited_tasks_when_task_id_is_none(self):
+        """The run-8b2d3371 shape: gate id reachable only through cited_tasks."""
+        flag = _gate_owned_flag(
+            task_id=None,
+            cited_tasks=[
+                {'project_id': 'autopilot_video', 'task_id': '645', 'title': 'Gate'},
+            ],
+        )
+
+        result, count = normalize_gate_owned_suggested_actions([flag], ['645'])
+
+        assert count == 1, (
+            'cited_tasks is the AUTHORITATIVE dedup key and a finding may carry '
+            'its task only there — reading task_id alone would miss the exact '
+            f'shape observed in run 8b2d3371; got {count!r}'
+        )
+        assert result[0]['suggested_action'].startswith(CANONICAL_HUMAN_GATE_ACTION)
+
+    def test_matches_a_comma_joined_composite_task_id(self):
+        """FINDING_ITEM_SCHEMA documents a comma-joined multi-id task_id shape."""
+        result, count = normalize_gate_owned_suggested_actions(
+            [_gate_owned_flag(task_id='645,652')], ['652'],
+        )
+
+        assert count == 1, (
+            'a composite task_id must match when EITHER component is a gate id '
+            '— the finding still cites a human gate; got '
+            f'{count!r}'
+        )
+        assert result[0]['suggested_action'].startswith(CANONICAL_HUMAN_GATE_ACTION)
+
+    def test_leaves_a_non_gate_finding_byte_identical(self):
+        """A finding citing only non-gate tasks is returned untouched."""
+        flag = _gate_owned_flag(task_id='4242')
+        original = copy.deepcopy(flag)
+
+        result, count = normalize_gate_owned_suggested_actions([flag], ['645', '652'])
+
+        assert count == 0, f'no gate-owned flag means count 0, got {count!r}'
+        assert result[0] == original, (
+            'a non-gate finding must be returned byte-identical — over-selection '
+            f'would rewrite a finding no human owns; got {result[0]!r}'
+        )
+        assert 'gate_owned_action_normalized' not in result[0], (
+            'the marker must not be stamped on an untouched flag'
+        )
+
+    def test_is_idempotent_across_repeated_passes(self):
+        """Feeding the output back in changes nothing and counts 0.
+
+        Matters because the normalizer runs once per cycle over findings that
+        can persist across cycles; a non-idempotent prefix would accrete
+        copies of the sentence until the suggested_action was unreadable.
+        """
+        once, first_count = normalize_gate_owned_suggested_actions(
+            [_gate_owned_flag()], ['645'],
+        )
+        twice, second_count = normalize_gate_owned_suggested_actions(once, ['645'])
+
+        assert first_count == 1 and second_count == 0, (
+            'the second pass must be a no-op; got '
+            f'{first_count!r} then {second_count!r}'
+        )
+        assert twice == once, 'a re-run must not alter an already-corrected flag'
+        assert twice[0]['suggested_action'].count(CANONICAL_HUMAN_GATE_ACTION) == 1, (
+            'the canonical sentence must appear exactly once, never doubled'
+        )
+
+    def test_sets_the_action_when_it_is_missing_none_or_blank(self):
+        """A missing/None/empty suggested_action is SET to the canonical sentence."""
+        for label, flag in (
+            ('missing', _gate_owned_flag()),
+            ('none', _gate_owned_flag(suggested_action=None)),
+            ('blank', _gate_owned_flag(suggested_action='   ')),
+        ):
+            if label == 'missing':
+                flag.pop('suggested_action')
+
+            result, count = normalize_gate_owned_suggested_actions([flag], ['645'])
+
+            assert count == 1, f'{label} suggested_action must still count 1, got {count!r}'
+            assert result[0]['suggested_action'] == CANONICAL_HUMAN_GATE_ACTION, (
+                f'a {label} suggested_action must become the canonical sentence '
+                f'ALONE, with no dangling separator; got '
+                f'{result[0]["suggested_action"]!r}'
+            )
+
+    def test_carves_out_the_real_curator_gate_resolution_flag(self):
+        """The REAL build_gate_resolution_flag output is left untouched.
+
+        Not a hand-written fixture: pinning against the real builder means a
+        future edit to either side is caught at the seam.  That flag's
+        suggested_action DELIBERATELY tells Stage 2 to set a gate task's
+        status — but only to transcribe a ruling a human curator already
+        recorded in Mem0, and it carries its own dismiss branch for the
+        merely-curated case.  Without this carve-out, task 4814 would ship a
+        rule that contradicts a live, deliberately-designed sibling flag on
+        its very first cycle.
+        """
+        flag = build_gate_resolution_flag('645', [{'id': 'mem-a'}])
+        original = copy.deepcopy(flag)
+
+        assert flag['flag_type'] == GATE_RESOLUTION_FLAG_TYPE, (
+            'guard on the fixture itself: this test only proves the carve-out '
+            'if the real builder still emits the carved-out flag_type'
+        )
+
+        result, count = normalize_gate_owned_suggested_actions([flag], ['645'])
+
+        assert count == 0, (
+            f'the {GATE_RESOLUTION_FLAG_TYPE} carve-out must not count, got {count!r}'
+        )
+        assert result[0] == original, (
+            'the curator-gate-resolution flag must be returned byte-identical — '
+            'prepending "no stage may record a decision" to a flag whose whole '
+            'purpose is to transcribe a recorded human ruling would contradict it'
+        )
+
+    def test_passes_non_dict_elements_through_without_raising(self):
+        """A malformed element must not cost the whole findings list."""
+        flags = ['not-a-dict', None, _gate_owned_flag()]
+
+        result, count = normalize_gate_owned_suggested_actions(flags, ['645'])
+
+        assert count == 1, f'the one real gate-owned flag still counts, got {count!r}'
+        assert result[0] == 'not-a-dict' and result[1] is None, (
+            f'non-dict elements must pass through unchanged, got {result[:2]!r}'
+        )
+
+    def test_does_not_mutate_the_callers_input_dicts(self):
+        """The in-scope flag is REPLACED by a shallow copy, never mutated in place.
+
+        Load-bearing: ``report.items_flagged``'s ``_pre_filter_flags`` snapshot
+        is a shallow list copy that ALIASES these same dicts, so an in-place
+        rewrite would retroactively alter the pre-filter snapshot.
+        """
+        flag = _gate_owned_flag()
+        original = copy.deepcopy(flag)
+
+        result, _count = normalize_gate_owned_suggested_actions([flag], ['645'])
+
+        assert flag == original, (
+            'the caller\'s dict must be untouched; got '
+            f'{flag!r}'
+        )
+        assert result[0] is not flag, (
+            'the corrected flag must be a new dict, not the caller\'s object'
+        )
+
+    def test_empty_inputs_are_identity(self):
+        """Empty gate ids and empty flags are both no-ops."""
+        flag = _gate_owned_flag()
+
+        result, count = normalize_gate_owned_suggested_actions([flag], [])
+        assert count == 0 and result[0] == flag, (
+            'no gate tasks in the tree means nothing to normalize'
+        )
+
+        result, count = normalize_gate_owned_suggested_actions([], ['645'])
+        assert result == [] and count == 0
+
+    def test_preserves_input_order_and_length(self):
+        """The normalizer never drops and never reorders.
+
+        It is a phrasing correction, not a filter — unlike every other member
+        of the Stage-1 post-processor chain it sits in.
+        """
+        flags = [
+            _gate_owned_flag(task_id='4242'),
+            _gate_owned_flag(task_id='645'),
+            _gate_owned_flag(task_id='9999'),
+            _gate_owned_flag(task_id='652'),
+        ]
+
+        result, count = normalize_gate_owned_suggested_actions(flags, ['645', '652'])
+
+        assert len(result) == len(flags), (
+            f'length must be preserved, got {len(result)} from {len(flags)}'
+        )
+        assert [f['task_id'] for f in result] == ['4242', '645', '9999', '652'], (
+            'input order must be preserved'
+        )
+        assert count == 2, f'exactly the two gate-owned flags count, got {count!r}'
+
+    def test_leaves_the_dedup_signature_fields_untouched(self):
+        """task_id, flag_type and cited_tasks are never modified.
+
+        Those three ARE ``compute_flag_signature``'s key, so leaving them
+        untouched is what makes running this after ``dedup_flags`` safe.
+        """
+        flag = _gate_owned_flag(
+            cited_tasks=[
+                {'project_id': 'autopilot_video', 'task_id': '645', 'title': 'Gate'},
+            ],
+        )
+
+        result, _count = normalize_gate_owned_suggested_actions([flag], ['645'])
+
+        for key in ('task_id', 'flag_type', 'cited_tasks'):
+            assert result[0][key] == flag[key], (
+                f'{key} must be untouched — it is part of compute_flag_signature, '
+                'and altering it would perturb cross-cycle dedup, suppression '
+                'and the stage1_flag_markers_acknowledged diff'
+            )
