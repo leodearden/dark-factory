@@ -383,6 +383,42 @@ class TestAddReuseItem:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture()
+def git_artifacts(tmp_path):
+    """TaskArtifacts pointing at a REAL git worktree (task 3651).
+
+    Mirrors ``test_reconcile_done_step_commits.py::_init_repo`` — including the
+    ``.gitignore`` = ``.task/`` line, without which ``git add -A`` would stage
+    the artifacts dir into the test's commits. Needed because
+    ``_mark_step_done``'s reachability guard shells out to real git; the plain
+    ``artifacts`` fixture (a bare temp dir) deliberately exercises the
+    git-unavailable fall-through instead.
+    """
+    repo = tmp_path / 'worktree'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-b', 'main'], cwd=repo, check=True, capture_output=True)
+    subprocess.run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo, check=True)
+    (repo / '.gitignore').write_text('.task/\n')
+    (repo / 'm.py').write_text('x = 1\n')
+    subprocess.run(['git', 'add', '-A'], cwd=repo, check=True, capture_output=True)
+    subprocess.run(['git', 'commit', '-m', 'Initial'], cwd=repo, check=True, capture_output=True)
+    a = TaskArtifacts(repo)
+    a.init('test-1', 'Test task', 'A test')
+    return a
+
+
+def _git_commit_file(repo: Path, name: str, content: str, message: str) -> str:
+    """Write, stage and commit *name*; return the resulting sha."""
+    (repo / name).write_text(content)
+    subprocess.run(['git', 'add', '-A'], cwd=repo, check=True, capture_output=True)
+    subprocess.run(['git', 'commit', '-m', message], cwd=repo, check=True, capture_output=True)
+    out = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, check=True, capture_output=True, text=True,
+    )
+    return out.stdout.strip()
+
+
 class TestMarkStepDone:
     def _setup_plan(self, artifacts):
         _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
@@ -427,6 +463,92 @@ class TestMarkStepDone:
         result = _mark_step_done(artifacts, 'nonexistent', 'abc123')
         assert result['status'] == 'error'
         assert 'not found' in result['message']
+
+    # -- task 3651: on-branch reachability guard --------------------------
+
+    def test_reachable_sha_is_recorded(self, git_artifacts):
+        """The ordinary implementer path: a sha the branch actually carries is
+        accepted and recorded unchanged. Guards against the new reachability
+        check rejecting legitimate work."""
+        self._setup_plan(git_artifacts)
+        sha = _git_commit_file(
+            git_artifacts.worktree, 'm.py', 'x = 2\n', 'feat: step-1',
+        )
+
+        result = _mark_step_done(git_artifacts, 'step-1', sha)
+
+        assert result['status'] == 'ok'
+        assert result['commit'] == sha
+        plan = git_artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert plan['steps'][0]['commit'] == sha
+
+    def test_unreachable_sha_is_rejected(self, git_artifacts):
+        """A REAL commit object that is not an ancestor of HEAD (it lives on a
+        side branch) must be refused, and NOTHING may be written to the plan.
+
+        This is the defect: today _mark_step_done records any string verbatim,
+        so a step can end up pointing at a sha the branch does not carry."""
+        self._setup_plan(git_artifacts)
+        repo = git_artifacts.worktree
+        subprocess.run(['git', 'switch', '-c', 'other'], cwd=repo, check=True, capture_output=True)
+        side_sha = _git_commit_file(repo, 'side.py', 'side\n', 'feat: on a side branch')
+        subprocess.run(['git', 'switch', 'main'], cwd=repo, check=True, capture_output=True)
+        # The object exists...
+        assert subprocess.run(
+            ['git', 'cat-file', '-e', side_sha], cwd=repo, capture_output=True,
+        ).returncode == 0
+        # ...but is not reachable from HEAD.
+        assert subprocess.run(
+            ['git', 'merge-base', '--is-ancestor', side_sha, 'HEAD'],
+            cwd=repo, capture_output=True,
+        ).returncode != 0
+
+        result = _mark_step_done(git_artifacts, 'step-1', side_sha)
+
+        assert result['status'] == 'error'
+        assert side_sha in result['message']
+        assert 'reachable' in result['message']
+        # The markup-repair envelope key is attached only when there ARE
+        # repairs (plan_tools.py::_with_markup_repairs); a clean plan's
+        # rejection must stay byte-identical to what every other caller sees.
+        assert 'markup_repairs' not in result
+        # Nothing was written.
+        plan = git_artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'pending'
+        assert not plan['steps'][0].get('commit')
+
+        # A fabricated sha is rejected the same way in this healthy repo.
+        fabricated = 'deadbeef' * 5
+        result2 = _mark_step_done(git_artifacts, 'step-1', fabricated)
+        assert result2['status'] == 'error'
+        assert fabricated in result2['message']
+        plan2 = git_artifacts.read_plan()
+        assert plan2['steps'][0]['status'] == 'pending'
+        assert not plan2['steps'][0].get('commit')
+
+    def test_records_and_warns_when_git_is_unavailable(self, artifacts, caplog):
+        """FAIL-OPEN, LOUDLY: when the reachability check cannot run at all
+        (no git repo at the worktree), the sha is still recorded — a false
+        reject would leave the step pending while its code sits on the branch,
+        which is the very failure this guard exists to prevent — but the
+        degradation is logged at WARNING, never silent.
+
+        Deliberately asymmetric to _mark_step_committed, which fails CLOSED."""
+        self._setup_plan(artifacts)
+
+        with caplog.at_level(logging.WARNING):
+            result = _mark_step_done(artifacts, 'step-1', 'abc123')
+
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert plan['steps'][0]['commit'] == 'abc123'
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('step-1' in m and 'abc123' in m for m in warnings), (
+            f'expected a loud WARNING naming the step and sha, got {warnings}'
+        )
 
 
 # ---------------------------------------------------------------------------
