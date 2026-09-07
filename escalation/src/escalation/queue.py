@@ -446,17 +446,18 @@ def read_escalation_for_scan(
       caller, where the record would have been filtered out anyway -- an
       archived record is by definition no longer pending -- so warning would
       only train operators to ignore the channel.  For an ARCHIVE-INCLUDING
-      scan it is a deliberate residual, stated plainly rather than implied:
-      ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
-      record relocated root -> ``archive/<date>/`` inside that window is in
-      NEITHER listing and drops out of the result entirely, reported only at
-      DEBUG.  Such a caller (``server.py``'s ``get_task_escalations`` when its
-      caller passes no status, and ``orchestrator.workflow``'s unfiltered
-      ``get_by_task(self.task_id)`` sweeps) can therefore receive a listing
-      that is silently short by one.  Still strictly better than the
-      pre-change crash, and bounded by the race window -- but recovering the
-      record would take a second archive glob after the root pass, which is
-      tracked as a follow-up rather than smuggled in here.
+      scan, ``get_by_task`` globs the archive tier BEFORE the root read loop,
+      so a record relocated root -> ``archive/<date>/`` inside that window is
+      in NEITHER the snapshot taken for the archive tier NOR the still-live
+      root copy at read time.  Task 5118 closes that residual: such a caller
+      (``get_by_task`` with ``status != 'pending'`` -- e.g. ``server.py``'s
+      ``get_task_escalations`` when its caller passes no status, and
+      ``orchestrator.workflow``'s unfiltered ``get_by_task(self.task_id)``
+      sweeps) re-locates the id via a fresh ``_locate_path`` call and retries
+      the read once before giving up on it, so the listing recovers the
+      record instead of silently coming back short by one.  A
+      ``status='pending'`` caller does not get this recovery -- see above,
+      the record would be filtered out on status anyway.
     - ``'unreadable'`` -- any OTHER ``OSError``: EACCES, EIO, fd exhaustion.
       The file IS present and something is genuinely wrong.  Logged at
       WARNING, in wording deliberately disjoint from the parse channel's so
@@ -534,12 +535,17 @@ def read_escalation_for_scan(
     ``orchestrator.digest`` and ``fused_memory.reconciliation.harness``
     (``Exception``).
 
-    EXPLICITLY OUT OF SCOPE: ``EscalationQueue.get`` is ``_locate_path``-then-
-    read rather than glob-then-read.  Its blast radius is the single record
-    the caller asked about rather than a whole listing, and the semantically
-    correct repair is re-locate-and-retry -- the record MOVED, it did not
-    vanish -- which is a different shape from "skip and continue".  Tracked as
-    a follow-up.
+    NOT ROUTED THROUGH THIS HELPER: ``EscalationQueue.get`` is
+    ``_locate_path``-then-read rather than glob-then-read.  Its blast radius
+    is the single record the caller asked about rather than a whole listing,
+    and the semantically correct repair is re-locate-and-retry -- the record
+    MOVED, it did not vanish -- which is a different shape from "skip and
+    continue".  Task 5118 implements exactly that repair directly in
+    ``get()`` (a bare ``FileNotFoundError`` catch around its own
+    locate-then-read sequence, retried once via a fresh ``_locate_path``)
+    rather than by routing through this tri-state helper, which exists for
+    glob-then-read listings and would need a different return shape to fit
+    a single-record caller.
 
     DECODE FAULTS follow the caller's ``parse_errors``, by design and not by
     accident.  ``UnicodeDecodeError`` from ``read_text`` on a truncated or
