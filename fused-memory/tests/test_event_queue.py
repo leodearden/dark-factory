@@ -344,21 +344,38 @@ async def test_overflow_writes_to_dead_letter(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_graceful_shutdown_flushes_within_window(tmp_path, real_buffer):
-    """Bounded flush drains everything when drainer can keep up."""
-    # The drain is awaited on the queue's own accounting (_wait_for_drained)
-    # BEFORE close() runs, so close() only ever performs a no-op flush and
-    # shutdown_flush_seconds is not load-bearing — see _wait_for_drained's
-    # docstring for why that gate is airtight. The sibling
-    # test_graceful_shutdown_is_independent_of_flush_window proves this
-    # independence directly, with shutdown_flush_seconds=0.0.
+@pytest.mark.parametrize('shutdown_flush_seconds', [2.0, 0.0])
+async def test_shutdown_after_drain_leaves_no_dead_letters(
+    tmp_path, real_buffer, shutdown_flush_seconds,
+):
+    """close() dead-letters nothing when the queue is already drained,
+    regardless of shutdown_flush_seconds.
+
+    The drain is awaited on the queue's own accounting (_wait_for_drained)
+    BEFORE close() runs, so close() only ever performs a no-op flush here —
+    shutdown_flush_seconds is never consulted; see _wait_for_drained's
+    docstring for why that gate is airtight. Parametrized over 2.0 (the
+    file's dominant convention) and 0.0 to prove the outcome is independent
+    of the window rather than merely tolerant of a generous one:
+
+    0.0 is not merely "small" — on CPython, asyncio.wait_for with timeout<=0
+    does ensure_future(coro) then checks fut.done(), which is False for a
+    freshly created coroutine, so it raises TimeoutError WITHOUT EVER READING
+    THE CLOCK. The window is therefore "already expired" as a matter of
+    logic, not of timing, so this test carries no wall-clock dependency in
+    either direction.
+
+    test_graceful_shutdown_close_drains_in_flight_events (below) covers the
+    complementary case: close() actually draining events that are still in
+    flight when it is called.
+    """
     q = EventQueue(
         real_buffer,
         dead_letter_path=tmp_path / 'dl.jsonl',
         maxsize=100,
         retry_initial_seconds=0.01,
         retry_max_seconds=0.1,
-        shutdown_flush_seconds=2.0,
+        shutdown_flush_seconds=shutdown_flush_seconds,
     )
     await q.start()
     for _ in range(50):
@@ -373,34 +390,65 @@ async def test_graceful_shutdown_flushes_within_window(tmp_path, real_buffer):
 
 
 @pytest.mark.asyncio
-async def test_graceful_shutdown_is_independent_of_flush_window(tmp_path, real_buffer):
-    """close() must drain fully even when shutdown_flush_seconds=0.0.
+async def test_graceful_shutdown_close_drains_in_flight_events(tmp_path, real_buffer):
+    """close()'s own bounded flush drains events still in flight when called.
 
-    0.0 is not merely "small" — on CPython, asyncio.wait_for with timeout<=0
-    does ensure_future(coro) then checks fut.done(), which is False for a
-    freshly created coroutine, so it raises TimeoutError WITHOUT EVER READING
-    THE CLOCK. The window is therefore "already expired" as a matter of
-    logic, not of timing, so this test carries no wall-clock dependency in
-    either direction: it proves the drain outcome is independent of
-    shutdown_flush_seconds rather than merely giving the window a generous
-    margin.
+    test_shutdown_after_drain_leaves_no_dead_letters (above) gates the drain
+    with _wait_for_drained before calling close(), so by the time close()
+    runs the queue is already empty and its
+    ``asyncio.wait_for(self._queue.join(), timeout=self._shutdown_flush)``
+    only ever performs a no-op flush. This test exercises the success branch
+    that leaves uncovered: close() called against a genuinely NON-EMPTY
+    queue, which must still drain everything and dead-letter nothing.
+
+    Gates the buffer's push on an ``asyncio.Event`` (not a sleep) so the
+    overlap between "close() is awaiting queue.join()" and "events are still
+    being committed" is deterministic rather than timing-dependent:
+    ``push_started`` confirms the drainer has retrieved the first event and
+    is blocked inside push() *before* close() is even invoked, and asyncio's
+    FIFO ``call_soon`` scheduling guarantees ``close()``'s
+    ``wait_for(queue.join())`` call runs — and suspends, since all 5 events
+    are still unfinished — before the gate-release wakes the drainer. So
+    close() is proven to observe a genuinely non-empty queue, not one that
+    merely happened to drain first.
     """
+    push_started = asyncio.Event()
+    gate = asyncio.Event()
+    original_push = real_buffer.push
+
+    async def gated_push(event):
+        push_started.set()
+        await gate.wait()
+        return await original_push(event)
+
+    real_buffer.push = gated_push
+
     q = EventQueue(
         real_buffer,
         dead_letter_path=tmp_path / 'dl.jsonl',
         maxsize=100,
         retry_initial_seconds=0.01,
         retry_max_seconds=0.1,
-        shutdown_flush_seconds=0.0,
+        shutdown_flush_seconds=5.0,
     )
     await q.start()
-    for _ in range(50):
+    for _ in range(5):
         q.enqueue(_make_event())
-    await _wait_for_drained(q, 50)
-    await q.close()
-    # All events landed; no dead-letter residue.
+    # Wait for the drainer to pick up the first event and block inside
+    # push() — guarantees all 5 events are still unfinished when close() is
+    # invoked below.
+    await push_started.wait()
+    close_task = asyncio.create_task(q.close())
+    # close_task's first step was scheduled above, before gate.set() below
+    # schedules the drainer's resume — FIFO call_soon ordering means close()
+    # has already entered (and suspended in) wait_for(queue.join()) against
+    # a non-empty queue by the time the drainer wakes up and starts
+    # committing.
+    gate.set()
+    await close_task
+
     stats = await real_buffer.get_buffer_stats('test-project')
-    assert stats['size'] == 50
+    assert stats['size'] == 5
     dl_path = tmp_path / 'dl.jsonl'
     assert not dl_path.exists() or dl_path.read_text() == ''
 
