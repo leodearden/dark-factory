@@ -569,10 +569,20 @@ current.** The CLI probe already exits `0` against a stale checkout — it
 only executes `--help`, which needs no correct code, just a resolvable
 entry point. The currency check is separate: `git rev-parse HEAD` on the
 remote must equal the dispatching workstation's `origin/main`. This
-distinction is not cosmetic — under `merge_verify_breadth=full` the module
-set is *discovered from the remote tree itself* (task 4536), so a stale
-remote checkout silently **narrows** the gate rather than failing loudly.
-Verify currency, every time, not just reachability.
+distinction is not cosmetic — but the reason is *not* that a stale
+checkout narrows the module set. Task 4536 closed exactly that hole:
+`verify_runner.py::run_merge_verify_on_worktree` unconditionally installs
+the dispatcher's set over the remote's own discovery walk
+(`config._module_configs = {mc.prefix: mc for mc in module_configs}`), so
+the module SET is authoritative from the wire spec and a stale remote can
+no longer silently drop modules the spec named or inject ones it did not.
+
+What a stale checkout still does is **run stale verify code**. The remote
+executes its own tree's timeouts, admission logic,
+`verify_cold_preprovision_command` and breadth handling — the gate that
+decides your merge is the one in the remote's checkout, not the one you
+reviewed on the workstation. Verify currency, every time, not just
+reachability.
 
 ### The per-host YAML
 
@@ -643,24 +653,34 @@ warm worktree, `<worktree_dir>/_merge-verify`, resetting it in place each
 time — trading the cost of materialising a worktree from scratch for
 reuse of whatever build caches already live inside it.
 
-Two things must both hold before turning it on for a project, not just one:
+Two things to settle before turning it on for a project — one about how
+the serial-lane constraint is actually enforced, one about whether the
+reuse is worth having at all:
 
-1. **The dispatcher-side serial-lane guard must be live too** — which
-   means the knob is set on **both** the dispatching workstation and the
-   remote host, not the remote alone. This isn't the only thing standing
-   between a remote-only flip and trouble — the remote enforces its own
-   per-host serial lane regardless (see the failure mode below) — but the
-   two guards do different jobs at different times. The remote's is a
-   *runtime* lock: contention there turns into an aborted verify, not a
-   race. The workstation-startup guard,
-   `merge_liveness.py::enforce_persistent_worktree_serial_lane`, is a
-   *fail-closed refusal at config time* instead — it reads the
-   **workstation's** copy of this knob at startup and raises
-   `PersistentWorktreeConfigError` when the per-host worst case,
-   `ceil(merge_ahead_bound / num_hosts)`, exceeds `1` (PRD §A invariant
-   4). Flip the knob on the remote alone and you keep the runtime lock but
-   lose the startup check that would have told you your concurrency
-   budget makes contention routine, before you ever dispatch a verify.
+1. **Set the knob on both sides together — but do not expect startup to
+   catch you if you don't.** The knob belongs on **both** the dispatching
+   workstation and the remote host, because each side reads its own copy
+   and they describe one shared physical constraint. What actually
+   enforces that constraint, though, is the remote's *runtime* lane lock:
+   contention there turns into an aborted verify rather than a race (see
+   the failure mode below).
+
+   It is worth being precise about what does **not** back you up here,
+   because the name suggests otherwise. There is a fail-closed config-time
+   guard, `merge_liveness.py::enforce_persistent_worktree_serial_lane`,
+   which raises `PersistentWorktreeConfigError` when the per-host worst
+   case `ceil(merge_ahead_bound / num_hosts)` exceeds `1` (PRD §A
+   invariant 4) — but at its only production call site
+   (`harness.py`, `_start_merge_worker`) it is invoked as
+   `enforce_persistent_worktree_serial_lane(config, merge_ahead_bound=_k,
+   num_hosts=_k)`. Because `num_hosts` equals `merge_ahead_bound`, the
+   per-host bound is `ceil(K/K) = 1` for every `K`, and the refusal branch
+   is structurally unreachable as wired today; the harness comment says so
+   outright ("each of the K hosts gets its own serial lane so per-host lane
+   bound = ceil(K/num_hosts) = 1"). Treat that guard as protecting the
+   invariant *by construction*, not as a net that will refuse a bad
+   concurrency budget at startup — it will not fire. The runtime lock
+   below is the enforcement that actually runs.
 2. **The project's cold-preprovision cost must be high enough to make
    reuse worth wanting.** If a project pays a full dependency
    install/build on every cold verify (a `verify_cold_preprovision_command`
@@ -688,22 +708,34 @@ throughput-and-paging basis rather than a corruption one.
 **Dark Factory's answer, as a worked example (decided 2026-09-07, task
 5051):** `false`. Two verified legs:
 
-1. **Paging, the decisive leg.** At this project's `merge_ahead_bound`
-   (`K=2`), two dark_factory verifies can reach the remote host
-   concurrently. With the knob on, that ordinary concurrency converts
-   into `flock_contention` results — each one a born-at-L2 escalation and
-   a blocked merge. The PRD assigned the remedy for that (host-level
-   arbitration) to task C, which is **cancelled**; turning the knob on
-   today would re-arm a paging hazard with no landed fix.
+1. **Paging, the decisive leg — but read the premise carefully.** As
+   configured *today*, `dark-factory-orchestrator.yaml` registers no
+   `verify_runners` at all, so `enabled_verify_runners` is empty and
+   `K = 1 + len(enabled_verify_runners) = 1` (`harness.py`). There is no
+   remote verify host for two dark_factory verifies to contend on, and no
+   `K=2`. So the immediate reason the knob is `false` is simply that the
+   feature it tunes is not yet in use.
+
+   The forward-looking reason is what makes `false` the right setting to
+   *keep*. Once task D1 registers the laptop runner, `K` becomes `2`, and
+   two dark_factory verifies can reach that one host concurrently. With
+   the knob on, that ordinary concurrency converts into `flock_contention`
+   results — each one a born-at-L2 escalation and a blocked merge. The PRD
+   assigned the remedy for that (host-level arbitration) to task C, which
+   is **cancelled**, so the fix that would make the knob safe at `K=2` has
+   not landed. Enabling it in the same change that registers the runner
+   would arm a paging hazard with no remedy behind it.
 2. **With the knob off**, `cli.py` is explicit — "Knob OFF -> lane_fd/
    compat_fd stay None -> byte-identical back-compat (no lock)" —
    concurrent verifies simply get disjoint ephemeral worktrees, no
    contention outcome at all.
 
-The recorded **cost** of "no": dark_factory sets a
-`verify_cold_preprovision_command`, and `verify.py`'s `_PREPROVISION_DONE`
-memo is in-process, so every stateless remote verify pays it cold — a
-full `uv sync --all-packages && npm ci`, every time. **Revisit path:**
+The recorded **cost** of "no", which lands *once a runner is registered*
+and not before: dark_factory sets a `verify_cold_preprovision_command`
+(`uv sync --all-packages && npm ci …`), and `verify.py`'s
+`_PREPROVISION_DONE` memo is in-process with a 5-minute TTL, so every
+stateless `ssh host orchestrator verify-merge …` dispatch pays that
+install cold. **Revisit path:**
 after measuring that cost over its own 14-day window, and only by
 flipping both sides together in the same change — never the remote
 alone.
