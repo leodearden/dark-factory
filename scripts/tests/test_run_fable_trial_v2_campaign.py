@@ -2304,3 +2304,139 @@ def test_rendering_the_decline_split_is_deterministic():
 # the pool is NOT re-selected, discharging the exact worry the retired pin
 # existed to hold. This note is here so a reader diffing 4760 against 4766 can
 # tell a resolved boundary from an accidentally-inverted assertion.
+
+
+# ===== task 4766: the unanimously-declining fixture, legible end to end =====
+#
+# The fixture-level half of the split. ``reify_task_3883`` is the real shape it
+# was built for: six of six no-plan cells across both candidate arms, every one
+# an adversarially-verified-true ``report_false_premise``. Under the four-band
+# scheme that fixture read as the single strongest piece of evidence for the
+# headroom the screen was selecting for, when it was in fact the strongest
+# evidence that the task was ill-posed. It stays RETAINED — PRD D6 discards only
+# the unambiguous ceiling band, Leo-ratified at the γ2 gate — so what changes is
+# what the partition is CALLED, which is what lets the redesigned eval set
+# ruling D9 (task 3636) calls for exclude decline-shaped fixtures on recorded
+# evidence rather than on repeated transcript forensics.
+
+
+def _unanimously_declining_results():
+    """THE reify_task_3883 shape in miniature: 6 of 6 no-plan cells, all declines."""
+    return [
+        _cell('f', config, trial=trial, plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'false_premise'})
+        for config in ('architect-opus-max', 'architect-fable-high')
+        for trial in (1, 2, 3)
+    ]
+
+
+def test_a_unanimously_declining_fixture_is_labelled_declined_and_retained():
+    """The explicit answer to "retained, discarded, or routed?": RETAINED, relabelled.
+
+    Locked so a later change cannot quietly start discarding it. Discarding
+    would reverse a Leo-ratified rule (D6: discard ONLY the unambiguous ceiling
+    band, ambiguity -> retain) and would save nothing — ruling D9 superseded the
+    stage-2 design outright, and ``partition_bands``' output has exactly one
+    consumer, the text renderer in the same module.
+    """
+    part = mod.partition_bands(_unanimously_declining_results(), 0.80)
+
+    assert part['by_fixture'] == {'f': 'declined'}
+    assert part['counts']['declined'] == 1
+    assert part['counts']['no_plan'] == 0
+    assert part['retained'] == ['f']
+    assert part['discarded'] == []
+
+
+def test_one_silent_cell_beside_a_decline_keeps_the_fixture_in_no_plan():
+    """A sibling's correct refusal must not MASK a genuine failure to plan.
+
+    One arm declined and the other emitted nothing and said nothing about why.
+    That second cell is real headroom evidence, so the fixture keeps the label
+    that reports it. ``declined`` means every no-plan cell was an explicit
+    refusal — which is exactly what ``_BAND_PRECEDENCE`` placing ``no_plan``
+    ahead of ``declined`` buys.
+    """
+    results = [
+        _cell('f', 'architect-opus-max', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'false_premise'}),
+        _cell('f', 'architect-fable-high', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'none'}),
+    ]
+
+    part = mod.partition_bands(results, 0.80)
+
+    assert part['by_fixture'] == {'f': 'no_plan'}
+    assert part['counts']['no_plan'] == 1
+    assert part['counts']['declined'] == 0
+    assert part['retained'] == ['f']
+
+
+def _band_count_line(lines, band):
+    """Index of *band*'s count line in the rendered PRD-D6 block."""
+    return next(i for i, line in enumerate(lines)
+                if line.startswith(f'  {band:<14}'))
+
+
+def test_the_banding_block_renders_declined_beside_no_plan():
+    """The count renders NEXT TO the number it refines, as the table column does."""
+    report = {'bands': mod.partition_bands(_unanimously_declining_results(), 0.80)}
+
+    lines = mod.format_campaign_report(report).splitlines()
+
+    assert _band_count_line(lines, 'declined') == _band_count_line(lines, 'no_plan') + 1
+    assert lines[_band_count_line(lines, 'declined')].split() == ['declined', '1']
+    assert lines[_band_count_line(lines, 'no_plan')].split() == ['no_plan', '0']
+
+
+def test_the_banding_block_explains_that_a_decline_is_not_headroom():
+    """The NOTE an operator needs to not re-derive the tranche-1 misreading.
+
+    A count line alone reproduces the defect one level up: a reader who sees
+    ``declined 1`` and does not know what it means still has to go and find out
+    whether it counts against the candidate. It does not — it is a correct
+    refusal — and the fixture is retained anyway, so the note has to say both.
+    """
+    report = {'bands': mod.partition_bands(_unanimously_declining_results(), 0.80)}
+
+    text = mod.format_campaign_report(report)
+
+    assert 'CORRECT REFUSAL' in text
+    assert 'RETAINED' in text
+    # The provenance, so the reading is checkable rather than asserted.
+    assert 'D9' in text or '3636' in text
+    # Named exits, not a gesture at "a decline": the closed vocabulary is what
+    # makes the band decidable.
+    assert 'report_false_premise' in text
+
+
+def test_the_decline_note_is_gated_on_a_nonzero_count():
+    """A campaign where nobody declined renders EXACTLY as it did before.
+
+    Same gate as the ``declined_any`` legend, and for the same recorded reason:
+    a campaign with no refusals must not grow a paragraph about refusals it
+    never made. The count line itself is unconditional — the artifact's schema
+    must not shift with its contents — so only the prose is gated.
+    """
+    quiet = [
+        _cell('f', 'architect-opus-max', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'none'}),
+    ]
+    report = {'bands': mod.partition_bands(quiet, 0.80)}
+    assert report['bands']['counts']['declined'] == 0, 'premise: nobody declined'
+
+    lines = mod.format_campaign_report(report).splitlines()
+
+    assert lines[_band_count_line(lines, 'declined')].split() == ['declined', '0']
+    assert 'CORRECT REFUSAL' not in '\n'.join(lines)
+
+
+def test_rendering_the_banding_block_with_declines_is_deterministic():
+    """The widened block still formats byte-identically twice."""
+    report = {'bands': mod.partition_bands(_unanimously_declining_results(), 0.80)}
+
+    assert mod.format_campaign_report(report) == mod.format_campaign_report(report)
