@@ -1798,12 +1798,48 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     # The fact channel now HAS a consumer — an operator reading
     # `data/orchestrator/markup-guard/plan-tools.jsonl` — which is exactly the
     # condition the old comment made the wiring conditional on.
+    #
+    # THE FACT CHANNEL NOW HAS TWO CONSUMERS (task 4597, esc-4528-1), fanned
+    # out by `_markup_fact_sink`. The journal serves an OPERATOR reading a file
+    # under the main checkout; the second stamps a `_markup_rejections` block
+    # onto plan.json itself, which is the artifact every LATER READER opens —
+    # the implementer briefing tells its agent to read `.task/plan.json`
+    # directly, and four architect-facing prompts embed the document verbatim.
+    # Neither of those audiences ever sees the journal, so without the stamp
+    # `design_decisions: []` stayed ambiguous between "the architect never
+    # called" and "the architect called six times and was refused six times".
+    #
+    # THIS NARROWS THE CONTRACT THIS SERVER'S TESTS PIN, deliberately and in
+    # exactly one place:
+    #
+    #     OLD: a refused call leaves plan.json BYTE-identical.
+    #     NEW: a refused call leaves every AUTHORED field of plan.json
+    #          identical. The only difference is the guard's own
+    #          `_markup_rejections` block.
+    #
+    # The narrowing is sound because the byte pin was a PROXY for a property
+    # about VALUES — the one stated four paragraphs above ("forwarding a repair
+    # would write a guessed-at document that every later reader inherits") and
+    # in the middleware header ("no middleware-repaired value can ever reach
+    # plan.json"). That property is preserved intact and is now asserted more
+    # directly than the byte pin ever asserted it: `tool` and `param` come from
+    # the invoked tool's own registration and schema, `outcome` from the
+    # guard's closed vocabulary, `ts` from the clock. NOTHING guessed, repaired
+    # or caller-authored reaches the document. In particular the matched
+    # pattern, the mis-close and the raw payload are all excluded — see
+    # `plan_markup_stamp`'s docstring for the three measured reasons.
+    #
+    # It is EAGER rather than buffered-until-the-next-accepted-write, which
+    # would have left the byte pins untouched. That alternative's one hole is
+    # the worst case: an architect whose LAST plan-tools call is a refusal, and
+    # which then stops, would have its losses silently dropped — and that is
+    # precisely the situation most in need of explanation.
     mcp.add_middleware(
         MarkupGuardMiddleware(
             RepairPolicy.REJECT_WITH_REPAIR,
             exempt_tools=frozenset(),
             escalation_sink=_markup_escalation_sink(artifacts),
-            fact_sink=_markup_fact_journal(artifacts),
+            fact_sink=_markup_fact_sink(artifacts),
         )
     )
 

@@ -232,6 +232,32 @@ class Harness:
     def plan_bytes(self) -> bytes:
         return self.plan_path.read_bytes()
 
+    def authored_plan(self) -> dict[str, Any]:
+        """The plan with the guard's own bookkeeping block removed (task 4597).
+
+        THE CONTRACT THIS SERVER PINS, at the level it is actually about.
+
+        It used to read "a refused call leaves plan.json BYTE-identical", and
+        that byte comparison was a PROXY for a property about VALUES: the
+        registration comment justifies the reject policy because "forwarding a
+        repair would write a guessed-at document that every later reader
+        inherits", and the middleware header says "no middleware-repaired value
+        can ever reach plan.json". Task 4597 wires a second fact consumer that
+        stamps a `_markup_rejections` counter, so the bytes DO change on a
+        refusal — but the property they stood for is preserved intact, and
+        comparing authored documents asserts it directly rather than by proxy.
+
+        Nothing guessed, repaired or caller-authored can reach the document
+        through the stamp: `tool` and `param` come from the invoked tool's own
+        registration and schema, `outcome` from the guard's closed vocabulary,
+        `ts` from the clock. The counter's own contents are pinned separately
+        by ``TestTheRefusalIsCountedOnThePlan``, including the control that it
+        carries no envelope markup and none of the refused payload.
+        """
+        plan = self.plan()
+        plan.pop(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY, None)
+        return plan
+
     def plan(self) -> dict[str, Any]:
         return json.loads(self.plan_path.read_text(encoding='utf-8'))
 
@@ -338,7 +364,7 @@ class TestAbsorbedSiblingIsRejected:
     async def test_the_tool_body_never_ran(self, harness: Harness):
         """What makes "reject writes nothing" TRUE rather than merely intended."""
         await harness.seed_plan()
-        before = harness.plan_bytes()
+        before = harness.authored_plan()
 
         with pytest.raises(ToolError) as excinfo:
             await harness.call('add_design_decision', {'decision': ABSORBED_RATIONALE})
@@ -348,7 +374,9 @@ class TestAbsorbedSiblingIsRejected:
             'required argument" also writes nothing, so without this pin '
             'the row would pass with no middleware registered at all'
         )
-        assert harness.plan_bytes() == before, 'a rejected call must not touch plan.json'
+        assert harness.authored_plan() == before, (
+            'a rejected call must not touch a single authored field'
+        )
         assert harness.plan()['design_decisions'] == []
 
 
@@ -472,7 +500,7 @@ class TestComposesWithTheReadTimeRepair:
         """
         await harness.seed_plan()
         harness.store_damaged_rationale()
-        damaged = harness.plan_bytes()
+        damaged = harness.authored_plan()
 
         with pytest.raises(ToolError) as excinfo:
             await harness.call('add_design_decision', {'decision': ABSORBED_RATIONALE})
@@ -482,8 +510,15 @@ class TestComposesWithTheReadTimeRepair:
             'required argument" also writes nothing, so without this pin '
             'the row would pass with no middleware registered at all'
         )
-        assert harness.plan_bytes() == damaged, (
+        assert harness.authored_plan() == damaged, (
             'the tool body never ran, so the STORED damage is still there'
+        )
+        assert harness.plan()['design_decisions'][0]['rationale'] == (
+            STORED_TRAILING_RATIONALE
+        ), (
+            'WHAT THIS ROW WAS ALWAYS ABOUT: the damaged value is byte-'
+            'identical, deferred rather than lost. The counter stamped '
+            'alongside it touches no stored field.'
         )
 
         result = await harness.call(
@@ -509,7 +544,16 @@ class TestTheDeclarationIsMachineChecked:
         ]
 
         assert len(guards) == 1, 'one guard, one boundary — never two on one server'
-        assert guards[0].policy is RepairPolicy.REJECT_WITH_REPAIR
+        assert guards[0].policy is RepairPolicy.REJECT_WITH_REPAIR, (
+            'PRD section 4 C2 declares REJECT_WITH_REPAIR for this server. Task '
+            '4597 now RESTS ON THIS: the plan.json counter is named '
+            '"_markup_rejections" because under this policy the repaired '
+            'outcome cannot occur, so every fact the stamp sees is a refusal. '
+            'Flipping this to FORWARD_REPAIR would silently make that name a '
+            'lie — the per-event `outcome` would still be honest, but the '
+            "block's own name and its note would not. Change the counter's "
+            'vocabulary in the same commit, or do not change this.'
+        )
         assert guards[0].exempt_tools == frozenset(), (
             'the empty exemption set is a DECLARATION, not an omission: no '
             'plan-tools tool has searching for envelope literals as its job'
@@ -995,11 +1039,11 @@ class TestUnrepairableResidueIsPreserved:
         """(e) Refusing is what makes the residue the ONLY copy — so it must hold."""
         rig = build_residue_rig(monkeypatch, artifacts)
         await rig.harness.seed_plan()
-        before = rig.harness.plan_bytes()
+        before = rig.harness.authored_plan()
 
         await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
 
-        assert rig.harness.plan_bytes() == before
+        assert rig.harness.authored_plan() == before
         assert rig.harness.plan()['design_decisions'] == []
 
 
@@ -1545,22 +1589,35 @@ class TestTheRejectionReachesADurableJournal:
         )
 
     @pytest.mark.asyncio
-    async def test_a_rejection_still_writes_nothing_to_the_plan(
+    async def test_a_rejection_still_writes_no_caller_content_to_the_plan(
         self, monkeypatch, artifacts: TaskArtifacts, tmp_path
     ):
-        """The journal is additive in the other direction too.
+        """The fact channels are additive in the other direction too.
 
-        "Reject writes nothing" is the contract the whole policy rests on; a new
-        write-side channel is exactly the kind of change that could quietly
-        breach it.
+        This row used to read "a rejection still writes NOTHING to the plan",
+        and warned that "a new write-side channel is exactly the kind of change
+        that could quietly breach it". Task 4597 adds exactly such a channel —
+        LOUDLY rather than quietly, in the commit that amends this row.
+
+        What the row was defending is unchanged, and is what it now says: a
+        rejection writes no CALLER CONTENT. The old byte comparison was a proxy
+        for a property about VALUES, and the property is stronger than the
+        proxy — the stamped block contains no caller-supplied bytes at all,
+        which ``TestTheRefusalIsCountedOnThePlan`` asserts against the encoded
+        block directly. What would still be a breach, and what this row still
+        catches, is any authored field moving.
+
+        The journal line is asserted alongside it because the two channels are
+        now composed: a fan-out that silently cost the journal its line would
+        move the dead end task 4744 closed rather than close it.
         """
         rig = build_residue_rig(monkeypatch, artifacts)
         await rig.harness.seed_plan()
-        before = rig.harness.plan_bytes()
+        before = rig.harness.authored_plan()
 
         await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
 
-        assert rig.harness.plan_bytes() == before
+        assert rig.harness.authored_plan() == before
         assert len(journal_lines(tmp_path)) == 1, 'the record went to the journal'
 
 
