@@ -425,6 +425,15 @@ class TestTasksReadRecord:
 
         assert page != walk
         assert type(page.mode) is not type(walk.mode)
+
+        # `isinstance` rather than a bare attribute read, because that is how
+        # production code must consume this union — and pyright ENFORCES it:
+        # reading `.page_size` off the un-narrowed `_OnePage | _CompleteRead`
+        # is a type error (MEASURED). That the checker refuses the shortcut is
+        # itself the proof that the discriminator is real rather than
+        # decorative, which is exactly what this test exists to pin.
+        assert isinstance(page.mode, tasks_mod._OnePage)
+        assert isinstance(walk.mode, tasks_mod._CompleteRead)
         assert page.mode.page_size == 10
         assert walk.mode.chunk_size == 10
 
@@ -665,7 +674,7 @@ class TestFetchTasksCache:
         assert len(success_result) == 1
         assert success_result[0]['title'] == 'Task C'
         # The marker never entered the positive cache — the recovered list did.
-        key = tasks_mod._fetch_tasks_cache_key('/proj/C', None, None, 0)
+        key = tasks_mod._TasksRead('/proj/C', None, tasks_mod._CompleteRead(None))
         assert tasks_mod._fetch_tasks_cache.get_fresh(key) == success_result
 
     async def test_fetch_tasks_returned_list_is_a_copy(
@@ -1356,7 +1365,7 @@ class TestFetchTasksNegativeCache:
 
         assert mock_mcp.call_count == 1, 'positive TTL still single-flights'
         assert isinstance(first, list) and first == second
-        key = tasks_mod._fetch_tasks_cache_key('/proj/NEG5', None, None, 0)
+        key = tasks_mod._TasksRead('/proj/NEG5', None, tasks_mod._CompleteRead(None))
         assert tasks_mod._fetch_tasks_negative_cache.get_fresh(key) is None, (
             'a successful fetch must never be stored as a negative entry'
         )
@@ -1409,7 +1418,7 @@ class TestFetchTasksNegativeCache:
             attempts_after_race = attempts
             third = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG7')
 
-        key = tasks_mod._fetch_tasks_cache_key('/proj/NEG7', None, None, 0)
+        key = tasks_mod._TasksRead('/proj/NEG7', None, tasks_mod._CompleteRead(None))
         # Precondition: the race really did leave BOTH entries fresh. Without
         # this the test could pass for the wrong reason (e.g. no marker stored).
         assert tasks_mod._fetch_tasks_negative_cache.get_fresh(key) is not None, (
@@ -1444,7 +1453,7 @@ class TestFetchTasksNegativeCache:
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(dummy_client, dummy_config, '/proj/NEG6')
 
-        key = tasks_mod._fetch_tasks_cache_key('/proj/NEG6', None, None, 0)
+        key = tasks_mod._TasksRead('/proj/NEG6', None, tasks_mod._CompleteRead(None))
         assert tasks_mod._fetch_tasks_cache.get_fresh(key) is None, (
             'an offline marker must not pin itself in the positive cache'
         )
@@ -2189,8 +2198,8 @@ class TestFetchTasksPagination:
             # The marker was refused by the POSITIVE cache.  Asserted on the
             # walk's own key, so a mis-keyed entry cannot pass this by hiding
             # under a different key.
-            key = tasks_mod._fetch_tasks_cache_key(
-                '/proj/flaky', None, 3, 0, True,
+            key = tasks_mod._TasksRead(
+                '/proj/flaky', None, tasks_mod._CompleteRead(3),
             )
             assert tasks_mod._fetch_tasks_cache.get_fresh(key) is None, (
                 'the offline marker must never enter the positive cache'

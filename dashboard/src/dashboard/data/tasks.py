@@ -27,11 +27,13 @@ parameterized by a ``deps`` list rather than a root, so its fixed label is
 already a correct single key.
 
 Caching: ``fetch_tasks`` and ``fetch_statuses`` are both cached, at
-deliberately different TTLs (20 s and 5 s). ``fetch_tasks``'s key is the pair
-**(project_root, narrowing)** rather than the root alone — see
-:func:`_fetch_tasks_cache_key`. Four of its five callers need the whole tree
-while ``active_tasks`` narrows, so a root-only key would let one caller's
-status-filtered result be served to the others for up to the TTL window.
+deliberately different TTLs (20 s and 5 s). ``fetch_tasks``'s key is a
+:class:`_TasksRead` RECORD — (project_root, statuses, mode) — rather than the
+root alone. Four of its five callers need the whole tree while ``active_tasks``
+narrows, so a root-only key would let one caller's status-filtered result be
+served to the others for up to the TTL window. The record is also the single
+source of the WIRE arguments (:meth:`_TasksRead.wire_arguments`), so the key
+and the request it stands for cannot drift apart.
 ``fetch_statuses`` takes no narrowing arguments, so the root alone IS its
 whole key. ``fetch_external_statuses`` is uncached and returns live data.
 """
@@ -41,6 +43,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -145,8 +148,101 @@ budget. Without this note, ``6.0 <= 7.0`` reads as a total-worst-case
 guarantee it is not.
 """
 
+# ---------------------------------------------------------------------------
+# The fetch_tasks cache key: a structured record, not an encoded string
+# ---------------------------------------------------------------------------
+# These replace the hand-rolled ``_fetch_tasks_cache_key`` encoder (a ``*``
+# sentinel for None, ``|`` field separators and a ``\x1f`` unit separator).
+# That encoding produced two measured defects, and the shape below makes both
+# UNREPRESENTABLE rather than merely fixed:
+#
+#   OFFSET DRIFT.  The encoder rendered ``|o={offset}`` unconditionally while
+#   ``offset`` only reached the wire alongside ``page_size``, so two reads with
+#   a byte-identical wire request minted two entries.  Here the only read that
+#   HAS an offset is :class:`_OnePage`, which always sends one.
+#
+#   STATUSES ORDER.  ``['a','b']`` and ``['b','a']`` encoded differently while
+#   naming one order-insensitive SQL ``IN`` list.  ``frozenset`` collapses them.
+#
+# The mode is a UNION rather than three flat fields because flat fields would
+# permit `page_size` set with `offset` unset, and a read that is somehow both a
+# page and a walk — invalid states that would then need runtime validation.
+# No field carries a DEFAULT, so a future read mode that forgets to enter one
+# is a pyright construction error AND a runtime TypeError, rather than a
+# valid-but-wrong key that collides silently.
+
+
+@dataclass(frozen=True, slots=True)
+class _OnePage:
+    """One explicit slice of the ascending-id task list: a PARTIAL answer."""
+
+    page_size: int
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CompleteRead:
+    """The COMPLETE task set. *chunk_size* selects transport, not the contract.
+
+    ``None`` means one unpaginated request; an int means walk the tree that
+    many rows at a time.  Both yield the same set.
+
+    *chunk_size* is nevertheless part of the cache key, and removing it is a
+    SILENT PRODUCTION REGRESSION rather than a simplification.  The positive
+    cache is chunk-INsensitive (both transports agree), but the NEGATIVE cache
+    is chunk-SENSITIVE: ``burndown._fetch_snapshot_tasks`` probes UNPAGINATED
+    and falls back to the chunked walk only when the probe returns the offline
+    marker — which is exactly what an oversize tree produces.  Both caches
+    share this one key (keying them separately is how they drift apart), so a
+    chunk-insensitive key would make probe and fallback ONE key: the fallback
+    would be suppressed by the probe's own failure and never reach the server,
+    and precisely the large projects pagination exists to serve would write no
+    snapshot row — a permanent hole in an append-only table with no backfill.
+    """
+
+    chunk_size: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _TasksRead:
+    """One ``fetch_tasks`` read: simultaneously the cache key AND the wire args.
+
+    Being both is the point.  The key and the request dict used to be built by
+    two separate encoders that already disagreed about ``offset``; deriving
+    both from this one record means they cannot disagree again.
+
+    The RETURN CONTRACT is the *mode*'s TYPE — ``type(read.mode)`` answers
+    "one page or the whole set?" without parsing anything out of a string.
+    """
+
+    project_root: str
+    statuses: frozenset[str] | None
+    mode: _OnePage | _CompleteRead
+
+    def wire_arguments(self, window: _OnePage | None) -> dict:
+        """Build the MCP ``get_tasks`` arguments for this read.
+
+        *window* is a PARAMETER rather than being read off :attr:`mode`
+        because a chunked walk re-uses ONE record across every page, varying
+        only the window.
+
+        ``statuses`` is guarded on ``is not None``, never truthiness:
+        ``frozenset()`` is falsy but means "no tasks at all", the opposite of
+        ``None``'s "whole tree", so a truthiness guard would silently widen it.
+        It crosses the wire ``sorted()`` — a frozenset has no iteration order,
+        and deterministic bytes beat nondeterministic ones for logs and mocks.
+        """
+        arguments: dict = {'project_root': self.project_root}
+        if self.statuses is not None:
+            arguments['statuses'] = sorted(self.statuses)
+        if window is not None:
+            arguments['page_size'] = window.page_size
+            arguments['offset'] = window.offset
+        return arguments
+
+
 _FETCH_TASKS_TTL_SECONDS = 20.0
-_fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
+_fetch_tasks_cache: TTLCache[list[dict] | dict, _TasksRead] = TTLCache(
     ttl_seconds=lambda: _FETCH_TASKS_TTL_SECONDS
 )
 
@@ -176,11 +272,12 @@ _fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
 # positive entry.  ``fetch_tasks`` therefore prefers a fresh POSITIVE entry
 # over a fresh marker: a demonstrated success outranks a retry-suppression
 # hint, and serving the marker there would put a false offline banner over
-# rows that had already loaded.  Both caches share
-# :func:`_fetch_tasks_cache_key`, so a recovered root also repopulates the
-# positive cache on its next attempt.
+# rows that had already loaded.  Both caches are keyed by the IDENTICAL
+# :class:`_TasksRead` record, so a recovered root also repopulates the positive
+# cache on its next attempt.  Keying them differently is exactly how the two
+# drift apart, which is why the record is built once per read and shared.
 _FETCH_TASKS_NEGATIVE_TTL_SECONDS = 5.0
-_fetch_tasks_negative_cache: TTLCache[dict] = TTLCache(
+_fetch_tasks_negative_cache: TTLCache[dict, _TasksRead] = TTLCache(
     ttl_seconds=lambda: _FETCH_TASKS_NEGATIVE_TTL_SECONDS
 )
 
@@ -215,6 +312,10 @@ _fetch_tasks_negative_cache: TTLCache[dict] = TTLCache(
 # degradation that should clear on the first poll after recovery rather than
 # up to 5 s later.
 _FETCH_STATUSES_TTL_SECONDS = 5.0
+# NOTE the key type is left DEFAULTED (``str``): fetch_statuses takes no
+# narrowing arguments, so the root alone IS its whole key. Since task 5018
+# that asymmetry against the two _TasksRead-keyed caches above is CHECKED by
+# pyright rather than merely conventional.
 _fetch_statuses_cache: TTLCache[dict] = TTLCache(
     ttl_seconds=lambda: _FETCH_STATUSES_TTL_SECONDS
 )
@@ -234,50 +335,6 @@ def _fetch_statuses_cache_clear() -> None:
     a caller clearing one seam should not silently reach into the other.
     """
     _fetch_statuses_cache.clear()
-
-
-def _fetch_tasks_cache_key(
-    project_root_str: str,
-    statuses: list[str] | None,
-    page_size: int | None,
-    offset: int,
-    paginate: bool = False,
-) -> str:
-    """Compose the ``_fetch_tasks_cache`` key for one (root, narrowing) pair.
-
-    The key must cover the narrowing arguments, not just the root: only ONE
-    of ``fetch_tasks``' five callers narrows, so a root-only key would let
-    ``active_tasks``' status-filtered entry be served to the four full-tree
-    callers (``app._load_task_cards``, ``data.orchestrator``,
-    ``data.merge_queue``, ``data.burndown``) — silently truncating them for
-    up to the TTL window, and doing so non-deterministically depending on
-    which caller raced in first.
-
-    ``statuses=None`` renders as ``*`` and is therefore distinct from
-    ``statuses=[]``, which renders as the empty string: the tool treats them
-    as opposite requests (whole tree vs no tasks at all), so collapsing them
-    onto one key would serve an empty list as if it were the full tree.
-
-    A ``\x1f`` (ASCII unit separator) delimits the statuses so a status
-    string containing the field separators cannot forge another key.
-
-    ``paginate`` is a MANDATORY part of the key, not a refinement: it selects
-    the RETURN CONTRACT, not the request narrowing.  ``page_size=10,
-    paginate=False`` is one 10-row page; ``page_size=10, paginate=True`` is the
-    complete tree walked ten rows at a time.  Those two answers differ in
-    length and content while agreeing on every other key component, so without
-    this discriminator whichever landed first inside the TTL window would be
-    served to the other caller — handing ``active_tasks`` a whole tree, or
-    handing ``burndown.collect_snapshot`` a 10-row page to write into an
-    append-only history table as the project's true size.
-    """
-    statuses_part = '*' if statuses is None else '\x1f'.join(statuses)
-    page_part = '*' if page_size is None else str(page_size)
-    walk_part = '1' if paginate else '0'
-    return (
-        f'{project_root_str}|s={statuses_part}|p={page_part}|o={offset}'
-        f'|w={walk_part}'
-    )
 
 
 def _shape_task(task: dict) -> dict | None:
@@ -398,8 +455,8 @@ async def fetch_tasks(
     Returns a ``list[dict]`` on success, or an offline marker
     ``{'offline': True, 'error': str}`` if every configured server fails.
 
-    Results are cached per **(project_root, narrowing)** — see
-    :func:`_fetch_tasks_cache_key` — for ``_FETCH_TASKS_TTL_SECONDS`` (~20 s)
+    Results are cached under a :class:`_TasksRead` record — (project_root,
+    statuses, mode) — for ``_FETCH_TASKS_TTL_SECONDS`` (~20 s)
     to avoid hammering the MCP server on every render.  Whatever a given
     narrowing returns is cached unchanged, and an unnarrowed entry and a
     narrowed entry for the same root are INDEPENDENT — which is what keeps a
@@ -436,8 +493,10 @@ async def fetch_tasks(
     exists).  ``paginate=True`` with ``page_size=None`` has no page to walk and
     degrades to the single unpaginated request.
 
-    *paginate* is part of the cache key (see :func:`_fetch_tasks_cache_key`),
-    and MUST stay so: a walk at ``page_size=10`` and a genuine
+    The walk-vs-slice distinction is part of the cache key — it is the
+    :attr:`_TasksRead.mode` record's TYPE (:class:`_CompleteRead` vs
+    :class:`_OnePage`) — and MUST stay so: a walk at ``page_size=10`` and a
+    genuine
     first-page-of-10 slice otherwise compute the identical key and whichever
     ran first inside the TTL window would be served to the other — a complete
     tree handed to a caller that asked for one page, or a 10-row page handed to
@@ -575,12 +634,35 @@ async def fetch_tasks(
     """
     project_root_str = str(project_root)
 
-    base_arguments: dict = {'project_root': project_root_str}
-    if statuses is not None:
-        base_arguments['statuses'] = statuses
-    if page_size is not None:
-        base_arguments['page_size'] = page_size
-        base_arguments['offset'] = offset
+    # ONE record, from which BOTH the cache key and every request dict are
+    # derived.  These used to be two separate encoders that already disagreed
+    # about `offset` (the key carried it unconditionally, the wire only
+    # alongside `page_size`); deriving both from one record is what makes that
+    # disagreement unrepresentable rather than merely fixed.
+    #
+    # The public arguments map onto the record's mode as follows, preserving
+    # today's behaviour exactly:
+    #   page_size=N, paginate=False -> _OnePage(N, offset)   one explicit slice
+    #   page_size=N, paginate=True  -> _CompleteRead(N)      walked N at a time
+    #   page_size=None              -> _CompleteRead(None)   one request
+    # The last line is why `paginate=True, page_size=None` still degrades to
+    # the single unpaginated request: there is no page to walk.
+    mode: _OnePage | _CompleteRead = (
+        _CompleteRead(page_size if paginate else None)
+        if paginate or page_size is None
+        else _OnePage(page_size, offset)
+    )
+    read = _TasksRead(
+        project_root_str,
+        None if statuses is None else frozenset(statuses),
+        mode,
+    )
+    # `offset` is deliberately NOT consulted outside the `_OnePage` branch: a
+    # complete read starting mid-tree is not complete, and letting it into the
+    # key while it never reached the wire is the measured drift defect.
+    base_arguments = read.wire_arguments(
+        mode if isinstance(mode, _OnePage) else None
+    )
 
     def _shape_all(raw_tasks: list, into: list[dict]) -> None:
         for task in raw_tasks:
@@ -612,17 +694,13 @@ async def fetch_tasks(
         page_budget: int | None = None
         first_total: int | None = None
         while True:
-            page_args: dict = {
-                'project_root': project_root_str,
-                'page_size': page_size,
-                'offset': walk_offset,
-            }
-            if statuses is not None:
-                # Sent on EVERY page: the tool applies the status filter BEFORE
-                # its in-memory slice, so `total` is the FILTERED count and an
-                # unfiltered page would both over-read and desynchronise the
-                # walk's terminator.
-                page_args['statuses'] = statuses
+            # Same record, different window — which is why wire_arguments
+            # takes the window as an argument rather than reading it off
+            # `read.mode`.  `statuses` therefore reaches EVERY page: the tool
+            # applies the status filter BEFORE its in-memory slice, so `total`
+            # is the FILTERED count and an unfiltered page would both over-read
+            # and desynchronise the walk's terminator.
+            page_args = read.wire_arguments(_OnePage(page_size, walk_offset))
             result = await _request(url, page_args)
             # Capture the RAW page: `len(shaped)` is not a usable proxy for it,
             # because _shape_all drops rows whose _shape_task returns None.
@@ -736,9 +814,7 @@ async def fetch_tasks(
             offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
         )
 
-    key = _fetch_tasks_cache_key(
-        project_root_str, statuses, page_size, offset, paginate,
-    )
+    key = read
 
     # A fresh negative entry short-circuits the attempt.  The marker is still
     # RETURNED, so degradation stays exactly as visible to the caller as it was
