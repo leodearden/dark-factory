@@ -2658,6 +2658,88 @@ class TestAggregateResultsKeepsWorkerDeathNote:
 
 
 
+
+class TestFailureReportNamesTheAbortedSession:
+    """`VerifyResult.failure_report()` must LEAD with the truncation caveat.
+
+    The same shape as the existing `## Verify Timed Out` section: tell the
+    debugger up front that the failure may not be real code, before it reads
+    a cause or a tally.  Without it the report hands over ``1 failed, 728
+    passed, 1 skipped`` with no indication that ~97% of the suite never ran
+    (esc-4176-6), and a ``FAILED`` line that xdist synthesized for the
+    crashed worker's in-flight test with no indication that it is not a
+    verdict (esc-4292-3).
+    """
+
+    HEADING = '## Session Aborted After Worker Death'
+
+    @staticmethod
+    def _result(test_output: str) -> VerifyResult:
+        return VerifyResult(
+            passed=False,
+            test_output=test_output,
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            category='test_failure',
+            cause_hint='session aborted after worker death; worker gw3 crashed',
+        )
+
+    def test_report_carries_the_section(self):
+        report = self._result(_TRUNCATED_TEST_LEG_OUTPUT).failure_report()
+        assert self.HEADING in report, f'Unexpected report: {report!r}'
+
+    def test_section_leads_the_report_ahead_of_the_failure_cause(self):
+        """Placement matches the `## Verify Timed Out` precedent: the caveat
+        comes BEFORE the cause, so it cannot be read as an afterthought."""
+        report = self._result(_TRUNCATED_TEST_LEG_OUTPUT).failure_report()
+        assert '## Failure Cause' in report, f'Unexpected report: {report!r}'
+        assert report.index(self.HEADING) < report.index('## Failure Cause'), (
+            f'Unexpected report: {report!r}'
+        )
+
+    def test_section_says_the_tally_is_partial(self):
+        """A reader must not mistake ``1 failed, 728 passed`` for complete."""
+        report = self._result(_TRUNCATED_TEST_LEG_OUTPUT).failure_report()
+        section = report.split(self.HEADING, 1)[1].split('\n## ', 1)[0].lower()
+        assert 'partial' in section, f'Unexpected section: {section!r}'
+        assert 'never ran' in section, f'Unexpected section: {section!r}'
+
+    def test_section_warns_the_failed_line_may_be_a_crash_artefact(self):
+        """esc-4292-3: the FAILED line naming the crashed worker's in-flight
+        test is xdist's own synthesis, not a verdict."""
+        report = self._result(_TRUNCATED_TEST_LEG_OUTPUT).failure_report()
+        section = report.split(self.HEADING, 1)[1].split('\n## ', 1)[0].lower()
+        assert 'crash' in section, f'Unexpected section: {section!r}'
+
+    def test_a_recovered_worker_crash_gets_no_section(self):
+        """NEGATIVE: a crash signature with NO bailout marker completed
+        normally, so the section must stay inert."""
+        recovered = (
+            'orchestrator/tests/test_config.py ....\n'
+            '[gw3] node down: Not properly terminated\n'
+            "worker gw3 crashed while running "
+            "'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
+            'replacing crashed worker gw3\n'
+            'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+            '========== 1 failed, 19621 passed in 953.70s ==========\n'
+        )
+        report = self._result(recovered).failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+
+    def test_an_ordinary_failure_report_is_byte_identical(self):
+        """REGRESSION GUARD: no crash signature at all -> today's report,
+        unchanged."""
+        ordinary = self._result(
+            'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+            '========== 1 failed, 2 passed in 5.00s ==========\n'
+        )
+        report = ordinary.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        assert report.startswith('## Failure Cause'), f'Unexpected report: {report!r}'
+
+
+
 class TestVerifyResultCauseHint:
     """Tests for the ``cause_hint`` field on ``VerifyResult`` and its population.
 
