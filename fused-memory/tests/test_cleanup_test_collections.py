@@ -18,6 +18,7 @@ not slow.
 """
 from __future__ import annotations
 
+import errno
 import functools
 import importlib.util
 import json
@@ -535,6 +536,99 @@ class TestLiveLeasesSeesOnlyLivingHolders:
         finally:
             proc.kill()
             proc.wait(timeout=5)
+
+
+class TestHoldLeaseFailsOpenAndLoud:
+    """An unusable lease directory degrades to the status quo, VISIBLY.
+
+    The holder side runs inside integration tests and inside two seeding
+    scripts.  If an unwritable or full ``/tmp`` made this raise, a live
+    bake-off would abort for a reason with nothing to do with what it
+    measures, and an integration test would fail on infrastructure noise.
+
+    What this change improves on is "no guard at all", so degrading back to
+    it is not a regression — degrading back to it SILENTLY would be.  Hence
+    the yielded ``held: bool`` and the stderr line, mirroring
+    ``shared/verify_admission.py::acquire_task_slot`` (clause C-fail-open).
+    """
+
+    @staticmethod
+    def _unusable_under_a_regular_file(monkeypatch, tmp_path) -> Path:
+        """A lease dir whose parent is a regular file: mkdir gives ENOTDIR."""
+        blocker = tmp_path / 'not-a-directory'
+        blocker.write_text('something else owns this path')
+        unusable = blocker / 'leases'
+        monkeypatch.setenv(_mod().LEASE_DIR_ENV, str(unusable))
+        return unusable
+
+    def test_it_yields_false_and_still_runs_the_block(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        mod = _mod()
+        self._unusable_under_a_regular_file(monkeypatch, tmp_path)
+        observed = []
+
+        with mod.hold_lease(owner='e2-bake-off gw0') as held:
+            observed.append(held)
+
+        assert observed == [False]
+        capsys.readouterr()
+
+    def test_it_reports_the_directory_and_the_error_on_one_stderr_line(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Both facts, because neither alone is actionable: the directory
+        says WHERE to look, the OSError says what to fix.  One line, because
+        this also fires under an unattended cron-adjacent run."""
+        mod = _mod()
+        unusable = self._unusable_under_a_regular_file(monkeypatch, tmp_path)
+
+        with mod.hold_lease(owner='e2-bake-off gw0'):
+            pass
+
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        lines = captured.err.strip().splitlines()
+        assert len(lines) == 1, captured.err
+        assert str(unusable) in lines[0]
+        assert os.strerror(errno.ENOTDIR) in lines[0]
+
+    def test_an_exception_in_the_block_still_propagates_unchanged(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Failing open must not change the caller's control flow either —
+        the un-held path has no fd and no file, and must still not swallow
+        the run's own failure on the way out."""
+        mod = _mod()
+        self._unusable_under_a_regular_file(monkeypatch, tmp_path)
+        boom = RuntimeError('the bake-off fell over anyway')
+
+        with pytest.raises(RuntimeError) as caught, mod.hold_lease(owner='e2'):
+            raise boom
+
+        assert caught.value is boom
+        capsys.readouterr()
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0, reason='root ignores directory permissions',
+    )
+    def test_it_yields_false_when_the_lease_directory_is_read_only(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """The realistic shape of the failure: the directory exists and is
+        simply not writable by this uid."""
+        mod = _mod()
+        parent = tmp_path / 'read-only'
+        parent.mkdir()
+        parent.chmod(0o500)
+        monkeypatch.setenv(mod.LEASE_DIR_ENV, str(parent / 'leases'))
+        try:
+            with mod.hold_lease(owner='e2-bake-off') as held:
+                assert held is False
+        finally:
+            parent.chmod(0o700)
+
+        assert str(parent / 'leases') in capsys.readouterr().err
 
 
 class TestSweep:
