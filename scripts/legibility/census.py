@@ -518,15 +518,33 @@ class CensusHeadroomExhausted(Exception):
     in the codebook as ordinary rejections.
 
     Carries the counts an operator needs to size what was interrupted:
-    *verified* clusters adjudicated before the hit, *unverified* ones left
-    (the hitting cluster plus every one never attempted).
+    *verified* clusters that came back TRUE before the hit, *rejected*
+    ones adjudicated FALSE before it, and *unverified* ones left (the
+    hitting cluster plus every one never attempted). A rejection is real
+    work already spent, not an absence -- omitting it made the counts fail
+    to account for the run on exactly the interrupted runs an operator
+    most needs to size.
+
+    INVARIANT, true at every raise site: ``verified + rejected +
+    unverified`` equals the number of clusters offered. At the two
+    pre-append sites (invocation error, unparseable banner) the hitting
+    cluster is not yet adjudicated, so ``verified + rejected == index``
+    and ``unverified == remaining``; at the backstop site it already IS
+    adjudicated, so ``verified + rejected == index + 1`` and ``unverified
+    == remaining - 1``. The total is therefore derivable by any reader and
+    is NOT threaded separately -- see ``_defer``, which sums it, so the
+    raise sites cannot disagree about what "total" means.
     """
 
-    def __init__(self, *, stage: str, reason: str, verified: int = 0, unverified: int = 0):
+    def __init__(
+        self, *, stage: str, reason: str, verified: int = 0, rejected: int = 0,
+        unverified: int = 0,
+    ):
         super().__init__(f"census headroom exhausted during {stage}: {reason}")
         self.stage = stage
         self.reason = reason
         self.verified = verified
+        self.rejected = rejected
         self.unverified = unverified
 
 
@@ -2736,7 +2754,10 @@ def _build_default_verify_fn(
         for index, cluster in enumerate(clusters):
             # The hitting cluster plus everything never attempted. Computed
             # identically at every raise site so the counts cannot disagree
-            # about what "unverified" means.
+            # about what "unverified" means. The `rejected` term is passed
+            # the same way, from `len(rejected)` at every site, for the same
+            # reason -- together with `verified` the three always sum to the
+            # clusters offered (see CensusHeadroomExhausted's INVARIANT).
             remaining = len(clusters) - index
             prompt = _verify_prompt(cluster, project_root=project_root)
             try:
@@ -2753,6 +2774,7 @@ def _build_default_verify_fn(
                                 f"reports no capacity: {probe.reason or 'no headroom'}"
                             ),
                             verified=len(verified),
+                            rejected=len(rejected),
                             unverified=remaining,
                         ) from exc
                 logger.warning(
@@ -2780,6 +2802,7 @@ def _build_default_verify_fn(
                                 f"capacity: {probe.reason or 'no headroom'}"
                             ),
                             verified=len(verified),
+                            rejected=len(rejected),
                             unverified=remaining,
                         ) from exc
                     logger.warning(
@@ -2815,6 +2838,7 @@ def _build_default_verify_fn(
                             f"{probe.reason or 'no headroom'}"
                         ),
                         verified=len(verified),
+                        rejected=len(rejected),
                         unverified=remaining - 1,
                     )
         return {
