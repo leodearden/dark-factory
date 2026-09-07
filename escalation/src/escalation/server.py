@@ -28,6 +28,7 @@ from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
 )
+from shared.merge_state import MergeState
 from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
@@ -3723,31 +3724,44 @@ def create_server(
         """Convert an epoch-seconds float to an ISO-8601 UTC string (matches event-store format)."""
         return datetime.fromtimestamp(ts, tz=UTC).isoformat()
 
-    def _map_terminal_state(raw: str) -> str:
-        """Map a raw terminal MergeOutcome.status / 'abandoned' / 'error' to coarse vocabulary."""
-        if raw in ('done', 'done_wip_recovery', 'already_merged'):
-            return 'done'
-        if raw == 'conflict':
-            return 'conflict'
-        if raw == 'abandoned':
-            return 'abandoned'
-        if raw == 'superseded':
-            return 'superseded'
-        # blocked / wip_halted / wip_recovery_no_advance / unmerged_state /
-        # unknown_branch / error → blocked
-        return 'blocked'
+    def _map_terminal_state(raw: str) -> MergeState:
+        """Map a raw terminal MergeOutcome.status / 'abandoned' / 'error' to coarse vocabulary.
 
-    def _map_live_state(raw: str) -> str:
-        """Map a live snapshot state to the public merge_status vocabulary."""
+        The *input* raws are MergeSubmitStatus values (plus 'abandoned', which
+        only ever originates here); the *output* is the poll vocabulary
+        ``shared.merge_state.MergeState``.  Which raw maps where is unchanged.
+        """
+        if raw in ('done', 'done_wip_recovery', 'already_merged'):
+            return MergeState.done
+        if raw == 'conflict':
+            return MergeState.conflict
+        if raw == 'abandoned':
+            return MergeState.abandoned
+        if raw == 'superseded':
+            return MergeState.superseded
+        # blocked / wip_halted / wip_recovery_no_advance / unmerged_state /
+        # stash_failed / unknown_branch / error → blocked
+        return MergeState.blocked
+
+    def _map_live_state(raw: str) -> MergeState | str:
+        """Map a live snapshot state to the public merge_status vocabulary.
+
+        Recognised raws are coerced to ``shared.merge_state.MergeState``.  The
+        trailing passthrough is DELIBERATE and is why merge_status cannot
+        promise a MergeState instance unconditionally: an unrecognised worker
+        state is forward-compatible fail-open, and turning it into a hard
+        ``MergeState(raw)`` would raise ValueError on a read-only probe path.
+        Task 4887 owns merge_status's degradation semantics.
+        """
         if raw == 'queued':
-            return 'queued'
+            return MergeState.queued
         if raw in ('merging', 'awaiting_verify', 'verifying'):
-            return 'verifying'
+            return MergeState.verifying
         if raw == 'gate_reverify':
-            return 'gate'
+            return MergeState.gate
         if raw == 'finalizing':
-            return 'finalizing'
-        return raw  # pass through unknown states unchanged
+            return MergeState.finalizing
+        return raw  # pass through unknown states unchanged (see docstring)
 
     def _durable_terminal_state(
         request_id: str | None,
@@ -3859,7 +3873,7 @@ def create_server(
         exception.
         """
         return {
-            'state': 'done',
+            'state': MergeState.done,
             'request_id': request_id,
             'generation': 1,
             'kind': 'found_on_main',
@@ -3976,6 +3990,14 @@ def create_server(
 
         Returns a dict with at minimum:
             state, request_id, generation (always 1 in α3).
+
+        ``state`` is a member of ``shared.merge_state.MergeState`` — LIVE_STATES
+        on the Tier-1 path, TERMINAL_STATES on Tiers 2-3.5, ``unknown`` on Tier
+        4.  That module is the single source of truth for the vocabulary; no
+        enumeration is restated here.  ONE EXCEPTION: ``_map_live_state`` passes
+        an UNRECOGNISED worker state through as a bare ``str`` (deliberate
+        fail-open — see its docstring), so ``state`` is not unconditionally a
+        MergeState instance.  It is always a ``str`` either way.
 
         Live entries also carry: position, enqueued_at, eta_seconds.
         Terminal entries carry: outcome (raw state), finished_at.
@@ -4199,7 +4221,7 @@ def create_server(
 
         # Tier 4: honest unknown
         return {
-            'state': 'unknown',
+            'state': MergeState.unknown,
             'request_id': request_id,
             'generation': 1,
             'hint': _MERGE_STATUS_UNKNOWN_HINT,
@@ -4215,8 +4237,16 @@ def create_server(
         returned by merge_request).  Returns a dict with three fields:
 
             cancelled (bool)  — True only when a pending waiter was successfully cancelled.
-            state     (str)   — Coarse terminal state in the same vocabulary as merge_status:
-                                'abandoned' | 'done' | 'conflict' | 'blocked' | 'unknown'
+            state     (str)   — Coarse terminal state; always a member of
+                                ``shared.merge_state.MergeState``.
+                                merge-state-vocab:begin partition=CANCEL_STATES
+                                'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' | 'unknown'
+                                merge-state-vocab:end
+                                Source of truth: shared/src/shared/merge_state.py::CANCEL_STATES.
+                                The span above is machine-pinned to it by
+                                scripts/tests/test_merge_state_vocabulary_consistency.py
+                                (the CONTRIBUTING.md lint-command-mirror convention) — edit
+                                the partition, not this list.
             reason    (str|None) — None on success; non-None string on every other path.
 
         Branch order (all paths return — never raises):
@@ -4275,7 +4305,7 @@ def create_server(
                 }
             return {
                 'cancelled': False,
-                'state': 'unknown',
+                'state': MergeState.unknown,
                 'reason': (
                     f'No in-flight waiter for request_id {request_id!r} '
                     '(already finalized, never submitted, server restarted, or this id '
@@ -4289,7 +4319,7 @@ def create_server(
             # Idempotent double-cancel: future is already cancelled.
             return {
                 'cancelled': False,
-                'state': 'abandoned',
+                'state': MergeState.abandoned,
                 'reason': 'Request was already cancelled.',
             }
 
@@ -4298,7 +4328,7 @@ def create_server(
             # call_soon-scheduled _waiters.pop done-callback hasn't run yet.
             # Defensive: excepted futures are abnormal; treat as 'blocked'.
             if rec.future.exception() is not None:
-                state: str = 'blocked'
+                state: MergeState | str = MergeState.blocked
             else:
                 state = _map_terminal_state(rec.future.result().status)
             return {
@@ -4325,6 +4355,6 @@ def create_server(
             git_ops=getattr(harness, 'git_ops', None),
             event_store=event_store,
         )
-        return {'cancelled': True, 'state': 'abandoned', 'reason': None}
+        return {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
 
     return mcp
