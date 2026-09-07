@@ -94,6 +94,7 @@ from orchestrator.verify_cancel import (
     remove_lock_holder_pgid,
     write_lock_holder_pgid,
 )
+from orchestrator.verify_classify import _ENOSPC_MARKERS
 from orchestrator.warm_lane_pool import WarmLanePoolCensus
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
@@ -233,6 +234,60 @@ _INDEX_LOCK_WARN_INTERVAL_S = 30.0
 # They must never drift: a short-circuit at a lower bar than the advice bar
 # would skip the wait and then NOT explain why.
 _INDEX_LOCK_STALE_FLOOR_S = 300.0
+
+
+# Bounded attempt budget for `git worktree add --detach`, shared by BOTH
+# worktree-minting sites (GitOps._create_merge_worktree and
+# GitOps.ephemeral_worktree) via git_ops.py::GitOps._worktree_add_with_retry.
+# Replaces ephemeral_worktree's former function-local `_MAX_ADD_RETRIES` at
+# the IDENTICAL value, so that method's pinned 3-attempt / [0.5, 1.0]-backoff
+# tests (test_ephemeral_worktree.py::TestEphemeralWorktreeRetry) are
+# unaffected by the extraction.
+_WORKTREE_ADD_MAX_ATTEMPTS = 3
+
+# `_ENOSPC_MARKERS` is deliberately IMPORTED from verify_classify (see the
+# import block above) rather than copied a third time. The tuple already
+# exists verbatim twice — verify_classify.py::_ENOSPC_MARKERS (canonical,
+# carrying the "do not invent new ENOSPC strings; extend that constant
+# instead" instruction) and merge_queue.py::_ENOSPC_MARKERS — and each
+# declares itself a single grounded vocabulary. A third copy would make that
+# claim false and let the three drift. The import is cycle-free:
+# verify_classify imports only orchestrator.verify_categories and
+# orchestrator.verify_cmd, neither of which imports anything from
+# orchestrator. If a new grounded ENOSPC sample appears, extend
+# verify_classify's tuple — never re-declare one here.
+
+
+def _worktree_add_failure_is_retryable(rc: int, out: str, err: str) -> bool:
+    """Is a failed ``git worktree add --detach`` worth retrying?
+
+    The SINGLE shared predicate for both worktree-minting sites
+    (git_ops.py::GitOps._create_merge_worktree and
+    git_ops.py::GitOps.ephemeral_worktree), consumed through
+    git_ops.py::GitOps._worktree_add_with_retry.
+
+    The shape is deliberately NEGATIVE — retry by default, fail fast only on
+    a known non-transient cause — rather than a positive "is this
+    contention?" matcher. A positive allow-list would need a pattern for
+    every transient shape git can emit, and the two archived transient
+    samples share no token: ``data/verify-logs`` task 4215 is ``fatal:
+    Invalid path '.../.git/worktrees/_merge-9a6caddb': No such file or
+    directory`` (the ADMINISTRATIVE registration path, not the checkout
+    path) while task 4545 is a bare ``Preparing worktree (detached HEAD
+    ae6e7e9)`` with no cause line at all. Any allow-list built from one
+    would silently stop retrying the other — and would stop retrying
+    whatever novel transient shape appears next.
+
+    ENOSPC stays loud and unretried (task 3692's ``/repo/.worktrees/cas-b No
+    space left on device``): a full disk does not heal in 1.5s of backoff, so
+    retrying there only delays the operator signal.
+
+    Both streams are inspected, matched case-insensitively against the whole
+    combined output — the same shape merge_queue.py::_verify_hit_enospc
+    applies to the same vocabulary.
+    """
+    haystack = f'{out}\n{err}'.lower()
+    return not any(marker in haystack for marker in _ENOSPC_MARKERS)
 
 
 class MergeParkError(Exception):
