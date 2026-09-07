@@ -4600,6 +4600,199 @@ class TestArchitectEvalGateLifecycle:
         assert mocks['gate'] is None
 
 
+# ---------------------------------------------------------------------------
+# Campaign-level gate ownership (task 4427)
+#
+# The per-cell gate above is correct but STATELESS across cells: cell N+1
+# re-leases the account cell N proved capped, paying a wasted invocation plus a
+# cooldown every time. ``campaign_usage_gate`` hoists construction+teardown to
+# whoever loops the cells (the μ stage functions and ``cli._run_single_eval``),
+# so ONE cap-state view serves the whole campaign.
+#
+# The hoist rests on one load-bearing premise: the ``usage_cap`` a cell would
+# have built its own gate from is the SAME ``usage_cap`` the campaign owner
+# reads off ``base_config``. That is an emergent property of two files
+# (``build_eval_orch_config`` + ``EVAL_PROFILE``), so it is pinned here as a
+# tripwire rather than trusted as a comment.
+# ---------------------------------------------------------------------------
+
+class TestCampaignGatePremise:
+    """A campaign gate built from ``base_config`` is what every cell expects.
+
+    ``_build_eval_usage_gate`` reads exactly one leaf — ``orch_config.usage_cap``
+    — and each cell's orch config is
+    ``apply_eval_profile(base_config).model_copy(update=...)``. Neither
+    ``EVAL_PROFILE`` nor that update dict mentions ``usage_cap``, so the leaf is
+    inherited verbatim and the campaign gate is byte-identical to the gate each
+    cell builds today. If someone later adds ``usage_cap`` to ``EVAL_PROFILE``,
+    the campaign gate would silently stop matching what cells expect — this
+    fails loudly instead.
+    """
+
+    def _base(self, tmp_path: Path):
+        # Mirrors test_eval_driver._base_config: a minimal YAML setting only
+        # project_root, layered over the packaged defaults through the REAL
+        # production config-load entry point (never a hand-built config).
+        from orchestrator.config import load_config
+
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(f'project_root: {tmp_path}\n')
+        return load_config(cfg_path)
+
+    @pytest.mark.parametrize('role', ['architect', 'implementer'])
+    def test_cell_orch_config_inherits_base_usage_cap_verbatim(
+        self, tmp_path: Path, role: str,
+    ):
+        from orchestrator.evals.configs import EvalConfig
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = self._base(tmp_path)
+        cfg = EvalConfig(f'{role}-sonnet-high', 'claude', 'sonnet', 'high', role=role)
+        task = {'id': 'df_task_4427', 'project_root': str(tmp_path)}
+
+        cell_config = build_eval_orch_config(cfg, task, base)
+
+        assert cell_config.usage_cap == base.usage_cap
+
+
+@pytest.mark.asyncio
+class TestCampaignUsageGate:
+    """``campaign_usage_gate`` owns build + guaranteed teardown for a campaign.
+
+    One CM single-sources what five campaign owners would otherwise copy — the
+    same reason ``_build_eval_usage_gate`` was extracted from three byte-identical
+    copies. Teardown lives in a ``finally`` so a raising campaign (a cancelled
+    fan-out, a cell that exploded) can never leak the probe loop.
+    """
+
+    def _base(self, tmp_path: Path):
+        from orchestrator.config import load_config
+
+        cfg_path = tmp_path / 'orchestrator.yaml'
+        cfg_path.write_text(f'project_root: {tmp_path}\n')
+        return load_config(cfg_path)
+
+    async def test_yields_the_built_gate_and_builds_exactly_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        from orchestrator.evals import runner
+
+        gate = make_gate_mock()
+        build = AsyncMock(return_value=gate)
+        monkeypatch.setattr(runner, '_build_eval_usage_gate', build)
+        base = self._base(tmp_path)
+
+        async with runner.campaign_usage_gate(base) as yielded:
+            assert yielded is gate
+
+        build.assert_awaited_once()
+        assert build.await_args.args[0] is base
+
+    async def test_gate_is_shut_down_on_normal_exit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        from orchestrator.evals import runner
+
+        gate = make_gate_mock()
+        monkeypatch.setattr(
+            runner, '_build_eval_usage_gate', AsyncMock(return_value=gate),
+        )
+
+        async with runner.campaign_usage_gate(self._base(tmp_path)):
+            gate.shutdown.assert_not_awaited()
+
+        gate.shutdown.assert_awaited_once()
+
+    async def test_gate_is_shut_down_when_the_campaign_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A campaign that dies mid-fan-out must not leak the probe loop.
+
+        The failure path is exactly where leaking costs most: a campaign that
+        blew up is the one most likely to have hit a cap, i.e. the one holding a
+        live account-resume probe loop.
+        """
+        from shared.testing import make_gate_mock
+
+        from orchestrator.evals import runner
+
+        gate = make_gate_mock()
+        monkeypatch.setattr(
+            runner, '_build_eval_usage_gate', AsyncMock(return_value=gate),
+        )
+
+        with pytest.raises(RuntimeError, match='campaign exploded'):
+            async with runner.campaign_usage_gate(self._base(tmp_path)):
+                raise RuntimeError('campaign exploded')
+
+        gate.shutdown.assert_awaited_once()
+
+    async def test_a_degraded_pool_yields_none_and_never_shuts_down(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """``_build_eval_usage_gate`` returns None three ways — all legitimate.
+
+        The CM must yield that None through (the campaign is deliberately
+        ungated) without attempting a teardown on it.
+        """
+        from orchestrator.evals import runner
+
+        monkeypatch.setattr(
+            runner, '_build_eval_usage_gate', AsyncMock(return_value=None),
+        )
+
+        async with runner.campaign_usage_gate(self._base(tmp_path)) as gate:
+            assert gate is None
+
+    async def test_none_base_config_yields_none_without_building(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """No base config → nothing to build a gate FROM.
+
+        ``base_config=None`` is a real caller shape (every stage function
+        defaults it), and ``build_eval_orch_config`` would raise on it anyway —
+        so the campaign stays ungated and cells fall back to their own build.
+        """
+        from orchestrator.evals import runner
+
+        build = AsyncMock()
+        monkeypatch.setattr(runner, '_build_eval_usage_gate', build)
+
+        async with runner.campaign_usage_gate(None) as gate:
+            assert gate is None
+
+        build.assert_not_awaited()
+
+    async def test_a_failing_shutdown_is_swallowed_and_warned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Best-effort teardown, mirroring run_architect_eval's finally.
+
+        The campaign's results are already collected by the time the CM exits;
+        a teardown failure must not convert a finished campaign into a raise.
+        """
+        from shared.testing import make_gate_mock
+
+        from orchestrator.evals import runner
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        gate = make_gate_mock()
+        gate.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
+        monkeypatch.setattr(
+            runner, '_build_eval_usage_gate', AsyncMock(return_value=gate),
+        )
+
+        async with runner.campaign_usage_gate(self._base(tmp_path)) as yielded:
+            assert yielded is gate
+
+        assert 'shutdown failed' in caplog.text
+
+
 @pytest.mark.asyncio
 class TestArchitectEvalSpendSurvivesFailover:
     """Spend from an ABANDONED attempt must still be charged to the cell.
