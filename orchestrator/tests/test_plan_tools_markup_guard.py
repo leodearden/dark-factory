@@ -2048,7 +2048,8 @@ class TestARefusalBeforeThePlanExistsIsAdoptedByIt:
             )
 
         assert not harness.plan_path.exists()
-        assert plan_markup_stamp.pending_block()['count'] == 1, (
+        pending = plan_markup_stamp.pending_block()
+        assert pending is not None and pending['count'] == 1, (
             'buffered rather than lost'
         )
 

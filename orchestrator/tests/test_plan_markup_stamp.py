@@ -582,6 +582,7 @@ class TestSummaryIsTheCompactView:
 
         summary = plan_markup_stamp.summary(plan)
 
+        assert summary is not None
         assert set(summary) == {'count', 'by_tool'}
 
     def test_a_plan_with_no_block_summarises_to_none(self):
@@ -806,7 +807,9 @@ class TestThePlanStampNeverRaises:
         seed_plan(artifacts)
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
 
-        assert await stamp('not a record at all') is None
+        # Deliberately off-contract: the middleware always hands a dict, and
+        # this pins that a shape surprise still cannot reach the caller.
+        assert await stamp('not a record at all') is None  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -864,7 +867,9 @@ class TestARefusalBeforeAnyPlanExistsIsBuffered:
             await stamp(make_fact(tool='create_plan', param='analysis'))
             clock.advance(1.0)
 
-        assert plan_markup_stamp.pending_block()['count'] == 3
+        pending = plan_markup_stamp.pending_block()
+        assert pending is not None
+        assert pending['count'] == 3
 
     def test_an_empty_buffer_reports_nothing(self):
         assert plan_markup_stamp.pending_block() is None
@@ -956,6 +961,7 @@ class TestDrainPendingFoldsTheBufferIntoAPlan:
 
         pending = plan_markup_stamp.pending_block()
 
+        assert pending is not None
         assert pending['count'] == cap + 5
         assert len(pending['events']) == cap
         assert pending['events_truncated'] is True

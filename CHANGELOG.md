@@ -10,6 +10,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### `_markup_rejections` — plan.json says how many of its own calls were refused (task 4597)
+
+A plan-tools call carrying leaked tool-call envelope markup is REFUSED before the
+tool body runs, which is the right disposition and leaves no trace at the one
+artifact every later reader opens. `design_decisions: []` was therefore genuinely
+ambiguous between "the architect never called" and "the architect called six times
+and was refused six times" — in task 4528 a reviewer could tell only because the
+architect happened to hand-file an info note.
+
+The guard's fact channel now has a SECOND consumer alongside task 4744's journal.
+`plan_tools._markup_fact_sink` fans each fact out to both, isolating them in
+separate try/except arms — load-bearing rather than defensive, because
+`MarkupGuardMiddleware._call_sink` wraps the whole sink in ONE try/except, so a
+composed sink that let the journal's exception propagate would silently skip the
+stamp. The journal runs first and keeps ownership of the return value.
+
+The block lands under a top-level `_markup_rejections`, joining the document's
+existing machine-written envelope (`_schema_version`, `_finalized_at`,
+`_revalidated_at`). It carries `count`, a `by_tool` aggregate, the `first_at` /
+`last_at` window bounds, up to 20 `{ts, tool, param, outcome}` events, an
+`events_truncated` disclosure whose PRESENCE means something was cut, and one
+static `note` so a reader who has never seen the key does not have to infer it.
+`confirm_plan` additionally folds a compact `{count, by_tool}` summary into its
+response — the architect's last tool result, and the only surface where the
+architect itself, still mid-session, can see that calls it believed it made were
+refused.
+
+- **It deliberately does not hold the matched pattern, the mis-close tag, or the
+  raw payload.** Three independent measured reasons. (1) The pattern and mis-close
+  ARE envelope markup, and plan.json is embedded verbatim into four
+  architect-facing prompts and edited by agents — a literal there reproduces the
+  exact over-consumption defect at the artifact a reader is told to open, which is
+  why `markup_journal` escapes its own bytes and the specimen corpus escapes every
+  literal. (2) `scripts/sweep_toolcall_markup.py` walks dead-lane plan.json
+  RECURSIVELY, so a stored literal would be classified as fresh corruption and
+  inflate the census the sweep exists to report. (3) The raw payload already has
+  exactly one owner, the residue escalation, which is by contract the only
+  surviving copy; a second weaker copy is the duplication the containment PRD rules
+  against. `build_event` is an ALLOWLIST copy rather than a filtered one, so a fact
+  that grows a field tomorrow cannot land in the plan by default.
+- **A contract narrows, deliberately and loudly.** Tasks 4457/4744 pinned that a
+  refused call leaves plan.json BYTE-identical. It now leaves every AUTHORED field
+  identical, the block being the only difference. The byte pin was a proxy for a
+  property about VALUES — `create_server`'s comment ("forwarding a repair would
+  write a guessed-at document that every later reader inherits") and the middleware
+  header ("no middleware-repaired value can ever reach plan.json") — and that
+  property is preserved intact: `tool` and `param` come from the invoked tool's own
+  registration and schema, `outcome` from the guard's closed vocabulary, `ts` from
+  the clock. Four pins were amended in the same commit as the wiring that falsifies
+  them, one renamed to say a rejection writes no CALLER CONTENT, and esc-4597-1
+  records the narrowing.
+- **A refused `create_plan` has no document to stamp**, so it is buffered in
+  process-global state (the shape `plan_tools._REPORTED_REFUSALS` already
+  establishes; one stdio subprocess is one agent session) and drained by
+  `_create_plan`, which also carries any existing block FORWARD because it
+  overwrites plan.json wholesale. Both are wrapped so bookkeeping can never fail a
+  call — the counter is a legibility aid, the plan is the work.
+- **`PLAN_SCHEMA_VERSION` is deliberately NOT bumped.**
+  `workflow._can_skip_revalidation` is the only production branch on it, and a bump
+  would decline the revalidation skip for every plan already on disk across the
+  fleet — a real fleet-wide cost in exchange for nothing, since the key is purely
+  additive and absent by default on the clean path.
+
 #### `consolidate_memories` — one transactional op for folding a duplicate cluster (task 3133)
 
 Replaces the hand-rolled write-then-delete choreography that made consolidation a
