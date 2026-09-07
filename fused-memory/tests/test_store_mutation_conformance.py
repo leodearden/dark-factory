@@ -28,16 +28,27 @@ to avoid. Mutation is instead recognised by CALL SHAPE, in two tiers:
 
   TIER B -- a generic verb (``delete``, ``update``, ``add``, ``save``) is
   flagged only when its receiver's dotted name carries a substrate hint
-  (``qdrant``, ``mem0``, ``graph``, ``driver``, ``backend``). This tier is
-  load-bearing, not defensive padding: it is the only thing that catches
-  ``qdrant_client.delete(...)`` and ``memory.mem0.update(...)`` -- the two
-  real, currently-guarded spellings the production module's own docstring
-  calls out as a mutation no pattern search finds, because ``.update(`` also
-  matches every dict update in the repo. The receiver-hint set was narrowed
-  by measurement: an early draft including ``'collection'``/``'store'``/
-  ``'client'`` produced a real false positive on ``collections.update(...)``,
-  a plain dict update in ``bake_off_storage_shape.py``; dropping those three
-  removed it while still catching every genuine site.
+  (``qdrant``, ``mem0``, ``graph``, ``driver``, ``backend``, ``client``).
+  This tier is load-bearing, not defensive padding: it is the only thing
+  that catches ``qdrant_client.delete(...)`` and ``memory.mem0.update(...)``
+  -- the two real, currently-guarded spellings the production module's own
+  docstring calls out as a mutation no pattern search finds, because
+  ``.update(`` also matches every dict update in the repo. The receiver-hint
+  set was narrowed, then partly re-widened, by measurement rather than
+  taste -- and the measurement is precise about which drop it justifies. An
+  early draft also included ``'collection'`` and ``'store'``; only
+  ``'collection'`` was PROVEN to cause a false positive --
+  ``collections.update(...)``, a plain dict update in
+  ``bake_off_storage_shape.py`` -- so it alone stays dropped, with
+  ``'store'`` dropped alongside it without an independently identified false
+  positive of its own. ``'client'`` is RESTORED here (amendment, task 4848):
+  re-measured against the live tree it introduces zero new hits, and
+  dropping it was a real false negative -- ``client.delete(...)`` /
+  ``self._client.delete(...)`` is a receiver idiom this codebase already
+  uses (``fused_memory/middleware/task_curator.py:2064,2307``), and a
+  mutating script written in that shape would otherwise escape this check
+  entirely: no allowlist entry, no audit-column row, nothing to signal the
+  gap.
 
 AST, NOT GREP. A docstring or comment that merely names ``delete_memory`` or
 ``assert_store_mutation_allowed`` must not be flagged as a candidate, nor
@@ -146,12 +157,25 @@ MUTATING_CALL_NAMES: frozenset[str] = frozenset({
 #: repo.
 GENERIC_MUTATING_VERBS: frozenset[str] = frozenset({'delete', 'update', 'add', 'save'})
 
-#: Tightened by MEASUREMENT, not taste: an early draft also included
-#: 'collection', 'store' and 'client', and 'collection' produced a real
-#: false positive on `collections.update(...)`, a plain dict update in
-#: bake_off_storage_shape.py. Dropping those three removed it while still
-#: catching every genuine site.
-SUBSTRATE_RECEIVER_HINTS: tuple[str, ...] = ('qdrant', 'mem0', 'graph', 'driver', 'backend')
+#: Tightened, then partly re-widened, by MEASUREMENT, not taste. An early
+#: draft also included 'collection' and 'store'; only 'collection' was
+#: PROVEN to cause a false positive -- `collections.update(...)`, a plain
+#: dict update in bake_off_storage_shape.py -- so it alone stays dropped,
+#: with 'store' dropped alongside it without an independently identified
+#: false positive of its own. 'client' was dropped in the same early draft
+#: but is RESTORED here (amendment, task 4848): re-measured against the
+#: live tree it produces zero new hits, and dropping it was a real false
+#: negative -- `client.delete(...)` / `self._client.delete(...)` is a
+#: receiver idiom already used in this codebase (see
+#: fused_memory/middleware/task_curator.py:2064,2307).
+SUBSTRATE_RECEIVER_HINTS: tuple[str, ...] = (
+    'qdrant',
+    'mem0',
+    'graph',
+    'driver',
+    'backend',
+    'client',
+)
 
 
 def _dotted_receiver(node: ast.Attribute) -> str:
@@ -310,6 +334,31 @@ class TestMutatingCallsTierB:
             f'got {hits}'
         )
 
+    def test_client_delete_is_flagged(self, tmp_path):
+        source = tmp_path / 'candidate.py'
+        source.write_text('def run():\n    client.delete(ids=[1])\n')
+
+        hits = mutating_calls(parse_python_module(source))
+
+        assert ('delete', 2) in hits, (
+            f"client.delete(...) must be flagged -- 'client' was restored to "
+            f'SUBSTRATE_RECEIVER_HINTS (amendment, task 4848) because this '
+            f'bare receiver idiom is already used in this codebase (see '
+            f'fused_memory/middleware/task_curator.py:2064,2307); got {hits}'
+        )
+
+    def test_self_dot_client_delete_is_flagged(self, tmp_path):
+        source = tmp_path / 'candidate.py'
+        source.write_text('def run():\n    self._client.delete(ids=[1])\n')
+
+        hits = mutating_calls(parse_python_module(source))
+
+        assert ('delete', 2) in hits, (
+            f'self._client.delete(...) must be flagged for the same reason as '
+            f"a bare client.delete(...) -- the hint matches the receiver's "
+            f'dotted name by substring, not by exact position; got {hits}'
+        )
+
     @pytest.mark.parametrize(
         'snippet',
         [
@@ -328,7 +377,7 @@ class TestMutatingCallsTierB:
 
         assert hits == [], (
             f'{snippet!r} has no substrate-hinting receiver (qdrant/mem0/graph/'
-            f'driver/backend) and must not be flagged -- this is the '
+            f'driver/backend/client) and must not be flagged -- this is the '
             f'false-positive guard that makes Tier B usable at all; got {hits}'
         )
 
