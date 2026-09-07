@@ -182,6 +182,57 @@ PYPROJECT_DEFAULT_TIMEOUT = 300
 # test_whole_tree_scan_timeout_guard.py).
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 300
 
+# task 5147: the per-test budget VERIFY actually passes -- the `--timeout=300`
+# token in `orchestrator/orchestrator.yaml`'s `test_command`, mirrored by every
+# pytest segment of the fleet chain in dark-factory-orchestrator.yaml.  This
+# comment is the SINGLE home of the INVERSION rationale; test modules and the
+# pyproject comment point HERE rather than restating it.
+#
+# WHY A MARKER IS AN OVERRIDE AND NEVER A FLOOR -- read verbatim from
+# `pytest_timeout.py::_get_item_settings` in the installed package:
+#
+#     if marker is not None:
+#         timeout = _validate_timeout(settings.timeout, "marker")
+#     if timeout is None:
+#         timeout = item.config._env_timeout
+#
+# The marker wins UNCONDITIONALLY.  `config._env_timeout` -- fed by CLI
+# `--timeout`, then `PYTEST_TIMEOUT`, then the ini `timeout` -- is consulted
+# ONLY when the marker yielded None.  So `@pytest.mark.timeout(N)` is a TWO-WAY
+# override: it raises the budget under a bare local `pytest` (ini default 60)
+# and LOWERS it under verify (CLI 300).
+#
+# THE INVERSION BAND.  Those two budgets bracket every test here, giving a
+# marker at N three distinct regimes:
+#   * N <= PYPROJECT_DEFAULT_TIMEOUT -- tightens under BOTH, so unambiguously a
+#     deliberate tight bound (test_verify_clock_stop.py's 15s watchdog marks
+#     exist precisely to assert something fires FAST);
+#   * PYPROJECT_DEFAULT_TIMEOUT < N < VERIFY_CLI_PER_TEST_TIMEOUT -- INVERTS.
+#     The author wrote N>60 intending to LOOSEN against the ini default in
+#     front of them, and under verify the sign flips: 300 silently becomes N;
+#   * N >= VERIFY_CLI_PER_TEST_TIMEOUT -- loosens under both.  Safe.
+# Only the middle band contradicts its author's evident intent, and a breach
+# there is not a red test: `timeout_method = "thread"` makes pytest-timeout
+# `os._exit()` the xdist worker, and `--max-worker-restart=0` then truncates
+# the session and blames an innocent test that merely shared it (the same
+# mechanism spelled out for WHOLE_TREE_SCAN_TEST_TIMEOUT above).
+# ENFORCED by tests/test_timeout_marker_inversion_guard.py.
+#
+# A LITERAL, NOT AN EXPRESSION, and deliberately NOT `5 *
+# PYPROJECT_DEFAULT_TIMEOUT` despite equalling it today.  What is being named
+# here is the VERIFY CLI BUDGET, whose only real-world source is that
+# `--timeout=300` token; the ini default is the OTHER edge of the band, not a
+# scale factor.  Deriving one edge from the other would let a tightened ini
+# default drag this constant DOWN in silence -- `timeout = 20` would shrink it
+# to 100 while a ratio assertion stayed green as an identity -- collapsing the
+# band toward nothing without a single test going red.  Same hazard, and same
+# resolution, as WHOLE_TREE_SCAN_TEST_TIMEOUT deliberately not borrowing
+# HEAVY_BARRIER_TEST_TIMEOUT's 300.  The literal is instead kept honest by an
+# EXECUTABLE link: test_timeout_marker_inversion_guard.py::
+# TestVerifyCliBudgetConstant re-reads orchestrator/orchestrator.yaml at
+# runtime and fails if the two disagree.  Never-narrow.
+VERIFY_CLI_PER_TEST_TIMEOUT = 300
+
 
 # task 3540: the claimant-liveness TTL the row builder below derives its
 # symbolic heartbeat ages from.  SINGLE definition — `conftest.mock_orch_config`
