@@ -581,12 +581,17 @@ class TaskStatusConfig(BaseModel):
 # --- Reconciliation ---
 
 class ProceduralTopicCluster(BaseModel):
-    """One known-contradictory procedural_knowledge topic for the write-time topic guard.
+    """One known-contradictory topic for the write-time topic guard.
 
-    A cluster is matched deterministically: an incoming ``procedural_knowledge``
-    add_memory write is soft-blocked when its (lowercased) content contains
-    EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``, OR any single
-    phrase listed in ``sufficient_phrases``. A blocked write routes the writer
+    A cluster is matched deterministically: an incoming add_memory write whose
+    explicit ``category`` is one of ``_TOPIC_GUARD_GATED_CATEGORIES``
+    (``procedural_knowledge`` and ``preferences_and_norms`` as of task 3430;
+    see ``fused_memory.server.tools``) is soft-blocked when its (lowercased)
+    content contains EITHER at least ``min_phrase_hits`` DISTINCT ``phrases``,
+    OR any single phrase listed in ``sufficient_phrases``. The cosine
+    near-duplicate guard that this topic guard complements (see
+    ``procedural_knowledge_near_dup_guard_enabled`` on ``ReconciliationConfig``)
+    remains ``procedural_knowledge``-only. A blocked write routes the writer
     to consolidate/update the existing entries or add context to the human gate
     task named in ``hint`` -- instead of accumulating another paraphrased,
     below-cosine-threshold restatement the semantic near-dup guard cannot catch
@@ -1858,8 +1863,11 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
-    # Write-time TOPIC-keyed cluster guard for procedural_knowledge add_memory writes
-    # (task 2845). Complements the cosine near-dup guard above: paraphrased same-topic
+    # Write-time TOPIC-keyed cluster guard for add_memory writes (task 2845),
+    # extended by task 3430 to gate on category in _TOPIC_GUARD_GATED_CATEGORIES
+    # (server/tools.py) -- currently procedural_knowledge and preferences_and_norms
+    # -- rather than procedural_knowledge alone. Complements the cosine near-dup
+    # guard above, which remains procedural_knowledge-only: paraphrased same-topic
     # entries score BELOW any cosine threshold that is also safe for unrelated writes,
     # so a recurring known-contradictory topic (e.g. "pytest-xdist -n0 serial override")
     # kept accumulating contradictory entries the cosine guard
@@ -1871,21 +1879,33 @@ class ReconciliationConfig(BaseModel):
     # reactive procedural_knowledge consolidation, not because the write path runs
     # inside reconciliation. Read live per add_memory write off the shared config
     # object, so it satisfies the reload.py live-read reload-safety rule.
+    # NOTE: the field keeps its historical `procedural_knowledge_` prefix for config
+    # back-compat even though the gate now spans both categories -- do not rename it
+    # (ReconciliationConfig's model_validator hard-raises on the legacy renamed key)
+    # or the ProceduralTopicCluster class / error_type strings.
     procedural_knowledge_topic_guard_clusters: list[ProceduralTopicCluster] = Field(
         default_factory=_default_topic_guard_clusters,
         description=(
-            'Known-contradictory procedural_knowledge topic clusters. An add_memory '
-            "write whose content contains >= a cluster's min_phrase_hits distinct "
-            "phrases -- OR any single one of that cluster's sufficient_phrases, for "
-            'phrases distinctive enough to qualify alone -- is soft-blocked '
+            'Known-contradictory topic clusters for the write-time topic guard. An '
+            'add_memory write whose explicit category is in _TOPIC_GUARD_GATED_CATEGORIES '
+            '(server/tools.py -- procedural_knowledge and preferences_and_norms as of '
+            "task 3430) and whose content contains >= a cluster's min_phrase_hits "
+            "distinct phrases -- OR any single one of that cluster's sufficient_phrases, "
+            'for phrases distinctive enough to qualify alone -- is soft-blocked '
             '(error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE '
-            'the cosine near-dup search. Seeded with five clusters (pytest-xdist, '
+            'the cosine near-dup search. The cosine near-dup guard remains '
+            'procedural_knowledge-only. Seeded with five clusters (pytest-xdist, '
             'the two architect families, ruff-format, and npx-pyright-EACCES); '
             'the two eval-worktree '
             'clusters that were seeded originally are RETIRED -- both their human '
             'gates (2841/2844) are done -- and must not be reinstated without '
             'reading the retirement notes on _default_topic_guard_clusters. An '
             'empty list disables the topic guard. '
+            'This field keeps its historical procedural_knowledge_ name prefix for '
+            'config back-compat even though the gate now spans both categories; '
+            'do not rename it (a ReconciliationConfig model_validator hard-raises on '
+            'the legacy renamed key) or the ProceduralTopicCluster class / '
+            'error_type strings. '
             'A sufficient_phrases entry absent from that cluster\'s phrases is '
             'rejected at load/reload rather than silently matching nothing. Green-tier '
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
