@@ -589,6 +589,78 @@ async def _walk_pages(
     return shaped
 
 
+async def _cached_fanout(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    read: _TasksRead,
+    strategy: Callable[[str], Awaitable[list[dict]]],
+    timeout: float,
+) -> list[dict] | dict:
+    """Fan out *strategy* across the configured urls, through BOTH task caches.
+
+    THE one place the fan-out / positive cache / negative cache / marker
+    policy lives.  Every public read routes through it and they differ only in
+    the *read* record they build and the *strategy* they bind — so there is no
+    second copy of any of this to drift out of step (INV-5).
+
+    *strategy* is invoked with ONE url at a time and is already bound to it, so
+    whatever it does (a single page, or a whole pinned-url walk) stays below
+    the cache: a per-page public call would mint one entry and one lock per
+    page, and let a failed page write a 5 s marker served mid-walk.
+
+    *client* and *timeout* are NOT read here — *strategy* already carries them.
+    They stay in the signature because *strategy* is opaque
+    (``Callable[[str], Awaitable[...]]``), so without them nothing at this
+    layer would show a reader that an HTTP client and a per-request budget are
+    what a read actually costs; and both public reads then call this with one
+    identical shape.
+    """
+    async def _refresh() -> list[dict] | dict:
+        return await first_success(
+            config.fused_memory_urls,
+            strategy,
+            log_label=fanout_label('fetch_tasks', read.project_root),
+            offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
+        )
+
+    # A fresh negative entry short-circuits the attempt.  The marker is still
+    # RETURNED, so degradation stays exactly as visible to the caller as it was
+    # before — only the retry is suppressed.
+    #
+    # UNLESS a fresh positive entry also exists (see the negative-cache note
+    # above: a concurrent failure+success pair leaves both fresh).  Then fall
+    # through and serve the data: the marker exists to suppress a RETRY, not to
+    # withhold a result already in hand, and reporting a root offline while
+    # holding fresh rows for it is the false-banner failure this whole seam is
+    # meant to avoid.  Falling through costs no MCP call — ``get_or_refresh``
+    # returns the same fresh entry this check just saw.  If it expires in the
+    # gap the worst case is one extra attempt, which is strictly better than a
+    # wrong answer.
+    suppressed = _fetch_tasks_negative_cache.get_fresh(read)
+    if suppressed is not None and _fetch_tasks_cache.get_fresh(read) is None:
+        return suppressed
+
+    result = await _fetch_tasks_cache.get_or_refresh(
+        read, _refresh, cache_ok=lambda v: isinstance(v, list),
+    )
+    if not isinstance(result, list):
+        # Record the offline marker, under the SAME record the positive cache
+        # is keyed by — keying the two differently is exactly how they drift.
+        # ``get_or_refresh`` is the store path because ``TTLCache`` exposes no
+        # bare setter and this needs no ``mcp_fanout`` change; the default
+        # always-true ``cache_ok`` keeps it, and its per-key lock makes a
+        # concurrent second failure reuse the first marker rather than race it.
+        async def _mark() -> dict:
+            return result
+
+        await _fetch_tasks_negative_cache.get_or_refresh(read, _mark)
+        return result
+    # Shallow copy: list-level mutation by a caller is isolated from the cached
+    # entry, the inner dicts are shared.  Both halves are documented on the
+    # public reads.
+    return list(result)
+
+
 def task_is_stranded(task: Mapping[str, Any], now: datetime | None = None) -> bool:
     """Return True when *task* is an in-progress task with no live claimant.
 
@@ -859,48 +931,7 @@ async def fetch_tasks(
         window = mode if isinstance(mode, _OnePage) else None
         return (await page_fn(window)).rows
 
-    async def _refresh() -> list[dict] | dict:
-        return await first_success(
-            config.fused_memory_urls,
-            _call,
-            log_label=fanout_label('fetch_tasks', project_root_str),
-            offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
-        )
-
-    key = read
-
-    # A fresh negative entry short-circuits the attempt.  The marker is still
-    # RETURNED, so degradation stays exactly as visible to the caller as it was
-    # before — only the retry is suppressed.
-    #
-    # UNLESS a fresh positive entry also exists (see the negative-cache note
-    # above: a concurrent failure+success pair leaves both fresh).  Then fall
-    # through and serve the data: the marker exists to suppress a RETRY, not to
-    # withhold a result already in hand, and reporting a root offline while
-    # holding fresh rows for it is the false-banner failure this whole seam is
-    # meant to avoid.  Falling through costs no MCP call — ``get_or_refresh``
-    # returns the same fresh entry this check just saw.  If it expires in the
-    # gap the worst case is one extra attempt, which is strictly better than a
-    # wrong answer.
-    suppressed = _fetch_tasks_negative_cache.get_fresh(key)
-    if suppressed is not None and _fetch_tasks_cache.get_fresh(key) is None:
-        return suppressed
-
-    result = await _fetch_tasks_cache.get_or_refresh(
-        key, _refresh, cache_ok=lambda v: isinstance(v, list),
-    )
-    if not isinstance(result, list):
-        # Record the offline marker.  ``get_or_refresh`` is the store path
-        # because ``TTLCache`` exposes no bare setter and this needs no
-        # ``mcp_fanout`` change; the default always-true ``cache_ok`` keeps it,
-        # and its per-key lock makes a concurrent second failure reuse the
-        # first marker rather than race it.
-        async def _mark() -> dict:
-            return result
-
-        await _fetch_tasks_negative_cache.get_or_refresh(key, _mark)
-        return result
-    return list(result)
+    return await _cached_fanout(client, config, read, _call, timeout)
 
 
 async def fetch_external_statuses(
