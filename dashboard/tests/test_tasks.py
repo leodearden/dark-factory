@@ -12,6 +12,7 @@ import dataclasses
 import inspect
 import logging
 import textwrap
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -2755,7 +2756,10 @@ class TestPublicReadContracts:
         saying WHICH page, and the answer would silently be the first — the
         shape that made a page and a whole tree look alike.
         """
-        kwargs = {'page_size': 10, 'offset': 0}
+        # `dict[str, Any]`, not the inferred `dict[str, int]`: pyright checks
+        # `**kwargs` against every keyword parameter, and a narrower value type
+        # is reported against `statuses: list[str] | None`.
+        kwargs: dict[str, Any] = {'page_size': 10, 'offset': 0}
         kwargs.pop(omitted)
 
         with pytest.raises(TypeError, match=omitted):
@@ -2788,9 +2792,10 @@ class TestPublicReadContracts:
         `paginate` is gone for the same reason at the contract level: the walk
         vs slice distinction is now WHICH FUNCTION you call.
         """
+        retired: dict[str, Any] = {rejected: 5}
         with pytest.raises(TypeError, match=rejected):
             await tasks_mod.fetch_tasks(
-                dummy_client, dummy_config, '/proj/gone', **{rejected: 5},
+                dummy_client, dummy_config, '/proj/gone', **retired,
             )
 
     async def test_fetch_tasks_accepts_chunk_size(self, dummy_client, dummy_config):
