@@ -89,7 +89,19 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 #     an L1 is open;
 #   - `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`, which
 #     raises `_StewardReescalated` and diverts the workflow on the strength of
-#     an open L1.
+#     an open L1;
+#   - `orchestrator/workflow.py::TaskWorkflow._await_steward_completion`, the
+#     requeue-diversion override, which holds a requeue-producing steward
+#     outcome back when an L1 is already open.
+#
+# BOTH workflow.py sites are uncategorized, and an earlier revision of this
+# block listed only the first. That was a measurement error, corrected here
+# (esc-4821-5): `_await_steward_completion` was mistakenly reported as NOT
+# holding an uncategorized read, when it holds exactly the requeue-diversion
+# one. Grep `has_open_l1(` and subtract the `category=` call sites before
+# editing this list -- there are two uncategorized readers in workflow.py, not
+# one. The omission never changed the DESIGN (level-0 is invisible to every
+# level-1-only reader alike), only this list's claim to be complete.
 #
 # That is the population this closes.  Two classes of `has_open_l1` reader are
 # deliberately NOT in it, and were re-measured rather than assumed: the
