@@ -528,17 +528,29 @@ the backend do the concatenation — never re-send the existing body. Either way
 by reading the response's `details` field or a follow-up \
 `mcp__fused-memory__get_task`, and flag a duplicated body in your structured report.
 
-The additive union above is ONLY for the ATTACH case (adding new hints \
-to a task). For the distinct RESHAPE case — converting a task's LEGACY list-format \
-`memory_hints` (`[{{entity, query}}, ...]`) to the canonical `{{entities, queries}}` \
-dict shape — you must NOT use `append=False`: a bare `append=False` whole-blob metadata \
-overwrite is now REJECTED (the task-2180 metadata-wipe incident, where it silently wiped \
-a live in-progress task's `substrate_confirmed`/`files`/`branch_base_sha`/`prd_path`/`routing`). \
-Instead do a read-modify-write under the explicit replace co-signal: call \
-`mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` to read the FULL \
-current metadata, convert and merge the reshaped hints into it locally, then write the \
-COMPLETE metadata blob back with `metadata_mode='replace'`. This preserves every sibling \
-key while replacing only the legacy hint shape.
+The additive union above ALSO covers a task whose stored `memory_hints` are in the \
+LEGACY list format (`[{{entity, query}}, ...]`) rather than the canonical \
+`{{entities, queries}}` dict shape. Such a row needs NO special handling and NO \
+conversion round-trip: attach hints exactly as above — `append=True` with \
+`metadata_mode` OMITTED — and the backend normalises the legacy shape on BOTH sides \
+before merging, so it converts the row to the canonical dict shape and unions it with \
+your newly-attached entries automatically, every sibling key preserved.
+
+Do NOT reach for `metadata_mode='replace'` to convert hints. Unlike 'merge' and \
+'additive', which REFUSE the write and leave the stored bytes untouched when a row's \
+existing metadata is corrupt, 'replace' writes your incoming blob verbatim and \
+BYPASSES the corrupt-blob guard — it is the one mode that can destroy a \
+corrupt-but-recoverable metadata row. Do NOT use `append=False` either: a bare \
+`append=False` whole-blob metadata overwrite is REJECTED (the task-2180 metadata-wipe \
+incident, where it silently wiped a live in-progress task's \
+`substrate_confirmed`/`files`/`branch_base_sha`/`prd_path`/`routing`).
+
+`metadata_mode='replace'` remains sanctioned for a genuinely intended WHOLE-BLOB \
+overwrite — repairing a corrupt metadata row, say — and then only with a COMPLETE \
+read-modify-write payload: call \
+`mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` to read the \
+FULL current metadata, apply your change locally, and write the COMPLETE blob back so \
+every sibling key survives. Never use it as a shortcut for attaching hints.
 
 `append=True` applies ONLY to `metadata` and to `details`/`prompt`. It has NEVER applied \
 to `description`, `title` or `priority` — those columns are REPLACE-ONLY, and combining \
