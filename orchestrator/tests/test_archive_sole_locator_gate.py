@@ -88,6 +88,17 @@ _GLOB_METHODS = frozenset({'glob', 'rglob'})
 # The ONE production site permitted to glob the archive by session id.
 _ARCHIVE_LOCATOR = ('shared/src/shared/transcript_archive.py', 'durable_archive_path')
 
+# Where the invariant is stated in PROSE, for humans. This gate enforces it;
+# that docstring is what explains it, and is where a deliberate change of
+# policy belongs. Cited as `path::symbol` per CLAUDE.md rather than a line pin.
+_PROSE_HOME = 'shared/src/shared/transcript_archive.py (module docstring)'
+
+# The sentence in that docstring this gate is the mechanical form of. Pinned so
+# the two cannot drift into disagreeing about what the rule IS — a gate whose
+# prose home has quietly said something else for six months is worse than no
+# prose home, because a reader trusts the words over the assertion.
+_PROSE_CLAIM = 'is the single session-id-keyed locator into it'
+
 # Sites that interpolate a session id into a glob against the LIVE CLI CONFIG
 # TREE rather than the archive. Each carries its reason inline so a future
 # reader can tell a legitimate live-tree lookup from the archive re-glob this
@@ -254,7 +265,9 @@ def _violation_message(unexpected: list[_Site]) -> str:
         'answer decides ELIGIBILITY, so a divergent finder costs resumes.\n'
         'If it globs the LIVE CLI config tree instead — a different store with '
         'a different layout — add it to _LIVE_CONFIG_TREE_ALLOWLIST keyed by '
-        '(path, enclosing function) WITH the reason inline.'
+        '(path, enclosing function) WITH the reason inline.\n'
+        f'The invariant is stated in prose at {_PROSE_HOME}, which is where a '
+        'change of policy belongs — not here.'
     )
 
 
@@ -443,3 +456,79 @@ def test_looks_like_session_id_boundaries(name: str, expected: bool) -> None:
     """Token-wise, never substring — the arm that keeps the allowlist from
     growing false positives while still catching a renamed locator."""
     assert _looks_like_session_id(name) is expected
+
+
+def test_failure_message_names_the_invariant_and_the_remedy() -> None:
+    """The message a future author reads has to do two jobs, and the second is
+    the one a structural gate usually gets wrong.
+
+    Naming the invariant (I-E) is the easy half. The hard half is that the
+    reflex on seeing a red allowlist-shaped gate is to ADD AN ALLOWLIST ENTRY,
+    which for this gate is precisely the wrong move: a real second archive
+    locator allowlisted is the invariant deleted, quietly, by the person the
+    guard was written for. So the message must say CALL the locator instead,
+    and must say WHY (the parts of the layout a re-glob drops), or it will lose
+    that argument to whoever is mid-refactor and in a hurry.
+
+    It must also point at the PROSE home, so a deliberate policy change lands
+    where it can be reasoned about rather than as an edit to a test constant.
+    """
+    msg = _violation_message([
+        _Site(
+            path='pkg/src/pkg/rogue.py',
+            function='find_it',
+            lineno=42,
+            pattern="f'{task_id}/*/{session_id}.jsonl*'",
+        ),
+    ])
+
+    # Names the invariant, by its identifier and in words.
+    assert 'I-E' in msg
+    assert 'durable_archive_path' in msg
+    assert 'SINGLE session-id-keyed locator' in msg
+
+    # Names the remedy — CALL it, do not re-glob — and does not merely imply it.
+    assert 'do not allowlist' in msg
+    assert 'CALL shared.transcript_archive.durable_archive_path' in msg
+    # ...and the reason the remedy is not arbitrary: what a re-glob drops.
+    assert '.jsonl*' in msg
+    assert 'is_file()' in msg
+    assert 'tiebreak' in msg
+    # ...and what it now costs, which is what changed under task 3730.
+    assert 'ELIGIBILITY' in msg
+
+    # Localises the offender precisely enough to act on without re-running.
+    assert 'pkg/src/pkg/rogue.py::find_it' in msg
+    assert 'line 42' in msg
+
+    # Points at the prose home for a policy change.
+    assert _PROSE_HOME in msg
+
+    # Keeps the legitimate escape hatch visible, so a genuine live-config-tree
+    # lookup is not blocked by a message that only says "never".
+    assert '_LIVE_CONFIG_TREE_ALLOWLIST' in msg
+
+
+def test_prose_home_still_states_the_invariant() -> None:
+    """The gate and its prose statement must not drift apart.
+
+    This gate is the mechanical form of a sentence in
+    ``shared/transcript_archive.py``'s module docstring, and its failure
+    message sends readers there. If that sentence is edited away — or the rule
+    is deliberately relaxed there without anyone touching this file — the gate
+    would keep enforcing a policy its own stated source no longer claims, and
+    the failure message would cite a paragraph that says something else.
+    Cheaper to notice here than in an argument six months from now.
+    """
+    docstring = ast.get_docstring(
+        ast.parse((REPO_ROOT / _ARCHIVE_LOCATOR[0]).read_text(encoding='utf-8'))
+    )
+    assert docstring is not None, f'{_ARCHIVE_LOCATOR[0]} lost its module docstring'
+    normalised = ' '.join(docstring.split())
+    assert _PROSE_CLAIM in normalised, (
+        f'{_PROSE_HOME} no longer states the I-E invariant this gate enforces '
+        f'(looked for: {_PROSE_CLAIM!r}). If the rule genuinely changed, change '
+        'it THERE and here together; if the wording merely moved, re-point '
+        '_PROSE_CLAIM at the new sentence.'
+    )
+    assert 'durable_archive_path' in normalised
