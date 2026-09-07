@@ -6163,3 +6163,87 @@ def test_run_census_clean_run_emits_no_unresolved_verdict_warning(tmp_path, capl
     assert not [
         r for r in _census_warnings(caplog) if "unresolved" in r.getMessage().lower()
     ]
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-15: RED — W-D, the RUN SUMMARY. Two silences remain. The
+# merge loop discards `apply_coding_record`'s stats entirely
+# (`updated_codebook, _stats = ...`), throwing away the
+# `candidate_disposition_conflicts` count task 4144 already computes; and
+# nothing states either tally once at the end of the run, where an operator
+# reading a journal sees the whole picture rather than one line per cluster.
+# The same already-rejected-same-title fixture drives BOTH signals: it is
+# exactly the case apply_coding_record counts as a disposition conflict.
+# ---------------------------------------------------------------------------
+
+def test_run_census_run_summary_names_unresolved_verdicts_and_disposition_conflicts(
+    tmp_path, caplog,
+):
+    kwargs = _rejected_twin_kwargs(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.unresolved_verdicts == 1, "step-13's signal still holds"
+
+    summaries = [
+        r for r in _census_warnings(caplog)
+        if "unresolved" in r.getMessage().lower()
+        and _THREE_NOVEL_TITLES[0] not in r.getMessage()
+    ]
+    assert len(summaries) == 1, (
+        "exactly ONE run-summary line, distinct from the per-cluster line; got "
+        f"{[r.getMessage() for r in _census_warnings(caplog)]}"
+    )
+    message = summaries[0].getMessage()
+    assert "1" in message, "the unresolved-verdict count"
+    assert "conflict" in message.lower(), (
+        "and the candidate_disposition_conflicts count accumulated across the "
+        f"merge loop; got {message!r}"
+    )
+
+
+def test_run_census_clean_run_emits_no_run_summary_line(tmp_path, caplog):
+    kwargs = _rejected_twin_kwargs(tmp_path, codebook_dict=_minimal_v2_codebook())
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.unresolved_verdicts == 0
+    assert not [
+        r for r in _census_warnings(caplog)
+        if "unresolved" in r.getMessage().lower() or "conflict" in r.getMessage().lower()
+    ], "both tallies zero -> no summary line at all"
+
+
+def test_main_done_line_names_unresolved_verdicts_when_nonzero(
+    tmp_path, monkeypatch, capsys,
+):
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    def _run_main(unresolved):
+        monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(
+            outcome=mod.CensusOutcome(
+                status="done",
+                report_path="plans/confusion-census-2026-07-30.md",
+                filed_task_ids=["1234"],
+                stop_reason="exhausted",
+                unresolved_verdicts=unresolved,
+            )
+        ))
+        assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+        return capsys.readouterr().out
+
+    nonzero_out = _run_main(2)
+    assert "unresolved_verdicts=2" in nonzero_out
+
+    zero_out = _run_main(0)
+    assert "unresolved_verdicts" not in zero_out, (
+        "the zero case must stay byte-identical — a clause trained to be "
+        "ignored is a clause that will be ignored"
+    )
+    assert zero_out == (
+        "census: done -- report=plans/confusion-census-2026-07-30.md "
+        "filed_tasks=1 stop_reason=exhausted\n"
+    )
