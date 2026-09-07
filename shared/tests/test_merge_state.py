@@ -132,38 +132,38 @@ class TestPollPartitions:
                 )
 
     def test_live_states(self):
-        assert LIVE_STATES == {
+        assert {
             MergeState.queued,
             MergeState.verifying,
             MergeState.gate,
             MergeState.finalizing,
-        }
+        } == LIVE_STATES
 
     def test_terminal_states(self):
-        assert TERMINAL_STATES == {
+        assert {
             MergeState.done,
             MergeState.conflict,
             MergeState.blocked,
             MergeState.abandoned,
             MergeState.superseded,
-        }
+        } == TERMINAL_STATES
 
     def test_outcome_states(self):
         assert OUTCOME_STATES == LIVE_STATES | TERMINAL_STATES
 
     def test_epistemic_states(self):
-        assert EPISTEMIC_STATES == {
+        assert {
             MergeState.no_record,
             MergeState.stale_record,
             MergeState.journaled,
             MergeState.unknown,
-        }
+        } == EPISTEMIC_STATES
 
     def test_poll_stop_states(self):
-        assert POLL_STOP_STATES == TERMINAL_STATES | {MergeState.unknown}
+        assert TERMINAL_STATES | {MergeState.unknown} == POLL_STOP_STATES
 
     def test_cancel_states(self):
-        assert CANCEL_STATES == TERMINAL_STATES | {MergeState.unknown}
+        assert TERMINAL_STATES | {MergeState.unknown} == CANCEL_STATES
 
 
 class TestPartitionsAreExhaustiveAndDisjoint:
@@ -179,14 +179,14 @@ class TestPartitionsAreExhaustiveAndDisjoint:
     """
 
     def test_outcome_epistemic_exhaustive(self):
-        assert OUTCOME_STATES | EPISTEMIC_STATES == frozenset(MergeState), (
+        assert frozenset(MergeState) == OUTCOME_STATES | EPISTEMIC_STATES, (
             'OUTCOME_STATES | EPISTEMIC_STATES must cover every MergeState member; '
             'unassigned: '
             f'{sorted(frozenset(MergeState) - (OUTCOME_STATES | EPISTEMIC_STATES))}'
         )
 
     def test_outcome_epistemic_disjoint(self):
-        assert OUTCOME_STATES & EPISTEMIC_STATES == frozenset(), (
+        assert frozenset() == OUTCOME_STATES & EPISTEMIC_STATES, (
             'OUTCOME_STATES and EPISTEMIC_STATES must be disjoint; both claim: '
             f'{sorted(OUTCOME_STATES & EPISTEMIC_STATES)}'
         )
@@ -199,7 +199,7 @@ class TestPartitionsAreExhaustiveAndDisjoint:
         )
 
     def test_live_terminal_disjoint(self):
-        assert LIVE_STATES & TERMINAL_STATES == frozenset(), (
+        assert frozenset() == LIVE_STATES & TERMINAL_STATES, (
             'LIVE_STATES and TERMINAL_STATES must be disjoint; both claim: '
             f'{sorted(LIVE_STATES & TERMINAL_STATES)}'
         )
