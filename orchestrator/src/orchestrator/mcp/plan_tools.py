@@ -1023,8 +1023,18 @@ def _create_plan(
         # rather than one clobbering the other. Neither writes a key when there
         # is nothing to record, so the overwhelmingly common clean path
         # produces a document byte-identical to what it produced before.
+        #
+        # THE CARRY-FORWARD GOES THROUGH THE ALGEBRA, never raw. plan.json is
+        # agent-adjacent, and every other consumer of a stored block
+        # (`merge_block`, `summary`) already degrades what it finds; copying the
+        # on-disk value verbatim would be the one path that launders a mangled
+        # block into a brand-new document — and from there into the four
+        # architect-facing prompts that embed the plan. `normalize_block`
+        # returns None when nothing survives, so an unrecoverable value is
+        # DROPPED rather than laundered into a present-and-zero key that would
+        # contradict this key's contract that its PRESENCE is the signal.
         existing = artifacts.read_plan()
-        carried = (
+        carried = plan_markup_stamp.normalize_block(
             existing.get(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY)
             if isinstance(existing, dict) else None
         )

@@ -50,7 +50,9 @@ set (INV-5), plus the two structural prefixes.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -545,6 +547,82 @@ class TestMergeIsTotalAgainstAMangledBlock:
 
         assert merged['events'] == incoming['events']
 
+    def test_a_stored_event_is_re_projected_through_the_allowlist(self):
+        """The allowlist and the cap have to hold for what is READ BACK too.
+
+        ``build_event`` guards what this module PUTS in the block; without the
+        matching guard on the way out of storage the two would hold only for
+        the current process, since every merge re-emits what it read into the
+        document it writes. A hand-edited event carrying an envelope literal
+        under an unfamiliar key would otherwise survive every later merge and
+        ride into the four architect-facing prompts that embed ``plan.json`` —
+        re-emitted by the one channel whose whole justification is that it
+        holds no such thing.
+        """
+        incoming = plan_markup_stamp.block_of(_events(1)[0])
+        poisoned = {
+            **plan_markup_stamp.block_of(_events(1)[0]),
+            'events': [{
+                'ts': '2026-09-07T00:00:00+00:00',
+                'tool': 'add_design_decision',
+                'param': 'decision',
+                'outcome': 'rejected',
+                # The two shapes the module refuses to hold, arriving from
+                # storage rather than from a fact record.
+                'pattern': _open_param('rationale'),
+                'note_to_self': _close('decision'),
+                'payload': 'x' * 5_000,
+            }],
+        }
+
+        merged = plan_markup_stamp.merge_block(poisoned, incoming)
+
+        stored = merged['events'][0]
+        assert set(stored) == set(plan_markup_stamp.STAMP_EVENT_KEYS), (
+            'an unknown key is DROPPED, not trimmed: the default for a field '
+            'nobody has reviewed is "not in the plan"'
+        )
+        encoded = json.dumps(merged)
+        for sequence in _FORBIDDEN_SEQUENCES:
+            assert sequence not in encoded, (
+                f'a stored event re-entered the merge carrying {sequence!r}'
+            )
+
+    def test_a_stored_events_overlong_value_is_capped_on_the_way_in(self):
+        cap = plan_markup_stamp.MARKUP_STAMP_MAX_FIELD_CHARS
+        incoming = plan_markup_stamp.block_of(_events(1)[0])
+        bloated = {
+            **plan_markup_stamp.block_of(_events(1)[0]),
+            'events': [{'ts': 'a' * 4_000, 'tool': 'b' * 4_000,
+                        'param': 'c' * 4_000, 'outcome': 'rejected'}],
+        }
+
+        merged = plan_markup_stamp.merge_block(bloated, incoming)
+
+        stored = merged['events'][0]
+        assert all(len(value) <= cap for value in stored.values())
+        assert stored['ts'] == 'a' * cap, 'a PREFIX, never a rewrite'
+
+    def test_an_overlong_by_tool_key_is_capped_and_its_count_kept(self):
+        """A capped key is a prefix, so two long keys can collapse onto one.
+
+        Their counts are SUMMED rather than one silently overwriting the
+        other — the same "the tally is never the thing that gets dropped"
+        discipline the rest of the algebra keeps.
+        """
+        cap = plan_markup_stamp.MARKUP_STAMP_MAX_FIELD_CHARS
+        stem = 'add_design_decision_' + 'x' * cap
+        mangled = {
+            **plan_markup_stamp.block_of(_events(1)[0]),
+            'by_tool': {stem + 'aaa': 2, stem + 'bbb': 3},
+            'count': 5,
+        }
+
+        merged = plan_markup_stamp.merge_block(mangled, {})
+
+        assert merged['by_tool'] == {stem[:cap]: 5}
+        assert all(len(tool) <= cap for tool in merged['by_tool'])
+
     def test_a_by_tool_holding_junk_counts_still_merges(self):
         incoming = plan_markup_stamp.block_of(_events(1)[0])
         mangled = {
@@ -596,6 +674,90 @@ class TestSummaryIsTheCompactView:
 
             assert plan_markup_stamp.summary(plan) is None, (
                 f'{mangled!r} must not reach a tool response half-formed'
+            )
+
+    def test_a_present_but_empty_block_summarises_to_none(self):
+        """PRESENT-AND-ZERO would contradict the key's whole contract.
+
+        ``{'count': 0, 'by_tool': {}}`` on a confirm_plan response announces a
+        loss that did not happen, to an architect whose only remedy is to
+        resend calls it never lost. The key's PRESENCE is the signal, so a
+        block with nothing in it is treated exactly as an absent one — however
+        it got that way (a hand-edit, a corruption, a value carried forward
+        from a document that held junk).
+        """
+        for empty in ({}, {'count': 0}, {'count': 'seven'},
+                      {'count': 0, 'by_tool': {}, 'events': []},
+                      {'by_tool': 'nope', 'events': 'nope'}):
+            plan = {plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: empty}
+
+            assert plan_markup_stamp.summary(plan) is None, (
+                f'{empty!r} records no refusal and must be omitted, not zeroed'
+            )
+
+    def test_a_block_whose_counters_are_mangled_but_whose_events_survive(self):
+        """Evidence beats tidiness: a surviving event is still a real refusal.
+
+        All THREE fields decide emptiness, not just the two the summary emits,
+        so a block whose numbers were mangled but whose events remain is still
+        reported rather than suppressed.
+        """
+        plan = {plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: {
+            'count': 'seven', 'by_tool': 'nope', 'events': _events(1),
+        }}
+
+        assert plan_markup_stamp.summary(plan) == {'count': 0, 'by_tool': {}}
+
+
+class TestNormalizeBlockGuardsTheCarryForward:
+    """``_create_plan`` is the one consumer that copies a stored block onward.
+
+    Every other consumer degrades what it finds; without this, the carry-forward
+    would be the single path that launders a mangled block into a brand-new
+    document — and from there into the four architect-facing prompts that embed
+    ``plan.json`` verbatim.
+    """
+
+    def test_a_usable_block_survives_re_projection(self):
+        block = plan_markup_stamp.merge_block(
+            plan_markup_stamp.block_of(_events(1, tool='add_plan_step')[0]),
+            plan_markup_stamp.block_of(_events(1, tool='create_plan')[0]),
+        )
+
+        normalized = plan_markup_stamp.normalize_block(block)
+
+        assert normalized is not None
+        assert normalized['count'] == 2
+        assert normalized['by_tool'] == {'add_plan_step': 1, 'create_plan': 1}
+
+    def test_a_mangled_block_is_normalised_rather_than_copied(self):
+        poisoned = {
+            'count': 3,
+            'by_tool': {'add_design_decision': 3},
+            'events': [{'tool': 'add_design_decision',
+                        'pattern': _open_param('rationale')}],
+            'note': 'a hand-written note that is not the constant',
+        }
+
+        normalized = plan_markup_stamp.normalize_block(poisoned)
+
+        assert normalized is not None
+        assert normalized['count'] == 3
+        assert normalized['note'] == plan_markup_stamp.STAMP_NOTE
+        for sequence in _FORBIDDEN_SEQUENCES:
+            assert sequence not in json.dumps(normalized)
+
+    def test_an_unrecoverable_block_is_dropped_rather_than_zeroed(self):
+        """``None``, so the carry-forward writes no key at all.
+
+        Laundering junk into a present-and-zero block would put a key meaning
+        nothing onto a brand-new plan, contradicting the contract that its
+        presence is the signal. There was no information in it to preserve.
+        """
+        for junk in ('a string', 42, None, ['a', 'list'], {}, {'count': 0},
+                     {'count': 'seven', 'by_tool': 'nope'}):
+            assert plan_markup_stamp.normalize_block(junk) is None, (
+                f'{junk!r} holds nothing and must not become a key'
             )
 
 
@@ -849,12 +1011,36 @@ class TestARefusalBeforeAnyPlanExistsIsBuffered:
     ):
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
 
-        await stamp(make_fact(tool='create_plan', param='title'))
+        locator = await stamp(make_fact(tool='create_plan', param='title'))
 
         pending = plan_markup_stamp.pending_block()
         assert pending is not None
         assert pending['count'] == 1
         assert pending['by_tool'] == {'create_plan': 1}
+        assert locator == plan_markup_stamp._PENDING_LOCATOR, (
+            'the emitter\'s "locator or None" contract distinguishes RECORDED '
+            'from LOST, and a buffered refusal is recorded — but the locator '
+            'is the buffer, not a path, because no artifact was touched'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_buffered_locator_is_not_a_filesystem_path(
+        self, artifacts: TaskArtifacts
+    ):
+        """Naming a path here would be a lie a caller could act on.
+
+        The two sibling channels on this boundary return a real journal path
+        and a real escalation id; an operator handed a plan.json path for a
+        refusal that wrote no plan.json would go looking for a file that does
+        not exist.
+        """
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        locator = await stamp(make_fact(tool='create_plan', param='title'))
+
+        assert locator is not None
+        assert not Path(locator).exists()
+        assert 'plan.json' not in locator
 
     @pytest.mark.asyncio
     async def test_repeated_refusals_accumulate_in_the_buffer(
@@ -873,6 +1059,119 @@ class TestARefusalBeforeAnyPlanExistsIsBuffered:
 
     def test_an_empty_buffer_reports_nothing(self):
         assert plan_markup_stamp.pending_block() is None
+
+
+class TestConcurrentStampsDoNotLoseACount:
+    """The one writer pair this module OWNS, and therefore closes.
+
+    plan-tools registers its tools as sync ``def``, so FastMCP dispatches them
+    on a thread pool, and the emitter adds a hop of its own
+    (``asyncio.to_thread``). A client that batches parallel calls can have two
+    refusals in flight on two threads at once. Unserialised, both read
+    ``plan.json`` before either writes and the second write lands a block that
+    never saw the first refusal — an UNDERCOUNT, in the one artifact whose
+    entire purpose is to say how much was lost.
+    """
+
+    @pytest.mark.asyncio
+    async def test_four_concurrent_refusals_all_land(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        """A slow read WIDENS the window, so the failure is deterministic.
+
+        Without ``_STAMP_LOCK`` all four threads read the same block-free plan
+        and the last write wins, leaving ``count == 1``.
+        """
+        seed_plan(artifacts)
+        real_read = artifacts.read_plan
+
+        def slow_read() -> dict[str, Any]:
+            plan = real_read()
+            time.sleep(0.02)
+            return plan
+
+        monkeypatch.setattr(artifacts, 'read_plan', slow_read)
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        await asyncio.gather(*(stamp(make_fact()) for _ in range(4)))
+
+        block = plan_on_disk(artifacts)[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 4, 'a concurrent refusal was undercounted'
+        assert block['by_tool'] == {'add_design_decision': 4}
+        assert len(block['events']) == 4
+
+    @pytest.mark.asyncio
+    async def test_concurrent_pre_plan_refusals_all_reach_the_buffer(
+        self, artifacts: TaskArtifacts
+    ):
+        """The buffer is process-global state, so it has the same race."""
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        await asyncio.gather(
+            *(stamp(make_fact(tool='create_plan', param='title')) for _ in range(4))
+        )
+
+        pending = plan_markup_stamp.pending_block()
+        assert pending is not None
+        assert pending['count'] == 4
+
+
+class TestTheCrossWriterWindowIsKnown:
+    """THE RESIDUE, pinned so it is a decision rather than an oversight.
+
+    ``plan.json`` has NO cross-writer lock anywhere: the ten plan-tools
+    mutators already race each other and ``artifacts.update_step_status`` the
+    same way, and this sink is a THIRD writer joining that existing race.
+    ``_STAMP_LOCK`` closes the stamp-against-stamp pair, which this module owns
+    both sides of; it cannot close stamp-against-an-accepted-tool-write,
+    because that needs the lock to live with ``artifacts.write_plan`` — the
+    single owner of the file — and to be taken by every mutator.
+
+    That is a change to ``orchestrator/artifacts.py``, outside task 4597's
+    scope, and filed as follow-up work rather than half-done here. THIS TEST IS
+    THE CANARY: when the cross-writer lock lands, it is the test that has to
+    change, and its failure will say so out loud instead of leaving the fix
+    unnoticed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_accepted_write_inside_the_window_is_lost(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        from orchestrator.mcp import plan_tools
+
+        seed_plan(artifacts)
+        real_read = artifacts.read_plan
+        interleaved = {'done': False}
+
+        def read_then_let_an_accepted_write_in() -> dict[str, Any]:
+            """Land an accepted ``add_plan_step`` between the read and write."""
+            plan = real_read()
+            if not interleaved['done']:
+                # Set FIRST: _add_plan_step reads the plan itself, and this
+                # wrapper is still installed.
+                interleaved['done'] = True
+                plan_tools._add_plan_step(
+                    artifacts, 'step-2', 'impl', 'An accepted call.'
+                )
+            return plan
+
+        monkeypatch.setattr(artifacts, 'read_plan', read_then_let_an_accepted_write_in)
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        await stamp(make_fact())
+
+        plan = plan_on_disk(artifacts)
+        assert interleaved['done'], 'the interleaving never happened'
+        assert plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]['count'] == 1
+        assert [step['id'] for step in plan['steps']] == ['step-1'], (
+            'KNOWN AND ACCEPTED: the stamp writes back the snapshot it read, '
+            'so an accepted write landing inside the window is lost. This is '
+            'the pre-existing unsynchronised-plan.json race, not a new one — '
+            'see _STAMP_LOCK. When a cross-writer lock lands in '
+            'orchestrator/artifacts.py, step-2 will survive and THIS '
+            'assertion is the one to update.'
+        )
 
 
 class TestDrainPendingFoldsTheBufferIntoAPlan:

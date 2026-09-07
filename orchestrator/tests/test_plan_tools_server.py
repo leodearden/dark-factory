@@ -190,6 +190,85 @@ class TestCreatePlan:
         assert artifacts.read_plan() == {}
 
 
+class TestCreatePlanCarriesTheRejectionCounterThroughTheAlgebra:
+    """``_create_plan`` overwrites plan.json WHOLESALE (task 4597).
+
+    It is therefore the one consumer that takes a stored ``_markup_rejections``
+    block and puts it straight into a document it is about to author. Every
+    other consumer (``merge_block``, ``summary``) already treats plan.json as
+    agent-adjacent and degrades what it finds; copying the on-disk value
+    verbatim would be the single path that launders a mangled block into a
+    brand-new plan — and from there into the four architect-facing prompts that
+    embed the document.
+    """
+
+    KEY = plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY
+
+    def _seed_with_block(self, artifacts, block):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        plan = artifacts.read_plan()
+        plan[self.KEY] = block
+        artifacts.write_plan(plan)
+
+    def test_a_usable_block_survives_the_overwrite(self, artifacts):
+        """Without this, a re-plan erases a counter earned earlier."""
+        self._seed_with_block(artifacts, plan_markup_stamp.block_of({
+            'ts': '2026-09-07T00:00:00+00:00',
+            'tool': 'add_design_decision',
+            'param': 'decision',
+            'outcome': 'rejected',
+        }))
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        block = artifacts.read_plan()[self.KEY]
+        assert block['count'] == 1
+        assert block['by_tool'] == {'add_design_decision': 1}
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+
+    def test_a_mangled_block_is_normalised_rather_than_copied(self, artifacts):
+        """The junk is re-projected, not laundered into the new document."""
+        self._seed_with_block(artifacts, {
+            'count': 2,
+            'by_tool': {'add_design_decision': 'lots', 'add_reuse_item': 2},
+            'events': [{'tool': 'add_design_decision', 'unreviewed_key': 'x' * 900}],
+            'note': 'a hand-edited note that is not the constant',
+        })
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        block = artifacts.read_plan()[self.KEY]
+        assert block['count'] == 2
+        assert block['by_tool'] == {'add_design_decision': 0, 'add_reuse_item': 2}
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+        assert set(block['events'][0]) <= set(plan_markup_stamp.STAMP_EVENT_KEYS), (
+            'an unreviewed key must not ride a carry-forward into a new plan'
+        )
+
+    def test_an_unrecoverable_block_is_dropped_rather_than_zeroed(self, artifacts):
+        """``None`` from the algebra means NO KEY, not a present-and-zero one.
+
+        The key's PRESENCE is the whole signal, so laundering junk into an
+        empty block would put a key meaning nothing onto a brand-new plan.
+        """
+        for junk in ('a string', 42, ['a', 'list'], {}, {'count': 'seven'}):
+            self._seed_with_block(artifacts, junk)
+
+            _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+            assert self.KEY not in artifacts.read_plan(), (
+                f'{junk!r} holds no recorded refusal and must not become a key'
+            )
+
+    def test_the_clean_path_still_writes_no_key_at_all(self, artifacts):
+        """THE OVERWHELMINGLY COMMON PATH stays byte-identical to today."""
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        assert self.KEY not in artifacts.read_plan()
+
+
 class TestAddPlanStep:
     def test_appends_step(self, artifacts):
         _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])

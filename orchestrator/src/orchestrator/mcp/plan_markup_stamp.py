@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -110,18 +111,18 @@ STAMP_EVENT_KEYS: tuple[str, ...] = ('ts', 'tool', 'param', 'outcome')
 #: The subset of :data:`STAMP_EVENT_KEYS` read off the middleware's fact record.
 _FACT_COPIED_KEYS: tuple[str, ...] = ('tool', 'param', 'outcome')
 
-#: One sentence saying what the block means, carried INSIDE it. A bare integer
-#: under an underscore-prefixed key is not self-describing to a reader who has
-#: never seen it, and the implementer, the reviewer and reconciliation all meet
-#: this document cold. Deliberately STATIC: interpolating counts or tool names
-#: would put caller-adjacent text into a field whose whole justification is that
-#: it holds none, and would duplicate numbers that sit two keys away.
 #: What the sink returns when it buffered instead of writing. A locator, so the
 #: emitter's "path or ``None``" contract still distinguishes "recorded" from
 #: "lost" — but deliberately NOT a filesystem path, since none was touched and
 #: naming one would be a lie a caller could act on.
 _PENDING_LOCATOR = 'pending:markup-rejections'
 
+#: One sentence saying what the block means, carried INSIDE it. A bare integer
+#: under an underscore-prefixed key is not self-describing to a reader who has
+#: never seen it, and the implementer, the reviewer and reconciliation all meet
+#: this document cold. Deliberately STATIC: interpolating counts or tool names
+#: would put caller-adjacent text into a field whose whole justification is that
+#: it holds none, and would duplicate numbers that sit two keys away.
 STAMP_NOTE = (
     'Machine-written by the plan-tools markup guard. Each event is one tool '
     'call this plan refused because its arguments carried leaked tool-call '
@@ -208,7 +209,21 @@ def _as_int(value: object, *, field: str) -> int:
 
 
 def _as_by_tool(value: object) -> dict[str, int]:
-    """*value* as a ``{tool: count}`` tally, dropping only what is unusable."""
+    """*value* as a ``{tool: count}`` tally, dropping only what is unusable.
+
+    THE KEYS ARE CAPPED, not merely type-checked. A stored block is
+    agent-adjacent — hand-edited, or inherited from a document some earlier
+    process wrote — and every merge re-emits what it read, so an overlong key
+    that entered once would ride into every later plan and every prompt that
+    renders one. Capping on the way IN is what makes
+    :data:`MARKUP_STAMP_MAX_FIELD_CHARS` a property of the BLOCK rather than
+    only of the events this module happens to build.
+
+    A capped key is a PREFIX, so two overlong keys can collapse onto one. Their
+    counts are SUMMED rather than one silently overwriting the other — the same
+    "an unusable value contributes its identity, the tally is never the thing
+    that gets dropped" discipline :func:`_as_int` keeps.
+    """
     if not isinstance(value, dict):
         if value is not None:
             logger.warning(
@@ -220,14 +235,33 @@ def _as_by_tool(value: object) -> dict[str, int]:
     for tool, count in value.items():
         if not isinstance(tool, str):
             continue
+        # The same prefix rule :func:`_capped` keeps, spelled directly because
+        # a dict KEY has to stay narrowed to ``str``.
+        key = tool[:MARKUP_STAMP_MAX_FIELD_CHARS]
         # PER ENTRY, not all-or-nothing: one junk tally must not cost the
         # other tools their counts.
-        tally[tool] = _as_int(count, field=f'by_tool[{tool!r}]')
+        tally[key] = tally.get(key, 0) + _as_int(count, field=f'by_tool[{tool!r}]')
     return tally
 
 
 def _as_events(value: object) -> list[dict[str, Any]]:
-    """*value* as a list of event dicts, dropping only what is unusable."""
+    """*value* as a list of event dicts, dropping only what is unusable.
+
+    RE-PROJECTED THROUGH :data:`STAMP_EVENT_KEYS` AND :func:`_capped`, not
+    merely shape-checked. :func:`build_event` guards what this module PUTS in;
+    this guards what it reads back — and without it the allowlist and the cap
+    would hold only for the current process, since a merge re-emits every
+    stored event verbatim into the document it writes.
+
+    That matters for exactly the population the two guards exist to protect: a
+    hand-edited or corrupted event carrying an envelope literal under some
+    extra key, or a megabyte string under a familiar one, would otherwise
+    survive every later merge and be re-emitted by the one channel whose whole
+    justification is that it holds neither. An unknown key is DROPPED rather
+    than trimmed, because the argument in :func:`build_event` — that a field
+    nobody has reviewed defaults to "not in the plan" — is about the key, not
+    its length.
+    """
     if not isinstance(value, list):
         if value is not None:
             logger.warning(
@@ -235,7 +269,11 @@ def _as_events(value: object) -> list[dict[str, Any]]:
                 'which is not a list; treating it as empty', value,
             )
         return []
-    return [event for event in value if isinstance(event, dict)]
+    return [
+        {key: _capped(event[key]) for key in STAMP_EVENT_KEYS if key in event}
+        for event in value
+        if isinstance(event, dict)
+    ]
 
 
 def _as_bound(value: object) -> str | None:
@@ -324,6 +362,54 @@ def merge_block(left: object, right: object) -> dict[str, Any]:
     return merged
 
 
+def _records_nothing(
+    count: int, by_tool: dict[str, int], events: list[dict[str, Any]]
+) -> bool:
+    """True when a block records no refusal at all, however it got that way.
+
+    TAKES THE DERIVED VALUES, not the stored ones, so ``{'count': 'seven'}``
+    counts as empty: a stored field that degrades to its identity carries no
+    more information than an absent one, and testing the raw value would let
+    any truthy scribble masquerade as a recorded loss.
+
+    A block is only ever WRITTEN with at least one event in it, so an empty one
+    is a hand-edit, a corruption, or a value carried forward from a document
+    that held junk. It is treated as ABSENT everywhere, because the whole
+    signalling convention on this key is that its PRESENCE means something was
+    refused — a present-and-zero block says nothing and costs a reader the one
+    inference the key exists to support.
+
+    All THREE fields are consulted, not just the two :func:`summary` emits: a
+    block whose ``count`` and ``by_tool`` were mangled but whose ``events``
+    survived still records real refusals, and suppressing it would throw away
+    evidence to tidy a number.
+    """
+    return not (count or by_tool or events)
+
+
+def normalize_block(value: object) -> dict[str, Any] | None:
+    """*value* re-projected through the algebra, or ``None`` if it holds nothing.
+
+    FOR THE CARRY-FORWARD IN ``plan_tools._create_plan``, which is the one
+    consumer that takes a stored block and puts it straight into a document it
+    is about to author. Every other consumer (:func:`merge_block`,
+    :func:`summary`) already treats ``plan.json`` as agent-adjacent and
+    degrades what it finds; routing the carry-forward through the same algebra
+    is what stops a corrupted block being copied verbatim into a brand-new plan
+    and from there into the four architect-facing prompts that embed the
+    document.
+
+    ``None`` — rather than a normalised zero block — when nothing survives, so
+    an unrecoverable value is DROPPED instead of being laundered into a
+    present-and-zero key. There was no information in it to preserve, and the
+    clean path must keep producing a document with no such key at all.
+    """
+    block = merge_block(value, {})
+    if _records_nothing(block['count'], block['by_tool'], block['events']):
+        return None
+    return block
+
+
 def summary(plan: object) -> dict[str, Any] | None:
     """The compact ``{count, by_tool}`` view, or ``None`` when there is none.
 
@@ -332,19 +418,66 @@ def summary(plan: object) -> dict[str, Any] | None:
     one place the loss reaches the durable agent transcript — not a second copy
     of a block that is already on disk two keys away.
 
-    ``None`` on an absent OR unusable block, so the omit-when-absent response
-    convention has an unambiguous thing to omit and a half-formed block can
-    never reach a tool response.
+    ``None`` on an absent, unusable OR EMPTY block, so the omit-when-absent
+    response convention has an unambiguous thing to omit and a half-formed
+    block can never reach a tool response. The empty case is not hypothetical
+    and not merely tidy: ``{'count': 0, 'by_tool': {}}`` on the response would
+    contradict this key's whole contract — that its PRESENCE is the signal —
+    by announcing a loss that did not happen.
     """
     if not isinstance(plan, dict):
         return None
     block = plan.get(PLAN_MARKUP_REJECTIONS_KEY)
     if not isinstance(block, dict):
         return None
-    return {
-        'count': _as_int(block.get('count'), field='count'),
-        'by_tool': _as_by_tool(block.get('by_tool')),
-    }
+    count = _as_int(block.get('count'), field='count')
+    by_tool = _as_by_tool(block.get('by_tool'))
+    if _records_nothing(count, by_tool, _as_events(block.get('events'))):
+        return None
+    return {'count': count, 'by_tool': by_tool}
+
+
+# ---------------------------------------------------------------------------
+# Concurrency — the one writer pair this module owns.
+# ---------------------------------------------------------------------------
+
+
+#: Serialises this module's bookkeeping AGAINST ITSELF: the sink's
+#: read-merge-write of ``plan.json``, and every mutation of the process-global
+#: pending buffer below.
+#:
+#: WHY THERE IS A RACE AT ALL. plan-tools registers its tools as sync ``def``,
+#: so FastMCP dispatches them on a thread pool, and the emitter adds a hop of
+#: its own (``asyncio.to_thread``). A client that batches parallel calls can
+#: have two refusals in flight at the same instant, on two different threads,
+#: both reading ``plan.json`` before either writes — and the second write would
+#: land a block that never saw the first refusal, undercounting the very leak
+#: the block exists to describe. The buffer has the matching shape: a refused
+#: ``create_plan`` buffering while an accepted one drains could have its event
+#: cleared without ever being folded in. Both pairs are fully closable here,
+#: because this module owns both sides of each, so both are closed.
+#:
+#: REENTRANT, because :func:`make_plan_stamp`'s body calls :func:`note_pending`
+#: while already holding it — a plain ``Lock`` would self-deadlock on the very
+#: pre-plan refusal path the buffer exists for.
+#:
+#: WHAT THIS LOCK DOES NOT CLOSE, stated plainly so the residue is a decision
+#: rather than an oversight: ``plan.json`` has NO cross-writer lock anywhere.
+#: The ten plan-tools mutators already race each other and
+#: ``artifacts.update_step_status`` the same way, and the sink is a third writer
+#: joining that existing race — an accepted ``add_plan_step`` whose write lands
+#: between the sink's read and its write is lost, and vice versa. Closing THAT
+#: needs the lock to live with ``artifacts.write_plan``, the single owner of the
+#: file, and to be taken by every mutator; that is a change to
+#: ``orchestrator/artifacts.py``, outside this task's scope, and it is filed as
+#: follow-up work rather than half-done here. The window is pinned by
+#: ``test_plan_markup_stamp.TestTheCrossWriterWindowIsKnown``, so the day it is
+#: closed the test that has to change says so.
+#:
+#: The critical section is deliberately as short as the work allows: one read,
+#: one PURE merge, one write. There is nothing between the two I/O calls to
+#: hoist out.
+_STAMP_LOCK = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -381,21 +514,24 @@ _PENDING_BLOCK: dict[str, Any] | None = None
 def note_pending(event: dict[str, Any]) -> None:
     """Hold *event* until there is a plan to fold it into."""
     global _PENDING_BLOCK
-    _PENDING_BLOCK = (
-        block_of(event) if _PENDING_BLOCK is None
-        else merge_block(_PENDING_BLOCK, block_of(event))
-    )
+    with _STAMP_LOCK:
+        _PENDING_BLOCK = (
+            block_of(event) if _PENDING_BLOCK is None
+            else merge_block(_PENDING_BLOCK, block_of(event))
+        )
 
 
 def pending_block() -> dict[str, Any] | None:
     """The buffered block, or ``None`` when nothing is waiting."""
-    return _PENDING_BLOCK
+    with _STAMP_LOCK:
+        return _PENDING_BLOCK
 
 
 def clear_pending() -> None:
     """Drop the buffer. For the autouse fixture that guards it per test."""
     global _PENDING_BLOCK
-    _PENDING_BLOCK = None
+    with _STAMP_LOCK:
+        _PENDING_BLOCK = None
 
 
 def drain_pending(plan: dict[str, Any]) -> dict[str, Any]:
@@ -413,12 +549,16 @@ def drain_pending(plan: dict[str, Any]) -> dict[str, Any]:
     clean path must produce a document byte-identical to what it is today.
     """
     global _PENDING_BLOCK
-    if _PENDING_BLOCK is None:
-        return plan
-    plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
-        plan.get(PLAN_MARKUP_REJECTIONS_KEY), _PENDING_BLOCK
-    )
-    _PENDING_BLOCK = None
+    # READ, MERGE AND CLEAR AS ONE. A refusal buffering concurrently would
+    # otherwise be cleared without ever being folded in — the buffer's own
+    # version of the lost update the sink's critical section closes.
+    with _STAMP_LOCK:
+        if _PENDING_BLOCK is None:
+            return plan
+        plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
+            plan.get(PLAN_MARKUP_REJECTIONS_KEY), _PENDING_BLOCK
+        )
+        _PENDING_BLOCK = None
     return plan
 
 
@@ -472,32 +612,41 @@ def make_plan_stamp(
     ASYNC, with the blocking work on a worker thread: the middleware calls this
     from inside the server's event loop, and one record costs a read and a
     write.
+
+    SERIALISED under :data:`_STAMP_LOCK`, which also covers the pending buffer
+    — two concurrent pre-plan refusals mutate the same process-global block.
+    See that constant for what the lock does and does not close.
     """
     plan_path = artifacts.root / 'plan.json'
 
     def stamp(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""
         event = build_event(record, now=now)
-        plan = artifacts.read_plan()
-        if isinstance(plan, dict) and not plan:
-            # NO PLAN YET — ``read_plan`` returns an empty dict for a missing
-            # file. Buffer instead of writing: see ``_PENDING_BLOCK``. The
-            # locator is the buffer, not a path, because no artifact was
-            # touched and naming one would be a lie the caller could act on.
-            note_pending(event)
-            return _PENDING_LOCATOR
-        if not isinstance(plan, dict):
-            logger.warning(
-                'markup stamp: the plan at %s read back as %r rather than a '
-                'mapping; the refusal of %s.%s will not be stamped',
-                plan_path, type(plan).__name__, event.get('tool'),
-                event.get('param'),
+        # BUILT OUTSIDE THE LOCK, held across the read/merge/write: the event is
+        # pure and needs no shared state, and the critical section stays the
+        # three lines that touch ``plan.json`` and ``_PENDING_BLOCK``.
+        with _STAMP_LOCK:
+            plan = artifacts.read_plan()
+            if isinstance(plan, dict) and not plan:
+                # NO PLAN YET — ``read_plan`` returns an empty dict for a
+                # missing file. Buffer instead of writing: see
+                # ``_PENDING_BLOCK``. The locator is the buffer, not a path,
+                # because no artifact was touched and naming one would be a lie
+                # the caller could act on.
+                note_pending(event)
+                return _PENDING_LOCATOR
+            if not isinstance(plan, dict):
+                logger.warning(
+                    'markup stamp: the plan at %s read back as %r rather than '
+                    'a mapping; the refusal of %s.%s will not be stamped',
+                    plan_path, type(plan).__name__, event.get('tool'),
+                    event.get('param'),
+                )
+                return None
+            plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
+                plan.get(PLAN_MARKUP_REJECTIONS_KEY), block_of(event)
             )
-            return None
-        plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
-            plan.get(PLAN_MARKUP_REJECTIONS_KEY), block_of(event)
-        )
-        artifacts.write_plan(plan)
+            artifacts.write_plan(plan)
         return str(plan_path)
 
     async def plan_stamp(record: dict[str, Any]) -> str | None:

@@ -67,6 +67,31 @@ refused.
   `_create_plan`, which also carries any existing block FORWARD because it
   overwrites plan.json wholesale. Both are wrapped so bookkeeping can never fail a
   call — the counter is a legibility aid, the plan is the work.
+- **A STORED block is re-projected on the way in, not merely shape-checked.** The
+  allowlist and the per-field cap would otherwise hold only for the events this
+  process builds: every merge re-emits what it read, so a hand-edited event
+  carrying an envelope literal under an unfamiliar key — or a megabyte string under
+  a familiar one — would survive indefinitely and be re-emitted by the very channel
+  whose justification is that it holds neither. Stored events are projected through
+  `STAMP_EVENT_KEYS` and capped; `by_tool` keys are capped too, and counts SUMMED
+  when two overlong keys collapse onto one prefix. `_create_plan`'s carry-forward
+  runs through the same algebra rather than copying the on-disk value raw, and an
+  unrecoverable block is DROPPED rather than laundered into a present-and-zero key.
+  For the same reason `summary` returns nothing for a present-but-empty block:
+  `{count: 0, by_tool: {}}` on a confirm_plan response would announce a loss that
+  did not happen, contradicting the contract that the key's PRESENCE is the signal.
+- **The stamp is serialised against ITSELF, and the residue is pinned.** plan-tools
+  registers sync tools, so FastMCP dispatches them on a thread pool and the emitter
+  adds an `asyncio.to_thread` hop of its own; two batched refusals could read
+  plan.json before either wrote, and the second write would land a block that never
+  saw the first — an undercount in the one artifact whose purpose is to say how
+  much was lost. A reentrant `_STAMP_LOCK` covers the sink's read-merge-write and
+  every mutation of the pending buffer. It does NOT close stamp-against-an-accepted
+  -tool-write: plan.json has no cross-writer lock anywhere, the ten plan-tools
+  mutators already race each other the same way, and closing that needs the lock to
+  live with `artifacts.write_plan` and be taken by every mutator — out of scope
+  here, filed as follow-up. `TestTheCrossWriterWindowIsKnown` pins the window so
+  the day it closes, the test that has to change says so.
 - **`PLAN_SCHEMA_VERSION` is deliberately NOT bumped.**
   `workflow._can_skip_revalidation` is the only production branch on it, and a bump
   would decline the revalidation skip for every plan already on disk across the
