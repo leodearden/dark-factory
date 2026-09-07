@@ -4347,6 +4347,64 @@ def test_boundary_fake_systemctl_rejects_a_real_unit_name(
     assert "_boundary_make_fake_systemctl" in message, message
 
 
+def test_boundary_drain_run_budget_is_load_scaled_off_the_unchanged_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_boundary_run_drain_script`'s DEFAULT budget scales with host load.
+
+    THE FLAKE (task 4207): `test_boundary2_all_idle_restarts_and_stamps_clock`
+    relies on this default and measured 11.66s against it in isolation -- 58%
+    of a fixed 20s, only ~1.7x headroom. What has to fit inside that one clock
+    is 9 python3 spawns (list-units, then per unit a drain_check + baseline
+    show + restart + verify show) plus the stamp's mktemp/date/date/mv, and a
+    single drain_check.py run was measured spreading 0.07s-0.44s (6x) at this
+    host's load-per-core. Nine spawns then land right at the 20s cliff.
+
+    Pinned by CALLING the budget function -- zero sleeping, no subprocess --
+    which is why that function is shaped to return its number rather than
+    being inlined into the signature (the same shape, for the same reason, as
+    `tests/scripts/test_spawn_claude.py::_spawn_run_budget`).
+
+    `os.getloadavg`/`os.cpu_count` are patched on the `os` MODULE so the patch
+    is visible from `df_pytest_isolation`'s namespace, where the shared scaler
+    this delegates to actually reads them.
+    """
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    # Idle host: EXACTLY the 20 that was hardcoded before, so no unloaded run
+    # changes by so much as a millisecond. This is the whole safety argument
+    # for adopting a scaler under an existing literal.
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    assert _boundary_drain_run_budget() == _BOUNDARY_DRAIN_RUN_BASE_SECS == 20
+
+    # Oversubscribed 5x: the budget lengthens with the contention that is
+    # actually stretching those 9 spawns.
+    monkeypatch.setattr(os, "getloadavg", lambda: (160.0, 160.0, 160.0))
+    assert _boundary_drain_run_budget() == 100
+
+    # Pathological: clamped, not unbounded.
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    assert _boundary_drain_run_budget() == _BOUNDARY_DRAIN_RUN_CAP_SECS
+
+
+def test_boundary_drain_run_cap_stays_inside_the_per_test_axe() -> None:
+    """The cap is DERIVED from pytest-timeout's axe, not tuned to taste.
+
+    This budget does not feed `wait_proof_grace_secs` (the callers that rely
+    on the default set no force-fire grace), so the binding ceiling is the
+    `--timeout=300` per-test axe both roots' test_command carries, and a
+    single spawn is the only thing this budget bounds. Constants only, no
+    monkeypatching: the scale/floor/clamp arithmetic is already pinned by
+    `TestLoadScaledGrace` in tests/scripts/test_fleet_dir_isolation.py, and
+    re-deriving it here would be pure duplication. Mirrors the identical
+    guard on `_SPAWN_RUN_CAP_SECS` in tests/scripts/test_spawn_claude.py.
+    """
+    assert _BOUNDARY_DRAIN_RUN_CAP_SECS < 300
+    # Comfortable margin, not a hair's breadth: the axe has to cover the whole
+    # test, not just the spawn this bounds.
+    assert _BOUNDARY_DRAIN_RUN_CAP_SECS * 2 < 300
+
+
 def test_boundary2_all_idle_restarts_and_stamps_clock(tmp_path: pathlib.Path) -> None:
     """Scenario 2 (I1/I2/I6) -- staleness past 8h, all idle: the REAL
     restart-all-orchestrators.sh --drain restarts every unit, verifies each
