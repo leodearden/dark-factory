@@ -2171,7 +2171,10 @@ def test_no_sql_side_clock_reads_in_data_layer():
         source_lines = source.splitlines()
         tree = ast.parse(source, filename=str(path))
         for node in _iter_non_docstring_string_literals(tree):
-            if "datetime('now'" not in node.value and 'datetime("now"' not in node.value:
+            value = node.value
+            if not isinstance(value, str):
+                continue
+            if "datetime('now'" not in value and 'datetime("now"' not in value:
                 continue
             start, end = node.lineno, getattr(node, 'end_lineno', node.lineno)
             for lineno in range(start, end + 1):
