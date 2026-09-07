@@ -1983,6 +1983,98 @@ def test_void_rate_by_project_skips_a_bundle_that_errored(tmp_path, corpus_roots
     assert list(by_project) == [str(root_a)]
 
 
+# ---------------------------------------------------------------------------
+# void_rate_by_project must carry EVERY headline rate the diagnosis quotes.
+#
+# The point of the cross-project section is that ONE block reproduces the
+# two-project headline. A reader who has to go back into each project's own
+# speculation section to assemble the comparison is doing by hand what this
+# section exists to do — and the void rate alone is the rate most likely to be
+# misread, since it says nothing about what the void cost.
+# ---------------------------------------------------------------------------
+
+
+def _by_project(corpus_roots, **kwargs):
+    root_a, root_b = corpus_roots
+    bundles = mlt.collect_projects(
+        [root_a, root_b], CORPUS_LO_DT, CORPUS_HI_DT, **kwargs
+    )
+    return str(root_a), str(root_b), mlt.void_rate_by_project(bundles)
+
+
+def test_void_rate_by_project_keeps_the_three_existing_keys_unchanged(corpus_roots):
+    a, b, by_project = _by_project(corpus_roots, speculation=True)
+    assert by_project[a]['n_speculative'] == 10
+    assert by_project[a]['n_voided_chain_dead'] == 3
+    assert by_project[a]['void_rate'] == pytest.approx(0.30)
+    assert by_project[b]['n_speculative'] == 12
+    assert by_project[b]['n_voided_chain_dead'] == 7
+    assert by_project[b]['void_rate'] == pytest.approx(7 / 12)
+
+
+def test_void_rate_by_project_carries_both_ahead_shares_side_by_side(corpus_roots):
+    a, b, by_project = _by_project(corpus_roots, speculation=True)
+    # Root A: of 13 landings, a07/a08/a09 speculated before landing and none
+    # of them was voided in between — the two measures agree there.
+    assert by_project[a]['speculative_ahead'] == {
+        'matched': 3, 'total': 13, 'share': pytest.approx(3 / 13),
+    }
+    assert by_project[a]['speculative_ahead_adopted'] == {
+        'matched': 3, 'total': 13, 'share': pytest.approx(3 / 13),
+    }
+    # Root B is where they diverge, which is the whole point: b03/b04/b05/b06
+    # each speculated at 04:0i on Aug 12, were VOIDED at 08:0i, and only landed
+    # afterwards. The loose measure credits all four; the strict one credits
+    # none. Only b01 — matched via a speculative merge_verify that was never
+    # voided before its landing — survives.
+    assert by_project[b]['speculative_ahead'] == {
+        'matched': 5, 'total': 6, 'share': pytest.approx(5 / 6),
+    }
+    assert by_project[b]['speculative_ahead_adopted'] == {
+        'matched': 1, 'total': 6, 'share': pytest.approx(1 / 6),
+    }
+
+
+def test_void_rate_by_project_carries_the_void_anatomy_split(corpus_roots):
+    a, b, by_project = _by_project(corpus_roots, speculation=True)
+    # No merge_verify ran between any item's speculation and its void in
+    # either corpus, so every void is pre-verify: 3 and 7, side by side. The
+    # spread the section reports is now a spread in what was WASTED, not just
+    # in how often.
+    assert by_project[a]['void_anatomy']['pre_verify'] == 3
+    assert by_project[a]['void_anatomy']['verify_burned'] == 0
+    assert by_project[b]['void_anatomy']['pre_verify'] == 7
+    assert by_project[b]['void_anatomy']['verify_burned'] == 0
+    # Fan-out: every void in both corpora carries its own dead_link.
+    assert by_project[a]['void_anatomy']['dead_link_distinct'] == 3
+    assert by_project[b]['void_anatomy']['dead_link_distinct'] == 7
+    assert by_project[a]['void_anatomy']['dead_link_max_voids'] == 1
+
+
+def test_void_rate_by_project_skips_an_errored_bundle_for_the_new_keys_too(
+    tmp_path, corpus_roots
+):
+    root_a, _ = corpus_roots
+    missing = tmp_path / 'no_such_project'
+    bundles = mlt.collect_projects(
+        [root_a, missing], CORPUS_LO_DT, CORPUS_HI_DT, speculation=True
+    )
+    by_project = mlt.void_rate_by_project(bundles)
+    # Same guarantee as the void rate: the unreadable project has no measured
+    # ahead share and no measured anatomy either, so it is ABSENT — never
+    # present with a 0-filled split that would read as "nothing was wasted".
+    assert list(by_project) == [str(root_a)]
+    assert 'speculative_ahead_adopted' in by_project[str(root_a)]
+    assert 'void_anatomy' in by_project[str(root_a)]
+
+
+def test_void_rate_by_project_is_empty_without_the_speculation_flag(corpus_roots):
+    _, _, by_project = _by_project(corpus_roots)
+    # The --json schema contract: no --speculation means no speculation
+    # section anywhere, not a section of zeros.
+    assert by_project == {}
+
+
 def test_collect_project_reports_a_missing_db_as_a_labelled_error(tmp_path):
     missing = tmp_path / 'no_such_project'
     bundle = mlt.collect_project(missing, CORPUS_LO_DT, CORPUS_HI_DT)
