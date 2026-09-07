@@ -1292,9 +1292,32 @@ def test_type_gates_resolve_pyright_without_npx(
     scripts-module-specific guard would put a repo-wide invariant in a file
     whose ownership and lock scope are module-local — the confusion
     ``tests/scripts/test_module_verify_budgets.py``'s own PLACEMENT docstring
-    warns about. That file is the established home for the promoted form, and
-    it was GENERALISED FROM these per-module guards after both existed rather
-    than bolted on ahead of them.
+    warns about.
+
+    The promoted form (task 4369) lives in the NEW sibling
+    ``tests/scripts/test_module_type_check_invocation.py`` — NOT
+    ``test_module_verify_budgets.py``, which is about budgets and was never a
+    candidate for this. That file's
+    ``test_no_discovered_module_config_shells_a_guarded_command_through_npx``
+    and ``test_every_discovered_pyright_type_gate_resolves_through_uv_run``
+    walk all nine configs ``config._discover_module_configs`` returns, and it
+    was GENERALISED FROM these per-module guards after both existed rather
+    than bolted on ahead of them. Only two of this guard's five assertions
+    were promoted repo-wide: the exact-token ``npx`` ban, and the "pyright
+    segment begins ``uv run``" positive half. The other three — the
+    ``--project <member>`` selector requirement, the
+    ``[tool.uv.workspace].members`` check, and the post-anchor pyright
+    config-redirect ban — stay HERE, because the seven workspace members
+    declare ``uv run --directory <member> ...``, not ``--project``, so a
+    repo-wide ``--project`` requirement would be RED for seven of nine
+    configs on a tree with no defect.
+
+    This guard is RETAINED on purpose, not subsumed by that promotion, on the
+    same "guards in this family must be able to fail independently"
+    principle the budgets promotion itself followed: if
+    ``test_module_type_check_invocation.py`` is ever deleted or its
+    collection breaks, ``scripts`` and ``tests/scripts`` — the only two
+    configs with any npx history — must not become the only unguarded ones.
     """
     discovered = discover_module_configs()
 
