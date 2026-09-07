@@ -421,7 +421,7 @@ class TestEvalOutcomes:
     """
 
     def test_the_outcome_order_is_derived_and_sorted(self) -> None:
-        assert _mod().EVAL_OUTCOMES == tuple(sorted(TRIAGE_OUTCOMES))
+        assert tuple(sorted(TRIAGE_OUTCOMES)) == _mod().EVAL_OUTCOMES
 
     def test_no_outcome_is_added_or_dropped_on_the_way(self) -> None:
         """Derived, not hand-written: a fifth outcome joins the report itself.
