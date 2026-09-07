@@ -4,6 +4,21 @@ Fleet Cockpit C5a (plans/fleet-cockpit-prd.md §9). Imports the frozen
 orchestrator.session_registry contract (PRD §6 G5: consumers import, never
 re-derive the record shape). This module is read-only: it never calls
 write_record/write_decision/update_decision_state/set_manual_boost.
+
+It is also the cockpit's PROJECT-TOKEN CANONICALIZATION BOUNDARY (task
+3812). Read-only is unchanged -- nothing here writes to disk -- but every
+record that enters the cockpit through this module leaves it with
+``.project`` folded onto the one canonical spelling
+(``session_registry.normalize_project_token``, task 3807). The reason the
+fold has to sit HERE, at the reader, rather than in the display or scoring
+adapters downstream: the cockpit unions its two record kinds -- sessions
+and decisions -- onto ONE ``project_weights`` key and ONE weight picker
+(``priority.score``'s ``project_weights[item.project]`` lookup and
+``panes.weight_editor.known_projects``), so the two kinds must fold
+together or an operator's weight silently applies to only one of them. The
+on-disk records themselves stay raw and unmigrated; this is a read-side
+fold, retroactive over every already-written record. Its two entry points
+are ``_read_record_soft`` (sessions) and ``scan_decisions`` (decisions).
 """
 
 from __future__ import annotations
@@ -13,6 +28,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from orchestrator import session_registry
+from orchestrator.session_registry import normalize_project_token
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +62,32 @@ def _read_record_soft(
     test_scan_matches_scan_sessions_for_seeded_dir). *caller* is folded into
     the warning message only, preserving each call site's original
     log-message prefix for anyone grepping logs.
+
+    It is also where the returned record's ``.project`` -- and ONLY
+    ``.project`` -- is rewritten onto its canonical spelling (task 3812; see
+    the module docstring). Being the one shared parse step is exactly why:
+    both scan paths inherit the fold by construction rather than by
+    convention, the same property they already inherit for fail-soft, and
+    SessionScanner's mtime cache therefore stores ALREADY-CANONICAL records
+    -- so the fold is paid once per PARSE, not once per poll tick. Every
+    other field is left byte-identical to what was written, notably
+    ``.title``, the literal terminal title ``.project`` was originally
+    parsed out of: rewriting one and not the other is intended, since the
+    title is display text while the project token is a join key.
     """
     try:
-        return session_registry.read_record(slug, root=root)
+        record = session_registry.read_record(slug, root=root)
     except (FileNotFoundError, session_registry.CorruptSessionRecord):
         logger.warning('%s: skipping unreadable record for %s', caller, slug, exc_info=True)
         return None
+    # In-place on a record this reader exclusively owns (read_record just
+    # built it), mirroring migrate_decision_project_tokens' own
+    # `record.project = new_project` idiom. The inequality guard means a
+    # cold scan of the 42k already-canonical records allocates nothing.
+    canonical = normalize_project_token(record.project)
+    if canonical != record.project:
+        record.project = canonical
+    return record
 
 
 def scan_sessions(root: Path | str | None = None) -> list[session_registry.SessionRecord]:

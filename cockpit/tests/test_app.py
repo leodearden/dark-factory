@@ -276,7 +276,12 @@ class TestInitialRender:
             assert table.row_count == 2
 
             row = table.get_row('a-1')
-            assert 'unblock:df#2085' in row
+            # 'df' on disk renders as 'dark_factory' (task 3812): the record
+            # went through the real SessionScanner, so registry_reader's
+            # read-boundary fold already canonicalized .project. This
+            # assertion is the end-to-end evidence that session_table.py's
+            # rendering sites are covered WITHOUT any edit to session_table.py.
+            assert 'unblock:dark_factory#2085' in row
 
 
 class TestSessionTableDefaultFilter:
