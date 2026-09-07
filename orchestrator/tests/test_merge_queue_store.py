@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from _orch_helpers import make_placeholder_future
+from test_verify_merge_flake_suppression import _module_config
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.merge_queue import GroupMergeRequest, MergeRequest
@@ -101,6 +102,22 @@ def _make_req(
     )
 
 
+NINE_PREFIXES = [
+    'cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
+    'sampler', 'scripts', 'shared', 'tests/scripts',
+]
+"""dark_factory's live nine-module registry shape.
+
+THE single definition, cross-imported by
+``test_merge_boundary_effective_module_configs`` so the two task-5063 suites
+cannot silently disagree about what "the whole registry" means.  Exported
+without the leading underscore precisely because it is cross-module.
+
+``tests/scripts`` is included deliberately: it is multi-segment and so
+exercises ``OrchestratorConfig.for_module``'s inward walk.
+"""
+
+
 def _config_with_modules(
     tmp_path: Path,
     prefixes: list[str],
@@ -114,22 +131,15 @@ def _config_with_modules(
     structurally cannot carry a PrivateAttr, and a bare MagicMock config is
     rejected by orchestrator's ``check_bare_magicmock_config.py`` lint).
 
-    All three commands are non-None so ``verify_plan._derive_full_suite_runs``
-    emits real FULL_SUITE runs rather than reasoned SKIPPED ones.
+    Each entry is built by ``test_verify_merge_flake_suppression._module_config``
+    — THE single definition of the fixture's command shape, per that helper's
+    own docstring — rather than hand-copied here, matching the sibling
+    ``test_merge_boundary_effective_module_configs``.  All three commands are
+    non-None there, so ``verify_plan._derive_full_suite_runs`` emits real
+    FULL_SUITE runs rather than reasoned SKIPPED ones.
     """
     config = _real_config(tmp_path, merge_verify_breadth=merge_verify_breadth)
-    config._module_configs = {
-        prefix: ModuleConfig(
-            prefix=prefix,
-            test_command=(
-                f'uv run --project {prefix} --directory {prefix} '
-                'pytest tests/ --tb=short -q'
-            ),
-            lint_command=f'uv run --project {prefix} ruff check src/',
-            type_check_command=f'uv run --project {prefix} pyright src/',
-        )
-        for prefix in prefixes
-    }
+    config._module_configs = {prefix: _module_config(prefix) for prefix in prefixes}
     return config
 
 
@@ -1557,12 +1567,6 @@ class TestJournalPersistsModulePrefixes:
 # ---------------------------------------------------------------------------
 
 
-_NINE_PREFIXES = [
-    'cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
-    'sampler', 'scripts', 'shared', 'tests/scripts',
-]
-
-
 def _write_journal(store_path: Path, entry: dict[str, object]) -> MergeQueueStore:
     """Hand-write a one-entry journal and return the store reading it."""
     import json
@@ -1590,7 +1594,7 @@ class TestLegacyJournalRecordRederivesModules:
         Measured stable at BOTH the test default ``lock_depth=2`` and the live
         ``lock_depth=12``, so the expectation is not depth-fragile.
         """
-        config = _config_with_modules(tmp_path, _NINE_PREFIXES)
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
         store = _write_journal(
             tmp_path / 'merge_queue.json',
             _legacy_journal_entry(
@@ -1620,7 +1624,7 @@ class TestLegacyJournalRecordRederivesModules:
         derived key resolves through ``for_module``, so the correct answer is
         the empty set — the same gate that task already had.
         """
-        config = _config_with_modules(tmp_path, _NINE_PREFIXES)
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
         store = _write_journal(
             tmp_path / 'merge_queue.json',
             _legacy_journal_entry(
@@ -1647,7 +1651,7 @@ class TestLegacyJournalRecordRederivesModules:
         genuinely docs-only legacy record onto a nine-module full-suite gate,
         so the empty set stays — but a WARNING names the record.
         """
-        config = _config_with_modules(tmp_path, _NINE_PREFIXES)
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
         store = _write_journal(
             tmp_path / 'merge_queue.json',
             _legacy_journal_entry('mr-blind', task_files=None),
@@ -1670,7 +1674,7 @@ class TestLegacyJournalRecordRederivesModules:
         """A non-empty persisted list that resolves to nothing is POSITIVE
         evidence the task had modules — so it must not silently produce the
         narrow gate this fix exists to close."""
-        config = _config_with_modules(tmp_path, _NINE_PREFIXES)
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
         entry = _legacy_journal_entry(
             'mr-stale',
             task_files=['orchestrator/src/orchestrator/merge_queue.py'],
@@ -1694,16 +1698,295 @@ class TestLegacyJournalRecordRederivesModules:
 
 
 # ---------------------------------------------------------------------------
+# task-5063 amendment — the three properties the original suite left implicit:
+#   * dedupe-by-mc.prefix, the stated reason _resolve_prefixes exists at all;
+#   * VALUE-shape validation of the persisted module_prefixes payload;
+#   * the UNKNOWN encoding surviving a re-record, so an unrecoverable module
+#     set stays LOUD across every restart instead of only the first.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPersistedPrefixesAreDedupedByResolvedConfig:
+    """Several persisted prefixes that resolve to ONE ModuleConfig yield one
+    entry, in first-seen order.
+
+    This is the whole reason ``_resolve_prefixes`` keys a ``seen`` dict by
+    ``mc.prefix`` rather than returning a plain list: ``for_module`` walks
+    INWARD, so ``orchestrator/src`` and ``orchestrator/tests`` both land on the
+    registered ``orchestrator`` config.  Reproducing
+    ``TaskWorkflow._resolve_module_configs``' grouping is what makes the
+    reconstructed set equal the original's by construction — and a regression
+    that dropped the dedupe would leave every other test in this file green
+    while emitting duplicate ModuleConfigs into the merge-role verify plan.
+    """
+
+    async def test_prefixes_collapsing_to_one_config_reconstruct_to_one_entry(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _config_with_modules(tmp_path, ['orchestrator'])
+        entry = _legacy_journal_entry('mr-dedupe', task_files=['a.py'])
+        entry['module_prefixes'] = [
+            'orchestrator/src', 'orchestrator/tests', 'orchestrator',
+        ]
+        store = _write_journal(tmp_path / 'merge_queue.json', entry)
+        [record] = store.load()
+
+        req = reconstruct_merge_request(record, config)
+
+        assert [mc.prefix for mc in req.module_configs] == ['orchestrator'], (
+            f'three prefixes resolving to one registered config must dedupe to '
+            f'a single ModuleConfig; got '
+            f'{[mc.prefix for mc in req.module_configs]!r}'
+        )
+
+    async def test_dedupe_preserves_first_seen_order(self, tmp_path: Path) -> None:
+        """First-seen order, not registry order — that is what the producer of
+        the ORIGINAL module_configs preserves."""
+        config = _config_with_modules(tmp_path, ['orchestrator', 'shared'])
+        entry = _legacy_journal_entry('mr-order', task_files=['a.py'])
+        entry['module_prefixes'] = [
+            'shared/src', 'orchestrator/src', 'shared', 'orchestrator/tests',
+        ]
+        store = _write_journal(tmp_path / 'merge_queue.json', entry)
+        [record] = store.load()
+
+        req = reconstruct_merge_request(record, config)
+
+        assert [mc.prefix for mc in req.module_configs] == ['shared', 'orchestrator']
+
+
+@pytest.mark.asyncio
+class TestMalformedModulePrefixesValueIsTreatedAsUnknown:
+    """A ``module_prefixes`` VALUE of the wrong shape degrades to UNKNOWN.
+
+    ``load()`` type-checks the ENTRY (``isinstance(entry, dict)``) but applies
+    no checking to field VALUES, so a hand-edited or foreign journal can put
+    anything here.  Both untreated shapes fail badly rather than loudly: a bare
+    ``str`` iterates as CHARACTERS, and a non-str element reaches
+    ``config.for_module(123)`` -> ``123.strip('/')`` -> ``AttributeError``,
+    which is not in ``load()``'s ``except (TypeError, KeyError)`` and escapes
+    ``reconstruct_merge_request``.
+    """
+
+    async def test_a_string_value_does_not_iterate_as_characters(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
+        entry = _legacy_journal_entry(
+            'mr-strval',
+            task_files=['orchestrator/src/orchestrator/merge_queue.py'],
+        )
+        entry['module_prefixes'] = 'orchestrator'
+        store = _write_journal(tmp_path / 'merge_queue.json', entry)
+        [record] = store.load()
+
+        with caplog.at_level(logging.WARNING):
+            req = reconstruct_merge_request(record, config)
+
+        assert [mc.prefix for mc in req.module_configs] == ['orchestrator'], (
+            f'a malformed value must fall through to the task_files '
+            f're-derivation, not be iterated as characters; got '
+            f'{[mc.prefix for mc in req.module_configs]!r}'
+        )
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('not a list of strings' in m for m in warnings), (
+            f'the malformed value must be named as such; warnings were {warnings!r}'
+        )
+
+    async def test_a_non_string_element_does_not_raise_out_of_reconstruct(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``[123]`` used to reach ``123.strip('/')``.
+
+        ``recover_pending_merges`` bounds that blast radius to one record, but
+        it is the same class of defect the entry-shape guard was added for.
+        """
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
+        entry = _legacy_journal_entry(
+            'mr-intval',
+            task_files=['orchestrator/src/orchestrator/merge_queue.py'],
+        )
+        entry['module_prefixes'] = [123]
+        store = _write_journal(tmp_path / 'merge_queue.json', entry)
+        [record] = store.load()
+
+        with caplog.at_level(logging.WARNING):
+            req = reconstruct_merge_request(record, config)
+
+        assert [mc.prefix for mc in req.module_configs] == ['orchestrator']
+
+    async def test_an_empty_string_value_is_unknown_not_an_empty_set(
+        self, tmp_path: Path,
+    ) -> None:
+        """``''`` is the shape that slips past BOTH untreated branches.
+
+        ``'' == []`` is False so the explicit-empty early-return misses it, and
+        ``if ''`` is falsy so it reaches the re-derivation — by accident rather
+        than by decision.  Pinned so the guard, not the coincidence, is what
+        produces the answer.
+        """
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
+        entry = _legacy_journal_entry(
+            'mr-emptystr',
+            task_files=['orchestrator/src/orchestrator/merge_queue.py'],
+        )
+        entry['module_prefixes'] = ''
+        store = _write_journal(tmp_path / 'merge_queue.json', entry)
+        [record] = store.load()
+
+        req = reconstruct_merge_request(record, config)
+
+        assert [mc.prefix for mc in req.module_configs] == ['orchestrator']
+
+
+@pytest.mark.asyncio
+class TestUnrecoverableModuleSetStaysLoudAcrossRestarts:
+    """Re-journaling a recovered request must not rewrite an UNKNOWN module set
+    as an authoritative EMPTY one.
+
+    THE FAILURE THIS PINS.  A legacy record with nothing to re-derive from
+    reconstructs to ``[]`` with the loud "unrecoverable" WARNING.  The
+    recovered request is then re-journaled by
+    ``SpeculativeMergeWorker._buffer_owned_request``.  If that write persisted
+    a plain ``[]``, the NEXT crash+recovery would take the "task genuinely had
+    no assigned modules" early-return and say NOTHING — so a request still
+    verifying narrower than its original goes silent from the second restart
+    onward, against the repo's loud-over-silent-degradation norm.
+    """
+
+    @staticmethod
+    def _recover_once(
+        store_path: Path, config: OrchestratorConfig,
+    ) -> tuple[MergeRequest, MergeQueueStore]:
+        """One full crash-recovery cycle: read the journal, reconstruct, and
+        re-journal the recovered request exactly as the worker's
+        ``_buffer_owned_request`` does."""
+        store = MergeQueueStore(store_path)
+        [record] = store.load()
+        req = reconstruct_merge_request(record, config)
+        store.record(req)
+        return req, store
+
+    async def test_second_recovery_of_an_unrecoverable_record_still_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
+        store_path = tmp_path / 'merge_queue.json'
+        _write_journal(store_path, _legacy_journal_entry('mr-blind2', task_files=None))
+
+        # Restart #1 — the loud one.
+        with caplog.at_level(logging.WARNING):
+            first, _ = self._recover_once(store_path, config)
+        assert first.module_configs == []
+        assert any(
+            'mr-blind2' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        ), 'the FIRST recovery must diagnose the unrecoverable set'
+
+        # Restart #2 — reads the journal the first recovery just rewrote.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            second, _ = self._recover_once(store_path, config)
+
+        assert second.module_configs == []
+        assert any(
+            'mr-blind2' in r.getMessage()
+            for r in caplog.records if r.levelno == logging.WARNING
+        ), (
+            'a request that is STILL verifying narrower than its original must '
+            'be diagnosed on EVERY restart, not only the first — a degradation '
+            'that goes silent is the exact failure this task exists to close'
+        )
+
+    async def test_the_re_record_keeps_the_unknown_sentinel_not_an_empty_list(
+        self, tmp_path: Path,
+    ) -> None:
+        """The mechanism behind the test above, asserted directly on disk.
+
+        ``None`` and ``[]`` are the whole design; collapsing UNKNOWN into
+        EMPTY at re-record time is what would silence the diagnostic.
+        """
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
+        store_path = tmp_path / 'merge_queue.json'
+        _write_journal(store_path, _legacy_journal_entry('mr-blind3', task_files=None))
+
+        self._recover_once(store_path, config)
+
+        [reloaded] = MergeQueueStore(store_path).load()
+        assert reloaded.module_prefixes is None, (
+            f'an UNKNOWN module set must stay UNKNOWN across the re-record; '
+            f'got {reloaded.module_prefixes!r}, which reads as "this task '
+            f'genuinely has no modules" on the next recovery'
+        )
+
+    async def test_a_genuinely_zero_module_request_still_re_records_as_empty(
+        self, tmp_path: Path,
+    ) -> None:
+        """CONTROL — the preservation above must not swallow the ``[]`` case.
+
+        A task that genuinely has no assigned modules was journaled with an
+        EXPLICIT ``[]``, which is not ``None``, so the re-record leaves it
+        alone and the global-fallback gate is preserved.
+        """
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
+        store_path = tmp_path / 'merge_queue.json'
+        store = MergeQueueStore(store_path)
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        store.record(_make_req('5063', '5063', worktree, config))
+
+        [record] = store.load()
+        assert record.module_prefixes == []
+        store.record(reconstruct_merge_request(record, config))
+
+        [reloaded] = MergeQueueStore(store_path).load()
+        assert reloaded.module_prefixes == [], (
+            f'an explicitly-empty module set must survive the re-record as [], '
+            f'not be demoted to the UNKNOWN sentinel; got '
+            f'{reloaded.module_prefixes!r}'
+        )
+
+    async def test_a_recovered_request_that_regains_modules_overwrites_unknown(
+        self, tmp_path: Path,
+    ) -> None:
+        """A NON-empty live set always wins: the module set is known again."""
+        config = _config_with_modules(tmp_path, NINE_PREFIXES)
+        store_path = tmp_path / 'merge_queue.json'
+        store = _write_journal(
+            store_path, _legacy_journal_entry('mr-regained', task_files=None),
+        )
+        [record] = store.load()
+        req = reconstruct_merge_request(record, config)
+        req.module_configs = [config.for_module('orchestrator')]  # type: ignore[list-item]
+
+        store.record(req)
+
+        [reloaded] = MergeQueueStore(store_path).load()
+        assert reloaded.module_prefixes == ['orchestrator']
+
+
+# ---------------------------------------------------------------------------
 # task-5063 — load() tolerates an UNKNOWN key instead of dropping the record.
 #
-# The forward-compat half of the module_prefixes schema change. Once the new
-# code writes that key, a REVERT of this commit leaves an older
-# merge_queue_store reading a journal it cannot parse: load() builds records
-# with PersistedMergeRequest(**entry) inside `except (TypeError, KeyError)`,
-# so one unexpected key made the whole entry vanish with only a
+# The forward-compat half of the module_prefixes schema change: load() builds
+# records with PersistedMergeRequest(**entry) inside `except (TypeError,
+# KeyError)`, so one unexpected key made the whole entry vanish with only a
 # `skipping malformed entry` warning — and a vanished entry is an in-flight
-# merge request that is never recovered. That turns a rollback into an
-# incident.
+# merge request that is never recovered.
+#
+# READ THE DIRECTION PRECISELY. The tolerance lives in the READER, so what
+# these tests pin is THIS binary and later ones surviving a journal written by
+# a NEWER one — the payoff is for FUTURE schema additions. They do NOT, and
+# cannot, make a rollback PAST this commit safe: a revert removes the tolerance
+# along with the writer, so a pre-5063 binary reading a journal carrying
+# `module_prefixes` still hits TypeError and still skips every such entry.
+#
+# What bounds THAT case is separate and weaker, and is pinned by
+# TestSkippedEntriesSurviveOnDisk below: load() never mutates _cache, so a
+# skipped entry stays in the mirror and is rewritten verbatim by the next
+# _save_raw. The in-flight merges it names are STALLED for the rollback's
+# duration, not erased — recoverable again once a tolerant binary reads them.
 # ---------------------------------------------------------------------------
 
 
@@ -1775,6 +2058,54 @@ class TestJournalLoadToleratesUnknownKeys:
         )
         assert [r for r in caplog.records if r.levelno == logging.WARNING], (
             'the skip must still be warned about'
+        )
+
+
+class TestSkippedEntriesSurviveOnDisk:
+    """A skipped entry is DEFERRED, not destroyed.
+
+    This is the honest, weaker mitigation for the one case the unknown-key
+    tolerance above genuinely cannot reach — a binary OLDER than that tolerance
+    reading a journal that carries ``module_prefixes``.  Such a binary skips the
+    entry, so the merge is not recovered while the rollback lasts; but ``load()``
+    never mutates ``_cache``, so the entry is still there for the next tolerant
+    reader.  Pinned here so the claim in the section header above is checked
+    rather than asserted.
+
+    A record MISSING a required field is used as the stand-in: it is the shape
+    THIS binary still skips, and it exercises the identical
+    skip-but-do-not-evict path an older binary would take on an unknown key.
+    """
+
+    def test_a_skipped_entry_is_rewritten_by_a_later_save(
+        self, tmp_path: Path,
+    ) -> None:
+        import json
+
+        store_path = tmp_path / 'merge_queue.json'
+        broken = _current_journal_entry('mr-unreadable')
+        del broken['task_id']
+        store_path.write_text(
+            json.dumps({'mr-unreadable': broken}), encoding='utf-8',
+        )
+
+        store = MergeQueueStore(store_path)
+        assert store.load() == [], 'precondition: this binary skips the entry'
+
+        # Any unrelated journal write flushes the whole cache back out.
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        store.record(_make_req('9999', '9999', worktree, _real_config(tmp_path)))
+
+        on_disk = json.loads(store_path.read_text(encoding='utf-8'))
+        assert 'mr-unreadable' in on_disk, (
+            'a skipped entry must survive a subsequent save — an unreadable '
+            'in-flight merge request is deferred until a binary that can parse '
+            'it reads the journal, not silently evicted'
+        )
+        assert on_disk['mr-unreadable'] == broken, (
+            'and it must survive VERBATIM, so the newer binary that wrote it '
+            'can still read every field it wrote'
         )
 
 

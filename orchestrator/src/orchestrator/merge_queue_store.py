@@ -14,10 +14,19 @@ Design highlights
   string, so an empty file is an anomaly, not a legitimate fresh state).
 * Forward-compatible reads (task 5063): an entry carrying an UNKNOWN field is
   loaded from its known keys with a WARNING naming the dropped ones, rather
-  than being skipped wholesale.  A journal written by a NEWER orchestrator
-  must survive being read by an older one — a skipped entry is an in-flight
-  merge request that is never recovered, so the alternative turns a rollback
-  into an incident.  Deliberately one-directional: an entry MISSING a required
+  than being skipped wholesale.  Read the DIRECTION of that protection
+  precisely, because it is easy to overclaim: the tolerance lives in the
+  READER, so it covers THIS binary and later ones reading a journal written
+  by a NEWER orchestrator.  It does NOT retroactively make a rollback PAST
+  this commit safe — a pre-task-5063 binary reading a journal that carries
+  ``module_prefixes`` still hits ``PersistedMergeRequest(**entry)`` ->
+  ``TypeError`` and still skips every such entry, exactly as before.
+  What bounds THAT case is separate and weaker: ``load()`` never mutates
+  ``_cache``, so a skipped entry stays in the mirror and is written back
+  verbatim by the next ``_save_raw``.  The in-flight merges it names are
+  STALLED for the duration of the rollback (nothing re-enqueues them), not
+  erased — they become recoverable again the moment a tolerant binary reads
+  the journal.  Deliberately one-directional: an entry MISSING a required
   field is still skipped.
 * Per-entry ENTRY-SHAPE validation (task 5063): a journal whose top level is a
   JSON object but whose value for one key is not a mapping loses only THAT
@@ -111,6 +120,30 @@ can never drift from the schema it is filtering against.
 """
 
 
+def _is_prefix_list(value: Any) -> bool:
+    """True when *value* is a well-formed ``module_prefixes`` payload.
+
+    :meth:`MergeQueueStore.load` applies NO type checking to field VALUES — it
+    hands whatever JSON held straight to the dataclass — so a hand-edited or
+    foreign journal can put any type here.  Both failure modes are silent and
+    misleading rather than loud (task 5063 amendment):
+
+    * a bare ``str`` iterates as CHARACTERS in :func:`_resolve_prefixes`,
+      producing a diagnostic that lists single letters, and
+    * a non-str element reaches ``config.for_module(123)`` ->
+      ``123.strip('/')`` -> ``AttributeError``, which is NOT in ``load()``'s
+      ``except (TypeError, KeyError)`` and so escapes
+      :func:`reconstruct_merge_request` entirely.
+
+    This is the value-level sibling of ``load()``'s ``isinstance(entry, dict)``
+    ENTRY-shape guard: same class of defect, one level further down.  A
+    malformed value is treated as UNKNOWN (``None``) by every caller, so the
+    ``task_files`` re-derivation still runs rather than the request silently
+    degrading to the file-scoped gate.
+    """
+    return isinstance(value, list) and all(isinstance(p, str) for p in value)
+
+
 # ---------------------------------------------------------------------------
 # Store
 # ---------------------------------------------------------------------------
@@ -175,12 +208,52 @@ class MergeQueueStore:
             # at reconstruction (task 5063).  `req` is the LIVE MergeRequest,
             # whose module_configs WorkflowRunner._resolve_module_configs has
             # already populated, so no new plumbing is needed here.
-            module_prefixes=[mc.prefix for mc in req.module_configs],
+            module_prefixes=self._prefixes_to_persist(req),
         )
 
         # Update in-memory mirror first; then flush atomically without re-reading.
         self._cache[req.request_id] = asdict(persisted)
         self._save_raw(self._cache)
+
+    def _prefixes_to_persist(self, req: MergeRequest) -> list[str] | None:  # type: ignore[type-arg]
+        """The ``module_prefixes`` value to journal for *req*.
+
+        Normally just ``[mc.prefix for mc in req.module_configs]``.  The one
+        exception preserves the UNKNOWN encoding across a re-record (task 5063
+        amendment):
+
+        A legacy record whose module set could not be recovered reconstructs
+        to ``[]`` with the loud "unrecoverable" WARNING from
+        :func:`_reconstruct_module_configs`.  That recovered request is then
+        re-journaled by ``merge_queue::SpeculativeMergeWorker.
+        _buffer_owned_request``.  Writing a plain ``[]`` there would rewrite an
+        UNKNOWN module set as an AUTHORITATIVE EMPTY one — collapsing the very
+        ``None``-vs-``[]`` distinction this design rests on — so on the NEXT
+        crash+recovery the ``prefixes == []`` early-return would fire and the
+        request would go on verifying narrower than its original in complete
+        SILENCE.  A degradation that is loud once and mute from the second
+        restart onward is worse than one that is loud every time.
+
+        So an EMPTY live set does not overwrite an UNKNOWN journaled one: the
+        marker is read back out of the journal itself (key absent OR explicitly
+        ``null``, both meaning UNKNOWN) rather than held in process memory, so
+        it survives the restart it exists to describe.  A NON-empty live set
+        always wins — the module set is known again, and a later ``[]`` from a
+        genuinely zero-module request that was already journaled as ``[]``
+        stays ``[]``, since ``[] is not None``.
+        """
+        prefixes = [mc.prefix for mc in req.module_configs]
+        if prefixes:
+            return prefixes
+        previous = self._cache.get(req.request_id)
+        if isinstance(previous, dict) and not _is_prefix_list(
+            previous.get('module_prefixes')
+        ):
+            # Absent, explicitly null, or malformed — every shape
+            # `_reconstruct_module_configs` reads as UNKNOWN reads as UNKNOWN
+            # here too, so the two never disagree about what was journaled.
+            return None
+        return prefixes
 
     def remove(self, request_id: str) -> None:
         """Remove *request_id* from the journal.
@@ -201,9 +274,10 @@ class MergeQueueStore:
         UNKNOWN keys are tolerated (task 5063): an entry carrying a field this
         binary does not know is constructed from its KNOWN keys alone, and the
         dropped ones are named in one WARNING.  This is the forward direction
-        of schema evolution — a journal written by a NEWER orchestrator must
-        survive being read by an older one, because the alternative is
-        silently losing in-flight merge requests during a rollback.
+        of schema evolution — THIS binary and later ones can read a journal
+        written by a NEWER orchestrator.  It does not reach backwards: a
+        binary that predates this tolerance still skips such an entry, and the
+        module docstring records what does and does not bound that case.
 
         The relaxation is one-directional: an entry MISSING a required field
         still raises and is still skipped with the message below.
@@ -320,11 +394,14 @@ def _reconstruct_module_configs(
       function that produced the ORIGINAL request's ``module_configs``.
       Reproducing its grouping is what makes the reconstructed set equal the
       original's by construction rather than by coincidence.
-    * ``module_prefixes is None`` (a record written before the field existed)
+    * ``module_prefixes is None`` (a record written before the field existed,
+      or one whose value failed the :func:`_is_prefix_list` shape check above)
       -> the module set is UNKNOWN, so it is re-derived from the preserved
       ``task_files`` by :func:`_modules_from_task_files`.  ``None`` therefore
       does the OPPOSITE of ``[]`` here, which is why the two encodings must
-      stay distinct.
+      stay distinct — and why
+      :meth:`MergeQueueStore._prefixes_to_persist` refuses to overwrite a
+      journaled UNKNOWN with an authoritative ``[]`` on re-record.
     * a non-empty ``module_prefixes`` that resolves to ZERO ModuleConfigs
       (every prefix de-registered) -> re-derive from ``task_files`` too, after
       a WARNING naming the unresolved prefixes.  A non-empty list is positive
@@ -346,6 +423,23 @@ def _reconstruct_module_configs(
     config is always correct.
     """
     prefixes = persisted.module_prefixes
+
+    # VALUE-shape guard, before the [] / truthiness branches below both of
+    # which would misread a malformed payload (a bare str is truthy and
+    # iterates as characters; `'' == []` is False and `if ''` is falsy, so an
+    # empty string would silently take the re-derive path for the wrong
+    # reason).  Demoting to the UNKNOWN sentinel keeps the task_files
+    # re-derivation available rather than degrading to the file-scoped gate.
+    if prefixes is not None and not _is_prefix_list(prefixes):
+        logger.warning(
+            'merge_queue_store: %s: persisted module_prefixes is not a list of'
+            ' strings (got %s: %r); treating the module set as UNKNOWN and'
+            ' re-deriving it from task_files',
+            persisted.request_id,
+            type(prefixes).__name__,
+            prefixes,
+        )
+        prefixes = None
 
     if prefixes == []:
         return []

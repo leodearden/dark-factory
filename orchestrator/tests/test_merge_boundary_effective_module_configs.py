@@ -34,7 +34,9 @@ cross-imported from ``test_merge_queue_main_health`` (the pattern
 chokepoint), and ``_materialize``/``_module_config``/``_FakeEventStore``/
 ``_FakeEscalationQueue`` from ``test_verify_merge_flake_suppression`` — the
 on-disk node-id -> subproject probe is ``Path.exists``-based, so the merge
-worktree holds REAL files.
+worktree holds REAL files.  ``NINE_PREFIXES`` is cross-imported from
+``test_merge_queue_store`` (task 5063), which owns its single definition, so
+this suite and the journal suite cannot disagree about the registry shape.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
+from test_merge_queue_store import NINE_PREFIXES
 from test_verify_merge_flake_suppression import (
     _FakeEscalationQueue,
     _FakeEventStore,
@@ -897,10 +900,6 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
     as a non-vacuity guard.
     """
 
-    _NINE_PREFIXES = [
-        'cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
-        'sampler', 'scripts', 'shared', 'tests/scripts',
-    ]
     # Must carry a .py path — see _merge_plan_full_suite_prefixes.
     _TASK_FILES = ['orchestrator/src/orchestrator/merge_queue_store.py']
 
@@ -908,14 +907,13 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
     def _nine_module_registry() -> dict[str, ModuleConfig]:
         """dark_factory's live nine-module registry shape.
 
-        Follows the file's existing ``_N_module_registry`` staticmethod idiom;
-        ``tests/scripts`` is included deliberately because it is multi-segment
-        and so exercises ``OrchestratorConfig.for_module``'s inward walk.
+        Follows the file's existing ``_N_module_registry`` staticmethod idiom.
+        The prefix list itself is cross-imported from
+        ``test_merge_queue_store.NINE_PREFIXES`` — its single definition — so
+        the two task-5063 suites cannot silently disagree about what "the whole
+        registry" means.
         """
-        return {
-            prefix: _module_config(prefix)
-            for prefix in TestRehydratedRequestVerifiesAsWideAsItsOriginal._NINE_PREFIXES
-        }
+        return {prefix: _module_config(prefix) for prefix in NINE_PREFIXES}
 
     @staticmethod
     def _config(tmp_path: Path, breadth: Literal['scoped', 'full']) -> OrchestratorConfig:
@@ -992,7 +990,7 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
         )
         # Non-vacuity: an oracle that itself regressed to empty must not make
         # the equality above pass trivially.
-        assert original_plan == sorted(self._NINE_PREFIXES)
+        assert original_plan == sorted(NINE_PREFIXES)
 
     @pytest.mark.asyncio
     async def test_rehydrated_request_under_scoped_breadth_keeps_the_tasks_own_modules(
