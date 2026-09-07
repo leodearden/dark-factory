@@ -4244,6 +4244,11 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
        widens ACROSS projects (``solar_challenge`` vs
        ``solar_challenge_platform`` are different project roots and are
        guarded from merging), so the fail-OPEN framing below is intact.
+       A ``--project`` naming a DECLINED alias target now WARNS (task 3813,
+       see PROJECT_TOKEN_ALIASES_DECLINED), so an operator passing a
+       config-declared token that matches zero rows learns it immediately
+       instead of reading a silent no-op as "nothing to reap". Advisory
+       only: it does not change the axis, the scoping, or what gets closed.
     2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
        only WITHIN one queue, and a project can run several: dark_factory
        runs ``data/escalations`` (orchestrator) and
@@ -4297,6 +4302,15 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     """
     reaper_dir = normalize_escalations_dir(escalations_dir)
     reaper_project = normalize_project_token(project)
+
+    # Advisory only (task 3813). Deliberately OUTSIDE _status, so it fires
+    # ONCE per invocation rather than once per record scanned -- a watcher
+    # runs this every Main Loop cycle and a per-record line would flood its
+    # log. It must not touch reaper_project, neither scoping axis, nor what
+    # gets closed: both guards below stay fail-OPEN exactly as documented.
+    declined_hint = declined_project_token_hint(reaper_project)
+    if declined_hint is not None:
+        logger.warning('reap-decisions: %s', declined_hint)
 
     def _status(decision: DecisionRecord) -> str | None:
         # Axis 1: normalize the decision's OWN stored token at compare time
