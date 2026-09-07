@@ -45,8 +45,9 @@ not a refactor.  Do not "finish the job" by migrating them.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -72,6 +73,15 @@ except ImportError:  # pragma: no cover — exercised only in minimal envs
 _QUEUE_DIRNAME: str = 'data/escalations'
 
 
+def _suffix(context: str) -> str:
+    """Render the caller's *context* as a trailing log clause, or nothing.
+
+    Kept out of the format arguments so a caller that supplies no context gets
+    a clean message rather than a dangling ``()``.
+    """
+    return f' ({context})' if context else ''
+
+
 def file_folded_escalation(
     project_root: str | None,
     *,
@@ -86,6 +96,8 @@ def file_folded_escalation(
     log_label: str,
     level: int = 1,
     dedupe: bool = True,
+    context: str = '',
+    on_fold: Callable[[Any], None] | None = None,
 ) -> str | None:
     """File one escalation under *anchor_task_id* into *project_root*'s queue.
 
@@ -137,6 +149,20 @@ def file_folded_escalation(
             payload — ``emit_markup_residue_escalation`` is the one such caller,
             where folding two records together would destroy the very data the
             record exists to preserve.
+        context: The caller's own free-text description of the subject, e.g.
+            ``"fail-open storm 'unknown_key'"``. Appended to every emitted
+            message INCLUDING the quiet no-op arms, where an operator most
+            needs to know what went unescalated.
+        on_fold: Called with the EXISTING escalation object when a fold occurs,
+            instead of the helper's default fold line. It exists so a caller
+            can keep fold-time logging on ITS OWN logger and at its own level:
+            ``emit_markup_storm_escalation`` compares the folded burst's
+            outcome against the open record's and logs at ERROR when they
+            differ, and ``tests/server/test_markup_tripwire.py`` asserts that
+            record's ``.name`` is ``fused_memory.server.markup_tripwire``. A
+            hook that raises is caught and logged — it is caller-supplied
+            logging on a never-raise path, and must not become a new way to
+            break the write path.
 
     Returns the escalation id — freshly filed, or the id of the already-open
     escalation under this anchor when one exists — or ``None`` when filing was
@@ -145,14 +171,14 @@ def file_folded_escalation(
     if project_root is None:
         logger.debug(
             '%s: no project_root, so there is no project queue to file into; '
-            'nothing escalated', log_label,
+            'nothing escalated%s', log_label, _suffix(context),
         )
         return None
 
     if not HAS_ESCALATION:
         logger.debug(
-            '%s: escalation package unavailable; nothing will be escalated',
-            log_label,
+            '%s: escalation package unavailable; nothing will be escalated%s',
+            log_label, _suffix(context),
         )
         return None
 
@@ -163,7 +189,7 @@ def file_folded_escalation(
         # project_root must not turn an alarm into a crash on a write path.
         logger.exception(
             '%s: could not open the escalation queue at project_root=%r; '
-            'nothing escalated', log_label, project_root,
+            'nothing escalated%s', log_label, project_root, _suffix(context),
         )
         return None
 
@@ -196,15 +222,26 @@ def file_folded_escalation(
             logger.exception(
                 '%s: failed to check for an already-open alarm under anchor %r '
                 'in project_root=%r; proceeding to file a new one rather than '
-                'silencing the alarm',
-                log_label, anchor_task_id, project_root,
+                'silencing the alarm%s',
+                log_label, anchor_task_id, project_root, _suffix(context),
             )
             existing = []
     if existing:
-        logger.info(
-            '%s: %s already open; folding into it rather than filing a duplicate',
-            log_label, existing[0].id,
-        )
+        if on_fold is not None:
+            try:
+                on_fold(existing[0])
+            except Exception:
+                # Caller-supplied logging on a never-raise path: a broken hook
+                # must cost its own log line, never the fold result.
+                logger.exception(
+                    '%s: the on_fold hook failed while folding into %s%s',
+                    log_label, existing[0].id, _suffix(context),
+                )
+        else:
+            logger.info(
+                '%s: %s already open; folding into it rather than filing a '
+                'duplicate%s', log_label, existing[0].id, _suffix(context),
+            )
         return existing[0].id
 
     # `Escalation(...)` is constructed INSIDE the guard deliberately, matching
@@ -229,9 +266,10 @@ def file_folded_escalation(
     except Exception:
         logger.exception(
             '%s: failed to submit the alarm under anchor %r in '
-            'project_root=%r', log_label, anchor_task_id, project_root,
+            'project_root=%r%s',
+            log_label, anchor_task_id, project_root, _suffix(context),
         )
         return None
 
-    logger.warning('%s: queued %s', log_label, esc_id)
+    logger.warning('%s: queued %s%s', log_label, esc_id, _suffix(context))
     return esc_id
