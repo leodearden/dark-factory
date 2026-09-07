@@ -29,7 +29,12 @@ import pytest
 from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 
-pytestmark = pytest.mark.skipif(
+#: Applied PER CLASS rather than as a module-level ``pytestmark``, so the
+#: pairwise anchor-collision regression at the foot of this file keeps running
+#: in a minimal env. It compares module CONSTANTS and needs no queue — and an
+#: anchor collision that only fails where the escalation package happens to be
+#: installed is an alarm switched off exactly where nobody is looking.
+_needs_escalation = pytest.mark.skipif(
     not _folded_escalation.HAS_ESCALATION,
     reason='escalation package unavailable (minimal env); the HAS_ESCALATION '
            'no-op arm is covered separately below',
@@ -67,6 +72,7 @@ def _filed(tmp_path) -> list[dict]:
     return [json.loads(p.read_text()) for p in sorted(queue_dir.glob('esc-*.json'))]
 
 
+@_needs_escalation
 class TestTheFiledEscalation:
     """One escalation, into the caller-named project's OWN queue."""
 
@@ -137,6 +143,7 @@ class TestTheFiledEscalation:
         assert _filed(tmp_path)[0]['level'] == 2
 
 
+@_needs_escalation
 class TestTheAnchorIsRequired:
     """The one property the consolidation must not collapse."""
 
@@ -163,6 +170,7 @@ class TestTheAnchorIsRequired:
             file_folded_escalation(str(tmp_path), _ANCHOR)  # type: ignore[misc]
 
 
+@_needs_escalation
 class TestDedupeFold:
     """A SUSTAINED storm folds into one pending parent, not one page per breach."""
 
@@ -281,6 +289,7 @@ class TestDedupeFold:
         assert len(calls) == 1, 'the default path DOES consult the pending anchor'
 
 
+@_needs_escalation
 class TestNeverRaises:
     """Called from live write paths: a raise here fails a write because the
     COMPLAINT about the write failed.
@@ -369,6 +378,7 @@ class TestNeverRaises:
         assert not (tmp_path / 'data' / 'escalations').exists()
 
 
+@_needs_escalation
 class TestFoldHookAndLogging:
     """`on_fold` exists so a caller can keep FOLD-TIME logging on ITS OWN
     logger — `emit_markup_storm_escalation` compares the folded burst's
@@ -464,4 +474,181 @@ class TestFoldHookAndLogging:
         assert any(
             'the subject that went unescalated' in r.getMessage()
             for r in caplog.records
+        )
+
+
+# ---------------------------------------------------------------------------
+# The anchor-collision regression, generalised (task 4854).
+#
+# Deliberately NOT decorated with `_needs_escalation`: it reads module
+# constants and needs no queue, and an alarm that only fires where the
+# escalation package happens to be installed is switched off exactly where
+# nobody is looking.
+# ---------------------------------------------------------------------------
+
+
+def _anchors_read_from_their_own_homes() -> dict[str, str]:
+    """Every filer's anchor, each imported FROM ITS OWN HOME.
+
+    Reading them from their homes rather than restating the literals here is
+    the property that makes a colliding RENAME fail this test: a copy of the
+    values in this file would keep passing while production went silent.
+    """
+    from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
+    )
+    from fused_memory.middleware.mem0_update_storm_escalator import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as MEM0_UPDATE_ANCHOR,
+    )
+    from fused_memory.middleware.referent_repair_storm_escalator import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as REFERENT_REPAIR_ANCHOR,
+    )
+    from fused_memory.middleware.scope_violation_escalator import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as SCOPE_VIOLATION_ANCHOR,
+    )
+    from fused_memory.middleware.scope_violation_escalator import (
+        _BUDGET_MISCONFIG_ANCHOR_TASK_ID as SCOPE_BUDGET_ANCHOR,
+    )
+    from fused_memory.middleware.scope_violation_escalator import (
+        _OVERRIDE_ANCHOR_TASK_ID as SCOPE_OVERRIDE_ANCHOR,
+    )
+    from fused_memory.server.markup_guard import (  # noqa: PLC0415
+        _RESIDUE_ANCHOR_TASK_ID as GUARD_RESIDUE_ANCHOR,
+    )
+    from fused_memory.server.markup_guard import (
+        _STORM_ANCHOR_TASK_ID as GUARD_STORM_ANCHOR,
+    )
+    from fused_memory.server.markup_tripwire import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as TRIPWIRE_ANCHOR,
+    )
+    from fused_memory.server.markup_tripwire import (
+        _RESIDUE_ANCHOR_TASK_ID as TRIPWIRE_RESIDUE_ANCHOR,
+    )
+    from fused_memory.server.write_triage import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as WRITE_TRIAGE_ANCHOR,
+    )
+    from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
+        _ANCHOR_PREFIX as UNVERIFIED_CLAIM_PREFIX,
+    )
+    from fused_memory.services.memory_metadata_census import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
+    )
+    from fused_memory.services.memory_metadata_census import (
+        writer_anchor_task_id,
+    )
+
+    return {
+        # -- the seven filers task 4854 folded into `_folded_escalation` -----
+        'write_triage': WRITE_TRIAGE_ANCHOR,
+        'markup_tripwire storm (the SQUATTED one)': TRIPWIRE_ANCHOR,
+        'markup_tripwire residue': TRIPWIRE_RESIDUE_ANCHOR,
+        'candidate_key_escalation': CANDIDATE_KEY_ANCHOR,
+        'referent_repair_storm_escalator': REFERENT_REPAIR_ANCHOR,
+        'completion_claim_gate prefix': UNVERIFIED_CLAIM_PREFIX,
+        'memory_metadata_census base': CENSUS_ANCHOR_BASE,
+        'memory_metadata_census sample writer': writer_anchor_task_id(
+            'dark_factory', 'claude-x',
+        ),
+        # -- markup_guard, which CALLS the tripwire's filers with anchors of
+        #    its own rather than carrying a copy of the skeleton -------------
+        'markup_guard storm': GUARD_STORM_ANCHOR,
+        'markup_guard residue': GUARD_RESIDUE_ANCHOR,
+        # -- the non-member neighbours. They dedupe on content fingerprints
+        #    via `submit_or_dedupe`, not on a pending anchor, so they are NOT
+        #    migrating — but they write to the SAME queue, so they can still
+        #    squat an anchor and must be in this sweep. ---------------------
+        'mem0_update_storm_escalator': MEM0_UPDATE_ANCHOR,
+        'scope_violation_escalator': SCOPE_VIOLATION_ANCHOR,
+        'scope_violation_escalator override': SCOPE_OVERRIDE_ANCHOR,
+        'scope_violation_escalator budget-misconfig': SCOPE_BUDGET_ANCHOR,
+    }
+
+
+#: The ONE pair that is deliberately the same value, asserted equal rather than
+#: excluded silently. `markup_guard` hands its residue records to
+#: `markup_tripwire.emit_markup_residue_escalation`, so both spell the SAME
+#: anchor for the SAME record kind. Two homes for one value is a lockstep
+#: hazard in the other direction — renaming one would split the series in half
+#: without any test noticing — so the pair is pinned EQUAL below.
+_DELIBERATE_ALIASES: tuple[tuple[str, str], ...] = (
+    ('markup_tripwire residue', 'markup_guard residue'),
+)
+
+
+class TestNoTwoFilersShareAnAnchor:
+    """A SQUATTED anchor is suppressed indefinitely, and reads as calm.
+
+    Measured incident: the L1 escalation watcher files its own cluster
+    records under the `markup-tripwire` anchor and SQUATS it — the tripwire
+    filed nothing 2026-08-16..2026-08-19 while 41 rejections occurred, all
+    17 records sitting at dedupe_count 0. A filer that dedupes against an
+    anchor somebody else keeps open never files again, and the resulting
+    silence is indistinguishable from health.
+
+    That incident is why `emit_markup_storm_escalation` grew its
+    `anchor_task_id` parameter (see its docstring), and it is why no filer
+    may share an anchor with any other. Asserted against every filer's
+    constants IMPORTED FROM THEIR OWN HOMES, so a future rename that collides
+    is caught here rather than in production silence.
+
+    GENERALISED FROM one-vs-seven to PAIRWISE by task 4854. The narrower
+    predecessor lived in `tests/server/test_write_triage.py` and compared
+    write_triage's anchor against its siblings only, so a collision between
+    any two OTHER filers passed it unnoticed — and it named neither
+    `completion_claim_gate` nor `memory_metadata_census`, the two filers that
+    task discovered.
+    """
+
+    def test_every_pair_of_anchors_is_distinct(self) -> None:
+        import itertools  # noqa: PLC0415
+
+        anchors = _anchors_read_from_their_own_homes()
+        aliased = {frozenset(pair) for pair in _DELIBERATE_ALIASES}
+
+        for (label_a, value_a), (label_b, value_b) in itertools.combinations(
+            anchors.items(), 2,
+        ):
+            if frozenset((label_a, label_b)) in aliased:
+                continue
+            assert value_a != value_b, (
+                f'{label_a} and {label_b} both file under the anchor '
+                f'{value_a!r}. A filer deduping against an anchor another '
+                'party keeps open is suppressed indefinitely, and that '
+                'silence reads as calm — give one of them an anchor of its '
+                'own, or add the pair to _DELIBERATE_ALIASES if they really '
+                'are one record kind with two spellings.'
+            )
+
+    def test_the_deliberate_aliases_stay_in_lockstep(self) -> None:
+        """Two homes for one value is the hazard in the other direction:
+        renaming one would split the series in half with nothing noticing."""
+        anchors = _anchors_read_from_their_own_homes()
+
+        for label_a, label_b in _DELIBERATE_ALIASES:
+            assert anchors[label_a] == anchors[label_b], (
+                f'{label_a} and {label_b} name the SAME record kind and must '
+                f'stay equal: got {anchors[label_a]!r} and {anchors[label_b]!r}'
+            )
+
+    def test_the_sweep_covers_every_filer_this_task_folded_in(self) -> None:
+        """Anti-vacuity: a pairwise sweep passes trivially if a filer is left
+        out, which is exactly how the predecessor missed two of them."""
+        anchors = _anchors_read_from_their_own_homes()
+
+        for required in (
+            'write_triage',
+            'markup_tripwire storm (the SQUATTED one)',
+            'markup_tripwire residue',
+            'candidate_key_escalation',
+            'referent_repair_storm_escalator',
+            'completion_claim_gate prefix',
+            'memory_metadata_census base',
+        ):
+            assert required in anchors, (
+                f'{required!r} files through `file_folded_escalation` but is '
+                'absent from the anchor sweep'
+            )
+        assert len(anchors) >= 14, (
+            f'the sweep shrank to {len(anchors)} entries; a filer was dropped '
+            'rather than renamed'
         )
