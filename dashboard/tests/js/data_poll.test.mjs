@@ -1189,20 +1189,32 @@ test('staleness: the last success instant survives a later failure', async () =>
   );
 });
 
-test('staleness: applyKey cannot clobber __stale', () => {
-  // The same guarantee __loaded already has: __stale is not an endpoint key,
-  // so no server payload can overwrite the map that reports the server is
-  // failing.
+test('staleness: applyKey cannot clobber __stale (or __loaded)', () => {
+  // No server payload may overwrite the map that reports the server is
+  // failing. Two independent layers, both asserted:
+  //   STRUCTURAL — `__stale` is not an endpoint key, so the production call
+  //     site (`keys.forEach(k => applyKey(k, body[k]))`) can never reach it.
+  //   ENFORCED — applyKey itself refuses DF_DATA's `__`-prefixed internal
+  //     namespace, so the invariant does not depend on nobody ever naming a
+  //     server-side key that way.
   const { api, window: win } = loadDataJs();
+
+  for (const keys of Object.values(api.endpointsFor('24h'))) {
+    for (const k of keys) {
+      assert.ok(!k.startsWith('__'), `endpointsFor names an internal key: ${k}`);
+    }
+  }
 
   win.DF_DATA.__stale[CURATOR_PATH] = { failures: 7, lastSuccessAt: 42 };
   api.applyKey('__stale', {});
+  api.applyKey('__loaded', { PROJECTS: false });
 
   assert.deepEqual(
     win.DF_DATA.__stale[CURATOR_PATH],
     { failures: 7, lastSuccessAt: 42 },
     'applyKey must not replace the published staleness map',
   );
+  assert.deepEqual(win.DF_DATA.__loaded, {}, 'applyKey must not replace the __loaded markers either');
 });
 
 test('staleness: past the threshold the per-attempt deadline drops to STALE_TIMEOUT_MS', async () => {

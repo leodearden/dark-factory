@@ -329,3 +329,32 @@ test('a missing `now` falls back rather than rendering NaN', () => {
   assert.equal(notices.length, 1);
   assert.ok(!/NaN/.test(notices[0].text), notices[0].text);
 });
+
+// ── cross-module: data.js's fallback threshold must agree with this one ────
+
+test("data.js's fallback threshold agrees with STALE_FAILURE_THRESHOLD", () => {
+  // data.js is the FIRST classic script in index.html, so it reads this
+  // module's threshold LAZILY (window.DF_ENDPOINT_STALENESS, at call time)
+  // and falls back to its own literal when the module has not loaded — that
+  // is what keeps it from gaining a hard load-order dependency on a later
+  // script. Two spellings of one number can drift, and the drift would be
+  // silent: the browser would take one value and the node harness the other,
+  // so a threshold raised here would leave data.js shortening deadlines on a
+  // different schedule than the UI reports staleness on.
+  const src = fs.readFileSync(path.join(REDUX_DIR, 'data.js'), 'utf8');
+  const fallback = src.match(/STALE_FAILURE_THRESHOLD_FALLBACK\s*=\s*(\d+)/);
+  assert.ok(fallback, 'data.js no longer carries a parsable fallback threshold literal');
+  assert.equal(
+    Number(fallback[1]),
+    STALE_FAILURE_THRESHOLD,
+    `data.js falls back to ${fallback[1]} while this module exports ` +
+      `${STALE_FAILURE_THRESHOLD} — the two must agree`,
+  );
+
+  // And the lazy read is the primary path, not dead code.
+  assert.match(
+    src,
+    /window\.DF_ENDPOINT_STALENESS/,
+    'data.js must prefer the loaded module\'s threshold over its fallback',
+  );
+});
