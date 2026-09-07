@@ -366,6 +366,14 @@ def _judge_task(tmp_path: Path) -> dict:
     }
 
 
+# Distinguishes "this case passed no usage_gate at all" (the OWNED path, where
+# the executor builds and tears down its own) from "this case passed
+# usage_gate=None" (a campaign owner that is deliberately ungated). The
+# production _GATE_UNSET sentinel exists for exactly this distinction; the
+# helpers need their own because a plain None default could not express it.
+_NO_INJECTED_GATE = object()
+
+
 async def _run_eval_hermetic(
     config: EvalConfig,
     base,
@@ -374,11 +382,33 @@ async def _run_eval_hermetic(
     *,
     judge_config: EvalConfig | None = None,
     outcome: WorkflowOutcome = WorkflowOutcome.DONE,
+    gate=None,
+    injected_gate=_NO_INJECTED_GATE,
+    run_side_effect: BaseException | None = None,
+    collect_side_effect: BaseException | None = None,
 ):
     """Drive run_eval with the worktree/workflow/metrics boundaries mocked.
 
     Returns ``(result, captured)`` where ``captured['build_workflow']`` is the
     kwargs dict build_workflow received (for asserting the threaded config).
+
+    ``_build_eval_usage_gate`` is patched UNCONDITIONALLY (task 4427) and
+    exposed as ``captured['build_gate']``. It has to be: the packaged default is
+    ``usage_cap.enabled: true``, so the real builder would otherwise construct a
+    live ``UsageGate`` off ``_base_config``'s resolved cap block — touching the
+    filesystem for probe dirs and account state, and leaving whether the gate
+    resolves to ``None`` dependent on whatever credentials the test machine
+    happens to export. ``gate=`` sets what the patched builder returns (default
+    ``None``, i.e. the ungated cell every pre-4427 case here already meant).
+
+    ``injected_gate=`` forwards to ``run_eval``'s own ``usage_gate=`` parameter —
+    a gate a campaign owner already built, which this cell must use without
+    tearing down. Omitted, no argument is passed at all (the owned path);
+    ``injected_gate=None`` passes an explicit ``None``, which is NOT the same
+    thing. ``run_side_effect`` / ``collect_side_effect`` make ``workflow.run()``
+    / ``collect_metrics`` raise, the two ways a cell can fail after the gate is
+    resolved — which is what proves the owned teardown really is in a
+    ``finally``.
     """
     from orchestrator.evals import runner
 
@@ -388,7 +418,9 @@ async def _run_eval_hermetic(
         return Path('/fake/wt'), 'run-eval'
 
     fake_wf = MagicMock()
-    fake_wf.run = AsyncMock(return_value=SimpleNamespace(outcome=outcome))
+    fake_wf.run = AsyncMock(
+        return_value=SimpleNamespace(outcome=outcome), side_effect=run_side_effect,
+    )
 
     def fake_build_workflow(**kwargs):
         captured['build_workflow'] = kwargs
@@ -396,17 +428,24 @@ async def _run_eval_hermetic(
 
     metrics_obj = MagicMock()
     metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    mock_collect = AsyncMock(return_value=metrics_obj)
+    mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
     mock_save = MagicMock()
+    mock_build_gate = AsyncMock(return_value=gate)
 
     monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
     monkeypatch.setattr(runner, 'save_result', mock_save)
+    monkeypatch.setattr(runner, '_build_eval_usage_gate', mock_build_gate)
+    captured['build_gate'] = mock_build_gate
+    captured['wf'] = fake_wf
 
+    extra = (
+        {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
+    )
     result = await runner.run_eval(
-        Path('/fake/task.json'), config, base, judge_config=judge_config,
+        Path('/fake/task.json'), config, base, judge_config=judge_config, **extra,
     )
     return result, captured
 
@@ -480,11 +519,21 @@ async def _run_end_to_end_hermetic(
     monkeypatch: pytest.MonkeyPatch,
     *,
     outcome: WorkflowOutcome = WorkflowOutcome.DONE,
+    gate=None,
+    injected_gate=_NO_INJECTED_GATE,
+    run_side_effect: BaseException | None = None,
+    collect_side_effect: BaseException | None = None,
 ):
     """Drive run_end_to_end with the worktree/workflow/metrics boundaries mocked.
 
     Returns ``(result, captured, mocks)`` where ``captured['build_workflow']``
-    is the kwargs dict build_workflow received (for asserting config + plan).
+    is the kwargs dict build_workflow received (for asserting config + plan)
+    and ``mocks['build_gate']`` is the patched ``_build_eval_usage_gate``.
+
+    The gate knobs (``gate`` / ``injected_gate`` / ``run_side_effect`` /
+    ``collect_side_effect``) mean exactly what they mean in
+    :func:`_run_eval_hermetic` — see its docstring for why the builder is
+    patched unconditionally.
     """
     from orchestrator.evals import runner
 
@@ -494,7 +543,9 @@ async def _run_end_to_end_hermetic(
         return Path('/fake/wt'), 'run-e2e'
 
     fake_wf = MagicMock()
-    fake_wf.run = AsyncMock(return_value=SimpleNamespace(outcome=outcome))
+    fake_wf.run = AsyncMock(
+        return_value=SimpleNamespace(outcome=outcome), side_effect=run_side_effect,
+    )
 
     def fake_build_workflow(**kwargs):
         captured['build_workflow'] = kwargs
@@ -502,19 +553,27 @@ async def _run_end_to_end_hermetic(
 
     metrics_obj = MagicMock()
     metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    mock_collect = AsyncMock(return_value=metrics_obj)
+    mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
     mock_save = MagicMock()
+    mock_build_gate = AsyncMock(return_value=gate)
 
     monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
     monkeypatch.setattr(runner, 'save_result', mock_save)
+    monkeypatch.setattr(runner, '_build_eval_usage_gate', mock_build_gate)
 
-    result = await runner.run_end_to_end(
-        Path('/fake/task.json'), arch_cfg, impl_cfg, base,
+    extra = (
+        {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
     )
-    return result, captured, {'collect': mock_collect, 'save': mock_save, 'wf': fake_wf}
+    result = await runner.run_end_to_end(
+        Path('/fake/task.json'), arch_cfg, impl_cfg, base, **extra,
+    )
+    return result, captured, {
+        'collect': mock_collect, 'save': mock_save, 'wf': fake_wf,
+        'build_gate': mock_build_gate,
+    }
 
 
 @pytest.mark.asyncio
@@ -558,6 +617,255 @@ class TestRunEndToEnd:
 
         # (d) persisted via save_result.
         mocks['save'].assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# task 4427 — run_eval / run_end_to_end gain the same injected-gate contract
+# run_architect_eval got: build-and-tear-down only when the caller supplied
+# nothing; use-and-leave-alone when a campaign owner handed one down.
+#
+# These two paths had ZERO gate coverage before this task — nothing outside
+# test_eval_architect.py ever exercised the seam — and they also never tore
+# their OWN gate down (469a2b5bd0 closed that leak for run_architect_eval
+# alone), so the owned-path teardown pins below are closing a pre-existing bug
+# as well as pinning new behaviour.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRunEvalInjectedGate:
+    async def test_injected_gate_reaches_the_workflow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _result, captured = await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            injected_gate=gate,
+        )
+
+        assert captured['build_workflow']['usage_gate'] is gate
+        # The hoist is pointless if the cell builds one anyway.
+        captured['build_gate'].assert_not_awaited()
+
+    async def test_injected_gate_is_never_torn_down(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Shutting down a borrowed gate would take failover from every sibling."""
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            injected_gate=gate,
+        )
+
+        gate.shutdown.assert_not_awaited()
+
+    async def test_injected_gate_survives_a_failing_workflow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _captured = await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            injected_gate=gate, run_side_effect=RuntimeError('workflow exploded'),
+        )
+
+        assert result.outcome == 'blocked'
+        gate.shutdown.assert_not_awaited()
+
+    async def test_explicit_none_means_ungated_not_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A campaign that degraded to ungated must not have cells rebuild."""
+        _result, captured = await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            injected_gate=None,
+        )
+
+        captured['build_gate'].assert_not_awaited()
+        assert captured['build_workflow']['usage_gate'] is None
+
+    async def test_owned_gate_is_built_and_torn_down(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Closes a pre-existing leak: run_eval never shut its own gate down."""
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _result, captured = await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            gate=gate,
+        )
+
+        captured['build_gate'].assert_awaited_once()
+        assert captured['build_workflow']['usage_gate'] is gate
+        gate.shutdown.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        'failure', ['run', 'collect'],
+        ids=['workflow_run_raises', 'collect_metrics_raises'],
+    )
+    async def test_owned_gate_teardown_is_in_a_finally(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+    ):
+        """Both post-gate failure shapes must still reach the teardown.
+
+        A cell that failed is the one most likely to have hit a cap, i.e. the
+        one holding a live account-resume probe loop — leaking there leaks
+        exactly where it costs most.
+        """
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        boom = RuntimeError('boom')
+        kwargs = (
+            {'run_side_effect': boom} if failure == 'run'
+            else {'collect_side_effect': boom}
+        )
+        await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            gate=gate, **kwargs,
+        )
+
+        gate.shutdown.assert_awaited_once()
+
+    async def test_a_failing_owned_shutdown_never_damages_the_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Best-effort teardown, mirroring run_architect_eval's finally."""
+        import logging
+
+        from shared.testing import make_gate_mock
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        gate = make_gate_mock()
+        gate.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
+
+        result, _captured = await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+            gate=gate,
+        )
+
+        assert result.outcome == 'done'
+        assert 'shutdown failed' in caplog.text
+
+
+@pytest.mark.asyncio
+class TestRunEndToEndInjectedGate:
+    async def test_injected_gate_reaches_the_workflow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _result, captured, mocks = await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch, injected_gate=gate,
+        )
+
+        assert captured['build_workflow']['usage_gate'] is gate
+        mocks['build_gate'].assert_not_awaited()
+
+    async def test_injected_gate_is_never_torn_down(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch, injected_gate=gate,
+        )
+
+        gate.shutdown.assert_not_awaited()
+
+    async def test_injected_gate_survives_a_failing_workflow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _captured, _mocks = await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch, injected_gate=gate,
+            run_side_effect=RuntimeError('workflow exploded'),
+        )
+
+        assert result.outcome == 'blocked'
+        gate.shutdown.assert_not_awaited()
+
+    async def test_explicit_none_means_ungated_not_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        _result, captured, mocks = await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch, injected_gate=None,
+        )
+
+        mocks['build_gate'].assert_not_awaited()
+        assert captured['build_workflow']['usage_gate'] is None
+
+    async def test_owned_gate_is_built_and_torn_down(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Closes the same pre-existing leak on the both-live executor."""
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _result, captured, mocks = await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch, gate=gate,
+        )
+
+        mocks['build_gate'].assert_awaited_once()
+        assert captured['build_workflow']['usage_gate'] is gate
+        gate.shutdown.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        'failure', ['run', 'collect'],
+        ids=['workflow_run_raises', 'collect_metrics_raises'],
+    )
+    async def test_owned_gate_teardown_is_in_a_finally(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+    ):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        boom = RuntimeError('boom')
+        kwargs = (
+            {'run_side_effect': boom} if failure == 'run'
+            else {'collect_side_effect': boom}
+        )
+        await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch, gate=gate, **kwargs,
+        )
+
+        gate.shutdown.assert_awaited_once()
+
+    async def test_a_failing_owned_shutdown_never_damages_the_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        import logging
+
+        from shared.testing import make_gate_mock
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        gate = make_gate_mock()
+        gate.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
+
+        result, _captured, _mocks = await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch, gate=gate,
+        )
+
+        assert result.outcome == 'done'
+        assert 'shutdown failed' in caplog.text
 
 
 # ---------------------------------------------------------------------------
