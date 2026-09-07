@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import re
 import textwrap
+from pathlib import Path
 from typing import NamedTuple
 
 import yaml
@@ -27,6 +28,14 @@ from orchestrator.pytest_markers import _marker_name, _pytestmark_value
 #: cwd while a plain ``pytest orchestrator/tests`` runs from the repo root,
 #: and this pin must read identically under both.
 _ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
+
+#: This directory, resolved from THIS FILE and never from the process CWD, for
+#: the same reason ``_ORCH_YAML`` is: the census must come out identical under
+#: merge-verify (cwd ``orchestrator/``) and a bare ``pytest orchestrator/tests``
+#: (cwd the repo root).  Same idiom as
+#: test_whole_tree_scan_timeout_guard.py::_TESTS_DIR and
+#: test_marker_registration_drift.py::TESTS_DIR.
+_TESTS_DIR = Path(__file__).resolve().parent
 
 #: Same spelling as tests/scripts/test_fallback_verify_config.py, which pins
 #: the FLEET-chain side of this same budget (``--timeout > 60`` on every
@@ -604,3 +613,53 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
         False,  # 360        -- loosens under both
         False,  # 960        -- PYTEST_TIMEOUT (warm-lane bash bucket)
     ]
+
+
+# ---------------------------------------------------------------------------
+# The named regression instance.
+# ---------------------------------------------------------------------------
+
+#: The module whose in-band marker is the CONFIRMED, MEASURED instance of this
+#: defect -- the one that motivated the task.  Named as a constant so the pin
+#: below reads as a regression test for a specific historical failure rather
+#: than as an arbitrary sample of the tree.
+_NAMED_REGRESSION_MODULE = 'test_aiosqlite_leak_isolation.py'
+
+
+def test_the_aiosqlite_leak_isolation_regression_is_fixed() -> None:
+    """No marker in test_aiosqlite_leak_isolation.py may sit in the inversion band.
+
+    THE MEASURED INSTANCE, recorded here so the number is never re-guessed.
+
+    ``test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile``
+    carried ``@pytest.mark.timeout(120)``.  It spawns TWO full pytest
+    subprocesses -- a treatment arm and a control arm -- and measures 15.27s
+    unloaded (``8 passed in 17.72s`` for the module).  This suite's own
+    measured load inflation for that class of work is ~4.8x: 30.75s at loadavg
+    120-176 for a 6.46s unloaded scan, recorded against
+    WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py.  15.27 x 4.8 is ~73s,
+    already 61% of the old 120s budget -- and the loadavg 250-423 step at which
+    xdist worker DEATHS were actually observed sits one further inflation step
+    beyond that.  So 120 was genuinely too tight; VERIFY_CLI_PER_TEST_TIMEOUT
+    leaves ~19.6x headroom over the measurement.
+
+    WHY IT COST WHOLE RUNS rather than one test: ``timeout_method = "thread"``
+    answers a breach by ``os._exit()``ing the xdist worker, and
+    ``--max-worker-restart=0`` declines to replace it, truncating the session
+    and blaming whatever innocent test shared the dead worker.  That is how
+    this one marker was blamed for failures in tasks 4176, 4384 and 4405.
+
+    Asserted over the WHOLE module rather than the one qualname: the point is
+    that this file stays clean, not that one line stays fixed.
+    """
+    source = (_TESTS_DIR / _NAMED_REGRESSION_MODULE).read_text(encoding='utf-8')
+
+    offenders = [site for site in _timeout_marker_sites(source) if _inverts(site.seconds)]
+
+    assert not offenders, (
+        f'{_NAMED_REGRESSION_MODULE} has regressed to an inverting timeout '
+        f'marker: {[(s.qualname, s.seconds) for s in offenders]}. This module '
+        'spawns two full pytest subprocesses per test; at 15.27s unloaded and '
+        "this suite's measured ~4.8x load inflation it reaches ~73s, which a "
+        'marker inside the band clamps below. Use VERIFY_CLI_PER_TEST_TIMEOUT.'
+    )
