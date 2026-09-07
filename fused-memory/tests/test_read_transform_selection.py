@@ -3675,7 +3675,7 @@ class TestFetchProductionRankingsHoldsALease:
         async def _fetch(*args, **kwargs):
             return {'queries': {}}
 
-        _FakeMemoryService.initialize_raises = initialize_raises
+        monkeypatch.setattr(_FakeMemoryService, 'initialize_raises', initialize_raises)
         monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _fake_config)
         monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
         monkeypatch.setattr(bake, 'drop_collections', _drop_and_look)
@@ -3700,6 +3700,24 @@ class TestFetchProductionRankingsHoldsALease:
         await mod.fetch_production_rankings([], project_suffix='utest')
 
         assert reaper.live_leases() == []
+
+    async def test_the_raising_flag_is_restored_rather_than_left_set(self):
+        """`initialize_raises` is a CLASS attribute, so setting it directly
+        would leave the double raising for the rest of the pytest process.
+
+        Nothing breaks today only because every test that touches
+        `_FakeMemoryService` goes through `_install_doubles` first, which
+        resets it — an invariant a future test that constructs the double
+        directly has no way to know about, and whose breakage would surface
+        as an order-dependent failure under `pytest-randomly`.  Asserted
+        inside one test through a nested monkeypatch context, so it does not
+        itself depend on collection order.
+        """
+        with pytest.MonkeyPatch.context() as patcher:
+            self._install_doubles(patcher, initialize_raises=True)
+            assert _FakeMemoryService.initialize_raises is True
+
+        assert _FakeMemoryService.initialize_raises is False
 
     async def test_the_lease_is_released_when_the_service_raises(self, monkeypatch):
         """A failed pass must not hold the cron off any more than a failed
