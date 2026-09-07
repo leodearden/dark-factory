@@ -76,8 +76,10 @@ from fused_memory.server.grouped_read import (
 # left dormant, this import fails LOUDLY at import time, which is the right
 # way to be told to hoist the helper. (Hoisting it into a shared home is the
 # better end state and is deliberately NOT done here: near_duplicate_guard.py
-# is outside this task's lock set.)
-from fused_memory.server.near_duplicate_guard import _cosine_of
+# is outside this task's lock set.) Public name (task 4734): renamed from the
+# underscore-prefixed ``_cosine_of`` so this cross-module import no longer
+# reaches into another module's private surface.
+from fused_memory.server.near_duplicate_guard import cosine_of
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -508,7 +510,7 @@ def decide_band(
     scored = [
         (cosine, r)
         for r in results
-        if (cosine := _cosine_of(r)) is not None
+        if (cosine := cosine_of(r)) is not None
     ]
     if not scored:
         return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)

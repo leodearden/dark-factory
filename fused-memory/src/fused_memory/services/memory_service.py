@@ -7642,8 +7642,8 @@ class MemoryService:
                     # _search_mem0 ever stamps it.  The
                     # write-time near-duplicate guard reads the cosine from
                     # metadata['store_score'] and qualifies on `>= threshold`
-                    # (near_duplicate_guard.find_near_duplicate_memory :114-121, via
-                    # _cosine_of :71-84); a MISSING cosine means "not comparable" and can
+                    # (near_duplicate_guard.py::find_near_duplicate_memory, via
+                    # near_duplicate_guard.py::cosine_of); a MISSING cosine means "not comparable" and can
                     # never qualify at any threshold, while a synthetic one would
                     # hard-block EVERY procedural_knowledge write on a consolidated
                     # topic — turning a retrieval fix into a write outage on precisely

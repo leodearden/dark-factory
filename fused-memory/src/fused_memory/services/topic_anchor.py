@@ -67,7 +67,7 @@ Since task 3658 ``relevance_score`` is an ordinal RRF fusion value
 (rank-1 ~ 0.0164), NOT a cosine; the honest per-store cosine lives in
 ``metadata['store_score']``.  The write-time near-duplicate guard reads the
 cosine from ``metadata['store_score']`` and qualifies on ``>= threshold``
-(``near_duplicate_guard.py`` ``_cosine_of`` / ``find_near_duplicate_memory``).
+(``near_duplicate_guard.py`` ``cosine_of`` / ``find_near_duplicate_memory``).
 An injected anchor therefore MUST carry no ``store_score`` at all: a missing
 cosine means "not comparable" and can never qualify at any threshold, whereas
 a synthetic high score would hard-block EVERY ``procedural_knowledge`` write
@@ -154,7 +154,7 @@ def extract_anchor_topics(
     key presence and value types are not schema-enforced at READ time, so a
     missing, empty, or non-``str`` topic is skipped rather than raised on.
     ``bool`` is excluded despite being an ``int`` subclass, consistent with
-    the coercion discipline in ``near_duplicate_guard._cosine_of``.
+    the coercion discipline in ``near_duplicate_guard.cosine_of``.
 
     Returning ``[]`` is the ZERO-COST path and the caller must treat it as
     "make no backend call at all" — on the live corpus today that is the

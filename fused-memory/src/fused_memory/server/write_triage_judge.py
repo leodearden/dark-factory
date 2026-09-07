@@ -54,8 +54,9 @@ from fused_memory.server.grouped_read import PARENT_ID_KEY
 # A second copy does not raise when task 3658's
 # ``relevance_score → metadata['store_score']`` move happens again: it scores
 # every candidate as uncomparable, which empties the judge's slate and reads
-# exactly like a genuinely novel corpus.
-from fused_memory.server.near_duplicate_guard import _cosine_of
+# exactly like a genuinely novel corpus. Public name (task 4734): renamed
+# from the underscore-prefixed ``_cosine_of``.
+from fused_memory.server.near_duplicate_guard import cosine_of
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -369,7 +370,7 @@ def select_judge_candidates(
     that reads them.
 
     Ordered by DESCENDING per-store cosine, read through
-    ``near_duplicate_guard._cosine_of`` — the SAME reader ``decide_band``
+    ``near_duplicate_guard.cosine_of`` — the SAME reader ``decide_band``
     uses, imported rather than re-implemented (INV-5). A second copy is
     precisely how task 3658's ``relevance_score → metadata['store_score']``
     move would go wrong again, and it would not raise: it would score every
@@ -397,7 +398,7 @@ def select_judge_candidates(
     """
     scored: list[tuple[float, MemoryResult]] = []
     for result in results or ():
-        cosine = _cosine_of(result)
+        cosine = cosine_of(result)
         if cosine is not None:
             scored.append((cosine, result))
     if not scored:
