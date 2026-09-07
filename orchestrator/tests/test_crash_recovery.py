@@ -2815,7 +2815,8 @@ class TestSessionResumeGuard:
         ineligible (``{'no_transcript', 'stale'}``), and it is the shape
         production reaches on EVERY crash-recovery path — ``run()``'s finally
         executes an unconditional ``cleanup_config_dir`` teardown
-        (``workflow.py::TaskWorkflow.run``) while ``session_preserved`` keeps
+        (registered by ``workflow.py::TaskWorkflow._on_terminal_cleanups``,
+        run on every terminal exit) while ``session_preserved`` keeps
         the sidecar, so ``_adopt_recovered_session``'s glob hands the guard
         ``config_dir=None``. ~91% of post-3578 fallbacks (92 of 101, measured
         2026-09-04) had exactly this recoverable archive the predicate never

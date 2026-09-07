@@ -1930,6 +1930,106 @@ coverage is a red herring. Note `restore='published'` should never appear at
 all: a published restore satisfies the corroboration, so no veto — and no
 event — follows it. Its absence is not evidence about archive coverage.
 
+### Reachability outranks freshness, and the age bound that outranks reachability
+
+Task 3730 changed *what makes a recovered session eligible to resume*. Before
+it, the harness guard asked "is this sidecar fresh, and is its transcript still
+in the live config dir?" — and the live config dir is deleted on every
+crash-recovery path: `TaskWorkflow.run` registers the `cleanup_config_dir`
+teardown entry from
+`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._on_terminal_cleanups`,
+which runs on every terminal exit, while `session_preserved` keeps the sidecar.
+So the guard was asking a question that the crash it exists to recover from had
+already answered "no".
+
+**What it asks now.** A durable archive entry counts as *reachability*: if the
+transcript is in the archive, the session is neither `stale` on age nor
+uncorroborated, because an archived transcript does not decay with wall-clock.
+`session_resume.freshness_window_secs` (24h) therefore applies **only when no
+archive exists**. The lookup is done once per dispatch by the guard
+(`orchestrator/src/orchestrator/harness.py::Harness._archive_available`) and
+feeds both the eligibility decision and the `archive_available` field on the
+fallback event, so the two can never disagree.
+
+**The backstop.** `session_resume.absolute_resume_age_secs` (default
+`432000` = 5 days) rejects a sidecar past that age **regardless** of
+reachability, reporting the reason `aged_out`. Without it "an archive outranks
+freshness" would slide into "an archive means no age limit", and a sidecar that
+survived an arbitrarily long outage would resume into a world that had moved
+on. The two knobs are not redundant and neither is dead config: freshness is
+the tighter, archive-suppressible one; the backstop is looser and
+unconditional.
+
+**It is DERIVED, not chosen.** The number answers "past what sidecar age can no
+legitimate in-flight task still be running?", and a sidecar's `started_at` is
+stamped per *invocation*, so its age at re-dispatch is two terms, both measured
+from `runs.db` by
+`orchestrator/src/orchestrator/resume_age_bound.py::observed_resume_age_inputs`:
+
+| term | what it is | measured 2026-09-07 |
+|---|---|---|
+| T1 in-flight | max `task_completed.duration_ms`, legitimate outcomes only (cancellations excluded — their durations reflect operator action) | 8.90 h over n=4,730 |
+| T2 downtime | max gap between consecutive `events` rows over the trailing 90 days: the sidecar ages while nothing runs | 56.99 h over n=303,040 gaps |
+
+`required = ceil((T1 + T2) × 1.5)` = 355,803 s = 4.12 days; the shipped default
+is that rounded up to the next whole day. **T2 is why the bound must exceed the
+freshness window** — a physical reason, not a multiplier tuned until it cleared
+the constraint: T1 alone (8.90 h) cannot reach 24 h at any honest factor.
+
+`orchestrator/tests/test_resume_age_bound.py` re-derives this against the live
+`runs.db` on **every verify run** and goes red if the fleet outgrows the shipped
+default (trip point: T1 + T2 above 80 h, roughly a 3.3-day outage). When it
+fires it is telling the truth — re-derive the bound, do not raise the constant
+to silence it; an anti-inflation clamp in the same file fails a default raised
+high enough that no realistic fleet could trip the guard. **Green tier**: the
+knob hot-reloads with the rest of the `session_resume` submodel via
+`reload_config` ([§6](#6-config-reload-vs-restart)), with no `RELOADABLE_FIELDS`
+edit.
+
+**The reason vocabulary** on `session_resume_fallback`. `data.reasons` is a
+**sorted list of every** reason the session was rejected, not a first match — so
+a `GROUP BY 1` over it is a co-occurrence census, and a session can report two
+at once:
+
+| reason | means | actionable? |
+|---|---|---|
+| `stale` | Old **with no archive to redeem it** (age ≥ `freshness_window_secs` and nothing in the archive), *or* the sidecar could not be dated at all — a missing/unparseable `started_at` is never redeemed by an archive, because an age that cannot be computed cannot be bounded either. | Yes — ask why the archive is missing (work the archival subsection above). |
+| `aged_out` | Age ≥ `absolute_resume_age_secs`. The backstop, and the one age check an archive does not suppress. | No — this is the backstop working. Expect a batch of them after a long outage. |
+| `no_transcript` | No archive, and the live config dir survives but holds no transcript for this session (or no config dir / session id was ever stashed). | Yes — a genuine corroboration failure. |
+| `reseeded` | No archive, and the stashed config dir is *provably* gone (ENOENT/ENOTDIR): warm-lane acquire always re-seeds from base, wiping `<lane>/.task/`. | No — expected. |
+| `capped` | `resume_count` ≥ `max_resumes_per_task`. Deliberately **mediation-agnostic**: an archive-mediated resume is throttled by the same counter, because the archive is transport, not a fresh start. | No — by-design throttling. |
+
+None of these feeds the fallback-storm escalation; all five are by-design
+(`_BY_DESIGN_SESSION_RESUME_REASONS`), so a week-old batch of sidecars after an
+outage cannot page you.
+
+```sql
+-- How often is the backstop firing, and with what beside it?
+SELECT json_extract(data, '$.reasons') AS reasons,
+       json_extract(data, '$.archive_available') AS archived,
+       COUNT(*)
+  FROM events
+ WHERE event_type = 'session_resume_fallback'
+   AND json_extract(data, '$.reasons') LIKE '%aged_out%'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+**Two baselines that are stale in the older task records, corrected here.** The
+task 3730 record cites "0 successes against 217 fallbacks" and task 3221;
+re-measured against `runs.db` on 2026-09-07 the true lifetime figures are **6**
+`session_resume`, **432** `session_resume_fallback` and **6**
+`session_resume_failed` (3221 is cancelled). And the archive-ignored rate — the
+share of post-3578 fallbacks that carried a recoverable archive the predicate
+never consulted, which is the measurement this change acts on — now stands at
+**159 of 172 (92%)**, measured 2026-09-07. It has been re-measured three times
+at growing sample size and has not moved: 32/34 in the original disposition,
+92/101 (91%) on 2026-09-04, 159/172 (92%) today. A finding that stable is not
+sampling noise. Expect the
+fallback count to fall and `session_resume` to rise as the fleet redeploys onto
+it; a `session_resume` that does **not** rise means the archive-mediated path is
+not firing, and the query above (with `archive_available` true beside a
+non-`aged_out` reason) is where to look first.
+
 ---
 
 ## See also

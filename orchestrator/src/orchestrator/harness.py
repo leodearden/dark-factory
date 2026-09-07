@@ -3759,7 +3759,9 @@ class Harness:
         # CORRECTED (task 3730, from this task's own Details). Production
         # reaches exactly that state on EVERY crash-recovery path, and by
         # design: run()'s finally executes an unconditional cleanup_config_dir
-        # teardown (workflow.py::TaskWorkflow.run) while session_preserved
+        # teardown (registered by
+        # workflow.py::TaskWorkflow._on_terminal_cleanups, run on every
+        # terminal exit of TaskWorkflow.run) while session_preserved
         # keeps the sidecar, so the config dir is gone and
         # _adopt_recovered_session's glob finds nothing. A reseed is not the
         # only way to arrive here, and it is not the common one. With an

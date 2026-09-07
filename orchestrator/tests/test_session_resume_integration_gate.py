@@ -176,8 +176,9 @@ def _make_transcript(base: Path, session_id: str) -> Path:
 
     NOTE WHAT THIS SHAPE IS AND IS NOT (task 3730). It is a LIVE config dir,
     which production DELETES on every crash-recovery path —
-    ``TaskWorkflow.run``'s finally runs ``cleanup_config_dir`` unconditionally
-    while ``session_preserved`` keeps the sidecar. So a row built on this
+    ``TaskWorkflow._on_terminal_cleanups``'s ``cleanup_config_dir`` entry runs
+    on every terminal exit of ``TaskWorkflow.run``, while ``session_preserved``
+    keeps the sidecar. So a row built on this
     helper exercises corroboration by the live transcript, not the state the
     fleet actually presents; the ``delta_`` rows below deliberately do NOT call
     it, and corroborate from the durable archive instead.
@@ -1562,9 +1563,11 @@ async def test_delta_archive_backed_crash_shape_adopts_and_injects(harness: Harn
     PRESERVED, durable archive PRESENT. That combination now reaches ELIGIBLE
     and injects the resume.
 
-    WHY THIS IS THE CASE THAT MATTERS. ``TaskWorkflow.run``'s finally executes
-    an UNCONDITIONAL ``cleanup_config_dir`` teardown while ``session_preserved``
-    keeps the sidecar, so on every crash-recovery path the live config dir is
+    WHY THIS IS THE CASE THAT MATTERS. ``TaskWorkflow.run`` runs the
+    ``cleanup_config_dir`` teardown entry registered by
+    ``TaskWorkflow._on_terminal_cleanups`` on EVERY terminal exit, while
+    ``session_preserved`` keeps the sidecar, so on every crash-recovery path
+    the live config dir is
     gone and only the sidecar survives. The eligible-path rows above
     (``test_b1_warm_lane_adopts_then_injects_same_session`` and friends) all
     seed a ``claude-config-<sid>/`` tree via ``_make_transcript`` — a shape
