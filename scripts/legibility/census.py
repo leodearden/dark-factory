@@ -136,6 +136,65 @@ def batch_dup_rate(records: list[dict]) -> float:
 # mine_to_saturation — stratified-random batch loop + saturation stop
 # ---------------------------------------------------------------------------
 
+_MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH = 3
+"""How many of ``coder.code_digests``' per-digest WARNINGs may survive ONE
+census mining batch before the rest are bounded away in favour of the
+batch aggregate.
+
+Small, but deliberately NOT zero. Zero would mean a census run silently
+swallows another module's log records -- the exact silent-degradation
+shape this fix exists to close. A small allowance keeps the raw,
+unaggregated line shape visible for the common one-or-two-failure batch
+(where there never was a flood), makes the suppression obviously PARTIAL
+rather than total, and still turns a 20-digest storm from 20 lines into
+4. The aggregate line states how many lines were bounded away, so the
+drop stays loud."""
+
+
+@contextlib.contextmanager
+def _bounded_coder_warnings(limit: int):
+    """Bound ``legibility.coder``'s per-digest WARNINGs to *limit* records
+    for the duration of the ``with`` block, yielding the counting filter
+    so the caller can read ``.suppressed``.
+
+    Deliberately CALLER-SCOPED, and removed in a ``finally`` so an
+    exception mid-batch cannot leave it attached. ``code_digests``'
+    per-digest WARNING is the only sink some failures ever reach for
+    ``nightly.run_nightly``'s trickle -- one or two failures a night,
+    where the per-digest shape is exactly right -- so it must never be
+    silenced globally, dropped to DEBUG, or bounded beyond the census's
+    own call.
+
+    A counting ``logging.Filter`` rather than either alternative: raising
+    the coder logger's LEVEL would suppress any FUTURE non-digest coder
+    warning too, and matching on the message template would couple census
+    to a string in ``coder.py`` -- a file this task holds no lock on and
+    which is free to reword. Filtering by count is surgical here because
+    the per-digest funnel is the only ``logger.*`` call in the whole coder
+    module, so there is no other record kind to collaterally swallow."""
+
+    class _CountingFilter(logging.Filter):
+        def __init__(self):
+            super().__init__()
+            self.seen = 0
+            self.suppressed = 0
+
+        def filter(self, record):
+            self.seen += 1
+            if self.seen > limit:
+                self.suppressed += 1
+                return False
+            return True
+
+    coder_logger = logging.getLogger("legibility.coder")
+    counting_filter = _CountingFilter()
+    coder_logger.addFilter(counting_filter)
+    try:
+        yield counting_filter
+    finally:
+        coder_logger.removeFilter(counting_filter)
+
+
 @dataclass
 class BatchStats:
     """Per-batch mining tally: how one ``coder.code_digests`` batch scored
@@ -225,6 +284,14 @@ def mine_to_saturation(
     because a batch has at most ``_DEFAULT_CENSUS_BATCH_SIZE`` digests, so
     the worst case is one long line rather than N lines.
 
+    The aggregate does not merely ADD to the flood: the
+    ``coder.code_digests`` call is wrapped in ``_bounded_coder_warnings``,
+    which caps its per-digest WARNINGs at
+    ``_MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH`` for the duration of THIS
+    call only, and the aggregate names how many lines that bound dropped.
+    The bound is caller-scoped by construction and removed in a ``finally``
+    -- ``nightly.run_nightly``'s trickle keeps full per-digest visibility.
+
     *max_batches* is the OPERATOR COST CAP (``--max-batches``): mining
     stops with ``stop_reason="capped"`` once that many batches have been
     coded. The cap is enforced here, inside the loop, rather than by
@@ -270,9 +337,14 @@ def mine_to_saturation(
     consecutive_saturated = 0
 
     for index, batch in enumerate(batch_source):
-        run_result = coder.code_digests(
-            list(batch), codebook_dict, project=project, model=model, invoke=invoke,
-        )
+        # ONLY this call is bounded -- see _bounded_coder_warnings' docstring
+        # for why the bound must never outlive it.
+        with _bounded_coder_warnings(
+            _MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
+        ) as bounded:
+            run_result = coder.code_digests(
+                list(batch), codebook_dict, project=project, model=model, invoke=invoke,
+            )
         result.records.extend(run_result.records)
 
         dup_rate = batch_dup_rate(run_result.records)
@@ -310,10 +382,18 @@ def mine_to_saturation(
                 f"{len(sessions)}x {reason!r} (e.g. session={sessions[0]})"
                 for reason, sessions in by_reason.items()
             )
+            # State the bound's own cost: a suppressed line is a dropped
+            # record, and a silent drop is the defect this whole line closes.
+            bound_note = (
+                f" [{bounded.suppressed} per-digest coder line(s) suppressed by "
+                f"this batch's bound of {_MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH}]"
+                if bounded.suppressed else ""
+            )
             logger.warning(
                 "mining batch %d: %d/%d digest(s) failed to code, %d distinct "
-                "reason(s): %s",
-                index, run_result.failed, run_result.total, len(by_reason), breakdown,
+                "reason(s): %s%s",
+                index, run_result.failed, run_result.total, len(by_reason),
+                breakdown, bound_note,
             )
 
         consecutive_saturated = consecutive_saturated + 1 if saturated else 0
