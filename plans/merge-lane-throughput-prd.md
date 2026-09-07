@@ -482,7 +482,9 @@ escalation") is WITHDRAWN as written.** Its whole remedy — laptop-side
 host-global admission, `RunnerBusy`, workstation-side local fallback, the
 `verify_host_busy` event, and the storm counter — was C's deliverable, and C
 is cancelled (superseded, per the 2026-09-03 ruling). No task currently owns
-any part of that remedy. Decision 2's text is left in place above per this
+any part of that remedy — the remedy is unowned, not the behaviour: what a
+same-project contention does today is still task 2307 β's born-at-L2 path
+(see (c)). Decision 2's text is left in place above per this
 PRD's frozen-text convention; read it as historical design intent, not
 current or implemented behaviour.
 
@@ -500,7 +502,11 @@ it off, and **not addressed by anything this PRD has implemented**.
 consistent with D1/5053 making no change here; see that task's own NOTE);
 `reify-laptop.yaml` sets it `true` (live). A project that later flips the
 knob on inherits the live born-at-L2 contention path with no arbitration
-lever in front of it.
+lever in front of it. Decision 2 also promised that C would amend
+`plans/laptop-warm-verify-flock-orphan-prd.md` with a dated pointer (INV-9)
+recording the supersession; with C cancelled, that pointer is moot and will
+not be filed — that PRD's β ruling stands as current, unsuperseded
+behaviour, which is exactly what this item retains.
 
 **(d) Open question, left for the PRD owner — NOT filed as part of this
 correction.** Whether to file a narrowed successor to C, covering only the
