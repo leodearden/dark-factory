@@ -82,6 +82,8 @@ _CENSUS_SCRIPT_PATH = (
 # be imported from, so its ``__all__`` grants the shared rule no second home.
 __all__ = [
     'DEFAULT_MAX_PAGES',
+    'WRITE_REASON',
+    'WRITE_SOURCE',
     'DEFAULT_PAGE_SIZE',
     'DEFAULT_SCROLL_MAX_PAGES',
     'ERROR_OUTCOMES',
@@ -96,6 +98,7 @@ __all__ = [
     'is_valid_topic_slug',
     'load_census_module',
     'plan_renames',
+    'rename_one',
 ]
 
 
@@ -107,6 +110,10 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'canonical_collision',
     'under_enumerated',
     'scroll_budget_exhausted',
+    'memory_not_found',
+    'topic_moved_since_plan',
+    'update_failed',
+    'rename_error',
 })
 
 #: Every bucket the report carries, PRE-SEEDED TO EMPTY.  Seeding is the
@@ -122,7 +129,21 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'record_without_id',
     'slug_collision',
     'canonical_collision',
+    # from rename_one
+    'memory_not_found',
+    'topic_moved_since_plan',
+    'update_failed',
+    'rename_error',
 )
+
+#: Written to every ``update_memory`` so the write journal attributes each
+#: rename to this sweep rather than to a generic ``mcp_tool``.  The amendment
+#: storm alarm reads this field; a bulk run under the default source would
+#: look exactly like the runaway rewrite that alarm exists to catch.
+WRITE_SOURCE = 'normalize_topic_slugs'
+
+#: Recorded on the write journal row beside the patch.
+WRITE_REASON = 'corpus-wide topic-slug normalization (task 4878)'
 
 #: Page size and page budget for each cell's scroll.  ALIASED from the
 #: backend, never restated: the budget travels with the paging loop it bounds
@@ -591,3 +612,116 @@ def plan_renames(records, *, project_id: str) -> tuple[list[Rename], list[dict]]
         str(s.get('memory_id')),
     ))
     return renames, skips
+
+
+# ---------------------------------------------------------------------------
+# The single write boundary
+# ---------------------------------------------------------------------------
+
+async def rename_one(memory_service, rename: Rename, *, apply: bool) -> dict:
+    """Move one record's topic, or report precisely why it was not moved.
+
+    The only function here that writes.  Order is copied from
+    ``retro_stamp_topics.stamp_one`` and is load-bearing:
+
+    1. **live re-read** (``get_memory_by_id``).  The plan's ids come off a
+       scroll that may be minutes old on a corpus orchestrators are writing
+       to.  Reading first is what turns a record consolidated away since the
+       scroll into a report line instead of a Qdrant ``set_payload`` that
+       acknowledges a write to nothing.
+    2. **decide** against the LIVE value, not the planned one.  A topic that
+       moved since the plan makes this row stale; applying anyway would
+       overwrite a live value with a fold of a value that no longer exists —
+       a data loss the report would score as a success.  A live topic that
+       already equals the target ends the call: a no-op ``update_memory``
+       would still journal a write op, still count toward the
+       content-amendment storm alarm, and would inflate the renamed count
+       with records that gained nothing.
+    3. **write**, metadata-only, patch = exactly ``{'topic': new}`` under
+       ``metadata_mode='merge'``.  Narrow on purpose: a wider patch would let
+       a normalization silently clobber ``canonical``, ``supersedes`` or the
+       consolidation bookkeeping across the whole target population at once.
+       Never a delete-and-recreate — that would mint a new memory id,
+       orphaning every reference to the old one and destroying ``created_at``,
+       the field consolidation uses to pick a canonical.
+
+    Every await is individually guarded.  The artifact is written after the
+    loop, so an exception escaping here would discard everything the sweep had
+    already learned; one backend hiccup must cost one report row instead.
+
+    Args:
+        memory_service: The injected ``MemoryService``.
+        rename: The frozen plan row.
+        apply: ``False`` performs the read and the decision and issues no
+            write, so the rehearsal exercises the SAME path ``--apply`` runs
+            rather than predicting it.
+
+    Returns:
+        A report-ready dict always carrying ``outcome``, plus whatever that
+        outcome needs to be actionable without a follow-up query
+        (``existing_topic``, ``error``, ``error_type``, ``response``).
+    """
+    base = {
+        'project_id': rename.project_id,
+        'memory_id': rename.memory_id,
+        'old_topic': rename.old_topic,
+        'new_topic': rename.new_topic,
+    }
+
+    try:
+        record = await memory_service.get_memory_by_id(
+            project_id=rename.project_id, memory_id=rename.memory_id,
+        )
+    except Exception as exc:
+        return {
+            **base,
+            'outcome': 'rename_error',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+    if record is None:
+        return {**base, 'outcome': 'memory_not_found'}
+
+    metadata = dict(record.get('metadata') or {})
+    existing_topic = metadata.get('topic')
+
+    if existing_topic == rename.new_topic:
+        return {**base, 'outcome': 'already_normalized', 'existing_topic': existing_topic}
+    if existing_topic != rename.old_topic:
+        return {
+            **base,
+            'outcome': 'topic_moved_since_plan',
+            'existing_topic': existing_topic,
+        }
+
+    if not apply:
+        return {**base, 'outcome': 'would_rename', 'existing_topic': existing_topic}
+
+    try:
+        response = await memory_service.update_memory(
+            memory_id=rename.memory_id,
+            project_id=rename.project_id,
+            metadata_patch={'topic': rename.new_topic},
+            metadata_mode='merge',
+            reason=WRITE_REASON,
+            _source=WRITE_SOURCE,
+        )
+    except Exception as exc:
+        return {
+            **base,
+            'outcome': 'rename_error',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+    # ``update_memory`` reports a not-found (and some other rejections) by
+    # RETURNING a structured envelope rather than raising, so a caller that
+    # only guarded against exceptions would score a refused write as a rename
+    # -- and the residue probe would then find the legacy slug still populated
+    # with no explanation anywhere in the report.
+    if isinstance(response, dict) and response.get('error_type'):
+        return {
+            **base,
+            'outcome': 'update_failed',
+            'error_type': response.get('error_type'),
+            'error': response.get('error'),
+            'response': response,
+        }
+    return {**base, 'outcome': 'renamed', 'response': response}
