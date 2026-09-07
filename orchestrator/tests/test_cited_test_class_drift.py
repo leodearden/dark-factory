@@ -47,7 +47,7 @@ from __future__ import annotations
 import ast
 import re
 import tokenize
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -415,6 +415,60 @@ class TestWrappedCandidates:
         assert _wrapped_candidates(source, 'TestFileExtensionsDriftGuard') == {
             'TestFileExtensionsDriftGuardDrift'
         }
+
+
+def _dangling_citations(src_dirs: Sequence[Path], test_dirs: Sequence[Path]) -> dict[str, str]:
+    """``{cited name: '<file>:<line>'}`` for every citation that does NOT resolve.
+
+    Four passes. (1) Sweep every ``*.py`` under *src_dirs* and extract its
+    citations, keeping the first location seen for each name; a file that
+    cannot be read or tokenized raises rather than being skipped. (2) LIVENESS:
+    a sweep that found no citations at all is broken, not clean, and says so —
+    returning ``{}`` there would let this guard pass forever while checking
+    nothing. (3) Resolve the whole cited set in one pass. (4) For the remainder
+    only, generate line-wrap join candidates and resolve ALL of them in ONE
+    further pass; a name with a candidate that resolves is not dangling.
+
+    Batching pass (4) is what keeps the fallback a fixed one-pass cost instead
+    of one full re-sweep per unresolved name. Reported locations are relative
+    to the repo root when the file is inside it (a synthetic tree is not), and
+    a surviving name carries the joined candidates that were tried, so a
+    failure message can show why a wrapped citation was still rejected.
+    """
+    citations: dict[str, str] = {}
+    sources: list[str] = []
+    for src_dir in src_dirs:
+        for path in sorted(src_dir.rglob('*.py')):
+            try:
+                source = path.read_text()
+                names = _cited_names(source)
+            except (OSError, ValueError, SyntaxError, tokenize.TokenError) as exc:
+                raise AssertionError(
+                    f'{path} could not be read/tokenized while sweeping for cited '
+                    f'test class names: {exc!r}. Fix the file — a silently skipped '
+                    f'file would make this guard vacuous for it.'
+                ) from exc
+            sources.append(source)
+            shown = path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path
+            for name, line in names.items():
+                citations.setdefault(name, f'{shown}:{line}')
+    if not citations:
+        raise AssertionError(
+            f'swept {[str(d) for d in src_dirs]} and found no cited test class '
+            f'names at all. The sweep is broken, not the tree clean.'
+        )
+    unresolved = set(citations) - _defined_test_classes(test_dirs, set(citations))
+    tried: dict[str, set[str]] = {name: set() for name in unresolved}
+    for name, candidates in tried.items():
+        for source in sources:
+            candidates.update(_wrapped_candidates(source, name))
+    joined = _defined_test_classes(test_dirs, {c for cs in tried.values() for c in cs})
+    return {
+        name: citations[name]
+        + (f' (also tried joined: {", ".join(sorted(tried[name]))})' if tried[name] else '')
+        for name in sorted(unresolved)
+        if not tried[name] & joined
+    }
 
 
 class TestDanglingCitations:
