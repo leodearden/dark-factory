@@ -24,7 +24,15 @@ executable:
   has the TASK tip as ``^1``, so the containment check exits 0 trivially
   and the arm falsely concludes "unrelated later merge, do not stamp".
 
-A third pin covers the same arm's *rationale*: which train-member shape
+Both of those are FALSE rc=0 verdicts, so a third pin covers the arm's
+mirror image: the LEGITIMATE rc=0 exit, where a real candidate exists,
+``contained-before`` correctly returns 0 because the branch was already in
+main before it, and the agent must NOT stamp.  Without it the suite would
+stay green if rc=0 stopped being reachable at all -- while the runbook
+began licensing a fabricated merge sha, the very risk the citation gate
+below the arm exists to close.
+
+A fourth pin covers the same arm's *rationale*: which train-member shape
 can actually REACH rc=0 at all (the no-op-rebase member), versus the
 ordinary coalesce-absorbed non-tip member whose shas the pre-merge rebase
 rewrites, which is permanently rc=1 -- ``skills/merge-queue/SKILL.md``
@@ -63,15 +71,23 @@ the runbook form and the production method AGREE: after this task they
 deliberately diverge (the doc gains ``--topo-order``, production does not)
 until that follow-up lands.
 
+Every synthetic repo carries the repo's standard git-isolation guards
+(esc-3072-3): ``assert_isolated_git_repo`` pre-flights each fixture root
+before any subprocess touches it, and ``git_env_with_ceiling`` caps git's
+upward repo discovery at that root -- the same pairing
+``orchestrator/tests/test_branch_work_landed.py`` and
+``orchestrator/tests/test_git_ops_no_op_landing.py`` apply.
+
 No sleeps, no network, no skips: if git is unavailable these fail loudly
 rather than silently skipping (the repo's no-silent-fail-soft invariant).
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
+
+from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 TASK_ID = 'T'
 
@@ -83,6 +99,39 @@ _GIT_ENV_ARGS = [
     '-c', 'commit.gpgsign=false',
 ]
 
+# DUPLICATION, deliberately not extracted yet.  ``_GIT_ENV_ARGS``, ``_git``,
+# ``_git_rc``, ``_commit`` and ``_new_repo`` are near-verbatim twins of the same
+# five helpers in ``test_citation_gate_positive_arm.py`` (this copy generalises
+# ``_git`` with ``date=`` and ``_commit`` with a per-branch filename).  Per-file
+# ``_git`` helpers are the wider suite's norm, so two copies stay under the bar.
+# If a THIRD real-git module for this ladder appears, lift these five -- in the
+# generalised form below -- into a small shared fixture module beside
+# ``_orch_helpers.py`` and have all three import it, rather than adding a third
+# copy.
+
+
+def _git_env(root: Path, date: str | None = None) -> dict[str, str]:
+    """Subprocess environment for a git call in *root*.
+
+    :func:`_orch_helpers.git_env_with_ceiling` caps git's upward repository
+    discovery at *root* (incident esc-3072-3), so a fixture command can never
+    retarget an ENCLOSING repository -- which is not hypothetical here, because
+    pytest's basetemp can sit inside a live task worktree.  The complementary
+    hazard -- an inherited ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_INDEX_FILE``,
+    which SKIPS discovery outright rather than walking, so no ceiling can bound
+    it -- is stripped from ``os.environ`` for the duration of every test by
+    ``df_pytest_isolation.py::_df_git_env_hermetic`` (autouse), which is why the
+    ``os.environ`` copy this ceiling is built on is already clean.
+
+    *date* pins both committer and author date, which is how the date-skew
+    fixture below is built.
+    """
+    env = git_env_with_ceiling(root)
+    if date is not None:
+        env['GIT_COMMITTER_DATE'] = date
+        env['GIT_AUTHOR_DATE'] = date
+    return env
+
 
 def _git(root: Path, *args: str, date: str | None = None) -> str:
     """Run git in *root* and return stripped stdout (raises on non-zero).
@@ -90,19 +139,17 @@ def _git(root: Path, *args: str, date: str | None = None) -> str:
     *date* pins both committer and author date for the invocation, which is
     how the date-skew fixture below is built.
     """
-    env = None
-    if date is not None:
-        env = {**os.environ, 'GIT_COMMITTER_DATE': date, 'GIT_AUTHOR_DATE': date}
     return subprocess.run(
         ['git', *_GIT_ENV_ARGS, *args],
-        cwd=root, check=True, capture_output=True, text=True, env=env,
+        cwd=root, check=True, capture_output=True, text=True, env=_git_env(root, date),
     ).stdout.strip()
 
 
 def _git_rc(root: Path, *args: str) -> int:
     """Run git in *root* and return only its exit code."""
     return subprocess.run(
-        ['git', *_GIT_ENV_ARGS, *args], cwd=root, capture_output=True, text=True,
+        ['git', *_GIT_ENV_ARGS, *args],
+        cwd=root, capture_output=True, text=True, env=_git_env(root),
     ).returncode
 
 
@@ -120,8 +167,19 @@ def _commit(root: Path, subject: str, filename: str, date: str | None = None) ->
 
 
 def _new_repo(root: Path) -> None:
+    """Create *root* as a repository root, then assert the isolation contract.
+
+    :func:`_orch_helpers.assert_isolated_git_repo` is a PURE-FILESYSTEM
+    pre-flight: it refuses a directory that merely sits inside some repo instead
+    of being one.  It runs immediately after ``git init`` -- the earliest moment
+    at which it can hold -- so every later fixture command in this module is
+    covered by the pre-flight as well as by the ceiling in :func:`_git_env`.
+    Asserting inside ``_new_repo`` rather than at each call site means a test
+    added later cannot forget it.
+    """
     root.mkdir()
     _git(root, 'init', '-b', 'main')
+    assert_isolated_git_repo(root)
 
 
 def _candidate_documented(root: Path, tid: str) -> str:
@@ -322,6 +380,64 @@ def test_a_merge_created_on_main_puts_main_at_caret_1(tmp_path: Path) -> None:
         'merged from main, the documented ^1 check renders the correct "this IS the '
         'merge that brought it in" verdict -- so the hazard above is about merge '
         'DIRECTION, not about the check itself'
+    )
+
+
+def test_an_already_landed_branch_yields_the_arms_legitimate_rc0_verdict(
+    tmp_path: Path,
+) -> None:
+    """The arm's CORRECT rc=0 exit: a real candidate exists, and must NOT be stamped.
+
+    The two pins above are both FALSE rc=0 verdicts (wrong candidate under date
+    order; branch-side ``^1``) and the ones below assert the positive "stamp it"
+    arm, so nothing yet executes the outcome rc=0 actually exists to produce.
+    This is that mirror.
+
+    ``task/T`` never advances past its creation point, so it is already
+    contained in main by construction -- the fast-forward / phantom-branch
+    landing -- and main then advances via an UNRELATED merge.  Two things must
+    hold together: the candidate query is NON-EMPTY, so the arm reaches its
+    containment check instead of short-circuiting on the ``$c`` empty path, and
+    that check returns 0 because the branch really was in main beforehand.  This
+    makes executable the second half of step 4's claim that the oldest
+    topological descendant merge is "an unrelated later merge only when the
+    branch was already in main before it".
+
+    If this ever flipped to rc=1, the suite would otherwise stay green while the
+    runbook started stamping ``$c`` as the merge that brought this branch in --
+    fabricated landing evidence for a branch carrying none of the task's work,
+    which the citation gate below the arm exists to catch.
+    """
+    root = tmp_path / 'repo'
+    _new_repo(root)
+
+    base = _commit(root, 'base', 'base.txt')
+    _git(root, 'branch', f'task/{TASK_ID}')  # left AT base; never advanced
+
+    _git(root, 'checkout', '-b', 'f1')
+    _commit(root, 'f1work', 'f1.txt')
+    _git(root, 'checkout', 'main')
+    _git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge f1 into main')
+    mf1 = _git(root, 'rev-parse', 'HEAD')
+
+    assert _git(root, 'rev-parse', f'task/{TASK_ID}') == base, (
+        'the branch must still sit at its creation point -- that is what makes it '
+        'already contained in main, which is the precondition for a legitimate rc=0'
+    )
+    assert _git(root, 'rev-parse', f'{mf1}^1') == base, (
+        'the unrelated merge was created on main, so its first parent is '
+        'main-just-before-it, which already contains the branch'
+    )
+
+    candidate = _candidate_topo(root, TASK_ID)
+    assert candidate == mf1, (
+        'the arm must reach its containment check with a REAL candidate here: rc=0 has '
+        'to be decided by the check, not short-circuited by an empty $c'
+    )
+    assert _contained_before(root, TASK_ID, f'{candidate}^1') == 0, (
+        "this is the arm's correct 'unrelated later merge, do not stamp' exit -- the "
+        'branch was genuinely in main before $c, so no merge commit brought it in and '
+        'stamping $c would fabricate landing evidence'
     )
 
 

@@ -231,9 +231,10 @@ must itself be on main *before* `$c`; if it is the branch side, read `$c^2` inst
 
 **The citation gate (phantom-branch check).** rc=0 does not by itself prove this branch carries
 any work: a branch that never advanced past its creation point has main's own old base commit as
-its tip, so it passes ancestry trivially, searches marker-empty, and yields no rev-list
-candidate — exactly this arm — while carrying none of the task's work. Stamping it would
-fabricate landing evidence for a phantom branch, and the server's only backstop
+its tip, so it passes ancestry trivially, searches marker-empty, and yields no *stampable*
+rev-list candidate — either none at all, or one whose containment check returns rc=0 because
+main already contained the branch — exactly this arm, while carrying none of the task's work.
+Stamping it would fabricate landing evidence for a phantom branch, and the server's only backstop
 (`git merge-base --is-ancestor <sha> main`) passes for it. Require a **positive task citation on
 main** first:
 
