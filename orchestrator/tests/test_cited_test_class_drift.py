@@ -47,9 +47,10 @@ from __future__ import annotations
 import ast
 import re
 import tokenize
+import tomllib
 from collections.abc import Collection, Iterable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import NamedTuple, cast
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -598,3 +599,115 @@ class TestDanglingCitations:
         )
         with pytest.raises(AssertionError, match='no cited test class names'):
             _dangling_citations(src_dirs, test_dirs)
+
+
+#: FLOORS, deliberately set well below the live values so ordinary tree growth
+#: can never break them, and never equalities or "measured at authorship"
+#: figures — the house pattern
+#: (``test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES``,
+#: ``test_whole_tree_scan_timeout_guard.py::_MIN_EXPECTED_SCANNERS``). They are
+#: the only numeric constants in this module.
+_MIN_SRC_FILES = 300
+_MIN_TEST_FILES = 900
+_MIN_CITATIONS = 100
+_MIN_CITING_MEMBERS = 3
+
+
+class _Sweep(NamedTuple):
+    """One real-tree sweep plus the census that proves it was not vacuous."""
+
+    dangling: dict[str, str]
+    src_files: int
+    test_files: int
+    citations: set[str]
+    citing_members: set[str]
+
+
+@pytest.fixture(scope='module')
+def _real_tree_sweep() -> _Sweep:
+    """The single real-tree sweep, shared by both tests that need it.
+
+    The census is gathered by its own extraction pass rather than read off the
+    guard's result, because on a green tree that result is ``{}`` and carries
+    no information whatever about how much was actually swept — which is
+    exactly the vacuity the census exists to rule out.
+    """
+    src_dirs, test_dirs = _src_dirs(), _test_dirs()
+    citations: set[str] = set()
+    citing_members: set[str] = set()
+    src_files = 0
+    for src_dir in src_dirs:
+        for path in sorted(src_dir.rglob('*.py')):
+            src_files += 1
+            names = _cited_names(path.read_text())
+            if names:
+                citations.update(names)
+                citing_members.add(src_dir.parent.name)
+    return _Sweep(
+        dangling=_dangling_citations(src_dirs, test_dirs),
+        src_files=src_files,
+        test_files=sum(1 for d in test_dirs for _ in d.rglob('*.py')),
+        citations=citations,
+        citing_members=citing_members,
+    )
+
+
+class TestCitedTestClassDrift:
+    """The deliverable guard, wired to the REAL workspace.
+
+    Green on arrival — every test class cited in src prose today exists — so
+    nothing here can currently fail, and its whole value is in failing on the
+    NEXT false coverage claim. ``TestDanglingCitations`` above carries the
+    burden of proving the mechanism can fail at all.
+    """
+
+    def test_every_cited_test_class_resolves(self, _real_tree_sweep: _Sweep):
+        """THE guard."""
+        dangling = _real_tree_sweep.dangling
+        assert not dangling, (
+            'src prose cites test classes that do not exist:\n'
+            + '\n'.join(f'  {name}  cited at {where}' for name, where in sorted(dangling.items()))
+            + '\n\nA docstring or comment saying a named test class covers '
+            'something is a load-bearing claim of coverage; when that class does '
+            'not exist the claim is FALSE, not a typo, and a reader who trusts '
+            'it skips writing the test. Two remedies, both legitimate: the class '
+            'was renamed or removed, so repoint the citation at whatever '
+            'replaced it; or it was never written, so write it (which is how '
+            'the ten-day verify_classify case in this module\'s docstring was '
+            'eventually closed). Deleting the citation is right ONLY when the '
+            'coverage claim itself was wrong.'
+        )
+
+    def test_the_sweep_is_not_vacuous(self, _real_tree_sweep: _Sweep):
+        """Floors and a structural spread check — no class name and no measured
+        count is asserted anywhere, so nothing here can rot."""
+        assert _real_tree_sweep.src_files >= _MIN_SRC_FILES, (
+            f'swept only {_real_tree_sweep.src_files} src files (floor '
+            f'{_MIN_SRC_FILES}) — the src corpus roots are probably wrong.'
+        )
+        assert _real_tree_sweep.test_files >= _MIN_TEST_FILES, (
+            f'only {_real_tree_sweep.test_files} test files are reachable (floor '
+            f'{_MIN_TEST_FILES}) — citations would resolve against almost nothing.'
+        )
+        assert len(_real_tree_sweep.citations) >= _MIN_CITATIONS, (
+            f'extracted only {len(_real_tree_sweep.citations)} distinct citations '
+            f'(floor {_MIN_CITATIONS}) — the extractor is probably broken.'
+        )
+        assert len(_real_tree_sweep.citing_members) >= _MIN_CITING_MEMBERS, (
+            f'citations came from only {sorted(_real_tree_sweep.citing_members)} '
+            f'(floor {_MIN_CITING_MEMBERS} distinct members) — the sweep is not '
+            f'reaching across the workspace.'
+        )
+
+    def test_corpus_roots_are_derived_not_hardcoded(self):
+        """Both corpora track the workspace at runtime, so adding or renaming a
+        member cannot silently shrink this guard's reach."""
+        members = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
+        members = members['tool']['uv']['workspace']['members']
+        expected_src = {REPO_ROOT / m / 'src' for m in members if (REPO_ROOT / m / 'src').is_dir()}
+        assert expected_src, 'the workspace member list yielded no src roots at all'
+        assert set(_src_dirs()) == expected_src
+        test_dirs = set(_test_dirs())
+        assert REPO_ROOT / 'tests' in test_dirs
+        member_tests = {REPO_ROOT / m / 'tests' for m in members if (REPO_ROOT / m / 'tests').is_dir()}
+        assert member_tests <= test_dirs
