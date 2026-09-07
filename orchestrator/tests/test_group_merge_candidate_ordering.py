@@ -323,3 +323,95 @@ def test_a_merge_created_on_main_puts_main_at_caret_1(tmp_path: Path) -> None:
         'merge that brought it in" verdict -- so the hazard above is about merge '
         'DIRECTION, not about the check itself'
     )
+
+
+def _build_train(root: Path, *, rebase_rewrites: bool) -> str:
+    """Build a two-member merge train and return the tip's merge commit.
+
+    ``task/M`` is the non-tip member, ``task/TIP`` the stacked tip that the
+    lane actually merges.  The lane rebases the stack onto main before
+    merging (``--onto main task/M~1 task/TIP``) and never advances the
+    member's OWN ref -- ``merge-queue/SKILL.md`` rule 3's mechanism.
+
+    *rebase_rewrites* selects the two shapes that differ in whether that
+    rebase is a no-op: True forks ``task/M`` BEFORE main advances, so the
+    replay writes new shas; False forks it from the current main, so the
+    replay has nothing to move and the member's own commits survive
+    verbatim into main.
+    """
+    _new_repo(root)
+    _commit(root, 'base', 'base.txt')
+
+    if not rebase_rewrites:
+        # main advances FIRST, so the member is already atop main and the
+        # pre-merge rebase has nothing to rewrite.
+        _commit(root, 'mainmoved', 'moved.txt')
+
+    _git(root, 'checkout', '-b', 'task/M')
+    _commit(root, 'mwork', 'm.txt')
+
+    if rebase_rewrites:
+        # main advances AFTER the member forked, so the rebase replays it.
+        _git(root, 'checkout', 'main')
+        _commit(root, 'mainmoved', 'moved.txt')
+
+    _git(root, 'checkout', '-b', 'task/TIP', 'task/M')
+    _commit(root, 'tipwork', 'tip.txt')
+    _git(root, 'rebase', '--onto', 'main', 'task/M~1', 'task/TIP')
+
+    _git(root, 'checkout', 'main')
+    _git(root, 'merge', '--no-ff', 'task/TIP', '-m', 'Merge task/TIP into main')
+    return _git(root, 'rev-parse', 'HEAD')
+
+
+def test_the_ordinary_coalesce_absorbed_member_can_never_reach_the_rc0_arm(
+    tmp_path: Path,
+) -> None:
+    """CASE A -- the pre-merge rebase rewrites the member's shas: rc=1, permanently.
+
+    This is the shape ``skills/merge-queue/SKILL.md``'s "Follow the
+    superseded successor" rule 3 describes, and the one
+    ``skills/_shared/deriving-landed-sha.md`` step 3 names as an
+    empty-marker cause.  Its work reaches main only as REWRITTEN commits
+    under the tip's merge, and its own ref is never advanced to them, so
+    the member never becomes an ancestor of main -- the ancestry check at
+    the top of step 4 lands on rc=1 and the rc=0 arm is unreachable.  A
+    reader arriving from step 3 therefore belongs on the rc=1 arm, which
+    is why the rc=0 rationale must not claim this case.
+    """
+    root = tmp_path / 'repo'
+    _build_train(root, rebase_rewrites=True)
+
+    assert _git_rc(root, 'merge-base', '--is-ancestor', 'task/M', 'main') == 1, (
+        'the rebase rewrote the member\'s shas and its own ref was never advanced, so '
+        'it cannot be an ancestor of main -- rc=1, and the rc=0 arm is unreachable'
+    )
+
+
+def test_the_no_op_rebase_member_is_the_shape_that_reaches_the_rc0_arm(
+    tmp_path: Path,
+) -> None:
+    """CASE B -- the pre-merge rebase is a no-op, so the member IS contained.
+
+    Identical train, except the member forked from the CURRENT main, so
+    the replay moves nothing and its own commits survive verbatim into the
+    tip's merge.  Now ancestry exits 0, the member reaches the rc=0 arm,
+    and the arm works on it: the candidate is the tip's merge commit and
+    ``contained-before`` exits 1 -- "this IS the merge that brought it in,
+    stamp it".  This is the case the rc=0 rationale should name.
+    """
+    root = tmp_path / 'repo'
+    tip_merge = _build_train(root, rebase_rewrites=False)
+
+    assert _git_rc(root, 'merge-base', '--is-ancestor', 'task/M', 'main') == 0, (
+        'with a no-op rebase the member\'s own commits are genuinely contained in the '
+        'group merge, so ancestry exits 0 and the rc=0 arm IS reached'
+    )
+    assert _candidate_topo(root, 'M') == tip_merge, (
+        "the rc=0 arm's candidate query must find the tip's merge commit -- the group "
+        'merge that absorbed this member'
+    )
+    assert _contained_before(root, 'M', f'{tip_merge}^1') == 1, (
+        'the member was not in main before the tip merge, so that merge IS what brought '
+        'it in: the stampable "absorbed into group merge" arm'
+    )
