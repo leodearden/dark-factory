@@ -2697,6 +2697,291 @@ class TestWalkPages:
             await tasks_mod._walk_pages(_page_fn, self._read(), 3)
 
 
+class TestCachedFanoutCore:
+    """`_cached_fanout(client, config, read, strategy, timeout)` — the ONE place
+    the fan-out / caching / marker policy lives.
+
+    RED source (step-6): `_cached_fanout` does not exist as a named unit; the
+    policy is inline at the tail of `fetch_tasks`. Naming it is what makes the
+    public split NON-duplicating: afterwards the two public reads differ ONLY
+    in the record they build and the strategy they bind, so there is no second
+    copy of the fan-out / caching / marker handling to drift out of step.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_fetch_tasks_cache(self):
+        tasks_mod._fetch_tasks_cache_clear()
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    @staticmethod
+    def _read(root='/proj/core', statuses=None, mode=None):
+        return tasks_mod._TasksRead(
+            root, statuses, mode if mode is not None else tasks_mod._CompleteRead(None)
+        )
+
+    # -- (a) parameterised by a per-URL read STRATEGY -----------------------
+
+    async def test_the_strategy_is_invoked_once_per_url_in_config_order(
+        self, dummy_client, two_url_config
+    ):
+        """The core owns the fan-out; the strategy owns what one url does.
+
+        Order is asserted, not just membership: `first_success` tries urls in
+        the configured order and the first success wins, so a core that
+        reordered them would silently change which server the dashboard
+        prefers.
+        """
+        seen: list[str] = []
+
+        async def _strategy(url):
+            seen.append(url)
+            raise ValueError('every server is down')
+
+        result = await tasks_mod._cached_fanout(
+            dummy_client, two_url_config, self._read('/proj/core-order'),
+            _strategy, 5.0,
+        )
+
+        assert seen == list(two_url_config.fused_memory_urls)
+        assert isinstance(result, dict) and result.get('offline') is True
+
+    async def test_a_value_error_from_the_strategy_falls_through(
+        self, dummy_client, two_url_config
+    ):
+        """`ValueError` is `first_success`'s documented soft-failure signal.
+
+        A strategy raising it must cost the next url an attempt rather than
+        collapsing the whole read to the offline marker.
+        """
+        rows = [{'id': 1, 'title': 'served by the second url'}]
+
+        async def _strategy(url):
+            if url == two_url_config.fused_memory_urls[0]:
+                raise ValueError('first url said no')
+            return rows
+
+        result = await tasks_mod._cached_fanout(
+            dummy_client, two_url_config, self._read('/proj/core-fallthrough'),
+            _strategy, 5.0,
+        )
+
+        assert result == rows
+
+    # -- (b) the positive cache stores successes ONLY, and copies the list --
+
+    async def test_a_success_is_cached_and_the_strategy_runs_once(
+        self, dummy_client, dummy_config
+    ):
+        """Second read inside the TTL is served from the positive cache."""
+        read = self._read('/proj/core-hit')
+        calls = 0
+
+        async def _strategy(_url):
+            nonlocal calls
+            calls += 1
+            return [{'id': 1, 'title': 'row'}]
+
+        first = await tasks_mod._cached_fanout(
+            dummy_client, dummy_config, read, _strategy, 5.0,
+        )
+        second = await tasks_mod._cached_fanout(
+            dummy_client, dummy_config, read, _strategy, 5.0,
+        )
+
+        assert first == second == [{'id': 1, 'title': 'row'}]
+        assert calls == 1, 'the second read must be served from the cache'
+
+    async def test_the_offline_marker_never_enters_the_positive_cache(
+        self, dummy_client, dummy_config
+    ):
+        """`cache_ok=lambda v: isinstance(v, list)` — successes only.
+
+        A marker in the POSITIVE cache would pin the offline banner for the
+        full ~20 s positive TTL instead of the ~5 s negative one, so this is
+        the guard that keeps the two TTLs meaning what they say.
+        """
+        read = self._read('/proj/core-nocache')
+
+        async def _strategy(_url):
+            raise ValueError('down')
+
+        marker = await tasks_mod._cached_fanout(
+            dummy_client, dummy_config, read, _strategy, 5.0,
+        )
+
+        assert isinstance(marker, dict) and marker.get('offline') is True
+        assert tasks_mod._fetch_tasks_cache.get_fresh(read) is None
+
+    async def test_the_returned_list_is_a_fresh_copy_of_shared_elements(
+        self, dummy_client, dummy_config
+    ):
+        """The documented SHALLOW copy contract, both halves of it.
+
+        List-level mutation is isolated (`result.clear()` cannot empty the
+        cached entry); element-level mutation is NOT (the inner dicts are
+        shared references). Both halves are pinned because callers are
+        documented to rely on the first and warned about the second.
+        """
+        read = self._read('/proj/core-copy')
+        row = {'id': 1, 'status': 'pending'}
+
+        async def _strategy(_url):
+            return [row]
+
+        first = await tasks_mod._cached_fanout(
+            dummy_client, dummy_config, read, _strategy, 5.0,
+        )
+        first.clear()
+
+        second = await tasks_mod._cached_fanout(
+            dummy_client, dummy_config, read, _strategy, 5.0,
+        )
+        assert len(second) == 1, 'list-level mutation must not reach the cache'
+        assert second is not first
+
+        # ...and the LIMIT of that isolation, stated as fact rather than hope.
+        assert second[0] is row
+
+    # -- (c) both caches, ONE key ------------------------------------------
+
+    async def test_both_caches_are_keyed_by_the_identical_record(
+        self, dummy_client, dummy_config
+    ):
+        """INV-5: a split key is exactly how positive and negative drift apart.
+
+        The SAME `_TasksRead` object must retrieve the marker from the negative
+        cache and the rows from the positive one. If the two ever grew separate
+        encoders, a recovered root would repopulate a key its own marker lookup
+        no longer reads.
+        """
+        read = self._read('/proj/core-onekey')
+
+        async def _fail(_url):
+            raise ValueError('down')
+
+        marker = await tasks_mod._cached_fanout(
+            dummy_client, dummy_config, read, _fail, 5.0,
+        )
+        assert tasks_mod._fetch_tasks_negative_cache.get_fresh(read) == marker, (
+            'the marker must be written under the read record itself'
+        )
+
+        rows = [{'id': 1, 'title': 'recovered'}]
+
+        async def _ok(_url):
+            return rows
+
+        # An equal-but-distinct record must reach the same entries: the key is
+        # the record's VALUE, not its identity.
+        twin = self._read('/proj/core-onekey')
+        assert twin == read and twin is not read
+        assert tasks_mod._fetch_tasks_negative_cache.get_fresh(twin) == marker
+
+        tasks_mod._fetch_tasks_negative_cache.clear()
+        await tasks_mod._cached_fanout(dummy_client, dummy_config, read, _ok, 5.0)
+        assert tasks_mod._fetch_tasks_cache.get_fresh(twin) == rows
+
+    # -- (d) marker precedence, BOTH directions -----------------------------
+
+    async def test_a_lone_fresh_marker_suppresses_the_attempt(
+        self, dummy_client, dummy_config
+    ):
+        """The retry is suppressed; the degradation signal is not."""
+        read = self._read('/proj/core-suppress')
+        marker = {'offline': True, 'error': 'earlier failure'}
+
+        async def _mark():
+            return marker
+
+        await tasks_mod._fetch_tasks_negative_cache.get_or_refresh(read, _mark)
+
+        called = False
+
+        async def _strategy(_url):
+            nonlocal called
+            called = True
+            return []
+
+        result = await tasks_mod._cached_fanout(
+            dummy_client, dummy_config, read, _strategy, 5.0,
+        )
+
+        assert result == marker, 'the marker is still RETURNED to the caller'
+        assert not called, 'a fresh marker must cost no MCP attempt'
+
+    async def test_a_fresh_positive_entry_outranks_a_fresh_marker(
+        self, dummy_client, dummy_config
+    ):
+        """A demonstrated success beats a retry-suppression hint.
+
+        Both caches CAN hold a fresh entry for one key — waiter A's failure
+        writes a 5 s marker while waiter B's success writes a 20 s positive
+        entry. Serving the marker there would put a false offline banner over
+        rows already loaded.
+        """
+        read = self._read('/proj/core-precedence')
+        rows = [{'id': 1, 'title': 'already loaded'}]
+
+        async def _ok(_url):
+            return rows
+
+        await tasks_mod._cached_fanout(dummy_client, dummy_config, read, _ok, 5.0)
+
+        async def _mark():
+            return {'offline': True, 'error': 'a concurrent failure'}
+
+        await tasks_mod._fetch_tasks_negative_cache.get_or_refresh(read, _mark)
+        assert tasks_mod._fetch_tasks_negative_cache.get_fresh(read) is not None
+
+        calls = 0
+
+        async def _strategy(_url):
+            nonlocal calls
+            calls += 1
+            return rows
+
+        result = await tasks_mod._cached_fanout(
+            dummy_client, dummy_config, read, _strategy, 5.0,
+        )
+
+        assert result == rows, 'the fresh positive entry wins'
+        assert calls == 0, 'falling through costs no MCP call — the entry is fresh'
+
+    # -- (e) exactly one core per public read -------------------------------
+
+    async def test_fetch_tasks_routes_through_the_core(
+        self, dummy_client, dummy_config, monkeypatch
+    ):
+        """The structural guard against a second copy of the policy.
+
+        `fetch_tasks` must delegate rather than carry its own fan-out, cache
+        and marker handling — otherwise the public split would duplicate all
+        three and they would drift.
+        """
+        seen: list[tasks_mod._TasksRead] = []
+
+        async def _fake(client, config, read, strategy, timeout):
+            seen.append(read)
+            assert client is dummy_client
+            assert config is dummy_config
+            assert callable(strategy)
+            assert timeout == 7.5
+            return []
+
+        monkeypatch.setattr(tasks_mod, '_cached_fanout', _fake)
+        result = await tasks_mod.fetch_tasks(
+            dummy_client, dummy_config, '/proj/core-route', timeout=7.5,
+        )
+
+        assert result == []
+        assert seen == [
+            tasks_mod._TasksRead(
+                '/proj/core-route', None, tasks_mod._CompleteRead(None)
+            )
+        ], 'exactly ONE core call, carrying the record the public read built'
+
+
 class TestFetchStatusesCache:
     """Per-project_root TTL cache inside fetch_statuses (task 3857 amendment).
 
