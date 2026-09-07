@@ -6,7 +6,11 @@ argv assembly, shared by the non-sandbox (_invoke_claude) and sandbox
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from shared.cli_invoke import (
     _REAL_BUILTIN_TOOLS_DENYLIST,
@@ -527,3 +531,65 @@ def test_argv_never_carries_the_user_prompt() -> None:
             i = j
     finally:
         _cleanup(temp_files)
+
+
+def test_build_claude_argv_unlinks_temp_files_when_build_raises() -> None:
+    """Pins the exception-path cleanup contract documented on
+    ``shared/src/shared/cli_invoke.py::build_claude_argv``: "On exception
+    (e.g. a non-serializable mcp_config), any temp files already created
+    during this call are unlinked before the exception propagates — callers
+    never need to clean up after a raised call."
+
+    Distinct from ``test_cli_invoke.py``'s ``test_temp_files_cleaned_up_on_error``,
+    which covers ``invoke_claude_agent``'s caller-side ``finally`` unlink after a
+    SUCCESSFUL build whose subprocess later fails. This test instead covers
+    ``build_claude_argv``'s OWN ``except`` block on a build that never returns —
+    the call raises, so the caller never gets a ``temp_files`` list to clean up
+    with; ``build_claude_argv`` must have already cleaned up everything itself.
+
+    A truthy-but-non-serializable ``mcp_config`` enters the ``if mcp_config:``
+    branch and fails inside ``json.dump`` — i.e. AFTER the sysprompt file is
+    already on disk, so both created files are on the line when the except
+    block runs. Asserting cleanup of EVERY recorded path (not just the
+    sysprompt one) matters: a mutation that moves the ``mcp_config_path``
+    ``temp_files.append`` to after the failing ``json.dump`` leaks only the
+    mcp file while the sysprompt file is still correctly unlinked, and a test
+    that checked only the sysprompt path would pass right through that
+    regression.
+    """
+    created: list[str] = []
+    original_mkstemp = tempfile.mkstemp
+
+    def tracking_mkstemp(**kwargs):
+        fd, path = original_mkstemp(**kwargs)
+        created.append(path)
+        return fd, path
+
+    with (
+        patch('shared.cli_invoke.tempfile.mkstemp', side_effect=tracking_mkstemp),
+        pytest.raises(TypeError),
+    ):
+        build_claude_argv(
+            model='opus',
+            max_budget_usd=5.0,
+            system_prompt='sys prompt text',
+            max_turns=50,
+            permission_mode='bypassPermissions',
+            allowed_tools=None,
+            disallowed_tools=None,
+            mcp_config={'mcpServers': object()},
+            output_schema=None,
+            effort=None,
+            resume_session_id=None,
+            session_id=None,
+        )
+
+    # Anti-vacuity guard: prove the files were actually created before the
+    # failure, so a regression that stopped creating them in the first place
+    # couldn't make the cleanup assertion below pass trivially.
+    assert len(created) == 2, f'expected sysprompt + mcp temp files to be created; got {created!r}'
+    assert Path(created[0]).name.startswith('sysprompt_'), f'got {created!r}'
+    assert Path(created[1]).name.startswith('mcp_'), f'got {created!r}'
+
+    for path in created:
+        assert not Path(path).exists(), f'temp file leaked after build_claude_argv raised: {path}'
