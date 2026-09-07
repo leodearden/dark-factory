@@ -1507,6 +1507,129 @@ def test_adopted_ahead_leaves_the_existing_loose_measure_untouched():
 
 
 # ---------------------------------------------------------------------------
+# compute_speculation — the VOID ANATOMY.
+#
+# The intuitive reading of a 58% void rate is "58% of verify capacity burned".
+# It is not: the dispatch-point void in `merge_queue.py::SpeculativeMergeWorker`
+# fires BEFORE host acquisition, so it discards a merge BUILD and never a
+# verify. These tests pin the split that makes the difference visible — a void
+# is `verify_burned` only when a `merge_verify` for the same task actually ran
+# between the item's last preceding speculation and the void — plus the
+# `dead_link` fan-out that says whether voids are independent stragglers or one
+# dead base cascading into many.
+# ---------------------------------------------------------------------------
+
+
+def _vv_link(task_id, minute, dead_link) -> dict[str, Any]:
+    """A chain_dead void carrying an EXPLICIT dead_link.
+
+    ``_vv`` derives a unique link per minute; the fan-out tests need several
+    voids to share one dead base SHA.
+    """
+    event = _vv(task_id, minute, 'dispatch')
+    event['data']['dead_link'] = dead_link
+    return event
+
+
+def _anatomy_fixture():
+    """Four chain-dead voids covering both arms of the split.
+
+    ``_sm`` stamps 03:MM, ``_v`` stamps HH:MM, ``_vv`` stamps 07:MM.
+
+      V1  spec 03:00, merge_verify 05:00, void 07:00 -> verify_burned
+      V2  spec 03:01,                     void 07:01 -> pre_verify
+      V3  no speculation at all,          void 07:02 -> pre_verify
+      V4  spec 03:03, void 07:03, merge_verify 08:00 -> pre_verify
+                                          (the verify ran AFTER the void)
+    """
+    speculative = [_sm('V1', 0, '0'), _sm('V2', 1, '0'), _sm('V4', 3, '1')]
+    voided = [
+        _vv('V1', 0, 'dispatch'), _vv('V2', 1, 'dispatch'),
+        _vv('V3', 2, 'dispatch'), _vv('V4', 3, 'dispatch'),
+    ]
+    verify = [
+        _v('V1', 5, 0, 600_000, depth=1, speculative=True),
+        _v('V4', 8, 0, 600_000, depth=1, speculative=True),
+    ]
+    return speculative, voided, verify, []
+
+
+def _anatomy_result():
+    return mlt.compute_speculation(*_anatomy_fixture())['void_anatomy']
+
+
+def test_void_anatomy_counts_a_verify_between_speculation_and_void_as_burned():
+    # V1 alone: a merge_verify actually ran on the doomed item before the void
+    # discarded it. That is the expensive arm the measure exists to detect.
+    assert _anatomy_result()['verify_burned'] == 1
+
+
+def test_void_anatomy_counts_a_void_with_no_intervening_verify_as_pre_verify():
+    # V2 (verify never ran) and V4 (the verify ran only AFTER the void) are
+    # both pre-verify: the void cost a merge build and a re-merge, not a verify.
+    assert _anatomy_result()['pre_verify'] == 3
+
+
+def test_void_anatomy_classifies_a_void_whose_task_never_speculated():
+    # V3 has no preceding speculative_merge at all. It must still be
+    # classified — dropping it silently would shrink the denominator and
+    # inflate whichever arm survives.
+    result = mlt.compute_speculation([], [_vv('V3', 2, 'dispatch')], [], [])
+    assert result['void_anatomy']['pre_verify'] == 1
+    assert result['void_anatomy']['verify_burned'] == 0
+
+
+def test_void_anatomy_arms_partition_the_chain_dead_voids():
+    anatomy = _anatomy_result()
+    assert anatomy['verify_burned'] + anatomy['pre_verify'] == 4
+    # And over the shared fixture, where one voided row carries
+    # reason='other': the anatomy is over CHAIN-DEAD voids only, so the arms
+    # sum to n_voided_chain_dead and not to len(voided_events).
+    result = _spec_result()
+    anatomy = result['void_anatomy']
+    assert anatomy['verify_burned'] + anatomy['pre_verify'] == (
+        result['n_voided_chain_dead']
+    ) == 3
+
+
+def test_void_anatomy_reports_dead_link_fan_out():
+    # One dead base SHA voided two items; two more voided one each.
+    voided = [
+        _vv_link('F1', 0, 'deadA'), _vv_link('F2', 1, 'deadA'),
+        _vv_link('F3', 2, 'deadB'), _vv_link('F4', 3, 'deadC'),
+    ]
+    anatomy = mlt.compute_speculation([], voided, [], [])['void_anatomy']
+    assert anatomy['dead_link_distinct'] == 3
+    assert anatomy['dead_link_max_voids'] == 2
+
+
+def test_void_anatomy_tallies_a_void_with_no_dead_link_under_the_sentinel():
+    stray = _vv('F5', 4, 'dispatch')
+    del stray['data']['dead_link']
+    anatomy = mlt.compute_speculation(
+        [], [_vv_link('F1', 0, 'deadA'), stray], [], []
+    )['void_anatomy']
+    # The module's UNKNOWN sentinel, same idiom as void_points — not a crash
+    # and not a silent drop.
+    assert anatomy['dead_link_unknown'] == 1
+    assert anatomy['dead_link_distinct'] == 2
+    assert mlt.UNKNOWN == '(unknown)'
+
+
+def test_void_anatomy_is_zero_and_none_shaped_on_an_empty_window():
+    anatomy = mlt.compute_speculation([], [], [], [])['void_anatomy']
+    # Counts are a real 0 (nothing was voided); the max is None, never 0,
+    # because "no void had a dead base" is not "the worst base killed none".
+    assert anatomy == {
+        'verify_burned': 0,
+        'pre_verify': 0,
+        'dead_link_distinct': 0,
+        'dead_link_max_voids': None,
+        'dead_link_unknown': 0,
+    }
+
+
+# ---------------------------------------------------------------------------
 # compute_queue_depth / compute_mixes
 # ---------------------------------------------------------------------------
 
