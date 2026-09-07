@@ -79,11 +79,537 @@ live assertions re-read every committed artifact fresh.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
+import re
+import subprocess
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_VOCABULARY_MODULE = REPO_ROOT / "shared" / "src" / "shared" / "merge_state.py"
+
+# Every partition name a `partition=` marker may cite. Stated here rather than
+# derived from the vocabulary module's `__all__` because it is a CONTRACT, not an
+# observation: a prose span may only pin a partition this guard knows how to
+# compare, so adding a partition to the module is a deliberate act that must also
+# teach the guard about it. The enum MEMBERS are never listed — those are derived
+# from the module on every run, which is the whole point (a hardcoded roster here
+# would be one more lock-step copy, stale on the next member).
+_REQUIRED_PARTITIONS = (
+    "LIVE_STATES",
+    "TERMINAL_STATES",
+    "OUTCOME_STATES",
+    "EPISTEMIC_STATES",
+    "POLL_STOP_STATES",
+    "CANCEL_STATES",
+    "SUBMIT_TERMINAL",
+    "SUBMIT_NON_TERMINAL",
+)
+
+# The two vocabularies hold 22 distinct wire values today (13 poll + 14 submit,
+# five spellings shared). A union this small would mean the module stopped
+# parsing, not that the vocabularies shrank — merge states are only ever added.
+# The floor is a NON-VACUITY guard on every comparison downstream, kept well
+# below the live count so a deliberate retirement does not go red spuriously.
+_MINIMUM_VOCABULARY_SIZE = 10
+
+
+def load_vocabulary(*, path: Path = _VOCABULARY_MODULE) -> dict[str, frozenset[str]]:
+    """The normative partitions, loaded from *path* BY FILE PATH, as plain strings.
+
+    Never ``import shared.merge_state``. Two reasons, both load-bearing:
+
+    * ``scripts/tests/`` modules must import no first-party package — that is what
+      lets ``uv run --project shared pytest scripts/tests/``
+      (``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
+      synced verify worktree, where ``escalation``/``orchestrator`` are not
+      installed.
+    * An agent Bash session typically inherits the MAIN checkout's ``VIRTUAL_ENV``
+      (``CLAUDE.md``, "Locating installed code"), so a plain import in a task
+      worktree resolves to MAIN's tree. This guard would then pin THIS worktree's
+      SKILL.md files against ANOTHER tree's vocabulary — green on drift, red on
+      none, depending on ambient state.
+
+    Values are coerced to ``str``. ``MergeState`` is a ``StrEnum``, so its members
+    already compare equal to their wire spelling, but the spans carry TEXT and a
+    caller building sets by hand must not have to know that.
+
+    Every failure is a loud ``AssertionError`` naming *path*, never an empty dict:
+    an empty vocabulary compares nothing against nothing, which PASSES — the guard
+    would report its strongest verdict having read no vocabulary at all.
+    """
+    assert path.is_file(), (
+        f"the merge-state vocabulary module {path} does not exist (task 4829). This "
+        f"guard derives both wire vocabularies from it on every run, so without it "
+        f"every span comparison below would compare an empty set against an empty "
+        f"set and PASS. Either the module moved (update `_VOCABULARY_MODULE`) or "
+        f"the worktree is incomplete."
+    )
+
+    spec = importlib.util.spec_from_file_location("_merge_state_vocabulary_by_path", path)
+    assert spec is not None and spec.loader is not None, (
+        f"{path} could not be turned into an importable module spec (task 4829)."
+    )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 — re-raised as a named guard failure
+        raise AssertionError(
+            f"the merge-state vocabulary module {path} could not be executed (task "
+            f"4829): {type(exc).__name__}: {exc}. It is loaded by absolute path under "
+            f"a synthetic module name, so the bare traceback names neither this guard "
+            f"nor the file — fix the module, or point `_VOCABULARY_MODULE` at it."
+        ) from exc
+
+    missing = [name for name in _REQUIRED_PARTITIONS if not hasattr(module, name)]
+    assert not missing, (
+        f"{path} defines no {missing!r} (task 4829). Every `merge-state-vocab` span "
+        f"in the repo cites a partition BY NAME, so a renamed or deleted partition "
+        f"leaves those spans pinned to nothing. Either restore the name or rename it "
+        f"in `_REQUIRED_PARTITIONS` and in every span that cites it."
+    )
+
+    partitions = {
+        name: frozenset(str(value) for value in getattr(module, name))
+        for name in _REQUIRED_PARTITIONS
+    }
+    empty = sorted(name for name, values in partitions.items() if not values)
+    assert not empty, (
+        f"{path} defines {empty!r} as EMPTY (task 4829) — a span pinned to an empty "
+        f"partition can only match an empty list, so the check would either pass "
+        f"vacuously or send a reader to delete a correct list."
+    )
+    return partitions
+
+
+def vocabulary_values(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
+    """Every wire value across BOTH vocabularies — the token filter for spans.
+
+    The union spans ``MergeState`` AND ``MergeSubmitStatus`` deliberately. Filtering
+    a span by its OWN partition instead would drop an intruder from the sibling
+    vocabulary before the comparison ever ran: a POLL span claiming ``merge_status``
+    returns ``wip_halted`` would read green, which is one of the three defects this
+    task exists to correct.
+    """
+    values = frozenset().union(*partitions.values()) if partitions else frozenset()
+    assert len(values) >= _MINIMUM_VOCABULARY_SIZE, (
+        f"the loaded vocabulary holds only {len(values)} distinct values "
+        f"{sorted(values)!r}, below the non-vacuity floor of "
+        f"{_MINIMUM_VOCABULARY_SIZE} (task 4829). Both wire vocabularies are "
+        f"expected; a union this small means the module was parsed but not read."
+    )
+    return values
+
+
+# `failed` is NOT a member of either vocabulary — it is a value
+# `skills/merge-queue/SKILL.md` and `skills/unblock-low-risk/SKILL.md` invented
+# (the real value is `error`). It is listed here anyway so that correcting those
+# files cannot accidentally start counting it.
+_AMBIGUOUS_TOKENS = frozenset(
+    {"done", "blocked", "queued", "conflict", "unknown", "error", "gate", "failed"}
+)
+
+
+def discriminating_tokens(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
+    """Vocabulary values minus the ones that double as task statuses or prose.
+
+    `done`, `blocked`, `queued`, `conflict` and `unknown` are all Taskmaster task
+    statuses; `error` and `gate` are ordinary English in this repo. Counting them
+    would flag most of `skills/` as an enumeration site, which trains readers to
+    register files to silence the guard — the failure mode that makes a guard stop
+    meaning anything.
+    """
+    tokens = vocabulary_values(partitions) - _AMBIGUOUS_TOKENS
+    assert tokens, (
+        "the discriminating token set is empty (task 4829) — with nothing to count, "
+        "no file can clear the threshold and the registry scan passes vacuously."
+    )
+    return tokens
+
+
+_BEGIN_MARKER = "merge-state-vocab:begin"
+_END_MARKER = "merge-state-vocab:end"
+
+# The partition a span pins itself to. UPPER_SNAKE only: partition names are
+# module-level constants, and a lowercase `partition=terminal_states` is a typo
+# that must fail as "names no partition" rather than silently matching nothing.
+_PARTITION_RE = re.compile(r"partition=([A-Z][A-Z0-9_]*)")
+
+# Any lowercase identifier-shaped token. Word boundaries, not a bare `[a-z]+`:
+# without the leading `\b` the pattern matches "erminal" inside "Terminal", which
+# is harmless only because membership filters it — better not to generate it.
+# This one regex serves both literal styles the pinned sites use (markdown
+# backticks, Python string literals) and both container styles (`{a, b}` set
+# notation, `a | b` pipes), because every one of them reduces to bare tokens once
+# the punctuation is ignored.
+_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_]*\b")
+
+
+def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
+    """Every ``merge-state-vocab`` span in *text*, as ``(partition_name, body)``.
+
+    TWO CARRIERS, one scanner. In markdown the markers ride in HTML comments
+    (``<!-- merge-state-vocab:begin partition=X ... -->`` … ``<!-- …:end -->``); in
+    a Python docstring they are bare lines, because an HTML comment there is
+    nonsense that renders literally in `--help` output and in every agent's
+    context. Four pinned sites use the first carrier and one uses the second, so a
+    scanner that handled only one would leave the other silently unpinned.
+
+    The begin comment's own body is EXCLUDED from the returned span: it carries the
+    source-of-truth pointer, this module's path and the partition name, any of
+    which would join the extracted value set if swallowed.
+
+    Every malformation raises loudly, naming *source*. The highest-value case is
+    ZERO spans — that is what an edit which deletes the markers but keeps the list
+    produces, and returning `[]` for it would turn the whole site's drift check
+    into a vacuous pass while the list rots.
+    """
+    lines = text.splitlines()
+    spans: list[tuple[str, str]] = []
+    open_span: tuple[str, int, str, int] | None = None
+
+    for index, line in enumerate(lines):
+        line_number = index + 1
+        if _BEGIN_MARKER in line:
+            match = _PARTITION_RE.search(line)
+            assert match is not None, (
+                f"{source}: the `{_BEGIN_MARKER}` marker at line {line_number} names no "
+                f"`partition=<NAME>` (task 4829). A span that does not say which "
+                f"partition it must equal cannot be checked against anything; add "
+                f"`partition=` naming one of {list(_REQUIRED_PARTITIONS)}."
+            )
+            partition_name = match.group(1)
+            assert open_span is None, (
+                f"{source}: span `{partition_name}` opens at line {line_number} while "
+                f"span `{open_span[0]}` (opened at line {open_span[3]}) is still open "
+                f"(task 4829) — spans do not nest. The inner list would be read as part "
+                f"of the outer one, so both comparisons would be wrong. Close the outer "
+                f"span with `{_END_MARKER}` before opening another."
+            )
+
+            marker_column = line.index(_BEGIN_MARKER)
+            if "<!--" in line[:marker_column]:
+                close_index = index
+                while close_index < len(lines) and "-->" not in lines[close_index]:
+                    close_index += 1
+                assert close_index < len(lines), (
+                    f"{source}: the `<!-- {_BEGIN_MARKER} partition={partition_name}` "
+                    f"comment opened at line {line_number} is never closed with `-->` "
+                    f"(task 4829) — the whole rest of the file would be read as the "
+                    f"begin comment's body."
+                )
+                remainder = lines[close_index].split("-->", 1)[1]
+                body_start = close_index + 1
+            else:
+                remainder = ""
+                body_start = index + 1
+
+            open_span = (partition_name, body_start, remainder, line_number)
+        elif _END_MARKER in line:
+            assert open_span is not None, (
+                f"{source}: a `{_END_MARKER}` marker at line {line_number} closes no "
+                f"open span (task 4829) — either its `{_BEGIN_MARKER}` was deleted, "
+                f"leaving the list below it unpinned, or the two markers are inverted."
+            )
+            partition_name, body_start, remainder, _ = open_span
+            body = "\n".join([remainder, *lines[body_start:index]])
+            spans.append((partition_name, body))
+            open_span = None
+
+    if open_span is not None:
+        raise AssertionError(
+            f"{source}: span `{open_span[0]}` opened at line {open_span[3]} is never "
+            f"closed by a `{_END_MARKER}` marker (task 4829). An unterminated span has "
+            f"no boundary, so every vocabulary token in the rest of the file would join "
+            f"its value set."
+        )
+
+    assert spans, (
+        f"{source}: no `{_BEGIN_MARKER} partition=<NAME>` span found at all (task "
+        f"4829). This file is in `PINNED_SITES` because it restates a merge-state "
+        f"vocabulary inline; with the markers gone, its list is free to drift and "
+        f"this guard would report success having checked nothing. Restore the span "
+        f"around the list, or unregister the file if the list is gone."
+    )
+
+    unknown = sorted({name for name, _ in spans if name not in _REQUIRED_PARTITIONS})
+    assert not unknown, (
+        f"{source}: span(s) pinned to {unknown!r}, which name no partition of "
+        f"{_repo_relative(_VOCABULARY_MODULE)} (task 4829). Known partitions are "
+        f"{list(_REQUIRED_PARTITIONS)}. A misspelled partition pins the list to "
+        f"nothing at all."
+    )
+    return spans
+
+
+def extract_values(body: str, vocabulary_values: frozenset[str], *, source: str = "a span") -> frozenset[str]:
+    """The vocabulary members named inside a span *body*.
+
+    Handles every literal style the pinned sites use — markdown backticks
+    (`` `done` ``), Python string literals (``"done"`` / ``'done'``), bare set
+    notation (``{queued, verifying}``) and pipe notation (``done | conflict``) —
+    because all four reduce to bare lowercase tokens once punctuation is ignored.
+    The sites are deliberately not forced into one style: a SKILL.md renders
+    backticks and a Python docstring does not.
+
+    Membership filtering is what lets a span carry ordinary English (``— stop
+    polling here``) without every noun becoming a phantom member. *vocabulary_values*
+    must be the union of BOTH vocabularies — see ``vocabulary_values()``.
+
+    Raises rather than returning an empty set: an empty set does compare unequal to
+    every partition, so the drift would be caught — but reported as "the list lost
+    all five members", sending the reader to fix a list that is fine when the real
+    defect is a misplaced `:end` marker.
+    """
+    found = frozenset(token for token in _TOKEN_RE.findall(body) if token in vocabulary_values)
+    assert found, (
+        f"{source}: a `merge-state-vocab` span body carries no vocabulary member at "
+        f"all (task 4829). Body was {body!r}. Almost always a misplaced marker — the "
+        f"`:end` above the list it was meant to close, or the `:begin` below it — "
+        f"rather than a list that genuinely lost every value."
+    )
+    return found
+
+
+def assert_span_matches(
+    values: frozenset[str],
+    partition: frozenset[str],
+    *,
+    source: str,
+    partition_name: str,
+) -> None:
+    """SET EQUALITY between a span's values and the partition it claims to mirror.
+
+    Missing and extra are reported SEPARATELY, each as a repr, because the two
+    have different fixes: a MISSING value means the prose list is stale (a member
+    landed and this copy did not follow — the drift B9 binds), while an EXTRA one
+    is usually a value pasted in from the sibling vocabulary (``already_merged`` in
+    a POLL list) or a value that never existed (``failed``).
+
+    The message quotes the offending values rather than a phrase about drift: a
+    reader cannot act on "the list has drifted" without being told which value.
+    """
+    values = frozenset(str(value) for value in values)
+    partition = frozenset(str(value) for value in partition)
+
+    assert values, (
+        f"{source}: the span pinned to `{partition_name}` produced an EMPTY value set "
+        f"(task 4829) — nothing was compared, so this check would otherwise pass or "
+        f"fail for reasons unrelated to the list's contents."
+    )
+
+    missing = sorted(partition - values)
+    extra = sorted(values - partition)
+    assert not missing and not extra, (
+        f"{source}: the `merge-state-vocab` span pinned to `{partition_name}` has "
+        f"drifted from {_repo_relative(_VOCABULARY_MODULE)}::{partition_name} (task "
+        f"4829). missing={missing!r} extra={extra!r}; span has {sorted(values)!r}, "
+        f"partition is {sorted(partition)!r}. A MISSING value means this list did not "
+        f"follow a member that landed in the enum; an EXTRA one is usually a value "
+        f"from the sibling vocabulary (`MergeSubmitStatus` values are not "
+        f"`merge_status` states) or one that never existed. Fix the list — the "
+        f"partition is the source of truth."
+    )
+
+
+# Every artifact that restates a merge-state vocabulary inline, and WHAT is pinned
+# there. `test_registry_is_complete` checks this registry against a scan, so it
+# cannot quietly fall behind the repo the way the prose sites did.
+PINNED_SITES = {
+    "escalation/src/escalation/server.py": (
+        "the `merge_cancel` docstring's CANCEL_STATES span (bare markers — an HTML "
+        "comment in a docstring would render literally)"
+    ),
+    "skills/merge-queue/SKILL.md": (
+        "live set, poll terminal set, submit terminal + non-terminal sets"
+    ),
+    "skills/unblock/SKILL.md": (
+        "the two poll tuples — branch arm (TERMINAL_STATES) and scoped arms "
+        "(POLL_STOP_STATES)"
+    ),
+    "skills/unblock-low-risk/SKILL.md": (
+        "live set (twice), submit terminal + non-terminal sets"
+    ),
+    "skills/escalation-watcher/SKILL.md": (
+        "poll terminal set, submit terminal + non-terminal sets"
+    ),
+}
+
+# Files inside the scan's domain that enumerate a deliberately NARROWED subset of a
+# vocabulary — a RULE about which values a particular arm handles, not a copy of a
+# vocabulary. Registering one would demand it re-add the very members it exists to
+# exclude, so each is excluded BY NAME with its reason recorded here rather than
+# left to fall under the threshold by luck.
+#
+# `test_declared_rule_sites_are_tracked_and_span_free` keeps this from becoming a
+# silent escape hatch: an excluded file must still exist, and must carry NO
+# `merge-state-vocab` span (if someone wraps a list there, it must be registered
+# above instead).
+_UNPINNED_RULE_SITES = {
+    "skills/orchestrate/SKILL.md": (
+        "the MERGE (halted) troubleshooting row enumerates the five statuses "
+        "`orchestrator/src/orchestrator/merge_queue.py`'s `_map_advance_failure` can "
+        "return that halt the queue (wip_halted, done_wip_recovery, "
+        "wip_recovery_no_advance, unmerged_state, stash_failed) — an orchestrator-owned "
+        "halt rule, not a copy of SUBMIT_TERMINAL. See esc-4829-3."
+    ),
+}
+
+# Four DISTINCT discriminating tokens is an enumeration, not a discussion.
+#
+# MEASURED on this tree over `git ls-files -- 'skills/*.md'` (42 files):
+# merge-queue 8, escalation-watcher 7, unblock-low-risk 6, orchestrate 6 (the rule
+# site above), unblock 5, review-briefing 2, everything else <= 2. So the threshold
+# sits one token below the lowest registered site and two above the highest
+# unregistered one. (The plan for task 4829 predicted 6/5/5/5 and "<= 2 everywhere
+# else"; the re-measured numbers above are what this tree actually shows, and the
+# sixth site is why `_UNPINNED_RULE_SITES` exists — filed as esc-4829-3.)
+_ENUMERATION_THRESHOLD = 4
+
+# BOUNDARY, deliberate and worth stating so a reader does not read it as an
+# oversight: this scan covers `skills/**` only — the domain of the five registered
+# sites. `ARCHITECTURE.md` (~lines 700-702) and `OPERATIONS.md` (~lines 517-523)
+# each carry a further enumeration interleaving BOTH vocabularies, and
+# `skills/merge-queue/SKILL.md` documents a `needs_rebase` outcome that
+# `merge_request` never returns (it is a `suffix_graph.py` internal). Those are out
+# of task 4829's declared scope and are filed as follow-up work.
+_SKILL_MARKDOWN_PATHSPEC = "skills/*.md"
+
+
+def _repo_relative(path: Path) -> str:
+    """*path* as a repo-relative label when it is in the repo, else absolute."""
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+_scan_label = _repo_relative
+
+
+def _scrubbed_git_env() -> dict[str, str]:
+    """``os.environ`` with every ``GIT_*`` override removed.
+
+    ``GIT_DIR``, ``GIT_WORK_TREE`` and ``GIT_INDEX_FILE`` are inherited by default
+    and any one of them silently retargets a git invocation at a different
+    repository than its ``cwd`` implies — which would make this scan's verdict a
+    property of ambient state rather than of repo content.
+    """
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
+def tracked_skill_markdown(*, root: Path = REPO_ROOT) -> list[Path]:
+    """Every TRACKED markdown file under ``skills/`` in *root*.
+
+    Sourced from ``git ls-files``, never a filesystem walk: an untracked file — a
+    scratch draft, a gitignored digest — must not be able to flip the registry
+    scan's verdict on nothing but local working-tree state.
+
+    Raises rather than falling back when the oracle cannot run. The repository half
+    is guaranteed (this module lives in one), but the ``git`` EXECUTABLE on ``PATH``
+    is not: a verify subprocess's ``PATH`` is rewritten by
+    ``orchestrator/src/orchestrator/verify.py::_target_subprocess_env``. A silent
+    filesystem fallback would restore exactly the hazard this sourcing removes, in
+    the situation nobody is watching.
+
+    COST, stated rather than hidden: a file written but not yet ``git add``ed is
+    invisible here. An author who writes a new runbook restating the vocabulary and
+    runs this guard before staging it gets a GREEN verdict. Acceptable — every
+    dispatched agent commits before verify runs, and pre-commit sees staged content
+    — but stage a new file before trusting a green run.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "-z", "--", _SKILL_MARKDOWN_PATHSPEC],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+            env=_scrubbed_git_env(),
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        returncode = getattr(exc, "returncode", None)
+        stderr = getattr(exc, "stderr", None)
+        detail = stderr.strip() if stderr else str(exc)
+        outcome = f"exited {returncode}" if returncode is not None else "could not be run"
+        raise RuntimeError(
+            f"the tracked-file scan of {root} failed (task 4829): `git ls-files -z -- "
+            f"{_SKILL_MARKDOWN_PATHSPEC}` {outcome} — {detail}. This scan sources its "
+            f"file list from TRACKED files only, by design, so {root} must be a git "
+            f"repository (or a subdirectory of one) with `git` on PATH — there is no "
+            f"filesystem-walk fallback."
+        ) from exc
+
+    found = set()
+    for relative in completed.stdout.split("\0"):
+        if not relative or not relative.endswith(".md"):
+            continue
+        path = root / relative
+        # `git ls-files` reads the INDEX, not the worktree: a path can be listed
+        # while missing on disk (routine mid-rebase), and it lists an UNMERGED path
+        # once per merge stage. Dropping the absent ones and deduping here keeps a
+        # conflicted tree from triplicating every finding downstream.
+        if path.is_file():
+            found.add(path)
+    return sorted(found)
+
+
+def find_unregistered_sites(
+    *,
+    files: list[Path] | None = None,
+    registry: dict[str, str] | None = None,
+    rule_sites: dict[str, str] | None = None,
+    discriminating: frozenset[str] | None = None,
+    threshold: int = _ENUMERATION_THRESHOLD,
+) -> list[str]:
+    """Files restating *threshold*+ DISTINCT discriminating values that nobody pinned.
+
+    A drift guard whose site list is hand-maintained reproduces the exact defect it
+    exists to prevent: it reads green while a newly written runbook restates the
+    vocabulary and rots on the next member. So ``PINNED_SITES`` is not trusted — it
+    is checked against a scan of every tracked markdown file under ``skills/``.
+
+    DISTINCT tokens, not occurrences: a file discussing one state six times is
+    discussing it, not enumerating the vocabulary.
+
+    Every argument is a seam for this module's own unit tests, which scan fixture
+    files under ``tmp_path``; the live call passes none of them. Loud on an empty
+    scan rather than returning ``[]``, since ``[]`` is this scan's strongest
+    possible verdict ("every site is registered") and an over-broad pathspec would
+    report it having read nothing.
+    """
+    files = tracked_skill_markdown() if files is None else files
+    registry = PINNED_SITES if registry is None else registry
+    rule_sites = _UNPINNED_RULE_SITES if rule_sites is None else rule_sites
+    if discriminating is None:
+        discriminating = discriminating_tokens(load_vocabulary())
+
+    assert files, (
+        "the registry scan received no files to check (task 4829) — an empty scan "
+        "returns an empty result, which is indistinguishable from `every enumeration "
+        "site is registered`. Check the pathspec."
+    )
+    assert discriminating, (
+        "the registry scan received an empty discriminating token set (task 4829) — "
+        "with nothing to count, no file can clear the threshold and the scan passes "
+        "vacuously."
+    )
+
+    unregistered: list[str] = []
+    for path in sorted(files):
+        label = _scan_label(path)
+        if label in registry or label in rule_sites:
+            continue
+        text = path.read_text(encoding="utf-8")
+        found = {token for token in _TOKEN_RE.findall(text) if token in discriminating}
+        if len(found) >= threshold:
+            unregistered.append(label)
+    return unregistered
+
 
 # ---------------------------------------------------------------------------
 # Hand-written fixture text. NEVER the live artifacts: an extractor unit test
