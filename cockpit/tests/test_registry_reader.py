@@ -313,6 +313,165 @@ class TestScanChangeShortCircuit:
         assert second == []
 
 
+class TestProjectTokenCanonicalization:
+    """SessionRecord.project is CANONICAL the moment it enters the cockpit (task 3812).
+
+    The fleet writes ONE project under several spellings: the spawn path
+    stamps record.project raw (it is parsed from the literal terminal
+    title), so 'dark-factory', 'DARK-Factory' and 'df' all sit on disk for
+    the same project (measured 2026-09-07: 42,026 / 1,493 / 89 records).
+    The cockpit keys one project_weights lookup and one weight picker on
+    that token, so a split spelling silently partitions an operator's
+    weight across buckets that never compare equal.
+
+    registry_reader therefore folds every scanned record's .project through
+    session_registry.normalize_project_token (task 3807's one canonical
+    fold) inside _read_record_soft -- the single parse step shared by
+    scan_sessions and SessionScanner.scan -- so both scan paths, and the
+    mtime cache behind SessionScanner, yield one bucket by construction.
+    """
+
+    _SPELLINGS = ('dark-factory', 'DARK-Factory', 'df', 'dark_factory')
+
+    def _seed_spellings(self, tmp_path):
+        for i, project in enumerate(self._SPELLINGS):
+            sr.write_record(
+                _make_record(session_slug=f'spelling-{i}', project=project), root=tmp_path
+            )
+
+    def test_every_spelling_scans_as_one_canonical_token(self, tmp_path):
+        """Four spellings on disk -> ONE bucket out of scan_sessions."""
+        from cockpit.registry_reader import scan_sessions
+
+        self._seed_spellings(tmp_path)
+
+        result = scan_sessions(tmp_path)
+
+        assert len(result) == len(self._SPELLINGS)
+        assert {r.project for r in result} == {'dark_factory'}
+
+    def test_scanner_agrees_with_scan_sessions_record_for_record(self, tmp_path):
+        """The fold lives in the ONE shared parse step, so the two scan
+        paths inherit it by construction -- mirrors
+        test_scan_matches_scan_sessions_for_seeded_dir's parity convention."""
+        from cockpit.registry_reader import SessionScanner, scan_sessions
+
+        self._seed_spellings(tmp_path)
+
+        result = SessionScanner(root=tmp_path).scan()
+        expected = scan_sessions(tmp_path)
+
+        assert [r.session_slug for r in result] == [r.session_slug for r in expected]
+        assert {r.session_slug: r for r in result} == {r.session_slug: r for r in expected}
+        assert {r.project for r in result} == {'dark_factory'}
+
+    def test_cache_hit_path_still_returns_the_canonical_token(self, tmp_path, monkeypatch):
+        """The fold happens BEFORE the mtime cache stores the record, so a
+        second scan() -- which reuses the cached SessionRecord and never
+        re-parses -- still hands back canonical tokens. This is what makes
+        the fold cost one call per PARSE rather than one per poll tick."""
+        from cockpit import registry_reader
+        from cockpit.registry_reader import SessionScanner
+
+        self._seed_spellings(tmp_path)
+
+        call_count = 0
+        original_read_record = registry_reader.session_registry.read_record
+
+        def counting_read_record(slug, root=None):
+            nonlocal call_count
+            call_count += 1
+            return original_read_record(slug, root=root)
+
+        monkeypatch.setattr(registry_reader.session_registry, 'read_record', counting_read_record)
+
+        scanner = SessionScanner(root=tmp_path)
+        first = scanner.scan()
+        assert call_count == len(self._SPELLINGS)
+        assert {r.project for r in first} == {'dark_factory'}
+
+        second = scanner.scan()
+        # No re-parse: every record below came out of the cache.
+        assert call_count == len(self._SPELLINGS)
+        assert {r.project for r in second} == {'dark_factory'}
+
+    def test_synthetic_and_basename_tail_tokens_stay_distinct(self, tmp_path):
+        """Collapse guard, mirroring
+        test_normalize_project_token_does_not_merge_solar_challenge_platform:
+        the fold merges SPELLINGS, never distinct projects. The registry's
+        long tail of synthetic tokens (fm-neutral-classifier-cwd-*,
+        _lane-<n>, run-<hex>, bare task ids) and cwd-basename tokens ('tmp',
+        'orchestrator', 'shared') each keep their OWN folded identity --
+        none is absorbed into 'dark_factory'."""
+        from cockpit.registry_reader import scan_sessions
+
+        tail = {
+            'fm-neutral-classifier-cwd-_3yp2s4h': 'fm_neutral_classifier_cwd_3yp2s4h',
+            '_lane-3': 'lane_3',
+            'run-a1b2c3': 'run_a1b2c3',
+            '3565': '3565',
+            'tmp': 'tmp',
+            'orchestrator': 'orchestrator',
+            'shared': 'shared',
+        }
+        for i, raw in enumerate(tail):
+            sr.write_record(_make_record(session_slug=f'tail-{i}', project=raw), root=tmp_path)
+        sr.write_record(_make_record(session_slug='real', project='dark-factory'), root=tmp_path)
+
+        result = scan_sessions(tmp_path)
+
+        scanned = {r.project for r in result}
+        assert scanned == {*tail.values(), 'dark_factory'}
+        # One distinct bucket per seeded token -- nothing collapsed together.
+        assert len(scanned) == len(tail) + 1
+
+    def test_unset_project_round_trips_as_the_empty_sentinel(self, tmp_path):
+        """'' is the UNSET sentinel, never a token: it must stay '' rather
+        than joining any real project's bucket."""
+        from cockpit.registry_reader import scan_sessions
+
+        sr.write_record(_make_record(session_slug='unset', project=''), root=tmp_path)
+
+        (record,) = scan_sessions(tmp_path)
+
+        assert record.project == ''
+
+    def test_only_the_project_field_is_rewritten(self, tmp_path):
+        """The reader canonicalizes .project and NOTHING else -- every other
+        field comes back byte-identical to what was written."""
+        import dataclasses
+
+        from cockpit.registry_reader import scan_sessions
+
+        written = _make_record(
+            session_slug='only-project',
+            project='DARK-Factory',
+            title='unblock:DARK-Factory#2085 only-project',
+            role='unblock',
+            task_id='2085',
+            start_ts='2026-07-07T00:00:00+00:00',
+            cwd='/home/leo/src/dark-factory',
+        )
+        sr.write_record(written, root=tmp_path)
+
+        (scanned,) = scan_sessions(tmp_path)
+
+        assert scanned.project == 'dark_factory'
+        assert scanned.session_slug == written.session_slug
+        assert scanned.status == written.status
+        # The title is the record's literal terminal title and is a
+        # documented MIRROR of the raw project token -- folding .project
+        # must not desynchronize it by rewriting it too.
+        assert scanned.title == written.title
+        assert scanned.role == written.role
+        assert scanned.task_id == written.task_id
+        assert scanned.start_ts == written.start_ts
+        assert scanned.cwd == written.cwd
+        # Exhaustive backstop: swap .project back and the whole record is
+        # equal, so no OTHER field moved either.
+        assert dataclasses.replace(scanned, project=written.project) == written
+
+
 class TestBuildSnapshot:
     def test_keyed_by_session_slug(self):
         from cockpit.registry_reader import build_snapshot
