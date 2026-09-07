@@ -3623,6 +3623,30 @@ class VerifyResult:
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
         sections = []
+        # Lead with the truncation caveat, ahead of `## Failure Cause`, for
+        # the same reason `## Verify Timed Out` below leads: the failure may
+        # not be real code, and the reader must know that BEFORE reading a
+        # cause or a tally. Derived from `self.test_output` rather than from
+        # a new dataclass field — `VerifyResult` is round-tripped through a
+        # generic `asdict`/`VerifyResult(**d)` codec and compared by equality
+        # in the CLI transparency tests, so every added field carries codec
+        # and `compare=` risk for a fact that is already recoverable here.
+        if self.test_output and _is_worker_death_truncated_session(self.test_output):
+            sections.append(
+                '## Session Aborted After Worker Death\n\n'
+                'A pytest-xdist worker died and the --max-worker-restart cap '
+                'was exceeded, so pytest ABANDONED every test still queued '
+                'and shut the session down early.\n'
+                '- Any pass/fail/skip tally below is PARTIAL, not a complete '
+                'result: the remaining tests never ran, so a small failure '
+                'count does NOT mean the rest of the suite passed.\n'
+                '- A FAILED line naming the crashed worker\'s in-flight test '
+                'is an artefact xdist synthesized for the crash, not that '
+                "test's own verdict — it commonly passes in isolation.\n"
+                '- Look for a genuine failure elsewhere in the output before '
+                'treating any of this as a real code failure; if there is '
+                'none, this run measured nothing and should be re-run.'
+            )
         if self.timed_out:
             # Lead with timeout info so the debugger knows the failure may not
             # be real code — list which commands actually hit the wall clock.
