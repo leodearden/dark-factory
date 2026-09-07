@@ -516,6 +516,36 @@ ready for it or not — and must never be done while a verify is in flight on
 that host, since the checkout is the code a live verify is currently
 executing.
 
+### Provisioning the remote host
+
+After fast-forwarding the checkout to the workstation's `main` (a plain
+`git fetch && git reset --hard origin/main` — never `git clean`; leave
+whatever untracked paths are already on that host alone), re-provision the
+environment at the new commit:
+
+```bash
+<uv path> sync --all-packages
+npm ci
+```
+
+- **Always `--all-packages`, never a bare `uv sync`.** A Dark-Factory
+  checkout is a **uv workspace**, and a bare `uv sync` exits `0` while
+  *pruning the other members' console scripts* — including the
+  `orchestrator` entry point this host exists to expose (task 4539). Losing
+  it turns every subsequent dispatch into a silent `rc=127`.
+- **`npm ci`** installs the pinned `npx pyright` (and anything else the
+  repo-root `package-lock.json` carries) — needed the same way it is on the
+  workstation (§1).
+- **Non-login-ssh PATH trap:** a plain `ssh <host> '<uv path> sync ...'` can
+  fail `rc=127` for a reason that has nothing to do with the command itself
+  — a non-interactive, non-login ssh session does not source
+  `~/.bashrc`/`~/.profile`, so a tool installed under, e.g., `~/.local/bin`
+  is simply not on `PATH` yet. Invoke it by absolute path (as above) or
+  export `PATH` first; don't mistake the resulting `127` for a broken
+  install. `node`/`npm` are commonly already on the default ssh `PATH` via
+  `/usr/bin`, so this trap tends to bite `uv` (or `cargo`, `~/.local/bin`
+  toolchains generally) more often than the Node half of this step.
+
 ---
 
 For hot-reloading config without a restart, understanding the fleet-redeploy
