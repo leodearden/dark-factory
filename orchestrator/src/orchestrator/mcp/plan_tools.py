@@ -96,7 +96,7 @@ from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import detect_for, repair
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink
+from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
 
 logger = logging.getLogger(__name__)
 
@@ -1650,6 +1650,82 @@ def _markup_fact_journal(
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
         resolve_root=lambda worktree: _markup_project_root(worktree),
     )
+
+
+def _markup_plan_stamp(
+    artifacts: TaskArtifacts,
+) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
+    """Build plan-tools' PLAN-STAMPING fact channel (task 4597, esc-4528-1).
+
+    A THIN SEAM over ``plan_markup_stamp.make_plan_stamp``, spelled beside
+    ``_markup_fact_journal`` and reached the same way — through this module's
+    globals at call time — so a test that substitutes it steers a sink
+    ``create_server`` has already built.
+
+    The journal answers "who leaked, from which tool, into which parameter,
+    when" for an OPERATOR reading a file under the main checkout. This answers
+    the same question for a later READER OF THE PLAN, which is a different
+    audience reached through a different artifact: the implementer briefing
+    tells its agent to open ``.task/plan.json`` directly, and the four
+    architect-facing prompts embed the document verbatim. Neither audience ever
+    sees the journal.
+    """
+    return plan_markup_stamp.make_plan_stamp(artifacts=artifacts)
+
+
+def _markup_fact_sink(
+    artifacts: TaskArtifacts,
+) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
+    """Fan one markup fact out to BOTH of this server's fact channels.
+
+    ``MarkupGuardMiddleware`` accepts exactly ONE ``fact_sink``, so the
+    composition lives here. Teaching the middleware about a list of sinks would
+    change a boundary shared with verdict-tools and the escalation server for a
+    need only plan-tools has — neither of the others owns a ``plan.json`` to
+    stamp — and the registration site is where every other server-specific
+    answer on this boundary already lives (``MarkupSinkSpec`` exists precisely
+    so nothing is inferred from a server name at call time).
+
+    EACH ARM IS ISOLATED, and that is load-bearing rather than defensive style.
+    The middleware's ``_call_sink`` wraps the WHOLE sink in ONE try/except, so
+    a composed sink that let the first arm's exception propagate would silently
+    skip the second entirely — one channel's outage taking the other down,
+    which is the exact fail-soft the containment PRD exists to end.
+
+    THE JOURNAL RUNS FIRST, so a stamp failure can never delay the established
+    durable record the storm escalation points an operator at, and the
+    composed sink returns THE JOURNAL'S locator — the existing fact-sink return
+    contract is unchanged, and the stamp is purely additive.
+
+    Both emitters are built ONCE, here, rather than per record: each memoizes
+    its own resolution state, and rebuilding them per call would discard it.
+    """
+    journal = _markup_fact_journal(artifacts)
+    stamp = _markup_plan_stamp(artifacts)
+
+    async def fact_sink(record: dict[str, Any]) -> str | None:
+        locator: str | None = None
+        try:
+            locator = await journal(record)
+        except Exception:
+            # Both emitters already contain every failure they can see; these
+            # are the floors under the ARMS THEMSELVES, so one channel's
+            # outage costs only its own record.
+            logger.exception(
+                'markup guard: the fact journal failed for %r; continuing to '
+                'the plan stamp', record.get('fact'),
+            )
+        try:
+            await stamp(record)
+        except Exception:
+            logger.exception(
+                'markup guard: the plan stamp failed for %r; the journal '
+                'result stands', record.get('fact'),
+            )
+        return locator
+
+    return fact_sink
+
 
 
 # ---------------------------------------------------------------------------
