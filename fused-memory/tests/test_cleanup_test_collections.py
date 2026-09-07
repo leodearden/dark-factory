@@ -969,6 +969,152 @@ class TestTheSweepHoldsOffWhileARunIsLive:
         capsys.readouterr()
 
 
+class TestDeadLeaseFilesAreReaped:
+    """Litter, not leases: a file nobody holds guards nothing.
+
+    A SIGKILLed holder leaves its file behind — no `finally`, no atexit, no
+    signal handler runs.  `live_leases` already ignores it, so nothing is
+    held off by it and there is no urgency; it is collected here purely so
+    the lease directory does not grow without bound.
+
+    Liveness is the flock, so there is no age threshold anywhere in this
+    class.  A clock would have to guess how long a run lives, and would be
+    wrong in one of the two directions no matter what value it picked.
+    """
+
+    @staticmethod
+    def _names(directory) -> list[str]:
+        if not directory.exists():
+            return []
+        return sorted(path.name for path in directory.iterdir())
+
+    def test_it_unlinks_the_files_nobody_holds_and_returns_the_count(
+        self, lease_dir,
+    ):
+        mod = _mod()
+        lease_dir.mkdir(parents=True)
+        for name in ('a.lease', 'b.lease', 'c.lease'):
+            (lease_dir / name).write_text('{}')
+
+        assert mod.reap_dead_leases() == 3
+        assert self._names(lease_dir) == []
+
+    def test_it_reaps_the_real_residue_of_a_sigkilled_holder(self, lease_dir):
+        """Not a hand-made stand-in: a genuine holder, killed with no chance
+        to clean up, is the exact thing this collects."""
+        mod = _mod()
+        lease_dir.mkdir(parents=True)
+        marker = lease_dir.parent / 'ready.marker'
+        lease_path = lease_dir / 'killed.lease'
+        proc = subprocess.Popen([
+            sys.executable, '-c', _LIVE_HOLDER_CHILD_SRC,
+            str(lease_path), str(marker), 'a-run-that-was-killed',
+        ])
+        try:
+            assert _wait_for_marker(marker), 'child never signalled readiness'
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+            proc = None
+
+            assert mod.reap_dead_leases() == 1
+            assert not lease_path.exists()
+        finally:
+            if proc is not None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_it_leaves_a_currently_held_lease_alone(self, lease_dir):
+        """The whole point.  Unlinking a live holder's file would take the
+        guard away from a run that is still seeding."""
+        mod = _mod()
+
+        with mod.hold_lease(owner='e2-bake-off gw1'):
+            held = self._names(lease_dir)
+
+            assert mod.reap_dead_leases() == 0
+            assert self._names(lease_dir) == held
+            assert len(mod.live_leases()) == 1
+
+    def test_it_returns_zero_when_the_directory_is_absent(self, lease_dir):
+        mod = _mod()
+        assert not lease_dir.exists()
+
+        assert mod.reap_dead_leases() == 0
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0, reason='root ignores file permissions',
+    )
+    def test_an_unreadable_file_is_left_alone_rather_than_raising(
+        self, lease_dir,
+    ):
+        """Unprobeable is not the same as dead.  A file whose flock cannot be
+        asked about is skipped, not unlinked — and never turns cron mail into
+        a traceback."""
+        mod = _mod()
+        lease_dir.mkdir(parents=True)
+        opaque = lease_dir / 'unreadable.lease'
+        opaque.write_text('{}')
+        opaque.chmod(0o000)
+        try:
+            assert mod.reap_dead_leases() == 0
+            assert opaque.exists()
+        finally:
+            opaque.chmod(0o600)
+
+    def test_a_second_sweeper_unlinking_first_does_not_raise(
+        self, lease_dir, monkeypatch,
+    ):
+        """Two sweeps can overlap — an operator running this by hand while
+        cron fires.  The loser of the race must return a count, not a
+        traceback."""
+        mod = _mod()
+        lease_dir.mkdir(parents=True)
+        doomed = lease_dir / 'raced.lease'
+        doomed.write_text('{}')
+        probe = mod._is_held
+
+        def _is_held_then_someone_else_unlinks_it(path):
+            verdict = probe(path)
+            path.unlink(missing_ok=True)
+            return verdict
+
+        monkeypatch.setattr(
+            mod, '_is_held', _is_held_then_someone_else_unlinks_it,
+        )
+
+        assert mod.reap_dead_leases() == 1
+        assert self._names(lease_dir) == []
+
+    def test_main_reaps_dead_leases_on_a_sweep_that_proceeds(
+        self, monkeypatch, capsys, lease_dir,
+    ):
+        mod = _mod()
+        lease_dir.mkdir(parents=True)
+        (lease_dir / 'left-behind.lease').write_text('{}')
+        _install_fake_qdrant(monkeypatch, LIVE_COLLECTIONS)
+
+        mod.main()
+
+        assert self._names(lease_dir) == []
+        capsys.readouterr()
+
+    def test_main_does_not_reap_on_the_held_off_path(
+        self, monkeypatch, capsys, lease_dir,
+    ):
+        """Nothing to reclaim while a run is live, and the held-off path has
+        to stay zero-cost — it returns before the client is even built."""
+        mod = _mod()
+        _install_fake_qdrant(monkeypatch, LIVE_COLLECTIONS)
+
+        with mod.hold_lease(owner='e2-bake-off gw0'):
+            (lease_dir / 'left-behind.lease').write_text('{}')
+
+            mod.main()
+
+            assert 'left-behind.lease' in self._names(lease_dir)
+        capsys.readouterr()
+
+
 @pytest.mark.parametrize('suffix', ['main', 'gw0', 'gw11'])
 def test_every_worker_suffix_produces_a_reapable_collection(suffix):
     """The per-xdist-worker project id must not be able to dodge the prefix."""
