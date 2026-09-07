@@ -174,6 +174,112 @@ class TestPrefixAgreement:
         assert _mod().PREFIX == '_test_mem0_qdrant_integration_'
 
 
+# --- the in-use lease (task 4775) ------------------------------------------
+
+
+class TestLeaseDirIsEnvironmentIndependent:
+    """The guard fires only if the HOLDER and the REAPER resolve one directory.
+
+    They never share an environment.  The reaper is a bare-``python3`` cron
+    job with a near-empty env; a holder is a pytest process (usually inside
+    a ``.worktrees/<id>`` checkout, under an xdist worker) or a hand-run
+    script in a login shell.  Every "portable" temp-directory source moves
+    between those two: ``tempfile.gettempdir()`` honours ``TMPDIR``/``TEMP``/
+    ``TMP``, which pytest and cron set differently, and ``XDG_RUNTIME_DIR``
+    is ``/run/user/<uid>`` in a login session and unset under cron.
+
+    A guard that resolved two different directories would find no lease,
+    delete, and leave nothing behind pointing at the reaper — silently never
+    firing, which is strictly worse than no guard, because it also stops the
+    next person looking.  So environment-independence is not a nicety here;
+    it is the whole property, and it is asserted before anything else.
+    """
+
+    #: Every variable a "portable temp dir" helper would consult.
+    TEMP_VARS = ('TMPDIR', 'TEMP', 'TMP', 'XDG_RUNTIME_DIR')
+
+    def _default(self, monkeypatch):
+        """The resolved lease dir with the test override removed."""
+        mod = _mod()
+        monkeypatch.delenv(mod.LEASE_DIR_ENV, raising=False)
+        return mod.lease_dir()
+
+    @pytest.mark.parametrize('var', TEMP_VARS)
+    def test_no_single_temp_variable_moves_it(self, monkeypatch, tmp_path, var):
+        mod = _mod()
+        baseline = self._default(monkeypatch)
+
+        monkeypatch.setenv(var, str(tmp_path / f'{var.lower()}-elsewhere'))
+
+        assert mod.lease_dir() == baseline
+
+    def test_all_four_set_at_once_do_not_move_it(self, monkeypatch, tmp_path):
+        """Set together, not merely one at a time: a helper that consulted
+        them in priority order would survive every single-variable case."""
+        mod = _mod()
+        baseline = self._default(monkeypatch)
+
+        for var in self.TEMP_VARS:
+            monkeypatch.setenv(var, str(tmp_path / f'{var.lower()}-elsewhere'))
+
+        assert mod.lease_dir() == baseline
+
+    def test_the_working_directory_does_not_move_it(self, monkeypatch, tmp_path):
+        """A repo-relative path would give every worktree its own private
+        lease dir, while ONE Qdrant at localhost:6333 is shared by all of
+        them — so the bake-off in one checkout would be invisible to a cron
+        sweep launched from another."""
+        mod = _mod()
+        baseline = self._default(monkeypatch)
+        elsewhere = tmp_path / 'some-other-cwd'
+        elsewhere.mkdir()
+
+        monkeypatch.chdir(elsewhere)
+
+        assert mod.lease_dir() == baseline
+
+    def test_it_is_absolute_and_outside_the_repo_working_tree(self, monkeypatch):
+        """Absolute for the same reason: the cron's cwd is not this repo, and
+        a lease under the tree would also leave the machine-operated
+        `project_root` checkout dirty."""
+        resolved = self._default(monkeypatch)
+
+        assert resolved.is_absolute()
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        assert not resolved.resolve().is_relative_to(repo_root)
+
+    def test_the_env_override_is_used_exactly_with_no_suffixing(
+        self, monkeypatch, tmp_path,
+    ):
+        """Exactly, because both sides must be able to agree on it: an
+        operator who points one process at a directory has to get THAT
+        directory, not a subdirectory of it that the other side may derive
+        differently."""
+        mod = _mod()
+        override = tmp_path / 'operator' / 'chosen' / 'dir'
+
+        monkeypatch.setenv(mod.LEASE_DIR_ENV, str(override))
+
+        assert mod.lease_dir() == override
+
+    def test_the_override_is_read_at_call_time_not_import_time(
+        self, monkeypatch, tmp_path,
+    ):
+        """The module is long since imported by the time this runs, and the
+        two calls below straddle a change to the variable — a value captured
+        at import (or memoised) could not follow it.  This is what makes the
+        pre-1 isolation fixture able to work at all."""
+        mod = _mod()
+        first, second = tmp_path / 'first', tmp_path / 'second'
+
+        monkeypatch.setenv(mod.LEASE_DIR_ENV, str(first))
+        seen_first = mod.lease_dir()
+        monkeypatch.setenv(mod.LEASE_DIR_ENV, str(second))
+        seen_second = mod.lease_dir()
+
+        assert (seen_first, seen_second) == (first, second)
+
+
 class TestSweep:
     """What the reaper deletes, and what it must not."""
 
