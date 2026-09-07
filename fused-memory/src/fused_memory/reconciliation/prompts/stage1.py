@@ -513,6 +513,27 @@ key actions taken") are NOT volatile counts and may still be written as \
 `temporal_facts` edges when they capture non-recoverable per-cycle decisions or \
 observations. Keep run summaries concise and deduplicated across cycles.
 
+### Pin-order and priority-override state — DO NOT persist as durable edges
+Pin order, pinned status, boost tier, `reserve_now` and TTL are LIVE-QUERIED state. \
+The authoritative source is `scheduler_overrides.db`, read via the `get_pin_queue` \
+MCP tool — that live read is the single source of truth for the current cycle. \
+Structural per-change history already exists in `data/orchestrator/runs.db` \
+(`priority_override_set`, `priority_override_cleared`, `task_pinned`, `task_unpinned`, \
+`pin_queue_reordered`) and is surfaced by the `get_scheduler_events` MCP tool.
+
+**MUST NOT**: write pin-order or priority-override state as durable Graphiti edges \
+— not via `add_memory` under any GRAPHITI_PRIMARY category \
+(`entities_and_relations`, `temporal_facts`, `decisions_and_rationale`), and not via \
+`add_episode`. This state churns and is routinely CLEARED with no corresponding \
+write, so a persisted edge goes stale within the hour while still reading as current. \
+Extraction also produces facts that name no task at all (e.g. "Pin order is set to \
+10."), which no sweep can attribute to a task or drain.
+
+**Note who the remaining writer is**: the MCP override tools themselves were changed \
+(task 3853, the esc-3834-1 ruling) to emit no such write, and their audit helper was \
+deleted. An edge of this class appearing now can only originate from a \
+reconciliation-stage write — that is, from you, the reader of this prompt.
+
 ### Stale task-count snapshot edges — do NOT emit correction findings
 
 Existing task-count snapshot edges in Graphiti are **stale-by-design**, NOT erroneous. \
