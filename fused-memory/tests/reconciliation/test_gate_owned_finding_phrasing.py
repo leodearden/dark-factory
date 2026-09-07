@@ -17,12 +17,21 @@ Covers:
   human-gate-owned tasks.  Deliberately a WIDER population than its sibling
   ``curator_gate_resolution_sweep.extract_open_gate_task_ids`` (which filters
   on mode alone), and deliberately STRICTER than a truthy read.
+- CANONICAL_HUMAN_GATE_ACTION / GATE_OWNED_ACTION_NORM_HEADING /
+  render_gate_owned_action_norm: the ONE sentence both halves quote, its
+  exported heading, and the Stage-1 prompt section that carries it.
 """
 
 from __future__ import annotations
 
+from fused_memory.reconciliation.curator_gate_resolution_sweep import (
+    GATE_RESOLUTION_FLAG_TYPE,
+)
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
+    CANONICAL_HUMAN_GATE_ACTION,
+    GATE_OWNED_ACTION_NORM_HEADING,
     extract_human_gated_task_ids,
+    render_gate_owned_action_norm,
 )
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
@@ -185,3 +194,173 @@ class TestExtractHumanGatedTaskIds:
         """No active tasks -> []."""
         assert extract_human_gated_task_ids(FilteredTaskTree().active_tasks) == []
         assert extract_human_gated_task_ids([]) == []
+
+
+class TestCanonicalHumanGateAction:
+    """The one sentence both halves quote, its heading, and its prompt section.
+
+    ONE OWNER (INV-5).  The prompt tells Stage 1 what to write; the
+    post-processor writes exactly that same sentence when Stage 1 does not.
+    If the two texts could drift, an operator reading a corrected finding
+    would see wording the stage was never given — so the constant is asserted
+    to be embedded VERBATIM in the rendered section, not paraphrased into it.
+
+    These are wiring/contract assertions on a code-owned constant, not prose
+    pins.  ``test_recon_gate_closure_guidance.py``'s
+    TestReconStageEscalationServerIdentity(c) records a prose substring pin
+    that was tried and deliberately REMOVED because it passed green on a
+    reworded mis-instruction and failed red on a harmless reword.
+    """
+
+    def test_canonical_action_is_a_nonempty_str_with_the_mandated_phrase(self):
+        """The sentence exists and carries the phrase the norm is named for."""
+        assert isinstance(CANONICAL_HUMAN_GATE_ACTION, str), (
+            f'CANONICAL_HUMAN_GATE_ACTION must be a str, got {type(CANONICAL_HUMAN_GATE_ACTION)!r}'
+        )
+        assert CANONICAL_HUMAN_GATE_ACTION.strip(), (
+            'CANONICAL_HUMAN_GATE_ACTION must be non-empty — it is prepended '
+            'verbatim onto corrected findings'
+        )
+        assert 'awaiting human-operator sign-off only' in CANONICAL_HUMAN_GATE_ACTION, (
+            'the canonical sentence must carry the mandated phrase "awaiting '
+            'human-operator sign-off only" — that phrase is what tells a '
+            'Stage-2 reader the finding is evidence, not an instruction; got '
+            f'{CANONICAL_HUMAN_GATE_ACTION!r}'
+        )
+
+    def test_canonical_action_carries_no_braces(self):
+        """No brace in any form: it is interpolated into an f-string prompt.
+
+        ``STAGE1_SYSTEM_PROMPT`` is an f-string, so a bare brace fails at
+        import; and ``test_stage1_consolidation_guidance.py`` additionally
+        asserts that ``{{``/``}}`` never survive into the RENDERED text, so
+        over-escaping fails too.  Carrying no brace at all satisfies both.
+        """
+        assert '{' not in CANONICAL_HUMAN_GATE_ACTION and '}' not in CANONICAL_HUMAN_GATE_ACTION, (
+            'the canonical sentence must contain no brace at all: a bare brace '
+            'breaks the STAGE1_SYSTEM_PROMPT f-string at import, and a doubled '
+            'brace breaks test_stage1_consolidation_guidance.py'
+        )
+
+    def test_heading_constant_is_exported_and_well_formed(self):
+        """The section heading is a constant so tests locate it without pinning prose.
+
+        Follows the ``EXECUTING_A_CLUSTER_FOLD_HEADING`` precedent in
+        ``prompts/stage1.py``: a pure rename with a byte-identical body must
+        not turn the wiring pins red for no behavioural reason.
+        """
+        assert isinstance(GATE_OWNED_ACTION_NORM_HEADING, str), (
+            'GATE_OWNED_ACTION_NORM_HEADING must be a str'
+        )
+        assert GATE_OWNED_ACTION_NORM_HEADING.startswith('## '), (
+            'the heading must be a top-level markdown section heading so it '
+            'sits at a prompt section boundary; got '
+            f'{GATE_OWNED_ACTION_NORM_HEADING!r}'
+        )
+        assert GATE_OWNED_ACTION_NORM_HEADING.strip() != '##', (
+            'the heading must carry a title, not just the marker'
+        )
+
+    def test_render_returns_a_section_starting_with_its_heading(self):
+        """The renderer emits one section, headed by the exported constant."""
+        section = render_gate_owned_action_norm()
+
+        assert isinstance(section, str) and section.strip(), (
+            'render_gate_owned_action_norm() must return a non-empty str'
+        )
+        assert section.startswith(GATE_OWNED_ACTION_NORM_HEADING), (
+            'the rendered section must start with GATE_OWNED_ACTION_NORM_HEADING '
+            'so it lands at a prompt section boundary; got '
+            f'{section[:80]!r}'
+        )
+
+    def test_render_embeds_the_canonical_sentence_verbatim_exactly_once(self):
+        """One owner: the section quotes the constant, it does not reword it."""
+        section = render_gate_owned_action_norm()
+
+        assert section.count(CANONICAL_HUMAN_GATE_ACTION) == 1, (
+            'the rendered norm must embed CANONICAL_HUMAN_GATE_ACTION verbatim '
+            'exactly once — a reworded second copy is exactly the drift the '
+            'single-owner design (INV-5) exists to prevent, and would make the '
+            'deterministic normalizer write wording the stage was never given'
+        )
+
+    def test_render_names_both_gate_metadata_keys(self):
+        """The stage must be told which structured fact makes a task gate-owned."""
+        section = render_gate_owned_action_norm()
+
+        for key in ('operational_mode', 'always_escalates'):
+            assert key in section, (
+                f'the rendered norm must name metadata.{key} — those two keys '
+                'are the whole selection predicate, and a stage told only "a '
+                'gate task" cannot tell which findings the rule covers'
+            )
+
+    def test_render_names_the_carve_out_flag_type(self):
+        """The carve-out is named by the IMPORTED constant, never re-spelled."""
+        section = render_gate_owned_action_norm()
+
+        assert GATE_RESOLUTION_FLAG_TYPE in section, (
+            'the rendered norm must name the carve-out flag type '
+            f'({GATE_RESOLUTION_FLAG_TYPE!r}) so the prompt half agrees with '
+            'the code half: build_gate_resolution_flag legitimately asks Stage '
+            '2 to transcribe a ruling a human curator already recorded, and a '
+            'blanket rule would contradict that live sibling flag on its first '
+            'cycle'
+        )
+
+    def test_render_carries_no_token_banned_from_stage1(self):
+        """Every token a live suite bans from the assembled Stage-1 prompt.
+
+        Each assertion names the suite that bans it, so a future editor of
+        this text sees WHY the token is unavailable rather than discovering it
+        as an unexplained red elsewhere.
+        """
+        section = render_gate_owned_action_norm()
+
+        banned = [
+            ('escalate_blocker',
+             'test_stages.py bans the bare substring in the Stage 1/3 prompts'),
+            ('{',
+             'STAGE1_SYSTEM_PROMPT is an f-string (a bare brace fails at import) '
+             'and test_stage1_consolidation_guidance.py bans doubled braces in '
+             'the rendered text'),
+            ('}',
+             'STAGE1_SYSTEM_PROMPT is an f-string (a bare brace fails at import) '
+             'and test_stage1_consolidation_guidance.py bans doubled braces in '
+             'the rendered text'),
+            ('source_finding_id',
+             'test_finding_provenance_prompt_guidance.py pins a DERIVED-COUNT '
+             'invariant that any new mention of this key breaks'),
+            ('related_memory_ids',
+             'test_finding_provenance_prompt_guidance.py pins a DERIVED-COUNT '
+             'invariant that any new mention of this key breaks'),
+            ('as_submit_task_kwargs',
+             'test_recon_self_model.py asserts this against the whole Stage-1 '
+             'prompt precisely so a future section cannot reintroduce it'),
+            ('write_entity_standing_decision',
+             'test_recon_report_guidance_drift.py bans this Stage-1-denied '
+             'stage-gated tool from the Stage-1 prompt'),
+        ]
+        for token, why in banned:
+            assert token not in section, (
+                f'the rendered norm must not contain {token!r}: {why}'
+            )
+
+    def test_render_carries_no_recon_report_tool_call_example(self):
+        """No ``add_finding(``-shaped example at all.
+
+        ``test_recon_report_guidance_drift.py`` runs a balanced-paren scan over
+        every ``add_finding(``-shaped example in the assembled prompt and
+        requires ``run_id`` in the args — and its extractor HARD-FAILS on
+        unbalanced parens.  A phrasing rule needs no call example, which
+        sidesteps the trap entirely.
+        """
+        section = render_gate_owned_action_norm()
+
+        assert 'add_finding(' not in section, (
+            'the norm states a phrasing rule and needs no recon-report call '
+            'example; adding one puts this section under '
+            "test_recon_report_guidance_drift.py's balanced-paren run_id scan "
+            'for no benefit'
+        )
