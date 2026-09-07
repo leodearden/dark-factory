@@ -533,3 +533,52 @@ def test_extractor_fails_soft_on_a_syntax_error() -> None:
     the very class of misattributed failure this module exists to prevent.
     """
     assert _timeout_marker_sites('def test_a(:\n') == ()
+
+
+# ---------------------------------------------------------------------------
+# _inverts(seconds) -- boundary table.
+# ---------------------------------------------------------------------------
+
+
+def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
+    """``_inverts`` is True only strictly inside ``(60, 300)``.
+
+    THE WHOLE DESIGN LIVES IN THESE EDGES, so every one is pinned rather than
+    left to a spot check.
+
+    CLOSED AT THE BOTTOM -- ``N <= PYPROJECT_DEFAULT_TIMEOUT`` is NOT an
+    offence, even though the task text says "N < 300".  A marker at or under
+    the ini default tightens under BOTH budgets, which makes it unambiguously a
+    deliberate tight bound rather than an accident: its author chose tighter
+    than even a bare local ``pytest`` would give them.  The worked example is
+    test_verify_clock_stop.py, which carries 13 marks at 15s because those
+    tests assert a watchdog fires FAST -- raising them to 300 would blunt the
+    assertion AND turn each hang test into a 300s stall.  Reading "N < 300"
+    literally would sweep those in and be actively wrong.
+
+    OPEN AT THE TOP -- ``N >= VERIFY_CLI_PER_TEST_TIMEOUT`` loosens under both
+    budgets and is safe, which is what keeps the sanctioned ceilings
+    (WHOLE_TREE_SCAN_TEST_TIMEOUT and HEAVY_BARRIER_TEST_TIMEOUT at 300,
+    PYTEST_TIMEOUT at 960) out of the guard's way -- including this module's
+    own ``pytestmark``.
+
+    None -> False is the fail-soft polarity from :func:`_resolve_seconds`:
+    "no opinion", never "too small".
+    """
+    assert [
+        _inverts(seconds)
+        for seconds in (None, 15, 60, 61, 90, 120, 150, 180, 299, 300, 360, 960)
+    ] == [
+        False,  # None       -- unresolvable: no opinion, never an offence
+        False,  # 15         -- test_verify_clock_stop.py's watchdog marks
+        False,  # 60         -- exactly the ini default: expresses no opinion
+        True,  # 61          -- first inverting value
+        True,  # 90          -- measured, test_merge_queue.py
+        True,  # 120         -- measured, the named regression instance
+        True,  # 150         -- measured, test_offline_lane_integration.py
+        True,  # 180         -- measured, the most common in-band value (34 sites)
+        True,  # 299         -- last inverting value
+        False,  # 300        -- WHOLE_TREE_SCAN / HEAVY_BARRIER / the CLI budget
+        False,  # 360        -- loosens under both
+        False,  # 960        -- PYTEST_TIMEOUT (warm-lane bash bucket)
+    ]
