@@ -93,13 +93,19 @@ def _write_manifest(root: Path, relpath: str, doc) -> Path:
     return path
 
 
-def _manifest_doc(task_id, label="δ", prd="plans/x-prd.md", checks=(("gate", _GREP_CHECK),)):
-    return {
-        "prd": prd,
-        "schema_version": 1,
-        "tasks": [{"label": label, "task_id": task_id,
-                   "capabilities": [_capability(n, c) for n, c in checks]}],
-    }
+def _manifest_doc(task_id, label="δ", prd="plans/x-prd.md", checks=(("gate", _GREP_CHECK),),
+                  external_task_id=None):
+    """One-task manifest doc. *external_task_id* binds a FOREIGN producer.
+
+    The two id fields are mutually exclusive in the model, so a caller
+    passing *external_task_id* passes ``task_id=None``. The key is emitted
+    only when supplied, so every existing caller's doc is byte-identical.
+    """
+    task: dict[str, object] = {"label": label, "task_id": task_id,
+                               "capabilities": [_capability(n, c) for n, c in checks]}
+    if external_task_id is not None:
+        task["external_task_id"] = external_task_id
+    return {"prd": prd, "schema_version": 1, "tasks": [task]}
 
 
 def _git_init(root: Path) -> None:
@@ -503,6 +509,48 @@ def test_seen_equals_compared_plus_every_skip_class(tmp_path, make_tasks_db):
     )
 
 
+def test_seen_arithmetic_is_untouched_by_an_external_registry_block(
+        tmp_path, make_tasks_db):
+    """THE SAME ARITHMETIC, with a foreign-registry block in the corpus.
+
+    The new class is skipped ABOVE the capability loop, exactly where the
+    task_id-is-None and no-db-row skips already happen, so its capabilities
+    never enter the eligible population. The identity therefore closes over the
+    same four terms and does NOT grow a fifth — a reader who learned the
+    arithmetic from the test above does not have to relearn it.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [
+            _entry("paired", {**_GREP_CHECK, "pattern": "drifted"}),
+            {"name": "unvalidatable", "kind": "grep", "pattern": "p"},  # no expect
+        ])],
+        manifests=[
+            ("plans/a-prd.capability-manifest.yaml", _manifest_doc(100, checks=(
+                ("paired", _GREP_CHECK),
+                ("unvalidatable", _GREP_CHECK),
+                ("orphan-sidecar", _GREP_CHECK),
+            ))),
+            ("plans/b-prd.capability-manifest.yaml", _manifest_doc(
+                None, label="η", external_task_id="reify:5613",
+                checks=(("foreign-gate", _GREP_CHECK),))),
+        ],
+    )
+
+    c = audit_project(str(root)).coverage
+
+    assert c.external_registry_task_blocks == 1
+    # 3, not 4: the external block's mechanical capability is never seen.
+    assert c.mechanical_capabilities_seen == 3
+    assert c.mechanical_capabilities_compared == 1
+    assert c.mechanical_capabilities_seen == (
+        c.mechanical_capabilities_compared
+        + c.capabilities_without_task_entry
+        + c.malformed_task_entries
+        + c.unconvertible_sidecar_descriptors
+    )
+
+
 def test_an_unconvertible_sidecar_descriptor_degrades_to_coverage(
         tmp_path, make_tasks_db, monkeypatch):
     """One bad sidecar descriptor must NOT abort the sweep.
@@ -553,10 +601,16 @@ def test_manifest_task_with_no_db_row_is_coverage_not_a_finding(
         tmp_path, make_tasks_db):
     """A stamped task_id with no tasks.db row binds nothing comparable.
 
-    Measured live on this corpus: 6 manifest task blocks whose stamped task_id
-    has no row. Counted separately from the missing-entry class above because
-    the two have different causes and different owners; collapsing them would
-    misattribute 6 rows into a population of 32.
+    Counted separately from the missing-entry class above because the two have
+    different causes and different owners; collapsing them would misattribute
+    the rows into a population a different audit owns.
+
+    This bucket means a STALE OR UNSTAMPED binding — an integer that was
+    supposed to name a row in THIS project's store and does not. It is
+    remediable by re-stamping or retiring the block, and the assertion below
+    that such a block does NOT increment external_registry_task_blocks is the
+    other half of that distinction: a foreign-registry binding is an EXPLAINED
+    absence, not a stale one, and is remediable by neither action.
     """
     root = _make_project(
         tmp_path, make_tasks_db,
@@ -568,8 +622,40 @@ def test_manifest_task_with_no_db_row_is_coverage_not_a_finding(
 
     assert audit.findings == []
     assert audit.coverage.manifest_tasks_without_db_row == 1
+    # THE TWO CLASSES MUST NOT COLLAPSE. A stale integer binding is not a
+    # foreign-registry binding, and telling an operator otherwise is how this
+    # bucket came to be read as "six blocks to re-stamp or retire".
+    assert audit.coverage.external_registry_task_blocks == 0
     # The whole task block is skipped, so none of its capabilities are even
     # SEEN — the skip happens above the capability loop, not inside it.
+    assert audit.coverage.mechanical_capabilities_seen == 0
+    assert audit.coverage.mechanical_capabilities_compared == 0
+
+
+def test_external_registry_task_block_is_its_own_coverage_class(
+        tmp_path, make_tasks_db):
+    """A block bound by external_task_id is an EXPLAINED absence, not a stale one.
+
+    Its producer is live — in ANOTHER project's registry — so it can never
+    appear in this project's tasks.db, and neither remediation that
+    manifest_tasks_without_db_row implies (re-stamp, or retire the block)
+    applies to it. It gets its own counter so the report says which of the two
+    an operator is looking at.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(999, [_entry("gate", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml",
+                    _manifest_doc(None, label="η", external_task_id="reify:5613"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.findings == []
+    assert audit.coverage.external_registry_task_blocks == 1
+    assert audit.coverage.manifest_tasks_without_db_row == 0
+    # Same skip position as the no-db-row class: above the capability loop, so
+    # the block's capabilities are not even SEEN.
     assert audit.coverage.mechanical_capabilities_seen == 0
     assert audit.coverage.mechanical_capabilities_compared == 0
 
