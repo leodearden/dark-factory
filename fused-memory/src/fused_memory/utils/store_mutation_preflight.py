@@ -73,13 +73,14 @@ COVERAGE IS PARTIAL. That rule is a norm, not an invariant: nothing enforces
 it mechanically yet, and task 4280 is where the static conformance check that
 would lands. What follows is a dated audit, not a live guarantee.
 
-GUARDED, as of task 4293 -- ``audit_duplicate_memories``,
-``cleanup_count_snapshots``, ``clear_false_dependency_invalidations``,
+GUARDED, as of task 4848 -- ``amend_stale_resume_cwd_records``,
+``audit_duplicate_memories``, ``cleanup_count_snapshots``,
+``cleanup_pin_queue_edges``, ``clear_false_dependency_invalidations``,
 ``clear_malformed_empty_memory``, ``consolidate_namespace_families``,
 ``invalidate_fabricated_shipping_edges``, ``migrate_cross_graph_leak``,
 ``prune_recon_cycle_summaries``, ``purge_knowlive_namespace``,
 ``retro_stamp_topics``, ``sweep_orphan_flag_markers``,
-``sweep_toolcall_xml_leak``, ``tag_cgl_eta_rehome_scope`` (13 call sites).
+``sweep_toolcall_xml_leak``, ``tag_cgl_eta_rehome_scope`` (15 call sites).
 This column IS exhaustive, because CALLING this function is what "guarded"
 MEANS: ``grep -rln 'assert_store_mutation_allowed(' fused-memory/scripts/
 --include='*.py'`` re-derives it, and re-dates it, in one line.
@@ -108,7 +109,7 @@ migrate's ``main()``/``build_arg_parser()``, this script becomes the only
 unguarded bulk-apply in the tree, silently.
 ``tests/test_cgl_eta_auto_apply_impl.py`` pins both halves.
 
-KNOWN UNGUARDED, same date -- as of task 4293, NONE. No shared-store mutator in
+KNOWN UNGUARDED, same date -- as of task 4848, NONE. No shared-store mutator in
 ``fused-memory/scripts/`` is currently KNOWN to be unguarded.
 
 That is a dated measurement, NOT an invariant, and it must not be restated as
