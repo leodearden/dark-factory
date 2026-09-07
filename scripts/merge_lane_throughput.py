@@ -1645,6 +1645,8 @@ def _format_speculation(
     section: dict[str, Any], window: tuple[str, str] | list[str]
 ) -> list[str]:
     ahead = section['speculative_ahead']
+    adopted = section['speculative_ahead_adopted']
+    anatomy = section['void_anatomy']
     lines = [_section(SECTION_TITLES['speculation'], window)]
     lines.append(
         f"    speculative_merge {section['n_speculative']}, chain_dead voids "
@@ -1655,6 +1657,28 @@ def _format_speculation(
     lines.append(
         f"      landed with speculation ahead: {ahead['matched']}/"
         f"{ahead['total']} ({_rate(ahead['share'])})"
+    )
+    # The STRICT measure, on its own line and over the SAME denominator. The
+    # label spells out what it excludes because on many windows the two counts
+    # are equal, and a reader who mistook one for the other would draw the
+    # opposite conclusion about how much speculation actually helped.
+    lines.append(
+        f"      landed with speculation ahead and NOT voided first (strict): "
+        f"{adopted['matched']}/{adopted['total']} "
+        f"({_rate(adopted['share'])})"
+    )
+    # The void anatomy belongs on the same screen as the void rate above: the
+    # rate alone invites "that much verify capacity burned", which the
+    # pre-verify arm is precisely the refutation of.
+    lines.append(
+        f"      void anatomy: {anatomy['pre_verify']} pre-verify (build "
+        f"discarded before host acquisition), "
+        f"{anatomy['verify_burned']} verify-burned"
+    )
+    lines.append(
+        f"      dead_link fan-out: {anatomy['dead_link_distinct']} distinct "
+        f"dead base(s), max {_count(anatomy['dead_link_max_voids'])} void(s) "
+        f"from one, {anatomy['dead_link_unknown']} with no dead_link"
     )
     # Two distributions, never pooled: speculative_merge.depth is a STR and
     # merge_verify.depth is a native int (see compute_speculation).
@@ -1752,6 +1776,20 @@ def format_report(bundles: Sequence[dict[str, Any]]) -> str:
             lines.append(
                 f"  {root}: {entry['n_voided_chain_dead']}/"
                 f"{entry['n_speculative']} = {_rate(entry['void_rate'])}"
+            )
+            # Continuation line, so the rate line above stays byte-identical:
+            # this block is the one place a reader can read the whole
+            # two-project headline without reopening each project's section.
+            ahead = entry['speculative_ahead']
+            adopted = entry['speculative_ahead_adopted']
+            anatomy = entry['void_anatomy']
+            lines.append(
+                f"      ahead {ahead['matched']}/{ahead['total']} "
+                f"({_rate(ahead['share'])}) loose, "
+                f"{adopted['matched']}/{adopted['total']} "
+                f"({_rate(adopted['share'])}) strict; "
+                f"{anatomy['pre_verify']} pre-verify void(s), "
+                f"{anatomy['verify_burned']} verify-burned"
             )
         lines.append(
             '  (side by side, never pooled: the spread between projects is '
