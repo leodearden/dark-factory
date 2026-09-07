@@ -191,6 +191,29 @@ async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate |
     return gate
 
 
+class _UnsetGate:
+    """Sentinel TYPE for "the caller passed no ``usage_gate`` at all".
+
+    WHY NOT a plain ``usage_gate: UsageGate | None = None`` default (task 4427):
+    :func:`_build_eval_usage_gate` legitimately returns ``None`` three ways
+    (``usage_cap.enabled=False``, the constructor raised, zero accounts
+    resolved). A campaign whose gate degraded that way would hand ``None`` to
+    every cell; with a ``None`` default each cell would read that as "the caller
+    supplied nothing" and build its own gate — silently restoring the exact
+    per-cell construction the hoist exists to remove, and re-paying a probe-dir
+    allocation plus a SIGHUP-handler steal per cell on the zero-account path.
+
+    The sentinel keeps "not provided" (build and own one) and "provided as
+    ``None``" (deliberately ungated for the whole campaign) distinguishable. A
+    private CLASS rather than a bare ``object()`` so the parameter annotation
+    ``UsageGate | None | _UnsetGate`` and ``isinstance(usage_gate, _UnsetGate)``
+    are pyright-clean.
+    """
+
+
+_GATE_UNSET = _UnsetGate()
+
+
 @asynccontextmanager
 async def campaign_usage_gate(
     base_config: OrchestratorConfig | None,
@@ -712,6 +735,8 @@ async def run_architect_eval(
     trial: int = 1,
     timeout_override: int | None = None,
     memory_endpoint: str | None = None,
+    *,
+    usage_gate: UsageGate | None | _UnsetGate = _GATE_UNSET,
 ) -> EvalResult:
     """Run ONE architect eval: invoke the architect LIVE and score its plan (θ).
 
@@ -870,10 +895,17 @@ async def run_architect_eval(
     # the earlier failure paths (worktree/config) the name is genuinely unbound
     # — which pyright correctly flags without this.
     artifacts: TaskArtifacts | None = None
-    # Pre-initialised for the SAME reason, plus one more: the finally block
-    # shuts the gate down, and it must not NameError when the failure happened
-    # before the gate was built (worktree/orch-config).
-    usage_gate: UsageGate | None = None
+    # Ownership is decided by what the CALLER did, never by what a build
+    # returned — so it is computed here, before anything can overwrite the
+    # parameter. A campaign owner (see :func:`campaign_usage_gate`) that passes
+    # an explicit ``None`` gets an ungated cell that still does not build one.
+    owns_gate = isinstance(usage_gate, _UnsetGate)
+    # Narrowed off the sentinel union so the invoke call site and the finally
+    # below both see a plain ``UsageGate | None``. Pre-initialised for the SAME
+    # reason as ``artifacts`` above, plus one more: the finally block shuts the
+    # gate down, and it must not NameError when the failure happened before the
+    # gate was built (worktree/orch-config).
+    usage_gate = None if owns_gate else usage_gate
     # Renamed from ``cost_usd`` (eval-revival υ): this local is ONLY the
     # architect invocation's spend. The cell's persisted ``cost_usd`` below
     # additionally folds in the plan judge's spend (``judge_cost_usd``), so
@@ -956,7 +988,13 @@ async def run_architect_eval(
         #     degrade) lives in _build_eval_usage_gate so all three entry
         #     points build the gate from ONE definition rather than three
         #     copies that can drift.
-        usage_gate = await _build_eval_usage_gate(orch_config)
+        #
+        #     Built only when this cell OWNS the gate. A campaign owner that
+        #     passed one down (task 4427) is handing over its live cap state,
+        #     so rebuilding here would both waste the construction and fragment
+        #     the very state the hoist exists to share.
+        if owns_gate:
+            usage_gate = await _build_eval_usage_gate(orch_config)
 
         # 3. Init artifacts so the architect has a place to write plan.json.
         #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
@@ -1187,24 +1225,26 @@ async def run_architect_eval(
         # Plan already read above; the worktree is no longer needed (scoring
         # reads the in-memory plan + the committed reference diff).
         await snapshots.cleanup_eval_worktree(project_root, worktree)
-        # The gate is built PER CELL — cli.py loops this coroutine over every
-        # config, and a campaign loops fixtures × trials in ONE process — so it
-        # has to be torn DOWN per cell too (reviewer: resource-cleanup). Left
-        # running, every cell that hit a cap leaks a live account-resume probe
-        # loop firing real CLI probes for the rest of the campaign, and each
-        # new gate steals the SIGHUP handler from predecessors that are still
-        # alive via those background tasks.
+        # SHARED-OWNERSHIP CONTRACT (task 4427): the gate is torn down only by
+        # whoever BUILT it. A cell that built its own (no ``usage_gate=``
+        # argument) must tear it down here — cli.py loops this coroutine over
+        # every config, and a campaign loops fixtures × trials in ONE process,
+        # so a gate left running leaks a live account-resume probe loop firing
+        # real CLI probes for the rest of the campaign, and each new gate steals
+        # the SIGHUP handler from predecessors kept alive by exactly those
+        # background tasks.
         #
-        # What this does NOT do is carry cap STATE across cells: cell N+1 still
-        # re-leases the account cell N proved capped, costing one wasted
-        # invocation plus a cooldown per cell. Fixing that means hoisting the
-        # gate to the campaign level and threading it through cli.py — outside
-        # this task's locked modules, so it is filed as follow-up rather than
-        # smuggled in here.
+        # A gate handed DOWN by a campaign owner (:func:`campaign_usage_gate`,
+        # threaded by the stage functions and cli._run_single_eval) is NOT ours
+        # to shut down: it keeps ONE cap-state view alive across every cell, so
+        # cell N+1 no longer re-leases the account cell N proved capped —
+        # exactly the wasted invocation plus cooldown per cell that the
+        # per-cell gate cost. Shutting it down here would take failover away
+        # from every sibling still to run.
         #
         # Best-effort: a teardown failure must never turn a scored cell into a
         # harness error.
-        if usage_gate is not None:
+        if owns_gate and usage_gate is not None:
             try:
                 await usage_gate.shutdown()
             except Exception:
