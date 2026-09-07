@@ -152,6 +152,28 @@ class TestJcodemunchLaunchPinned:
         jc = out['mcpServers']['jcodemunch']
         assert jc['env']['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'
 
+    def test_constants_are_the_shared_ones_not_a_copy(self):
+        """mcp_lifecycle IMPORTS the launch contract rather than redefining it.
+
+        Identity, not equality, is asserted on the ENV DICT: ``==`` would pass
+        against a copy-pasted duplicate and so could never go red, whereas a
+        dict is never interned, so ``is`` can only hold if mcp_lifecycle
+        imports the constant — which is the single-source-of-truth property
+        being pinned.
+
+        Only equality is asserted on the COMMAND string: CPython interns
+        identifier-like literals only, and 'jcodemunch-mcp' contains hyphens,
+        so a passing ``is`` there would be an implementation detail of the
+        interning heuristic rather than a contract this task establishes.
+        """
+        from shared.jcodemunch_launch import JCODEMUNCH_COMMAND as SHARED_COMMAND
+        from shared.jcodemunch_launch import JCODEMUNCH_ENV as SHARED_ENV
+
+        from orchestrator import mcp_lifecycle
+
+        assert mcp_lifecycle.JCODEMUNCH_ENV is SHARED_ENV
+        assert mcp_lifecycle.JCODEMUNCH_COMMAND == SHARED_COMMAND
+
 
 # ---------------------------------------------------------------------------
 # Step-1/Step-2 (task 2042): mcp_config_json escalation_headers
