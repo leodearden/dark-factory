@@ -2572,6 +2572,92 @@ class TestWorkerDeathLegSummary:
 
 
 
+
+def _worker_death_child(*, module: str = 'orchestrator') -> VerifyResult:
+    """A child result whose TEST leg was truncated by an xdist worker death.
+
+    Its summary is produced by `_summarize_checks` itself rather than
+    hand-written, so this test cannot drift from the producer: an edit to
+    `_worker_death_leg_note`'s wording is exercised here automatically.
+    """
+    from orchestrator.verify import _summarize_checks
+
+    _, category, cause_hint, summary, failing_legs = _summarize_checks(
+        1, _TRUNCATED_TEST_LEG_OUTPUT, False, 'uv run pytest',
+        0, '', False, 'ruff check',
+        0, '', False, 'pyright',
+        test_duration=209.67,
+    )
+    return VerifyResult(
+        passed=False,
+        test_output=_TRUNCATED_TEST_LEG_OUTPUT,
+        lint_output='',
+        type_output='',
+        summary=summary,
+        category=category,
+        cause_hint=f'{module}: {cause_hint}',
+        failing_leg_categories=failing_legs,
+    )
+
+
+class TestAggregateResultsKeepsWorkerDeathNote:
+    """A worker-death note must survive multi-subproject aggregation verbatim.
+
+    A DIRECT regression guard against the defect task 3173 recorded in
+    `_aggregate_results`: that loop substring-scans child summaries for
+    exactly three hardcoded literals ('tests failed' / 'lint issues' / 'type
+    errors'), so a note matching none of them made a multi-subproject verify
+    degrade to a bare 'Failures: ' with no parts at all — "erasing the one
+    fact that says the run produced no verdict". A second no-verdict note
+    reproduces that bug one edit later unless the carry-through is extended.
+    """
+
+    def test_note_survives_aggregation_beside_a_real_test_failure(self):
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _worker_death_child(module='fused-memory')])
+        assert not agg.passed
+        assert WORKER_DEATH_SUMMARY_MARKER in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        assert 'remaining tests never ran' in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        # The sibling's genuine verdict is still reported — never masked.
+        assert 'tests failed' in agg.summary, f'Unexpected summary: {agg.summary!r}'
+        # The bug's signature: everything after the envelope dropped away.
+        assert agg.summary != 'Failures: '
+        assert agg.summary.strip() != 'Failures:'
+
+    def test_note_survives_aggregation_with_a_passing_sibling(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _worker_death_child()])
+        assert not agg.passed
+        assert WORKER_DEATH_SUMMARY_MARKER in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        assert agg.summary != 'Failures: '
+
+    def test_duplicate_worker_death_notes_are_not_repeated(self):
+        """Two subprojects truncated identically must not stutter the same
+        sentence twice — the de-duplication the signal-kill carry-through
+        already guarantees."""
+        agg = _aggregate_results([
+            _worker_death_child(),
+            _worker_death_child(module='dashboard'),
+        ])
+        assert agg.summary.count(WORKER_DEATH_SUMMARY_MARKER) == 1, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+
+
+
 class TestVerifyResultCauseHint:
     """Tests for the ``cause_hint`` field on ``VerifyResult`` and its population.
 
