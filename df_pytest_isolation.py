@@ -687,6 +687,28 @@ WAIT_PROOF_GRACE_FLOOR_SECS = 30
 # when someone edits it, which the tests here would catch anyway.
 LEAK_SELF_TERMINATION_CEILING_SECS = 90
 
+# The other half of that invariant, from the caller's side: the largest spawn
+# timeout a wait-proving test may use.
+#
+# DERIVED, not chosen. wait_proof_grace_secs(t) = max(FLOOR, ceil(t * MULTIPLIER)),
+# so with the values above t=22 -> 88 <= 90 (legal) and t=23 -> 92 > 90 (illegal).
+# 22 is therefore the largest spawn timeout whose derived grace still lets a
+# poller that escapes its kill expire inside the ceiling. The same arithmetic is
+# already spelled out inline at
+# ``scripts/tests/test_restart_all_orchestrators.py`` for the force-fire test's
+# own ``spawn_timeout = 22``; this constant is what stops the NEXT site
+# re-deriving it by hand -- which is how a grace gets chosen freehand, and how
+# 86 orphan pollers accumulated on 2026-08-06.
+#
+# Unlike LEAK_SELF_TERMINATION_CEILING_SECS above -- documented as DECLARATIVE,
+# with nothing computing from it -- this one IS computed from, so moving either
+# WAIT_PROOF_GRACE_MULTIPLIER or the ceiling must be reflected here.
+# ``tests/scripts/test_drain_process_leak_isolation.py::
+# TestWaitProofGraceSecs::test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits``
+# asserts BOTH that this value is legal and that value+1 is not, so it cannot
+# silently drift out of date in either direction.
+WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS = 22
+
 
 def wait_proof_grace_secs(spawn_timeout_secs: float) -> int:
     """The grace a wait-proving test should hand the script it spawns.
