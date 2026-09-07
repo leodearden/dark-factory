@@ -166,3 +166,173 @@ def build_event(
     for key in _FACT_COPIED_KEYS:
         event[key] = _capped(record.get(key))
     return event
+
+
+# ---------------------------------------------------------------------------
+# The block algebra — pure functions over plain dicts, no I/O.
+# ---------------------------------------------------------------------------
+#
+# Kept apart from the sink deliberately: the merge is where every subtlety
+# lives (the cap, the bounds, the disclosure key, the degradation) and it is
+# reviewable and testable without a filesystem. The sink below is then thin
+# enough to read in one pass.
+
+
+def _as_int(value: object, *, field: str) -> int:
+    """*value* as a non-negative count, degrading to ``0``.
+
+    A merge runs INSIDE a decided refusal, so raising here would turn a working
+    guard into an outage of its own — and ``plan.json`` is agent-adjacent, so
+    the block on disk may be anything. An unusable value therefore contributes
+    its IDENTITY rather than propagating: the merged block degrades to a
+    partially-recovered count, and the INCOMING event is never the thing that
+    gets dropped. Logged at warning, never silently.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        if value is not None:
+            logger.warning(
+                'markup stamp: %s on the stored rejection block is %r, which '
+                'is not a count; treating it as 0', field, value,
+            )
+        return 0
+    return max(value, 0)
+
+
+def _as_by_tool(value: object) -> dict[str, int]:
+    """*value* as a ``{tool: count}`` tally, dropping only what is unusable."""
+    if not isinstance(value, dict):
+        if value is not None:
+            logger.warning(
+                'markup stamp: by_tool on the stored rejection block is %r, '
+                'which is not a mapping; treating it as empty', value,
+            )
+        return {}
+    tally: dict[str, int] = {}
+    for tool, count in value.items():
+        if not isinstance(tool, str):
+            continue
+        # PER ENTRY, not all-or-nothing: one junk tally must not cost the
+        # other tools their counts.
+        tally[tool] = _as_int(count, field=f'by_tool[{tool!r}]')
+    return tally
+
+
+def _as_events(value: object) -> list[dict[str, Any]]:
+    """*value* as a list of event dicts, dropping only what is unusable."""
+    if not isinstance(value, list):
+        if value is not None:
+            logger.warning(
+                'markup stamp: events on the stored rejection block is %r, '
+                'which is not a list; treating it as empty', value,
+            )
+        return []
+    return [event for event in value if isinstance(event, dict)]
+
+
+def _as_bound(value: object) -> str | None:
+    """*value* as a window bound, or ``None`` when it is not one."""
+    return value if isinstance(value, str) and value else None
+
+
+def block_of(event: dict[str, Any]) -> dict[str, Any]:
+    """The one-event block — the identity every merge starts from."""
+    return {
+        'count': 1,
+        'by_tool': {event['tool']: 1} if isinstance(event.get('tool'), str) else {},
+        'first_at': _as_bound(event.get('ts')),
+        'last_at': _as_bound(event.get('ts')),
+        'events': [event],
+        'note': STAMP_NOTE,
+    }
+
+
+def merge_block(left: object, right: object) -> dict[str, Any]:
+    """*left* and *right* folded into one block. Total, and never raises.
+
+    ASSOCIATIVE over a sequence of events, which is load-bearing rather than
+    tidy: the sink folds ONE incoming event into whatever is on disk, while
+    ``_create_plan`` folds a whole BUFFERED block into a carried-forward one.
+    Those are different association orders over the same events, and a merge
+    that disagreed between them would let the same refusals produce two
+    different documents.
+
+    THE EVENT LIST KEEPS THE FIRST N, not the last. The consequence is that the
+    list STOPS CHANGING once it is full, so a pathological leak churns two
+    integers instead of rewriting the whole block on every refusal — and the
+    events that survive are the ones from the beginning of the leak, which is
+    where its shape is legible. The uncapped ``count`` and the tool-bounded
+    ``by_tool`` are what answer the question anyway; the events are texture.
+
+    ``events_truncated`` is written only once ``count`` EXCEEDS the retained
+    list, following the convention that a disclosure key's PRESENCE means
+    something was cut rather than merely that the emitter ran — a full list is
+    not the same as a cut one. It carries no companion dropped-count on
+    purpose: ``count - len(events)`` already says how many were dropped, and a
+    stored second accounting is a number that can drift from the two beside it.
+
+    ``note`` is REWRITTEN from :data:`STAMP_NOTE` rather than inherited, so the
+    constant stays the single owner of the wording and a stale or hand-edited
+    note on an agent-adjacent document is corrected instead of preserved.
+    """
+    sides = [side if isinstance(side, dict) else {} for side in (left, right)]
+    for side, given in zip(sides, (left, right), strict=True):
+        if not side and given is not None and not isinstance(given, dict):
+            logger.warning(
+                'markup stamp: the stored rejection block is %r, which is not '
+                'a mapping; starting a fresh one', given,
+            )
+
+    by_tool: dict[str, int] = {}
+    for side in sides:
+        for tool, count in _as_by_tool(side.get('by_tool')).items():
+            by_tool[tool] = by_tool.get(tool, 0) + count
+
+    events: list[dict[str, Any]] = []
+    for side in sides:
+        events.extend(_as_events(side.get('events')))
+
+    bounds = [
+        [b for b in (_as_bound(side.get(field)) for side in sides) if b is not None]
+        for field in ('first_at', 'last_at')
+    ]
+
+    count = sum(_as_int(side.get('count'), field='count') for side in sides)
+    kept = events[:MARKUP_STAMP_MAX_EVENTS]
+
+    merged: dict[str, Any] = {
+        'count': count,
+        'by_tool': by_tool,
+        # A null bound never wins a min or a max: the bounds are taken over the
+        # values that EXIST, so a side that does not know its window cannot
+        # erase a bound the other side does know.
+        'first_at': min(bounds[0]) if bounds[0] else None,
+        'last_at': max(bounds[1]) if bounds[1] else None,
+        'events': kept,
+        'note': STAMP_NOTE,
+    }
+    if count > len(kept):
+        merged['events_truncated'] = True
+    return merged
+
+
+def summary(plan: object) -> dict[str, Any] | None:
+    """The compact ``{count, by_tool}`` view, or ``None`` when there is none.
+
+    Deliberately NOT the whole block. This is what ``_confirm_plan`` folds into
+    the architect's LAST tool result — a signal that something was lost, in the
+    one place the loss reaches the durable agent transcript — not a second copy
+    of a block that is already on disk two keys away.
+
+    ``None`` on an absent OR unusable block, so the omit-when-absent response
+    convention has an unambiguous thing to omit and a half-formed block can
+    never reach a tool response.
+    """
+    if not isinstance(plan, dict):
+        return None
+    block = plan.get(PLAN_MARKUP_REJECTIONS_KEY)
+    if not isinstance(block, dict):
+        return None
+    return {
+        'count': _as_int(block.get('count'), field='count'),
+        'by_tool': _as_by_tool(block.get('by_tool')),
+    }
