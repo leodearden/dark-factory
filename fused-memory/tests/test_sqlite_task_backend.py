@@ -6786,3 +6786,81 @@ async def test_row_to_task_preserves_unknown_key_without_typed_defaults(backend,
 
     task = await backend.get_task('1', project_root=project_root)
     assert task['metadata'] == {'prd': 'x', 'unknown_key': 1}
+
+
+# ── get_dependency_edges — the compact edge-set read ────────────────────
+
+
+class TestGetDependencyEdges:
+    """The three-column dependency read, mirroring why ``get_statuses`` exists
+    alongside ``get_tasks``: the caller needs the edge set, not ~3800 full task
+    rows, and it reads inside the Graphiti per-group identity lock where payload
+    size is write latency.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_the_full_adjacency_map_for_the_default_tag(
+        self, backend, project_root
+    ):
+        for title in ('a', 'b', 'c', 'd'):
+            await backend.add_task(project_root=project_root, title=title)
+        await backend.add_dependency('3', '2', project_root=project_root)
+        await backend.add_dependency('3', '1', project_root=project_root)
+        await backend.add_dependency('4', '3', project_root=project_root)
+
+        edges = await backend.get_dependency_edges(project_root=project_root)
+
+        # Sorted ascending, and a task with NO dependencies is ABSENT from the
+        # map rather than present with an empty list — the contract inherited
+        # from _fetch_dependencies, which build_dependency_index's node-seeding
+        # depends on knowing.
+        assert edges == {3: [1, 2], 4: [3]}
+        assert 1 not in edges
+        assert 2 not in edges
+
+    @pytest.mark.asyncio
+    async def test_returns_plain_ints_not_sqlite_rows(self, backend, project_root):
+        await backend.add_task(project_root=project_root, title='a')
+        await backend.add_task(project_root=project_root, title='b')
+        await backend.add_dependency('2', '1', project_root=project_root)
+
+        edges = await backend.get_dependency_edges(project_root=project_root)
+
+        assert isinstance(edges, dict)
+        for task_id, deps in edges.items():
+            assert type(task_id) is int
+            assert isinstance(deps, list)
+            assert all(type(dep) is int for dep in deps)
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_tag_scopes_the_read(self, backend, project_root):
+        await backend.add_task(project_root=project_root, title='a')
+        await backend.add_task(project_root=project_root, title='b')
+        await backend.add_dependency('2', '1', project_root=project_root)
+
+        assert await backend.get_dependency_edges(
+            project_root=project_root, tag='master',
+        ) == {2: [1]}
+        assert await backend.get_dependency_edges(
+            project_root=project_root, tag='no-such-tag',
+        ) == {}
+
+    @pytest.mark.asyncio
+    async def test_reads_live_state_not_a_cache(self, backend, project_root):
+        await backend.add_task(project_root=project_root, title='a')
+        await backend.add_task(project_root=project_root, title='b')
+        await backend.add_dependency('2', '1', project_root=project_root)
+        assert await backend.get_dependency_edges(project_root=project_root) == {
+            2: [1]
+        }
+
+        await backend.remove_dependency('2', '1', project_root=project_root)
+
+        assert await backend.get_dependency_edges(project_root=project_root) == {}
+
+    def test_declared_on_the_protocol(self):
+        """MemoryService.taskmaster is annotated ``TaskBackendProtocol | None``,
+        so the call site must type-check without a getattr escape hatch — which
+        would itself be the silent-degradation anti-pattern this repo forbids.
+        """
+        assert hasattr(TaskBackendProtocol, 'get_dependency_edges')
