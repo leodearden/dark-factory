@@ -410,6 +410,22 @@ let currentWin = '24h';
 
 // Real (browser) deps; opts.deps overrides individual entries (tests inject
 // a controllable clock/RNG/fetch instead of these).
+//
+// EVERY ENTRY HERE IS AN ENVIRONMENT CAPABILITY — a clock, an RNG, fetch, the
+// timer pair. Do NOT add a policy value, and `timeoutMs` in particular. It was
+// pinned here once and that silently disabled the reduced deadline entirely:
+// refreshDFData merges these FIRST, so `deps.timeoutMs` was never undefined,
+// so refreshOne's `deps.timeoutMs ?? (failures >= threshold ? STALE_TIMEOUT_MS
+// : DEFAULT_TIMEOUT_MS)` could not fall through and STALE_TIMEOUT_MS was dead
+// code in every browser. The node suite stayed green throughout, because its
+// tests hand refreshOne a partial deps object with no timeoutMs and so take a
+// path production never takes. Chrome 151 is what caught it (task 4884 step-19,
+// #4791 acceptance 3): four consecutive ~30000ms aborts on a wedged endpoint
+// whose banner already read "4 consecutive attempts failed".
+//
+// Now pinned from both ends by data_poll.test.mjs's "PRODUCTION deps merge"
+// test — behaviourally through refreshDFData, and structurally against this
+// literal.
 const DEFAULT_POLL_DEPS = {
   now: () => Date.now(),
   random: () => Math.random(),
@@ -417,7 +433,6 @@ const DEFAULT_POLL_DEPS = {
   fetchImpl: (u, i) => fetch(u, i),
   setTimeoutImpl: (fn, ms) => setTimeout(fn, ms),
   clearTimeoutImpl: id => clearTimeout(id),
-  timeoutMs: DEFAULT_TIMEOUT_MS,
 };
 
 // `opts.state`/`opts.deps` let callers supply isolated flow-control state

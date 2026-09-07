@@ -1288,3 +1288,89 @@ test('staleness: DEFAULT_TIMEOUT_MS survives untouched as a parsable literal', (
     'the reduced deadline must actually be shorter than the default one',
   );
 });
+
+test('staleness: the reduced deadline is reached through the PRODUCTION deps merge, not only a hand-built deps', async () => {
+  // REGRESSION FENCE for a defect the sibling test above structurally could
+  // NOT catch, found by step-19's real-browser check (task 4884, #4791).
+  //
+  // WHAT WAS MEASURED. Chrome 151 headless against the worktree's dashboard,
+  // /api/v2/dashboard/merge-queue wedged with `await asyncio.Event().wait()`.
+  // Correlating Network.requestWillBeSent with Network.loadingFailed gave four
+  // consecutive aborts at 30008 / 30164 / 30001 / 29981 ms — including the
+  // attempt that STARTED at failures === 3, which had to arm 5000. The banner
+  // rendered ("4 consecutive attempts failed"), so the threshold was crossed;
+  // only the deadline never dropped.
+  //
+  // WHY THE OTHER TEST PASSED ANYWAY. It calls refreshOne with a deps object
+  // it builds by hand, and that object has no `timeoutMs` key, so
+  // `deps.timeoutMs ?? (...)` falls through to the failures-based selection.
+  // Production never takes that path: refreshDFData merges DEFAULT_POLL_DEPS
+  // FIRST, and pinning `timeoutMs` there made `deps.timeoutMs` permanently
+  // 30000 — the ?? could never fall through, and the reduced deadline was
+  // dead code in every browser while green in the harness.
+  //
+  // So this test drives refreshDFData (the merge site) and injects everything
+  // EXCEPT timeoutMs, reproducing the production shape exactly. A deps default
+  // that re-pins timeoutMs turns it red.
+  const armed = [];
+  const fetchStub = () => Promise.reject(new Error('simulated failure'));
+  const { api } = loadDataJs({ fetchStub });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = {
+    now: () => t,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: (fn, ms) => { armed.push(ms); return armed.length; },
+    clearTimeoutImpl: () => {},
+    // DELIBERATELY NO timeoutMs — that is the whole point of this test.
+  };
+  const cycle = async () => {
+    await api.refreshDFData(undefined, { state, deps, jitterMaxMs: 0 });
+    // Clear backoff the way real wall-clock time does, so the next cycle is
+    // an ATTEMPT rather than a skip.
+    for (const st of state.values()) t = Math.max(t, st.nextAllowedAt);
+  };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) await cycle();
+
+  assert.equal(
+    armed[0], 30000,
+    'the FIRST attempt must still use the full 30s deadline through the production merge',
+  );
+  for (const st of state.values()) {
+    assert.ok(
+      st.failures >= STALE_FAILURE_THRESHOLD,
+      `every endpoint must be past the threshold before the assertion below; got ${st.failures}`,
+    );
+  }
+
+  const before = armed.length;
+  await cycle();
+  const past = armed.slice(before);
+  assert.ok(past.length > 0, 'the next cycle must arm at least one deadline');
+  for (const ms of past) {
+    assert.equal(
+      ms, STALE_TIMEOUT_MS,
+      'an endpoint past the threshold must arm a ' + STALE_TIMEOUT_MS + 'ms deadline through ' +
+        'the PRODUCTION deps merge, not 30000 — measured 4 consecutive ~30000ms aborts in ' +
+        'Chrome 151 because DEFAULT_POLL_DEPS pinned timeoutMs',
+    );
+  }
+
+  // The source-level trap, stated separately so the failure names the cause
+  // rather than only the symptom: DEFAULT_POLL_DEPS must not pin `timeoutMs`.
+  // Every other DEFAULT_POLL_DEPS entry is a genuine environment capability
+  // (a clock, an RNG, fetch, the timer pair); `timeoutMs` is a POLICY value
+  // the selection below it is supposed to choose, and pinning a policy in the
+  // defaults is what silently disabled it.
+  const defaults = DATA_JS_SOURCE.match(/const DEFAULT_POLL_DEPS = \{[^}]*\}/);
+  assert.ok(defaults, 'DEFAULT_POLL_DEPS must remain a greppable object literal');
+  assert.ok(
+    !/timeoutMs/.test(defaults[0]),
+    'DEFAULT_POLL_DEPS must NOT pin timeoutMs — doing so makes `deps.timeoutMs ?? ...` ' +
+      'unreachable in the browser and turns STALE_TIMEOUT_MS into dead code (measured: ' +
+      '4 consecutive ~30000ms aborts in Chrome 151 with the banner already rendered)',
+  );
+});
