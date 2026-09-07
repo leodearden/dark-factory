@@ -941,6 +941,21 @@ class EscalationQueue:
         filter.  Note: the pre-scan covers only the paths that are actually
         scanned — when ``status == 'pending'`` the archive is skipped entirely,
         so a cross-tier duplicate is invisible to the pre-scan in that mode.
+
+        Mid-scan relocation recovery (task 5118): the path list above is a
+        snapshot; nothing holds a lock while the read loop below runs it, so
+        the archive sweep can relocate a record between the snapshot and its
+        read.  ``read_escalation_for_scan`` reports that as ``'vanished'``
+        rather than raising.  For an archive-including scan (``status !=
+        'pending'``) that is recoverable — the record MOVED, it did not
+        vanish — so the read loop re-locates it via a fresh ``_locate_path``
+        call and retries the read once before dropping it, instead of
+        silently returning a listing that is short by one.  For
+        ``status == 'pending'`` no recovery is attempted: the archive is
+        skipped by design there, and a record relocated out of the root is by
+        definition no longer pending, so recovering it would only add
+        archive I/O to the fast path for a record the filter would discard
+        anyway.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
@@ -983,6 +998,25 @@ class EscalationQueue:
             # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
             # distinguishable from a genuinely faulty file (WARNING).
             esc, reason = read_escalation_for_scan(path, context='queue.get_by_task')
+            if reason == 'vanished' and status != 'pending':
+                # Task 5118 (follow-up to task 5111's amendment 8): for an
+                # archive-including scan, a record relocated root -> archive
+                # inside this window landed in NEITHER the pre-scan archive
+                # glob above nor this still-a-hit read, so it would otherwise
+                # drop out of the listing silently.  It MOVED, it did not
+                # vanish -- re-locate it fresh (this also covers a second
+                # relocation, e.g. an archive-to-archive re-date) and retry
+                # the read once before giving up on it.
+                relocated = self._locate_path(path.stem)
+                if relocated is not None:
+                    esc, reason = read_escalation_for_scan(
+                        relocated, context='queue.get_by_task (re-glob after vanish)',
+                    )
+                    if reason == 'ok' and esc is not None:
+                        logger.debug(
+                            f'get_by_task: recovered {path.stem!r} via re-glob after '
+                            f'mid-scan relocation from {path} to {relocated}'
+                        )
             # esc is None iff reason != 'ok'; the second clause narrows the
             # type without relying on an assert (stripped under -O).
             if reason != 'ok' or esc is None:
