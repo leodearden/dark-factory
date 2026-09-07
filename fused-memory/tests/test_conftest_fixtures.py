@@ -7,10 +7,18 @@ from __future__ import annotations
 
 import inspect
 import os
+import sys
+import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from _fm_helpers import extract_cypher, extract_params, make_rebuild_detail
+from _fm_helpers import (
+    extract_cypher,
+    extract_params,
+    load_script_module,
+    make_rebuild_detail,
+)
 
 # --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
 
@@ -402,3 +410,126 @@ class TestMakeGraphMockCypherDispatch:
         graph = make_graph_mock()
         assert (await graph.ro_query('MATCH (n) RETURN n')).result_set == []
         assert (await graph.ro_query('MATCH (n) RETURN count(*)')).result_set == [[0]]
+
+
+# ---------------------------------------------------------------------------
+# The integration-lane in-use lease (task 4775)
+# ---------------------------------------------------------------------------
+
+CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
+REAPER_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
+
+
+def _fused_memory_conftest():
+    """The loaded fused-memory conftest, found by PATH rather than by name.
+
+    ``sys.modules['conftest']`` is shared with sibling subprojects'
+    conftests — conftest.py's own docstring says so, which is the reason
+    ``_fm_helpers.py`` exists — so keying on the name could hand back a
+    different package's module.
+    """
+    target = CONFTEST_PATH.resolve()
+    for module in list(sys.modules.values()):
+        path = getattr(module, '__file__', None)
+        if path and Path(path).resolve() == target:
+            return module
+    raise AssertionError(f'{CONFTEST_PATH} is not loaded')
+
+
+class TestTheIntegrationLaneLeaseFixture:
+    """One marker-keyed autouse fixture covers the whole integration lane.
+
+    Three live integration modules seed under a prefix the 6-hourly cron
+    reaps — `test_rrf_cross_store_merge.py`,
+    `test_memory_eval_retrieval_probe.py`, `test_memory_eval_staleness_sweep.py`
+    — and a future one will too.  A per-module opt-in is a thing that fourth
+    module can FORGET, and silently forgetting the guard is precisely the
+    failure this exists to prevent.
+
+    Driven here by stepping the real fixture body over a request that does
+    and does not carry the marker, rather than by marking a test in this
+    file.  Two reasons, both load-bearing: `addopts = -m 'not integration'`
+    would DESELECT a marked test, so the assertions would never run in the
+    merge lane at all; and a marked test in this module would be handed the
+    real machine-global lease directory (a conftest autouse fixture is set
+    up before a module-level one, so the pre-1 isolation would not yet have
+    applied) — writing into the very directory the live cron reads.
+    """
+
+    FIXTURE = '_integration_collection_lease'
+
+    @staticmethod
+    def _reaper():
+        return load_script_module(REAPER_PATH)
+
+    @classmethod
+    def _fixture_body(cls):
+        """The undecorated generator behind the fixture."""
+        definition = getattr(_fused_memory_conftest(), cls.FIXTURE)
+        return getattr(definition, '__wrapped__', definition)
+
+    @staticmethod
+    def _request(*, marked, nodeid='tests/test_some_module.py::test_seeds'):
+        """The two attributes of a real request the fixture reads."""
+        def _get_closest_marker(name):
+            if marked and name == 'integration':
+                return types.SimpleNamespace(name=name, args=(), kwargs={})
+            return None
+
+        node = types.SimpleNamespace(
+            nodeid=nodeid, get_closest_marker=_get_closest_marker,
+        )
+        return types.SimpleNamespace(node=node)
+
+    def test_it_is_autouse_so_a_test_never_has_to_request_it(self, request):
+        """An opt-in a future integration module can forget is the failure
+        mode this guard exists to prevent."""
+        assert self.FIXTURE in request.fixturenames
+
+    def test_a_marked_test_holds_a_live_lease_during_its_body(self, lease_dir):
+        """Liveness observed while the fixture is active — not that setup
+        ran, which would pass even if the lease were released immediately."""
+        reaper = self._reaper()
+        nodeid = 'tests/test_rrf_cross_store_merge.py::test_seeds_a_live_corpus'
+        body = self._fixture_body()(self._request(marked=True, nodeid=nodeid))
+        next(body)
+        try:
+            live = reaper.live_leases()
+        finally:
+            with pytest.raises(StopIteration):
+                next(body)
+
+        assert len(live) == 1, live
+        assert nodeid in live[0]['owner'], live[0]['owner']
+
+    def test_an_unmarked_test_takes_no_lease_and_writes_nothing(self, lease_dir):
+        """The merge lane runs under `-m 'not integration'`, so this is
+        almost every test in the suite: it must cost nothing and must never
+        hold the real cron off."""
+        reaper = self._reaper()
+        body = self._fixture_body()(self._request(marked=False))
+        next(body)
+        try:
+            live = reaper.live_leases()
+            directory_created = lease_dir.exists()
+        finally:
+            with pytest.raises(StopIteration):
+                next(body)
+
+        assert live == []
+        assert not directory_created
+
+    def test_the_lease_is_released_once_the_marked_test_completes(
+        self, lease_dir,
+    ):
+        """A lease that outlived its test would hold the cron off for the
+        rest of the pytest session."""
+        reaper = self._reaper()
+        body = self._fixture_body()(self._request(marked=True))
+        next(body)
+        assert len(reaper.live_leases()) == 1
+
+        with pytest.raises(StopIteration):
+            next(body)
+
+        assert reaper.live_leases() == []
