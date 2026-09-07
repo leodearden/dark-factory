@@ -54,7 +54,9 @@ die and the guard becomes required.
 
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
 
 PREFIX = '_test_mem0_qdrant_integration_'
 
@@ -72,6 +74,53 @@ E2_BAKEOFF_PREFIX = '_test_e2_bakeoff'
 PREFIXES: tuple[str, ...] = (PREFIX, E2_BAKEOFF_PREFIX)
 
 QDRANT_URL = 'http://localhost:6333'
+
+
+#: Environment override for :func:`lease_dir`.  It exists so tests never
+#: write into the real directory the live cron reads — a test that left a
+#: lease there would hold a real sweep off this host, and one that reaped
+#: there would unlink a live run's lease.  An OPERATOR who sets it has to
+#: set it for BOTH sides: a holder and a reaper that disagree about the
+#: directory are exactly the silent-no-guard failure described below.
+LEASE_DIR_ENV = 'DF_EPHEMERAL_COLLECTION_LEASE_DIR'
+
+#: Where in-use leases live.  Hardcoded and absolute on purpose; see
+#: :func:`lease_dir` for why every "portable" alternative is wrong here.
+DEFAULT_LEASE_DIR = Path('/tmp/dark-factory-ephemeral-collection-leases')
+
+
+def lease_dir() -> Path:
+    """Return the directory in-use leases live in, resolved at CALL time.
+
+    A hardcoded absolute ``/tmp`` path looks like a smell and is the one
+    property that makes the guard correct.  The guard fires only if the
+    HOLDER and the REAPER resolve the SAME directory, and they never share
+    an environment: the reaper is this file, run by cron under a bare
+    ``python3`` with a near-empty env; a holder is a pytest process (usually
+    inside a ``.worktrees/<id>`` checkout, under an xdist worker) or a
+    hand-run script in a login shell.
+
+      * ``tempfile.gettempdir()`` honours ``TMPDIR``/``TEMP``/``TMP``, and
+        pytest and cron set those differently;
+      * ``XDG_RUNTIME_DIR`` is ``/run/user/<uid>`` in a login session and
+        unset under cron;
+      * a repo-relative path gives every worktree its own private lease
+        directory even though ONE Qdrant at ``localhost:6333`` is shared by
+        all of them — and it would leave the machine-operated
+        ``project_root`` checkout dirty besides.
+
+    Under any of those the reaper would read an empty directory, find no
+    lease and delete: a guard that silently never fires, which is strictly
+    worse than no guard because it also stops the next person looking.
+
+    Resolved on every call, never memoised, so :data:`LEASE_DIR_ENV` can be
+    redirected after this module is imported — which is what lets the test
+    suite keep its hands off the real directory.  An empty value counts as
+    unset: ``Path('')`` is the current working directory, i.e. precisely the
+    repo-relative failure above.
+    """
+    override = os.environ.get(LEASE_DIR_ENV)
+    return Path(override) if override else DEFAULT_LEASE_DIR
 
 
 def main() -> None:
