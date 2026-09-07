@@ -314,3 +314,275 @@ class TestTheEventCarriesNoEnvelopeMarkup:
         assert 'pattern' not in event
         assert 'misclose' not in event
         assert 'fact' not in event
+
+
+# ---------------------------------------------------------------------------
+# The block algebra — pure functions over plain dicts.
+# ---------------------------------------------------------------------------
+
+
+def _events(count: int, *, tool: str = 'add_design_decision') -> list[dict[str, Any]]:
+    """*count* stamped events one second apart, so their order is assertable."""
+    clock = _Clock()
+    built = []
+    for _ in range(count):
+        built.append(plan_markup_stamp.build_event(make_fact(tool=tool), now=clock))
+        clock.advance(1.0)
+    return built
+
+
+class TestBlockOfBuildsTheOneEventBlock:
+    """The identity every merge starts from."""
+
+    def test_a_single_event_block_is_fully_populated(self):
+        (event,) = _events(1)
+
+        block = plan_markup_stamp.block_of(event)
+
+        assert block['count'] == 1
+        assert block['by_tool'] == {'add_design_decision': 1}
+        assert block['first_at'] == event['ts']
+        assert block['last_at'] == event['ts']
+        assert block['events'] == [event]
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+
+    def test_nothing_was_cut_so_the_disclosure_key_is_absent(self):
+        """PRESENCE means something was dropped — never merely that it ran."""
+        (event,) = _events(1)
+
+        assert 'events_truncated' not in plan_markup_stamp.block_of(event)
+
+
+class TestMergeBlockAccumulates:
+    """``merge_block(left, right)`` — the whole of the on-disk update."""
+
+    def test_counts_sum_and_by_tool_sums_per_tool(self):
+        first = plan_markup_stamp.block_of(_events(1, tool='add_plan_step')[0])
+        second = plan_markup_stamp.block_of(_events(1, tool='add_design_decision')[0])
+        third = plan_markup_stamp.block_of(_events(1, tool='add_design_decision')[0])
+
+        merged = plan_markup_stamp.merge_block(
+            plan_markup_stamp.merge_block(first, second), third
+        )
+
+        assert merged['count'] == 3
+        assert merged['by_tool'] == {'add_plan_step': 1, 'add_design_decision': 2}
+
+    def test_the_window_bounds_take_the_min_and_the_max(self):
+        events = _events(3)
+        blocks = [plan_markup_stamp.block_of(event) for event in events]
+
+        # Merged OUT OF ORDER on purpose: the bounds are min/max over values,
+        # never "whatever arrived first and last".
+        merged = plan_markup_stamp.merge_block(
+            plan_markup_stamp.merge_block(blocks[2], blocks[0]), blocks[1]
+        )
+
+        assert merged['first_at'] == events[0]['ts']
+        assert merged['last_at'] == events[2]['ts']
+
+    def test_a_null_bound_never_wins_a_min_or_a_max(self):
+        """A bound is taken over the values that EXIST.
+
+        A block whose ``first_at`` is missing or null must not pull the merged
+        window's start to nothing — that would erase a bound this side actually
+        knows.
+        """
+        (event,) = _events(1)
+        known = plan_markup_stamp.block_of(event)
+        blank = {'count': 1, 'by_tool': {'confirm_plan': 1}, 'first_at': None,
+                 'last_at': None, 'events': []}
+
+        merged = plan_markup_stamp.merge_block(blank, known)
+
+        assert merged['first_at'] == event['ts']
+        assert merged['last_at'] == event['ts']
+
+    def test_the_note_is_always_rewritten_from_the_constant(self):
+        """A stale or hand-edited note on disk is CORRECTED, not inherited.
+
+        The constant stays the single owner of the wording; ``plan.json`` is
+        agent-adjacent, so a note that drifted must not survive a merge.
+        """
+        stale = plan_markup_stamp.block_of(_events(1)[0])
+        stale['note'] = 'Some earlier wording an agent edited by hand.'
+
+        merged = plan_markup_stamp.merge_block(stale, plan_markup_stamp.block_of(_events(1)[0]))
+
+        assert merged['note'] == plan_markup_stamp.STAMP_NOTE
+
+    def test_merging_is_associative_over_a_sequence(self):
+        """Left-folded and right-folded must agree, or the on-disk block drifts.
+
+        The sink folds one incoming event into whatever is on disk, and
+        ``_create_plan`` folds a whole buffered block into a carried-forward
+        one. Those are different association orders over the same events.
+        """
+        blocks = [plan_markup_stamp.block_of(event) for event in _events(4)]
+
+        left = blocks[0]
+        for block in blocks[1:]:
+            left = plan_markup_stamp.merge_block(left, block)
+        right = blocks[-1]
+        for block in reversed(blocks[:-1]):
+            right = plan_markup_stamp.merge_block(block, right)
+
+        assert left == right
+
+
+class TestTheEventListIsCapped:
+    """Bounded, because ``plan.json`` rides verbatim into four prompts."""
+
+    def test_the_first_n_events_are_kept_and_the_rest_dropped(self):
+        """FIRST N, not last: the list stops changing once it is full.
+
+        A pathological leak then churns two integers instead of rewriting the
+        whole block on every refusal.
+        """
+        cap = plan_markup_stamp.MARKUP_STAMP_MAX_EVENTS
+        events = _events(cap + 5)
+
+        merged = plan_markup_stamp.block_of(events[0])
+        for event in events[1:]:
+            merged = plan_markup_stamp.merge_block(
+                merged, plan_markup_stamp.block_of(event)
+            )
+
+        assert merged['events'] == events[:cap]
+        assert merged['count'] == cap + 5, 'the COUNT is never capped'
+
+    def test_the_disclosure_key_appears_only_once_something_was_cut(self):
+        cap = plan_markup_stamp.MARKUP_STAMP_MAX_EVENTS
+        events = _events(cap + 1)
+
+        at_cap = plan_markup_stamp.block_of(events[0])
+        for event in events[1:cap]:
+            at_cap = plan_markup_stamp.merge_block(
+                at_cap, plan_markup_stamp.block_of(event)
+            )
+        assert len(at_cap['events']) == cap
+        assert 'events_truncated' not in at_cap, 'full is not the same as cut'
+
+        over_cap = plan_markup_stamp.merge_block(
+            at_cap, plan_markup_stamp.block_of(events[cap])
+        )
+
+        assert over_cap['events_truncated'] is True
+        assert over_cap['count'] - len(over_cap['events']) == 1, (
+            'how many were dropped is already derivable from the two numbers '
+            'present; a stored dropped-count would be a second accounting able '
+            'to drift from them'
+        )
+
+    def test_by_tool_stays_complete_past_the_event_cap(self):
+        """The aggregate is what actually answers the question.
+
+        It is bounded by the TOOL SURFACE rather than by the leak, so it stays
+        complete and small even when ``events`` is full.
+        """
+        cap = plan_markup_stamp.MARKUP_STAMP_MAX_EVENTS
+        merged = plan_markup_stamp.block_of(_events(1, tool='add_design_decision')[0])
+        for _ in range(cap + 5):
+            merged = plan_markup_stamp.merge_block(
+                merged, plan_markup_stamp.block_of(_events(1, tool='add_reuse_item')[0])
+            )
+
+        assert merged['by_tool'] == {'add_design_decision': 1, 'add_reuse_item': cap + 5}
+
+
+class TestMergeIsTotalAgainstAMangledBlock:
+    """``plan.json`` is agent-adjacent, so the block on disk may be anything.
+
+    A merge runs INSIDE a decided refusal, so raising here would turn a working
+    guard into an outage of its own. Every field degrades to its identity and
+    the INCOMING event survives — a partially-recovered count beats a lost one.
+    """
+
+    def test_a_non_dict_block_merges_without_raising(self):
+        incoming = plan_markup_stamp.block_of(_events(1)[0])
+
+        for mangled in ('a string', 42, None, ['a', 'list']):
+            merged = plan_markup_stamp.merge_block(mangled, incoming)
+
+            assert merged['count'] == 1, f'{mangled!r} lost the incoming event'
+            assert merged['by_tool'] == {'add_design_decision': 1}
+            assert merged['events'] == incoming['events']
+
+    def test_a_non_int_count_degrades_to_the_recoverable_total(self):
+        incoming = plan_markup_stamp.block_of(_events(1)[0])
+        mangled = {**plan_markup_stamp.block_of(_events(1)[0]), 'count': 'seven'}
+
+        merged = plan_markup_stamp.merge_block(mangled, incoming)
+
+        assert merged['count'] == 1, (
+            'the unusable side contributes its identity; the incoming event is '
+            'never the thing that gets dropped'
+        )
+
+    def test_a_non_dict_by_tool_degrades_without_losing_the_incoming_tally(self):
+        incoming = plan_markup_stamp.block_of(_events(1)[0])
+        mangled = {**plan_markup_stamp.block_of(_events(1)[0]), 'by_tool': 'nope'}
+
+        merged = plan_markup_stamp.merge_block(mangled, incoming)
+
+        assert merged['by_tool'] == {'add_design_decision': 1}
+
+    def test_a_non_list_events_degrades_without_losing_the_incoming_event(self):
+        incoming = plan_markup_stamp.block_of(_events(1)[0])
+        mangled = {**plan_markup_stamp.block_of(_events(1)[0]), 'events': {'not': 'a list'}}
+
+        merged = plan_markup_stamp.merge_block(mangled, incoming)
+
+        assert merged['events'] == incoming['events']
+
+    def test_a_by_tool_holding_junk_counts_still_merges(self):
+        incoming = plan_markup_stamp.block_of(_events(1)[0])
+        mangled = {
+            **plan_markup_stamp.block_of(_events(1)[0]),
+            'by_tool': {'add_design_decision': 'lots', 'add_plan_step': 2},
+        }
+
+        merged = plan_markup_stamp.merge_block(mangled, incoming)
+
+        assert merged['by_tool']['add_design_decision'] == 1
+        assert merged['by_tool']['add_plan_step'] == 2
+
+
+class TestSummaryIsTheCompactView:
+    """What ``_confirm_plan`` folds into the architect's LAST tool result."""
+
+    def test_a_plan_with_a_block_summarises_to_count_and_by_tool(self):
+        block = plan_markup_stamp.merge_block(
+            plan_markup_stamp.block_of(_events(1, tool='add_plan_step')[0]),
+            plan_markup_stamp.block_of(_events(1, tool='add_design_decision')[0]),
+        )
+        plan = {'steps': [], plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: block}
+
+        summary = plan_markup_stamp.summary(plan)
+
+        assert summary == {
+            'count': 2,
+            'by_tool': {'add_plan_step': 1, 'add_design_decision': 1},
+        }
+
+    def test_the_summary_carries_no_events_and_no_note(self):
+        """A signal to the architect, not a second copy of the block."""
+        block = plan_markup_stamp.block_of(_events(1)[0])
+        plan = {plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: block}
+
+        summary = plan_markup_stamp.summary(plan)
+
+        assert set(summary) == {'count', 'by_tool'}
+
+    def test_a_plan_with_no_block_summarises_to_none(self):
+        """Absent, so the omit-when-absent convention has something to omit."""
+        assert plan_markup_stamp.summary({'steps': [], 'files': ['a.py']}) is None
+        assert plan_markup_stamp.summary({}) is None
+
+    def test_an_unusable_block_summarises_to_none(self):
+        for mangled in ('a string', 42, None, ['a', 'list']):
+            plan = {plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: mangled}
+
+            assert plan_markup_stamp.summary(plan) is None, (
+                f'{mangled!r} must not reach a tool response half-formed'
+            )
