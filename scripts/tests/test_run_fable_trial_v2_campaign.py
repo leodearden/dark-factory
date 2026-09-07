@@ -19,6 +19,7 @@ instrument as it exists rather than as it will exist.
 """
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 
@@ -639,6 +640,210 @@ def test_partition_bands_on_the_most_retaining_cell():
 
     assert part['by_fixture'] == {'f1': 'intermittent'}
     assert part['discarded'] == []
+
+
+# ----- task 4766: the no-plan rung SPLITS on terminal_kind -----
+#
+# ``no_plan`` conflated two OPPOSITE verdicts on a candidate: one that could not
+# plan at all (the headroom this pool is selected for) and one that took an
+# explicit plan-tools decline exit (a CORRECT refusal of moot, blocked or
+# ill-posed work). Ruling D9 (task 3636) records the cost: tranche 1 read 47 of
+# 53 ``plan_steps = 0`` cells as an 89% planning failure when every one was a
+# verified-true decline — "the no-plan band is DECLINE-SHAPED, not
+# incapability-shaped".
+#
+# The split is LABELLING ONLY. Both bands are RETAINED (PRD D6 discards only the
+# unambiguous ceiling band, Leo-ratified at the γ2 gate), and
+# ``test_the_split_cannot_re_select_the_pool`` proves exhaustively that no
+# fixture changes side — the hazard task 4760 refused to take on, whose own
+# words were that "re-banding inside a measurement-plumbing change would
+# silently re-select the hard pool".
+
+
+def _decline_kinds():
+    """The REAL decline vocabulary, read off the instrument at collection time.
+
+    Never a hard-coded list of five strings. ``DECLINE_KINDS`` derives from
+    metrics.py's single ``_DECLINE_READERS`` map precisely so a sixth architect
+    exit cannot be half-added; parametrizing over the tuple extends that
+    discipline to the bander, so a new exit that nobody taught ``band_for_cell``
+    about fails here instead of silently banding ``no_plan``. Spelled as a
+    deferred import for the same reason every other ``orchestrator`` import in
+    this module is.
+    """
+    from orchestrator.evals.metrics import DECLINE_KINDS
+
+    return DECLINE_KINDS
+
+
+@pytest.mark.parametrize('kind', _decline_kinds())
+def test_a_no_plan_cell_that_explicitly_declined_bands_declined(kind):
+    """Each of the five plan-tools decline exits bands ``declined``, not ``no_plan``.
+
+    The cell is otherwise the ordinary no-plan shape — ``plan_steps = 0`` with a
+    valid reference — so the ONLY thing moving it out of ``no_plan`` is the
+    terminal kind.
+    """
+    m = _metrics(plan_steps=0, plan_quality=0.0,
+                 extra_metrics={'judged_without_reference': False,
+                                'terminal_kind': kind})
+
+    assert mod.band_for_cell(m, 0.80) == 'declined'
+
+
+@pytest.mark.parametrize('kind', ('none', 'planned'))
+def test_a_no_plan_cell_with_a_non_decline_kind_still_bands_no_plan(kind):
+    """Only DECLINE_KINDS moves the rung. The rest of the closed vocabulary does not.
+
+    ``none`` is the real silent-failure shape and ``planned`` a member of
+    TERMINAL_KINDS that is not a decline; both must stay in the band that means
+    "this candidate emitted no plan", because that is the headroom evidence the
+    screen exists to find.
+    """
+    m = _metrics(plan_steps=0, plan_quality=0.0,
+                 extra_metrics={'judged_without_reference': False,
+                                'terminal_kind': kind})
+
+    assert mod.band_for_cell(m, 0.80) == 'no_plan'
+
+
+def test_an_unmeasured_terminal_kind_is_never_read_as_a_decline():
+    """UNMEASURED bands ``no_plan``, in BOTH of its shapes — never ``declined``.
+
+    ``terminal_kind_of`` deliberately conflates a missing key with an explicit
+    ``None``: both mean we never measured why this cell has no plan, and its
+    docstring records that a third arm for the explicit null would misread the
+    cell as "did not decline". A ``--results-dir`` replay of the tranche-1
+    corpus is entirely keyless, so the legacy shape is the COMMON case, not an
+    exotic one. Banding either ``declined`` would fabricate a refusal nobody
+    observed; ``no_plan`` already means "we cannot tell why there is no plan",
+    which is the conservative direction D6 demands of every ambiguous rung.
+
+    Sibling of ``test_a_legacy_cell_reads_unmeasured_never_a_fabricated_kind``.
+    """
+    common = {'plan_steps': 0, 'plan_quality': 0.0}
+    ref_ok = {'judged_without_reference': False}
+    explicit_null = _metrics(
+        **common, extra_metrics={**ref_ok, 'terminal_kind': None},
+    )
+    legacy = _metrics(**common, extra_metrics=ref_ok,
+                      drop_metrics=_PRE_TERMINAL_KIND)
+    assert 'terminal_kind' not in legacy, 'premise: this cell predates task 4760'
+
+    assert mod.band_for_cell(explicit_null, 0.80) == 'no_plan'
+    assert mod.band_for_cell(legacy, 0.80) == 'no_plan'
+
+
+def test_declined_is_a_retained_band_wired_into_every_constant():
+    """The name exists in all three tuples, and the two tuples cannot drift apart.
+
+    ``RETAINED_BANDS`` gets no edit of its own — its ``b != 'ceiling'``
+    derivation picks ``declined`` up from ``BANDS`` automatically, which is D6's
+    "discard only the ceiling band" rule staying single-sourced. The
+    precedence SLOT is pinned because it is load-bearing, not cosmetic: see
+    ``test_the_split_cannot_re_select_the_pool``.
+    """
+    assert 'declined' in mod.BANDS
+    assert 'declined' in mod.RETAINED_BANDS
+    assert 'declined' in mod._BAND_PRECEDENCE
+    # Two tuples over one vocabulary: a band added to either alone would make
+    # partition_bands raise (index) or drop a counts key.
+    assert set(mod._BAND_PRECEDENCE) == set(mod.BANDS)
+    assert (mod._BAND_PRECEDENCE.index('declined')
+            == mod._BAND_PRECEDENCE.index('no_plan') + 1)
+
+
+_ALL_BANDS = ('ceiling', 'intermittent', 'no_plan', 'declined', 'unmeasured')
+"""The five band names, spelled OUT so the exhaustive enumeration cannot shrink.
+
+Reading these off ``mod.BANDS`` would let a regression that drops a band also
+delete the cases that would have caught it. The tie back to production is an
+explicit set-equality assertion inside the test instead.
+"""
+
+_PRE_SPLIT_PRECEDENCE = ('no_plan', 'intermittent', 'unmeasured', 'ceiling')
+"""Task 4760's four-band precedence, RECOMPUTED here rather than imported.
+
+The point of the lock below is to compare this change against the behaviour it
+replaces, so importing the (now five-band) production tuple would compare it
+against itself and assert nothing.
+"""
+
+_BAND_CELL_KWARGS = {
+    'ceiling': dict(plan_steps=6, plan_quality=0.92,
+                    extra_metrics={'judged_without_reference': False,
+                                   'terminal_kind': 'planned'}),
+    'intermittent': dict(plan_steps=5, plan_quality=0.40,
+                         extra_metrics={'judged_without_reference': False,
+                                        'terminal_kind': 'planned'}),
+    'no_plan': dict(plan_steps=0, plan_quality=0.0,
+                    extra_metrics={'judged_without_reference': False,
+                                   'terminal_kind': 'none'}),
+    'declined': dict(plan_steps=0, plan_quality=0.0,
+                     extra_metrics={'judged_without_reference': False,
+                                    'terminal_kind': 'false_premise'}),
+    'unmeasured': dict(cap_tainted=True, invocation_error='architect: cap_hit',
+                       extra_metrics={'judged_without_reference': False,
+                                      'terminal_kind': 'none'}),
+}
+"""One ``_cell`` kwargs recipe per band. Each is checked to really band that way."""
+
+
+def _pre_split_label(cell_bands):
+    """The label task 4760's four-band bander gave a fixture with these cells."""
+    folded = ['no_plan' if b == 'declined' else b for b in cell_bands]
+    return min(folded, key=_PRE_SPLIT_PRECEDENCE.index)
+
+
+def test_the_split_cannot_re_select_the_pool():
+    """THE SAFETY LOCK: the split REFINES labels and moves no fixture, exhaustively.
+
+    Over every multiset of one to three cell-bands — every shape a fixture with
+    up to three admitted cells can take — two properties must hold:
+
+    (i) DISPOSITION INVARIANCE. The fixture lands on the same side of
+        retained/discarded as it did under the pre-split four-band rule. This is
+        what makes the change safe to land on an already-committed corpus: it
+        cannot re-select the hard pool, which is exactly the hazard task 4760
+        declined to take on inside a measurement-plumbing change.
+
+    (ii) LABEL REFINEMENT. The new label either equals the old one, or is
+        ``declined`` precisely where the old was ``no_plan``. Nothing else moves.
+
+    Placing ``declined`` immediately after ``no_plan`` in ``_BAND_PRECEDENCE``
+    is the UNIQUE slot satisfying these; the plausible alternative (last before
+    ``ceiling``, making the label mean strict unanimity) violates (ii) 25 times
+    over this same enumeration, relabelling ``{declined, unmeasured}`` fixtures
+    as ``unmeasured`` and so sending γ1's re-run recipe at a fixture that
+    already holds an admissible cell. So the assertion genuinely discriminates
+    between the two placements rather than passing for any of them.
+    """
+    assert set(_ALL_BANDS) == set(mod.BANDS), 'the enumeration must cover every band'
+
+    for size in (1, 2, 3):
+        for cell_bands in itertools.combinations_with_replacement(_ALL_BANDS, size):
+            results = [
+                _cell('f', 'A', trial=i + 1, **_BAND_CELL_KWARGS[band])
+                for i, band in enumerate(cell_bands)
+            ]
+            for result, band in zip(results, cell_bands, strict=True):
+                assert mod.band_for_cell(result.metrics, 0.80) == band, (
+                    f'premise: the {band!r} recipe must build a {band!r} cell'
+                )
+
+            part = mod.partition_bands(results, 0.80)
+            new = part['by_fixture']['f']
+            old = _pre_split_label(cell_bands)
+
+            assert new == old or (new == 'declined' and old == 'no_plan'), (
+                f'{cell_bands}: {old!r} -> {new!r} is not a refinement'
+            )
+            assert ('f' in part['retained']) == (old != 'ceiling'), (
+                f'{cell_bands}: retention changed (was {old!r}, now {new!r})'
+            )
+            assert ('f' in part['discarded']) == (old == 'ceiling'), (
+                f'{cell_bands}: discard changed (was {old!r}, now {new!r})'
+            )
 
 
 def test_banding_without_q_ceiling_exits(tmp_path, monkeypatch):
