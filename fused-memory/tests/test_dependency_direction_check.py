@@ -36,7 +36,11 @@ from fused_memory.middleware.dependency_direction_check import (
     classify_dependency_assertion,
     extract_dependency_assertions,
 )
-from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.memory_service import (
+    MemoryService,
+    ReferentRepairStats,
+    ReferentStats,
+)
 
 #: The logger the sub-pass emits its structured WARNING through.
 _MS_LOGGER = 'fused_memory.services.memory_service'
@@ -606,3 +610,92 @@ class TestMemoryServiceSubPass:
         svc = _service(mock_config)
         result = _result(BAD_FACTS, field=field)
         assert await svc._check_dependency_direction(result, group_id=GROUP) == 3
+
+
+class TestReconcileEpisodeIdentityWiring:
+    """The check is the NINTH `_run_pass` — appended AFTER zeta/eta, whose
+    documented load-bearing "runs last" ordering must stay undisturbed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_findings_are_folded_into_reconcile_stats(self, mock_config):
+        svc = _service(mock_config)
+        stats = await svc._reconcile_episode_identity(
+            _result(BAD_FACTS), group_id=GROUP
+        )
+
+        assert stats.dependency_direction_flagged == 3
+        assert len(stats.dependency_direction_findings) == 3
+        for record in stats.dependency_direction_findings:
+            assert record['edge_uuid'] in BAD_FACTS
+            assert record['fact'] == BAD_FACTS[record['edge_uuid']]
+            assert isinstance(record['dependent'], int)
+            assert isinstance(record['dependency'], int)
+            assert record['classification'] in (REVERSED, SIBLING_SEQUENTIAL)
+
+    @pytest.mark.asyncio
+    async def test_the_eight_pre_existing_stats_fields_are_undisturbed(
+        self, mock_config
+    ):
+        svc = _service(mock_config)
+        stats = await svc._reconcile_episode_identity(
+            _result(BAD_FACTS), group_id=GROUP
+        )
+
+        assert stats.errors == []
+        for name in (
+            'edges_deduped',
+            'dependency_edges_restored',
+            'sibling_edges_restored',
+            'stale_ttl_edges_invalidated',
+            'nodes_resolved',
+            'task_names_normalized',
+        ):
+            assert isinstance(getattr(stats, name), int)
+        # zeta/eta still return their own dataclasses: the new pass did not
+        # disturb their ordering contract or eta's data dependency on zeta.
+        assert isinstance(stats.referent_stats, ReferentStats)
+        assert isinstance(stats.repair_stats, ReferentRepairStats)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_check_never_fails_the_committed_write(
+        self, mock_config, monkeypatch
+    ):
+        svc = _service(mock_config)
+
+        async def _boom(*a, **kw):
+            raise RuntimeError('checker bug')
+
+        monkeypatch.setattr(svc, '_check_dependency_direction', _boom)
+        stats = await svc._reconcile_episode_identity(
+            _result(BAD_FACTS), group_id=GROUP
+        )
+
+        assert '_check_dependency_direction' in stats.errors
+        assert stats.dependency_direction_flagged == 0
+        # A swallowed failure must never leave partial findings that read as a
+        # clean result.
+        assert stats.dependency_direction_findings == []
+
+    @pytest.mark.asyncio
+    async def test_cancellation_still_propagates(self, mock_config, monkeypatch):
+        svc = _service(mock_config)
+
+        async def _cancel(*a, **kw):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(svc, '_check_dependency_direction', _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await svc._reconcile_episode_identity(_result(BAD_FACTS), group_id=GROUP)
+
+    @pytest.mark.asyncio
+    async def test_an_out_of_scope_episode_leaves_both_fields_at_defaults(
+        self, mock_config
+    ):
+        svc = _service(mock_config)
+        stats = await svc._reconcile_episode_identity(
+            _result({'e1': 'Task 3727 and task 3619 were both filed today'}),
+            group_id=GROUP,
+        )
+        assert stats.dependency_direction_flagged == 0
+        assert stats.dependency_direction_findings == []
