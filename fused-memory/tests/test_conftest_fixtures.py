@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -21,30 +22,11 @@ from _fm_helpers import (
 )
 
 # --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
-
-
-@pytest.fixture(autouse=True)
-def lease_dir(tmp_path, monkeypatch):
-    """Point ``DF_EPHEMERAL_COLLECTION_LEASE_DIR`` at a per-test directory.
-
-    A hard isolation boundary, not a convenience.  The lease directory
-    ``cleanup_test_collections.lease_dir()`` returns by default is a
-    HARDCODED machine-global absolute path (that is the property the guard's
-    correctness rests on — see the design note on that function), and it is
-    the very directory the live 6-hourly cron reads.  A test that wrote a
-    lease into it would hold a real sweep off this host; a test that reaped
-    it would unlink the lease of a live bake-off running in another checkout.
-
-    Autouse, and applied to EVERY test in this module rather than only the
-    lease tests, for exactly that reason: a test that forgets to request the
-    isolation must not be able to fall through silently to the real
-    directory.  Tests that need the path can still request this fixture by
-    name; the directory is not created here, because a lease-dir-absent case
-    is one of the behaviours under test.
-    """
-    directory = tmp_path / 'ephemeral-collection-leases'
-    monkeypatch.setenv('DF_EPHEMERAL_COLLECTION_LEASE_DIR', str(directory))
-    return directory
+#
+# Defined once in the sibling module so five importers cannot drift apart;
+# its docstring says why redirecting the directory is a hard boundary rather
+# than a convenience.  Autouse applies to every test in THIS module.
+from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # preserve_config_path fixture tests
@@ -533,3 +515,45 @@ class TestTheIntegrationLaneLeaseFixture:
             next(body)
 
         assert reaper.live_leases() == []
+
+
+class TestTheLeaseDirIsolationHasOneDefinition:
+    """The fixture keeping tests out of the machine-global lease directory is
+    defined ONCE and imported by the modules that need it.
+
+    It was five verbatim copies of a ~26-line function before this guard
+    (task 4775 pre-1).  The duplication is correctness-relevant rather than
+    cosmetic: the fixture's whole job is to stop a test writing into the
+    directory the live 6-hourly cron reads, so a sixth module that copies a
+    STALE variant — or copies nothing — is exactly the silent fall-through
+    the fixture exists to prevent, and nothing about it would fail loudly.
+    """
+
+    TESTS_DIR = Path(__file__).parent
+    HOME = '_fm_lease_dir_fixture.py'
+    #: `lease_dir\w*` so a copy under either spelling is caught — the shared
+    #: definition is `lease_dir_fixture`, registered under the fixture NAME
+    #: `lease_dir`.  Spelled as a regex so this file does not match itself.
+    DEFINITION = re.compile(r'^\s*def lease_dir\w*\(', re.MULTILINE)
+
+    def test_only_the_shared_module_defines_it(self):
+        definitions = sorted(
+            path.name
+            for path in self.TESTS_DIR.glob('*.py')
+            if self.DEFINITION.search(path.read_text(encoding='utf-8'))
+        )
+
+        assert definitions == [self.HOME], (
+            f'{definitions} define the fixture themselves; import the one '
+            f'definition instead — `from _fm_lease_dir_fixture import '
+            f'lease_dir  # noqa: F401`'
+        )
+
+    def test_an_importing_module_really_gets_the_isolation(self, lease_dir):
+        """This module is one of the importers, so the redirection is
+        observable from inside it: the reaper resolves the tmp directory and
+        not the hardcoded machine-global one the live cron reads."""
+        reaper = load_script_module(REAPER_PATH)
+
+        assert reaper.lease_dir() == lease_dir
+        assert reaper.lease_dir() != reaper.DEFAULT_LEASE_DIR
