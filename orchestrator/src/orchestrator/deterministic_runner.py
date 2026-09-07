@@ -365,6 +365,7 @@ from orchestrator.proc_supervision import (
 from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.systemd_inspect import (
     _deterministic_deploy_health_verdict,
+    _wedged_unit_sentinel,
     inspect_systemd_unit,
 )
 from orchestrator.workflow import WorkflowOutcome
@@ -1269,6 +1270,50 @@ class DeterministicRunner:
             timeout_secs=self._inspect_timeout_secs,
             reap_grace_secs=self._reap_grace_secs,
         )
+
+    async def _inspect_unit_guarded(self, inspect_fn, unit: str) -> dict:
+        """Await ``inspect_fn(unit)``, degrading an ``OSError`` to the wedged sentinel.
+
+        Task 4157. Used by BOTH ``run()`` call sites that would otherwise let a
+        unit-inspector failure escape — the crash-window re-verify and the
+        pre-deploy baseline capture — so the guard exists once rather than
+        twice.
+
+        WHY this exists at the call site even though
+        ``systemd_inspect.inspect_systemd_unit`` is itself fail-closed:
+        ``inspect_fn`` resolves to ``self._unit_inspector or
+        self._default_inspect_unit``, and ``_unit_inspector`` is a
+        constructor-injectable seam. The default's contract does not bind an
+        injected inspector, so hardening only the source would leave ``run()``'s
+        documented "always returns BLOCKED, never a raw exception" contract
+        (the sentence is at deterministic_runner.py:2073-2074, in the task-2240
+        stamp-only fallback whose ``except IllegalDeployTransition`` sits just
+        below it) false for any caller that uses the seam — and a guarantee
+        that holds only when a documented seam is unused is not a guarantee.
+
+        Catches ``OSError`` ONLY, never a bare ``Exception``: ``run()``
+        deliberately raises ``ValueError`` (the sole entry in its documented
+        ``Raises:`` section) and ``NotImplementedError`` (the "gate resolved
+        but before_done_ran_at is not set" operator guard), and swallowing
+        either into a silent BLOCKED escalation would convert a loud
+        authoring/state defect into a silent one.
+
+        Returns the caller's dict unchanged on success; on an ``OSError``,
+        :func:`~orchestrator.systemd_inspect._wedged_unit_sentinel` — which both
+        call sites' existing fail-closed consumers already reject (the verify
+        leg's ``pid > 0`` check, the baseline leg's task-2091 ``ActiveState``
+        gate), so no new branch is needed downstream.
+        """
+        try:
+            return await inspect_fn(unit)
+        except OSError as exc:
+            logger.warning(
+                'DeterministicRunner: unit inspect of %s failed to run (%r) — '
+                'degrading to the MainPID=0 sentinel so the failure routes '
+                'through the existing fail-closed path instead of escaping run()',
+                unit, exc,
+            )
+            return _wedged_unit_sentinel()
 
     async def _default_run_script(self, before_done: dict) -> tuple[int, str]:
         """Run the deploy script to completion under a timeout.
@@ -3365,7 +3410,15 @@ class DeterministicRunner:
                     and deploy_state.verify_baseline is not None
                 ):
                     inspect_fn = self._unit_inspector or self._default_inspect_unit
-                    fresh_state = await inspect_fn(target_unit)
+                    # Task 4157: guarded — an inspector OSError here would
+                    # otherwise escape run() and bypass this very escalation.
+                    # The sentinel it degrades to classifies as 'unconfirmed'
+                    # below under BOTH baseline modes, so control falls
+                    # through to the crash-window escalation with the
+                    # reverify_note enrichment already in place.
+                    fresh_state = await self._inspect_unit_guarded(
+                        inspect_fn, target_unit,
+                    )
                     verdict = _deterministic_deploy_health_verdict(
                         fresh_state, verify_baseline=deploy_state.verify_baseline,
                     )
