@@ -154,11 +154,32 @@ the plain backlog verdict for an ad-hoc census.
 
 The adjacent pool is CENSUSED, NEVER DELETED here: the probe counts it and stops,
 never enumerating it, never running a predicate over it, never adding it to the
-delete set — a boundary enforced by ``TestFlagForStage2IsNeverDeleted``. In short:
-live relay markers would be caught by this script's own predicates, it has neither
-the ``is_protected_mirror_record`` guard nor the tombstone write that the in-cycle
-``_sweep_stale_mem0_pool`` applies, and task 2966's collector already drains that
-pool correctly.
+delete set — a boundary enforced by ``TestFlagForStage2IsNeverDeleted``. That
+ruling now rests on two reasons, not three: live relay markers would be caught by
+this script's own ``find_taskless_markers`` / ``--terminal-drain`` predicates (they
+are live, not dead weight), and task 2966's in-cycle collector already drains that
+pool, so a second collector here would race a correct one. The third reason is
+retired — task 4435 closed the parity gap it named, and this script now applies
+BOTH the ``is_protected_mirror_record`` guard (at :func:`delete_orphan_markers`,
+the delete choke point, so every caller inherits it) and the
+``record_mem0_deletion_tombstones`` write over its confirmed deletes, as the
+in-cycle ``_sweep_stale_mem0_pool`` does. Closing it changes nothing about the
+boundary: the two surviving reasons are each independently sufficient.
+
+Read that as parity ON THOSE TWO COUNTS, not as equivalence. This script is still
+the looser of the two paths: ``_sweep_stale_mem0_pool`` applies a THIRD
+protected-record predicate that has NOT been ported here —
+``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS`` (task
+4375), added after the age-only rule destroyed the 40 ``kind='cadence_check'``
+audit records described above. So ``find_stale_markers`` / ``find_terminal_task_markers`` here can still
+destroy a permanent audit record that happens to carry
+``source='stage1_flag_marker'``, and deletion here is permanent (see "Deletion vs
+backfill"). That divergence is deliberate, not an oversight: task 4435's scope was
+the two counts its own description named, and the audit arm does not port
+mechanically (in ``_sweep_stale_mem0_pool`` it is documented as defence-in-depth
+BEHIND a primary terminal-task-closure gate, whereas this script's
+``--terminal-drain`` deliberately deletes markers BECAUSE their task went
+terminal). Tracked as task 5129.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
 records, in which project, when), for the full censused-never-deleted
@@ -191,6 +212,10 @@ from functools import partial
 from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+from fused_memory.reconciliation.mem0_tombstone import (
+    is_protected_mirror_record,
+    record_mem0_deletion_tombstones,
+)
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
@@ -506,6 +531,80 @@ def find_terminal_task_markers(
     return result
 
 
+def _member_metadata(member: dict) -> dict:
+    """Return *member*'s metadata dict, or ``{}`` for any non-dict payload.
+
+    The sibling ``find_*`` predicates use ``(m.get('metadata') or {})``, which
+    is enough for a truthiness test but raises ``AttributeError`` on a
+    metadata that is present and NOT a dict (a list, a string). The
+    protected-record log lines below read INDIVIDUAL keys off a payload the
+    guard has already flagged as anomalous, so they use this stricter form:
+    a weird payload must never crash the sweep from inside the reporting for
+    the guard that exists to make it safer.
+
+    Pure, sync, no I/O.
+    """
+    metadata = member.get('metadata')
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def find_protected_markers(members: list[dict]) -> list[dict]:
+    """Return members this sweep must NEVER delete (task 3041/4435).
+
+    A member returned here is a protected ``cycle_summary`` ledger MIRROR —
+    the durable audit anchor a later auditor resolves a memory id against —
+    not a marker. Deleting one is unrecoverable (see the module docstring's
+    "Deletion vs backfill": deletion here is permanent, not self-healing),
+    so it is refused unconditionally, however it reached the delete set.
+
+    Restores parity with the in-cycle collector
+    ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` ON THIS ONE
+    GUARD, which it applies before its own eligibility test. Parity is not
+    total, and this predicate must not be read as making it so: that
+    collector applies a SECOND protected-record predicate this script still
+    lacks — ``mem0_tombstone.is_protected_audit_record`` (task 4375), a
+    membership test over ``PROTECTED_AUDIT_KINDS`` withholding
+    deliberately-permanent audit records such as ``kind='cadence_check'``.
+    Until that lands (task 5129), this script's ``find_stale_markers`` /
+    ``find_terminal_task_markers`` can still reach such a record if it
+    carries ``source='stage1_flag_marker'``. The two are deliberately
+    separate predicates rather than one — ``mem0_tombstone``'s own docstring
+    gives the reason (they answer different questions, and separate skips
+    keep distinct attribution) — so folding the audit arm in here would be
+    the wrong shape even once it is in scope.
+
+    The two discriminators are single-sourced in
+    ``fused_memory.reconciliation.mem0_tombstone`` and deliberately IMPORTED
+    rather than copied here. A local copy would be exactly the lockstep
+    literal duplication INV-5 forbids, and ``mem0_tombstone``'s own module
+    docstring records that private copies "kept in sync BY CONVENTION"
+    already produced this half-disabled-guard failure once: an edit to
+    either side would silently protect one pool and not the other. (This is
+    a deliberate exception to the by-value mirroring used for
+    ``FLAG_FOR_STAGE2_FILTERS`` above: that rationale is about staying
+    decoupled from the heavy reconciliation-STAGE module, and
+    ``mem0_tombstone`` is a near-leaf that pulls in neither
+    ``fused_memory.services.*`` nor ``task_knowledge_sync``.)
+
+    ``is_protected_mirror_record`` is itself fully defensive — ``None``, a
+    non-dict, and unexpected value types all return ``False`` without
+    raising — so a weird Mem0 payload can never crash the sweep from inside
+    the guard that exists to make it safer.
+
+    Pure, sync, no I/O.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+
+    Returns:
+        Subset of *members* whose metadata declares ``kind ==
+        'cycle_summary'`` OR ``record_type == 'ledger_stamp'``. Order is
+        preserved. An unprotected input returns ``[]``.
+    """
+    return [m for m in members if is_protected_mirror_record(m.get('metadata'))]
+
+
 # ---------------------------------------------------------------------------
 # Async delete
 # ---------------------------------------------------------------------------
@@ -523,6 +622,21 @@ async def delete_orphan_markers(
     asyncio.gather with return_exceptions=True, per-item WARNING on failure,
     count only successes.
 
+    Protected-mirror guard (task 3041/4435)
+    ---------------------------------------
+    This is the sweep's DELETE CHOKE POINT, so the guard lives here: every
+    current and future caller inherits it, including one that never consults
+    :func:`find_protected_markers` itself. It is UNCONDITIONAL — it overrides
+    ``--delete-ids``, the operator's targeted-correction lever, exactly as
+    ``_sweep_stale_mem0_pool``'s guard is a ``continue`` no caller can opt out
+    of. The asymmetry that settles it is the one ``mem0_tombstone`` states:
+    over-protecting a marker costs one loudly-logged skipped GC, while
+    under-protecting a mirror costs the audit anchor an auditor is about to
+    look for — and here that loss is unrecoverable, since "deletion here is
+    permanent, not self-healing" (module docstring). An operator who genuinely
+    needs a specific protected record gone has the unguarded, individually
+    authorised fused-memory MCP ``delete_memory`` tool.
+
     Args:
         memory_service: Live (or mock) MemoryService instance.
         project_id: Project scope passed to each delete_memory call.
@@ -530,10 +644,47 @@ async def delete_orphan_markers(
         causation_id: Optional causation id forwarded to each delete_memory call.
 
     Returns:
-        ``{'deleted': int, 'failed': [ids]}``
+        ``{'deleted': int, 'failed': [ids], 'protected_skipped': [ids],
+        'tombstoned': int}``. ``protected_skipped`` lists the members refused
+        by the guard above, in input order. ``tombstoned`` is the number of
+        task-3041 ledger rows written for this sweep's confirmed deletes — a
+        value below ``deleted`` means records were destroyed with an
+        incomplete audit trail (no ``recon_ledger`` wired, or a failed batch
+        write; both logged at WARNING), never that a delete failed. All four
+        keys are present unconditionally, including on the empty-input fast
+        path, so no caller needs a ``.get`` fallback.
     """
     if not orphans:
-        return {'deleted': 0, 'failed': []}
+        return {'deleted': 0, 'failed': [], 'protected_skipped': [], 'tombstoned': 0}
+
+    # Enforcement, checked BEFORE the gather so an over-broad delete set
+    # degrades to a loud skip rather than collateral mirror loss. One WARNING
+    # per member, naming both discriminators — modelled on the message
+    # ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` emits, so an
+    # operator grepping the journal recognises the two skips as one guard.
+    protected = find_protected_markers(orphans)
+    if protected:
+        protected_ids = {id(m) for m in protected}  # builtin id(), see NOTE below
+        for member in protected:
+            metadata = _member_metadata(member)
+            logger.warning(
+                'sweep_orphan_flag_markers: SKIPPING protected cycle_summary '
+                'mirror memory_id=%s (kind=%s record_type=%s) — this record '
+                'must never be deleted by a marker sweep; reaching this guard '
+                "means this run's delete set was over-broad and the predicate "
+                'or --delete-ids that produced it should be tightened '
+                '(task 3041/4435).',
+                member.get('id'), metadata.get('kind'), metadata.get('record_type'),
+                extra={'project_id': project_id, 'memory_id': member.get('id')},
+            )
+        orphans = [m for m in orphans if id(m) not in protected_ids]
+    # NOTE ``id(m)`` above is the BUILTIN object identity, not the member's
+    # ``'id'`` payload key. find_protected_markers returns the very objects it
+    # was handed, so object identity is the exact complement of the protected
+    # subset and needs no assumption that memory uuids are unique within one
+    # delete set (they are, but that is the caller's invariant, not this
+    # function's).
+    protected_skipped = [m.get('id') for m in protected]
 
     async def _delete_one(orphan: dict):
         return await memory_service.delete_memory(
@@ -551,6 +702,7 @@ async def delete_orphan_markers(
 
     deleted = 0
     failed: list[str] = []
+    tombstone_victims: list[dict] = []
     for orphan, result in zip(orphans, results, strict=False):
         if isinstance(result, BaseException):
             logger.warning(
@@ -560,8 +712,63 @@ async def delete_orphan_markers(
             failed.append(orphan['id'])
         else:
             deleted += 1
+            # Success branch ONLY (task 3041): a tombstone must never claim a
+            # record that is still alive, so the failure branch above is
+            # deliberately left untouched. `deleted`/`failed` are therefore
+            # fully computed before the tombstone block below, and no path
+            # through it can perturb them.
+            tombstone_victims.append(orphan)
 
-    return {'deleted': deleted, 'failed': failed}
+    tombstoned = 0
+    if tombstone_victims:
+        # ONE ledger transaction for the whole sweep, not one per victim: each
+        # `upsert` is its own commit — hence its own fsync, serialized on the
+        # single aiosqlite worker thread — so a per-victim loop would cost N
+        # sequential fsyncs on a backlog sweep (task-3041 amendment finding).
+        #
+        # `deleter` is deliberately the same literal already passed to
+        # delete_memory as `_source`, per record_mem0_deletion_tombstone's
+        # documented contract for the field ("the delete's `_source` audit
+        # tag, i.e. WHICH sweep took it") — so the write journal and the
+        # tombstone name this sweep identically.
+        #
+        # record_mem0_deletion_tombstones is internally fail-safe (returns 0,
+        # never raises); this try/except is a SECOND belt so that even a
+        # helper that is patched or broken cannot raise out of — or alter the
+        # count of — this sweep, while still saying so out loud rather than
+        # swallowing it. `deleted`/`failed` are already final above, so no
+        # path through here can perturb what the caller is told.
+        try:
+            tombstoned = await record_mem0_deletion_tombstones(
+                memory_service,
+                project_id,
+                tombstone_victims,
+                deleter='sweep_orphan_flag_markers',
+                # Same id the deletes above were journaled under, which is
+                # what makes the two cross-referenceable. A manual/nightly
+                # sweep has no reconciliation run, so '' is the honest value
+                # (and matches the ledger row's own run_id default).
+                deleting_run_id=causation_id or '',
+            )
+        except Exception:
+            logger.warning(
+                'sweep_orphan_flag_markers: tombstone batch raised for %d '
+                'deleted record(s); the deletes themselves succeeded and are '
+                'counted, but this sweep left no task-3041 audit trail for '
+                'them — an auditor chasing one of these memory ids will find '
+                'nothing distinguishing this sweep from silent data loss.',
+                len(tombstone_victims),
+                exc_info=True,
+                extra={'project_id': project_id},
+            )
+            tombstoned = 0
+
+    return {
+        'deleted': deleted,
+        'failed': failed,
+        'protected_skipped': protected_skipped,
+        'tombstoned': tombstoned,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +798,13 @@ async def run(
           (e.g. a numeric task_id that is still pending, or a comma-joined
           composite id) that no automatic predicate can catch.
     A member matched by more than one predicate/list is deleted exactly once.
+
+    Protected ``cycle_summary``/``ledger_stamp`` mirrors are then SUBTRACTED
+    from that union (:func:`find_protected_markers`, task 3041/4435) before
+    any count is taken, so ``orphan_count``/``orphan_ids``/``bucket_counts``
+    all describe the delete set actually taken. The subtraction is
+    unconditional and overrides the targeted correction list too — see
+    :func:`delete_orphan_markers` for why.
 
     Args:
         args: argparse.Namespace (or SimpleNamespace) with at least:
@@ -636,6 +850,26 @@ async def run(
             - targeted_correction_ids (list[str]): the subset of
               ``args.delete_ids`` actually found among the enumerated
               members (the found-intersection, not the raw input list).
+              Deliberately NOT narrowed by the protected-mirror subtraction:
+              it records what the operator's ids MATCHED, which must stay
+              visible even when the guard then refuses them, so a refused
+              request reads as refused rather than as silently lost.
+            - protected_skipped_count (int) / protected_skipped_ids
+              (list[str]): every ENUMERATED member matched by
+              :func:`find_protected_markers` — records this sweep must never
+              delete — in scroll order. Scoped to the enumeration rather than
+              to the delete set on purpose: the finding is that this script's
+              filter matched a protected record at all, and a member no
+              predicate happens to catch today is precisely the one a
+              union-scoped count would hide until an operator's
+              ``--delete-ids`` named it. Every id listed here is absent from
+              ``orphan_ids``. Present unconditionally in BOTH modes
+              (``0``/``[]`` when nothing was protected), so the skip is a
+              first-class, greppable fact in the nightly JSON. A non-empty
+              subset ALSO emits one aggregate WARNING naming the ids and
+              both discriminators, so the event is greppable in the journal
+              too — the report key and the log line are complements here,
+              exactly as they are for ``undated_kept_count``.
             - cross_check (dict): adjacent-population census (task 3897) —
               ``{'source_total', 'flag_for_stage2_total', 'blind_spot',
               'probe_failed'}``. Diagnostic only, NEVER part of the delete
@@ -648,6 +882,24 @@ async def run(
               unobserved population must never be asserted as a blind spot.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
+            - tombstoned (int, only when apply=True): task-3041 ledger rows
+              written for this sweep's confirmed deletes. A value below
+              ``deleted`` means records were destroyed with an incomplete
+              audit trail (typically no ``recon_ledger`` wired, or a failed
+              batch write — both logged at WARNING); it never indicates a
+              failed delete, which is reported by ``failed`` instead.
+            - enforced_protected_skipped (list[str], only when
+              apply=True): ids the UNCONDITIONAL guard inside
+              :func:`delete_orphan_markers` refused at the delete choke
+              point. Normally ``[]``, because the protected subtraction
+              above already removed them from the delete set — so a
+              non-empty value means the choke-point guard caught something
+              that partition did not, and it is the only key that accounts
+              for ``deleted + len(failed) < orphan_count``. Deliberately
+              NOT merged into ``protected_skipped_ids``, which is
+              enumeration-scoped and answers a different question (what
+              this script's filter matched, vs. what was refused at the
+              door).
             - after (dict with counts, only when apply=True)
     """
     project_id: str = getattr(args, 'project_id', 'dark_factory')
@@ -862,6 +1114,73 @@ async def run(
             seen_ids.add(m['id'])
             orphans.append(m)
 
+    # Protected-mirror subtraction (task 3041/4435), applied BEFORE
+    # orphan_ids/targeted_correction_ids/bucket_counts are computed, so all
+    # three stay consistent with the delete set actually taken.
+    #
+    # The predicate runs over the whole ENUMERATED population, not just the
+    # union, and the delete set is then narrowed by object identity. Since
+    # `orphans` is a subset of `members`, that removes exactly the same
+    # members from the delete set either way — what widens is only what gets
+    # REPORTED. That is deliberate: the finding this guard exists to surface
+    # is that the enumeration filter matched a record it must never delete
+    # (mem0_tombstone's "the enumeration filter is over-broad for this pool"),
+    # which is a property of the enumeration, not of whichever predicate
+    # happened to also catch it. A ledger_stamp that no automatic predicate
+    # catches is exactly the case a union-scoped count would hide until the
+    # night an operator's --delete-ids named it.
+    #
+    # This partition exists ALONGSIDE the choke-point guard inside
+    # delete_orphan_markers, not instead of it, because the two have different
+    # jobs. This one is REPORTING: a DRY RUN never reaches
+    # delete_orphan_markers at all, so it is the only thing that keeps
+    # `orphan_count`'s documented meaning ("the actual number of records
+    # deleted (or that would be deleted)") true in the mode an operator reads
+    # before deciding to --apply. The choke-point guard is ENFORCEMENT, and is
+    # inherited by every current and future caller of delete_orphan_markers,
+    # including ones that never consult this predicate. Called from here the
+    # choke-point guard therefore never fires; it stays as defence in depth
+    # and is pinned directly by its own tests.
+    protected = find_protected_markers(members)
+    if protected:
+        # The subtraction is never SILENT. Because it happens here, the
+        # choke-point guard's own per-member WARNING can no longer fire on
+        # this path, so this is the only journal output the event produces —
+        # and the systemd journal, not the JSON report, is where an operator
+        # greps after a nightly run has already scrolled past. The report key
+        # is not a substitute for it; `undated_kept_count` above sets the
+        # precedent that a "why do this run's numbers look like that"
+        # condition warrants BOTH.
+        #
+        # Aggregate rather than one-per-member (the shape the choke-point
+        # guard uses, mirroring ``_sweep_stale_mem0_pool``): this warning is
+        # enumeration-scoped like `undated_kept`'s directly above it, and
+        # says the same class of thing — a permanent floor under
+        # ``--check --max-backlog`` that draining cannot reach below.
+        rendered: list[str] = []
+        for member in protected:
+            metadata = _member_metadata(member)
+            rendered.append(
+                f"{member.get('id')}(kind={metadata.get('kind')!r} "
+                f"record_type={metadata.get('record_type')!r})"
+            )
+        logger.warning(
+            'sweep_orphan_flag_markers: %d of %d enumerated markers are '
+            'protected records that must never be deleted by a marker sweep '
+            'and are excluded from the delete set: %s. Reaching this means '
+            "this run's source enumeration matched a record belonging to "
+            'another pool (mem0_tombstone: the enumeration filter is '
+            'over-broad for this pool), so that filter — or the --delete-ids '
+            'that named one — should be tightened. These records also floor '
+            'the residual backlog permanently: no amount of draining removes '
+            'them, so a --check/--max-backlog gate set below that floor can '
+            'never pass (task 3041/4435).',
+            len(protected), len(members), ', '.join(rendered),
+            extra={'project_id': project_id},
+        )
+        protected_obj_ids = {id(m) for m in protected}  # builtin id(), not the key
+        orphans = [m for m in orphans if id(m) not in protected_obj_ids]
+
     orphan_ids = [o['id'] for o in orphans]
     # The found-intersection of args.delete_ids with the enumerated members
     # (not the raw input list) — order-preserving per `members`.
@@ -892,6 +1211,8 @@ async def run(
         'undated_kept_count': len(undated_kept),
         'bucket_counts': bucket_counts,
         'targeted_correction_ids': targeted_correction_ids,
+        'protected_skipped_count': len(protected),
+        'protected_skipped_ids': [m['id'] for m in protected],
         'cross_check': cross_check,
     }
 
@@ -901,6 +1222,19 @@ async def run(
         )
         report['deleted'] = delete_result['deleted']
         report['failed'] = delete_result['failed']
+        report['tombstoned'] = delete_result['tombstoned']
+        # What the CHOKE-POINT guard actually refused, as distinct from what
+        # the enumeration-scoped partition above skipped. Today it is always
+        # [] — the partition hands delete_orphan_markers a delete set the
+        # guard has nothing left to catch — and that identity is exactly what
+        # must not degrade silently: without this key, a future edit that
+        # reorders or drops the partition would make the guard fire, leave
+        # deleted + len(failed) < orphan_count, and put NOTHING in the report
+        # accounting for the difference (protected_skipped_ids reports the
+        # enumeration, not what was refused at the door). Reported under its
+        # own name rather than unioned into protected_skipped_ids so the two
+        # views stay distinguishable; the identity is pinned by a test.
+        report['enforced_protected_skipped'] = delete_result['protected_skipped']
 
         # After counts
         after_source = await memory_service.count_memories_by_metadata(
