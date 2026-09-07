@@ -231,6 +231,37 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # Raising any one of these constants requires re-checking the others — they
 # are mutually constrained, and ``test_tasks_budget.py`` enforces that.
 # None of them may be raised toward ``memory.mcp_tool_call``'s 10 s default.
+#
+# AFTER-STATE, measured 2026-09-07 (task 4884 step-20), same method as the
+# before-numbers above: caches cleared, then a cold ``GET
+# /api/v2/dashboard/tasks``, 10 repetitions, 9 configured roots, live
+# fused-memory. RAW NUMBERS, because this is the capacity baseline the next
+# change reads:
+#
+#   before (per-call 2.0, sequential, fixed order): 208 of 3045 active rows;
+#     dark-factory, reify AND autopilot-video all marked OFFLINE.
+#   after:  rows 295 / 1167 / 1562 / 1689 / 1776 / 2680 / 2806 / 2857 /
+#           2924 / 3043; wall 9.8–22.4 s; payload 0.9–14.3 MB.
+#
+# HONEST VERDICT, both halves. FAIRNESS (rotation) holds: the degraded/offline
+# set differed on every one of the 10 renders, against the journal's fixed
+# trailing pair (solar-challenge-platform, pump-web-ui) every render.
+# COMPLETENESS does NOT hold unconditionally: 3 of 10 renders came back fully
+# clean (0 offline, 0 degraded, 2806–3043 rows in 9.8–13.4 s), the other 7
+# degraded or offlined between one and six roots. So a cold render CAN now
+# serve every root inside the budget, but is not guaranteed to.
+#
+# Deliberately NOT closed by raising this constant. Doing so would buy the
+# clean render by making failure impossible, which is exactly what #4795
+# acceptance 3 forbids and what ``test_tasks_budget.py`` (c) blocks — and it
+# would spend the serialisation headroom the 14.3 MB payload measured above
+# actually needs. The residual is the un-projected ``SELECT *`` read (task
+# 4390); until that lands the honest markers are the answer, not a wider bound.
+#
+# CONFOUND, stated so the numbers are not over-read: these were taken with the
+# production dashboard also polling the SAME single fused-memory server every
+# 3 s, so they include real contention and are a pessimistic bound, not a
+# quiet-system best case.
 _TASKS_TOTAL_BUDGET = 20.0
 
 # How many project roots ``collect_tasks_with_counts`` may have in flight.
