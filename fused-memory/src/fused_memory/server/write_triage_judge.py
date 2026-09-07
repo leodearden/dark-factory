@@ -311,7 +311,37 @@ Reply with a bare JSON object and nothing else:
 """
 
 
-def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
+def _is_attach_target(candidate: MemoryResult, attach_target_id: str | None) -> bool:
+    """Is *candidate* the record the band's verdict will be filed against?
+
+    The SAME two-clause predicate :func:`select_judge_candidates`' rescue arm
+    uses, so the marker and the rescue can never disagree about which record
+    carries the evidence. The second clause is not defensive padding:
+    ``_canonical_id_of`` HOISTS a child winner to its parent id, so
+    ``decision.canonical_id`` routinely names a record that is not in the
+    slate at all, and a bare ``candidate.id == attach_target_id`` marker marks
+    NOTHING there — the silent version of the defect rather than a fix for it.
+
+    ``None`` marks nothing, and neither does an id naming no candidate: the
+    mark MATCHES against the slate rather than interpolating what it was
+    handed. That is what
+    ``scripts/check_write_triage_attach_target.py::_echoes_argument``
+    separates a real marker from a free-text parameter by.
+    """
+    if attach_target_id is None:
+        return False
+    return (
+        candidate.id == attach_target_id
+        or (candidate.metadata or {}).get(PARENT_ID_KEY) == attach_target_id
+    )
+
+
+def build_judge_prompt(
+    content: str,
+    candidates: list[MemoryResult],
+    *,
+    attach_target_id: str | None = None,
+) -> str:
     """Render the user-side prompt: the new entry, then the candidates.
 
     CONTENT ONLY. No metadata is interpolated — not the agent_id, not the
@@ -319,8 +349,25 @@ def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
     task context reaches the judge", and rendering no metadata at all is what
     makes it a structural property rather than an incidental one: there is no
     field list to keep in sync and no leak to notice later. Candidate ids ARE
-    rendered, because the model must be able to say which candidate it means —
-    they are opaque memory uuids, not context.
+    rendered, because they let the model tell the candidates apart AND
+    identify the one marked as the attach target — they are opaque memory
+    uuids, not context.
+
+    *attach_target_id* is the band's winner (``decision.canonical_id``). The
+    candidate satisfying :func:`_is_attach_target` gains an ``attach_target``
+    line naming its own id, wherever it sits in the slate; every other
+    candidate, and an id matching none of them, renders exactly as it would
+    with no target at all. Position is NOT a sound encoding of the target:
+    :func:`select_judge_candidates` rescues a hoisted parent's evidence child
+    by APPENDING it, so the target is LAST on that slate and first on a flat
+    one (measured in
+    ``plans/write-triage-attach-target-contradiction.md`` §2).
+
+    This closes item 1 of ``scripts/check_write_triage_flip_preconditions.sh``
+    via option (b) — the prompt names the attach target. Option (a), a verdict
+    that carries the candidate id it reasoned about, remains task 4798 item 7
+    and is NOT superseded by this: the gate accepts either remedy because what
+    it asserts is the invariant, not the mechanism.
 
     Every field is bounded by :data:`_FIELD_CHARS` and marked with
     :data:`_ELIDED_MARKER` when cut, so the call stays near C1's ~2.5k-token
@@ -337,6 +384,12 @@ def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
     ]
     for candidate in candidates:
         lines.append(f'- id: {candidate.id}')
+        if _is_attach_target(candidate, attach_target_id):
+            # Names the CANDIDATE's id, not the argument. A bare
+            # `attach_target: true` flag would leave no differing line
+            # mentioning any candidate id, which is precisely what the gate's
+            # `_swap_verdict` rejects.
+            lines.append(f'  attach_target: {candidate.id}')
         lines.append(f'  text: {_elide(candidate.content)}')
     if not candidates:
         lines.append('(none)')
@@ -354,6 +407,16 @@ def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
     lines.append(
         'Classify the relationship between NEW ENTRY and the candidates. '
         f'Answer with exactly one of: {", ".join(JUDGE_VERDICTS)}.',
+    )
+    # CONSTANT, and rendered unconditionally — it interpolates nothing. A
+    # sentence carrying `attach_target_id` would re-enter the echo path the
+    # gate's `_echoes_argument` control exists to catch, and one rendered only
+    # when a target matched would make the prompt differ for an id naming no
+    # candidate. Appearing identically in every rendering, it cannot perturb
+    # which candidate the swap test attributes a difference to.
+    lines.append(
+        'The candidate marked "attach_target" is the one this verdict will be '
+        'filed against; the others are context for the comparison.',
     )
     lines.append(
         'Reply with a bare JSON object and nothing else: '
