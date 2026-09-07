@@ -3350,9 +3350,16 @@ class TestSessionResumeConfig:
     SessionResumeConfig mirrors DeliveredChecksConfig's shape (an `enabled`
     kill-switch plus ge-bounded int knobs), is exposed on OrchestratorConfig
     under the literal field name `session_resume` (delivered-check contract),
-    and all five leaves are green-tier hot-reloadable via the
+    and all seven leaves are green-tier hot-reloadable via the
     `_submodel_leaf_paths('session_resume', SessionResumeConfig)` whole-submodel
     group in RELOADABLE_FIELDS.
+
+    THE COUNT IS LOAD-BEARING, so keep it honest. This docstring and
+    `test_leaves_in_reloadable_fields`'s both said FIVE while the body already
+    enumerated SIX — they went stale when task 3578 added
+    `restore_from_archive`, and task 3730 found them stale by one while adding
+    the seventh (`absolute_resume_age_secs`). A count that drifts is worse than
+    no count: it reads as a checked claim.
     """
 
     def test_defaults(self):
@@ -3368,6 +3375,12 @@ class TestSessionResumeConfig:
         # per-boot counter. 3600s is read off the measured signature — bursts
         # are ~17 fallbacks inside one hour, quiet gaps are ~7h and ~39h.
         assert cfg.storm_window_secs == 3600
+        # task 3730 (PRD leaf δ / D3): a DERIVED bound, not a chosen number.
+        # 432000s = 5 days is the 2026-09-07 requirement (355,803s = 4.12d)
+        # rounded up to the next whole day; the derivation and its provenance
+        # live in orchestrator/resume_age_bound.py and are re-checked every run
+        # by test_resume_age_bound.py's live guard.
+        assert cfg.absolute_resume_age_secs == 432000
 
     def test_storm_window_secs_ge_1_rejects_zero(self):
         """storm_window_secs < 1 must raise ValidationError (ge=1 bound)."""
@@ -3405,6 +3418,59 @@ class TestSessionResumeConfig:
         with pytest.raises(ValidationError):
             SessionResumeConfig(fallback_storm_threshold=-1)
 
+    def test_absolute_resume_age_secs_ge_1_rejects_zero(self):
+        """absolute_resume_age_secs < 1 must raise ValidationError (ge=1 bound).
+
+        Bounded like its siblings: a zero or negative backstop would reject
+        every recovered session outright, silently turning the whole
+        session-resume feature off through a knob that reads as a tuning dial.
+        """
+        from orchestrator.config import SessionResumeConfig
+
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(absolute_resume_age_secs=0)
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(absolute_resume_age_secs=-1)
+
+    def test_absolute_resume_age_secs_round_trips_from_yaml(self, tmp_path):
+        """The backstop is settable from dark-factory-orchestrator.yaml."""
+        cfg_path = tmp_path / 'orch.yaml'
+        cfg_path.write_text(
+            'session_resume:\n  absolute_resume_age_secs: 600000\n'
+        )
+        config = load_config(cfg_path)
+
+        assert config.session_resume.absolute_resume_age_secs == 600000
+        # The sibling leaves keep their defaults — a partial block must not
+        # reset the rest of the submodel.
+        assert config.session_resume.enabled is True
+        assert config.session_resume.freshness_window_secs == 86400
+
+    def test_absolute_bound_is_looser_than_the_freshness_window(self):
+        """The absolute backstop must sit ABOVE freshness, never below it.
+
+        The two knobs answer different questions and δ (task 3730 / D2+D3)
+        makes them independent: `freshness_window_secs` applies ONLY when no
+        durable archive exists, while `absolute_resume_age_secs` applies
+        unconditionally. If the absolute bound were the TIGHTER of the two it
+        would fire first on the no-archive path as well, and
+        `freshness_window_secs` would become dead config that an operator
+        could retune with no observable effect.
+
+        RELATIONAL on purpose: it tracks a retune of either knob rather than
+        pinning two numbers that can be changed independently into an
+        inconsistent pair.
+        """
+        from orchestrator.config import SessionResumeConfig
+
+        cfg = SessionResumeConfig()
+        assert cfg.absolute_resume_age_secs > cfg.freshness_window_secs, (
+            f'absolute_resume_age_secs ({cfg.absolute_resume_age_secs}s) must '
+            f'exceed freshness_window_secs ({cfg.freshness_window_secs}s), or '
+            'the backstop fires first on the no-archive path and the freshness '
+            'window becomes unreachable config'
+        )
+
     def test_exposed_on_orchestrator_config(self):
         """A default OrchestratorConfig exposes `.session_resume` as a
         SessionResumeConfig instance under the literal field name.
@@ -3417,13 +3483,24 @@ class TestSessionResumeConfig:
         assert config.session_resume.enabled is True
 
     def test_leaves_in_reloadable_fields(self):
-        """All five session_resume leaves are green-tier hot-reloadable
+        """All seven session_resume leaves are green-tier hot-reloadable
         (membership assertions, robust to future growth of RELOADABLE_FIELDS).
 
         `storm_window_secs` (task 3256) needed no RELOADABLE_FIELDS edit —
         `_submodel_leaf_paths` enumerates `model_fields` dynamically, which is
         exactly the property its docstring advertises. This assertion is what
-        pins that the property actually held.
+        pins that the property actually held, and it has now held three times:
+        `restore_from_archive` (task 3578) and `absolute_resume_age_secs`
+        (task 3730) both joined the green tier with no RELOADABLE_FIELDS edit
+        either.
+
+        `absolute_resume_age_secs` is asserted on its EXACT dotted name because
+        that is task 3730's delivered-check contract: the backstop must be
+        hot-appliable via reload_config with no restart, so an operator who has
+        to widen it after a long outage does not have to bounce the fleet.
+
+        (This docstring said FIVE while the list below held six until task 3730
+        corrected it — see the class docstring.)
         """
         for leaf in (
             'session_resume.enabled',
@@ -3432,6 +3509,7 @@ class TestSessionResumeConfig:
             'session_resume.fallback_storm_threshold',
             'session_resume.storm_window_secs',
             'session_resume.restore_from_archive',
+            'session_resume.absolute_resume_age_secs',
         ):
             assert leaf in RELOADABLE_FIELDS, (
                 f'{leaf} must be a member of RELOADABLE_FIELDS '
