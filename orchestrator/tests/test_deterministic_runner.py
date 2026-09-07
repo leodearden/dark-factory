@@ -4370,6 +4370,54 @@ class TestInspectUnitTimeoutHardening:
             'the verify-leg inspect is ever invoked'
         )
 
+    async def test_spawn_failure_baseline_inspect_blocks_without_running_deploy(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector SPAWN failure must fail closed exactly like
+        a wedged inspect — end-to-end through the REAL (non-injected) inspector.
+
+        ``unit_inspector`` is deliberately left unset so
+        ``_default_inspect_unit`` -> ``systemd_inspect.inspect_systemd_unit``
+        executes for real; that is what proves the source-level guard reaches
+        production rather than only the constructor seam that the
+        runner-level tests inject through. RED today: the raw ``OSError``
+        propagates straight out of ``run()``, so the task-2091 ActiveState
+        gate never fires and the operator never sees the infra_issue.
+        """
+        import errno
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4157', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            script_runner=script_runner,
+        )
+
+        with patch(
+            'asyncio.create_subprocess_exec',
+            AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files')),
+        ):
+            # Hang tripwire: fail loudly rather than stalling the suite.
+            outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4157', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        # The deploy must NOT be attempted on an untrusted baseline
+        # (before_done_ran_at is already stamped; I1 once-only).
+        script_runner.assert_not_called()
+
     async def test_baseline_inspect_fail_advances_deploy_state_phase_ran_to_escalated(
         self, tmp_path: Path,
     ):

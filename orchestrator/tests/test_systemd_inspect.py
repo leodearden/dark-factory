@@ -10,6 +10,7 @@ DeterministicRunner and harness delegate to it.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -98,6 +99,92 @@ class TestInspectSystemdUnit:
 
         assert result['MainPID'] == 0
         assert isinstance(result['MainPID'], int)
+
+    @pytest.mark.asyncio
+    async def test_spawn_filenotfound_returns_mainpid_zero_sentinel(self, caplog) -> None:
+        """Task 4157: a MISSING ``systemctl`` binary must degrade to the SAME
+        MainPID=0 sentinel the timeout branch returns, not raise.
+
+        ``asyncio.create_subprocess_exec`` sits OUTSIDE the ``try`` that
+        guards ``communicate()``, so today a spawn failure escapes raw — past
+        ``DeterministicRunner.run()``'s documented "always returns BLOCKED,
+        never a raw exception" contract, and past the crash-window /
+        baseline-gate escalations the operator is supposed to see.
+        """
+        with (
+            patch(
+                'asyncio.create_subprocess_exec',
+                AsyncMock(side_effect=FileNotFoundError(
+                    2, 'No such file or directory', 'systemctl',
+                )),
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.systemd_inspect'),
+        ):
+            result = await inspect_systemd_unit(
+                'orchestrator-reify.service', timeout_secs=5.0,
+            )
+
+        assert result == {
+            'MainPID': 0,
+            'ActiveState': '',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        assert 'orchestrator-reify.service' in caplog.text
+        assert 'MainPID=0 sentinel' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_spawn_emfile_returns_mainpid_zero_sentinel(self, caplog) -> None:
+        """Task 4157: the second spawn-failure mode — a fork failure under
+        resource pressure (fd exhaustion) — must degrade identically.
+
+        EMFILE is the pointed case because it fails the spawn from a
+        system-wide root cause that has nothing to do with the unit being
+        inspected, so raising here would convert a transient host condition
+        into a raw exception escaping an async workflow slot.
+        """
+        with (
+            patch(
+                'asyncio.create_subprocess_exec',
+                AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files')),
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.systemd_inspect'),
+        ):
+            result = await inspect_systemd_unit(
+                'fused-memory.service', timeout_secs=5.0,
+            )
+
+        assert result == {
+            'MainPID': 0,
+            'ActiveState': '',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        assert 'fused-memory.service' in caplog.text
+        assert 'MainPID=0 sentinel' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_non_oserror_spawn_failure_still_propagates(self) -> None:
+        """Pins the NARROWNESS of the spawn guard: ``except OSError`` only.
+
+        Widening to a bare ``except Exception`` — a very natural refactor for
+        a function documented as sentinel-safe — would swallow programmer
+        errors and ``NotImplementedError`` (an event loop with no subprocess
+        support), returning a sentinel that LIES about the unit's state
+        instead of failing loudly. Mirrors the established
+        ``_raise_emfile_spawn`` / ``_raise_runtime_error`` pairing in
+        ``tests/test_remove_merge_worktree_guarded.py``.
+        """
+        with (
+            patch(
+                'asyncio.create_subprocess_exec',
+                AsyncMock(side_effect=RuntimeError('not an OSError — must stay loud')),
+            ),
+            pytest.raises(RuntimeError, match='must stay loud'),
+        ):
+            await inspect_systemd_unit(
+                'orchestrator-reify.service', timeout_secs=5.0,
+            )
 
 
 class TestEmptyBaselineFresh:
