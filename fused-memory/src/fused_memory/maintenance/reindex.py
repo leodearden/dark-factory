@@ -115,6 +115,20 @@ class ReindexManager:
                 failed drop propagates — with the partial list logged at ERROR —
                 rather than being reported as a clean run.
 
+                As of task 4777 the drop also WAITS for the FalkorDB index
+                catalog to settle before reading it, so re-running this
+                entrypoint after a failed or interrupted run is safe rather than
+                liable to a spurious ``Unable to drop index on
+                :Entity(name_embedding): no such index.``  Dropping a VECTOR
+                property from a label whose index carries other surviving fields
+                makes FalkorDB build a REPLACEMENT index, and a catalog read
+                taken during that build can still return the stale pre-drop row
+                — which is what a rapid re-run used to act on.  A catalog that
+                never settles now raises ``IndexCatalogUnsettledError`` instead
+                of dropping against an undetermined index state: fail closed, so
+                the operator gets a named failure rather than a partial rebuild
+                reported as clean.
+
         Returns:
             Dict with reindex_result (ReindexResult), replay_count (int), and
             indices_dropped (list of {label, field} dicts).
