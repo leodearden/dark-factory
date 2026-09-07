@@ -2322,6 +2322,112 @@ def test_main_speculation_flag_adds_the_section_and_the_by_project_spread(
     assert '10/22' not in tail
 
 
+# ---------------------------------------------------------------------------
+# Both output surfaces must carry the new rates.
+#
+# The user-observable signal for the speculation diagnosis is a command whose
+# PRINTED output reproduces the report's headline. A measure that exists only
+# in `--json` (or only in a function's return value) does not satisfy that, so
+# the text report and the JSON payload are pinned together here.
+# ---------------------------------------------------------------------------
+
+
+def test_main_speculation_block_prints_the_strict_ahead_share_distinctly(
+    capsys, corpus_roots
+):
+    root_a, _ = corpus_roots
+    _, out, _ = _run(capsys, *_both(corpus_roots), '--speculation')
+    block = _project_blocks(out)[str(root_a.resolve())]
+    # Root A: 13 landings, 3 with speculation ahead, none voided in between —
+    # so the two measures agree numerically and only the LABEL separates them.
+    # That is exactly the case where mistakable wording would go unnoticed.
+    assert 'landed with speculation ahead: 3/13 (0.231)' in block
+    assert (
+        'landed with speculation ahead and NOT voided first (strict): '
+        '3/13 (0.231)'
+    ) in block
+
+
+def test_main_speculation_block_prints_the_void_anatomy_and_fan_out(
+    capsys, corpus_roots
+):
+    root_a, root_b = corpus_roots
+    _, out, _ = _run(capsys, *_both(corpus_roots), '--speculation')
+    blocks = _project_blocks(out)
+    # A void rate on its own invites the reading "that much verify capacity
+    # burned". The split has to be on the same screen as the rate, or the
+    # misreading is the default one.
+    assert (
+        'void anatomy: 3 pre-verify (build discarded before host '
+        'acquisition), 0 verify-burned'
+    ) in blocks[str(root_a.resolve())]
+    assert (
+        'void anatomy: 7 pre-verify (build discarded before host '
+        'acquisition), 0 verify-burned'
+    ) in blocks[str(root_b.resolve())]
+    assert (
+        'dead_link fan-out: 3 distinct dead base(s), max 1 void(s) from one, '
+        '0 with no dead_link'
+    ) in blocks[str(root_a.resolve())]
+
+
+def test_main_cross_project_block_prints_both_shares_and_the_pre_verify_count(
+    capsys, corpus_roots
+):
+    root_a, root_b = corpus_roots
+    code, out, _ = _run(capsys, *_both(corpus_roots), '--speculation')
+    assert code == 0
+    tail = out[out.index(mlt.VOID_RATE_BY_PROJECT_TITLE):]
+    # The existing per-root rate line is unchanged...
+    assert f'{root_a.resolve()}: 3/10 = 0.300' in tail
+    assert f'{root_b.resolve()}: 7/12 = 0.583' in tail
+    # ...and each root now carries its own two shares and its own waste split,
+    # so this one block reproduces the whole two-project headline.
+    assert (
+        'ahead 3/13 (0.231) loose, 3/13 (0.231) strict; '
+        '3 pre-verify void(s), 0 verify-burned'
+    ) in tail
+    assert (
+        'ahead 5/6 (0.833) loose, 1/6 (0.167) strict; '
+        '7 pre-verify void(s), 0 verify-burned'
+    ) in tail
+
+
+def test_main_json_carries_the_new_keys_on_both_surfaces(capsys, corpus_roots):
+    root_a, root_b = corpus_roots
+    _, raw, _ = _run(capsys, *_both(corpus_roots), '--speculation', '--json')
+    payload = json.loads(raw)
+    spec_b = payload['projects'][str(root_b)]['sections']['speculation']
+    assert spec_b['speculative_ahead_adopted'] == {
+        'matched': 1, 'total': 6, 'share': pytest.approx(1 / 6),
+    }
+    assert spec_b['void_anatomy']['pre_verify'] == 7
+    assert spec_b['void_anatomy']['verify_burned'] == 0
+    by_project = payload['void_rate_by_project']
+    assert by_project[str(root_a)]['speculative_ahead_adopted']['matched'] == 3
+    assert by_project[str(root_b)]['void_anatomy']['dead_link_distinct'] == 7
+
+
+def test_main_without_the_flag_prints_no_block_and_empties_the_mapping(
+    capsys, corpus_roots
+):
+    # NB the test name deliberately avoids the word this asserts is absent:
+    # pytest derives tmp_path from the test name and the report prints that
+    # path, so a name containing it would make the absence check unfalsifiable.
+    _, out, _ = _run(capsys, *_both(corpus_roots))
+    assert mlt.SECTION_TITLES['speculation'] not in out
+    assert 'void anatomy' not in out
+    assert 'dead_link fan-out' not in out
+    # '(strict)' with its parentheses, not the bare word: the lead-time
+    # section legitimately says "strictly before them" on every run.
+    assert '(strict)' not in out
+    _, raw, _ = _run(capsys, *_both(corpus_roots), '--json')
+    payload = json.loads(raw)
+    # The schema contract: the key is always present and always empty without
+    # the flag — never a section of zeros.
+    assert payload['void_rate_by_project'] == {}
+
+
 def test_main_every_section_header_carries_the_resolved_window(capsys, corpus_roots):
     _, out, _ = _run(capsys, *_both(corpus_roots), '--chains', '--speculation')
     headers = [ln for ln in out.splitlines() if ln.startswith(mlt.SECTION_PREFIX)]
