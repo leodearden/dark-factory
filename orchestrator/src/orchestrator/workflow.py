@@ -9051,10 +9051,18 @@ class TaskWorkflow:
         that returns ``None`` (no equivalent) does the step escalate. This tier
         keeps the same best-effort/fail-safe and zero-persisted-state posture:
         it is re-derived from live git every pass, and a false negative reverts
-        to exactly the pre-2762 escalation baseline. The WIP heuristic stays
-        FIRST because in Scenario A the step's diff is folded into a larger WIP
-        diff with a different patch-id and no standalone equivalent, so the
-        filename-subset signal is the only correct one there.
+        to exactly the pre-2762 escalation baseline.
+
+        **Tier ordering (task 3651)**: this remap tier now runs FIRST, ahead
+        of the filename-subset WIP heuristic. The original 2762 rationale for
+        keeping the heuristic in front — that in Scenario A the step's diff is
+        folded into a larger WIP diff with a different patch-id and no
+        standalone equivalent — is TRUE, but the conclusion does not follow:
+        precisely BECAUSE this tier cannot match a genuine squash,
+        :meth:`GitOps.find_equivalent_commit` returns ``None`` there and the
+        heuristic still fires unchanged on the next line. Ordering is therefore
+        free in Scenario A, and strictly better whenever several steps are
+        orphaned in one pass — see the fallback-tier paragraph below.
 
         **Cross-restart durability (task 2764)**: the per-``(step_id,
         stale_commit)`` dedup set is in-memory and process-local, so an
@@ -9072,13 +9080,27 @@ class TaskWorkflow:
         the ``if remapped: continue`` early-out), so hydration suppresses
         precisely the re-files it should and nothing more.
 
-        **Heuristic, not a content diff**: the match above is a
-        *filename-set* subset check only — it never compares file contents
-        or blob shas. A WIP commit that happens to touch a superset of the
-        orphaned step's filenames but with unrelated content would still
-        count as a match and get silently re-pointed. This is accepted
-        given the best-effort posture (the fallback on any doubt is an
-        escalation, never silence) — :meth:`GitOps.branch_content_in_main`
+        **Heuristic, not a content diff — and the FALLBACK tier (task
+        3651)**: the WIP match is a *filename-set* subset check only — it
+        never compares file contents or blob shas. A WIP commit that happens
+        to touch a superset of the orphaned step's filenames but with
+        unrelated content would still count as a match and get silently
+        re-pointed. Worse, the test is outright DEGENERATE when several done
+        steps touch the same file(s): every one of them satisfies
+        ``set(orphaned_files) <= wip_files``, so running it first stamped the
+        single ``wip_tip_sha`` onto ALL of them and destroyed per-step
+        provenance (observed on reify task 5665 — four commits all touching
+        one file, steps 3/5/7 all recording the same sha — and on tasks 4050
+        and 4154). That is precisely why
+        :meth:`GitOps.find_equivalent_commit` now runs first: it resolves each
+        orphan to its OWN replayed sha when one exists, and this
+        filename-subset test is reached only when no precise equivalent does.
+        Demoting it rather than deleting it is deliberate — it is the only
+        tier that can resolve a genuine squash, where the step's content
+        lives inside a larger WIP diff with no standalone equivalent. Its
+        residual looseness stays acceptable given the best-effort posture
+        (the fallback on any doubt is an escalation, never silence) —
+        :meth:`GitOps.branch_content_in_main`
         shows the byte-level ``git diff --quiet`` pattern this could
         upgrade to if the filename heuristic ever proves too loose in
         practice.
@@ -9138,31 +9160,39 @@ class TaskWorkflow:
                 commit = item['commit']
                 if await self.git_ops.is_ancestor(commit, head):
                     continue  # still reachable — nothing to reconcile
+                # TIER 1 (precise, task 2762 — promoted ahead of the WIP
+                # heuristic by task 3651): remap the orphaned commit to its
+                # rebase-replayed sha on the live branch.
+                # find_equivalent_commit locates a patch-id-equivalent (or, on
+                # a diff-altering rebase that kept the message, a uniquely
+                # subject-matching) commit in base..HEAD and returns its sha.
+                # It is fully fail-safe (None on any git error, an
+                # unresolvable/GC'd commit, ambiguity, or no equivalent), so a
+                # miss simply falls through to the tiers below — zero persisted
+                # state, re-derived from live git each pass. Running it first
+                # is what stops N orphans that share a filename from all
+                # collapsing onto the one WIP tip (see the docstring's
+                # fallback-tier paragraph).
+                remapped = await self.git_ops.find_equivalent_commit(
+                    self.worktree, base, commit,
+                )
+                if remapped:
+                    self.artifacts.update_step_status(item['id'], 'done', remapped)
+                    continue
+                # TIER 2 (coarse fallback): the filename-subset WIP heuristic.
+                # Reached only when tier 1 found no precise equivalent — which
+                # is exactly the genuine-squash case (Scenario A), where the
+                # step's diff is folded into a larger WIP diff carrying a
+                # different patch-id and a WIP subject, so no standalone
+                # equivalent exists and this is the only signal available.
+                # orphaned_files is computed lazily HERE rather than before the
+                # dispatch: the subset test is its only consumer (the
+                # escalation below never reads it), so a tier-1 hit no longer
+                # pays for a `git show --name-only` it would discard.
                 orphaned_files = await self.git_ops.get_commit_changed_files(commit)
                 if orphaned_files and wip_tip_sha and set(orphaned_files) <= wip_files:
                     self.artifacts.update_step_status(item['id'], 'done', wip_tip_sha)
                 else:
-                    # No WIP-filename match. Before escalating, try to remap the
-                    # orphaned commit to its rebase-replayed sha on the live
-                    # branch. This is the clean-replay case (Scenario B): a
-                    # requeue/inter-iteration rebase that preserves individual
-                    # commits rather than squashing them into a WIP
-                    # safety-commit leaves NO WIP run at HEAD, so wip_tip_sha is
-                    # None and the filename heuristic above never fires.
-                    # find_equivalent_commit locates a patch-id-equivalent (or,
-                    # on a diff-altering rebase that kept the message, a
-                    # uniquely subject-matching) commit in base..HEAD and
-                    # returns its sha. It is fully fail-safe (None on any git
-                    # error, an unresolvable/GC'd commit, ambiguity, or no
-                    # equivalent), so a false negative simply falls through to
-                    # the unchanged escalation path below — zero persisted
-                    # state, re-derived from live git each pass.
-                    remapped = await self.git_ops.find_equivalent_commit(
-                        self.worktree, base, commit,
-                    )
-                    if remapped:
-                        self.artifacts.update_step_status(item['id'], 'done', remapped)
-                        continue
                     # Mismatch, unresolvable original (empty file set — e.g.
                     # GC'd), no WIP run at HEAD, and no live-branch equivalent:
                     # cannot safely auto-reconcile. Flag for review and leave
