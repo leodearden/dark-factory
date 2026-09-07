@@ -480,16 +480,27 @@ requirement for a working install — skip this section unless you need it.
 
 - **The project checkout**, at a fixed path (e.g. `~/src/<project>`), kept in
   sync with the dispatching workstation's `main` (see "Provisioning the
-  remote host" below for how it gets refreshed). It is a full clone that the
-  remote runs commands directly against, not a worktree.
+  remote host" below for how it gets refreshed). It is an independent full
+  clone, not a linked worktree of the dispatcher. Verify itself does not run
+  directly in this clone — each `verify-merge` materialises a worktree under
+  it (`GitOps.acquire_host_verify_worktree`), a fresh `_merge-<uuid>` per
+  invocation or a reused warm one; see "Warm vs. ephemeral verify
+  worktrees" below.
 - **`receive.denyCurrentBranch = updateInstead`**, set on that checkout
   (`git config receive.denyCurrentBranch updateInstead`). This is required
   because the dispatcher's best-effort keep-alive push targets
-  `<main-branch>:refs/heads/<main-branch>` — the configured
-  `git.main_branch` (threaded into `RemoteRunner` as `main_branch`, and
-  skipped entirely when that setting is unset) — which is the branch the
+  `<main-branch>:refs/heads/<main-branch>` — the configured `git.main_branch`
+  (`str`, default `main` — it has no unset state) — which is the branch the
   remote checkout has checked out, and git refuses to accept a push to a
-  checked-out branch by default. `updateInstead` tells git to update the
+  checked-out branch by default. The `RemoteRunner(main_branch=...)`
+  argument is always populated from `git.main_branch` in production —
+  `merge_queue.py::_build_verify_runners` is the sole production site that
+  constructs a `RemoteRunner`, and it always passes
+  `main_branch=config.git.main_branch` — so this push, and therefore the
+  `updateInstead` requirement, is not optional. `RemoteRunner`'s
+  `if self._main_branch:` skip exists only for direct construction with
+  `main_branch=None` (tests), which a config-driven dispatch never does.
+  `updateInstead` tells git to update the
   working tree in place instead of rejecting the push. When that push is
   rejected (typically a non-fast-forward — the remote's own `main` moved),
   the dispatcher retries **once** with a **force** refspec
@@ -746,14 +757,31 @@ throughput-and-paging basis rather than a corruption one.
    feature it tunes is not yet in use.
 
    The forward-looking reason is what makes `false` the right setting to
-   *keep*. Once task D1 registers the laptop runner, `K` becomes `2`, and
-   two dark_factory verifies can reach that one host concurrently. With
-   the knob on, that ordinary concurrency converts into `flock_contention`
-   results — each one a born-at-L2 escalation and a blocked merge. The PRD
-   assigned the remedy for that (host-level arbitration) to task C, which
-   is **cancelled**, so the fix that would make the knob safe at `K=2` has
-   not landed. Enabling it in the same change that registers the runner
-   would arm a paging hazard with no remedy behind it.
+   *keep* — but not the mechanism this leg used to name. Once task D1
+   registers the laptop runner, `K` becomes `2` — yet `HostAllocator` is
+   documented and implemented as **one slot per host**
+   (`self._slots[name] = _SLOT_FREE`; `acquire_remote` requires
+   `_SLOT_FREE`), and both the merge worker and the drift detective
+   (`merge_drift.py`'s `acquire_local`/`acquire_remote`) dispatch through
+   that same worker-lifetime allocator instance. So at `K=2`, ordinary
+   allocator-mediated concurrency cannot by itself put two dark_factory
+   verifies on the laptop together — a runtime "by construction"
+   guarantee, parallel to the config-time one point 1 above establishes
+   for the startup guard. `plans/merge-lane-throughput-prd.md`
+   §"RULED 2026-09-03" retracts the arithmetic this leg used to lean on
+   ("the decompose session's estimate of '1–3 blocked merges and L2 pages
+   per day' without arbitration... was arithmetic on the false premise")
+   and names `FLOCK_CONTENTION_CATEGORY` a **within-project orphan
+   detector**, never a co-tenancy one — the
+   realistic trigger is an orphaned lane lock (a stuck or crashed holder;
+   `plans/laptop-warm-verify-flock-orphan-prd.md`, tasks 2306/2307) or a
+   dispatch that bypasses the allocator (a manual `ssh host orchestrator
+   verify-merge ...`), not two allocator-granted verifies sharing a host.
+   That same ruling is why task C (5052), the proposed host-level
+   arbitration, is **cancelled** — but a `flock_contention` event's actual
+   cost, a born-at-L2 escalation and a blocked merge (below), still has no
+   landed remedy, which is why `false` stays the setting to keep, on this
+   narrower and verified basis.
 2. **With the knob off**, `cli.py` is explicit — "Knob OFF -> lane_fd/
    compat_fd stay None -> byte-identical back-compat (no lock)" —
    concurrent verifies simply get disjoint ephemeral worktrees, no
@@ -836,13 +864,18 @@ Four operator-facing facts:
   that bumps `package-lock.json` (a new pinned `npx pyright`, say) leaves
   the remote's Node-installed tools stale even with the automatic sync
   enabled; `npm ci` stays a manual concern in "Provisioning the remote
-  host" above either way. Two more things the automation does silently:
+  host" above either way. Three more things the automation does silently:
   it asserts a post-sync liveness probe (`REMOTE_LIVENESS_CMD`) and
   **benches the runner** if that fails rather than leaving it looking
-  synced, and it compares the remote's head against the dispatcher's
+  synced; it compares the remote's head against the dispatcher's
   `@{upstream}` before declaring the runner stale, so a dispatcher that is
   merely ahead of a healthy, origin-current remote doesn't trigger a false
-  `runner_stale` alert.
+  `runner_stale` alert; and it refuses to pull while a verify is in flight
+  on that runner — serialised on a per-runner lock, `sync_if_stale` returns
+  `skipped: verify in flight` without pulling or benching, and re-checks on
+  the next dispatch — so opting in does not re-introduce the
+  pull-under-live-verify hazard "What lives on the remote host" above warns
+  a manual refresh must avoid by hand.
 
 For the environment-parity checklist between a workstation and a laptop
 verify host, and day-2 operational notes for a live laptop runner, see
