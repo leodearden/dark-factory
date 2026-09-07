@@ -809,7 +809,28 @@ _NESTED_HEARTBEAT = f'{synthetic_unit("nested")}.json'
 # assertions: the before-snapshot tests turn on which of the two is named.
 _PREEXISTING_HEARTBEAT = f'{synthetic_unit("preexisting")}.json'
 
-_NESTED_CONFTEST = f'''\
+def _nested_conftest_source(*, preexisting: bool) -> str:
+    """Source for the nested conftest, parameterised by the seed.
+
+    A FUNCTION rather than a second near-copy of the template: the seeding
+    variant differs from the plain one by four lines, and two templates
+    drifting apart is how the nested harness would quietly stop testing what
+    its name claims.
+
+    When *preexisting*, a synthetic heartbeat is written at conftest IMPORT
+    time -- immediately after the fleet dir is created and therefore strictly
+    BEFORE the session-scoped guard's ``before = set(...)`` snapshot runs.
+    That ordering is the whole point of the seam: it is the only way to put a
+    file in the guard's inherited set.
+    """
+    seed = (
+        f"""
+(df_pytest_isolation.LIVE_FLEET_DIR / {_PREEXISTING_HEARTBEAT!r}).write_text("{{}}")
+"""
+        if preexisting
+        else ''
+    )
+    return f"""\
 import sys
 from pathlib import Path
 
@@ -822,9 +843,10 @@ import df_pytest_isolation
 # real machine-global fleet directory.
 df_pytest_isolation.LIVE_FLEET_DIR = Path(__file__).resolve().parent / 'fleet'
 df_pytest_isolation.LIVE_FLEET_DIR.mkdir(parents=True, exist_ok=True)
-
+{seed}
 from df_pytest_isolation import {_GUARD_NAME}  # noqa: F401
-'''
+"""
+
 
 
 def _nested_test_source(*, leaks: bool) -> str:
@@ -847,13 +869,27 @@ def _nested_test_source(*, leaks: bool) -> str:
     )
 
 
-def _nested_run(tmp_path: Path, *, leaks: bool) -> subprocess.CompletedProcess[str]:
-    """Run a throwaway pytest session wired to the guard, in its own tmp tree."""
-    root = tmp_path / ('leaking' if leaks else 'clean')
+def _nested_run(
+    tmp_path: Path, *, leaks: bool, preexisting: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a throwaway pytest session wired to the guard, in its own tmp tree.
+
+    *leaks* writes a synthetic heartbeat DURING the nested test; *preexisting*
+    seeds one from the nested conftest at import time, i.e. before the guard's
+    before-snapshot. They are independent, so all four combinations are
+    reachable. ``preexisting=False`` is the default, which keeps the two
+    original call sites byte-identical in behaviour.
+    """
+    # Unique per variant, so the (up to) four trees cannot collide under one
+    # tmp_path when a single test drives more than one.
+    root = tmp_path / (
+        f"{'leaking' if leaks else 'clean'}"
+        f"{'-seeded' if preexisting else ''}"
+    )
     root.mkdir()
     shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
     (root / 'pytest.ini').write_text(_NESTED_INI)
-    (root / 'conftest.py').write_text(_NESTED_CONFTEST)
+    (root / 'conftest.py').write_text(_nested_conftest_source(preexisting=preexisting))
     (root / 'test_forgetful.py').write_text(_nested_test_source(leaks=leaks))
     return subprocess.run(
         [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
