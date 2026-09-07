@@ -149,6 +149,34 @@ class TestParseJudgeVerdict:
         """The happy path: exactly what `response_format=json_object` returns."""
         assert parse_judge_verdict(_payload(word)) == outcome
 
+    @pytest.mark.parametrize(
+        ('word', 'outcome'),
+        [
+            ('Restates', OUTCOME_RESTATED),
+            (' restates ', OUTCOME_RESTATED),
+            ('RESTATES', OUTCOME_RESTATED),
+            ('\nAmends\n', OUTCOME_AMENDED),
+            ('  Contests', OUTCOME_CONTESTED),
+            ('Distinct\t', OUTCOME_STORED),
+        ],
+        ids=['title-case', 'padded', 'upper', 'newline-wrapped',
+             'leading-space', 'trailing-tab'],
+    )
+    def test_case_and_whitespace_are_normalised(
+        self, word: str, outcome: str,
+    ) -> None:
+        """`.strip().lower()` is load-bearing, and nothing else pinned it.
+
+        Every other case in this class is already bare lowercase, so deleting
+        the normalisation left the whole suite green while turning a model
+        that answered `"Restates"` — an entirely reasonable thing for an LLM
+        to emit through a JSON schema that does not enumerate the casing —
+        into a `JudgeOutputError` on EVERY middle-band write. That is a
+        counted fail-open per write, which surfaces as a storm escalation
+        describing an outage that is not happening.
+        """
+        assert parse_judge_verdict(_payload(word)) == outcome
+
     def test_a_fenced_json_block_parses(self) -> None:
         """A model that ignores the JSON mode and fences its answer still parses."""
         raw = f'```json\n{_payload("amends")}\n```'
