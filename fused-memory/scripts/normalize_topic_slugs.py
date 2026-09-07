@@ -60,13 +60,36 @@ from fused_memory.utils.store_mutation_preflight import (
 # defined locally.  This script is loaded by path via ``importlib`` and cannot
 # be imported from, so its ``__all__`` grants the shared rule no second home.
 __all__ = [
+    'ERROR_OUTCOMES',
     'Rename',
+    'SKIP_BUCKETS',
     'StoreMutationUnavailable',
     'assert_store_mutation_allowed',
     'derive_topic_slug',
     'is_valid_topic_slug',
     'plan_renames',
 ]
+
+
+#: Outcomes that mean the corpus did not get what the plan intended.  Named
+#: once, here, so :func:`resolve_exit_code` and the report agree on what
+#: "clean" means instead of each keeping its own list.
+ERROR_OUTCOMES: frozenset[str] = frozenset({
+    'slug_collision',
+    'canonical_collision',
+})
+
+#: Every bucket the report carries, PRE-SEEDED TO EMPTY.  Seeding is the
+#: point: an absent bucket reads as "nothing was skipped", which is a
+#: different claim from "we looked and found nothing".  A hole in coverage
+#: that never reaches the artifact is a hole nobody closes.
+SKIP_BUCKETS: tuple[str, ...] = (
+    # from plan_renames
+    'topic_unfoldable',
+    'record_without_id',
+    'slug_collision',
+    'canonical_collision',
+)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +154,10 @@ def plan_renames(records, *, project_id: str) -> tuple[list[Rename], list[dict]]
       carries the RAW value and never a guessed slug: an operator resolving
       it by hand needs to see what is actually on the record, and the reason
       it is here at all is that this script refused to name a replacement.
+    * **refused, per SLUG** — the fold lands on an occupied slug
+      (``slug_collision``), possibly severely (``canonical_collision``).  See
+      the guard below; the refusal covers every record carrying that legacy
+      value, and is filed once for the slug rather than once per record.
 
     Output is sorted by ``(project_id, new_topic, memory_id)`` — and the skips
     correspondingly — because scroll order is not stable, and two rehearsals
@@ -148,6 +175,55 @@ def plan_renames(records, *, project_id: str) -> tuple[list[Rename], list[dict]]
     renames: list[Rename] = []
     skips: list[dict] = []
 
+    # --- pass 1: what does the corpus already look like? -------------------
+    # Built BEFORE any verdict, from the whole record set, so no decision can
+    # depend on the order the backend happened to page records back in.
+    #
+    #   observed_topics       every topic value present, conforming or not
+    #   canonical_ids_by_topic  which records under a topic claim canonical
+    #   sources_by_target     which legacy values want to fold onto a target
+    observed_topics: set[str] = set()
+    canonical_ids_by_topic: dict[str, list[str]] = {}
+    sources_by_target: dict[str, set[str]] = {}
+    for record in records:
+        metadata = record.get('metadata') or {}
+        topic = metadata.get('topic')
+        if not isinstance(topic, str):
+            continue
+        observed_topics.add(topic)
+        # ``is True``, not truthiness: metadata comes off a live store and is
+        # not schema-enforced at this seam, so ``canonical: 'false'`` — a
+        # non-empty string — would otherwise read as a canonical claim and
+        # escalate a mild refusal into the severe bucket.
+        if metadata.get('canonical') is True:
+            memory_id = record.get('id')
+            if isinstance(memory_id, str) and memory_id:
+                canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
+        if not is_valid_topic_slug(topic):
+            folded = derive_topic_slug(topic)
+            if folded is not None:
+                sources_by_target.setdefault(folded, set()).add(topic)
+
+    # --- pass 2: classify, then emit --------------------------------------
+    # WHY REFUSE RATHER THAN MERGE.  Folding ``foo_bar`` onto ``foo-bar`` when
+    # something already carries ``foo-bar`` is not a normalization: it merges
+    # two topic namespaces, changing cluster membership for records this sweep
+    # never examined.  When both sides hold a ``canonical: true`` it is worse
+    # than that — ``topic`` is what SCOPES canonical uniqueness
+    # (``memory_service._check_canonical_uniqueness`` probes
+    # ``{'topic': T, 'canonical': True}``), so the merged cluster holds exactly
+    # the second canonical that invariant exists to prevent.  Under the shipped
+    # ``memory_metadata.enforce = false`` that seam WARN-fails open, so it would
+    # land silently with this script as its author.
+    #
+    # WHY THE SERVICE-SIDE PROBE CANNOT SUBSTITUTE FOR THIS ONE.  The seam
+    # adjudicates a SINGLE write against live state, one at a time.  It would
+    # let the first member of a colliding group through and refuse only the
+    # second — leaving the corpus in a state determined by iteration order, and
+    # half-merged.  Deciding here, against the whole record set, makes the
+    # verdict a property of the CORPUS instead.  Same posture, same reason, as
+    # ``retro_stamp_topics.stamp_one``'s ``stray_canonical_on_member``.
+    collisions: dict[str, dict] = {}
     for record in records:
         metadata = record.get('metadata') or {}
         if 'topic' not in metadata:
@@ -175,6 +251,55 @@ def plan_renames(records, *, project_id: str) -> tuple[list[Rename], list[dict]]
             })
             continue
 
+        # Occupied by a record that already carries the target value, or
+        # contested by a SECOND legacy value folding onto the same target.
+        # The second case is refused for BOTH sources: letting one through
+        # would make the outcome depend on scroll order, and would refuse the
+        # other for an occupancy this script had just manufactured.
+        incumbent = folded in observed_topics
+        contested = len(sources_by_target.get(folded, ())) > 1
+        if incumbent or contested:
+            entry = collisions.get(topic)
+            if entry is None:
+                old_canonicals = sorted(canonical_ids_by_topic.get(topic, ()))
+                new_canonicals = sorted(
+                    memory_id
+                    for other in (
+                        {folded} | (sources_by_target.get(folded, set()) - {topic})
+                    )
+                    for memory_id in canonical_ids_by_topic.get(other, ())
+                )
+                severe = bool(old_canonicals) and bool(new_canonicals)
+                entry = {
+                    'reason': (
+                        'canonical_collision' if severe else 'slug_collision'
+                    ),
+                    'project_id': project_id,
+                    'old_topic': topic,
+                    'new_topic': folded,
+                    'colliding_count': 0,
+                    'memory_ids': [],
+                    'old_canonical_ids': old_canonicals,
+                    'new_canonical_ids': new_canonicals,
+                    'note': (
+                        'the fold would merge two topic namespaces AND carry a '
+                        'canonical from each side into one cluster, '
+                        'manufacturing the second canonical '
+                        '_check_canonical_uniqueness exists to prevent — '
+                        'resolve by hand before re-running'
+                        if severe else
+                        'the target slug is already occupied (by conforming '
+                        'records, or by a second legacy value folding onto it), '
+                        'so the rename would MERGE two topic namespaces rather '
+                        'than normalize one — resolve by hand before re-running'
+                    ),
+                }
+                collisions[topic] = entry
+            entry['colliding_count'] += 1
+            if isinstance(memory_id, str) and memory_id:
+                entry['memory_ids'].append(memory_id)
+            continue
+
         if not memory_id or not isinstance(memory_id, str):
             # ``update_memory`` is addressed by memory id.  Refusing here keeps
             # an unaddressable row out of the planned-work count instead of
@@ -197,8 +322,15 @@ def plan_renames(records, *, project_id: str) -> tuple[list[Rename], list[dict]]
             new_topic=folded,
         ))
 
+    for entry in collisions.values():
+        entry['memory_ids'].sort()
+        skips.append(entry)
+
     renames.sort(key=lambda r: (r.project_id, r.new_topic, r.memory_id))
     skips.sort(key=lambda s: (
-        str(s.get('reason')), str(s.get('project_id')), str(s.get('memory_id')),
+        str(s.get('reason')),
+        str(s.get('project_id')),
+        str(s.get('old_topic', '')),
+        str(s.get('memory_id')),
     ))
     return renames, skips
