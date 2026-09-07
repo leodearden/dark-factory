@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import pathlib
 import posixpath
+import re
 import shlex
 
 import pytest
@@ -751,3 +752,130 @@ def test_pyright_clause_cwds_normalises_relative_hops() -> None:
     so the mirror would report drift between two commands that agree.
     """
     assert vci.pyright_clause_cwds("cd a && npx pyright && cd ../b && npx pyright") == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# marked_span
+# ---------------------------------------------------------------------------
+
+# The two live patterns, spelled as literals for the same reason the chains above
+# are: this file is the helper's oracle and must be able to disagree with its
+# callers. `_INLINE_SPAN` is the shape
+# ``test_contributing_lint_command_drift.py`` extracts (an inline-code command on
+# a labelled bullet); `_FENCE_SPAN` is the shape
+# ``test_contributing_type_check_command_drift.py`` extracts (a fenced block).
+# Both are exercised so the shared mechanic is pinned against BOTH callers'
+# patterns, not just the one that currently imports it.
+_INLINE_SPAN = re.compile(r"- \*\*Lint\*\*: `([^`]+)`")
+_FENCE_SPAN = re.compile(r"```bash\n(.*?)```", re.DOTALL)
+
+_SPAN_KWARGS = {
+    "begin": "demo-mirror:begin",
+    "end": "demo-mirror:end",
+    "what": "fenced ```bash block",
+    "source": "CONTRIBUTING.md",
+    "label": "the demo bullet's fenced command",
+    "task": "4108",
+}
+
+_MARKED_FENCE_DOC = """\
+```bash
+cd decoy && uv run pyright
+```
+
+<!-- demo-mirror:begin cites `type_check_command` in its own prose -->
+```bash
+  cd alpha && uv run pyright
+```
+<!-- demo-mirror:end -->
+
+```bash
+cd another-decoy && uv run pyright
+```
+"""
+
+
+def test_marked_span_returns_the_marked_match_verbatim() -> None:
+    """Only the marked match is returned, and it is NOT normalised on the way out.
+
+    Two properties in one assertion, both load-bearing. The decoy fences above
+    and below the marker are what a "first match"/"last match" extractor would
+    return — the measured hazard, since CONTRIBUTING.md really does carry other
+    fenced pyright commands that must stay generic and unpinned. And the leading
+    whitespace survives: only the caller's downstream comparison knows how much
+    normalisation is safe, so canonicalising here could hide a real difference
+    from it.
+    """
+    assert (
+        marked_span_result := vci.marked_span(
+            _MARKED_FENCE_DOC, pattern=_FENCE_SPAN, **_SPAN_KWARGS
+        )
+    ) == "  cd alpha && uv run pyright\n"
+    assert marked_span_result != marked_span_result.strip()
+
+
+def test_marked_span_works_on_an_inline_code_pattern_too() -> None:
+    """The mechanic is pattern-agnostic — the caller's regex is the only policy.
+
+    The Lint mirror extracts an inline-code span off a labelled bullet, the
+    Type-check mirror a fenced block. Sharing the four marker assertions is only
+    safe if neither shape is privileged, so both are pinned here rather than in
+    whichever guard happens to import the helper first.
+    """
+    doc = (
+        "<!-- demo-mirror:begin -->\n"
+        "- **Lint**: `uv run ruff check alpha beta`\n"
+        "<!-- demo-mirror:end -->\n"
+    )
+    assert (
+        vci.marked_span(doc, pattern=_INLINE_SPAN, **{**_SPAN_KWARGS, "what": "Lint bullet"})
+        == "uv run ruff check alpha beta"
+    )
+
+
+@pytest.mark.parametrize(
+    ("doc", "case"),
+    [
+        ("```bash\ncd alpha && uv run pyright\n```\n", "no marker at all"),
+        (
+            "<!-- demo-mirror:begin -->\n```bash\ncd alpha\n```\n<!-- demo-mirror:end -->\n"
+            "<!-- demo-mirror:begin -->\n```bash\ncd beta\n```\n<!-- demo-mirror:end -->\n",
+            "duplicated marker pair",
+        ),
+        (
+            "<!-- demo-mirror:end -->\n```bash\ncd alpha\n```\n<!-- demo-mirror:begin -->\n",
+            "inverted markers",
+        ),
+        (
+            "<!-- demo-mirror:begin -->\nno fence here at all\n<!-- demo-mirror:end -->\n",
+            "marker present, no match",
+        ),
+        (
+            "<!-- demo-mirror:begin -->\n```bash\n   \n```\n<!-- demo-mirror:end -->\n",
+            "blank match",
+        ),
+    ],
+)
+def test_marked_span_fails_loudly_and_names_the_artifact(doc: str, case: str) -> None:
+    """Every failure RAISES and names the marker and the source — never '' or None.
+
+    This is the vacuity contract both CONTRIBUTING.md mirrors are built on: an
+    extractor that silently yields nothing turns the drift assertion green while
+    pinning nothing, which is strictly worse than no guard because the check
+    still reports success. "No marker" is that hazard head-on; "duplicated" is it
+    one level down, where silently taking the first leaves the second mirror
+    unpinned and free to drift; "inverted" yields an empty slice and so falls to
+    the match assertion with the same remedy; "no match" and "blank" are the two
+    ways a marker can survive a rewrite while delimiting nothing usable.
+
+    The MESSAGE wording is not pinned, only that it carries the begin literal and
+    the source — the same discipline this file states for the command helpers'
+    ``label``, and what keeps the two mirrors' failures distinguishable.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        vci.marked_span(doc, pattern=_FENCE_SPAN, **_SPAN_KWARGS)
+
+    message = str(excinfo.value)
+    assert _SPAN_KWARGS["begin"] in message, case
+    assert _SPAN_KWARGS["source"] in message, case
+    assert _SPAN_KWARGS["task"] in message, case

@@ -104,45 +104,41 @@ _MARKED_BASH_FENCE = re.compile(r"```bash\n(.*?)```", re.DOTALL)
 def _documented_type_check_command(markdown_text: str) -> str:
     """The command in the fenced bash block delimited by the mirror markers.
 
-    Every failure is a loud ``AssertionError`` naming the marker literal and
-    CONTRIBUTING.md, never a ``''``/``None`` return. That is the vacuity hazard
-    and the whole point: an extractor that silently yields nothing turns the
-    drift assertion green while pinning nothing — strictly worse than no guard,
-    because the check still reports success.
+    The four marker assertions — exactly one begin, exactly one end, exactly one
+    match in the slice between them (which is also what catches INVERTED
+    markers), and a non-blank match — are
+    ``verify_command_invariants.marked_span``'s, shared with the Lint mirror
+    rather than copied beside it. Every failure is a loud ``AssertionError``
+    naming the marker literal and CONTRIBUTING.md, never a ``''``/``None``
+    return: that is the vacuity hazard and the whole point, since an extractor
+    that silently yields nothing turns the drift assertion green while pinning
+    nothing — strictly worse than no guard, because the check still reports
+    success.
+
+    The ONE-LINE rule below is this guard's own and stays here, because it is a
+    fact about the fenced form rather than about markers: only a fenced block can
+    carry a continued chain, and the Lint mirror's inline-code span cannot.
 
     Returns the command ``strip()``ed and otherwise verbatim. No further
     normalisation: the downstream comparison depends on not silently
     canonicalising away a real difference.
     """
-    begin_count = markdown_text.count(MIRROR_BEGIN)
-    assert begin_count == 1, (
-        f"expected exactly one {MIRROR_BEGIN!r} marker, found {begin_count} "
-        f"(task 4108). This marker delimits the Type-check bullet's fenced "
-        f"command in CONTRIBUTING.md that mirrors the package directories of "
-        f"dark-factory-orchestrator.yaml's type_check_command. If it was "
-        f"deleted, restore it around that fenced block; if it was duplicated, "
-        f"one of the two mirrors is unpinned and free to drift."
-    )
-    end_count = markdown_text.count(MIRROR_END)
-    assert end_count == 1, (
-        f"expected exactly one {MIRROR_END!r} marker to close {MIRROR_BEGIN!r} "
-        f"in CONTRIBUTING.md, found {end_count} (task 4108) — restore the "
-        f"closing marker below the Type-check bullet's fenced command"
-    )
-
-    # Inverted markers yield an empty slice, so the next assertion catches that
-    # too, loudly and with the same remedy.
-    marked = markdown_text[markdown_text.index(MIRROR_BEGIN) : markdown_text.index(MIRROR_END)]
-    fences: list[str] = _MARKED_BASH_FENCE.findall(marked)
-    assert len(fences) == 1, (
-        f"expected exactly one fenced ```bash block between {MIRROR_BEGIN!r} and "
-        f"{MIRROR_END!r} in CONTRIBUTING.md, found {len(fences)}: {fences!r} "
-        f"(task 4108). The marker must wrap that fence and nothing else; if the "
-        f"bullet was restructured or the markers were inverted, move the marker "
-        f"back around the copy-pasteable type-check command."
+    fence = vci.marked_span(
+        markdown_text,
+        begin=MIRROR_BEGIN,
+        end=MIRROR_END,
+        pattern=_MARKED_BASH_FENCE,
+        what="fenced ```bash block",
+        source="CONTRIBUTING.md",
+        label=(
+            "the Type-check bullet's fenced command in CONTRIBUTING.md that "
+            "mirrors the package directories of dark-factory-orchestrator.yaml's "
+            "type_check_command"
+        ),
+        task="4108",
     )
 
-    lines = [line for line in fences[0].splitlines() if line.strip()]
+    lines = [line for line in fence.splitlines() if line.strip()]
     # ONE line, deliberately. `verify._cd_clause_target` recognises only an exact
     # two-token `cd <dir>`, so a multi-line or backslash-continued chain would
     # leave the walker unable to see the `cd` clauses — and this guard would then
@@ -158,12 +154,11 @@ def _documented_type_check_command(markdown_text: str) -> str:
         f"silently pin only part of the chain."
     )
 
-    command = lines[0].strip()
-    assert command, (
-        f"the command between {MIRROR_BEGIN!r} and {MIRROR_END!r} in "
-        f"CONTRIBUTING.md is empty (task 4108)"
-    )
-    return command
+    # No non-blank assertion here: `lines` is already filtered on `.strip()`, so
+    # a single surviving line cannot be blank. Vacuity is refused twice over
+    # upstream — `marked_span` rejects a blank match, and a fence of only blank
+    # lines yields `len(lines) == 0` and takes the assertion above.
+    return lines[0].strip()
 
 
 # Extractor fixtures are hand-written markdown, never the real CONTRIBUTING.md,

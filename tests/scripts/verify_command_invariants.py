@@ -3,6 +3,14 @@
 This module holds NO test functions of its own. Its own unit tests live in
 ``test_verify_command_invariants.py`` beside it.
 
+Since task 4108 it also holds :func:`marked_span`, the marker-delimited document
+extraction the two CONTRIBUTING.md MIRROR guards share. That is a deliberate
+widening past "command parsing": the four marker assertions were about to exist
+in a second hand-written copy for exactly the reason the five command-parsing
+copies below did, and the same rule applies to both. Everything in the WHY IT
+EXISTS and IMPORT ME sections is written about the command helpers, but is meant
+about this module.
+
 WHY IT EXISTS. A trio of command-parsing helpers — pick the ``&&`` segment that
 invokes the checker, extract that checker's positional targets, decide whether a
 path is covered by one of them — was hand-maintained in FIVE copies:
@@ -67,6 +75,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import shlex
 
 from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
@@ -421,9 +430,7 @@ def flag_args(tokens: list[str], prefixes: tuple[str, ...]) -> list[str]:
     return [t for t in tokens if t.startswith(prefixes)]
 
 
-def pyright_clause_cwds(
-    cmd: str, *, skip_uv_project: bool = True, label: str | None = None
-) -> list[str]:
+def pyright_clause_cwds(cmd: str, *, skip_uv_project: bool = True) -> list[str]:
     """Return, in order, the normalised cwd of each pyright clause in *cmd*.
 
     Walks the ``&&``-chain tracking cwd through ``cd <dir>`` clauses using the
@@ -456,11 +463,14 @@ def pyright_clause_cwds(
         question a ``--project`` spelling is a real answer, so it is INCLUDED.
         This is what the CONTRIBUTING.md mirror needs (task 4108).
 
-    *label* is accepted for signature symmetry with this module's other helpers
-    (:func:`required_segment`, :func:`anchor_split`, :func:`positional_targets`),
-    so a guard parsing two commands can pass it uniformly. It is currently
-    unread, and that is not an oversight: those helpers thread *label* into
-    ASSERTION messages, and this one raises nothing — see the next paragraph.
+    NO *label* PARAMETER, deliberately. This module's other helpers
+    (:func:`required_segment`, :func:`anchor_split`, :func:`positional_targets`)
+    take one because they thread it into ASSERTION messages; this one raises
+    nothing, so a *label* here would be unread surface whose only effect is to
+    mislead a caller into believing it improves a diagnostic. Task 4108 briefly
+    carried one "for signature symmetry" and dropped it on review. Add it back in
+    the same change that gives this function something to raise, so the name
+    keeps one meaning across the module.
 
     THIS FUNCTION PARSES; IT DOES NOT DECIDE. It reports what the chain says and
     makes no claim that the answer is non-empty or correct. NON-VACUITY is
@@ -483,3 +493,93 @@ def pyright_clause_cwds(
             continue
         cwds.append(cwd)
     return cwds
+
+
+def marked_span(
+    text: str,
+    *,
+    begin: str,
+    end: str,
+    pattern: re.Pattern[str],
+    what: str,
+    source: str,
+    label: str,
+    task: str,
+) -> str:
+    """The single *pattern* match between the *begin* and *end* markers in *text*.
+
+    The extraction half of a tier-2 MIRROR guard, as
+    ``docs/legibility/design-invariants.md`` INV-10 defines the tier: a
+    marker-delimited span of a document, checked against the live artifact it
+    restates. Two such guards read CONTRIBUTING.md —
+    ``test_contributing_lint_command_drift.py`` (task 3558: the Lint bullet's
+    inline-code span against ``lint_command``) and
+    ``test_contributing_type_check_command_drift.py`` (task 4108: the Type-check
+    bullet's fenced ```` ```bash ```` block against ``type_check_command``) — and
+    their extractors were the SAME four assertions over two different regexes.
+    That is the N-copy shape the rest of this module exists to close, so it is
+    closed here rather than by a third hand-written copy.
+
+    EVERY FAILURE IS A LOUD ``AssertionError`` naming the marker literal, the
+    *source* artifact and the *task*, never a ``''``/``None`` return. All three
+    in EVERY message, not just in most: the helper must not depend on a caller
+    having happened to spell the filename into its *label*, which is how the
+    begin-count message was missing *source* when this was extracted. That is the vacuity hazard and the
+    whole point: an extractor that silently yields nothing turns the drift
+    assertion green while pinning nothing — strictly worse than no guard, since
+    the check still reports success. The assertions are, in order: exactly one
+    *begin*; exactly one *end*; exactly one *pattern* match in the slice between
+    them; and a non-blank match. INVERTED markers need no case of their own —
+    they yield an empty slice, so the match assertion catches them with the same
+    remedy.
+
+    Returns the match VERBATIM — not stripped, not otherwise normalised. Only the
+    caller's downstream comparison knows how much normalisation is safe, and
+    canonicalising here could hide a real difference from it.
+
+    POLICY STAYS WITH THE CALLER, per this module's contract. The *pattern* (an
+    inline-code span, a fenced block), the marker literals, the artifact *source*
+    and the *label*/*what* remedy wording all arrive as arguments; what is shared
+    is only the four-assertion marker mechanic. *task* is the filing this guard
+    belongs to, carried into every message so a human meets the rationale rather
+    than a bare mismatch.
+
+    NOT YET THE SOLE HOME. ``test_contributing_lint_command_drift.py``'s
+    ``_documented_lint_command`` is still a private copy of these four
+    assertions: that file was outside task 4108's lock set, so migrating it would
+    have widened that task's concurrency footprint. The swap is mechanical —
+    pass its ``_MARKED_LINT_COMMAND`` pattern, its two marker literals and task
+    3558 — and until it happens, a change to the assertion mechanics here must be
+    mirrored there by hand. Filed as follow-up; recorded here rather than left
+    implicit because an un-migrated copy that nobody has written down is exactly
+    how the five copies this module replaced came to drift.
+    """
+    begin_count = text.count(begin)
+    assert begin_count == 1, (
+        f"expected exactly one {begin!r} marker in {source}, found "
+        f"{begin_count} (task {task}). This marker delimits {label}. If it was "
+        f"deleted, restore it around that span; if it was duplicated, one of "
+        f"the two mirrors is unpinned and free to drift."
+    )
+    end_count = text.count(end)
+    assert end_count == 1, (
+        f"expected exactly one {end!r} marker to close {begin!r} in {source}, "
+        f"found {end_count} (task {task}) — restore the closing marker below "
+        f"{label}"
+    )
+
+    # Inverted markers yield an empty slice, so the next assertion catches that
+    # too, loudly and with the same remedy.
+    marked = text[text.index(begin) : text.index(end)]
+    spans: list[str] = pattern.findall(marked)
+    assert len(spans) == 1, (
+        f"expected exactly one {what} between {begin!r} and {end!r} in "
+        f"{source}, found {len(spans)}: {spans!r} (task {task}). The marker "
+        f"must wrap {label} and nothing else; if it was restructured or the "
+        f"markers were inverted, move the marker back around it."
+    )
+    assert spans[0].strip(), (
+        f"the {what} between {begin!r} and {end!r} in {source} is blank "
+        f"(task {task})"
+    )
+    return spans[0]
