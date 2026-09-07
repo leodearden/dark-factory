@@ -184,9 +184,10 @@ class TestTopicSlugNamespaceIsShared:
     copy fail mechanically rather than by review.
 
     The thing to watch for when editing ``derive_topic_slug`` is a *second
-    anchored slug validator*.  The fold itself legitimately needs a
-    character-class pattern to collapse runs of punctuation, so ``re`` is
-    not forbidden here — what must not appear is a local pattern that
+    anchored slug validator*.  The fold legitimately needs a character-class
+    pattern to collapse runs of punctuation — but since task 4878 that
+    pattern lives in ε beside the fold, and this script imports ``re`` for
+    nothing at all.  What must not appear here is a local pattern that
     decides whether a slug is VALID, because that is the copy free to
     drift from ε while every test still passes.  Validity is settled by
     calling ``is_valid_topic_slug``; the identity assertions below prove
