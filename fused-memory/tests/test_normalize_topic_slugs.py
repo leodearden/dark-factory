@@ -17,6 +17,7 @@ constant and the tests pin the arithmetic against it, never the live number.
 """
 from __future__ import annotations
 
+import ast
 import copy
 import dataclasses
 import importlib.util
@@ -2111,3 +2112,203 @@ class TestReportRenderAndCli:
         args = _mod._build_parser().parse_args([])
         assert args.json_out.endswith('plans/topic-slug-normalization-report.json')
         assert args.md_out.endswith('plans/topic-slug-normalization-report.md')
+
+
+# ===========================================================================
+# baseline_delta — scope item 4, the measurement the next reader inherits
+# ===========================================================================
+
+class TestBaselineDelta:
+    """The report diffs THIS run against one committed, dated measurement.
+
+    Scope item 4 asks for the post-migration count "against the ad707e72
+    baseline ... so the next reader can see the delta instead of re-deriving
+    it".  Folding it into the report rather than leaving it a manual step is
+    what makes it survive: a number an operator has to re-derive is a number
+    the next operator re-derives differently.
+
+    NOTHING here asserts a LIVE corpus count.  The very history this block
+    carries — 98 -> 103 distinct non-conforming values while the validator sat
+    in warn mode — proves the number moves on its own, so a test pinning it
+    would be a doomed RED.  The baseline is a constant, the measurement comes
+    off an INJECTED corpus, and these tests pin the arithmetic between them.
+    """
+
+    def test_the_baseline_is_a_named_committed_constant(self):
+        assert _mod.BASELINE_DISTINCT_NON_CONFORMING == 103
+
+    @pytest.mark.asyncio
+    async def test_the_report_carries_the_baseline_and_its_provenance(self):
+        service, _corpus = _run_service({'dark_factory': []})
+
+        block = (await run_sweep(service, projects=('dark_factory',)))['baseline_delta']
+
+        assert block['baseline_distinct_non_conforming'] == 103
+        assert 'ad707e72' in block['baseline_source']
+        assert '2026-08-04' in block['baseline_source']
+
+    @pytest.mark.asyncio
+    async def test_the_history_records_the_direction_of_travel(self):
+        """98 -> 103 is the fact that makes a pinned live count indefensible."""
+        service, _corpus = _run_service({'dark_factory': []})
+
+        block = (await run_sweep(service, projects=('dark_factory',)))['baseline_delta']
+
+        assert '98' in str(block['baseline_history'])
+        assert '103' in str(block['baseline_history'])
+
+    @pytest.mark.asyncio
+    async def test_the_measurement_counts_distinct_VALUES_not_records(self):
+        """One legacy slug on eight records is ONE non-conforming value.
+
+        This is the census's own partition (``_build_topic_coverage`` item 3),
+        and matching it is what makes the delta comparable to the baseline at
+        all: counting records instead would report 8 against a baseline of
+        distinct values and manufacture a growth that never happened.
+        """
+        service, _corpus = _run_service({
+            'dark_factory': [_crec(f'm{i}', 'legacy_topic') for i in range(8)],
+        })
+
+        block = (await run_sweep(service, projects=('dark_factory',)))['baseline_delta']
+
+        assert block['measured_distinct_non_conforming'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_measurement_spans_every_swept_project(self):
+        service, _corpus = _run_service({
+            'dark_factory': [_crec('m1', 'a_topic'), _crec('m2', 'b_topic')],
+            'reify': [_crec('m3', 'c_topic')],
+        })
+
+        block = (await run_sweep(
+            service, projects=('dark_factory', 'reify')))['baseline_delta']
+
+        assert block['measured_distinct_non_conforming'] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_conforming_corpus_measures_zero(self):
+        service, _corpus = _run_service({
+            'dark_factory': [_crec('m1', 'fine-topic'), _crec('m2', None)],
+        })
+
+        block = (await run_sweep(service, projects=('dark_factory',)))['baseline_delta']
+
+        assert block['measured_distinct_non_conforming'] == 0
+
+    @pytest.mark.asyncio
+    async def test_the_delta_is_measured_minus_baseline(self):
+        service, _corpus = _run_service({
+            'dark_factory': [_crec('m1', 'a_topic')],
+        })
+
+        block = (await run_sweep(service, projects=('dark_factory',)))['baseline_delta']
+
+        assert block['delta'] == (
+            block['measured_distinct_non_conforming']
+            - block['baseline_distinct_non_conforming']
+        )
+        assert block['delta'] == 1 - 103
+
+    @pytest.mark.asyncio
+    async def test_it_names_the_standing_re_measurement_instrument(self):
+        """The live number stays the census's to define — not this script's."""
+        service, _corpus = _run_service({'dark_factory': []})
+
+        block = (await run_sweep(service, projects=('dark_factory',)))['baseline_delta']
+
+        assert 'census_memory_metadata.py' in block['remeasure_command']
+        assert 'slug_non_conforming' in block['remeasure_command']
+        assert 'topic_coverage' in block['remeasure_command']
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_sweep_says_its_measurement_is_a_lower_bound(self):
+        """A cell this run never finished cannot be counted as zero residue."""
+        service, _corpus = _run_service({'dark_factory': [_crec('m1', 'a_topic')]})
+        report = await run_sweep(service, projects=('dark_factory',))
+        report['coverage_complete'] = False
+
+        rendered = _mod.render_markdown(report)
+
+        assert 'LOWER BOUND' in rendered
+
+    def test_markdown_prints_the_whole_block(self):
+        report = {
+            'apply': False,
+            'baseline_delta': {
+                'baseline_distinct_non_conforming': 103,
+                'baseline_source': 'memory ad707e72, measured 2026-08-04',
+                'baseline_history': 'PRD leaf alpha measured 98; ad707e72 103',
+                'measured_distinct_non_conforming': 87,
+                'measured_by_project': {'dark_factory': 40, 'reify': 47},
+                'delta': -16,
+                'remeasure_command': (
+                    'census_memory_metadata.py -> '
+                    'coverage.topic_coverage.slug_non_conforming'
+                ),
+            },
+        }
+
+        rendered = _mod.render_markdown(report)
+
+        assert '103' in rendered
+        assert 'ad707e72' in rendered
+        assert '2026-08-04' in rendered
+        assert '98' in rendered
+        assert '87' in rendered
+        assert '-16' in rendered
+        assert 'census_memory_metadata.py' in rendered
+        assert 'slug_non_conforming' in rendered
+
+    def test_markdown_survives_a_report_with_no_baseline_block(self):
+        """The renderer is also handed hand-built reports; it must not crash."""
+        assert _mod.render_markdown({'apply': False})
+
+    @pytest.mark.asyncio
+    async def test_the_measured_count_is_broken_out_per_project(self):
+        service, _corpus = _run_service({
+            'dark_factory': [_crec('m1', 'a_topic')],
+            'reify': [_crec('m2', 'b_topic'), _crec('m3', 'c_topic')],
+        })
+
+        block = (await run_sweep(
+            service, projects=('dark_factory', 'reify')))['baseline_delta']
+
+        assert block['measured_by_project'] == {'dark_factory': 1, 'reify': 2}
+
+
+class TestNoLiveCorpusCountIsPinned:
+    """The one rule this whole section exists to keep.
+
+    The corpus is live and moving; the baseline's own history proves it. A
+    committed constant is a dated measurement a reader can evaluate; a test
+    asserting today's live number is a scheduled failure that teaches whoever
+    hits it to delete the assertion.
+    """
+
+    def test_the_only_committed_number_is_the_dated_baseline(self):
+        source = SCRIPT_PATH.read_text(encoding='utf-8')
+        # The constant is defined exactly once, and its provenance sits beside
+        # it rather than in a commit message nobody will read again.
+        assert source.count('BASELINE_DISTINCT_NON_CONFORMING = 103') == 1
+        assert 'ad707e72' in source
+        assert '2026-08-04' in source
+
+    def test_this_suite_never_reaches_a_live_backend(self):
+        """The structural reason no live count can be pinned here.
+
+        Checked over the parsed IMPORT statements rather than by substring,
+        so the assertion cannot be satisfied — or defeated — by its own text
+        appearing in the file.  This suite loads the script by path and
+        injects doubles; it imports nothing from the package, so there is no
+        seam through which a live corpus could reach an assertion.
+        """
+        tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or '')
+
+        assert not [m for m in imported if m.startswith('fused_memory')], imported
