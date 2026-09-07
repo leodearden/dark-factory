@@ -69,9 +69,18 @@ that mutates the shared store in-process -- it constructs its own
 :func:`assert_store_mutation_allowed` before the first mutation AND before the
 scan.
 
-COVERAGE IS PARTIAL. That rule is a norm, not an invariant: nothing enforces
-it mechanically yet, and task 4280 is where the static conformance check that
-would lands. What follows is a dated audit, not a live guarantee.
+COVERAGE IS NOW PARTIALLY MECHANICAL. ``tests/test_store_mutation_conformance.py``
+(task 4280, landed by task 4848) enforces this rule for every script whose AST
+contains a CALL-SHAPED mutation -- a distinctive mutating callee name, or a
+generic verb (``delete``/``update``/``add``/``save``) on a receiver whose
+dotted name hints at a substrate (``qdrant``/``mem0``/``graph``/``driver``/
+``backend``) -- by requiring a call to :func:`assert_store_mutation_allowed`
+imported from this module. ``PREFLIGHT_EXEMPT_SCRIPTS`` below is that check's
+only escape hatch, and its entries are policed for staleness: one that stops
+matching a live, unguarded candidate must be deleted, not left behind. What
+follows is still a dated audit, not a live guarantee -- the check enforces
+the RULE, not this prose, and it is call-shaped only. See below for what
+that still misses.
 
 GUARDED, as of task 4848 -- ``amend_stale_resume_cwd_records``,
 ``audit_duplicate_memories``, ``cleanup_count_snapshots``,
@@ -113,9 +122,18 @@ KNOWN UNGUARDED, same date -- as of task 4848, NONE. No shared-store mutator in
 ``fused-memory/scripts/`` is currently KNOWN to be unguarded.
 
 That is a dated measurement, NOT an invariant, and it must not be restated as
-one. Nothing enforces it mechanically until task 4280 lands its static
-conformance check; until then a script added tomorrow is unguarded by default
-and this section will not notice. "Guarded" also means only what the column
+one. A script added tomorrow that makes a call-shaped mutation without calling the
+guard is now caught the next time the suite runs -- but the check is
+call-shaped only, so it is not omniscient. Raw Cypher/SQL assembled inside a
+STRING LITERAL is invisible to it: ``migrate_cross_graph_leak.py``'s graph
+``DETACH DELETE`` is classified a non-candidate for exactly this reason, and
+stays guarded by hand rather than by the mechanism. ``cgl_eta_auto_apply_impl``
+is a second, deliberate non-candidate one level removed: its only mutation is
+invoking ``migrate_cross_graph_leak.run()`` via ``importlib``, not a mutating
+callee itself, so it is never flagged and carries NO allowlist entry --
+being undetected and being exempt are different dispositions, and the
+GUARDED BY INHERITANCE column above, not ``PREFLIGHT_EXEMPT_SCRIPTS``, is
+still the only place that records it. "Guarded" also means only what the column
 says -- the script's OWN mutations, from its ``run()``-level probe onward. It
 does not cover the writes ``MemoryService.initialize()`` performs before
 ``run()`` is ever called (Graphiti index creation plus the W6-ε dup-uuid-edge
@@ -137,8 +155,13 @@ measured:
     deliberately in neither column. Task 4293 wrote that reasoning, with the
     premises that would kill it, into each of those two files.
 
-Task 4280 is the mechanism that derives the columns mechanically instead of by
-hand; these lists are the interim, hand-checked stand-in.
+``tests/test_store_mutation_conformance.py`` is that mechanism now, for the
+RULE -- but not for these columns themselves, which remain the interim,
+hand-checked audit trail rather than generated output; keeping them accurate
+after a script changes is still on the author, same as before. Nor does it
+reach ``MemoryService.initialize()``'s pre-``run()`` writes (Graphiti startup
+maintenance) at all -- that gap is systemic, outside this check's scope
+entirely, and stays tracked by tasks 4318 and 4350.
 
 Two placement rules, which are the non-obvious part:
 
