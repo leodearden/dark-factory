@@ -80,8 +80,137 @@ configuration least able to notice a regression here.
 
 from __future__ import annotations
 
+import ast
+
 import pytest
-from _ast_guard import parse_python_module
+from _ast_guard import calls_named, imported_names_from, parse_python_module
+
+# ---------------------------------------------------------------------------
+# The classifier (task 4280 / 4848)
+# ---------------------------------------------------------------------------
+#
+# Lives in this test module rather than in production source, mirroring the
+# sibling AST guards (test_falkor_index_barrier_guard.py's
+# _discover_live_index_modules, test_gather_idiom_helper_routing.py's
+# _gather_calls_with_return_exceptions): the classifier has exactly one
+# consumer -- this file's own assertions -- and promoting it to
+# src/fused_memory/ would give it an audience it does not have.
+# ---------------------------------------------------------------------------
+
+#: The guard this whole module polices calls to.
+GUARD_CALLABLE = 'assert_store_mutation_allowed'
+#: Where it must be imported FROM to count -- see is_guarded().
+GUARD_MODULE = 'fused_memory.utils.store_mutation_preflight'
+
+#: Tier A -- distinctive mutating callee names, flagged regardless of
+#: receiver. No plain read method collides with any of these spellings.
+MUTATING_CALL_NAMES: frozenset[str] = frozenset({
+    'delete_memory',
+    'update_memory',
+    'add_memory',
+    'add_episode',
+    'delete_episode',
+    'delete_entity',
+    'update_edge',
+    'delete_edge',
+    'delete_collection',
+    'create_collection',
+    'set_payload',
+    'overwrite_payload',
+    'delete_points',
+    'upsert',
+    'delete_all',
+    'reset',
+})
+
+#: Tier B -- generic verbs, counted only when the receiver hints at a
+#: substrate (see SUBSTRATE_RECEIVER_HINTS below). Load-bearing, not
+#: defensive padding: this is the ONLY tier that catches
+#: `qdrant_client.delete(...)` and `memory.mem0.update(...)` -- the two
+#: spellings the production module's docstring calls a mutation no pattern
+#: search finds, because `.update(` also matches every dict update in the
+#: repo.
+GENERIC_MUTATING_VERBS: frozenset[str] = frozenset({'delete', 'update', 'add', 'save'})
+
+#: Tightened by MEASUREMENT, not taste: an early draft also included
+#: 'collection', 'store' and 'client', and 'collection' produced a real
+#: false positive on `collections.update(...)`, a plain dict update in
+#: bake_off_storage_shape.py. Dropping those three removed it while still
+#: catching every genuine site.
+SUBSTRATE_RECEIVER_HINTS: tuple[str, ...] = ('qdrant', 'mem0', 'graph', 'driver', 'backend')
+
+
+def _dotted_receiver(node: ast.Attribute) -> str:
+    """Render the dotted receiver chain of an attribute access, e.g. ``memory.mem0``.
+
+    Recurses through nested ``ast.Attribute``/``ast.Name`` nodes so a
+    multi-hop receiver renders in full. Any other expression as the ultimate
+    base (a call result, a subscript, ...) renders as ``'<expr>'`` rather
+    than raising -- Tier B only needs to test *membership* of a hint
+    substring, not a faithful source reprint.
+    """
+    if isinstance(node.value, ast.Name):
+        base = node.value.id
+    elif isinstance(node.value, ast.Attribute):
+        base = _dotted_receiver(node.value)
+    else:
+        base = '<expr>'
+    return f'{base}.{node.attr}'
+
+
+def mutating_calls(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every Tier A / Tier B mutating call in *tree*, as ``(callee_name, lineno)``.
+
+    Tier A hits are unconditional on the receiver. Tier B hits require the
+    receiver's dotted name to contain a substrate hint -- see the module
+    docstring for why both tiers exist and why the hint set is shaped the
+    way it is. A module with zero hits is not a mutation CANDIDATE at all,
+    which is what keeps a purely read-only script (one that only constructs
+    a MemoryService and calls search/get/count methods) out of scope.
+    """
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            name = func.id
+            receiver = ''
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+            if isinstance(func.value, ast.Name):
+                receiver = func.value.id
+            elif isinstance(func.value, ast.Attribute):
+                receiver = _dotted_receiver(func.value)
+            else:
+                receiver = ''
+        else:
+            continue
+
+        # Tier A is unconditional on the receiver; Tier B requires a
+        # substrate-hinting one. Combined into one `or` (rather than kept as
+        # two `if`/`elif` branches) so ruff's duplicate-body check does not
+        # flag it -- both conditions lead to the identical append.
+        if name in MUTATING_CALL_NAMES or (
+            name in GENERIC_MUTATING_VERBS
+            and any(hint in receiver for hint in SUBSTRATE_RECEIVER_HINTS)
+        ):
+            hits.append((name, node.lineno))
+    return hits
+
+
+def is_guarded(tree: ast.Module) -> bool:
+    """True iff *tree* both calls the guard AND imports it from the real module.
+
+    Both halves are required. A call alone could be satisfied by a
+    locally-defined no-op decoy carrying the same name; an import alone
+    proves nothing was ever invoked. Either half missing means the script is
+    not actually protected against the half-completed-mutation failure mode
+    this module exists to close.
+    """
+    if not calls_named(tree, GUARD_CALLABLE):
+        return False
+    return GUARD_CALLABLE in imported_names_from(tree, GUARD_MODULE)
 
 
 class TestMutatingCallsTierA:
@@ -232,7 +361,7 @@ class TestIsGuardedRequiresCallAndProvenance:
     def test_call_imported_from_the_wrong_module_is_not_guarded(self, tmp_path):
         source = tmp_path / 'candidate.py'
         source.write_text(
-            'from somewhere.else import assert_store_mutation_allowed\n\n'
+            'from somewhere.other import assert_store_mutation_allowed\n\n'
             'def run():\n'
             "    assert_store_mutation_allowed(operation='run')\n"
         )
