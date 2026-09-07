@@ -1595,9 +1595,10 @@ class SearchResults(list):
 class ReconcileStats:
     """Aggregated counts from one ``_reconcile_episode_identity`` run.
 
-    Returned to the caller and logged for observability — NOT wired into the
-    durable write-journal schema (extending that schema is out of scope for
-    task 2202 / W6-β). Each field mirrors the int return of the
+    Nine sub-passes as of task 3770. Returned to the caller and logged for
+    observability — NOT wired into the durable write-journal schema (extending
+    that schema is out of scope for task 2202 / W6-β). Each field mirrors the
+    int return of the
     correspondingly-named post-write sweep — including
     ``stale_ttl_edges_invalidated`` (task 2319), the under-invalidation-
     direction counterpart of ``sibling_edges_restored``. ``errors`` collects
@@ -1628,6 +1629,15 @@ class ReconcileStats:
     repair_stats: ReferentRepairStats = field(
         default_factory=lambda: ReferentRepairStats()
     )
+    #: The dependency-direction check's count and structured records (task
+    #: 3770, the NINTH sub-pass). It FLAGS and never rewrites: a mismatched
+    #: edge is superseded with ``invalid_at`` and recorded here, and the fact
+    #: text travels through verbatim. Surfaced as a structured WARNING log line
+    #: plus these two fields ONLY — ``ReconcileStats`` is explicitly not part of
+    #: the durable write-journal schema, so a future consumer must not read
+    #: durability into this seam.
+    dependency_direction_flagged: int = 0
+    dependency_direction_findings: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -4927,7 +4937,7 @@ class MemoryService:
         self, result: Any, *, group_id: str, referents: ReferentSet = (),
         content: str = '', referent_source: str = 'derived',
     ) -> ReconcileStats:
-        """Fold the eight post-write identity/verification/repair sweeps into one call.
+        """Fold the nine post-write identity/verification/repair sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -4939,7 +4949,7 @@ class MemoryService:
         lock and could race with a concurrent same-group write; folding them
         into one locked reconcile closes that race.
 
-        Runs the six sub-passes in their pre-existing chain order —
+        Runs the first six sub-passes in their pre-existing chain order —
         dependency-restore before sibling-restore, matching the ordering
         this replaces at the ``_execute_graphiti_write`` call site (a
         dependency edge must be un-superseded before the sibling-restore
@@ -4988,10 +4998,25 @@ class MemoryService:
         stays the documented MANUAL escape hatch for that case. Overwriting a
         summary verbatim is not a decision a write-time pass may take unattended.
 
+        ``_check_dependency_direction`` (task 3770) is the NINTH and last. It
+        checks the DIRECTION of freshly-extracted dependency facts against live
+        Taskmaster edges — the extraction LLM flattens parallel relations into
+        sequential ones and inverts transitive chains while naming only real,
+        adjacent task numbers, so the result reads as plausible and a planning
+        read accepts it. It FLAGS and never rewrites: a mismatched edge is
+        superseded with ``invalid_at`` and recorded, and the fact text is left
+        verbatim because the extraction being wrong is itself the signal.
+        Appended after eta rather than inserted mid-chain: it reads only edge
+        ``.fact`` TEXT and has no data dependency on any earlier pass, so
+        putting it last leaves zeta's and eta's ordering contracts untouched.
+        Its findings are surfaced through a structured WARNING log line plus
+        ``ReconcileStats`` — which is NOT part of the durable write-journal
+        schema, so nothing downstream may assume durability from this seam.
+
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
         ``ReconcileStats.errors`` (leaving its count at its default — ``0`` for
-        the six int passes, an empty ``ReferentStats`` for zeta, an empty
+        the seven int passes, an empty ``ReferentStats`` for zeta, an empty
         ``ReferentRepairStats`` for eta), and the remaining sub-passes still
         run — a single sub-pass failure must never fail the already-committed
         episode write. That guarantee is worth most at eta, the one pass that
@@ -5098,6 +5123,22 @@ class MemoryService:
             ),
             ReferentRepairStats(),
         )
+        # NINTH and last. Appended rather than inserted: this pass reads only
+        # edge `.fact` TEXT and has no data dependency on any earlier pass, so
+        # putting it last leaves zeta's and eta's documented load-bearing "runs
+        # last" ordering — and eta's `stats.referent_stats` data dependency —
+        # entirely undisturbed.
+        stats.dependency_direction_flagged = await _run_pass(
+            '_check_dependency_direction',
+            self._check_dependency_direction(result, group_id=group_id),
+            0,
+        )
+        if '_check_dependency_direction' not in stats.errors:
+            # Only on the NON-RAISING path. A swallowed failure must not leave
+            # partial findings that a reader would take for a clean result.
+            stats.dependency_direction_findings = list(
+                self._dependency_direction_findings
+            )
         return stats
 
     def referent_source_counts(self) -> dict[str, int]:
