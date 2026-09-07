@@ -2207,7 +2207,17 @@ def run_census(
     # defer-path escalation above (which returns immediately afterwards),
     # this one sits between the mining spend and the output writes -- a
     # raising escalate_fn must not be what discards the run's results.
+    #
+    # The signature also lands in the COMMITTED REPORT, via `mass_rejection`
+    # below. Before that it did not: the log line and the info escalation
+    # were the only trace, both ephemeral, while the dated markdown -- the
+    # artifact an operator actually reads weeks later -- rendered
+    # byte-identically to a clean census whenever no verify cap was set. The
+    # escalation stays best-effort for the reason above; the report line is
+    # the durable one.
+    mass_rejection = None
     if clusters_to_verify and not verified:
+        mass_rejection = MassRejection(offered=len(clusters_to_verify))
         suspect = (
             f"census: ALL {len(clusters_to_verify)} verified-candidate cluster(s) were "
             "REJECTED and none survived -- suspect a systemic verifier failure "
@@ -2429,6 +2439,7 @@ def run_census(
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
+        mass_rejection=mass_rejection,
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
