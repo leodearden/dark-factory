@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from fused_memory.middleware import _folded_escalation
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage
@@ -1625,7 +1626,7 @@ class TestEmitTriageFailOpenStormEscalation:
         self, tmp_path, monkeypatch,
     ) -> None:
         """The defensive-import no-op path (minimal envs without escalation)."""
-        monkeypatch.setattr(write_triage, 'HAS_ESCALATION', False)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
         assert emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM) is None
         assert not (tmp_path / 'data' / 'escalations').exists()
 
@@ -1646,7 +1647,7 @@ class TestEmitTriageFailOpenStormEscalation:
         the count dropped entirely.
         """
         esc_id = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             assert esc_id is None
             return
 
@@ -1685,7 +1686,7 @@ class TestEmitTriageFailOpenStormEscalation:
     ) -> None:
         """The anchor is stable so the ids form one greppable series."""
         esc_id = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             return
         assert esc_id is not None
         assert write_triage._ANCHOR_TASK_ID in esc_id, f'unexpected id shape: {esc_id!r}'
@@ -1694,7 +1695,7 @@ class TestEmitTriageFailOpenStormEscalation:
         self, tmp_path,
     ) -> None:
         """The queue location is the project's own, never a global default."""
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             pytest.skip('escalation package unavailable in this environment')
 
         emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
@@ -1710,7 +1711,7 @@ class TestEmitTriageFailOpenStormEscalation:
         """
         first = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
         second = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             assert first is None and second is None
             return
 
@@ -1720,7 +1721,7 @@ class TestEmitTriageFailOpenStormEscalation:
 
     def test_files_afresh_once_the_prior_escalation_is_resolved(self, tmp_path) -> None:
         """Dedup must not silence a NEW outage after the old one was cleared."""
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             pytest.skip('escalation package unavailable in this environment')
         from escalation.queue import EscalationQueue  # noqa: PLC0415
 
@@ -1738,13 +1739,13 @@ class TestEmitTriageFailOpenStormEscalation:
         Best-effort dedup: losing duplicate-suppression is strictly better than
         losing the alarm for an outage that is actively happening.
         """
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             pytest.skip('escalation package unavailable in this environment')
 
         def _boom(self, task_id, status=None):
             raise OSError('cannot read queue')
 
-        monkeypatch.setattr(write_triage.EscalationQueue, 'get_by_task', _boom)
+        monkeypatch.setattr(_folded_escalation.EscalationQueue, 'get_by_task', _boom)
         assert emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM) is not None
 
     def test_a_submit_failure_returns_none_rather_than_propagating(
@@ -1757,24 +1758,24 @@ class TestEmitTriageFailOpenStormEscalation:
         convert a successfully-degraded write into a failed one, which is the
         C1 violation the whole fail-open apparatus exists to prevent.
         """
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             pytest.skip('escalation package unavailable in this environment')
 
         def _boom(self, esc):
             raise OSError('disk on fire')
 
-        monkeypatch.setattr(write_triage.EscalationQueue, 'submit', _boom)
+        monkeypatch.setattr(_folded_escalation.EscalationQueue, 'submit', _boom)
         assert emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM) is None
 
     def test_a_queue_open_failure_returns_none(self, tmp_path, monkeypatch) -> None:
         """Even constructing the queue is wrapped — same never-raise contract."""
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             pytest.skip('escalation package unavailable in this environment')
 
         def _boom(*args, **kwargs):
             raise OSError('no such directory')
 
-        monkeypatch.setattr(write_triage, 'EscalationQueue', _boom)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _boom)
         assert emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM) is None
 
     def test_tolerates_a_storm_dict_missing_keys(self, tmp_path) -> None:
@@ -1785,7 +1786,7 @@ class TestEmitTriageFailOpenStormEscalation:
         degraded along with its missing numbers could not be routed or deduped,
         which is exactly when an operator needs it most.
         """
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             pytest.skip('escalation package unavailable in this environment')
 
         esc_id = emit_triage_fail_open_storm_escalation(str(tmp_path), {})
@@ -1863,17 +1864,17 @@ class TestEmitTriageFailOpenStormEscalation:
         capturing the anchor the dedup read is called with and comparing it to
         the `task_id` that actually landed.
         """
-        if not write_triage.HAS_ESCALATION:
+        if not _folded_escalation.HAS_ESCALATION:
             pytest.skip('escalation package unavailable in this environment')
 
         seen: list = []
-        real_get_by_task = write_triage.EscalationQueue.get_by_task
+        real_get_by_task = _folded_escalation.EscalationQueue.get_by_task
 
         def _spy(self, task_id, status=None):
             seen.append(task_id)
             return real_get_by_task(self, task_id, status=status)
 
-        monkeypatch.setattr(write_triage.EscalationQueue, 'get_by_task', _spy)
+        monkeypatch.setattr(_folded_escalation.EscalationQueue, 'get_by_task', _spy)
         emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
 
         payload = json.loads(
@@ -1924,3 +1925,67 @@ class TestAttachWriteLanded:
         would still happen, and the caller would never be told about it.
         """
         assert attach_write_landed(result) is True, label
+
+
+class TestDelegatesToTheSharedHelper:
+    """The filer BODY now lives in `middleware/_folded_escalation` (task 4854).
+
+    What stays in `write_triage` is this leaf's own identity — above all its
+    anchor, which the comment block above `_ANCHOR_TASK_ID` records as
+    load-bearing rather than tidy.
+    """
+
+    def test_forwards_this_leafs_own_anchor_role_and_category(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        seen: dict = {}
+
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-write-triage-fail-open-1'
+
+        monkeypatch.setattr(write_triage, 'file_folded_escalation', _spy)
+
+        result = write_triage.emit_triage_fail_open_storm_escalation(
+            str(tmp_path), {'count': 5, 'window_seconds': 60},
+        )
+
+        assert result == 'esc-write-triage-fail-open-1'
+        assert seen['anchor_task_id'] == 'write-triage-fail-open'
+        assert seen['anchor_task_id'] == write_triage._ANCHOR_TASK_ID
+        assert seen['agent_role'] == 'fused-memory/write-triage'
+        assert seen['category'] == 'write_triage_fail_open_storm'
+        assert seen['severity'] == 'blocking'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_the_anchor_constants_are_still_attributes_of_THIS_module(self) -> None:
+        """They must not migrate into the helper: the pairwise
+        anchor-collision regression reads every filer's anchor FROM ITS OWN
+        HOME, which is what makes a colliding rename fail a test instead of
+        going silent in production."""
+        assert write_triage._ANCHOR_TASK_ID == 'write-triage-fail-open'
+        assert write_triage._AGENT_ROLE == 'fused-memory/write-triage'
+        assert write_triage._CATEGORY == 'write_triage_fail_open_storm'
+        assert write_triage._PRD_PATH == (
+            'docs/prds/memory-write-path-convergence.md'
+        )
+
+    def test_the_detail_construction_stays_in_THIS_module(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-write-triage-fail-open-1'
+
+        monkeypatch.setattr(write_triage, 'file_folded_escalation', _spy)
+
+        write_triage.emit_triage_fail_open_storm_escalation(
+            str(tmp_path), {'count': 7, 'window_seconds': 120},
+        )
+
+        assert write_triage._PRD_PATH in seen['detail']
+        assert 'write_triage' in seen['log_label']
