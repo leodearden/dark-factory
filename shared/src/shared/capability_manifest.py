@@ -292,6 +292,9 @@ class ManifestTask(BaseModel):
       registry, named in the repo's canonical qualified
       ``"project_id:task_id"`` form (``docs/task-authoring.md`` §3.2, the
       same spelling as ``metadata.external_deps``), e.g. ``"reify:5613"``.
+      NORMALISED ON VALIDATE to ``ExternalDep.render()``'s canonical
+      spelling, so the stored value is always JOIN-SAFE against an
+      ``external_deps`` entry (see the validator below).
       ``commit_planning`` never stamps such a block: its step-4 write-back
       only touches labels present in the batch being committed, and a
       foreign producer is by construction not in a dark-factory batch.
@@ -342,13 +345,26 @@ class ManifestTask(BaseModel):
         # split/strip check here. Re-raised so the message names the
         # offending label, which ExternalDep cannot know.
         try:
-            ExternalDep.parse(self.external_task_id)
+            dep = ExternalDep.parse(self.external_task_id)
         except ValueError as exc:
             raise ValueError(
                 f'ManifestTask {self.label!r}: malformed external_task_id '
                 f'{self.external_task_id!r}; expected the qualified '
                 f'"project_id:task_id" form (e.g. "reify:5613"). {exc}'
             ) from exc
+        # NORMALISE rather than store verbatim. ExternalDep.parse STRIPS
+        # before splitting, so ' reify:5613 ' is well-formed but is NOT
+        # equal to the 'reify:5613' a task's metadata.external_deps
+        # carries. Every consumer treats this field as an OPAQUE KEY --
+        # the live-corpus test compares it with ==, and the field is
+        # documented as the same spelling as external_deps -- so a
+        # non-canonical stored value would make any future join between a
+        # manifest block and its producer's external_deps silently MISS.
+        # Normalising here (rather than rejecting the padded form) keeps
+        # the parser's own tolerance intact while making the stored string
+        # the one thing callers may rely on. parse(s).render() == s holds
+        # for the canonical form, so this is idempotent.
+        self.external_task_id = dep.render()
         return self
 
 

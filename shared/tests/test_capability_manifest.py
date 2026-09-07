@@ -476,13 +476,15 @@ class TestManifestTask:
         with pytest.raises(ValidationError):
             ManifestTask(label='α', task_id='not-an-int', capabilities=[])  # type: ignore[arg-type]
 
-    def test_external_task_id_accepted_verbatim(self):
+    def test_external_task_id_accepted_in_canonical_form(self):
         """A block whose producer lives in ANOTHER project's registry.
 
         The value is the repo's canonical qualified form
-        (``"project_id:task_id"``, docs/task-authoring.md §3.2) and is
-        exposed verbatim — the model validates the wire form, it does not
-        rewrite it.
+        (``"project_id:task_id"``, docs/task-authoring.md §3.2). An
+        already-canonical value round-trips unchanged, which is what makes
+        the normalisation in ``_check_producer_binding`` idempotent — see
+        ``test_external_task_id_surrounding_whitespace_normalised`` for the
+        non-canonical input it exists for.
         """
         task = ManifestTask(label='η', external_task_id='reify:5613', capabilities=[])
         assert task.external_task_id == 'reify:5613'
@@ -541,16 +543,34 @@ class TestManifestTask:
         assert repr(value) in message
         assert 'η' in message
 
-    def test_external_task_id_surrounding_whitespace_accepted(self):
-        """Whitespace the shared parser tolerates is tolerated here too.
+    def test_external_task_id_surrounding_whitespace_normalised(self):
+        """Whitespace the shared parser tolerates is ACCEPTED and normalised away.
 
         ``ExternalDep.parse`` strips before splitting, so this is a
-        well-formed value. It is stored verbatim — the model validates the
-        wire form, it does not normalise it (``parse(s).render() == s``
-        holds for the stripped form; see ExternalDep's own docstring).
+        well-formed value and validation must not reject it. But it is NOT
+        stored verbatim: every consumer treats this field as an opaque key
+        (the live-corpus test compares it with ``==``, and the docstring
+        promises the same spelling as ``metadata.external_deps``), so a
+        padded value would make any join against an ``external_deps``
+        entry silently miss. The model stores ``ExternalDep.render()``'s
+        canonical spelling instead, which is the one form callers may rely
+        on.
         """
         task = ManifestTask(label='η', external_task_id=' reify:5613 ', capabilities=[])
-        assert task.external_task_id == ' reify:5613 '
+        assert task.external_task_id == 'reify:5613'
+
+    def test_external_task_id_normalisation_is_idempotent(self):
+        """Re-validating a stored value is a no-op, so a round-trip is stable.
+
+        ``manifest_stamping``'s write-back re-dumps and the corpus sweep
+        re-loads; if normalisation were not idempotent, a sidecar would
+        churn on every pass.
+        """
+        once = ManifestTask(label='η', external_task_id=' reify:5613 ', capabilities=[])
+        twice = ManifestTask(
+            label='η', external_task_id=once.external_task_id, capabilities=[]
+        )
+        assert twice.external_task_id == once.external_task_id == 'reify:5613'
 
     def test_empty_label_rejected(self):
         with pytest.raises(ValidationError) as exc_info:
