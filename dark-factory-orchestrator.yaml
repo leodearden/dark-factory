@@ -798,6 +798,34 @@ type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx
 verify_command_timeout_secs: 3600
 verify_cold_command_timeout_secs: 5400
 
+# Pre-turn-1 startup grace (Leo, 2026-09-07; esc-4444-3 cluster).
+# RAISED 120 -> 450, matching reify's already-ruled value.
+#
+# WHY. Six of the seven members of the 2026-09-03 dispatch-failure cluster were
+# NOT an upstream 529 — they were pre-turn-1 kills landing at 120600-120835ms,
+# i.e. within ~250ms of this fixed 120s wall clock. Failures clustered that
+# tightly around a fixed budget are watchdog behaviour, not variable-API
+# behaviour. The agent never produced a turn, so it never read its task, and the
+# kill destroys the evidence that would distinguish a genuine hang from CPU
+# starvation. This host runs at CPU PSI ~52% (some avg10) with runqueue >100 on
+# 32 cores, so 120s of wall clock is routinely not 120s of scheduled CPU.
+#
+# COST OF BEING WRONG is bounded and small, per reify's identical ruling: a
+# genuine from-source-build / uv / MCP-startup wedge now burns 450s instead of
+# 120s before the kill. That is cheap against the alternative measured here — a
+# terminal BLOCKED task plus an L2 escalation plus a human unblock session,
+# because the planning path has no retry for this shape.
+#
+# NOT the whole fix. This widens a fixed budget; it does not make the budget
+# load-aware, and it does not fix the stderr naming the wrong bound. Task 3326
+# ("Watchdog two-regime startup grace") owns both halves and remains pending.
+#
+# Green-tier: timeouts.startup_grace_secs is in RELOADABLE_FIELDS via
+# _submodel_leaf_paths('timeouts', TimeoutsConfig). Applies via the escalation
+# MCP's reload_config, no restart.
+timeouts:
+  startup_grace_secs: 450
+
 # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3). On a COLD verify
 # worktree the shared workspace .venv is populated only as a SIDE EFFECT of the
 # TEST leg running `uv run pytest` in each member. The full-repo-scope root LINT
