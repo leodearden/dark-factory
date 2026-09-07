@@ -98,8 +98,8 @@ class TestHandleAuthFailure:
 class TestAuthFailedPersistsResetsAt:
     """auth_failed event details carry the parsed resets_at when the reason
     text contains a "resets …" phrase. Source of truth for cap-time parsing
-    is the gate's _parse_resets_at; the dashboard reads what we persist
-    rather than re-parsing the reason string itself.
+    is shared.invocation_outcome._parse_resets_at; the dashboard reads what we
+    persist rather than re-parsing the reason string itself.
 
     DECIDED SHAPE (task 4042) — do not "helpfully" re-disable this branch.
     Restoring the 401/403 response-body snippet re-armed the ``'resets' in
@@ -112,11 +112,13 @@ class TestAuthFailedPersistsResetsAt:
          regression (93baf1193a < b68eea415b), so suppressing it would invent
          new behaviour.
       2. An UNPARSEABLE "resets" hint persists NOTHING rather than a fabricated
-         hour. The branch's original parser was the forked
-         ``usage_gate._parse_resets_at``, which returns ``now + 1h`` on parse
-         failure; the dashboard (``dashboard/data/costs.py::_extract_resets_at``)
-         surfaces the persisted value verbatim as a real reset ETA, so that
-         would put a fabricated recovery time on a revoked token — violating
+         hour. The branch's original parser WAS the forked
+         ``usage_gate._parse_resets_at``, which returned ``now + 1h`` on parse
+         failure (task 4042 moved the call site off it; task 4357 retired the
+         fork itself). The dashboard
+         (``dashboard/data/costs.py::_extract_resets_at``) surfaces the
+         persisted value verbatim as a real reset ETA, so a fabricated one
+         would put an invented recovery time on a revoked token — violating
          PRD 7.1.a ("an unknown reset time must be reported as explicitly
          unknown, never fabricated").
     """
