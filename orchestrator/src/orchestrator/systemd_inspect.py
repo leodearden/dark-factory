@@ -36,6 +36,31 @@ logger = logging.getLogger(__name__)
 _INSPECT_TIMEOUT_SECS: float = 10.0
 
 
+def _wedged_unit_sentinel() -> dict:
+    """The MainPID=0 degradation sentinel, in ONE place (task 4157).
+
+    Returned by :func:`inspect_systemd_unit` whenever it cannot obtain a
+    trustworthy reading — the task-2091 ``communicate()`` timeout, and (task
+    4157) a subprocess SPAWN failure. ``DeterministicRunner._inspect_unit_guarded``
+    returns it too, for an injected inspector that raises past this module.
+
+    A FACTORY returning a fresh dict, deliberately NOT a module-level constant:
+    callers do not merely read the result, they retain and embed it —
+    ``_enrich_deploy_state_baseline`` persists baseline-derived values into
+    ``deploy_state``, the baseline gate interpolates it into an escalation
+    detail, and ``_capturing_inspector`` stashes it into ``captured['new_state']``
+    for ``done_provenance``. A shared mutable dict would let any future
+    in-place mutation along one of those paths corrupt every other call site's
+    view, including across tasks in the same process.
+    """
+    return {
+        'MainPID': 0,
+        'ActiveState': '',
+        'ActiveEnterTimestamp': '',
+        'ActiveEnterTimestampMonotonic': 0,
+    }
+
+
 async def inspect_systemd_unit(
     unit: str,
     *,
@@ -47,13 +72,41 @@ async def inspect_systemd_unit(
     Returns a dict with at minimum: MainPID (int), ActiveState (str),
     ActiveEnterTimestamp (str), ActiveEnterTimestampMonotonic (int).
     Integers default to 0 on parse failure (sentinel-safe).
+
+    Never raises on a systemd-side failure: BOTH degradation modes — a
+    subprocess SPAWN failure (task 4157: missing ``systemctl``, or a fork
+    failure under resource pressure) and a ``communicate()`` timeout (task
+    2091: systemd busy/hung) — return :func:`_wedged_unit_sentinel`'s
+    MainPID=0 / ActiveState='' dict instead. That sentinel is rejected
+    downstream rather than trusted, so a degraded reading fails closed: see
+    the branch comment below.
+
+    A non-``OSError`` spawn failure (e.g. ``NotImplementedError`` from an
+    event loop with no subprocess support) is deliberately NOT caught — it
+    signals a broken runtime, not a degraded systemd, and a sentinel would
+    lie about the unit's state.
     """
-    proc = await asyncio.create_subprocess_exec(
-        'systemctl', '--user', 'show', unit,
-        '-p', 'MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic',
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'systemctl', '--user', 'show', unit,
+            '-p', 'MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        # Task 4157: the spawn itself can fail — a missing/unresolvable
+        # `systemctl` (FileNotFoundError) or a fork failure under resource
+        # pressure (EMFILE/ENOMEM, PermissionError). This `await` was
+        # previously OUTSIDE any try, so such an OSError escaped raw past
+        # DeterministicRunner.run()'s "always returns BLOCKED, never a raw
+        # exception" contract and past the escalations an operator needs.
+        # Converge on the SAME sentinel the timeout branch returns below, so
+        # both degradation modes are indistinguishable to every consumer.
+        logger.warning(
+            'systemctl show %s could not be spawned (%r) — returning MainPID=0 sentinel',
+            unit, exc,
+        )
+        return _wedged_unit_sentinel()
     try:
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_secs,
@@ -85,12 +138,12 @@ async def inspect_systemd_unit(
         # pid > 0) — run()'s baseline capture additionally checks
         # ActiveState=='' to catch a wedged baseline before the deploy
         # is even attempted.
-        return {
-            'MainPID': 0,
-            'ActiveState': '',
-            'ActiveEnterTimestamp': '',
-            'ActiveEnterTimestampMonotonic': 0,
-        }
+        #
+        # Task 4157: the spawn-failure branch above converges on this same
+        # sentinel, so BOTH degradation modes are rejected by those two
+        # downstream checks identically — one sentinel, one definition
+        # (`_wedged_unit_sentinel`), one set of consumers to reason about.
+        return _wedged_unit_sentinel()
     result: dict = {}
     for line in (stdout or b'').decode(errors='replace').splitlines():
         if '=' in line:
