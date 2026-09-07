@@ -1149,6 +1149,10 @@ class TestListIndicesColumnBinding:
         assert records[0]['field'] == ['uuid']
         assert records[0]['type'] == {'uuid': ['RANGE']}
         assert records[0]['entity_type'] == 'RELATIONSHIP'
+        # `status` sits at position 0 in this reordered header and at 7 in the
+        # live one -- the assertion a positional read cannot pass, and the whole
+        # reason status is resolved through resolve_header_positions (task 4777).
+        assert records[0]['status'] == 'OPERATIONAL'
 
     @pytest.mark.asyncio
     async def test_missing_required_column_raises_naming_it_and_the_header(
@@ -1169,6 +1173,52 @@ class TestListIndicesColumnBinding:
 
         message = str(excinfo.value)
         assert 'entitytype' in message
+        assert 'label' in message  # the header it actually saw is named
+
+    @pytest.mark.asyncio
+    async def test_status_is_exposed_as_a_record_key(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The readiness column the production settle barrier reads (task 4777).
+
+        ``_await_index_catalog_settled`` consumes it through
+        ``falkor_indices.unsettled_index_statuses``.  Resolving it HERE rather
+        than in a new reader is what keeps the by-name column resolution in one
+        place: task 4777 forbids a fourth hand-rolled ``CALL db.indexes()``
+        header walk.
+        """
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([LIVE_ROW_RELATES_TO], header=LIVE_HEADER)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        records = await backend.list_indices(group_id='test')
+
+        assert records[0]['status'] == 'OPERATIONAL'
+
+    @pytest.mark.asyncio
+    async def test_missing_status_column_raises_naming_it(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """``status`` is now a REQUIRED column, and fails closed like the others.
+
+        A FalkorDB shape change that drops it must fail loudly in
+        ``resolve_header_positions`` rather than silently disarm the settle
+        barrier by making every record look unreadable — or, worse, readable.
+        Mirrors ``test_missing_required_column_raises_naming_it_and_the_header``.
+        """
+        header_without_status = [c for c in LIVE_HEADER if c[1] != 'status']
+        row_without_status = [
+            v for i, v in enumerate(LIVE_ROW_RELATES_TO) if LIVE_HEADER[i][1] != 'status'
+        ]
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([row_without_status], header=header_without_status)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        with pytest.raises(IndexHeaderShapeError) as excinfo:
+            await backend.list_indices(group_id='test')
+
+        message = str(excinfo.value)
+        assert 'status' in message
         assert 'label' in message  # the header it actually saw is named
 
     @pytest.mark.asyncio
