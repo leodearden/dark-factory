@@ -987,6 +987,12 @@ def _create_plan(
     # this function is ever entered. The instruction above is load-bearing in
     # the other direction now — hooking this function into _read_plan_repaired
     # would put the same damage through two mechanisms.
+    #
+    # THE BOOKKEEPING READ BELOW IS NOT A BREACH OF THAT INSTRUCTION. It goes
+    # through a plain `artifacts.read_plan()` for the same reason, and it
+    # touches exactly ONE machine-written key — the guard's own
+    # `_markup_rejections` block — and no prose field at all. Do not "simplify"
+    # it onto `_read_plan_repaired`.
     files = _coerce_files(files)
     plan = {
         'task_id': task_id,
@@ -998,6 +1004,41 @@ def _create_plan(
         'design_decisions': [],
         'reuse': [],
     }
+    try:
+        # TWO BOOKKEEPING MOVES, both required and for DIFFERENT reasons
+        # (task 4597).
+        #
+        # CARRY FORWARD, because this function overwrites plan.json WHOLESALE:
+        # a re-plan, or a second create_plan in one session, would otherwise
+        # erase a counter earned earlier — losing exactly the record it exists
+        # to keep, at the moment a reader most wants it.
+        #
+        # DRAIN, because a create_plan refused before any plan existed had no
+        # document to stamp and was buffered instead. This is the plan it was
+        # waiting for. Without it, the loudest leak shape on this server — an
+        # architect bounced repeatedly before its plan exists — would be the
+        # one case the counter could never describe.
+        #
+        # Both are MERGES, so the carried-forward and buffered blocks compose
+        # rather than one clobbering the other. Neither writes a key when there
+        # is nothing to record, so the overwhelmingly common clean path
+        # produces a document byte-identical to what it produced before.
+        existing = artifacts.read_plan()
+        carried = (
+            existing.get(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY)
+            if isinstance(existing, dict) else None
+        )
+        if carried is not None:
+            plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = carried
+        plan_markup_stamp.drain_pending(plan)
+    except Exception:
+        # BOOKKEEPING CAN NEVER FAIL A create_plan. The counter is a legibility
+        # aid; the plan is the work. Losing the count is a cost an operator
+        # absorbs, losing the plan is not.
+        logger.exception(
+            'markup stamp: could not carry the rejection counter into the new '
+            'plan for %s; the plan itself is unaffected', task_id,
+        )
     artifacts.write_plan(plan)
     return {'status': 'ok', 'task_id': task_id}
 
