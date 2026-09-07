@@ -853,6 +853,17 @@ class SessionResumeConfig(BaseModel):
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
+    Since task 3730 (PRD leaf δ) reachability OUTRANKS freshness: a durable
+    transcript archive corroborates a session on its own, so
+    ``freshness_window_secs`` is consulted only when NO archive exists, and
+    ``absolute_resume_age_secs`` is the unconditional backstop that stops that
+    from meaning "no age limit at all". A session past the backstop reports
+    ``aged_out`` — a distinct, by-design reason from ``stale``, because the two
+    are actioned differently: ``stale`` means "old, with no archive to redeem
+    it" (worth asking why the archive is missing) while ``aged_out`` means "old
+    past the point where resuming is safe regardless of reachability" (the
+    backstop working as designed).
+
     ``restore_from_archive=false`` is the NARROWER kill switch (task 3578):
     the ``_invoke`` arm site stops rehydrating a missing transcript from the
     durable archive, but eligibility, corroboration and every
@@ -908,6 +919,40 @@ class SessionResumeConfig(BaseModel):
             'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
             'absolute cap plus slack, so a sidecar is rejected only once it '
             'clearly outlives any legitimate in-flight invocation.'
+        ),
+    )
+    absolute_resume_age_secs: int = Field(
+        default=432000,
+        ge=1,
+        description=(
+            'ABSOLUTE outer bound on a recovered sidecar\'s age: past this many '
+            'seconds a session is never resumed, and the fallback event carries '
+            '"aged_out" in its data.reasons (task 3730 / PRD leaf δ, D3). '
+            'DISTINCT FROM freshness_window_secs, and the pair is what keeps '
+            '"a durable archive outranks age" from becoming "no age limit at '
+            'all": freshness applies ONLY when no durable archive exists (D2 — '
+            'an archive does not decay with wall-clock, so age is the wrong '
+            'question for a session that is still reachable), while this '
+            'backstop applies UNCONDITIONALLY, archive or not. It must '
+            'therefore sit ABOVE freshness_window_secs; below it, freshness '
+            'would be unreachable config. '
+            'A DERIVED bound, not a chosen number. Two MEASURED terms: the '
+            'longest legitimate in-flight invocation, plus the longest '
+            'observed orchestrator downtime — a sidecar\'s started_at is '
+            'stamped per invocation, so its age when the guard evaluates it is '
+            'in-flight-time-at-crash PLUS however long the orchestrator was '
+            'down before re-dispatching, and the sidecar accrues that age while '
+            'nothing runs. The derivation, the safety factor and its '
+            'measurement provenance live in '
+            'orchestrator/resume_age_bound.py::RESUME_AGE_SAFETY_FACTOR; '
+            'orchestrator/tests/test_resume_age_bound.py re-derives it against '
+            'the live runs.db every run and goes red when the fleet outgrows '
+            'it, so this default tracks measured behaviour rather than sitting '
+            'still. Default 432000 (5 days) is the 2026-09-07 requirement '
+            '(355,803s = 4.12 days) rounded up to the next whole day. Must be '
+            '>= 1: a zero or negative bound would reject every recovered '
+            'session and silently disable the feature through a knob that '
+            'reads as a tuning dial.'
         ),
     )
     max_resumes_per_task: int = Field(
@@ -5544,10 +5589,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # whole-submodel-group precedent.
     _submodel_leaf_paths('transcript_archive', TranscriptArchiveConfig),
     # Warm-lane session-resume guard (task γ) — a new dedicated submodel, same
-    # whole-submodel-group idiom as routing/chronic_flake above: the kill switch
-    # and all three ge-bounded knobs (freshness_window_secs / max_resumes_per_task
-    # / fallback_storm_threshold) are green-tier hot-reloadable with no separate
-    # RELOADABLE_FIELDS edit.
+    # whole-submodel-group idiom as routing/chronic_flake above: both kill
+    # switches (enabled / restore_from_archive) and all FIVE ge-bounded knobs
+    # (freshness_window_secs / absolute_resume_age_secs / max_resumes_per_task /
+    # fallback_storm_threshold / storm_window_secs) are green-tier
+    # hot-reloadable with no separate RELOADABLE_FIELDS edit. This comment
+    # undercounted at "all three" until task 3730; the enumeration is
+    # documentation only, since _submodel_leaf_paths reads model_fields, but a
+    # count that drifts reads as a checked claim and is not one — the check is
+    # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
