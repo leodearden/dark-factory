@@ -729,6 +729,49 @@ def wait_proof_grace_secs(spawn_timeout_secs: float) -> int:
     return max(WAIT_PROOF_GRACE_FLOOR_SECS, derived)
 
 
+def load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
+    """Scale a subprocess budget by host load-per-core, floored and capped.
+
+    The promoted, SHARED form of ``tests/scripts/test_spawn_claude.py``'s
+    module-private ``_load_scaled_grace`` (task 2733, promoted by task 4890).
+    Promoted rather than copied because ``scripts/tests/`` cannot import a
+    ``tests/scripts/`` test module -- the two test roots cannot import each
+    other's modules at all, for the reason already written down at
+    ``tests/scripts/test_orchestrator_watchdog.py::_boundary_run_drain_script``
+    -- and this module is where the cross-root helpers already live.
+
+    THE FLOOR IS THE POINT. An idle host (``loadavg_1min <= cpu_count``) gives
+    ``factor == 1.0`` exactly, and ``max(base, min(cap, ceil(base * 1.0)))``
+    is exactly ``base_secs`` for every ``base_secs <= cap_secs``. So adopting
+    this at an existing call site can only LENGTHEN that site's budget under
+    contention; it can never shorten one, and it cannot slow an unloaded run
+    by so much as a millisecond. That is what makes it safe to swap in under
+    a fixed literal without re-deriving the literal.
+
+    Capped at *cap_secs* so a pathologically loaded host stays bounded, and
+    fails safe to *base_secs* where the platform has no loadavg. Note the
+    ``max``/``min`` ORDER: a *cap_secs* below *base_secs* returns *base_secs*,
+    never the smaller cap, because callers derive caps from unrelated ceilings
+    rather than choosing them above every base.
+
+    LOAD-PER-CORE, not worker count, is the right signal for the two test
+    roots that use this: they run SERIALLY (no xdist, no random ordering), so
+    the contention that stretches their subprocess spawns is EXTERNAL -- other
+    suites' workers on the same 32-core host. A worker-count heuristic would
+    see nothing and scale by 1.
+
+    Returns an ``int``: callers stringify these budgets into env vars that
+    bash's integer operators compare, and those reject ``30.0`` -- the same
+    constraint :func:`wait_proof_grace_secs` records.
+    """
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return base_secs
+    factor = max(1.0, load1 / (os.cpu_count() or 1))
+    return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
+
+
 def _unsafe_pgid_reason(pgid: int) -> str | None:
     """Return why *pgid* is unsafe to ``killpg``, or ``None`` if it is fine.
 
