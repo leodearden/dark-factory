@@ -16,6 +16,7 @@ Step map:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -883,6 +884,112 @@ def _ofat_task_loader(path: Path) -> dict:
     return {'id': path.stem, 'project_root': '/fake', 'pre_task_commit': 'x'}
 
 
+# ---------------------------------------------------------------------------
+# task 4427 — ONE gate per campaign, shared by every cell of a stage fan-out.
+#
+# A stage IS the campaign: it expands fixtures × candidates × trials and fans
+# the cells out. Owning the gate there is what lets cell N+1 inherit cell N's
+# cap knowledge instead of re-leasing an account already proved capped — the
+# wall-clock win φ's failover was added for, which a per-cell gate forfeits.
+#
+# _build_eval_usage_gate MUST be patched in these: base_config is a REAL config
+# whose packaged default is usage_cap.enabled=true, so the unpatched builder
+# would construct a live UsageGate (probe dirs, account state, a SIGHUP handler).
+# ---------------------------------------------------------------------------
+
+_GATE_ARG_MISSING = object()
+
+
+class _CampaignGateProbe:
+    """Records the ``usage_gate=`` every cell of a fan-out was handed.
+
+    Each fake executor also asserts, AT CALL TIME, that the gate has not been
+    shut down yet. That is the only way to distinguish "torn down once after the
+    fan-out" (correct) from "torn down between cells" (which would leave later
+    cells running against a dead gate) — an after-the-fact
+    ``assert_awaited_once`` cannot tell those apart.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, gate=None):
+        from orchestrator.evals import runner
+
+        self._runner = runner
+        self._monkeypatch = monkeypatch
+        self.gate = gate
+        self.seen: list = []
+        self.build = AsyncMock(return_value=gate)
+        monkeypatch.setattr(runner, '_build_eval_usage_gate', self.build)
+        monkeypatch.setattr(runner, 'load_task', _ofat_task_loader)
+
+    def install(self, *executor_names: str, fail_on: str | None = None,
+                cancel_on: str | None = None):
+        """Patch each named executor with the recording fake."""
+        async def fake(task_path, *args, trial=1,
+                       usage_gate=_GATE_ARG_MISSING, **_kwargs):
+            self.seen.append(usage_gate)
+            if self.gate is not None:
+                assert self.gate.shutdown.await_count == 0, (
+                    'the campaign gate was torn down while cells were still '
+                    'running — later cells would be left without failover'
+                )
+            if cancel_on is not None and cancel_on in task_path.stem:
+                raise asyncio.CancelledError()
+            if fail_on is not None and fail_on in task_path.stem:
+                raise RuntimeError('boom in one cell')
+            label = getattr(args[0], 'name', 'cell') if args else 'cell'
+            return EvalResult(task_path.stem, label, 'done', {}, '/tmp/wt',
+                              trial=trial)
+
+        for name in executor_names:
+            self._monkeypatch.setattr(self._runner, name, fake)
+
+
+def _distinct_gates(probe: _CampaignGateProbe) -> set[int]:
+    return {id(g) for g in probe.seen}
+
+
+async def _assert_one_gate_serves_every_cell(probe: _CampaignGateProbe, stage):
+    await stage()
+
+    # ONE build for the whole fan-out, however many cells it expanded to.
+    probe.build.assert_awaited_once()
+    assert len(probe.seen) > 1, 'the case must fan out to several cells'
+    # …and literally the same object in every cell: one cap-state view.
+    assert _distinct_gates(probe) == {id(probe.gate)}
+    # Torn down exactly once, and (per the in-cell assert above) only after the
+    # last cell returned.
+    probe.gate.shutdown.assert_awaited_once()
+
+
+async def _assert_teardown_survives_a_failing_cell(probe: _CampaignGateProbe, stage):
+    results = await stage()
+
+    # The surviving cells still completed (the pre-existing continue-on-failure
+    # contract is untouched) and the gate is still torn down exactly once.
+    assert results, 'the non-failing cells must still return their results'
+    probe.gate.shutdown.assert_awaited_once()
+
+
+async def _assert_teardown_survives_cancellation(probe: _CampaignGateProbe, stage):
+    with pytest.raises(asyncio.CancelledError):
+        await stage()
+
+    # Cancellation still propagates AND the gate is torn down — no leaked probe
+    # loop on the SIGINT path, which is the one an operator actually takes.
+    probe.gate.shutdown.assert_awaited_once()
+
+
+async def _assert_a_degraded_campaign_stays_ungated(probe: _CampaignGateProbe, stage):
+    await stage()
+
+    # Built once, degraded to None — and every cell is told so EXPLICITLY. A
+    # cell that received no argument would build its own gate, restoring the
+    # per-cell construction the hoist removes.
+    probe.build.assert_awaited_once()
+    assert len(probe.seen) > 1
+    assert probe.seen == [None] * len(probe.seen)
+
+
 @pytest.mark.asyncio
 class TestRunOfatStage:
     async def test_dispatches_each_candidate_by_role_over_every_cell(
@@ -957,6 +1064,75 @@ class TestRunOfatStage:
         assert len(results) == 1
         assert results[0].task_id == 'df_task_ok'
         assert any('failed' in r.message.lower() for r in caplog.records)
+
+    # --- task 4427: the OFAT stage owns ONE gate for the whole screen -------
+
+    def _cells(self, tmp_path: Path):
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+        return [t1, t2], [
+            EvalConfig('claude-opus-high', 'claude', 'opus', 'high'),
+            EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high',
+                       role='architect'),
+            EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge'),
+        ]
+
+    def _stage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe, **kw):
+        from orchestrator.evals import runner
+
+        paths, candidates = self._cells(tmp_path)
+        probe.install('run_eval', 'run_architect_eval', **kw)
+        base = _base_config(tmp_path)
+
+        async def stage():
+            return await runner.run_ofat_stage(
+                paths, candidates, base_config=base, trials=2,
+            )
+        return stage
+
+    async def test_one_gate_serves_every_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_one_gate_serves_every_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
+        # All three role branches (implementer / architect / judge-via-run_eval)
+        # ride the same gate — the judge branch pins JUDGE_OFAT_IMPLEMENTER_PIN
+        # as its config and would be easy to miss when threading.
+        assert len(probe.seen) == 2 * 3 * 2  # fixtures × candidates × trials
+
+    async def test_teardown_survives_a_failing_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_a_failing_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe, fail_on='df_task_a'),
+        )
+
+    async def test_teardown_survives_cancellation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_cancellation(
+            probe, self._stage(tmp_path, monkeypatch, probe, cancel_on='df_task_a'),
+        )
+
+    async def test_a_degraded_campaign_stays_ungated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        probe = _CampaignGateProbe(monkeypatch, None)
+        await _assert_a_degraded_campaign_stays_ungated(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1080,6 +1256,70 @@ class TestRunOfatStageJudge:
 
 @pytest.mark.asyncio
 class TestRunMatrixStage:
+
+    def _invoke(self, runner, paths, base):
+        arch_survivors = [
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
+            EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect'),
+        ]
+        impl_survivors = [EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')]
+
+        async def stage():
+            return await runner.run_matrix_stage(
+                paths, arch_survivors, impl_survivors, base_config=base, trials=2,
+            )
+        return stage
+
+    # --- task 4427: the stage owns ONE gate for the whole fan-out ----------
+
+    def _stage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe, **kw):
+        from orchestrator.evals import runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+        probe.install('run_end_to_end', **kw)
+        base = _base_config(tmp_path)
+        return self._invoke(runner, [t1, t2], base)
+
+    async def test_one_gate_serves_every_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_one_gate_serves_every_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
+
+    async def test_teardown_survives_a_failing_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_a_failing_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe, fail_on='df_task_a'),
+        )
+
+    async def test_teardown_survives_cancellation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_cancellation(
+            probe, self._stage(tmp_path, monkeypatch, probe, cancel_on='df_task_a'),
+        )
+
+    async def test_a_degraded_campaign_stays_ungated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        probe = _CampaignGateProbe(monkeypatch, None)
+        await _assert_a_degraded_campaign_stays_ungated(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
     async def test_runs_end_to_end_over_full_cross_product_incl_diagonal(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
@@ -1185,6 +1425,68 @@ class TestRunMatrixStage:
 
 @pytest.mark.asyncio
 class TestRunConfirmStage:
+
+    def _invoke(self, runner, paths, base):
+        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high',
+                                 role='architect')
+        impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
+
+        async def stage():
+            return await runner.run_confirm_stage(
+                paths, arch_winner, impl_winner, base_config=base, trials=3,
+            )
+        return stage
+
+    # --- task 4427: the stage owns ONE gate for the whole fan-out ----------
+
+    def _stage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe, **kw):
+        from orchestrator.evals import runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+        probe.install('run_end_to_end', **kw)
+        base = _base_config(tmp_path)
+        return self._invoke(runner, [t1, t2], base)
+
+    async def test_one_gate_serves_every_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_one_gate_serves_every_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
+
+    async def test_teardown_survives_a_failing_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_a_failing_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe, fail_on='df_task_a'),
+        )
+
+    async def test_teardown_survives_cancellation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_cancellation(
+            probe, self._stage(tmp_path, monkeypatch, probe, cancel_on='df_task_a'),
+        )
+
+    async def test_a_degraded_campaign_stays_ungated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        probe = _CampaignGateProbe(monkeypatch, None)
+        await _assert_a_degraded_campaign_stays_ungated(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
     async def test_runs_single_winning_combo_over_fixtures_and_trials(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):

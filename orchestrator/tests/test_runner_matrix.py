@@ -14,7 +14,7 @@ import logging
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -465,6 +465,158 @@ class TestRunEvalMatrixCancellation:
         assert isinstance(exc_val, asyncio.CancelledError), (
             f'Expected exc_val to be CancelledError instance, got {exc_val!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4427 — run_eval_matrix owns ONE gate for the whole matrix.
+#
+# The matrix is a campaign: it expands task_paths × configs × trials in one
+# process. A per-cell gate makes cell N+1 re-lease the account cell N already
+# proved capped; one campaign-level gate gives every cell a single cap-state
+# view. The gate must outlive the asyncio.wait monitor loop INCLUDING its
+# sibling-cancellation drain, so no probe loop leaks on the SIGINT path.
+# ---------------------------------------------------------------------------
+
+_GATE_ARG_MISSING = object()
+
+
+def _matrix_base_config(tmp_path: Path):
+    """A real config via load_config (mirrors test_eval_driver._base_config).
+
+    Must be non-None: ``campaign_usage_gate(None)`` is deliberately ungated, so
+    a None base_config would never build a gate to observe.
+    """
+    from orchestrator.config import load_config
+
+    cfg_path = tmp_path / 'orchestrator.yaml'
+    cfg_path.write_text(f'project_root: {tmp_path}\n')
+    return load_config(cfg_path)
+
+
+class _MatrixGateProbe:
+    """Records the ``usage_gate=`` every matrix cell was handed.
+
+    The fake also asserts AT CALL TIME that the gate is not yet shut down —
+    an after-the-fact ``assert_awaited_once`` cannot distinguish "torn down once
+    after the matrix" from "torn down between cells", which would leave later
+    cells running against a dead gate.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, gate=None):
+        self.gate = gate
+        self.seen: list = []
+        self.build = AsyncMock(return_value=gate)
+        monkeypatch.setattr(runner_mod, '_build_eval_usage_gate', self.build)
+        self._monkeypatch = monkeypatch
+
+    def install(self, *, cancel_on: str | None = None, fail_on: str | None = None):
+        async def fake_run_eval(task_path, config, *_a, trial=1,
+                                usage_gate=_GATE_ARG_MISSING, **_k):
+            self.seen.append(usage_gate)
+            if self.gate is not None:
+                assert self.gate.shutdown.await_count == 0, (
+                    'the campaign gate was torn down while cells were still '
+                    'running — later cells would be left without failover'
+                )
+            if cancel_on is not None and cancel_on in task_path.stem:
+                raise asyncio.CancelledError()
+            if fail_on is not None and fail_on in task_path.stem:
+                raise RuntimeError('simulated failure')
+            return EvalResult(task_path.stem, config.name, 'done', {}, '/tmp/stub',
+                              trial=trial)
+
+        self._monkeypatch.setattr(runner_mod, 'run_eval', fake_run_eval)
+
+
+@pytest.mark.asyncio
+class TestRunEvalMatrixCampaignGate:
+    """One gate for the whole matrix, torn down once after the fan-out."""
+
+    def _paths(self, tmp_path: Path) -> list[Path]:
+        a, b = tmp_path / 'task_a.json', tmp_path / 'task_b.json'
+        a.touch()
+        b.touch()
+        return [a, b]
+
+    async def test_one_gate_serves_every_cell(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _MatrixGateProbe(monkeypatch, make_gate_mock())
+        probe.install()
+
+        await run_eval_matrix(
+            self._paths(tmp_path), [_CFG], _matrix_base_config(tmp_path),
+            trials=2, force=True,
+        )
+
+        # ONE build for the whole matrix, however many cells it expanded to…
+        probe.build.assert_awaited_once()
+        assert len(probe.seen) == 2 * 1 * 2  # fixtures × configs × trials
+        # …literally the same object in every cell (one cap-state view)…
+        assert {id(g) for g in probe.seen} == {id(probe.gate)}
+        # …torn down exactly once, and only after the last cell returned.
+        probe.gate.shutdown.assert_awaited_once()
+
+    async def test_teardown_survives_a_failing_cell(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _MatrixGateProbe(monkeypatch, make_gate_mock())
+        probe.install(fail_on='task_a')
+
+        results = await run_eval_matrix(
+            self._paths(tmp_path), [_CFG], _matrix_base_config(tmp_path),
+            force=True,
+        )
+
+        # log-and-continue is untouched, and the gate still comes down once.
+        assert [r.task_id for r in results] == ['task_b']
+        probe.gate.shutdown.assert_awaited_once()
+
+    async def test_teardown_survives_cancellation(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ):
+        """The SIGINT path is the one an operator actually takes.
+
+        The gate must outlive the sibling-cancellation drain and still be torn
+        down on the way out, or an aborted campaign leaks a live probe loop into
+        whatever runs next in the process.
+        """
+        from shared.testing import make_gate_mock
+
+        probe = _MatrixGateProbe(monkeypatch, make_gate_mock())
+        probe.install(cancel_on='task_a')
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_eval_matrix(
+                self._paths(tmp_path), [_CFG], _matrix_base_config(tmp_path),
+                force=True,
+            )
+
+        probe.gate.shutdown.assert_awaited_once()
+
+    async def test_a_degraded_campaign_stays_ungated(
+        self, patch_load_task, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ):
+        """A campaign that degraded to ungated must not have cells rebuild.
+
+        Every cell is told ``usage_gate=None`` EXPLICITLY; a cell that received
+        no argument at all would build its own gate, silently restoring the
+        per-cell construction the hoist removes.
+        """
+        probe = _MatrixGateProbe(monkeypatch, None)
+        probe.install()
+
+        await run_eval_matrix(
+            self._paths(tmp_path), [_CFG], _matrix_base_config(tmp_path),
+            trials=2, force=True,
+        )
+
+        probe.build.assert_awaited_once()
+        assert probe.seen == [None] * 4
 
 
 @pytest.mark.asyncio
