@@ -1954,6 +1954,123 @@ class TestScanSurvivesRecordArchivedMidScan:
         assert found.id == 'esc-4176-1', f'wrong record returned: {found.id!r}'
 
 
+class TestGetRetriesRelocationBetweenLocateAndRead:
+    """Task 5118, workstream A: ``get()`` must retry, not raise or return
+    ``None``, when the archive sweep relocates the record between
+    ``_locate_path`` and ``read_text``.
+
+    Unlike the glob-then-read scans above (``get_by_task``, ``get_pending``,
+    ``find_terminal_by_citation``), ``get()`` is ``_locate_path``-then-read:
+    its blast radius is the single record the caller asked about, and the
+    correct repair is re-locate-and-retry rather than "skip and continue" —
+    the record MOVED, it did not vanish.
+    """
+
+    def test_get_recovers_a_record_relocated_between_locate_and_read(
+        self, tmp_path: Path, caplog,
+    ):
+        """RED on main: ``FileNotFoundError`` escapes ``get()`` entirely
+        once ``_locate_path`` has already returned the (about to be stale)
+        root path.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            result = queue.get('esc-1-1')
+
+        # (a) The record is recovered, not lost — the retry's fresh
+        # _locate_path call finds it at its new archive location.
+        assert result is not None, 'expected the relocated record to be recovered'
+        assert result.id == 'esc-1-1'
+
+        # (b) Loud enough to audit: the retry is named at DEBUG.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any('esc-1-1' in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG mentioning esc-1-1; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+        # (c) ...but not loud enough to cry wolf — a mid-read relocation is
+        # expected concurrency, not corruption.
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not loud, (
+            f'Expected no WARNING-or-above for a benign relocation; got: '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+
+    def test_get_returns_none_for_a_record_genuinely_deleted_mid_read(
+        self, tmp_path: Path,
+    ):
+        """A record deleted (not relocated) mid-read must still resolve to
+        ``None`` after the retry — no raise, no infinite loop.
+
+        Distinguishes real relocation (recoverable via re-locate) from real
+        deletion (genuinely gone): the interposition here unlinks the file
+        outright instead of moving it into the archive tree, so the retry's
+        fresh ``_locate_path`` call finds nothing anywhere and must fall back
+        to ``None`` cleanly.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        original_read_text = Path.read_text
+
+        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                doomed.unlink()
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', deleting_read_text):
+            result = queue.get('esc-1-1')
+
+        assert result is None
+
+    def test_get_propagates_a_present_but_unreadable_record(
+        self, tmp_path: Path,
+    ):
+        """A present-but-unreadable record must still raise — boundary pin
+        against the fix over-catching.
+
+        GREEN on main already (the un-fixed ``get()`` never caught
+        ``OSError`` either). Proves the retry loop's handler catches
+        ``FileNotFoundError`` only, never bare ``OSError``: a genuine
+        EACCES/EIO fault must not be degraded into the treatment a routine
+        archival gets (silently retried and then swallowed to ``None``).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        flaky = unreadable_read_text(doomed)
+
+        with patch.object(Path, 'read_text', flaky):
+            with pytest.raises(PermissionError):
+                queue.get('esc-1-1')
+
+    def test_get_returns_none_for_a_genuinely_nonexistent_id(self, tmp_path: Path):
+        """An id that never existed still resolves to ``None`` (no retry
+        machinery regression on the ordinary not-found path)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        assert queue.get('esc-1-999') is None
+
+
 class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
