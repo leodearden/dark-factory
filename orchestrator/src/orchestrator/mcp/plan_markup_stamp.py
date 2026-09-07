@@ -116,6 +116,12 @@ _FACT_COPIED_KEYS: tuple[str, ...] = ('tool', 'param', 'outcome')
 #: this document cold. Deliberately STATIC: interpolating counts or tool names
 #: would put caller-adjacent text into a field whose whole justification is that
 #: it holds none, and would duplicate numbers that sit two keys away.
+#: What the sink returns when it buffered instead of writing. A locator, so the
+#: emitter's "path or ``None``" contract still distinguishes "recorded" from
+#: "lost" — but deliberately NOT a filesystem path, since none was touched and
+#: naming one would be a lie a caller could act on.
+_PENDING_LOCATOR = 'pending:markup-rejections'
+
 STAMP_NOTE = (
     'Machine-written by the plan-tools markup guard. Each event is one tool '
     'call this plan refused because its arguments carried leaked tool-call '
@@ -342,6 +348,81 @@ def summary(plan: object) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# The pending buffer — refusals that arrive before any plan exists.
+# ---------------------------------------------------------------------------
+#
+# A refused ``create_plan`` has no document to stamp, and the middleware's own
+# docs name the case ("a plan-tools create_plan refused before any plan
+# exists"). Stamping one anyway would MANUFACTURE a plan out of a refusal — a
+# document with no task_id, no title and no analysis — which every later reader
+# would inherit as the architect's own work, and would break the standing
+# ``test_no_plan_is_written`` pin. Dropping it instead would leave the LOUDEST
+# leak shape on this server (an architect bounced repeatedly before its plan
+# exists) as the one case the counter can never describe.
+#
+# So it is held here and adopted by the plan ``_create_plan`` is about to write.
+#
+# PROCESS-GLOBAL STATE IS THE ESTABLISHED SHAPE HERE, not an invention:
+# ``plan_tools._REPORTED_REFUSALS`` is exactly this, with an autouse fixture
+# clearing it per test — which a consumer of THIS buffer must do too, or one
+# test's buffered refusal inflates the next one's count.
+#
+# THE SCOPE ARGUMENT. One plan-tools stdio subprocess is one agent session, and
+# that is precisely the span of "this architect's lost calls" — the question
+# the block exists to answer. A narrower scope would lose the pre-plan
+# refusals; a wider one would attribute another agent's losses to this plan.
+#
+# IT HOLDS A FOLDED BLOCK, not a growing list, so it inherits the same cap and
+# the same merge algebra as the on-disk block and cannot grow without bound in
+# a long-leaking session that never succeeds in creating a plan.
+_PENDING_BLOCK: dict[str, Any] | None = None
+
+
+def note_pending(event: dict[str, Any]) -> None:
+    """Hold *event* until there is a plan to fold it into."""
+    global _PENDING_BLOCK
+    _PENDING_BLOCK = (
+        block_of(event) if _PENDING_BLOCK is None
+        else merge_block(_PENDING_BLOCK, block_of(event))
+    )
+
+
+def pending_block() -> dict[str, Any] | None:
+    """The buffered block, or ``None`` when nothing is waiting."""
+    return _PENDING_BLOCK
+
+
+def clear_pending() -> None:
+    """Drop the buffer. For the autouse fixture that guards it per test."""
+    global _PENDING_BLOCK
+    _PENDING_BLOCK = None
+
+
+def drain_pending(plan: dict[str, Any]) -> dict[str, Any]:
+    """Fold the buffer into *plan* and clear it. Returns *plan*.
+
+    CLEARS on the way out, so a second ``create_plan`` in the same session — a
+    re-plan — cannot re-adopt refusals the first plan already carries.
+
+    MERGES rather than replaces, because ``_create_plan`` also carries forward
+    any block the existing document holds: the carried-forward block and the
+    buffered one are two sides of one merge, and both have to land.
+
+    Leaves *plan* UNTOUCHED when nothing is buffered. Not present-and-empty:
+    the block's PRESENCE is the whole signal, so the overwhelmingly common
+    clean path must produce a document byte-identical to what it is today.
+    """
+    global _PENDING_BLOCK
+    if _PENDING_BLOCK is None:
+        return plan
+    plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
+        plan.get(PLAN_MARKUP_REJECTIONS_KEY), _PENDING_BLOCK
+    )
+    _PENDING_BLOCK = None
+    return plan
+
+
+# ---------------------------------------------------------------------------
 # The sink — the third write-side channel on this boundary.
 # ---------------------------------------------------------------------------
 
@@ -398,6 +479,13 @@ def make_plan_stamp(
         """The blocking body, run on a worker thread."""
         event = build_event(record, now=now)
         plan = artifacts.read_plan()
+        if isinstance(plan, dict) and not plan:
+            # NO PLAN YET — ``read_plan`` returns an empty dict for a missing
+            # file. Buffer instead of writing: see ``_PENDING_BLOCK``. The
+            # locator is the buffer, not a path, because no artifact was
+            # touched and naming one would be a lie the caller could act on.
+            note_pending(event)
+            return _PENDING_LOCATOR
         if not isinstance(plan, dict):
             logger.warning(
                 'markup stamp: the plan at %s read back as %r rather than a '
