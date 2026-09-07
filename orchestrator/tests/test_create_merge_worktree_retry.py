@@ -607,3 +607,126 @@ class TestCreateMergeWorktreeRetry:
         assert adds[0][-1] == git_ops.config.main_branch, (
             f'expected the add to check out {git_ops.config.main_branch!r}; got {adds[0][-1]!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7: ENOSPC fast-fail, and a final error an operator can act on
+# ---------------------------------------------------------------------------
+
+
+class TestCreateMergeWorktreeFinalFailure:
+    """step-7: WORK items (2) and (3).
+
+    (2) A full disk must fail fast and loud — blanket-retrying it only
+    delays the operator signal by 1.5s.
+
+    (3) The final error must carry every captured stream plus the rc and the
+    attempt count. Four of the five archived occurrences carried NO cause
+    line at all, so today's ``f'...: {err}'`` left an operator with nothing
+    to act on.
+
+    RED on step-6's tree: the ENOSPC-fast-fail half is already green (the
+    predicate is wired), but every message assertion fails — today's message
+    has no rc, no stdout and no attempt count.
+    """
+
+    def test_enospc_fails_fast_and_loud(self, tmp_path: Path) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body():
+            return await git_ops._create_merge_worktree(base_sha=BASE_SHA)
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_make_fake_merge_run([(1, '', ENOSPC_3692_STDERR)], calls),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            asyncio.run(_body())
+
+        assert ENOSPC_3692_STDERR in str(exc_info.value), (
+            f'expected the ENOSPC cause to survive into the error; got {exc_info.value!s}'
+        )
+        assert len(_add_argvs(calls)) == 1, (
+            f'expected exactly ONE add attempt on a full disk; got {_add_argvs(calls)}'
+        )
+        assert mock_sleep.await_args_list == [], (
+            f'expected NO backoff on ENOSPC — 1.5s of sleeping cannot free a '
+            f'byte; got {mock_sleep.await_args_list}'
+        )
+
+    def test_error_carries_both_streams_the_rc_and_the_attempt_count(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body():
+            return await git_ops._create_merge_worktree(base_sha=BASE_SHA)
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_make_fake_merge_run(
+                    [(1, 'STDOUT-MARKER', 'STDERR-MARKER')], calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            asyncio.run(_body())
+
+        msg = str(exc_info.value)
+        # The prefix is a COMPATIBILITY CONTRACT beyond this module: three
+        # test modules construct it verbatim to simulate this failure
+        # (test_merge_queue_resolve_release.py, test_merge_queue_concurrent_verify.py)
+        # and docs/legibility/confusion-codebook.yaml keys two entries on
+        # it, so operator greps and the codebook both depend on it. Only the
+        # SUFFIX is free to change.
+        assert msg.startswith('Failed to create merge worktree: '), (
+            f'expected the load-bearing prefix to survive; got {msg!r}'
+        )
+        assert 'STDERR-MARKER' in msg, f'expected stderr in the message; got {msg!r}'
+        assert 'STDOUT-MARKER' in msg, f'expected stdout in the message; got {msg!r}'
+        assert 'rc=1' in msg, f'expected the rc in the message; got {msg!r}'
+        assert '3' in msg, f'expected the attempt count in the message; got {msg!r}'
+        assert len(_add_argvs(calls)) == 3
+
+    def test_the_4545_truncated_shape_is_now_diagnosable(self, tmp_path: Path) -> None:
+        """The archived 4545 line read only ``Failed to create merge
+        worktree: Preparing worktree (detached HEAD ae6e7e9)`` — git's
+        progress line with no cause, and neither rc nor stdout captured. An
+        operator could not tell whether git printed a fatal that was lost,
+        or never printed one at all (a signal kill, which surfaces as a
+        NEGATIVE rc). A future occurrence of that same shape must now answer
+        both questions.
+        """
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body():
+            return await git_ops._create_merge_worktree(base_sha=BASE_SHA)
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_make_fake_merge_run([(1, '', TRANSIENT_4545_STDERR)], calls),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            asyncio.run(_body())
+
+        msg = str(exc_info.value)
+        assert 'rc=1' in msg, f'expected the rc, unavailable in 4545; got {msg!r}'
+        assert TRANSIENT_4545_STDERR in msg
+        # An EMPTY stream must render visibly, distinguishing "git said
+        # nothing on stdout" from "we never captured stdout" — the exact
+        # ambiguity the archived line left unresolved.
+        assert "stdout=''" in msg, (
+            f'expected an explicitly-empty stdout rather than a collapsed '
+            f'blank; got {msg!r}'
+        )
