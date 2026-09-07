@@ -31,10 +31,12 @@ import pytest
 # test module would bind a module-scoped copy that shadows the conftest's.
 from df_pytest_isolation import (
     PIPE_CLOSING_LEAKER_SRC,
+    WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
     assert_synthetic_units,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
     fleet_dir_redirect_violation_reason,
+    load_scaled_grace,
     read_leaked_pid,
     run_in_new_session,
     synthetic_unit,
@@ -487,7 +489,30 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     # the grace must outlast the timeout (or the script force-fires mid-test and
     # the assertion below fails), and must stay small enough that a poller which
     # escapes the kill self-terminates in seconds rather than 27.8h (task 3798).
-    spawn_timeout = 3
+    # That design is what makes the load-scaling below a ONE-line change:
+    # wait_proof_grace_secs derives from this same (now scaled) binding, so the
+    # grace-outlasts-timeout invariant holds automatically at every load -- at
+    # base 3 the grace is the 30s floor, at the 22 cap it is 88, always >= 4x.
+    #
+    # BASE 3 IS PRESERVED DELIBERATELY, not widened (task 4890): load_scaled_grace
+    # floors at its base, so an unloaded run is byte-identical and this test still
+    # takes ~3s there. The cap is WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS because the
+    # grace DERIVED from this binding must stay inside
+    # LEAK_SELF_TERMINATION_CEILING_SECS -- see that constant's derivation.
+    #
+    # THE MEASURED MECHANISM (task 4218): a flat 3s had to cover bash start +
+    # script parse + the fake systemctl's python3 (list-units) + drain_check.py's
+    # own python3 before the defer `echo` in restart-all-orchestrators.sh is even
+    # reached. The one observed failure's stdout ended exactly at the preceding
+    # "Restarting 1 orchestrator unit(s)" line, which is the signature of the
+    # budget expiring before that echo. The MIRROR test in
+    # tests/scripts/test_orchestrator_watchdog.py::
+    # test_boundary4_defers_busy_unit_while_others_proceed carries a comment
+    # recording that 8s was already measured as insufficient for the same defer
+    # line under load and was raised to 20 -- this site's 3s was 2.7x tighter
+    # still. Freshness is NOT the mechanism: `classify` needs now - ts_epoch > 120
+    # for stale, unreachable inside a 3s budget.
+    spawn_timeout = load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     with pytest.raises(subprocess.TimeoutExpired) as exc_info:
         _run_script(
@@ -507,7 +532,21 @@ def test_defer_withholds_restart_while_busy(tmp_path):
     # here is how the task-3799 rename would silently half-land -- the defer
     # assertion would just stop matching the name the fixture actually used.
     assert f"deferring restart of {UNIT_R}: mid-merge" in stdout, (
-        f"expected a stable defer-prefix line; got stdout={stdout!r}"
+        f"expected a stable defer-prefix line; got stdout={stdout!r} "
+        f"stderr={_decode(exc_info.value.stderr)!r} "
+        f"(spawn_timeout={spawn_timeout}s, load-scaled from base 3). "
+        f"TWO mechanisms produce this, and their stdout is byte-identical, so "
+        f"check both before touching a number: (1) the budget expired before "
+        f"the defer `echo` was reached -- stdout ending at the preceding "
+        f"'Restarting N orchestrator unit(s)' line is the tell, and the "
+        f"remedy is the load scaling already applied here, so log the RESOLVED "
+        f"budget above and check whether it hit the cap rather than widening "
+        f"the base; (2) restart-all-orchestrators.sh coerces ANY non-zero exit "
+        f"of drain_check.py to raw=\"absent\", after which drain_await_fresh "
+        f"polls SILENTLY for up to ORCH_DRAIN_UNKNOWN_GRACE_SECS (default 120, "
+        f"deliberately left unset by this test) and prints nothing at all. "
+        f"Do NOT pin that grace to disambiguate -- it trades a silent stall "
+        f"for an equally confusing spurious restart."
     )
     state = _load_state(state_path)
     assert ["--user", "restart", UNIT_R] not in state["calls"], (
