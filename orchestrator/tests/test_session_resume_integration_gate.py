@@ -53,7 +53,12 @@ from shared.config_dir import TaskConfigDir
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig, SessionResumeConfig
+from orchestrator.config import (
+    GitConfig,
+    OrchestratorConfig,
+    SessionResumeConfig,
+    TranscriptArchiveConfig,
+)
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.harness import Harness
@@ -165,7 +170,17 @@ def _make_transcript(base: Path, session_id: str) -> Path:
     ``<entry>/.task/claude-config-*`` at boot and ``transcript_exists`` re-globs
     ``<cfg>/projects/*/<sid>.jsonl`` at dispatch — placing the transcript under
     the lane's ``.task/`` satisfies BOTH the boot glob and the dispatch re-glob,
-    so a composed recover→dispatch reaches ``(True, 'eligible')``.
+    so a composed recover→dispatch reaches the EMPTY reason set (task 3728
+    replaced the predicate's ``(True, 'eligible')`` tuple with a composite
+    ``frozenset``; ``not reasons`` is now the eligibility predicate itself).
+
+    NOTE WHAT THIS SHAPE IS AND IS NOT (task 3730). It is a LIVE config dir,
+    which production DELETES on every crash-recovery path —
+    ``TaskWorkflow.run``'s finally runs ``cleanup_config_dir`` unconditionally
+    while ``session_preserved`` keeps the sidecar. So a row built on this
+    helper exercises corroboration by the live transcript, not the state the
+    fleet actually presents; the ``delta_`` rows below deliberately do NOT call
+    it, and corroborate from the durable archive instead.
     """
     cfg = base / f'claude-config-{session_id}'
     proj = cfg / 'projects' / 'some-slug'
@@ -1506,6 +1521,145 @@ async def test_b5_stale_sidecar_falls_back(harness: Harness):
     et, kwargs = cap.emits[0]
     assert et == EventType.session_resume_fallback
     assert kwargs['data']['reasons'] == ['stale']
+
+
+# ── δ (task 3730): the durable archive is a source of REACHABILITY ───────────
+# The three rows below are the δ boundary set — this task's own B8/B9 plus the
+# production-shape headline — driven through the SAME composed
+# recover→dispatch chain as B1–B11 above. They are NOT this file's pre-existing
+# B8/B9 (2775's matrix: "stale dispatches emit but file no L1" and "cold
+# worktree adopts"), which are unrelated and unchanged; the names below carry a
+# `delta_` prefix so the two numbering schemes cannot be confused.
+@pytest.mark.asyncio
+async def test_delta_archive_backed_crash_shape_adopts_and_injects(harness: Harness):
+    """δ HEADLINE — the shape production ACTUALLY reaches on crash recovery,
+    which this file's pre-δ fixture was structurally incapable of producing.
+
+    Config dir DELETED (no ``_make_transcript`` call at all, so
+    ``_adopt_recovered_session``'s ``(entry/'.task').glob('claude-config-*')``
+    finds nothing and the guard is handed ``config_dir=None``), sidecar
+    PRESERVED, durable archive PRESENT. That combination now reaches ELIGIBLE
+    and injects the resume.
+
+    WHY THIS IS THE CASE THAT MATTERS. ``TaskWorkflow.run``'s finally executes
+    an UNCONDITIONAL ``cleanup_config_dir`` teardown while ``session_preserved``
+    keeps the sidecar, so on every crash-recovery path the live config dir is
+    gone and only the sidecar survives. The eligible-path rows above
+    (``test_b1_warm_lane_adopts_then_injects_same_session`` and friends) all
+    seed a ``claude-config-<sid>/`` tree via ``_make_transcript`` — a shape
+    production deletes — so the gate's green eligible path was green against a
+    state the fleet never presents. That is why ~91% of post-3578 fallbacks
+    (92 of 101, measured 2026-09-04) carried a recoverable archive: the
+    predicate had no way to consult it.
+
+    Two-way, like B1: β genuinely adopted the session with NO config dir
+    stashed, and γ independently accepted it on the strength of the archive
+    alone — so the archive is demonstrably what changed the answer, and the
+    recovered plan still flows through as ``initial_plan``.
+    """
+    task_id, session_id = '3730a', 'uuid-delta-crash-shape'
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer', with_transcript=False,
+    )
+    harness.config.session_resume = SessionResumeConfig()
+    harness.config.transcript_archive = TranscriptArchiveConfig()
+    _seed_archived_transcript(harness.config.project_root, task_id, session_id)
+
+    await harness._recover_crashed_tasks()
+
+    # ── ADOPT side (β): session + plan recovered, NO config dir stashed ──
+    assert task_id in harness._recovered_sessions
+    assert task_id in harness._recovered_plans
+    assert task_id not in harness._recovered_session_config_dirs
+    adopted = harness._recovered_sessions[task_id]
+    recovered_plan = harness._recovered_plans[task_id]
+
+    # ── INJECT side (γ+δ): the archive corroborates → resume injected ──
+    cap = await _dispatch_capture(harness, task_id)
+    assert cap.resume_session_id is adopted
+    assert cap.resume_session_id['session_id'] == session_id
+    assert cap.initial_plan is recovered_plan
+    assert [et for et, _ in cap.emits] == [EventType.session_resume]
+
+
+@pytest.mark.asyncio
+async def test_delta_b8_aged_past_freshness_with_archive_still_resumes(
+    harness: Harness,
+):
+    """δ B8 — the SAME shape as B5 (aged past ``freshness_window_secs``) but
+    with a durable archive: eligible, where B5 falls back as 'stale'.
+
+    Reachability outranks freshness (D2): an archived transcript does not decay
+    with wall-clock, so "how old is it" is the wrong question about a session
+    that is still reachable. B5 above is the control — byte-identical setup
+    minus the archive — so the pair shows the archive is the only variable.
+    """
+    task_id, session_id = '3730b', 'uuid-delta-aged-ok'
+    cfg = SessionResumeConfig()
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer',
+        fresh=False,  # 2× the freshness window, exactly as B5
+        with_transcript=False,
+    )
+    harness.config.session_resume = cfg
+    harness.config.transcript_archive = TranscriptArchiveConfig()
+    _seed_archived_transcript(harness.config.project_root, task_id, session_id)
+    assert 2 * cfg.freshness_window_secs < cfg.absolute_resume_age_secs, (
+        'this row must sit BETWEEN the two thresholds, or it is measuring the '
+        'backstop rather than the freshness demotion'
+    )
+
+    await harness._recover_crashed_tasks()
+    adopted = harness._recovered_sessions[task_id]
+
+    cap = await _dispatch_capture(harness, task_id)
+
+    assert cap.resume_session_id is adopted
+    assert [et for et, _ in cap.emits] == [EventType.session_resume]
+
+
+@pytest.mark.asyncio
+async def test_delta_b9_aged_past_absolute_bound_falls_back_aged_out(
+    harness: Harness,
+):
+    """δ B9 — past ``absolute_resume_age_secs`` the archive stops helping: the
+    dispatch falls back with 'aged_out', and the recovered plan is still kept.
+
+    Reachability outranks FRESHNESS, not the BACKSTOP (D3). Without this row
+    the one above would read as "an archive exempts a session from age
+    entirely", and a sidecar surviving an arbitrarily long outage would resume
+    into a world that had moved on.
+
+    The age is taken off the CONFIG FIELD, never a literal, so a re-derived
+    bound (``orchestrator/resume_age_bound.py`` re-derives it against runs.db
+    on every verify) re-tunes this row with it.
+    """
+    task_id, session_id = '3730c', 'uuid-delta-aged-out'
+    cfg = SessionResumeConfig()
+    _setup_warm_lane_session(
+        harness, task_id, session_id, role='implementer',
+        age_secs=2 * cfg.absolute_resume_age_secs,
+        with_transcript=False,
+    )
+    harness.config.session_resume = cfg
+    harness.config.transcript_archive = TranscriptArchiveConfig()
+    _seed_archived_transcript(harness.config.project_root, task_id, session_id)
+
+    await harness._recover_crashed_tasks()
+    recovered_plan = harness._recovered_plans[task_id]
+
+    cap = await _dispatch_capture(harness, task_id)
+
+    assert cap.resume_session_id is None
+    assert cap.initial_plan is recovered_plan  # I3: the age costs the resume, not the plan
+    assert len(cap.emits) == 1
+    et, kwargs = cap.emits[0]
+    assert et == EventType.session_resume_fallback
+    # 'stale' is suppressed by the archive and corroboration is satisfied by
+    # it, so the backstop is the ONLY reason left — which is the whole point of
+    # giving it its own token rather than reusing 'stale'.
+    assert kwargs['data']['reasons'] == ['aged_out']
+    assert kwargs['data']['archive_available'] is True
 
 
 # ── B6: kill switch (session_resume.enabled = false) ─────────────────────────
