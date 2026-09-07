@@ -65,6 +65,8 @@ What you're trading for that: a bounded first census is a *sample*, not a sweep,
 ## Post-run checklist
 
 1. **Read the dated report.** `plans/confusion-census-<date>.md` in the *censused* project's own checkout — open it and read the origin × manifestation matrix (where confusions came from vs. how they showed up) plus the narrative sections. This is the actual deliverable; don't just trust the one-line CLI summary.
+
+   **Check for a `## Verification` section on a run you gave no `--max-verify-clusters`.** On a flagless run that section only appears when something is wrong: it means every offered cluster was rejected and none survived. Treat that as a suspected *systemic* verifier failure (model unreachable, tool access denied, unparseable verdicts) rather than a genuinely unremarkable census, and read the per-cluster verify warnings in `journalctl --user -u legibility-trickle@<project>` before accepting the run.
 2. **Sanity-check per-stratum coverage counts.** The report should show mining coverage across the strata the sampler drew from — if one stratum has near-zero sightings while others are dense, that's worth a second look (could be a genuinely clean area, could be a sampling gap).
 3. **Confirm `census-state.json` advanced.** Check `docs/legibility/census-state.json` in the censused project — `last_census_at` should now be this run's timestamp and `last_census_report` should point at the new report. This is what makes the *next* census automatic: with a real anchor in place, `census_trigger` can now compute `days_since` and the interval/tasks-landed/novelty-spike conditions become live instead of perpetually "N/A".
 
