@@ -162,6 +162,20 @@ EVAL_CLASSES: tuple[str, ...] = (
     CLASS_DISTRACTOR,
 )
 
+#: The confusion table's OTHER axis, in report order — the same "one list,
+#: two consumers" shape as ``EVAL_CLASSES`` above, for the same reason.
+#: DERIVED rather than hand-written, so a fifth triage outcome added to
+#: ``write_triage`` joins this report automatically instead of becoming a
+#: second list to keep in sync.
+#:
+#: ``TRIAGE_OUTCOMES`` is a frozenset, whose iteration order is
+#: PYTHONHASHSEED-dependent, and this script's output is a COMMITTED artifact
+#: read by an operator at the task-3169 flip gate: iterating it directly makes
+#: two identical runs produce two differently-ordered reports, and makes the
+#: committed markdown stop being provably the render of the committed JSON.
+#: Measured 2026-08-27 — the committed pair disagreed on exactly this.
+EVAL_OUTCOMES: tuple[str, ...] = tuple(sorted(TRIAGE_OUTCOMES))
+
 #: Curator label -> the verdicts that count as correct for it. See the module
 #: docstring for the rationale behind each entry; every one traces to a human
 #: adjudication rather than to an opinion formed here.
@@ -360,7 +374,7 @@ def score_cases(
 
     per_class = {name: {'n': 0, 'correct': 0} for name in EVAL_CLASSES}
     confusion = {
-        name: dict.fromkeys(TRIAGE_OUTCOMES, 0) for name in EVAL_CLASSES
+        name: dict.fromkeys(EVAL_OUTCOMES, 0) for name in EVAL_CLASSES
     }
     duplicate_split = {OUTCOME_RESTATED: 0, OUTCOME_AMENDED: 0}
     false_contested = 0
@@ -371,7 +385,7 @@ def score_cases(
         bucket['n'] += 1
         if verdict in case['acceptable_outcomes']:
             bucket['correct'] += 1
-        row = confusion.setdefault(name, dict.fromkeys(TRIAGE_OUTCOMES, 0))
+        row = confusion.setdefault(name, dict.fromkeys(EVAL_OUTCOMES, 0))
         row[verdict] = row.get(verdict, 0) + 1
         if name == LABEL_DUPLICATE and verdict in duplicate_split:
             duplicate_split[verdict] += 1
@@ -492,7 +506,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f'| {name} | {entry["n"]} | {entry["correct"]} | {entry["accuracy"]} |',
         )
 
-    outcomes = list(TRIAGE_OUTCOMES)
+    outcomes = list(EVAL_OUTCOMES)
     lines += [
         '', '## Confusion — expected class by observed verdict', '',
         '| class | ' + ' | '.join(outcomes) + ' |',

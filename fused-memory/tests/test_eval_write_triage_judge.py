@@ -472,6 +472,11 @@ class TestScoreCases:
         cases = _cases(('a', 'duplicate'), ('b', 'pseudo_contradiction'))
         got = _mod().score_cases(cases, [OUTCOME_STORED, OUTCOME_CONTESTED])
         assert set(got['confusion']) == set(_mod().EVAL_CLASSES)
+        for name, row in got['confusion'].items():
+            assert set(row) == set(TRIAGE_OUTCOMES), name
+        assert got['confusion']['duplicate'][OUTCOME_STORED] == 1
+        assert got['confusion']['duplicate'][OUTCOME_RESTATED] == 0
+        assert got['confusion']['pseudo_contradiction'][OUTCOME_CONTESTED] == 1
 
     def test_every_confusion_row_is_keyed_in_eval_outcome_order(self) -> None:
         """Order, not membership: `list(row)`, never `set(row)`.
@@ -485,11 +490,6 @@ class TestScoreCases:
         got = _mod().score_cases(cases, [OUTCOME_RESTATED, OUTCOME_STORED])
         for name, row in got['confusion'].items():
             assert list(row) == list(_mod().EVAL_OUTCOMES), name
-        for name, row in got['confusion'].items():
-            assert set(row) == set(TRIAGE_OUTCOMES), name
-        assert got['confusion']['duplicate'][OUTCOME_STORED] == 1
-        assert got['confusion']['duplicate'][OUTCOME_RESTATED] == 0
-        assert got['confusion']['pseudo_contradiction'][OUTCOME_CONTESTED] == 1
 
     def test_the_duplicate_split_is_a_distribution_not_an_error_term(self) -> None:
         """Reported, and deliberately not scored — see the table's rationale."""

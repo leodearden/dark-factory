@@ -23,28 +23,28 @@
   },
   "confusion": {
     "duplicate": {
-      "stored": 31,
       "amended": 30,
       "contested": 4,
-      "restated": 10
+      "restated": 10,
+      "stored": 31
     },
     "distinct": {
-      "stored": 2,
       "amended": 1,
       "contested": 0,
-      "restated": 0
+      "restated": 0,
+      "stored": 2
     },
     "pseudo_contradiction": {
-      "stored": 3,
       "amended": 1,
       "contested": 1,
-      "restated": 1
+      "restated": 1,
+      "stored": 3
     },
     "distractor": {
-      "stored": 18,
       "amended": 0,
       "contested": 0,
-      "restated": 0
+      "restated": 0,
+      "stored": 18
     }
   },
   "duplicate_outcome_split": {

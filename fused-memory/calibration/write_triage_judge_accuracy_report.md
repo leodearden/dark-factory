@@ -11,12 +11,12 @@
 
 ## Confusion — expected class by observed verdict
 
-| class | stored | restated | amended | contested |
+| class | amended | contested | restated | stored |
 |---|---|---|---|---|
-| duplicate | 31 | 10 | 30 | 4 |
-| distinct | 2 | 0 | 1 | 0 |
-| pseudo_contradiction | 3 | 1 | 1 | 1 |
-| distractor | 18 | 0 | 0 | 0 |
+| duplicate | 30 | 4 | 10 | 31 |
+| distinct | 1 | 0 | 0 | 2 |
+| pseudo_contradiction | 1 | 1 | 1 | 3 |
+| distractor | 0 | 0 | 0 | 18 |
 
 ## Duplicate attach split (a distribution, not an error term)
 
