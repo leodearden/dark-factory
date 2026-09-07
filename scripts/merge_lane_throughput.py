@@ -871,13 +871,44 @@ def compute_speculation(
     — the strict measure moves reify roughly three times as far, which is the
     spread the loose measure was concealing.
 
+    VOID ANATOMY = what a chain-dead void actually COST, which is the number
+    the void rate alone gets wrong.  A void is ``verify_burned`` only when a
+    `merge_verify` row for the same task ran strictly between that item's last
+    preceding `speculative_merge` and the void; every other chain-dead void is
+    ``pre_verify``, and the two arms partition ``n_voided_chain_dead`` by
+    construction.  The distinction is load-bearing because the two void arms
+    in `merge_queue.py::SpeculativeMergeWorker` cost completely different
+    things.  The ADOPTION arm (`merge_queue.py::SpeculativeMergeWorker._void_and_remerge`,
+    reached from `_finalize_inflight`) discards a verify that has already run
+    — expensive.  The DISPATCH arm (the INV-3 `_chain_dead_link` re-check in
+    `_dispatch_item`) fires at the TOP of dispatch, before host acquisition,
+    and its own log line reads "dead-base straggler at dispatch (dead link %s)
+    — re-merging against actual main instead of burning a verify".  So a
+    ``pre_verify`` void costs a merge-worktree build, a
+    `_cleanup_owned_merge_worktree` and a `_remerge` — plus the foregone
+    speculation — and NOT verify minutes.  Reading a high void rate as burned
+    verify capacity would aim a policy remedy at the wrong resource, which is
+    exactly what this split exists to prevent; ``verify_burned`` is the
+    expensive case, reported so that it is detected if it ever appears rather
+    than assumed away.
+
+    DEAD-LINK FAN-OUT answers the other question a void rate hides: whether
+    voids are independent stragglers or one dead base cascading into many.
+    ``dead_link_distinct`` is the number of distinct ``data['dead_link']``
+    SHAs and ``dead_link_max_voids`` the most voids attributable to any single
+    one, so a fan-out near 1.0 rules out cascade amplification and a fat one
+    would name the cascading base.  A void carrying no ``dead_link`` is
+    tallied under :data:`UNKNOWN` (counted by ``dead_link_unknown``) — the
+    same idiom as ``void_points`` — rather than crashing or being dropped.
+
     Every rate is ``None``, never ``0.0``, when its denominator is empty:
     "nothing was speculated in this window" is not "speculation was tried and
-    never voided".
+    never voided".  ``dead_link_max_voids`` follows the same rule for the same
+    reason: "no void had a dead base" is not "the worst base killed none".
 
     Returns ``{'speculative_depth', 'verify_depth', 'void_rate',
     'n_speculative', 'n_voided_chain_dead', 'void_points',
-    'speculative_ahead', 'speculative_ahead_adopted'}``.
+    'speculative_ahead', 'speculative_ahead_adopted', 'void_anatomy'}``.
     """
     n_speculative = len(speculative_events)
     chain_dead = [
@@ -891,6 +922,32 @@ def compute_speculation(
     speculative_by_task = _by_task(speculative_events)
     verify_by_task = _by_task(verify_events)
     voided_by_task = _by_task(voided_events)
+
+    # Void anatomy: which arm fired, and how far one dead base reached.
+    verify_burned = 0
+    dead_links: Counter[str] = Counter()
+    for void in chain_dead:
+        dead_links[str(void.get('data', {}).get('dead_link') or UNKNOWN)] += 1
+        void_ts = _parse_ts(void.get('timestamp'))
+        raw_task = void.get('task_id')
+        if void_ts is None or raw_task is None:
+            continue
+        void_task = str(raw_task)
+        speculated = _last_before(
+            speculative_by_task.get(void_task, []), void_ts
+        )
+        if speculated is None:
+            # No speculation precedes this void, so nothing could have been
+            # verified between the two. Classified, not dropped: dropping it
+            # would shrink the denominator and inflate whichever arm survived.
+            continue
+        if _any_between(
+            verify_by_task.get(void_task, []), speculated[0], void_ts
+        ):
+            verify_burned += 1
+    # Subtraction, not a second tally: the arms partition the chain-dead voids
+    # by construction, so no row can fall out of both.
+    pre_verify = len(chain_dead) - verify_burned
 
     total_landings = 0
     matched_landings = 0
@@ -941,6 +998,13 @@ def compute_speculation(
             'matched': adopted_landings,
             'total': total_landings,
             'share': adopted_landings / total_landings if total_landings else None,
+        },
+        'void_anatomy': {
+            'verify_burned': verify_burned,
+            'pre_verify': pre_verify,
+            'dead_link_distinct': len(dead_links),
+            'dead_link_max_voids': max(dead_links.values()) if dead_links else None,
+            'dead_link_unknown': dead_links.get(UNKNOWN, 0),
         },
     }
 
