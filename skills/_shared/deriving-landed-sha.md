@@ -174,7 +174,7 @@ Look for a group/train merge, and **verify it before stamping** — a non-empty 
 authoritative on its own:
 
 ```bash
-c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1)
+c=$(git rev-list --topo-order --ancestry-path --merges task/<TASK_ID>..main | tail -1)
 if [ -n "$c" ]; then
     git merge-base --is-ancestor task/<TASK_ID> "$c^1"
     echo "contained-before rc=$?"
@@ -183,8 +183,22 @@ fi
 
 `--ancestry-path task/<TASK_ID>..main` lists every merge that *descends from* this branch, so
 once the branch is on main it also lists every unrelated merge landed afterwards, and `tail -1`
-returns the **oldest** of those — the first unrelated task's merge. The containment check on
-`$c`'s first parent (main just before that merge) decides:
+returns the **oldest** of them. That oldest descendant is the merge that brought this branch in
+when one exists, and an unrelated later merge only when the branch was already in main before it
+— which is exactly the distinction the containment check below is there to make.
+
+**`--topo-order` is REQUIRED, not decoration.** `git rev-list` orders by **commit date** by
+default, *not* topologically, so the "oldest" claim above holds only while dates happen to agree
+with topology. A merge whose committer date is skewed or was rewritten — a rebase, a replayed
+patch, a clock-skewed machine — can sort out of position, and `tail -1` then returns a *later*
+merge instead of the one that brought this branch in. Dropping `--topo-order` fails **silently**:
+`$c^1` is then that later merge's parent, which already contains the branch, so the check reports
+`contained-before rc=0`, the arm reads "unrelated later merge, do not stamp", and the real group
+merge is skipped — the procedure degrades to the citation gate below and stamps a citing commit
+where an actual merge sha was available. Do not "tidy" it away.
+(`orchestrator/tests/test_group_merge_candidate_ordering.py` reproduces this against real git.)
+
+The containment check on `$c`'s first parent (main just before that merge) decides:
 
 - **contained-before rc=1** → the branch was not in main before `$c`, so `$c` **is** the merge
   that brought it in. Stamp `{"kind": "<merged|found_on_main>", "commit": "$c", "note": "absorbed
