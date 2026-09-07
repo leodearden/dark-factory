@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import types
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -298,6 +301,37 @@ def _decision(canonical_id: str | None, similarity: float | None = 0.80) -> Band
     return BandDecision(OUTCOME_JUDGE, canonical_id, similarity, 0.95, 0.70)
 
 
+#: The repo root, reached from `<repo>/fused-memory/tests/server/`.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: The flip gate's own attach-target checker, and the tree it reads.
+_PROBE_PATH = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_target.py'
+_JUDGE_SRC_ROOT = _REPO_ROOT / 'fused-memory' / 'src'
+
+
+def _marked_ids(candidates: list[MemoryResult], attach_target_id: str) -> set[str]:
+    """Which candidate ids the attach-target mark names, read from the DIFF.
+
+    Diffed against the same slate rendered with no target rather than grepped
+    for a mark's spelling: what the invariant asserts is that naming a target
+    changes the rendering in a way attributable to a specific candidate, which
+    is exactly what `check_write_triage_attach_target.py::_swap_verdict`
+    measures. A test keyed on the literal mark text would instead pin the
+    mechanism and pass for a marker that names the wrong record.
+    """
+    unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
+    marked = build_judge_prompt(
+        'new', candidates, attach_target_id=attach_target_id,
+    )
+    added = set(marked.splitlines()) - set(unmarked.splitlines())
+    return {
+        candidate.id
+        for candidate in candidates
+        for line in added
+        if candidate.id in line
+    }
+
+
 class TestSelectJudgeCandidates:
     """Which of the retrieved results the judge actually gets to see.
 
@@ -494,6 +528,136 @@ class TestBuildJudgePrompt:
     def test_an_empty_candidate_list_still_renders(self) -> None:
         """Pure and total: rendering never raises, whatever it is handed."""
         assert isinstance(build_judge_prompt('new', []), str)
+
+    # --- the attach target (gate item 1, option (b)) -------------------------
+    #
+    # `select_judge_candidates` guarantees the band's winner is in the slate
+    # but NOT where it sits: the hoisted-parent rescue APPENDS the evidence
+    # child, so the attach target is LAST there and first on a flat slate.
+    # Position is therefore not a sound encoding of "the candidate this
+    # verdict will be filed against" — the prompt has to name it.
+    # `plans/write-triage-attach-target-contradiction.md` §2 carries the
+    # measurement; `scripts/check_write_triage_flip_preconditions.sh` item 1
+    # is the gate that reads it.
+
+    def test_the_named_candidate_is_the_only_one_marked(self) -> None:
+        """A flat slate: the mark lands on the id it was asked for, alone."""
+        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
+        marked = _marked_ids(candidates, 'm1')
+        assert marked == {'m1'}
+
+    def test_a_hoisted_parent_marks_the_child_that_carries_the_evidence(
+        self,
+    ) -> None:
+        """The canonical id can be absent from the slate ENTIRELY.
+
+        `_canonical_id_of` hoists a child winner to its parent id, so
+        `decision.canonical_id` names a record retrieval never returned. The
+        child carrying `PARENT_ID_KEY` is the one the judge is really looking
+        at, and a naive `r.id == canonical_id` marker marks NOTHING here —
+        which is the silent version of the defect, not a fix for it.
+        """
+        child = _result(
+            'child-1', 0.60,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        candidates = [_result('m0', 0.90), _result('m1', 0.89), child]
+        assert 'parent-1' not in [c.id for c in candidates]
+        assert _marked_ids(candidates, 'parent-1') == {'child-1'}
+
+    def test_the_target_is_marked_wherever_it_sits_in_the_slate(self) -> None:
+        """Built through `select_judge_candidates`, so the rescue produces it.
+
+        The rescue appends (`[*selected[: max(n - 1, 0)], winner]`), so the
+        attach target lands LAST. A marker keyed on position — `candidates[0]`
+        — marks the wrong record on exactly this slate, and the gate's own
+        report says so.
+        """
+        child = _result(
+            'child-1', 0.60,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        results = [*[_result(f'm{i}', 0.90 - i / 100) for i in range(6)], child]
+        selected = select_judge_candidates(results, 3, canonical_id='parent-1')
+        assert [r.id for r in selected] == ['m0', 'm1', 'child-1']
+        assert _marked_ids(selected, 'parent-1') == {'child-1'}
+
+    def test_an_unrecognised_target_marks_nothing_and_does_not_perturb(
+        self,
+    ) -> None:
+        """The mark MATCHES against the slate; it does not echo its argument.
+
+        This is the control `scripts/check_write_triage_attach_target.py`
+        applies (`_echoes_argument`): an implementation that merely
+        interpolates the value satisfies a swap test while binding no verdict
+        to any candidate. A matcher recognises neither nonce and renders the
+        same prompt for both — and the same prompt as for no target at all.
+        """
+        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
+        unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
+        first = build_judge_prompt(
+            'new', candidates, attach_target_id='not-on-this-slate-1',
+        )
+        second = build_judge_prompt(
+            'new', candidates, attach_target_id='not-on-this-slate-2',
+        )
+        assert first == unmarked
+        assert second == unmarked
+        assert first == second
+        assert 'not-on-this-slate-1' not in first
+        assert 'not-on-this-slate-2' not in second
+
+    def test_two_targets_on_one_slate_render_differently(self) -> None:
+        """The swap test the gate applies: the rendering DEPENDS on the target.
+
+        Necessary and not sufficient on its own — hence the echo control
+        above — but a prompt that renders identically for two different attach
+        targets has told the model nothing about which candidate the verdict
+        will be filed against.
+        """
+        candidates = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
+        first = build_judge_prompt('new', candidates, attach_target_id='m0')
+        second = build_judge_prompt('new', candidates, attach_target_id='m2')
+        assert first != second
+        first_only = set(first.splitlines()) - set(second.splitlines())
+        second_only = set(second.splitlines()) - set(first.splitlines())
+        assert any('m0' in line for line in first_only)
+        assert any('m2' in line for line in second_only)
+
+
+class TestAttachTargetGateProbe:
+    """The flip gate's own checker, run against this worktree's source.
+
+    `scripts/check_write_triage_flip_preconditions.sh` item 1 delegates to
+    `scripts/check_write_triage_attach_target.py`, which asserts the INVARIANT
+    (a verdict binds to a determinate candidate) rather than any mechanism.
+    Running the gate's own probe as the oracle is what keeps this suite and
+    the gate from ever disagreeing about whether item 1 is closed — nothing
+    about the invariant is re-implemented here.
+    """
+
+    def test_the_probe_reports_a_clean_pass(self) -> None:
+        """Exit 0, and NOT the `PASS-NEEDS-CONFIRMATION` downgrade.
+
+        The downgrade means the marker echoed its argument and was forgiven
+        only because the parameter is target-NAMED; it demands an operator
+        eyeball before the flip. A marker that matches against the slate earns
+        the clean pass instead.
+        """
+        if not _PROBE_PATH.exists():
+            pytest.skip(f'attach-target probe not present at {_PROBE_PATH}')
+        completed = subprocess.run(
+            [sys.executable, str(_PROBE_PATH), '--src-root', str(_JUDGE_SRC_ROOT)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert (
+            'PASS  the judge path binds a verdict to a determinate candidate'
+            in completed.stdout
+        ), completed.stdout
+        assert 'PASS-NEEDS-CONFIRMATION' not in completed.stdout, completed.stdout
 
 
 # ---------------------------------------------------------------------------
