@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from shared.cli_invoke import read_transcript_records
 from shared.config_dir import TaskConfigDir
+from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 from shared.safe_io import load_json_or_warn
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -501,8 +502,11 @@ class BaseStage:
     def _build_mcp_config(self) -> dict:
         """Assemble MCP server config for Claude CLI.
 
-        Includes the fused-memory server (HTTP or stdio), and optionally
-        the escalation HTTP server if an escalation URL is configured.
+        Always includes the fused-memory server (HTTP or stdio), the
+        jcodemunch stdio server (launched per the shared contract in
+        ``shared/jcodemunch_launch.py``), and the in-process recon-report
+        HTTP server on ``self._recon_report_port``.  The escalation HTTP
+        server is added only if an escalation URL is configured.
         """
         fm_config = _find_fused_memory_server()
 
@@ -525,9 +529,24 @@ class BaseStage:
 
         servers: dict = {
             'fused-memory': fm_entry,
+            # jcodemunch: single source of truth is
+            # `shared/jcodemunch_launch.py::JCODEMUNCH_COMMAND` /
+            # `::JCODEMUNCH_ENV`.  The hand-rolled `uvx` form this replaces was
+            # wrong twice over: `uvx` re-resolves the package and rebuilds
+            # tree-sitter C-extension sdists from source on every launch, which
+            # under host load stalled startup past the 1200s wall (the 0-turn
+            # MCP-startup wedge, reify esc-4415-232); and it carried no env, so
+            # the JCODEMUNCH_GIT_ROOT_IDENTITY identity lever never reached
+            # this agent.  That lever matters most HERE: recon stages run at
+            # the canonical project_root, so this is the site most likely to
+            # mint the shared `<owner>/<repo>` index — see the adoption
+            # precondition in the shared module.  `command`, no `args`:
+            # jcodemunch-mcp is the argv[0] launcher and takes none.  dict()
+            # copy so a caller mutating this config cannot corrupt the
+            # process-wide constant.
             'jcodemunch': {
-                'command': 'uvx',
-                'args': ['jcodemunch-mcp'],
+                'command': JCODEMUNCH_COMMAND,
+                'env': dict(JCODEMUNCH_ENV),
             },
             # PRD γ: recon_report MCP server — in-process only, not in any
             # disallow list because mcp__recon-report__* tools only mutate

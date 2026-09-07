@@ -74,15 +74,17 @@ __all__ = ['JCODEMUNCH_COMMAND', 'JCODEMUNCH_ENV']
 # `jcodemunch-mcp delete-index <owner>/<repo>` is run — see
 # scripts/jcodemunch-watcher.service.template's identical caveat. Dark
 # Factory has no such legacy index today, so the fix is effective here now.
-# Known gap: two sibling launch sites skip this lever and re-spell
-# command/args instead of importing these constants —
-# fused_memory/reconciliation/stages/base.py's recon-stage launch and
-# scripts/setup-host.sh's user-scope `claude mcp add` registration. Either
-# creating a legacy git-root index would silently re-collapse that repo's
-# worktrees per the precondition above, undermining this fix. Out of this
-# task's two-file scope; tracked at tkt_0RSRDYZ75MPVYJP76093P7PYWQ
-# (fused-memory site) and tkt_0RSY9MNEMSYK2GBPQ0MJDTYKCQ (setup-host.sh site
-# + this compounding risk).
+# Known gap: ONE sibling launch site still skips this lever and re-spells
+# command/args instead of importing these constants — scripts/setup-host.sh's
+# user-scope `claude mcp add ... -- uvx --python 3.12 jcodemunch-mcp`
+# registration. Its creating a legacy git-root index would silently
+# re-collapse that repo's worktrees per the precondition above, undermining
+# this fix. Out of scope here; tracked at tkt_0RSY9MNEMSYK2GBPQ0MJDTYKCQ
+# (setup-host.sh site + this compounding risk).
+# The other former gap — fused_memory/reconciliation/stages/base.py's
+# recon-stage launch — was closed by task 4617 (tkt_0RSRDYZ75MPVYJP76093P7PYWQ),
+# which is also what lifted these constants out of orchestrator into `shared`
+# so that site could import them.
 JCODEMUNCH_COMMAND: str = 'jcodemunch-mcp'
 JCODEMUNCH_ENV: dict[str, str] = {
     'JCODEMUNCH_NO_VERSION_HINT': '1',
