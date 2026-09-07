@@ -614,7 +614,8 @@ def test_partition_is_exact():
         'f1': 'ceiling', 'f2': 'intermittent', 'f3': 'no_plan', 'f4': 'unmeasured',
     }
     assert part['counts'] == {
-        'ceiling': 1, 'intermittent': 1, 'no_plan': 1, 'unmeasured': 1,
+        'ceiling': 1, 'intermittent': 1, 'no_plan': 1, 'declined': 0,
+        'unmeasured': 1,
     }
     assert part['discarded'] == ['f1']
     assert part['retained'] == ['f2', 'f3', 'f4']
@@ -2287,24 +2288,19 @@ def test_rendering_the_decline_split_is_deterministic():
     assert mod.format_campaign_report(report) == mod.format_campaign_report(report)
 
 
-def test_banding_ignores_the_terminal_kind_entirely():
-    """``band_for_cell`` was NOT modified — banding drives FIXTURE SELECTION.
-
-    Stage-2 fixture selection is the companion sampler task's scope; teaching
-    the bander about declines here would silently re-select the pool. A cell
-    bands identically whether it carries a decline kind, a 'none', or no
-    ``terminal_kind`` key at all.
-    """
-    common = {'plan_steps': 0, 'plan_quality': 0.0}
-    ref_ok = {'judged_without_reference': False}
-    declined = _metrics(
-        **common, extra_metrics={**ref_ok, 'terminal_kind': 'false_premise'},
-    )
-    silent = _metrics(**common, extra_metrics={**ref_ok, 'terminal_kind': 'none'})
-    legacy = _metrics(
-        **common, extra_metrics=ref_ok, drop_metrics=_PRE_TERMINAL_KIND,
-    )
-
-    bands = {mod.band_for_cell(m, 0.80) for m in (declined, silent, legacy)}
-
-    assert bands == {'no_plan'}
+# RETIRED (task 4766): ``test_banding_ignores_the_terminal_kind_entirely``.
+#
+# It asserted ``band_for_cell`` bands a declining cell, a silent one and a
+# keyless one all ``no_plan`` — task 4760's DELIBERATE scope marker, not stale
+# cruft, whose own docstring deferred the question to "the companion sampler
+# task's scope". Task 4766 IS that resolution (the sampler companion, 4759,
+# turned out to own fixture base-pinning instead), so the assertion is inverted
+# ON PURPOSE and its successors live in the step-9 banding block above:
+# ``test_a_no_plan_cell_that_explicitly_declined_bands_declined`` (the
+# inversion), ``test_a_no_plan_cell_with_a_non_decline_kind_still_bands_no_plan``
+# and ``test_an_unmeasured_terminal_kind_is_never_read_as_a_decline`` (the two
+# halves the old pin got right, kept), and
+# ``test_the_split_cannot_re_select_the_pool`` — which proves exhaustively that
+# the pool is NOT re-selected, discharging the exact worry the retired pin
+# existed to hold. This note is here so a reader diffing 4760 against 4766 can
+# tell a resolved boundary from an accidentally-inverted assertion.

@@ -692,7 +692,7 @@ def format_campaign_report(report: dict[str, Any]) -> str:
     return '\n'.join(lines)
 
 
-BANDS = ('ceiling', 'intermittent', 'no_plan', 'unmeasured')
+BANDS = ('ceiling', 'intermittent', 'no_plan', 'declined', 'unmeasured')
 
 # ``ceiling`` is the ONLY discarded band. Everything else is retained.
 RETAINED_BANDS = tuple(b for b in BANDS if b != 'ceiling')
@@ -704,8 +704,21 @@ RETAINED_BANDS = tuple(b for b in BANDS if b != 'ceiling')
 # admissible cell, so a fixture that already has a genuine measurement must not
 # be labelled ``unmeasured`` and re-run pointlessly. ``no_plan`` leads because a
 # candidate that could not plan at all is the strongest evidence of headroom
-# this pool is being selected for.
-_BAND_PRECEDENCE = ('no_plan', 'intermittent', 'unmeasured', 'ceiling')
+# this pool is being selected for — a rationale that is TRUE of it for the first
+# time now that ``declined`` has moved the correct refusals out of it (task
+# 4766; ruling D9, task 3636).
+#
+# ``declined`` sits IMMEDIATELY AFTER ``no_plan`` and nowhere else. That slot is
+# load-bearing, not cosmetic: it is the unique one under which the split merely
+# REFINES labels — every fixture keeps its old label or gains ``declined``
+# exactly where the old label was ``no_plan``, and none changes side between
+# retained and discarded. The plausible alternative (last before ``ceiling``,
+# making the label mean strict unanimity) relabels ``{declined, unmeasured}``
+# fixtures as ``unmeasured``, which would send γ1's re-run recipe at a fixture
+# that already holds an admissible cell — regressing against the very rationale
+# above. Do not reorder: the property is enumerated exhaustively by
+# ``test_the_split_cannot_re_select_the_pool``, not asserted here.
+_BAND_PRECEDENCE = ('no_plan', 'declined', 'intermittent', 'unmeasured', 'ceiling')
 
 
 def band_for_cell(metrics: dict[str, Any], q_ceiling: float) -> str:
@@ -718,10 +731,31 @@ def band_for_cell(metrics: dict[str, Any], q_ceiling: float) -> str:
        admissible cell, so the driver NAMES them rather than banding on a
        refusal — banding one would penalise whichever candidate happened to be
        scheduled inside a session-cap window, a property of the schedule.
-    2. ``not produced_a_plan`` -> ``no_plan``. THE plan-production predicate
-       (``metrics.py:191``), used directly and never re-implemented, and never
-       replaced by ``plan_quality > 0``: the two plan scorers disagreed exactly
-       on a stepless artifact, so a nonzero score is not evidence a plan exists.
+    2. ``not produced_a_plan`` -> ``declined`` when this cell's
+       :func:`~orchestrator.evals.metrics.terminal_kind_of` is one of the five
+       explicit plan-tools decline exits, else ``no_plan``. THE
+       plan-production predicate (``metrics.py:191``) still decides that a cell
+       is on this rung at all — used directly and never re-implemented, and
+       never replaced by ``plan_quality > 0``: the two plan scorers disagreed
+       exactly on a stepless artifact, so a nonzero score is not evidence a plan
+       exists. What the split adds is WHY there is no plan, because the two
+       causes are OPPOSITE verdicts on the candidate: a genuine "could not plan"
+       is the headroom this pool is selected for, whereas a decline is the
+       architect CORRECTLY refusing moot, blocked or ill-posed work. Reading
+       them as one number is what made tranche 1 report an 89% planning failure
+       over cells that were every one a verified-true decline (ruling D9, task
+       3636). An UNMEASURED kind — a missing key or an explicit ``None``, which
+       ``terminal_kind_of`` conflates on purpose — stays ``no_plan``: that band
+       already means "we cannot tell why there is no plan", and banding it
+       ``declined`` would fabricate a refusal nobody observed.
+
+       SCOPE: the split lives strictly INSIDE this branch. A cell that planned
+       and THEN declined satisfies ``produced_a_plan``, never reaches rung 2,
+       and bands on its plan's merits exactly as before — preserving the
+       contract ``docs/plan-scoring-and-judge.md`` states for that cell, that
+       both facts survive and a downstream reader can bucket it either way.
+       Both bands are RETAINED, so this changes what the partition is CALLED and
+       never which side a fixture lands on.
     3. reference validity not KNOWN-GOOD -> ``intermittent``. Either THIS CELL
        carries no :data:`MARKER_KEY` (it predates σ, so its validity was never
        measured) or it is marked as judged without a reference. The two cases
@@ -748,12 +782,20 @@ def band_for_cell(metrics: dict[str, Any], q_ceiling: float) -> str:
     fires, so such a fixture can never be discarded — the conservative
     direction, by construction rather than by care.
     """
-    from orchestrator.evals.metrics import produced_a_plan
+    from orchestrator.evals.metrics import (
+        DECLINE_KINDS,
+        produced_a_plan,
+        terminal_kind_of,
+    )
 
     if metrics.get('cap_tainted'):
         return 'unmeasured'
     if not produced_a_plan(metrics):
-        return 'no_plan'
+        # Through the accessor, never a bare ``metrics.get('terminal_kind')``:
+        # it exists so this driver and the report layer consult ONE expression,
+        # and it already conflates missing-key with explicit-None into the
+        # ``None`` that must NOT band ``declined``.
+        return 'declined' if terminal_kind_of(metrics) in DECLINE_KINDS else 'no_plan'
     if MARKER_KEY not in metrics or metrics.get(MARKER_KEY):
         return 'intermittent'
     quality = metrics.get('plan_quality')
@@ -773,7 +815,7 @@ def partition_bands(results: list[Any], q_ceiling: float) -> dict[str, Any]:
 
     ``retained`` and ``discarded`` partition the pool EXACTLY: disjoint, and
     their union is every fixture that produced a cell. ``counts`` always carries
-    all four bands, zeros included, so the artifact's schema does not shift with
+    every band, zeros included, so the artifact's schema does not shift with
     its contents.
 
     The returned ``marker_available`` is a run-level DISPLAY flag ONLY: it
