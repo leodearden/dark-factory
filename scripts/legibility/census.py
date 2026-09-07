@@ -210,6 +210,21 @@ def mine_to_saturation(
     ``saturated`` is forced False and the consecutive-saturated counter is
     reset, exactly as if the batch scored below threshold.
 
+    A batch with ANY coding failures emits exactly ONE aggregated WARNING
+    naming the batch index, ``failed/total``, how many DISTINCT failure
+    reasons there were, and per reason its count plus one example session
+    id. A batch that coded cleanly stays silent. This is the caller-side
+    summary ``coder.code_digests``' own docstring points at: that function
+    logs one WARNING per failed digest, which is the right shape for the
+    nightly trickle (one or two failures a night) and a flood for a census
+    batch of 20. Reasons are grouped by EXACT string equality with no
+    normalization -- the property those per-digest lines exist for is
+    telling 20 identical ENOENTs apart from 20 distinct model errors, and
+    any canonicalization is a guess that can collapse precisely that
+    distinction. Output stays bounded without a cap on distinct reasons
+    because a batch has at most ``_DEFAULT_CENSUS_BATCH_SIZE`` digests, so
+    the worst case is one long line rather than N lines.
+
     *max_batches* is the OPERATOR COST CAP (``--max-batches``): mining
     stops with ``stop_reason="capped"`` once that many batches have been
     coded. The cap is enforced here, inside the loop, rather than by
@@ -276,6 +291,30 @@ def mine_to_saturation(
                 status=run_result.status,
             )
         )
+
+        # The CALLER-SIDE aggregate `coder.code_digests`' docstring points
+        # at: that function emits one WARNING per failed digest, which is
+        # the right shape for the nightly trickle's one-or-two failures and
+        # a flood for a 20-digest census batch. This line is the batch-level
+        # summary that a flood cannot be read as. Grouping is EXACT-STRING by
+        # design -- the property the per-digest lines exist for is telling N
+        # identical ENOENTs apart from N genuinely distinct model errors, and
+        # any normalization is a guess that can collapse the two. `coder.py`
+        # is deliberately NOT modified (its per-digest line is the only sink
+        # some failures ever reach for callers other than this one).
+        if run_result.failed:
+            by_reason: dict[str, list[str]] = {}
+            for session, reason in run_result.failures:
+                by_reason.setdefault(reason, []).append(session)
+            breakdown = "; ".join(
+                f"{len(sessions)}x {reason!r} (e.g. session={sessions[0]})"
+                for reason, sessions in by_reason.items()
+            )
+            logger.warning(
+                "mining batch %d: %d/%d digest(s) failed to code, %d distinct "
+                "reason(s): %s",
+                index, run_result.failed, run_result.total, len(by_reason), breakdown,
+            )
 
         consecutive_saturated = consecutive_saturated + 1 if saturated else 0
         if consecutive_saturated >= config.consecutive_batches:
