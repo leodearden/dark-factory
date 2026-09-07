@@ -86,6 +86,7 @@ scan_corpus = _mod.scan_corpus
 triage_rejection = _mod.triage_rejection
 simulate_candidate = _mod.simulate_candidate
 extract_plural_ids = _mod.extract_plural_ids
+EnumerationOutcome = _mod.EnumerationOutcome
 _CANDIDATE_GUARDS = _mod._CANDIDATE_GUARDS
 
 
@@ -667,11 +668,11 @@ async def test_edge_enumeration_paginates_past_the_resultset_cap():
     rows, distinct = _fake_corpus()
     query_fn = _FakeCappedEdgeQuery(rows, cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
-    assert complete is True
+    assert outcome.complete is True
     assert len(facts) == distinct
     assert set(facts) == {f'edge-{i:02d}' for i in range(10)}
     # fact text is preserved verbatim...
@@ -710,12 +711,12 @@ async def test_edge_enumeration_of_empty_graph_is_complete_and_empty():
     """Zero edges is a valid, COMPLETE result — knowlive held exactly that."""
     query_fn = _FakeCappedEdgeQuery([], cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
     assert facts == {}
-    assert complete is True
+    assert outcome.complete is True
 
 
 # ---------------------------------------------------------------------------
@@ -758,11 +759,11 @@ async def test_enumeration_fails_closed_when_page_size_exceeds_the_server_cap():
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=20, resultset_size=10,
     )
 
-    assert complete is False, (
+    assert outcome.complete is False, (
         'a page_size at or above the server cap cannot yield a provably '
         'complete enumeration'
     )
@@ -789,12 +790,12 @@ async def test_enumeration_fails_closed_at_the_module_default_cap():
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_mod.RESULTSET_SIZE,
     )
 
     assert _mod.RESULTSET_SIZE == 10000, "FalkorDB's server-wide default"
-    assert complete is False
+    assert outcome.complete is False
     assert facts == {}
     assert query_fn.cyphers == []
 
@@ -811,13 +812,13 @@ async def test_enumeration_fails_closed_when_the_page_cap_is_exhausted():
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE, max_pages=3,
     )
 
     page_cyphers = [c for c in query_fn.cyphers if 'SKIP' in c]
     assert len(page_cyphers) == 3, 'the loop must TERMINATE at the cap'
-    assert complete is False, (
+    assert outcome.complete is False, (
         'hitting the page cap on a still-full page is a suspected shortfall, '
         'not a successful enumeration'
     )
@@ -834,11 +835,11 @@ async def test_benign_pagination_is_still_complete():
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
-    assert complete is True
+    assert outcome.complete is True
     assert len(facts) == 50
 
 
@@ -913,9 +914,9 @@ async def test_enumeration_fails_closed_when_the_server_caps_below_the_assumed_c
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
 
-    facts, complete = await enumerate_valid_edge_facts(query_fn, page_size=20)
+    facts, outcome = await enumerate_valid_edge_facts(query_fn, page_size=20)
 
-    assert complete is False, (
+    assert outcome.complete is False, (
         'enumerated 10 against a census-reported 50 — a count mismatch is a '
         'shortfall however it was caused'
     )
@@ -933,11 +934,11 @@ async def test_enumeration_is_complete_when_the_enumerated_count_matches_the_cen
     """
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
-    assert complete is True
+    assert outcome.complete is True
     assert len(facts) == 50
 
 
@@ -1033,19 +1034,20 @@ async def test_a_corpus_that_only_grew_is_still_a_complete_enumeration(caplog):
     )
 
     with caplog.at_level('INFO'):
-        result = await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
-    facts, complete = result
+        facts, outcome = await enumerate_valid_edge_facts(
+            query_fn, page_size=_PAGE_SIZE,
+        )
 
     assert len(facts) == 50
-    assert complete is True, (
+    assert outcome.complete is True, (
         'every edge that existed for the whole run was read; a corpus that '
         'GREW under the enumeration is not a truncated one'
     )
 
     # Both readings leave the function — an artifact reporting a census-derived
     # verdict without the two numbers behind it cannot be audited.
-    assert result.census_before == 50
-    assert result.census_after == 51
+    assert outcome.census_before == 50
+    assert outcome.census_after == 51
 
     # Disclosed at INFO, not failed at WARNING.
     assert [r for r in caplog.records if r.levelname == 'WARNING'] == [], (
@@ -1080,13 +1082,14 @@ async def test_a_corpus_that_shrank_is_tolerated_only_down_to_the_post_census(ca
     )
 
     with caplog.at_level('INFO'):
-        result = await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
-    facts, complete = result
+        facts, outcome = await enumerate_valid_edge_facts(
+            query_fn, page_size=_PAGE_SIZE,
+        )
 
     assert len(facts) == 50
-    assert complete is True, '50 >= min(51, 50) — nothing continuously present was missed'
-    assert result.census_before == 51
-    assert result.census_after == 50
+    assert outcome.complete is True, '50 >= min(51, 50) — nothing continuously present was missed'
+    assert outcome.census_before == 51
+    assert outcome.census_after == 50
 
     infos = '\n'.join(
         r.getMessage() for r in caplog.records if r.levelname == 'INFO'
@@ -1113,13 +1116,14 @@ async def test_an_enumeration_short_of_both_censuses_is_still_a_shortfall(caplog
     )
 
     with caplog.at_level('WARNING'):
-        result = await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
-    facts, complete = result
+        facts, outcome = await enumerate_valid_edge_facts(
+            query_fn, page_size=_PAGE_SIZE,
+        )
 
     assert len(facts) == 40
-    assert complete is False, '40 < min(50, 51) — ten edges present throughout went unread'
-    assert result.census_before == 50
-    assert result.census_after == 51
+    assert outcome.complete is False, '40 < min(50, 51) — ten edges present throughout went unread'
+    assert outcome.census_before == 50
+    assert outcome.census_after == 51
 
     warnings = '\n'.join(
         r.getMessage() for r in caplog.records if r.levelname == 'WARNING'
@@ -1140,11 +1144,11 @@ async def test_a_stable_count_that_disagrees_is_still_a_suspected_shortfall(capl
     query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
 
     with caplog.at_level('WARNING'):
-        facts, complete = await enumerate_valid_edge_facts(
+        facts, outcome = await enumerate_valid_edge_facts(
             query_fn, page_size=20,
         )
 
-    assert complete is False
+    assert outcome.complete is False
     assert len(facts) < 50
 
     warnings = '\n'.join(r.getMessage() for r in caplog.records)
@@ -1184,11 +1188,11 @@ async def test_enumeration_fails_closed_when_the_count_probe_returns_nothing(
         _fake_rows(50), cap=_PAGE_SIZE, count_rows=count_rows,
     )
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
-    assert complete is False
+    assert outcome.complete is False
     assert len(facts) == 50, 'the paging worked; only the proof was unavailable'
 
 
@@ -1213,12 +1217,12 @@ async def test_a_census_that_answers_then_stops_answering_fails_closed(caplog):
     )
 
     with caplog.at_level('WARNING'):
-        facts, complete = await enumerate_valid_edge_facts(
+        facts, outcome = await enumerate_valid_edge_facts(
             query_fn, page_size=_PAGE_SIZE,
         )
 
     assert len(facts) == 50, 'the paging itself was fine'
-    assert complete is False, 'an unavailable proof is not a passing one'
+    assert outcome.complete is False, 'an unavailable proof is not a passing one'
 
     warnings = '\n'.join(r.getMessage() for r in caplog.records)
     assert 'no usable count' in warnings
@@ -1243,13 +1247,13 @@ async def test_a_row_with_a_null_uuid_is_skipped_not_counted():
     rows[2] = [None, 'Tasks 1020 and 1030 are pending.']
     query_fn = _FakeCappedEdgeQuery(rows, cap=_PAGE_SIZE, count_rows=[[3]])
 
-    facts, complete = await enumerate_valid_edge_facts(
+    facts, outcome = await enumerate_valid_edge_facts(
         query_fn, page_size=_PAGE_SIZE,
     )
 
     assert len(facts) == 3, 'the null-uuid row is not an enumerated edge'
     assert None not in facts
-    assert complete is True, 'and the census agrees 3 is the whole corpus'
+    assert outcome.complete is True, 'and the census agrees 3 is the whole corpus'
 
 
 # ---------------------------------------------------------------------------
@@ -1265,7 +1269,10 @@ class _FakeEdgeSource:
     call log rather than by a mysteriously large number.
     """
 
-    def __init__(self, corpora: dict[str, tuple[list[str], bool]]) -> None:
+    def __init__(
+        self,
+        corpora: dict[str, tuple[list[str], bool | EnumerationOutcome]],
+    ) -> None:
         self.corpora = corpora
         self.asked: list[str] = []
         # RECORDED, not just accepted. An earlier version discarded
@@ -1279,8 +1286,37 @@ class _FakeEdgeSource:
     async def __call__(self, project_id: str, *, page_size: int):
         self.asked.append(project_id)
         self.page_sizes.append(page_size)
-        facts, complete = self.corpora[project_id]
-        return {f'{project_id}-edge-{i}': f for i, f in enumerate(facts)}, complete
+        facts, outcome = self.corpora[project_id]
+        return (
+            {f'{project_id}-edge-{i}': f for i, f in enumerate(facts)},
+            _as_outcome(outcome),
+        )
+
+
+def _as_outcome(value: bool | EnumerationOutcome) -> EnumerationOutcome:
+    """Let a corpus declare `True`/`False` where the seam wants an outcome.
+
+    ``enumerate_valid_edge_facts`` returns an ``EnumerationOutcome`` and
+    ``run`` consumes one, but the ~20 corpus declarations in this file care
+    about exactly one bit of it. Widening every one of them to a constructor
+    call would bury the fact each is actually testing under boilerplate, so
+    the bool is coerced here and only the tests that care about the DIAGNOSIS
+    spell an outcome out.
+
+    A False coerces to the shape the invariant demands — an incomplete
+    outcome must carry a reason and a kind — using the shipped
+    ``INCOMPLETE_SHORT_READ``, which is what a bare 'this graph came back
+    short' means. A test asserting on a SPECIFIC kind passes its own outcome.
+    """
+    if not isinstance(value, bool):
+        return value
+    if value:
+        return EnumerationOutcome(complete=True)
+    return EnumerationOutcome(
+        complete=False,
+        reason='fake edge source: declared incomplete by the test corpus',
+        kind=graphiti_client.INCOMPLETE_SHORT_READ,
+    )
 
 
 _ALPHA_FACTS = [

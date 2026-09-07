@@ -102,6 +102,7 @@ from fused_memory.backends.graphiti_client import (  # noqa: E402
     _DEFAULT_READ_PAGE_SIZE,
     _MAX_READ_PAGES,
     _RESULTSET_SIZE,
+    INCOMPLETE_CENSUS_UNAVAILABLE,
     INCOMPLETE_SHORT_READ,
     INCOMPLETE_STRUCTURAL_KINDS,
     INCOMPLETE_STRUCTURAL_REFUSAL,
@@ -641,41 +642,66 @@ class _QueryFnGraph:
         return SimpleNamespace(result_set=rows)
 
 
-class _EnumerationResult(tuple):
-    """The ``(facts, complete)`` pair, plus the census bracket it was judged on.
+# The probe's OWN incompleteness kind, and the only one it mints. Every
+# other kind this module reports is graphiti_client's, reused verbatim.
+#
+# It exists because no shipped kind describes what it names: the four
+# ``INCOMPLETE_*`` values all classify a read that REACHED the paginator and
+# came back deficient, whereas this one marks a graph where the enumeration
+# raised before producing anything — a graph key that vanished between the
+# listing and the query is the cheap, routine way in (``list_graphs()``
+# returns dozens of ephemeral pytest graphs). Borrowing a shipped kind for it
+# would put a value in the artifact that the layer it came from never emits.
+ENUMERATION_FAILED = 'enumeration_failed'
 
-    A tuple SUBCLASS rather than a new return type, deliberately: the
-    completeness band is DERIVED from the two census readings, so an artifact
-    reporting `complete: false` without them cannot be audited — a reader
-    cannot tell a corpus that grew from one that was truncated, which is the
-    entire distinction the band exists to draw. The readings therefore have to
-    leave this function rather than live only in a log line on an operator's
-    terminal.
 
-    Carrying them as ATTRIBUTES on the existing pair keeps every caller and
-    every enumeration test unpacking exactly what it unpacked before, so this
-    change is to the completeness RULE and to nothing else. It is a stepping
-    stone: the typed ``EnumerationOutcome`` that also carries the failure
-    reason and kind replaces it, and this class goes away with it.
+@dataclass(frozen=True)
+class EnumerationOutcome:
+    """Whether an enumeration is all of it, and — when it is not — why.
+
+    Modelled directly on ``PagedRead``, including the field SPLIT, which that
+    docstring already argues for this exact situation: ``reason`` is
+    diagnostic prose aimed at an operator reading a log and is deliberately
+    NOT a stable interface, while ``kind`` is the discriminator a consumer can
+    branch on without parsing prose. This module does not get to invent a
+    second convention for the same problem one layer up.
+
+    ``kind`` is one of graphiti_client's four ``INCOMPLETE_*`` values —
+    reused, not paralleled, so the committed artifact and the backend's own
+    logs name one failure with one string and a reader correlating them needs
+    no mapping — or this module's ``ENUMERATION_FAILED``.
+
+    INVARIANT: ``reason is None``, ``kind is None`` and ``complete is True``
+    all hold together or none does. An incomplete outcome that cannot say why
+    is the defect this type exists to make unrepresentable; an explained
+    'complete' would be just as untrustworthy in the other direction.
+
+    ``census_before``/``census_after`` are the bracket the verdict was DERIVED
+    from, and they travel with it because a `complete: false` without them
+    cannot be audited: a reader cannot tell a corpus that grew from one that
+    was truncated, which is the entire distinction the tolerance band draws.
+    Both are None when no census was taken at all.
     """
 
-    # No ``__slots__``: CPython rejects a non-empty one on a tuple subtype
-    # ("nonempty __slots__ not supported for subtype of 'tuple'"), since the
-    # variable-length tuple storage and a slot layout cannot coexist. The
-    # per-instance dict is the cost, and it is paid once per graph per run.
+    complete: bool
+    reason: str | None = None
+    kind: str | None = None
+    census_before: int | None = None
+    census_after: int | None = None
 
-    def __new__(
-        cls,
-        facts: dict[str, str],
-        complete: bool,
-        *,
-        census_before: int | None,
-        census_after: int | None,
-    ) -> _EnumerationResult:
-        self = super().__new__(cls, (facts, complete))
-        self.census_before = census_before
-        self.census_after = census_after
-        return self
+    def __post_init__(self) -> None:
+        if (self.reason is None) != self.complete:
+            raise ValueError(
+                f'EnumerationOutcome: complete={self.complete} but '
+                f'reason={self.reason!r} — an incomplete enumeration must say '
+                'why, and a complete one has nothing to explain'
+            )
+        if (self.kind is None) != self.complete:
+            raise ValueError(
+                f'EnumerationOutcome: complete={self.complete} but '
+                f'kind={self.kind!r} — the discriminator follows the same '
+                'biconditional as the prose'
+            )
 
 
 async def enumerate_valid_edge_facts(
@@ -684,7 +710,7 @@ async def enumerate_valid_edge_facts(
     page_size: int = DEFAULT_PAGE_SIZE,
     resultset_size: int = RESULTSET_SIZE,
     max_pages: int = MAX_ENUM_PAGES,
-) -> tuple[dict[str, str], bool]:
+) -> tuple[dict[str, str], EnumerationOutcome]:
     """Enumerate every valid RELATES_TO edge's fact text, keyed on edge uuid.
 
     The paging itself is DELEGATED to graphiti_client's ``_paged_ro_query``
@@ -701,11 +727,13 @@ async def enumerate_valid_edge_facts(
     uuid legitimately arrives more than once (documented on
     get_all_valid_edges). A NULL fact is coerced to ''.
 
-    Returns an ``_EnumerationResult``: the ``(facts_by_uuid, complete)`` pair,
-    carrying the two census readings the verdict was derived from. The flag is
-    the fail-closed hook: an under-enumerated corpus must be reported as a
-    FAILURE rather than as a smaller report, because the headline result is a
-    zero and a truncated zero is worthless.
+    Returns ``(facts_by_uuid, EnumerationOutcome)``. The outcome is the
+    fail-closed hook: an under-enumerated corpus must be reported as a FAILURE
+    rather than as a smaller report, because the headline result is a zero and
+    a truncated zero is worthless. It carries the two census readings the
+    verdict was derived from, and — whenever the verdict is a failure — the
+    KIND and the REASON, so the shortfall reaches the committed artifact
+    instead of stopping at the operator's terminal.
 
     ``complete`` is FALSE — and every one of these paths logs a WARNING
     naming the numbers, so a shortfall is never silent — when:
@@ -729,6 +757,16 @@ async def enumerate_valid_edge_facts(
     function treats as never tolerable; (3) and (4) are EMPIRICAL, and the two
     kinds are deliberately independent rather than redundant. The shipped
     engine names the same split for the same reason.
+
+    WHERE THE KIND AND REASON COME FROM. Whenever ``_paged_ro_query`` already
+    judged the read incomplete, ITS kind and ITS prose are carried through
+    verbatim — the layer that made the observation is the one that gets to
+    word it, and passing it along unaltered is what keeps the artifact and the
+    backend's logs naming one failure with one string. Only where this
+    function reaches a verdict the paginator did not are they minted here:
+    the post-census that stopped answering, and the dedup that fell below the
+    band on rows the paginator was content with. Those still use the SHIPPED
+    kind vocabulary, because the failures they name are the same failures.
 
     THE CORPUS IS LIVE AND IS BEING WRITTEN WHILE THIS RUNS. The graphs
     measured here are the orchestrator's and the reconciler's working memory,
@@ -792,7 +830,11 @@ async def enumerate_valid_edge_facts(
         # for the reason its own comment gives: a partial dict invites the
         # caller to use it anyway. Return here rather than fall through, so
         # the post-census does not turn 'zero queries issued' into one.
-        return {}, False
+        return {}, EnumerationOutcome(
+            complete=False,
+            reason=paged.reason,
+            kind=INCOMPLETE_STRUCTURAL_REFUSAL,
+        )
 
     facts: dict[str, str] = {}
     for row in paged.rows:
@@ -826,47 +868,80 @@ async def enumerate_valid_edge_facts(
         and census_before != census_after
     )
 
+    complete = (
+        not structurally_incomplete
+        and floor is not None
+        and len(facts) >= floor
+    )
+
+    # The diagnosis, built ONCE and used twice: logged for the operator
+    # watching the run, and returned so it reaches the committed artifact.
+    # Two spellings of the same finding would be two things to keep in step,
+    # and the artifact's copy is the one nobody is watching when it goes
+    # wrong. `reason` stays None on the complete path, which is half the
+    # EnumerationOutcome invariant.
+    reason: str | None = None
+    kind: str | None = None
+
     if structurally_incomplete:
-        logger.warning(
-            'enumerate_valid_edge_facts: hit the %d-page cap (page_size=%d, '
-            'enumerated=%d) while the last page was still full — enumeration '
-            'is incomplete. Re-run with a larger --page-size.',
-            max_pages, page_size, len(facts),
+        reason = (
+            f'enumerate_valid_edge_facts: hit the {max_pages}-page cap '
+            f'(page_size={page_size}, enumerated={len(facts)}) while the last '
+            f'page was still full — enumeration is incomplete. Re-run with a '
+            f'larger --page-size.'
         )
+        kind = paged.incomplete_kind
+        logger.warning('%s', reason)
     elif census_before is None:
-        logger.warning(
+        reason = (
             'enumerate_valid_edge_facts: the census probe returned no usable '
             'count, so completeness cannot be proven. Reporting INCOMPLETE — '
-            'an unavailable proof is not a passing one.',
+            'an unavailable proof is not a passing one.'
         )
+        kind = INCOMPLETE_CENSUS_UNAVAILABLE
+        logger.warning('%s', reason)
     elif census_after is None:
-        logger.warning(
+        reason = (
             'enumerate_valid_edge_facts: the post-enumeration census probe '
             'returned no usable count, so the tolerance band has only one '
             'end and completeness cannot be proven. Reporting INCOMPLETE — '
-            'an unavailable proof is not a passing one.',
+            'an unavailable proof is not a passing one.'
         )
+        kind = INCOMPLETE_CENSUS_UNAVAILABLE
+        logger.warning('%s', reason)
     elif len(facts) < floor:
         if corpus_moved:
-            logger.warning(
-                'enumerate_valid_edge_facts: enumerated %d distinct edges, '
-                'short of %d — the smaller of a census that read %d before '
-                'paging and %d after (page_size=%d). At least %d edges were '
-                'present for the WHOLE run and went unread, which concurrent '
-                'writing does not explain. Reporting INCOMPLETE.',
-                len(facts), floor, census_before, census_after, page_size,
-                floor - len(facts),
+            message = (
+                f'enumerate_valid_edge_facts: enumerated {len(facts)} distinct '
+                f'edges, short of {floor} — the smaller of a census that read '
+                f'{census_before} before paging and {census_after} after '
+                f'(page_size={page_size}). At least {floor - len(facts)} edges '
+                f'were present for the WHOLE run and went unread, which '
+                f'concurrent writing does not explain. Reporting INCOMPLETE.'
             )
         else:
-            logger.warning(
-                'enumerate_valid_edge_facts: enumerated %d distinct edges but '
-                'the census reports %d, stable across the whole run '
-                '(page_size=%d) — the enumeration is SHORT and the corpus did '
-                'not move under it. The most likely cause is a server '
-                'result-set cap below the assumed %d; unstable page '
-                'boundaries would do it too. Reporting INCOMPLETE.',
-                len(facts), census_before, page_size, resultset_size,
+            message = (
+                f'enumerate_valid_edge_facts: enumerated {len(facts)} distinct '
+                f'edges but the census reports {census_before}, stable across '
+                f'the whole run (page_size={page_size}) — the enumeration is '
+                f'SHORT and the corpus did not move under it. The most likely '
+                f'cause is a server result-set cap below the assumed '
+                f'{resultset_size}; unstable page boundaries would do it too. '
+                f'Reporting INCOMPLETE.'
             )
+        logger.warning('%s', message)
+        # WHOSE WORDS GO IN THE ARTIFACT. When the paginator already judged
+        # this read deficient, its prose and its kind are carried through
+        # VERBATIM rather than replaced by the message just logged: the layer
+        # that made the observation is the one that gets to word it, and a
+        # reader correlating the artifact against the backend's own logs then
+        # finds one failure named one way. The message above is this
+        # function's separate account of the same shortfall — stated in
+        # distinct edges against the band rather than in rows against the
+        # pre-census — and it is what gets recorded only where the paginator
+        # was content and this dedup was not.
+        reason = paged.reason or message
+        kind = paged.incomplete_kind or INCOMPLETE_SHORT_READ
     elif corpus_moved:
         # DISCLOSED, not failed. These graphs are the orchestrator's and the
         # reconciler's working memory, so a census that moves under a run
@@ -882,12 +957,6 @@ async def enumerate_valid_edge_facts(
             'are recorded in the report.',
             census_before, census_after, len(facts), page_size,
         )
-
-    complete = (
-        not structurally_incomplete
-        and floor is not None
-        and len(facts) >= floor
-    )
 
     if paged.incomplete_kind == INCOMPLETE_SHORT_READ and complete:
         # The shipped layer already logged a WARNING naming a suspected
@@ -909,8 +978,12 @@ async def enumerate_valid_edge_facts(
             census_before, census_after, paged.reason,
         )
 
-    return _EnumerationResult(
-        facts, complete, census_before=census_before, census_after=census_after,
+    return facts, EnumerationOutcome(
+        complete=complete,
+        reason=reason,
+        kind=kind,
+        census_before=census_before,
+        census_after=census_after,
     )
 
 
@@ -921,7 +994,15 @@ async def enumerate_valid_edge_facts(
 # 2: the report gained `project_ids_source`, `unmeasured_graphs` and
 #    `max_samples`, when the measured GRAPH SET stopped being assumed and
 #    started being discovered and cross-checked (see DEFAULT_PROJECT_IDS).
-SCHEMA_VERSION = 2
+# 3: the report started saying, per graph, WHY a measurement is deficient and
+#    WHAT it was judged against — `error`/`error_kind` and the
+#    `census_before`/`census_after` bracket — so a `complete: false` row can
+#    be diagnosed from the artifact rather than from an operator's terminal.
+#    Alongside: `near_miss` under the near-miss label (the raw
+#    `lexical_precondition` CONTAINS the regex matches and cannot be
+#    subtracted from them), and a candidate band restated per rejected MATCH
+#    end to end, with its denominators named so the arithmetic closes.
+SCHEMA_VERSION = 3
 
 # FALLBACK ONLY — not the normal project set. The measured graphs are
 # DISCOVERED from the store via ``GraphitiBackend.list_graphs()``, because a
@@ -1025,13 +1106,45 @@ def _verdict_for(totals: ScanResult, triage_totals: dict[str, int]) -> str:
 
 @dataclass(frozen=True)
 class ProjectReport:
-    """One project graph's measurement."""
+    """One project graph's measurement.
+
+    INVARIANT: ``(error is None) == complete``, and ``error_kind`` follows the
+    same biconditional — inherited from ``EnumerationOutcome``, and asserted
+    here too because this is the shape that gets COMMITTED. A `complete:
+    false` row with nothing beside it is indistinguishable in the artifact
+    from any other, and the responses diverge: a graph that vanished mid-run
+    calls for a re-run, a graph whose read was truncated calls for a larger
+    ``--page-size``. The reverse defect is just as corrosive — an explanation
+    attached to a healthy row would make every explanation suspect.
+
+    ``census_before``/``census_after`` are the bracket ``complete`` was judged
+    against, carried so a reader can tell a corpus that grew from one that was
+    truncated. Both are None when no census was taken at all, which is the
+    honest reading for a graph that never enumerated: a zero there would claim
+    the graph was PROVEN empty.
+    """
 
     project_id: str
     valid_edges: int
     complete: bool
     scan: ScanResult
     triage: dict[str, int] = field(default_factory=dict)
+    error: str | None = None
+    error_kind: str | None = None
+    census_before: int | None = None
+    census_after: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.error is None) != self.complete:
+            raise ValueError(
+                f'ProjectReport({self.project_id!r}): complete='
+                f'{self.complete} but error={self.error!r}'
+            )
+        if (self.error_kind is None) != self.complete:
+            raise ValueError(
+                f'ProjectReport({self.project_id!r}): complete='
+                f'{self.complete} but error_kind={self.error_kind!r}'
+            )
 
 
 @dataclass(frozen=True)
@@ -1097,10 +1210,15 @@ async def run(
 ) -> Report:
     """Measure every requested project through the injected *edge_source*.
 
-    ``edge_source(project_id, *, page_size) -> (facts_by_uuid, complete)`` is
-    the only corpus access, mirroring cleanup_count_snapshots.run(args, *,
-    memory): every test drives a fake through it, so the whole aggregation
-    band is checkable with no live backend.
+    ``edge_source(project_id, *, page_size) -> (facts_by_uuid,
+    EnumerationOutcome)`` is the only corpus access, mirroring
+    cleanup_count_snapshots.run(args, *, memory): every test drives a fake
+    through it, so the whole aggregation band is checkable with no live
+    backend. The outcome — not a bare bool — is what lets a deficient graph
+    reach the artifact carrying its own diagnosis; a source that raises
+    instead gets ``ENUMERATION_FAILED`` and the exception's type and message,
+    which is the one failure no shipped ``INCOMPLETE_*`` kind describes
+    because no query ever reached the paginator.
 
     ``graph_lister() -> list[str]`` is the second seam, and it decides WHICH
     graphs get measured. The enumerator can prove it read every row of a
@@ -1183,10 +1301,10 @@ async def run(
     for project_id in project_ids:
         logger.info('enumerating project=%s', project_id)
         try:
-            facts_by_uuid, complete = await edge_source(
+            facts_by_uuid, outcome = await edge_source(
                 project_id, page_size=args.page_size,
             )
-        except Exception:
+        except Exception as exc:
             # One graph's failure is a coverage shortfall, NOT a lost run.
             # Letting this propagate aborted the whole measurement and wrote
             # no artifact at all, contradicting exit_code's own stated rule
@@ -1212,20 +1330,36 @@ async def run(
                 complete=False,
                 scan=ScanResult(),
                 triage={},
+                # TYPE AND MESSAGE, no traceback: logger.exception above
+                # already has the traceback, and the artifact's job is
+                # IDENTIFICATION — telling a vanished graph from a refused
+                # connection from a timeout months later, in a file a reader
+                # has without the log. A traceback pasted into a committed
+                # JSON would also be diff churn on every re-measurement.
+                error=f'{type(exc).__name__}: {exc}',
+                error_kind=ENUMERATION_FAILED,
+                # Left None rather than zeroed: no census was ever taken, and
+                # a 0 here would read as a graph PROVEN empty.
+                census_before=None,
+                census_after=None,
             ))
             continue
         scan = scan_corpus(facts_by_uuid.values())
         projects.append(ProjectReport(
             project_id=project_id,
             valid_edges=len(facts_by_uuid),
-            complete=complete,
+            complete=outcome.complete,
             scan=scan,
             triage=_triage_counts(scan),
+            error=outcome.reason,
+            error_kind=outcome.kind,
+            census_before=outcome.census_before,
+            census_after=outcome.census_after,
         ))
         logger.info(
             'project=%s edges=%d matched=%d rejected=%d selected=%d complete=%s',
             project_id, len(facts_by_uuid), scan.regex_matched,
-            scan.guard_rejected, scan.selected, complete,
+            scan.guard_rejected, scan.selected, outcome.complete,
         )
 
     totals = _sum_scans(p.scan for p in projects)
@@ -1419,6 +1553,22 @@ def render_json(report: Report) -> str:
                 'project_id': project.project_id,
                 'valid_edges': project.valid_edges,
                 'complete': project.complete,
+                # Next to `complete`, not in an appendix: the flag and the
+                # reason for it are one fact, and a reader who has to look
+                # elsewhere for the second half is a reader who will publish
+                # the first half alone. `error_kind` is the branchable
+                # discriminator, `error` the prose — the same split PagedRead
+                # makes, with the same kind VALUES, so this artifact and the
+                # backend's logs name one failure with one string.
+                'error': project.error,
+                'error_kind': project.error_kind,
+                # The bracket the verdict was made against. Without it a
+                # `complete: false` cannot be told from a corpus that merely
+                # grew, which is the whole distinction the tolerance band
+                # draws — and a `complete: true` cannot be seen to have been
+                # made over a corpus that moved by a thousand edges.
+                'census_before': project.census_before,
+                'census_after': project.census_after,
                 'scan': _scan_payload(project.scan),
                 'triage': dict(sorted(project.triage.items())),
                 'rejections': _rejection_payload(project.scan.rejections),
@@ -1496,7 +1646,17 @@ def render_markdown(report: Report) -> str:
             f'| `{project.project_id}` | {project.valid_edges:,} | '
             f'{scan.near_miss:,} | {scan.regex_matched:,} | '
             f'{scan.guard_rejected:,} | {scan.selected:,} | '
-            f'{"yes" if project.complete else "**NO**"} |'
+            + (
+                'yes'
+                if project.complete
+                # The KIND rides in the cell itself, so the table alone
+                # already separates 'the graph went away' from 'the read was
+                # truncated' — the two call for opposite responses, and a bare
+                # **NO** sends a reader hunting for a log they may not have.
+                # The prose lands below, where a column cannot hold it.
+                else f'**NO** (`{project.error_kind}`)'
+            )
+            + ' |'
         )
     totals = report.totals
     lines += [
@@ -1516,6 +1676,32 @@ def render_markdown(report: Report) -> str:
             + '.',
             '',
         ]
+    # WHY each **NO** is a **NO**. Without this the artifact records that a
+    # graph fell short and destroys the only account of how, leaving a reader
+    # months later to guess between a graph that vanished mid-run (re-run) and
+    # a read the store truncated (raise --page-size). The kinds are shared
+    # with `graphiti_client`, so a reader can grep this string in the
+    # backend's own logs and land on the same event.
+    incomplete_projects = [p for p in _sorted_projects(report) if not p.complete]
+    if incomplete_projects:
+        lines += [
+            'Why each `**NO**` above is a **NO** — the kind is the '
+            'discriminator (shared with `graphiti_client`, so it names the '
+            'same failure the backend logs name), the reason is that layer\'s '
+            'own account of it:',
+            '',
+            '| project | kind | reason |',
+            '| --- | --- | --- |',
+        ]
+        for project in incomplete_projects:
+            # Pipes would break the row, newlines the table; neither appears
+            # in any reason produced today, and escaping them here costs
+            # nothing against the day one does.
+            reason = (project.error or '').replace('|', '\\|').replace('\n', ' ')
+            lines.append(
+                f'| `{project.project_id}` | `{project.error_kind}` | {reason} |'
+            )
+        lines.append('')
     lines += [
         'The near-miss column is what makes a zero interpretable: it separates '
         '"the corpus holds no plural-task shapes at all" from "it holds them '
@@ -1883,7 +2069,9 @@ def _build_live_edge_source(config: Any) -> Any:
             await backend.initialize(skip_maintenance=True)
             initialized = True
 
-    async def edge_source(project_id: str, *, page_size: int):
+    async def edge_source(
+        project_id: str, *, page_size: int,
+    ) -> tuple[dict[str, str], EnumerationOutcome]:
         await _ensure_initialized()
         graph = backend._graph_for(project_id)  # noqa: SLF001
 
