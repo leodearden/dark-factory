@@ -132,20 +132,51 @@ _TASK_NODE_NAME_PATTERN = re.compile(
 # with no IGNORECASE flag needed, since [A-Za-z] already spans both cases.
 #
 # The digit class is '[0-9]', NOT '\d', for the reason recorded on
-# _TASK_NODE_NAME_PATTERN above. Measured: 'reify:\u0663' parsed to
-# Referent(project_id='reify', number='\u0663'). The qualifier class was already
+# _TASK_NODE_NAME_PATTERN above. Measured: 'reify:٣' parsed to
+# Referent(project_id='reify', number='٣'). The qualifier class was already
 # ASCII-explicit, so the digit capture was the last Unicode-permissive CAPTURE
-# class in the vocabulary — captures only, and deliberately so. Every pattern
-# here still pads with '\s', and the mention patterns' lookbehinds still use
-# '\w', both of which stay Unicode-broad: measured on this branch,
-# 'task\u00a0132' and 'reify\u00a0:\u00a0132' (NBSP; likewise U+2003 EM SPACE and
-# U+2007 FIGURE SPACE) still parse to number '132'. That breadth is safe here:
-# padding breadth costs at most an exotic SPELLING of a number that is itself
-# ASCII and names a real node, while a lookaround only ever REFUSES a match, so
-# its breadth is precision, never recall loss. Only a CAPTURE hands
-# the character onward as data, which is why the fix is an explicit class and
-# not re.ASCII: re.ASCII would re-scope '\d', '\s' and '\w' at once, three
-# separately-reasoned axes for the price of one.
+# class in the vocabulary — captures only, and deliberately so. General
+# whitespace padding elsewhere in the vocabulary stays Unicode-broad by
+# design — measured on this branch, 'task 132' (NBSP) still parses via
+# _TASK_NODE_NAME_PATTERN's '\s+' branch — because a pad only ever costs an
+# exotic SPELLING of a number that is itself ASCII, never a recall loss. Only
+# a CAPTURE hands the character onward as data, which is why the digit fix is
+# an explicit class and not re.ASCII: re.ASCII would re-scope '\d', '\s' and
+# '\w' at once, three separately-reasoned axes for the price of one.
+#
+# This pattern's OWN padding is the deliberate exception to that breadth, for
+# a different reason entirely — not Unicode safety but LINE-BREAK safety
+# (task 4850). The colon is padded '[ \t]', NOT '\s', on BOTH sides: MEASURED,
+# before this narrowing, parse_node_name('reify:\n132') and
+# parse_node_name('reify\n:132') each parsed to Referent(project_id='reify',
+# number='132') — an entity NAME containing a hard line break is not a
+# project-qualified node name. This was the LAST '\s'-padded colon in the
+# module: _TASK_NODE_NAME_PATTERN, _LOCAL_MENTION_PATTERN and
+# _QUALIFIED_REF_PATTERN already padded '#'/':' with '[ \t]' (task 4123); all
+# four patterns now agree, closing a vocabulary that would otherwise exist
+# twice and drift (INV-5).
+#
+# The ANCHORING padding narrows the same way, for the same reason: '^\s*'
+# becomes '^[ \t]*', and the terminator is '\Z', NOT '$'. '$' (without
+# re.MULTILINE) also matches just before a single trailing newline, so a
+# naive '[ \t]*$' would still accept 'reify:132\n' while rejecting
+# 'reify:132\n\n' — an incoherent half-fix. Do not simplify '\Z' back to '$'.
+#
+# _TASK_NODE_NAME_PATTERN's own anchoring ('^\s*...\s*$') is DELIBERATELY left
+# unnarrowed, and the resulting asymmetry is declared rather than converged:
+# this pattern mints ONLY foreign referents (parse_node_name tries the local
+# pattern first, so every local spelling is already claimed), and for a
+# consumer performing destructive edge surgery a narrowing that REMOVES a
+# foreign ref is the safe direction — a missed ref is recoverable, a
+# misattributed one is not. Narrowing the LOCAL pattern instead would remove
+# bare mentions, and so remove CONTESTS, the dangerous direction — the same
+# reasoning already recorded for _QUALIFIED_REF_PATTERN's colon versus
+# _LOCAL_MENTION_PATTERN's whitespace branch below.
+#
+# Live impact is NIL today: task_naming.canonicalize_task_node_name returns
+# None for any qualified referent and would equally return None if the name
+# stopped parsing. The value of closing this gap is coherence and protection
+# for a future direct consumer of qualified node names.
 _QUALIFIED_NODE_NAME_PATTERN = re.compile(
     r'^[ \t]*([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)[ \t]*\Z'
 )
@@ -237,17 +268,19 @@ _LOCAL_MENTION_PATTERN = re.compile(
 #   _LOCAL_MENTION_PATTERN whitespace branch two blocks above, deliberately
 #   left as '\s+' because narrowing THERE removes bare mentions and so removes
 #   contests, which is the dangerous direction.
-#   This also brings the last '\s'-padded colon in the module into line with
-#   _TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN, which already pad
+#   This also brought the last '\s'-padded colon in the module into line with
+#   _TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN, which already padded
 #   '#'/':' with '[ \t]' for exactly this reason. _QUALIFIED_NODE_NAME_PATTERN
-#   above is deliberately NOT changed here: it is out of task 4123's scope and
-#   is tracked as task 4235 (duplicate filing: 4239), which carries the
-#   measurement — parse_node_name('reify:\n132') still parses today. Behaviour
-#   is identical for every LIVE consumer either way, because the only
-#   production chain (task_naming.canonicalize_task_node_name) returns None for
-#   any qualified referent and would equally return None if the name stopped
-#   parsing; the value of closing it is coherence, before a consumer that acts
-#   on qualified node names lands.
+#   above was NOT changed by task 4123 — it was out of that task's scope. Its
+#   own colon AND anchoring padding were closed separately by task 4850 (task
+#   4235 coalesced into it; task 4239 was cancelled as a duplicate filing),
+#   which brought the fourth and last pattern into line — see the comment on
+#   that pattern for the measurement. Behaviour is identical for every LIVE
+#   consumer either way, because the only production chain
+#   (task_naming.canonicalize_task_node_name) returns None for any qualified
+#   referent and would equally return None if the name stopped parsing; the
+#   value of closing it was coherence, ahead of a consumer that acts on
+#   qualified node names.
 # - The digit class is '[0-9]', NOT '\d', for the reason recorded on
 #   _TASK_NODE_NAME_PATTERN above: '\d' matches Unicode decimal digits on a str
 #   pattern, so 'see reify:\u0663 now' scanned from another group yielded a

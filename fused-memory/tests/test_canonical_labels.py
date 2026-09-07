@@ -439,10 +439,11 @@ class TestUnicodeDigitsAreNotTaskNumbers:
     (the four colon-padding spellings) already run on every commit, and between
     them they are what proves this narrowing disturbed neither the separator
     alternation, the case-insensitivity, nor the colon padding — that padding
-    being a SEPARATE axis, tracked as task 4235 (duplicate filing 4239) and
-    scoped out here. A second copy of those lists inside this class would be
-    the very lockstep duplication INV-5 exists to prevent, reproduced in the
-    test suite: the next narrowing would touch one copy and the two would drift.
+    was a SEPARATE axis, scoped out here and closed later by task 4850 (which
+    coalesced task 4235; task 4239 was cancelled as a duplicate filing). A second
+    copy of those lists inside this class would be the very lockstep duplication
+    INV-5 exists to prevent, reproduced in the test suite: the next narrowing
+    would touch one copy and the two would drift.
     """
 
     @pytest.mark.parametrize(
