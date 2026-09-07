@@ -156,11 +156,13 @@ def lease_dir() -> Path:
 def _lease_filename(owner: str) -> str:
     """A filename no other holder can collide with, readable in a listing.
 
-    Uniqueness is what lets the acquisition use ``O_CREAT | O_EXCL`` with no
-    retry loop: holders never contend for a path, so an ``EEXIST`` would be a
-    real defect rather than ordinary contention.  It also means no new holder
-    can ever reuse a DEAD holder's path, which is what makes reaping dead
-    lease files safe (see :func:`reap_dead_leases`).
+    Uniqueness is what lets the acquisition use ``O_CREAT | O_EXCL`` without
+    ever contending: holders never race for a path, so an ``EEXIST`` would be
+    a real defect rather than ordinary contention.  (:func:`hold_lease` does
+    re-attempt, but never for ``EEXIST`` — only when a sweep reaped its file
+    mid-acquisition, and it draws a fresh name for each attempt.)  It also
+    means no new holder can ever reuse a DEAD holder's path, which is what
+    makes reaping dead lease files safe (see :func:`reap_dead_leases`).
 
     The owner is slugified rather than dropped because these names are read
     by a human in cron mail; the pid and a uuid4 carry the uniqueness.
@@ -187,6 +189,28 @@ def _lease_body(owner: str) -> bytes:
     return json.dumps(record).encode()
 
 
+#: How many times :func:`hold_lease` re-attempts an acquisition a concurrent
+#: sweep unlinked out from under it.  Bounded rather than unbounded because
+#: this runs inside live experiments: a pathological loop must degrade to the
+#: documented fail-open (one stderr line, no guard) instead of hanging a
+#: bake-off.  Three is already far past the plausible worst case — the sweep
+#: fires every six hours and would have to lose the same microsecond race
+#: three times in a row, against a fresh filename each time.
+_ACQUIRE_ATTEMPTS = 3
+
+
+def _still_linked(fd: int) -> bool:
+    """Is the flocked file still IN the directory, or was it unlinked?
+
+    ``st_nlink == 0`` means some other process unlinked this path while the
+    acquisition was in flight — a lock on an inode nothing can name, which
+    :func:`live_leases` will never see again.  Asked AFTER the flock, of the
+    open file description rather than the path, so the answer cannot be
+    stale: once the flock is held, the file can no longer be reaped.
+    """
+    return os.fstat(fd).st_nlink != 0
+
+
 @contextlib.contextmanager
 def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
     """Publish a lease that holds :func:`main`'s sweep off while it is open.
@@ -209,6 +233,16 @@ def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
     beside an integration test) never contend and one release never
     un-guards another.
 
+    A file is nevertheless VISIBLE in the directory for the microseconds
+    between its create and its flock, and in that window a sweep reads it as
+    dead and :func:`reap_dead_leases` unlinks it.  The acquisition therefore
+    re-checks (:func:`_still_linked`) that the file it just locked is still
+    named, and starts over under a fresh one if it is not.  Without that
+    check the cost is wildly out of proportion to the window: the holder ends
+    up flocking an inode nothing can name, so `held` reports a guard that no
+    sweep can ever see again — a microsecond race buying a run of hours no
+    protection at all, silently.
+
     FAILS OPEN — do not "tighten" this into a raise.  An unusable lease
     directory (unwritable, full, a regular file in the way) yields ``False``
     and reports one line on stderr instead of raising.  The callers are
@@ -221,8 +255,11 @@ def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
     ``shared/verify_admission.py::acquire_task_slot`` (clause C-fail-open).
     """
     target = lease_dir() if directory is None else Path(directory)
-    path = target / _lease_filename(owner)
     fd = None
+    # The path this holder created, or None when it created nothing: what the
+    # `finally` has to take away again, tracked separately from `fd` because a
+    # re-attempt closes one file and creates another.
+    path: Path | None = None
     # `held` is set only after the WHOLE acquisition succeeds, and is never
     # inferred from `fd`: a file opened but not flocked is not a lease, and
     # reporting one as held would be the silent no-guard this fails open to
@@ -231,11 +268,35 @@ def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
     held = False
     try:
         target.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        os.set_inheritable(fd, False)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.write(fd, _lease_body(owner))
-        held = True
+        for _ in range(_ACQUIRE_ATTEMPTS):
+            candidate = target / _lease_filename(owner)
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            path = candidate
+            os.set_inheritable(fd, False)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _still_linked(fd):
+                os.write(fd, _lease_body(owner))
+                held = True
+                break
+            # A sweep reaped this file in the microseconds between the create
+            # and the flock, when it existed and was not yet locked.  Keeping
+            # it would be the worst outcome available: a flock on an unnamed
+            # inode holds nothing off, yet `held` would say it does, so a run
+            # of hours would be invisible to EVERY sweep for its whole life.
+            # Start over under a fresh name instead — the reaper cannot have
+            # been holding this file, so unlinking our own litter is safe.
+            os.close(fd)
+            fd = None
+            with contextlib.suppress(OSError):
+                candidate.unlink(missing_ok=True)
+            path = None
+        else:
+            print(
+                f'Could not take an ephemeral-collection lease in {target} '
+                f'(reaped mid-acquisition {_ACQUIRE_ATTEMPTS} times); the '
+                f'cleanup sweep is NOT held off for {owner}',
+                file=sys.stderr,
+            )
     except OSError as exc:
         # Both facts on one line: the directory says WHERE to look, the
         # error says what to fix.
@@ -256,6 +317,7 @@ def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
         if fd is not None:
             with contextlib.suppress(OSError):
                 os.close(fd)
+        if path is not None:
             with contextlib.suppress(OSError):
                 path.unlink(missing_ok=True)
 
@@ -346,11 +408,19 @@ def reap_dead_leases(*, directory: Path | None = None) -> int:
     only to stop the lease directory growing without bound after every run
     that is SIGKILLed, OOM-killed or otherwise denied its ``finally``.
 
-    Unlinking a LIVE holder's file is impossible rather than merely avoided:
+    Unlinking an ESTABLISHED lease is impossible rather than merely avoided:
     only a file whose flock is acquired outright is removed, and unique
     filenames (see :func:`_lease_filename`) mean no new holder can ever be
     handed a dead holder's path.  A file that cannot be probed at all is
     skipped rather than removed — unprobeable is not the same as dead.
+
+    The one file this CAN take from a living process is one still being
+    ACQUIRED: created, not yet flocked, and from here identical to litter —
+    same bytes, same absent lock.  That is unresolvable from this side, so it
+    is resolved on the holder's instead: :func:`hold_lease` re-checks after
+    locking and starts over when its file has been taken.  Named rather than
+    implied, because this is the only case in which the paragraph above is
+    not the whole truth.
 
     Never raises, for the same reason as :func:`live_leases`: two sweeps can
     overlap (an operator running this by hand while cron fires), and the

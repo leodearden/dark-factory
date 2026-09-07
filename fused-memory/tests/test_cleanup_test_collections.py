@@ -374,6 +374,83 @@ class TestHoldLease:
         assert self._names(lease_dir) == []
 
 
+class TestTheAcquisitionWindowIsClosed:
+    """A file that exists but is not yet flocked must never become a lease
+    that holds nothing off.
+
+    Between the ``O_CREAT | O_EXCL`` create and the ``flock``, a holder's file
+    is in the directory and unlocked — so a sweep landing in that window reads
+    it as dead and `reap_dead_leases` unlinks it.  A holder that shrugged at
+    that would then be locking an inode nothing can name: `live_leases` cannot
+    see it and never will again, so a bake-off of HOURS would report itself
+    guarded while every sweep for its whole life ignored it.  Amplifying a
+    microsecond race into an unguarded run is exactly the "guard that silently
+    never fires" the module docstring calls worse than no guard.
+
+    Driven through `_still_linked` — the check that closes the window —
+    because the real race is microseconds wide and cannot be hit
+    deterministically from a test.
+    """
+
+    def test_a_file_reaped_before_the_flock_is_re_acquired_under_a_new_name(
+        self, lease_dir, monkeypatch,
+    ):
+        """The holder ends up with a lease that is BOTH locked and named."""
+        mod = _mod()
+        answers = [False, True]
+        monkeypatch.setattr(mod, '_still_linked', lambda fd: answers.pop(0))
+
+        with mod.hold_lease(owner='e2-bake-off') as held:
+            published = sorted(path.name for path in lease_dir.iterdir())
+            live = mod.live_leases()
+
+        assert answers == [], 'the re-attempt never happened'
+        assert held is True
+        # One file, not two: the first attempt's litter is taken away rather
+        # than left for the reaper to notice six hours later.
+        assert len(published) == 1, published
+        assert [record['owner'] for record in live] == ['e2-bake-off']
+        assert sorted(lease_dir.iterdir()) == []
+
+    def test_it_fails_open_and_loud_rather_than_re_attempting_forever(
+        self, lease_dir, monkeypatch, capsys,
+    ):
+        """Bounded, because this runs inside live experiments: a pathological
+        loop must degrade to the documented fail-open rather than hang a
+        bake-off.  Same stderr shape as the unusable-directory case, so an
+        operator reads one message rather than two."""
+        mod = _mod()
+        monkeypatch.setattr(mod, '_still_linked', lambda fd: False)
+
+        with mod.hold_lease(owner='e2-bake-off') as held:
+            assert held is False
+            assert sorted(lease_dir.iterdir()) == [], 'litter left behind'
+
+        err = capsys.readouterr().err
+        assert str(lease_dir) in err
+        assert 'e2-bake-off' in err
+        assert 'NOT held off' in err
+
+    def test_an_ordinary_acquisition_consults_the_check_exactly_once(
+        self, lease_dir, monkeypatch,
+    ):
+        """No race, no re-attempt: the common path stays a single create."""
+        mod = _mod()
+        checked: list[int] = []
+        still_linked = mod._still_linked
+
+        def _record(fd):
+            checked.append(fd)
+            return still_linked(fd)
+
+        monkeypatch.setattr(mod, '_still_linked', _record)
+
+        with mod.hold_lease(owner='e2-bake-off') as held:
+            assert held is True
+
+        assert len(checked) == 1, checked
+
+
 def _wait_for_marker(marker_path: Path, timeout: float = 5.0) -> bool:
     """Poll for *marker_path* to appear; return False on timeout.
 
