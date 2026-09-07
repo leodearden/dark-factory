@@ -44,7 +44,12 @@ the live memory-write path (via ``asyncio.to_thread`` off
 ``MemoryService._repair_episode_referents``), where a raise would fail an
 already-committed episode's reconcile chain because the COMPLAINT ABOUT the
 write failed.  The repairs it is complaining about have already landed by the
-time this runs; escalation is purely additive.
+time this runs; escalation is purely additive.  That contract is now KEPT IN
+ONE PLACE: the defensive optional-package import, the guarded queue, the
+dedupe-fold and the never-raise submit all live in
+:mod:`fused_memory.middleware._folded_escalation`, which this module calls.
+What stays here is this alarm's own identity (``_ANCHOR_TASK_ID`` and friends)
+and its own evidence rendering.
 """
 
 from __future__ import annotations
@@ -52,33 +57,26 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
-# Defensive import, mirroring candidate_key_escalation / scope_violation_escalator:
-# the `escalation` workspace package is optional (minimal CI envs, unit tests
-# without escalation infra, deployments that have not installed it). When it is
-# missing this module becomes a logged no-op so the repair pass's own
-# never-fail-the-write guarantee is never at risk.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    HAS_ESCALATION = False
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
 
-_QUEUE_DIRNAME: str = 'data/escalations'
-
-#: Anchor task_id handed to ``EscalationQueue.make_id``, so the resulting ids
+#: Anchor task_id handed to ``file_folded_escalation``, which threads it through
+#: both ``EscalationQueue.make_id`` and the fold lookup — so the resulting ids
 #: (``esc-referent-repair-storm-1``, ...) are greppable and distinct from the
 #: other fused-memory series — and, more importantly, so
 #: ``get_by_task(_ANCHOR_TASK_ID, status='pending')`` is a stable per-project
 #: lookup for "is this alarm already open".
+#:
+#: STAYS A CONSTANT OF THIS MODULE even though the filer body is now shared: a
+#: filer deduping against an anchor somebody else keeps open never files again,
+#: and that silence is indistinguishable from health.  The pairwise regression
+#: that catches a colliding rename
+#: (``tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor``) reads
+#: every filer's anchor FROM ITS OWN HOME, which only works while this lives
+#: here.
 _ANCHOR_TASK_ID: str = 'referent-repair-storm'
 
 _AGENT_ROLE: str = 'fused-memory/referent-repair-guard'
@@ -127,56 +125,6 @@ def emit_referent_repair_storm_escalation(
     possible (the ``escalation`` package is unavailable, or the queue write
     failed). NEVER raises.
     """
-    if not HAS_ESCALATION:
-        logger.warning(
-            'referent_repair_storm: escalation package unavailable; '
-            'project_id=%r has a repair streak of %d (threshold %d, %d repair(s) '
-            'this episode) that will NOT be escalated. Repairs continue.',
-            project_id, streak, threshold, repairs,
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        # Constructing the queue creates its directory; a read-only or missing
-        # project_root must not turn an alarm into a crash on the write path.
-        logger.exception(
-            'referent_repair_storm: could not open the escalation queue at '
-            'project_root=%r; project_id=%r streak=%d goes unescalated',
-            project_root, project_id, streak,
-        )
-        return None
-
-    # DEDUPE-FOLD. Once a project is storming, EVERY subsequent episode breaches
-    # the threshold again — the streak only grows until a clean pass resets it.
-    # Filing per breach would bury the operator queue under near-identical
-    # entries and make the real signal (one project, one regression) harder to
-    # see, not easier. `_ANCHOR_TASK_ID` is a stable per-project anchor, so any
-    # still-pending escalation under it IS this project's open storm alarm.
-    #
-    # A read failure falls THROUGH to filing rather than aborting: a possible
-    # duplicate is a far cheaper failure than a silenced storm, and this arm is
-    # reached only when the queue directory is already misbehaving.
-    try:
-        existing = queue.get_by_task(_ANCHOR_TASK_ID, status='pending')
-    except Exception:
-        logger.exception(
-            'referent_repair_storm: failed to check for an already-open alarm '
-            'in project_root=%r; proceeding to file a new one rather than '
-            'silencing the storm',
-            project_root,
-        )
-        existing = []
-    if existing:
-        logger.warning(
-            'referent_repair_storm: %s already open for project_id=%r '
-            '(streak now %d, %d repair(s) this episode); folding into it '
-            'rather than filing a duplicate',
-            existing[0].id, project_id, streak, repairs,
-        )
-        return existing[0].id
-
     shown = list(records[:_MAX_RECORDS_IN_DETAIL])
     omitted = len(records) - len(shown)
     try:
@@ -208,67 +156,42 @@ def emit_referent_repair_storm_escalation(
         f'total{f", {omitted} omitted below" if omitted else ""}):',
         records_json,
     ]
-    detail = '\n'.join(detail_lines)
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(_ANCHOR_TASK_ID),
-            task_id=_ANCHOR_TASK_ID,
-            agent_role=_AGENT_ROLE,
-            severity='blocking',
-            category=_CATEGORY,
-            summary=(
-                f'referent repair storm in {project_id}: {streak} consecutive '
-                f'episodes needed an edge-endpoint repair (threshold {threshold})'
-            ),
-            detail=detail,
-            suggested_action=(
-                'Audit the referent scanner (fused_memory/utils/canonical_labels.py) '
-                'and the resolver (fused_memory/utils/referent_resolution.py) for a '
-                'regression that mis-attributes edge endpoints; '
-                'MemoryService.referent_repair_counts() reports the live '
-                'per-project streaks and the process-lifetime repaired / '
-                'flagged_unrepairable / failed totals. Repairs were NOT halted '
-                'and continue while this is open.'
-            ),
-            # BORN AT L1, matching all three sibling fused-memory escalators
-            # (`candidate_key_escalation`, `mem0_update_storm_escalator`,
-            # `scope_violation_escalator`) — NOT at L0.
-            #
-            # The L0-routes-to-the-steward rule governs an escalation filed BY A
-            # DISPATCHED AGENT about its own task; it does not reach here.
-            # `Steward._pick_escalation` reads
-            # `escalation_queue.get_by_task(self.task_id, status='pending',
-            # level=0)` (orchestrator/src/orchestrator/steward.py::Steward),
-            # scoped to the REAL task that steward was spawned for.  This alarm
-            # is filed by a background server process under the synthetic anchor
-            # `_ANCHOR_TASK_ID`, which is never dispatched and therefore never
-            # has a steward — so an L0 entry here has no consumer at all.  It
-            # would be reached only by
-            # `HarnessRunner._reap_orphan_l0_escalations`, which promotes
-            # unclaimed L0s to L1 after `orphan_l0_timeout_secs`.  Filing at L0
-            # would therefore not route the alarm to a steward; it would merely
-            # DELAY it by that timeout before landing exactly where L1 puts it
-            # immediately.  For a storm escape whose whole purpose is that a
-            # regression not be absorbed silently, a built-in delay is the wrong
-            # default.
-            level=1,
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        # The repairs this is complaining about have already committed; a queue
-        # I/O failure must cost the operator a heads-up, never the write.
-        logger.exception(
-            'referent_repair_storm: failed to submit the alarm for '
-            'project_id=%r (streak=%d, %d repair(s) this episode)',
-            project_id, streak, repairs,
-        )
-        return None
-
-    logger.warning(
-        'referent_repair_storm: queued %s for project_id=%r — %d consecutive '
-        'episodes needed an edge-endpoint repair (threshold %d, %d this '
-        'episode). Repairs continue.',
-        esc_id, project_id, streak, threshold, repairs,
+    # The filer skeleton — defensive import, guarded queue, the DEDUPE-FOLD on
+    # `_ANCHOR_TASK_ID`, and the never-raise submit — lives in
+    # `middleware/_folded_escalation`.  `_ANCHOR_TASK_ID` stays a constant of
+    # THIS module and is passed in explicitly: the helper has no default for it,
+    # because a filer that dedupes against an anchor somebody else keeps open
+    # goes permanently silent and that silence reads exactly like health.
+    #
+    # The fold itself is why the anchor is per-project rather than per-episode:
+    # once a project is storming, EVERY subsequent episode breaches the
+    # threshold again, and filing per breach would bury the operator queue.
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=_ANCHOR_TASK_ID,
+        agent_role=_AGENT_ROLE,
+        category=_CATEGORY,
+        severity='blocking',
+        summary=(
+            f'referent repair storm in {project_id}: {streak} consecutive '
+            f'episodes needed an edge-endpoint repair (threshold {threshold})'
+        ),
+        detail='\n'.join(detail_lines),
+        suggested_action=(
+            'Audit the referent scanner (fused_memory/utils/canonical_labels.py) '
+            'and the resolver (fused_memory/utils/referent_resolution.py) for a '
+            'regression that mis-attributes edge endpoints; '
+            'MemoryService.referent_repair_counts() reports the live '
+            'per-project streaks and the process-lifetime repaired / '
+            'flagged_unrepairable / failed totals. Repairs were NOT halted '
+            'and continue while this is open.'
+        ),
+        logger=logger,
+        log_label='referent_repair_storm',
+        context=(
+            f'project_id={project_id!r} streak={streak} threshold={threshold} '
+            f'{repairs} repair(s) this episode; repairs continue'
+        ),
+        level=1,
     )
-    return esc_id
