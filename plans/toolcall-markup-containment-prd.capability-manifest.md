@@ -233,7 +233,11 @@ no row is orphaned:
 
 Evidence key: `wired` = a production entry path exists on main today or is produced by a
 task in this leaf's own transitive dependency closure; `producer:X` = produced upstream by
-label X; `measured` = re-derived at decompose by direct probe.
+label X; `measured` = re-derived at decompose by direct probe. Verdict `OPEN` — added to the
+vocabulary by task **4471**, after this file was last written, which is why it appears nowhere
+above — = the binding is deliberately **undecided** and the decision is homed in that leaf as its
+own work product; it does not block queueing and must never be read as a green G3 binding
+(`shared/src/shared/capability_manifest.py`; `plans/capability-delivered-checks-prd.md` §Contract).
 
 ### α — `shared.toolcall_markup` (detector + repairer + fixture corpus)
 
@@ -255,7 +259,12 @@ label X; `measured` = re-derived at decompose by direct probe.
 | storm counter keyed `(project, outcome)` (INV-4) | `wired` — `MarkupStormCounter` at `markup_tripwire.py:294` generalises | PASS |
 | residue escalation carrying raw payload (INV-7) | `wired` — `emit_markup_storm_escalation` at `:374`; `data/escalations/` live | PASS |
 
-### γ — register on four servers; retire the in-line gates
+### γ — register on four servers; retire the in-line gates — **SPLIT THREE WAYS 2026-08-19**
+
+**Superseded by γ1/γ2/γ3 below.** The decompose-time table is left exactly as written — it is the
+2026-08-05 claim and stays the historical record — with the correction recorded **alongside** it,
+mirroring how Ruling 1 is recorded above and how the `.yaml` twin preserves η's decompose-time
+FAIL in that capability's binding prose rather than deleting it.
 
 | Capability | Binding | Verdict |
 |---|---|---|
@@ -264,6 +273,50 @@ label X; `measured` = re-derived at decompose by direct probe.
 | four `_markup_gate` call sites to retire (INV-5) | `measured` — exactly four at `:1828 :2020 :5446 :5990` | PASS |
 | live `submit_task` rejects with `repaired_call` | `producer:β` — in γ's closure (γ←β←α) | PASS |
 | live `escalate_info` lands with `suggested_action` | `producer:β` — in γ's closure | PASS |
+
+**Correction, 2026-08-19** (operator commit `965f3206eb`; recorded authoritatively in PRD §9).
+The single γ leaf declared all four servers and was therefore **never dispatched once** —
+`data/orchestrator/runs.db` carries zero events of any type for task **3690** — because it
+required simultaneous module locks on the two hottest files in the repo. Nothing about the
+contracts changed; only the packaging. Two rows above do **not** survive the split intact:
+
+- **`four registration sites` was a FALSE PASS.** §6 probed `add_middleware` against the
+  STANDALONE `fastmcp` class and then confirmed "four sites" by grepping the `FastMCP`
+  constructor — a class-**name** match that does not distinguish the two implementations.
+  fused-memory imports the MCP SDK's *bundled* `mcp.server.fastmcp.FastMCP`, which has neither
+  `add_middleware` nor `get_tool`. Re-verdicted `OPEN` under γ3.
+- **the `_markup_gate` anchors `:1828 :2020 :5446 :5990` are stale.** The four call sites are at
+  `fused-memory/.../tools.py:2701, 2936, 6686, 7239` (def at `:1144`). Re-verdicted `OPEN` under γ3.
+
+### γ1 — register on the escalation and verdict-tools servers (the `FORWARD_REPAIR` pair) — task **3690**
+
+| Capability | Binding | Verdict |
+|---|---|---|
+| `middleware-registered-on-forward-repair-pair` | capability→producer (`measured` 2026-08-19, live `hasattr` probe) — both sites import the STANDALONE `fastmcp 3.2.2`, where `add_middleware` and `get_tool` are present | PASS |
+| `list-typed-evidence-recovery-pinned` | capability→producer (**UNMEASURED**) — `Repair.recovered` is typed `dict[str, str]` and the middleware applies it as a raw `arguments.update` with no type coercion; `escalate_info.evidence` is list-typed, so the esc-3184-2 specimen exercises a case B3 does not | OPEN |
+| `live-escalate-info-lands-with-suggested-action` | `producer:β` — in γ1's closure (γ1←β←α); argument mutation reaching the tool confirmed by PRD §6 live probe | PASS |
+
+*Provenance of the split (the `.yaml` twin's γ1 task-level `note:`, rendered here).* **SPLIT
+2026-08-19.** The original γ declared all four servers and was never dispatched once — zero
+`runs.db` events, ever, in the seven days after β landed — because it required simultaneous
+module locks on the two hottest files in the repo. γ2 (task **4457**) carries plan-tools; γ3
+(task **4458**) carries fused-memory. γ1 also absorbs task **4180** (cancelled into it).
+
+### γ2 — register on plan-tools, and rule on the overlap with ε's read-time path — task **4457**
+
+| Capability | Binding | Verdict |
+|---|---|---|
+| `middleware-registered-on-plan-tools` | capability→producer (`measured` 2026-08-19) — `plan_tools.py` imports the STANDALONE `fastmcp 3.2.2`; site moved to `:1553`, +957 from the `:596` the PRD cites | PASS |
+| `d1-ruling-recorded-against-3692s-read-time-path` | capability→decision — task 3692 (ε, done) landed an independent read-time repairer in the same file (`_with_markup_repairs` at `:982`, ~25 call sites) that cannot reject, memoizes refusals per-process, and deliberately leaves `_create_plan`'s inbound arguments to this middleware. Composing vs superseding must be decided and tested **here**, not left implicit (D1, INV-5). | OPEN |
+| `live-plan-tools-write-rejected-with-repaired-call` | `producer:β` — in γ2's closure (γ2←β←α); in-flight argument access proven by PRD §6 live probe | PASS |
+
+### γ3 — adapt the guard to fused-memory's **bundled** FastMCP; cover the two ungated write tools; only then retire the in-line gates — task **4458**
+
+| Capability | Binding | Verdict |
+|---|---|---|
+| `fused-memory-boundary-adapted` | capability→producer — ⚠️ **THE ORIGINAL γ ROW FOR THIS SITE WAS A FALSE PASS.** §6 verified `add_middleware` against the STANDALONE `fastmcp` class only and then confirmed the four sites by grepping the `FastMCP` constructor — a NAME match that does not distinguish the two classes. Measured 2026-08-19: `fused-memory/server/tools.py:17` imports `mcp.server.fastmcp.FastMCP` (the MCP SDK's **BUNDLED** class), where `hasattr add_middleware` is False and `hasattr get_tool` is False. The middleware is unattachable here as written; this leaf must choose between migrating to standalone `fastmcp` or adapting through the existing `_safe_call_tool` chokepoint in `server/main.py`. | OPEN |
+| `ungated-write-tools-now-covered` | capability→producer (`measured` 2026-08-19) — `add_system_record` (`tools.py:3102`) and `update_memory` (`tools.py:4316`) have no gate of any kind; both write to Mem0 and both carry optional trailing parameters, which is the shape where a swallow is silent rather than loud | OPEN |
+| `inline-markup-gate-call-sites-retired-inv5` | capability→producer (`measured` 2026-08-19) — exactly four call sites at `tools.py:2701, 2936, 6686, 7239` (def at `:1144`); the `1828/2020/5446/5990` anchors in the original row are stale. **MUST NOT** be retired before the replacement is live and demonstrated — this is the one boundary whose containment provably works (Mem0 frozen since 2026-07-30, Graphiti since 2026-07-29). | OPEN |
 
 ### δ — retro-sweep of terminal state, atomic
 
