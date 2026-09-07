@@ -1887,6 +1887,36 @@ def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
     )
 
 
+def _worker_death_leg_note(label: str) -> str:
+    """Describe a leg whose pytest session was TRUNCATED by a worker death.
+
+    The sibling of ``_killed_leg_note`` above, for the second cause of a
+    verdict-less leg (task 5082).  There the process was stopped before it
+    could emit a single diagnostic; here it ran, printed a plausible-looking
+    tally, and that tally is a LIE OF OMISSION — `xdist/dsession.py` called
+    `triggershutdown()` when the ``--max-worker-restart`` cap was exceeded, so
+    every test still queued on every worker was abandoned and the counts cover
+    only what had already finished.
+
+    Every clause is a MEASURED fact, as ``_killed_leg_note``'s are: which leg,
+    that the remaining tests never ran, and that the tally is partial.  It
+    deliberately does NOT quote the tally, and deliberately does not take a
+    duration — the wall-clock time of a truncated run measures nothing anyone
+    should act on.
+
+    Clauses are separated by ``'; '`` and the sentence must stay free of
+    ``', '`` — see ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint: the
+    ``', '``-joined summary is the wire format between this function and
+    ``_aggregate_results``, and a comma here would silently truncate the note
+    on the way through aggregation, leaving only the marker-bearing half.
+    Pinned by test_verify.py::TestWorkerDeathLegSummary.
+    """
+    return (
+        f'{label} leg {WORKER_DEATH_SUMMARY_MARKER}; '
+        f'remaining tests never ran; tally is partial'
+    )
+
+
 def _summarize_checks(
     test_rc: int, test_out: str, test_timed_out: bool, test_cmd: str | None,
     lint_rc: int, lint_out: str, lint_timed_out: bool, lint_cmd: str | None,
@@ -1931,6 +1961,19 @@ def _summarize_checks(
     ``f'Failures: {...}'`` envelope is preserved so every existing consumer
     that prefix- or substring-matches on it stays green.
 
+    CONTRACT, SECOND NO-VERDICT CAUSE (task 5082): a TEST leg whose pytest
+    session was truncated by an xdist worker death contributes
+    ``_worker_death_leg_note`` instead of the flat ``'tests failed'``
+    verdict.  Same defect shape, different mechanism — the leg here was not
+    killed; it ran and printed a plausible-looking tally that counts only the
+    tests which had already finished before `triggershutdown()` abandoned the
+    rest (esc-4176-6 measured ``1 failed, 728 passed, 1 skipped`` where a
+    clean re-run of the identical command reported ``19622 passed, 17
+    skipped``).  ``'tests failed'`` asserts a complete measured verdict that
+    no such run produced.  Gated on the test leg alone because the bailout
+    marker is a pytest-xdist artefact: a lint or type leg carrying that text
+    is quoting it, not exhibiting it.
+
     CONTRACT (task 3173 review amendment): the returned ``category`` and
     ``failing_leg_categories`` answer DIFFERENT questions and neither
     substitutes for the other.  ``category`` is the severity-ranked worst leg
@@ -1971,10 +2014,10 @@ def _summarize_checks(
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
     parts = []
-    for rc, label, tool_verdict, duration in (
-        (test_rc, 'test', 'tests failed', test_duration),
-        (lint_rc, 'lint', 'lint issues', lint_duration),
-        (type_rc, 'type', 'type errors', type_duration),
+    for rc, out, label, tool_verdict, duration in (
+        (test_rc, test_out, 'test', 'tests failed', test_duration),
+        (lint_rc, lint_out, 'lint', 'lint issues', lint_duration),
+        (type_rc, type_out, 'type', 'type errors', type_duration),
     ):
         if rc == 0:
             continue
@@ -1982,8 +2025,16 @@ def _summarize_checks(
         # saying exactly that instead of a fabricated tool verdict. Crash
         # signals (SIGSEGV/SIGABRT/...) are NOT external kills — they are
         # genuine faults of the code under test and keep today's wording.
+        #
+        # ORDER IS LOAD-BEARING (task 5082): the external kill is checked
+        # FIRST because it is the STRONGER no-verdict claim — no diagnostics
+        # at all, versus a session that ran and printed a partial tally. A
+        # killed leg's captured output can itself carry a bailout marker, and
+        # task 3173's wording for that case must not regress.
         if is_external_kill_rc(rc):
             parts.append(_killed_leg_note(label, rc, duration))
+        elif label == 'test' and _is_worker_death_truncated_session(out):
+            parts.append(_worker_death_leg_note(label))
         else:
             parts.append(tool_verdict)
     summary = f'Failures: {", ".join(parts)}'
