@@ -207,7 +207,10 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
             return rows
         return rows[offset:offset + page_size]
 
-    async def _statuses(client, config, project_root):
+    # ``timeout`` is accepted-and-ignored: _shape_one_project threads
+    # active_tasks._TASKS_PER_CALL_TIMEOUT into all three of its calls, so a
+    # stub without the keyword raises TypeError instead of shaping rows.
+    async def _statuses(client, config, project_root, *, timeout=None):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
             return {'offline': True, 'error': 'task fetch offline'}
@@ -964,7 +967,7 @@ async def test_collect_done_counts_returns_per_project_done_count(tmp_path, monk
     # reify: 1 done
     reify_statuses = {10: 'done', 11: 'in-progress', 12: 'pending'}
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         resolved = project_root.resolve()
         if resolved == df_root.resolve():
             return dict(df_statuses)
@@ -988,7 +991,7 @@ async def test_collect_done_counts_skips_offline_projects(tmp_path, monkeypatch,
     offline_root = tmp_path / 'offline-project'
     offline_root.mkdir()
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         if project_root.resolve() == offline_root.resolve():
             return {'offline': True, 'error': 'connection refused'}
         return {1: 'done', 2: 'in-progress'}
@@ -1008,7 +1011,7 @@ async def test_collect_done_counts_all_done_zero(tmp_path, monkeypatch, dummy_cl
     root = tmp_path / 'empty-project'
     root.mkdir()
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         return {1: 'in-progress', 2: 'pending'}
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
@@ -2341,21 +2344,30 @@ class TestShapeOneProjectNarrowing:
         """The budget ROSTER must describe the shipped calls, not merely count them.
 
         ``test_tasks_budget.py`` machine-checks
-        ``DEFAULT_PER_CALL_TIMEOUT * len(_PER_PROJECT_MCP_CALLS) <=
+        ``_TASKS_PER_CALL_TIMEOUT * len(_PER_PROJECT_MCP_CALLS) <=
         _TASKS_PER_PROJECT_BUDGET``.  That arithmetic is only a true statement
         ABOUT THIS SYSTEM if every enumerated call actually threads the term.
         ``fetch_statuses`` shipped without it, so one of the three ran on
-        ``mcp_tool_call``'s 10 s default and could alone overrun the 7 s
+        ``mcp_tool_call``'s 10 s default and could alone overrun the
         per-project budget the roster claims to bound — a constants-only test
         cannot see that, which is why this one asserts at the WIRE.
+
+        The term is the Tasks-tab-LOCAL ``_TASKS_PER_CALL_TIMEOUT`` (task
+        4884), NOT ``tasks.DEFAULT_PER_CALL_TIMEOUT``.  Asserting the shared
+        default here would be actively wrong in a way this test exists to
+        catch: three route budgets bind the shared default by reference, so
+        pinning the Tasks tab to it re-couples exactly what the local constant
+        was introduced to decouple.  If this assertion fails because the two
+        values converged, delete the local constant — do not edit this test to
+        follow it.
 
         Driving the full three-call path (caps > 0) also means adding a fourth
         per-project call without the keyword fails here, rather than silently
         widening the budget.
         """
-        import dashboard.data.tasks as tasks_mod
         from dashboard.data.active_tasks import (
             _PER_PROJECT_MCP_CALLS,
+            _TASKS_PER_CALL_TIMEOUT,
             _shape_one_project,
         )
 
@@ -2377,10 +2389,13 @@ class TestShapeOneProjectNarrowing:
             f'{[c["tool"] for c in calls]}'
         )
         for call in calls:
-            assert call['kwargs'].get('timeout') == tasks_mod.DEFAULT_PER_CALL_TIMEOUT, (
-                f"{call['tool']} was issued without the per-request budget "
-                f"(timeout={call['kwargs'].get('timeout')!r}) — it falls back to "
-                "mcp_tool_call's 10s default, so the per-project budget "
+            assert call['kwargs'].get('timeout') == _TASKS_PER_CALL_TIMEOUT, (
+                f"{call['tool']} was issued with timeout="
+                f"{call['kwargs'].get('timeout')!r}, not the Tasks tab's own "
+                f'_TASKS_PER_CALL_TIMEOUT ({_TASKS_PER_CALL_TIMEOUT}s) — with '
+                "no keyword it falls back to mcp_tool_call's 10s default, and "
+                'with the SHARED default it silently under-budgets the '
+                '5 000-task trees this tab reads, so the per-project budget '
                 'arithmetic in test_tasks_budget.py does not describe it'
             )
 

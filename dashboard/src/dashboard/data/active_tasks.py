@@ -145,14 +145,60 @@ _PER_PROJECT_MCP_CALLS: tuple[str, ...] = (
     'get_tasks[terminal]',
 )
 
+# Per-HTTP-REQUEST budget for the Tasks tab's own MCP calls, threaded into
+# every call ``_shape_one_project`` issues.
+#
+# MEASURED 2026-09-07 against the live fused-memory (localhost:8002), 9
+# configured roots, caches cleared per root, per-call timeout temporarily
+# raised to 10.0 so a slow root reported its real latency instead of a
+# ReadTimeout: per-CALL max 2.696 s, per-ROOT wall max 2.876 s (dark-factory
+# 5128 tasks, reify 7279), p95 across roots 1.695 s. Everything else was
+# under 0.1 s — the distribution is two big trees and seven small ones, not a
+# uniform cost.
+#
+# 4.4 = 1.5 * the 2.876 s per-root wall max, rounded up to one decimal.
+#
+# WHY 2.0 IS TOO SMALL, on evidence rather than on principle: at
+# ``tasks.DEFAULT_PER_CALL_TIMEOUT`` the same measurement's truly-cold render
+# marked dark-factory, reify AND autopilot-video OFFLINE and shipped 208 of
+# 3045 active rows — i.e. the Tasks tab reported the three largest projects
+# unreachable while fused-memory was serving them fine, which is what the
+# journal's ``fetch_tasks[reify] failed for http://localhost:8002:
+# ReadTimeout`` lines are. Offline is a claim that the read demonstrably
+# failed; a per-call budget below the honest service time turns that claim
+# into a lie on every cold render.
+#
+# WHY THE SERVER COST SCALES WITH TREE SIZE even though this read is
+# status-narrowed: there is no field projection at any layer and the backend
+# query is ``SELECT *`` feeding a fixed 14-key row — see ``fetch_tasks``'
+# docstring, which records the limitation, and task 4390, which is the open
+# follow-up to add projection. Until that lands, narrowing the STATUSES does
+# not narrow the WORK, so a 5 000-task tree costs what a 5 000-task tree
+# costs and the budget has to be sized for it.
+#
+# WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
+# ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
+# ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET``, which
+# ``orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET``,
+# ``merge_queue._TASK_TITLES_BUDGET`` and ``app._TASK_CARDS_BUDGET`` all bind
+# BY REFERENCE (task 4788). Raising the shared default to fix the Tasks tab
+# would silently widen three unrelated route budgets — none of which fetches
+# a 5 000-task tree, so none of which needs it.
+# ``test_tasks_budget.py`` assertion (e) pins both halves of this.
+_TASKS_PER_CALL_TIMEOUT = 4.4
+
 # Whole-operation bound for ONE project root, enforced by ``asyncio.wait_for``
 # in ``collect_tasks_with_counts``.
 #
-# ``tasks.DEFAULT_PER_CALL_TIMEOUT`` (2.0) * 3 calls = 6.0 <= 7.0, leaving
-# 1.0 s of slack so this deadline is a real backstop for non-MCP overhead
+# ``_TASKS_PER_CALL_TIMEOUT`` (4.4) * 3 calls = 13.2 <= 14.0, leaving
+# 0.8 s of slack so this deadline is a real backstop for non-MCP overhead
 # (JSON decode, row shaping, event-loop scheduling) rather than coinciding
 # exactly with the sum of its parts — the same reasoning as healthz's
 # ``_DB_PROBE_TIMEOUT * 3 = 2.7 <= _HEALTHZ_TOTAL_BUDGET = 3.0``.
+#
+# It moved 7.0 -> 14.0 only because ``_TASKS_PER_CALL_TIMEOUT`` moved 2.0 ->
+# 4.4: the parts-fit-the-whole shape is unchanged and the slack is still
+# named. It is NOT an independent widening, and must not be raised on its own.
 #
 # What that sum does and does NOT claim: it bounds the sum of the
 # PER-HTTP-REQUEST budgets. It does NOT bound a cold MCP session, which
@@ -161,7 +207,7 @@ _PER_PROJECT_MCP_CALLS: tuple[str, ...] = (
 # residual is exactly what this ``wait_for`` layer exists to cap: the two
 # layers are complementary, not redundant (the same two-layer note
 # ``dashboard/src/dashboard/data/task_runtime.py``'s module docstring carries).
-_TASKS_PER_PROJECT_BUDGET = 7.0
+_TASKS_PER_PROJECT_BUDGET = 14.0
 
 # Whole-handler deadline for the entire multi-project aggregation.
 #
@@ -171,8 +217,19 @@ _TASKS_PER_PROJECT_BUDGET = 7.0
 # structural worst case of roughly ``roots * 3 posts * 10 s`` with no cap at
 # all.
 #
-# Raising any one of these three constants requires re-checking the others —
-# they are mutually constrained, and ``test_tasks_budget.py`` enforces that.
+# DELIBERATELY UNCHANGED at 20.0 while ``_TASKS_PER_PROJECT_BUDGET`` doubled.
+# The obvious "fix" for a cold render that runs out of budget is to widen this
+# toward ``data.js``'s 30 000 ms abort, and it is the wrong one: the measured
+# payload is ~14 MB, and the 10 s of remaining headroom is what serialises and
+# ships it. Spend that headroom on more fetching and the handler delivers a
+# payload the browser has already aborted — a 15s-handler-behind-a-5s-caller,
+# which is the exact failure ``test_healthz_deadline.py`` exists to prevent
+# and strictly worse than degrading a root. The root-count problem is solved
+# by CONCURRENCY (``_TASKS_ROOT_CONCURRENCY``) and the fairness problem by
+# ROTATION, neither of which costs headroom.
+#
+# Raising any one of these constants requires re-checking the others — they
+# are mutually constrained, and ``test_tasks_budget.py`` enforces that.
 # None of them may be raised toward ``memory.mcp_tool_call``'s 10 s default.
 _TASKS_TOTAL_BUDGET = 20.0
 
@@ -642,9 +699,21 @@ async def _shape_one_project(
     # the trade this change set out to make. Cached, the two endpoints share
     # one read and consecutive polls collapse. See
     # tasks._FETCH_STATUSES_TTL_SECONDS for why 5 s.
+    #
+    # Both carry the Tasks-tab-LOCAL _TASKS_PER_CALL_TIMEOUT rather than
+    # tasks.DEFAULT_PER_CALL_TIMEOUT: this tab is the only caller that reads a
+    # 5 000-task tree, and at the shared 2.0 s default the measurement of
+    # 2026-09-07 marked the three largest roots OFFLINE on a cold render. See
+    # the constant for the numbers and for why the shared default may not move.
     fetched, status_map = await asyncio.gather(
-        fetch_tasks(client, config, project_root, statuses=sorted(_ACTIVE_STATUSES)),
-        fetch_statuses(client, config, project_root),
+        fetch_tasks(
+            client, config, project_root,
+            statuses=sorted(_ACTIVE_STATUSES),
+            timeout=_TASKS_PER_CALL_TIMEOUT,
+        ),
+        fetch_statuses(
+            client, config, project_root, timeout=_TASKS_PER_CALL_TIMEOUT,
+        ),
     )
     if isinstance(fetched, dict) and fetched.get('offline'):
         return [], True, 0
@@ -696,6 +765,7 @@ async def _shape_one_project(
             statuses=sorted(_TERMINAL_STATUSES),
             page_size=window,
             offset=max(0, n_terminal - window),
+            timeout=_TASKS_PER_CALL_TIMEOUT,
         )
         if isinstance(terminal, list):
             # DEDUP, not concatenate. The two fetches are separate cached
