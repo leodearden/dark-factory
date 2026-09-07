@@ -279,3 +279,91 @@ class TestDedupeFold:
 
         assert _emit(tmp_path, dedupe=True) is not None
         assert len(calls) == 1, 'the default path DOES consult the pending anchor'
+
+
+class TestNeverRaises:
+    """Called from live write paths: a raise here fails a write because the
+    COMPLAINT about the write failed.
+
+    Every caller's own docstring already promises this; consolidating to one
+    home means the promise is now kept in exactly one place.
+    """
+
+    def test_a_submit_failure_returns_none_and_logs(self, tmp_path, monkeypatch, caplog):
+        class _BrokenQueue:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            def get_by_task(self, *_a, **_kw):
+                return []
+
+            def make_id(self, task_id):
+                return f'esc-{task_id}-1'
+
+            def submit(self, _esc):
+                raise OSError('read-only filesystem')
+
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _BrokenQueue)
+
+        with caplog.at_level('ERROR'):
+            assert _emit(tmp_path) is None
+        assert caplog.records, 'a swallowed failure must still be visible'
+
+    def test_a_get_by_task_failure_falls_through_to_filing(self, tmp_path, monkeypatch):
+        """A read failure must not BLOCK the alarm — better a possible
+        duplicate than a silenced storm.  This arm is reached only when the
+        queue directory is already misbehaving."""
+        real_queue = _folded_escalation.EscalationQueue
+
+        class _UnreadableQueue(real_queue):  # type: ignore[misc,valid-type]
+            def get_by_task(self, *_a, **_kw):
+                raise OSError('queue scan failed')
+
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _UnreadableQueue)
+
+        esc_id = _emit(tmp_path)
+        assert isinstance(esc_id, str), (
+            'the lookup guard must FALL THROUGH to filing, never return early'
+        )
+        assert len(_filed(tmp_path)) == 1
+
+    def test_a_queue_construction_failure_returns_none(self, tmp_path, monkeypatch):
+        """Constructing the queue creates its directory; a read-only or missing
+        project_root must not turn an alarm into a crash on the write path."""
+        def _explode(*_a, **_kw):
+            raise OSError('cannot create queue dir')
+
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _explode)
+
+        assert _emit(tmp_path) is None
+
+    def test_a_malformed_payload_degrades_to_no_escalation(self, tmp_path, monkeypatch):
+        """`Escalation(...)` is constructed INSIDE the guard deliberately: a
+        malformed payload must degrade to "no escalation", never to an
+        exception out of the guard."""
+        def _explode(*_a, **_kw):
+            raise ValueError('malformed escalation payload')
+
+        monkeypatch.setattr(_folded_escalation, 'Escalation', _explode)
+
+        assert _emit(tmp_path) is None
+
+    def test_without_the_escalation_package_it_no_ops(self, tmp_path, monkeypatch, caplog):
+        """The minimal-env path: logged, nothing filed, `None` returned. Every
+        caller must behave identically whether or not the optional `escalation`
+        workspace package is installed."""
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+
+        with caplog.at_level('DEBUG'):
+            result = _emit(tmp_path)
+
+        assert result is None
+        assert not (tmp_path / 'data' / 'escalations').exists()
+        assert caplog.records, 'a no-op alarm must still say so'
+
+    def test_a_none_project_root_returns_none_quietly(self, tmp_path, caplog):
+        """`write_triage` takes `project_root: str | None`; None means there is
+        no project queue to file into, which is not an error."""
+        with caplog.at_level('DEBUG'):
+            assert _emit(tmp_path, project_root=None) is None
+        assert not (tmp_path / 'data' / 'escalations').exists()
