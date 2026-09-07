@@ -847,6 +847,56 @@ _XDIST_CRASH_INDUCED_LOADSCOPE_INTERNALERROR_OUTPUT = (
 )
 
 
+# task 5082, facet 2: xdist's BAILOUT marker — the literal it prints on
+# exactly the branch that gives up. `xdist/dsession.py::DSession.worker_workerdown`
+# increments `_failed_nodes_count`, and when the configured
+# `--max-worker-restart` cap is exceeded it sets
+# ``msg = f"worker {node.gateway.id} crashed and worker restarting disabled"``
+# (the `--max-worker-restart=0` case dark-factory configures at
+# orchestrator/pyproject.toml) or ``f"maximum crashed workers reached: {N}"``,
+# reports it, and calls `triggershutdown()` — abandoning every test still
+# queued on every worker. `pytest_terminal_summary` then re-emits the same
+# message through `terminalreporter.write_sep("=", f"xdist: {msg}")`, which is
+# the ``=``-barred form transcribed here.
+#
+# The tally below it is therefore PARTIAL. Modelled on the esc-4176-6
+# measurement: the truncated run reported ``1 failed, 728 passed, 1 skipped``
+# while a clean re-run of the identical command reported ``19622 passed, 17
+# skipped`` — i.e. ~97% of the suite never ran, yet the shape is structurally
+# indistinguishable from an ordinary complete red run.
+_XDIST_SESSION_ABORTED_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
+    + '1 failed, 728 passed, 1 skipped in 209.67s\n'
+)
+
+# task 5082, facet 2, the DISCRIMINATION fixture: the SIBLING branch of the
+# same `if maximum_reached:` in dsession.py — a target configured with
+# ``--max-worker-restart > 0`` prints ``replacing crashed worker gwN``, clones
+# the node, and the session runs to COMPLETION with a full, trustworthy tally.
+# verify.py verifies multiple projects (see the multi-project rationale on
+# verify._KNOWN_LOAD_FLAKE_NODEID_RES), so this shape is reachable. It carries
+# the identical crash signature as the aborted fixture above — which is
+# precisely why detection must key on the bailout literal and NOT on
+# _XDIST_WORKER_CRASH_RE: keying on the crash signature would stamp "session
+# aborted" on a complete run, trading the reported inaccuracy for a new one in
+# the opposite direction.
+_XDIST_WORKER_REPLACED_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + 'replacing crashed worker gw3\n'
+    + '19622 passed, 17 skipped in 953.70s\n'
+)
+
+# task 5082: the non-zero-cap spelling of the same bailout. dsession.py emits
+# this wording instead whenever ``--max-worker-restart`` is set above 0 and the
+# cap is then exceeded — same `triggershutdown()`, same truncation.
+_XDIST_MAX_WORKERS_REACHED_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + '=========== xdist: maximum crashed workers reached: 2 ===========\n'
+    + '3 failed, 402 passed in 88.10s\n'
+)
+
+
 class TestBareXdistWorkerCrashDetector:
     """task 2365 step-1: verify._is_bare_xdist_worker_crash(output) pure helper.
 
@@ -1119,6 +1169,68 @@ class TestBareXdistWorkerCrashDetector:
         assert verify._PYTEST_FAILURE_SUMMARY_RE.search(output) is None
 
         assert verify._is_bare_xdist_worker_crash(output) is False
+
+
+class TestWorkerDeathTruncatedSession:
+    """task 5082 step-1: the two facet-2 detection primitives.
+
+    ``verify._is_worker_death_truncated_session(output)`` answers "did
+    pytest-xdist give up and abandon the remaining tests", and
+    ``verify._crash_attributed_nodeids(output)`` answers "which node-ids did
+    xdist itself blame on a dead worker rather than on a real verdict".
+
+    RED today: neither helper exists yet (AttributeError).
+    """
+
+    def test_bailout_marker_is_true(self):
+        """The ``worker gwN crashed and worker restarting disabled`` bailout -> True."""
+        assert verify._is_worker_death_truncated_session(_XDIST_SESSION_ABORTED_OUTPUT) is True
+
+    def test_maximum_crashed_workers_reached_is_true(self):
+        """The non-zero-cap spelling of the same bailout -> True."""
+        assert (
+            verify._is_worker_death_truncated_session(_XDIST_MAX_WORKERS_REACHED_OUTPUT)
+            is True
+        )
+
+    def test_replaced_worker_session_is_false(self):
+        """A worker CRASH whose session nevertheless ran to completion -> False.
+
+        The load-bearing discrimination. This fixture carries the identical
+        crash signature as _XDIST_SESSION_ABORTED_OUTPUT — pinned below before
+        the verdict — so a green verdict here proves the predicate keys on the
+        BAILOUT literal and not on _XDIST_WORKER_CRASH_RE. Keying on the crash
+        signature would relabel every ``--max-worker-restart > 0`` target's
+        complete run as truncated.
+        """
+        assert verify._XDIST_WORKER_CRASH_RE.search(_XDIST_WORKER_REPLACED_OUTPUT) is not None
+
+        assert (
+            verify._is_worker_death_truncated_session(_XDIST_WORKER_REPLACED_OUTPUT)
+            is False
+        )
+
+    def test_empty_output_is_false(self):
+        """Falsy output carries no marker, so it can never claim truncation."""
+        assert verify._is_worker_death_truncated_session('') is False
+
+    def test_crash_attributed_nodeids_names_the_in_flight_test(self):
+        """The crashed worker's in-flight node-id is recovered from the crash notice.
+
+        This is the node-id xdist's own ``handle_crashitem`` synthesizes a
+        ``outcome="failed"``/``when="???"`` report for — the esc-4292-3 shape,
+        where the single FAILED summary line names a test that passes in
+        isolation.
+        """
+        assert verify._crash_attributed_nodeids(_XDIST_SESSION_ABORTED_OUTPUT) == {
+            'orchestrator/tests/test_config.py::TestFoo::test_bar'
+        }
+
+    def test_crash_attributed_nodeids_is_empty_without_a_crash_notice(self):
+        """Output with no crash notice attributes nothing — never guess."""
+        output = 'FAILED orchestrator/tests/test_y.py::test_y - AssertionError\n'
+        assert verify._crash_attributed_nodeids(output) == set()
+        assert verify._crash_attributed_nodeids('') == set()
 
 
 class TestPytestFailureSummaryRegex:
