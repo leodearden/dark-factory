@@ -25,13 +25,16 @@ import sys
 import types
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
-    evaluate_closure,
+    closure_exists_probe,
 )
+from fused_memory.reconciliation.event_buffer import EventBuffer
 
 _ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = _ROOT / 'scripts' / 'check_consolidation_closure.py'
@@ -228,9 +231,58 @@ class TestCliUnstampedClusterMember:
 
 
 class TestCliAndSeamAgree:
-    """Guards against the CLI and the seam disagreeing about the very cluster
-    an operator is checking — the false reassurance the whole gate exists to
-    prevent."""
+    """The CLI's verdict and the REAL seam's verdict, over one cluster.
+
+    The comparison is deliberately CLI-output versus
+    ``TaskInterceptor.set_task_status(..., 'done')`` — the actual chokepoint
+    an operator is predicting — and NOT versus a local
+    ``evaluate_closure(unstamped_live_ids=<list comprehension>)`` call. A
+    hand-rolled reference derivation can only agree with production by
+    accident: the earlier version of this test omitted the canonical's
+    ``supersedes`` subtraction entirely (the subtlest rule in
+    ``unstamped_candidates``, and the one keeping every delete-arm
+    consolidation closeable) and stayed green only because no case exercised
+    it. Both sides now run the same production code, and the fourth case
+    below exercises exactly that rule.
+
+    The two sides are wired to ONE ``FakeMemory``: the CLI reaches it through
+    ``scroll_cluster``, the seam through the three injected collaborators
+    ``server/main.py::_wire_closure_collaborators`` binds in production.
+    """
+
+    @staticmethod
+    async def _seam_codes(metadata, memory, tmp_path):
+        """Drive the real chokepoint and return its reason codes."""
+        buf = EventBuffer(db_path=tmp_path / 'cli_seam_eb.db', buffer_size_threshold=100)
+        await buf.initialize()
+        try:
+            taskmaster = AsyncMock()
+            taskmaster.get_task = AsyncMock(
+                return_value={'id': '9001', 'status': 'pending', 'metadata': metadata}
+            )
+            taskmaster.set_task_status = AsyncMock(return_value={'success': True})
+            taskmaster.set_status_and_stamp_audit = AsyncMock(
+                return_value={'success': True}
+            )
+            interceptor = TaskInterceptor(taskmaster, AsyncMock(), buf)
+
+            async def scroll(filters, *, limit, project_id):
+                return await memory.get_memories_by_metadata(
+                    project_id, filters, limit=limit
+                )
+
+            async def count(filters, *, project_id):
+                return await memory.count_memories_by_metadata(project_id, filters)
+
+            interceptor.set_consolidation_scroll(
+                scroll, count=count, exists=closure_exists_probe(memory)
+            )
+            result = await interceptor.set_task_status(
+                '9001', 'done', project_root=str(_ROOT)
+            )
+            return [r['code'] for r in (result.get('reasons') or [])]
+        finally:
+            await buf.close()
 
     @pytest.mark.parametrize(
         'observed,live_ids,members',
@@ -238,26 +290,55 @@ class TestCliAndSeamAgree:
             ([_uuid(42)], [_uuid(42)], _WELL_FORMED),          # stray, live
             ([_uuid(42)], [], _WELL_FORMED),                    # stray, gone
             ([_uuid(1), _uuid(2)], [], _WELL_FORMED),           # all stamped
+            # THE DELETE ARM: the canonical claims it absorbed _uuid(42), and
+            # the store would report that id LIVE if either side probed it. Both
+            # must subtract the claim and close clean — if one side forgets, the
+            # CLI reassures an operator the seam is about to refuse (or the
+            # reverse, which makes a correct consolidation look uncloseable).
+            (
+                [_uuid(1), _uuid(42)],
+                [_uuid(42)],
+                [
+                    _member(_uuid(1), canonical=True, supersedes=[_uuid(42)]),
+                    _member(_uuid(2)),
+                ],
+            ),
         ],
     )
-    def test_same_inputs_same_reason_codes(self, observed, live_ids, members, capsys):
+    def test_same_inputs_same_reason_codes(
+        self, observed, live_ids, members, tmp_path, capsys
+    ):
         import json  # noqa: PLC0415
 
-        memory = FakeMemory(members, live_ids=live_ids)
-        _run(_gate_blob(observed), memory, as_json=True)
+        metadata = _gate_blob(observed)
+
+        cli_memory = FakeMemory(members, live_ids=live_ids)
+        _run(metadata, cli_memory, as_json=True)
         cli_codes = [
             r['code'] for r in json.loads(capsys.readouterr().out)['reasons']
         ]
 
-        unstamped = [i for i in observed if str(i).lower() in {
-            str(x).lower() for x in live_ids
-        } and i not in {m['id'] for m in members}]
-        verdict = evaluate_closure(
-            _gate_blob(observed)[GATE_METADATA_KEY],
-            members=members,
-            scroll_total=len(members),
-            scroll_truncated=False,
-            scroll_available=True,
-            unstamped_live_ids=unstamped,
+        seam_memory = FakeMemory(members, live_ids=live_ids)
+        seam_codes = asyncio.run(
+            self._seam_codes(metadata, seam_memory, tmp_path)
         )
-        assert cli_codes == [r['code'] for r in verdict.reasons]
+
+        assert cli_codes == seam_codes
+        # Same verdict AND same store traffic: a side that reached a matching
+        # verdict while probing a different set of ids has a different
+        # derivation and would diverge on the next case.
+        assert [c[1] for c in cli_memory.point_reads] == [
+            c[1] for c in seam_memory.point_reads
+        ]
+
+    def test_the_delete_arm_case_really_would_have_probed(self, tmp_path):
+        """Guards the guard: the ``supersedes`` case above is only meaningful
+        because the claimed id WOULD otherwise be a probe candidate. Drop the
+        claim and both sides go looking for it."""
+        unclaimed = [_member(_uuid(1), canonical=True), _member(_uuid(2))]
+        memory = FakeMemory(unclaimed, live_ids=[_uuid(42)])
+        codes = asyncio.run(
+            self._seam_codes(_gate_blob([_uuid(1), _uuid(42)]), memory, tmp_path)
+        )
+        assert 'unstamped_cluster_member' in codes
+        assert [c[1] for c in memory.point_reads] == [_uuid(42)]

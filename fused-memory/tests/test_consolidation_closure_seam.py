@@ -459,7 +459,18 @@ class TestSeamUnstampedEdgePolicies:
         """ACCEPTANCE 3. An observed id absent from the scroll AND claimed in
         the canonical\'s ``supersedes`` is a correctly absorbed member, not a
         stray. Without this, every correctly executed delete-arm consolidation
-        would become permanently uncloseable."""
+        would become permanently uncloseable.
+
+        THIS TEST PINS A DELIBERATE BLIND SPOT, not just a saving. Because the
+        claim is subtracted BEFORE any probe, a claimed id that is still LIVE
+        (arming below) draws neither ``absorbed_member_still_live`` (it is not
+        in the scroll, which is all ``_classify_supersedes`` tests) nor
+        ``unstamped_cluster_member``. Since task 4808 a probe EXISTS, so that
+        case could be routed to ``absorbed_member_still_live`` at the cost of
+        one read per absorbed id — a design change 4808\'s plan froze, filed as
+        follow-up ticket ``tkt_0RTCC7BZFQ4CKJ9F4GJRRTZB0V``. A future agent
+        closing that ticket must flip this expectation CONSCIOUSLY; it is not a
+        bug this test caught."""
         absorbed = _uuid(42)
         taskmaster.get_task.return_value = {
             'id': '9001',

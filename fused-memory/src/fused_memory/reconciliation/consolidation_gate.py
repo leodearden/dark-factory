@@ -346,16 +346,36 @@ def unstamped_candidates(
     ``consolidation_gate.py::resolve_unstamped_live_ids`` settles it with one
     point read per survivor.
 
-    WHY THE CANONICAL'S ``supersedes`` IS SUBTRACTED HERE.  A delete-arm
-    consolidation deletes its absorbed members and records them in the
-    canonical's ``supersedes``; every one of those ids is, correctly, absent
-    from the scroll.  Reporting them would make a correctly executed
-    consolidation permanently uncloseable — the same class of error
+    WHY THE CANONICAL'S ``supersedes`` IS SUBTRACTED HERE — AND WHAT THAT
+    NOW COSTS.  A delete-arm consolidation deletes its absorbed members and
+    records them in the canonical's ``supersedes``; every one of those ids is,
+    correctly, absent from the scroll.  Only the CANONICAL's claim counts, and
+    only when exactly one canonical exists, exactly as
+    ``consolidation_gate.py::_classify_supersedes`` rules: a non-canonical
+    peer's stale ``supersedes`` is not what the gate asserted.
+
+    The subtraction's ORIGINAL justification was correctness — before a probe
+    existed, reporting a claimed-absorbed id would have made every correctly
+    executed consolidation permanently uncloseable, the same class of error
     ``consolidation_gate.py::evaluate_closure`` warns about in its central
     membership property when it explains why peer COUNT is never a refusal.
-    Only the CANONICAL's claim counts, and only when exactly one canonical
-    exists, exactly as ``consolidation_gate.py::_classify_supersedes`` rules:
-    a non-canonical peer's stale ``supersedes`` is not what the gate asserted.
+    That argument is STALE as of task 4808: :func:`resolve_unstamped_live_ids`
+    now settles each survivor with a point read, and a correctly executed
+    delete arm probes ABSENT and adds no refusal.  What the subtraction still
+    buys is COST — one Qdrant read per absorbed id, on the ``done`` transition
+    itself — not correctness.
+
+    KNOWN BLIND SPOT, stated rather than implied.  An id the canonical claims
+    it absorbed but which is STILL LIVE and never carried the topic stamp
+    yields neither ``absorbed_member_still_live`` (it is not in the scroll,
+    which is all ``_classify_supersedes`` tests) nor
+    ``unstamped_cluster_member`` (it is subtracted here) — the gate closes over
+    a false closure claim.  This is pre-existing and is pinned as intended by
+    ``tests/test_consolidation_closure_seam.py::TestSeamUnstampedEdgePolicies::
+    test_the_delete_arm_still_closes``.  Changing it means routing a live hit
+    on a claimed id to ``absorbed_member_still_live`` and weighing the extra
+    probes, which is a design decision task 4808's plan froze; it is filed as
+    follow-up ticket ``tkt_0RTCC7BZFQ4CKJ9F4GJRRTZB0V``.
 
     Defensive on every shape.  A ``gate_block`` that is not a Mapping, a
     missing/non-Mapping ``provenance``, and an ``observed_members`` that is
