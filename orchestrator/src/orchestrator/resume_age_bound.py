@@ -24,6 +24,7 @@ on the dispatch path.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -59,6 +60,43 @@ SAMPLE_WINDOW_DAYS = 90
 # gates only genuinely sparse sources — a fresh checkout, a truncated db, a
 # corpus holding nothing but cancellations.
 MIN_SAMPLE_TASKS = 50
+
+# Headroom multiplier over the plain (max in-flight + max downtime) projection.
+#
+# MEASURED on this host 2026-09-07 against data/orchestrator/runs.db, read-only
+# (a re-measurement of the 2026-09-04 planning figures; both terms moved under
+# 1% in three days, which is itself evidence the derivation is stable rather
+# than noise-driven):
+#
+#   T1 in-flight .... n=4,730 task_completed rows with duration_ms > 0 and
+#                     outcome NOT IN ('cancelled','soft-cancelled');
+#                     max 32,052,087 ms = 8.90 h.
+#   T2 downtime ..... n=303,040 inter-event gaps spanning 90.58 days;
+#                     max 205,149 s = 56.99 h (2026-06-12 -> 2026-06-14).
+#                     Next four: 42.42 h, 37.17 h, 25.42 h, 19.84 h.
+#
+#   requirement ..... ceil((32,052 + 205,149) x 1.5) = 355,803 s = 4.12 days.
+#   shipped default .. 432,000 s (5 days) — the requirement rounded UP to the
+#                     next whole day, which is the whole of the rule; no
+#                     multiplier was tuned to reach it.
+#   margin .......... 1.21x over the requirement.
+#   trip point ...... the guard goes red once T1 + T2 exceeds 288,000 s (80 h)
+#                     — about 1.21x today's combined 65.89 h, i.e. roughly a
+#                     3.3-day outage. Rare enough not to flap, and when it does
+#                     fire it is telling the truth: sidecars really can be that
+#                     old, and the bound has to be re-derived rather than
+#                     assumed.
+#
+# Must be >= 1: below 1 the bound would sit UNDER the worst case it is derived
+# from and would reject sessions that are still legitimately in flight.
+#
+# The factor is deliberately modest (1.5, against 3621's 3) because the two
+# terms are already MAXIMA over a 90-day window rather than a peak rate — the
+# conservatism is in the inputs, not the multiplier. The anti-inflation clamp
+# in test_resume_age_bound.py caps the practical headroom below 2x anyway: a
+# sample with both terms doubled must still exceed the shipped default, or the
+# constant has been raised until no realistic fleet could trip the guard.
+RESUME_AGE_SAFETY_FACTOR = 1.5
 
 
 def default_runs_db_path() -> Path:
@@ -186,3 +224,50 @@ def observed_resume_age_inputs(db_path: Path | str) -> ResumeAgeSample | None:
         gap_rows=len(gaps),
         span_days=(stamps[-1] - stamps[0]).total_seconds() / 86400,
     )
+
+
+def required_absolute_resume_age_secs(
+    inflight_max_secs: float,
+    downtime_max_secs: float,
+    safety_factor: float,
+) -> int:
+    """Smallest ``absolute_resume_age_secs`` that cannot reject a live session.
+
+    *inflight_max_secs* is the longest LEGITIMATE invocation observed and
+    *downtime_max_secs* the longest stretch the orchestrator emitted nothing
+    (see :func:`observed_resume_age_inputs`); *safety_factor* is the headroom
+    multiplier over that plain sum (see :data:`RESUME_AGE_SAFETY_FACTOR`).
+
+    WHY TWO TERMS, and why the second is not optional. A sidecar's
+    ``started_at`` is stamped per INVOCATION
+    (``workflow.py::TaskWorkflow._invoke``, at the ``write_agent_session``
+    call), so its age when the ``_run_slot`` guard finally evaluates it is
+    in-flight-time-at-crash PLUS however long the orchestrator was down before
+    re-dispatching. The sidecar sits untouched across an outage, accruing age
+    while nothing runs. Omitting the downtime term is not conservative — it is
+    wrong for the quantity being bounded, and it would reject sessions from a
+    task that never stopped being legitimate.
+
+    The downtime term is also what makes the derivation HONEST rather than
+    reverse-engineered. The in-flight term ALONE measured 8.90 h on
+    2026-09-07, which cannot clear the 86,400 s ``freshness_window_secs`` at
+    any safety factor a reviewer would accept — so a single-term derivation
+    would force someone to pick a multiplier BECAUSE it cleared the
+    constraint, which is the "magic number wearing a formula" that
+    ``docs/legibility/design-invariants.md`` G6 and task 3621 both reject.
+    T2's measured 56.99 h supplies a PHYSICAL reason the absolute bound
+    exceeds freshness.
+
+    Rounds UP: a fractional requirement must never round down into headroom
+    the measured worst case does not leave.
+
+    To RE-DERIVE the bound, measure the live db and read the answer here::
+
+        sample = observed_resume_age_inputs(default_runs_db_path())
+        required_absolute_resume_age_secs(
+            sample.inflight_max_secs,
+            sample.downtime_max_secs,
+            RESUME_AGE_SAFETY_FACTOR,
+        )
+    """
+    return math.ceil((inflight_max_secs + downtime_max_secs) * safety_factor)
