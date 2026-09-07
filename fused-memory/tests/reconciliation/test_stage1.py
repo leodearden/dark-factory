@@ -54,6 +54,9 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectScope
+from fused_memory.reconciliation.gate_owned_finding_phrasing import (
+    CANONICAL_HUMAN_GATE_ACTION,
+)
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
@@ -5147,4 +5150,231 @@ class TestAccountedClusterGrowthWiring:
         )
         assert benign_flag in passed_flags, (
             f'the benign flag must reach dedup_flags; got flags={passed_flags!r}'
+        )
+
+
+def _always_escalates_task(tid) -> dict:
+    """A blocked human gate carrying ONLY metadata.always_escalates.
+
+    The population ``curator_gate_resolution_sweep.extract_open_gate_task_ids``
+    provably misses (it filters on ``operational_mode`` alone) — produced when
+    the operational-routing coercion turns a task into a pure human gate while
+    leaving ``operational_mode='llm'`` in place.
+    """
+    return {
+        'id': tid,
+        'status': 'blocked',
+        'title': f'Gate task {tid}',
+        'metadata': {'always_escalates': True},
+    }
+
+
+class TestGateOwnedActionPhrasingWiring:
+    """MemoryConsolidator.run() must normalize gate-owned suggested_actions
+    (task 4814), prepending CANONICAL_HUMAN_GATE_ACTION to any surviving
+    finding whose cited task is a human decision gate, and surfacing
+    report.stats['gate_owned_suggested_actions_normalized'].
+
+    Closes autopilot_video run 8b2d3371, Stage 1 findings 640d4ceb (task 645)
+    and 66af9601 (task 652): Stage 1 phrased a gate-owned finding's
+    suggested_action as "Stage 2 or operator should decide ...", and Stage 2 —
+    which holds update_task/set_task_status — had to catch and correct it.
+    The recurring cost is that Stage 2 must catch it EVERY cycle; the code
+    gate removes that need.
+
+    RED until step-10 wires the normalizer into run() and sets the stat.
+    """
+
+    _STAT = 'gate_owned_suggested_actions_normalized'
+    _AMBIGUOUS = (
+        'Stage 2 or operator should decide whether to enumerate the remaining '
+        'members and extend the gate.'
+    )
+
+    def _base_report(self, items_flagged=None) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=items_flagged if items_flagged is not None else [],
+            stats={},
+        )
+
+    def _citing_flag(self, tid: str) -> dict:
+        """An LLM-shaped finding citing *tid* only through cited_tasks.
+
+        The run-8b2d3371 shape: ``task_id`` is None and the gate is reachable
+        only through the authoritative ``cited_tasks`` key.
+        """
+        return {
+            'description': f'Gate {tid} has an unresolved membership question.',
+            'severity': 'moderate',
+            'actionable': True,
+            'task_id': None,
+            'flag_type': 'task_memory_divergence',
+            'category': 'task_memory_mismatch',
+            'cited_tasks': [
+                {'project_id': 'test_project', 'task_id': tid, 'title': f'Gate {tid}'},
+            ],
+            'suggested_action': self._AMBIGUOUS,
+        }
+
+    async def _run(self, stage, items_flagged=None, run_id='run-4814-step9'):
+        """Drive run() with dedup_flags passing everything through unchanged."""
+        with (
+            patch.object(
+                BaseStage, 'run',
+                new=AsyncMock(return_value=self._base_report(items_flagged)),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kw: kw['flags']),
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_stat_present_and_zero_on_a_run_that_flagged_nothing(self):
+        """The stat is ALWAYS present, so a consumer needs no .get(..., 0)."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('645')])
+
+        report = await self._run(stage, items_flagged=[])
+
+        assert report.stats.get(self._STAT) == 0, (
+            f'{self._STAT} must be pre-initialised to 0 on every run — the '
+            'always-present stats convention (tasks 2312 / 2229 / 3084) — so a '
+            f'consumer never needs a default; got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stat_present_and_zero_on_a_remediation_pass(self):
+        """A remediation pass returns early, and the pre-init must sit ABOVE that return."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.remediation_findings = [{'description': 'fix this'}]
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('645')])
+
+        report = await self._run(stage, items_flagged=[])
+
+        assert report.stats.get(self._STAT) == 0, (
+            f'{self._STAT} must be present and 0 on a remediation pass — the '
+            'pre-init belongs above the `if self.remediation_findings is not '
+            f'None: return report` early return; got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_gate_owned_finding_gets_the_canonical_sentence_prepended(self):
+        """End-to-end run-8b2d3371 repair: the ambiguous action is corrected."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('645')])
+
+        report = await self._run(stage, items_flagged=[self._citing_flag('645')])
+
+        assert len(report.items_flagged) == 1, (
+            'the normalizer must never DROP a finding — it is a phrasing '
+            f'correction, not a filter; got {report.items_flagged!r}'
+        )
+        action = report.items_flagged[0]['suggested_action']
+        assert action.startswith(CANONICAL_HUMAN_GATE_ACTION), (
+            'a finding citing an operational_mode=gate task must lead with the '
+            'canonical human-gate sentence, so Stage 2 meets it before the '
+            f'ambiguous text; got {action[:140]!r}. RED: '
+            'normalize_gate_owned_suggested_actions is not yet wired into run().'
+        )
+        assert self._AMBIGUOUS in action, (
+            "the model's original text must be preserved after the prefix — it "
+            'is the finding evidence, and a lossy correction is unreviewable'
+        )
+        assert report.stats.get(self._STAT) == 1, (
+            f'exactly one finding was corrected; got stats={report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_normalization_leaves_the_dedup_signature_fields_untouched(self):
+        """task_id / flag_type / cited_tasks survive the pass unchanged.
+
+        Those three ARE ``compute_flag_signature``'s key, so leaving them alone
+        is what keeps cross-cycle dedup, suppression and the
+        ``stage1_flag_markers_acknowledged`` diff unaffected by this task.
+        """
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('645')])
+        flag = self._citing_flag('645')
+
+        report = await self._run(stage, items_flagged=[flag])
+
+        survivor = report.items_flagged[0]
+        assert survivor['task_id'] == flag['task_id'], 'task_id must be untouched'
+        assert survivor['flag_type'] == flag['flag_type'], 'flag_type must be untouched'
+        assert survivor['cited_tasks'] == flag['cited_tasks'], (
+            'cited_tasks must be untouched — it is the authoritative half of '
+            'compute_flag_signature, and perturbing it would silently break '
+            'cross-cycle dedup and the flag-marker acknowledgment diff'
+        )
+
+    @pytest.mark.asyncio
+    async def test_always_escalates_only_task_is_also_normalized(self):
+        """The population extract_open_gate_task_ids provably misses.
+
+        A task carrying only ``always_escalates=True`` is just as much a human
+        decision gate; reusing the mode-only sibling selector would leave this
+        finding uncorrected.
+        """
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[_always_escalates_task('652')],
+        )
+
+        report = await self._run(stage, items_flagged=[self._citing_flag('652')])
+
+        assert report.items_flagged[0]['suggested_action'].startswith(
+            CANONICAL_HUMAN_GATE_ACTION,
+        ), (
+            'an always_escalates-only task is a human gate too — the mode-only '
+            'sibling selector would miss it, which is why task 4814 has its own; '
+            f'got {report.items_flagged[0]["suggested_action"][:140]!r}'
+        )
+        assert report.stats.get(self._STAT) == 1, (
+            f'the always_escalates finding must be counted; got {report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_filtered_task_tree_normalizes_nothing_and_does_not_raise(self):
+        """No task tree -> no structured gate fact to read -> no correction."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        assert stage.filtered_task_tree is None, 'guard: the factory default is None'
+
+        report = await self._run(stage, items_flagged=[self._citing_flag('645')])
+
+        assert report.items_flagged[0]['suggested_action'] == self._AMBIGUOUS, (
+            'with no task tree there is no gate fact to key on, so the finding '
+            f'must pass through unchanged; got {report.items_flagged[0]!r}'
+        )
+        assert report.stats.get(self._STAT) == 0, (
+            f'nothing can be normalized without a task tree; got {report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_finding_citing_a_non_gate_task_is_left_alone(self):
+        """Over-selection would rewrite a finding no human owns."""
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[
+            _open_gate_task('645'),
+            {'id': '4242', 'status': 'pending', 'metadata': {'operational_mode': 'llm'}},
+        ])
+
+        report = await self._run(stage, items_flagged=[self._citing_flag('4242')])
+
+        assert report.items_flagged[0]['suggested_action'] == self._AMBIGUOUS, (
+            'a finding citing a NON-gate task must be returned unchanged — the '
+            'selector is strict precisely so it can only under-select; got '
+            f'{report.items_flagged[0]!r}'
+        )
+        assert report.stats.get(self._STAT) == 0, (
+            f'no gate-owned finding means the stat stays 0; got {report.stats!r}'
         )
