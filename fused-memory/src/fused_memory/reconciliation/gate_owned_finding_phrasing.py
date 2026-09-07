@@ -253,3 +253,145 @@ def extract_human_gated_task_ids(tasks):
             continue
         seen.add(str(raw_tid))
     return sorted(seen)
+
+
+def _flag_cited_task_ids(flag):
+    """Return the set of str task ids *flag* cites, from both id channels.
+
+    Reads the top-level ``task_id`` — split on ``','`` and stripped, because
+    ``FINDING_ITEM_SCHEMA`` documents a comma-joined multi-id shape for that
+    field — plus every ``cited_tasks[i]['task_id']``. ``cited_tasks`` is the
+    AUTHORITATIVE dedup key per that schema, and a finding may carry its task
+    ONLY there (the shape observed in autopilot_video run 8b2d3371), so
+    reading ``task_id`` alone would miss the very population this module
+    exists for.
+
+    None and blank ids contribute nothing. Malformed shapes (a non-list
+    ``cited_tasks``, a non-dict entry) are skipped rather than raised on.
+
+    Pure: no I/O, no side effects.
+    """
+    ids = set()
+
+    raw_tid = flag.get('task_id')
+    if raw_tid is not None:
+        for part in str(raw_tid).split(','):
+            part = part.strip()
+            if part:
+                ids.add(part)
+
+    cited = flag.get('cited_tasks')
+    if isinstance(cited, list):
+        for entry in cited:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get('task_id')
+            if raw is None:
+                continue
+            cited_id = str(raw).strip()
+            if cited_id:
+                ids.add(cited_id)
+
+    return ids
+
+
+def normalize_gate_owned_suggested_actions(flags, gate_task_ids):
+    """Prepend :data:`CANONICAL_HUMAN_GATE_ACTION` to gate-owned findings.
+
+    Half B of task 4814 — the deterministic half, and the one that actually
+    removes Stage 2's per-cycle catch. Selection keys on the STRUCTURED gate
+    fact (the caller passes ids from :func:`extract_human_gated_task_ids` over
+    ``filtered_task_tree.active_tasks``), never on the model's prose: "is this
+    phrasing ambiguous?" has no reliable regex, so a wording detector would
+    catch only the three offenders task 4814 enumerates while a fact-keyed
+    correction fires on every gate-owned finding — including phrasings nobody
+    has seen yet.
+
+    A flag is corrected when it cites a gate id (see
+    :func:`_flag_cited_task_ids`) UNLESS either exemption applies:
+
+    - ``flag_type == GATE_RESOLUTION_FLAG_TYPE`` — the carve-out. That flag's
+      ``suggested_action`` deliberately tells Stage 2 to set a gate task's
+      status, because its evidence is a ruling a human curator ALREADY
+      recorded in Mem0: Stage 2 is transcribing a human decision, not making
+      one, and the flag carries its own dismiss branch for the merely-curated
+      case. The constant is IMPORTED, never re-spelled (INV-5).
+    - the canonical sentence is already present — IDEMPOTENCE. Findings
+      persist across cycles, so a non-idempotent prefix would accrete copies
+      until the ``suggested_action`` was unreadable.
+
+    A corrected flag is a shallow ``dict`` COPY whose ``suggested_action`` is
+    the canonical sentence followed by the model's original text (or the
+    sentence alone when the original is missing/``None``/blank, so no dangling
+    separator is emitted), and which carries ``gate_owned_action_normalized =
+    True``. Copying rather than mutating is load-bearing:
+    ``report.items_flagged``'s ``_pre_filter_flags`` snapshot is a shallow list
+    copy that ALIASES the caller's dicts, so an in-place rewrite would
+    retroactively alter the pre-filter snapshot.
+
+    The model's own text is PRESERVED after the prefix rather than replaced:
+    it is the finding's evidence, and keeping it makes the transformation
+    reviewable and idempotent.
+
+    ``task_id``, ``flag_type`` and ``cited_tasks`` are never touched. Those
+    three ARE ``flag_dedup.compute_flag_signature``'s key, so cross-cycle
+    dedup, suppression and the ``stage1_flag_markers_acknowledged`` diff are
+    provably unaffected by this pass.
+
+    Never drops, never reorders — it is a phrasing correction, not a filter,
+    unlike every other member of the Stage-1 post-processor chain it sits in.
+    Non-dict elements pass through unchanged rather than raising: a malformed
+    element must not cost the whole findings list.
+
+    Args:
+        flags: Stage-1 finding dicts (``report.items_flagged``).
+        gate_task_ids: Str/int ids of human-gate-owned tasks, typically from
+            :func:`extract_human_gated_task_ids`. ``str``-coerced here so an
+            int-typed caller cannot silently match nothing.
+
+    Returns:
+        ``(flags, count)`` — a NEW list of the same length and order, and the
+        number of findings whose ``suggested_action`` was rewritten.
+
+    Pure and sync: no I/O, no side effects. Deliberately NOT try/except
+    wrapped, matching its pure sibling
+    ``flag_dedup.filter_stale_count_snapshot_corrections`` at the same call
+    site.
+    """
+    gate_ids = {str(tid) for tid in gate_task_ids}
+    if not gate_ids:
+        return list(flags), 0
+
+    normalized = []
+    count = 0
+
+    for flag in flags:
+        if not isinstance(flag, dict):
+            normalized.append(flag)
+            continue
+
+        if flag.get('flag_type') == GATE_RESOLUTION_FLAG_TYPE:
+            normalized.append(flag)
+            continue
+
+        if not (_flag_cited_task_ids(flag) & gate_ids):
+            normalized.append(flag)
+            continue
+
+        existing = flag.get('suggested_action')
+        existing_text = existing if isinstance(existing, str) else ''
+        if CANONICAL_HUMAN_GATE_ACTION in existing_text:
+            normalized.append(flag)
+            continue
+
+        corrected = dict(flag)
+        corrected['suggested_action'] = (
+            CANONICAL_HUMAN_GATE_ACTION + ' ' + existing_text.strip()
+            if existing_text.strip()
+            else CANONICAL_HUMAN_GATE_ACTION
+        )
+        corrected['gate_owned_action_normalized'] = True
+        normalized.append(corrected)
+        count += 1
+
+    return normalized, count
