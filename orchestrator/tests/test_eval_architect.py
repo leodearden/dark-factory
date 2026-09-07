@@ -1591,6 +1591,14 @@ def _arch_task_no_reference() -> dict:
     return task
 
 
+# Distinguishes "this case passed no usage_gate at all" (the OWNED path, where
+# run_architect_eval builds and tears down its own) from "this case passed
+# usage_gate=None" (deliberately ungated by a campaign owner). A plain None
+# default could not tell those apart — which is the same trap the production
+# _GATE_UNSET sentinel exists to avoid.
+_NO_INJECTED_GATE = object()
+
+
 async def _run_architect_eval_hermetic(
     cfg,
     *,
@@ -1611,6 +1619,8 @@ async def _run_architect_eval_hermetic(
     decline_reader_errors: dict[str, BaseException] | None = None,
     cleanup_side_effect=None,
     expose_mocks: dict | None = None,
+    injected_gate=_NO_INJECTED_GATE,
+    patch_cap_retry: bool = False,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1698,6 +1708,24 @@ async def _run_architect_eval_hermetic(
       ``runner.UsageGate`` to RAISE it — the construction-failure /
       warn-and-degrade path.
 
+    ``injected_gate=`` is a DIFFERENT knob from ``usage_gate=`` and the two must
+    not be conflated (task 4427). ``usage_gate=`` patches the CONSTRUCTOR, so
+    the cell still builds and OWNS its gate — that is the owned path every
+    pre-4427 case exercises. ``injected_gate=`` instead forwards the value to
+    ``run_architect_eval``'s own ``usage_gate=`` PARAMETER, i.e. a gate a
+    campaign owner already built, which the cell must use without tearing down.
+    Omitted, no ``usage_gate`` argument is passed at all, so the owned path is
+    byte-identical to before; ``injected_gate=None`` passes an explicit ``None``
+    (deliberately ungated), which is NOT the same as omitting it.
+
+    ``patch_cap_retry=True`` replaces ``runner.invoke_with_cap_retry`` with an
+    AsyncMock (exposed as ``mocks['cap_retry']``) instead of letting the real
+    wrapper drive the gate. That is the only seam where the object the cell
+    actually invoked WITH is directly readable —
+    ``mocks['cap_retry'].await_args.args[0]`` — which is what an injected-gate
+    identity assertion needs. ``invoke_agent`` is then never reached, so
+    ``mocks['invoke']`` stays uncalled for such a case.
+
     ``shared.cli_invoke.asyncio.sleep`` is patched unconditionally (the
     ``_SLEEP_PATCH`` idiom from shared/tests/test_cap_retry.py:224) so cap-retry
     cooldowns never really sleep; exposed as ``mocks['sleep']``.
@@ -1718,6 +1746,10 @@ async def _run_architect_eval_hermetic(
         cache_read_tokens=48_000, cache_create_tokens=6_000, turns=9,
     )
     mock_invoke = AsyncMock(return_value=invoke_return, side_effect=invoke_side_effect)
+    mock_cap_retry = (
+        AsyncMock(return_value=invoke_return, side_effect=invoke_side_effect)
+        if patch_cap_retry else None
+    )
 
     artifacts_instance = MagicMock()
     artifacts_instance.read_plan.return_value = produced_plan
@@ -1805,14 +1837,22 @@ async def _run_architect_eval_hermetic(
         p(patch('orchestrator.evals.runner.load_task',
                 MagicMock(return_value=_task_def)))
         p(patch('orchestrator.verify.run_verification', mock_verify))
+        if mock_cap_retry is not None:
+            p(patch('orchestrator.evals.runner.invoke_with_cap_retry',
+                    mock_cap_retry))
+        extra = (
+            {} if injected_gate is _NO_INJECTED_GATE
+            else {'usage_gate': injected_gate}
+        )
         result = await runner.run_architect_eval(
-            Path('/fake/task.json'), cfg, base_config=MagicMock(),
+            Path('/fake/task.json'), cfg, base_config=MagicMock(), **extra,
         )
     return result, {
         'invoke': mock_invoke, 'verify': mock_verify,
         'save': mock_save, 'judge': mock_judge,
         'sleep': mock_sleep, 'UsageGate': gate_factory, 'gate': usage_gate,
         'cleanup': mock_cleanup, 'artifacts': artifacts_instance,
+        'cap_retry': mock_cap_retry,
     }
 
 
@@ -4598,6 +4638,133 @@ class TestArchitectEvalGateLifecycle:
         )
         assert result.outcome == 'done'
         assert mocks['gate'] is None
+
+
+@pytest.mark.asyncio
+class TestArchitectEvalInjectedGate:
+    """A gate the CALLER built is used as-is and never torn down (task 4427).
+
+    The per-cell build above stays the default, but a campaign owner that
+    already holds a gate must be able to hand it down — and the cell must NOT
+    shut it down, because that would destroy the shared cap state mid-campaign,
+    which is the entire point of hoisting it.
+    """
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_injected_gate_is_the_one_invoked_with(self):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+            injected_gate=gate, patch_cap_retry=True,
+        )
+
+        # The gate the campaign owns is the gate the invoke actually rides.
+        assert mocks['cap_retry'].await_args.args[0] is gate
+
+    async def test_an_injected_gate_suppresses_the_per_cell_build(self):
+        """The hoist is pointless if the cell builds one anyway."""
+        from shared.testing import make_gate_mock
+
+        from orchestrator.evals import runner
+
+        gate = make_gate_mock()
+        build = AsyncMock(return_value=make_gate_mock())
+        with patch.object(runner, '_build_eval_usage_gate', build):
+            _result, _mocks = await _run_architect_eval_hermetic(
+                self._cfg(), produced_plan=_well_formed_plan(),
+                injected_gate=gate, patch_cap_retry=True,
+            )
+
+        build.assert_not_awaited()
+
+    async def test_an_injected_gate_is_never_shut_down(self):
+        """Tearing down a borrowed gate would destroy the campaign's cap state.
+
+        Cell N shutting the shared gate down would take failover away from every
+        cell after it — strictly worse than the per-cell gate it replaced.
+        """
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+            injected_gate=gate, patch_cap_retry=True,
+        )
+
+        assert result.outcome == 'done'
+        gate.shutdown.assert_not_awaited()
+
+    async def test_an_injected_gate_survives_a_failing_cell(self):
+        """The failure path is exactly where the shared gate matters most.
+
+        A cell that blew up is the one most likely to have hit a cap, i.e. the
+        one carrying the cap knowledge its siblings need.
+        """
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan={},
+            injected_gate=gate, patch_cap_retry=True,
+            invoke_side_effect=RuntimeError('architect exploded'),
+        )
+
+        assert result.outcome == 'blocked'
+        gate.shutdown.assert_not_awaited()
+
+    async def test_explicit_none_means_ungated_not_unset(self):
+        """``usage_gate=None`` is a DECISION, not a missing argument.
+
+        ``_build_eval_usage_gate`` returns None three legitimate ways, so a
+        campaign can be deliberately ungated. If the cell read that None as
+        "nothing was supplied" it would build its own gate — silently restoring
+        the per-cell construction the hoist removes, and re-paying a probe-dir
+        alloc plus a SIGHUP-handler steal on the zero-account path.
+        """
+        from orchestrator.evals import runner
+
+        build = AsyncMock()
+        with patch.object(runner, '_build_eval_usage_gate', build):
+            _result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(), produced_plan=_well_formed_plan(),
+                injected_gate=None, patch_cap_retry=True,
+            )
+
+        build.assert_not_awaited()
+        assert mocks['cap_retry'].await_args.args[0] is None
+
+    async def test_omitting_the_parameter_keeps_the_owned_path(self):
+        """Back-compat: no argument still means build-your-own AND tear it down.
+
+        The four TestArchitectEvalGateLifecycle pins cover the teardown; this
+        adds the other half — that the cell still BUILDS when nothing is passed,
+        which is what makes the sentinel (rather than a None default) load-bearing.
+        """
+        from shared.testing import make_gate_mock
+
+        from orchestrator.evals import runner
+
+        own_gate = make_gate_mock()
+        build = AsyncMock(return_value=own_gate)
+        with patch.object(runner, '_build_eval_usage_gate', build):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(), produced_plan=_well_formed_plan(),
+                patch_cap_retry=True,
+            )
+
+        build.assert_awaited_once()
+        assert mocks['cap_retry'].await_args.args[0] is own_gate
+        assert result.outcome == 'done'
+        # Owned → the cell is still responsible for the teardown.
+        own_gate.shutdown.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
