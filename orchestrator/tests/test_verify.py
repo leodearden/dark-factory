@@ -16,6 +16,7 @@ from orchestrator.verify import (
     _CATEGORY_PRIORITY,
     _PRUNE_THROTTLE_SECS,
     SIGNAL_KILL_SUMMARY_MARKER,
+    WORKER_DEATH_SUMMARY_MARKER,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
@@ -2382,6 +2383,92 @@ class TestExtractCauseHint:
         )
         hint = _extract_cause_hint(output1 + output2)
         assert hint == 'FAILED tests/test_x.py::test_first_subproject - AssertionError', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    # ---------------------------------------------------------------------
+    # task 5082 step-5: rung 0 — a session TRUNCATED by an xdist worker death.
+    #
+    # Two things go wrong today, and both are reporting defects rather than
+    # detection ones.  (1) The only FAILED line is often the one xdist
+    # FABRICATED for the test the dead worker had in flight
+    # (`dsession.py::handle_crashitem`, `outcome="failed"` / `when="???"`), so
+    # rung 1 names an innocent test that passes in isolation — esc-4292-3's
+    # measured shape.  (2) With no FAILED line at all the ladder falls through
+    # to rung 3 and quotes the tally, which after `triggershutdown()` counts
+    # only the tests that had already run — a PARTIAL count presented as a
+    # complete result.
+    # ---------------------------------------------------------------------
+
+    _TRUNCATED_SESSION_OUTPUT = (
+        'orchestrator/tests/test_config.py ....\n'
+        '[gw3] node down: Not properly terminated\n'
+        "worker gw3 crashed while running "
+        "'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
+        'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar\n'
+        '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
+        '1 failed, 728 passed, 1 skipped in 209.67s\n'
+    )
+
+    def test_worker_death_truncated_session_does_not_blame_crashed_test(self):
+        """The crashed worker's in-flight test is never named as the cause.
+
+        esc-4292-3: that FAILED line is xdist's own synthesis, and the test it
+        names passes in isolation.  Naming it sends the debugger after a
+        failure that never happened.
+        """
+        hint = _extract_cause_hint(self._TRUNCATED_SESSION_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert 'test_config.py::TestFoo::test_bar' not in hint, (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_worker_death_hint_does_not_quote_the_partial_tally(self):
+        """Rung 0 pre-empts rung 3, so the PARTIAL tally is never quoted.
+
+        ``1 failed, 728 passed, 1 skipped`` counts only what had already run
+        before `triggershutdown()`; a clean re-run of the identical command
+        reported 19622 passed (esc-4176-6).  Quoting it as a cause reads as a
+        complete result.
+        """
+        hint = _extract_cause_hint(self._TRUNCATED_SESSION_OUTPUT)
+        assert '1 failed, 728 passed' not in hint, f'Unexpected hint: {hint!r}'
+
+    def test_worker_death_hint_still_names_a_surviving_real_failure(self):
+        """Truncation must never MASK a genuine independent failure.
+
+        Both facts are reported: the abort marker AND the FAILED line that is
+        not crash-attributed.  Suppressing every FAILED line on truncation
+        would recreate task 4066's incident (8 real failures hidden);
+        returning only the surviving line would let the ladder quote a partial
+        tally as complete.  Carrying both is the only option that adds
+        information without discarding any.
+        """
+        output = (
+            self._TRUNCATED_SESSION_OUTPUT
+            + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert 'test_x.py::test_real' in hint, f'Unexpected hint: {hint!r}'
+
+    def test_non_truncated_crash_hint_is_unchanged(self):
+        """REGRESSION GUARD: rung 0 is INERT outside a confirmed truncation.
+
+        Same worker crash, but the session RECOVERED (no bailout marker), so
+        the tally is complete and trustworthy and today's rung-1 result must
+        come back byte-identical.
+        """
+        output = (
+            'orchestrator/tests/test_config.py ....\n'
+            '[gw3] node down: Not properly terminated\n'
+            "worker gw3 crashed while running "
+            "'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
+            'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar\n'
+            '========== 1 failed, 2 passed in 5.00s ==========\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == 'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar', (
             f'Unexpected hint: {hint!r}'
         )
 
