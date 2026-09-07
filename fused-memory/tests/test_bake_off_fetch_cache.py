@@ -109,6 +109,32 @@ import hashlib  # noqa: E402
 
 import pytest  # noqa: E402
 
+# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
+
+
+@pytest.fixture(autouse=True)
+def lease_dir(tmp_path, monkeypatch):
+    """Point ``DF_EPHEMERAL_COLLECTION_LEASE_DIR`` at a per-test directory.
+
+    A hard isolation boundary, not a convenience.  The lease directory
+    ``cleanup_test_collections.lease_dir()`` returns by default is a
+    HARDCODED machine-global absolute path (that is the property the guard's
+    correctness rests on — see the design note on that function), and it is
+    the very directory the live 6-hourly cron reads.  A test that wrote a
+    lease into it would hold a real sweep off this host; a test that reaped
+    it would unlink the lease of a live bake-off running in another checkout.
+
+    Autouse, and applied to EVERY test in this module rather than only the
+    lease tests, for exactly that reason: a test that forgets to request the
+    isolation must not be able to fall through silently to the real
+    directory.  Tests that need the path can still request this fixture by
+    name; the directory is not created here, because a lease-dir-absent case
+    is one of the behaviours under test.
+    """
+    directory = tmp_path / 'ephemeral-collection-leases'
+    monkeypatch.setenv('DF_EPHEMERAL_COLLECTION_LEASE_DIR', str(directory))
+    return directory
+
 
 class TestTheScriptIsLoadedOnceNotReExecuted:
     """The loader seam must REUSE the script, not re-execute it.
