@@ -62,6 +62,58 @@ def _citation(project_id: str, task_id: str, title: str = 'x') -> dict:
     return {'project_id': project_id, 'task_id': task_id, 'title': title}
 
 
+class TestResolveFindingTaskTargetMultiPartTaskId:
+    """A comma-joined task_id must NOT be routed verbatim.
+
+    `add_finding` stores the value canonicalized by
+    `recon_report._canonicalize_task_id_string`, which splits on ',', sorts and
+    REJOINS with ',' -- a documented supported shape -- and `flagged_items`
+    copies it straight through. Routing `'5040,5149'` verbatim would store a
+    record that `get_by_task` (exact equality) misses for BOTH 5040 and 5149,
+    recreating the dead-end this module exists to close.
+    """
+
+    def test_comma_joined_bare_task_id_is_not_routed(self):
+        assert resolve_finding_task_target({'task_id': '5040,5149'}, 'dark_factory') is None
+
+    def test_comma_joined_value_is_never_returned_verbatim(self):
+        """The specific failure: a joined string reaching make_id/get_by_task."""
+        for joined in ('5040,5149', '5040, 5149', ' 5040 ,5149 ', 'a,b,c'):
+            result = resolve_finding_task_target({'task_id': joined}, 'dark_factory')
+            assert result is None, f'{joined!r} resolved to {result!r}'
+            assert result != joined
+
+    def test_single_id_with_comma_noise_still_resolves(self):
+        """Splitting normalizes; it must not reject a genuine single id."""
+        for noisy in ('5040', ' 5040 ', '5040,', ',5040', '5040 , ', '5040,5040'):
+            assert resolve_finding_task_target({'task_id': noisy}, 'dark_factory') == '5040', noisy
+
+    def test_comma_only_task_id_is_not_routed(self):
+        for empty in (',', ' , ', ',,'):
+            assert resolve_finding_task_target({'task_id': empty}, 'dark_factory') is None
+
+    def test_multi_part_bare_id_falls_through_to_citations(self):
+        """The bare branch declining must not suppress a usable citation."""
+        finding = {
+            'task_id': '5040,5149',
+            'cited_tasks': [_citation('dark_factory', '4458')],
+        }
+        assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
+
+    def test_comma_joined_citation_entry_is_skipped(self):
+        finding = {'cited_tasks': [_citation('dark_factory', '5040,5149')]}
+        assert resolve_finding_task_target(finding, 'dark_factory') is None
+
+    def test_comma_joined_citation_does_not_block_a_later_good_one(self):
+        finding = {
+            'cited_tasks': [
+                _citation('dark_factory', '5040,5149'),
+                _citation('dark_factory', '4458'),
+            ],
+        }
+        assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
+
+
 class TestResolveFindingTaskTargetCitedTasksFallback:
     """The `cited_tasks` fallback, and the same-project guard on it."""
 

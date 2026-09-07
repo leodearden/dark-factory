@@ -134,6 +134,54 @@ _ESCALATION_SEVERITY = 'info'
 _AGENT_ROLE = 'reconciliation-harness'
 
 
+def _sole_task_id_part(value: object) -> str | None:
+    """Return the single task id inside *value*, or None if it is not exactly one.
+
+    A ``task_id`` field is NOT guaranteed to hold one id. A comma-joined value
+    (e.g. ``'5040,5149'``) is a DOCUMENTED supported shape: ``add_finding``
+    stores the value canonicalized by
+    ``fused_memory/server/recon_report.py::_canonicalize_task_id_string``, which
+    splits on ``','``, sorts and REJOINS with ``','`` — and ``flagged_items``
+    copies that straight through. So a finding about two tasks arrives here as
+    a single joined string.
+
+    Routing such a value verbatim would be worse than not routing it. The id is
+    load-bearing twice over: ``EscalationQueue.make_id`` builds
+    ``esc-{task_id}-{seq}`` from it, and ``EscalationQueue.get_by_task`` filters
+    on EXACT equality of the stored field. A record stored under
+    ``'5040,5149'`` is therefore invisible to ``get_by_task('5040')`` AND to
+    ``get_by_task('5149')`` — it surfaces on no task's ladder at all, which is
+    precisely the dead-end this module exists to close, only now wearing a
+    well-formed-looking record and consuming a queue slot. Worse,
+    ``Harness._reap_orphan_l0_escalations`` scans ``get_pending()`` without any
+    task-existence check and would eventually promote that L0 to L1 under a
+    task id that does not exist.
+
+    A multi-part value therefore returns None and is simply NOT ROUTED. This is
+    deliberately conservative rather than clever: picking one part would file
+    against an arbitrary task and silently drop the others, and splitting into N
+    records would breach the volume-parity guarantee documented on
+    ``_file_finding_task_escalation``. Deciding which of several tasks a
+    contradiction belongs to is semantic work, and semantic detection is
+    explicitly out of scope for this arm. Not routing is no worse than today's
+    behaviour: the recon-queue filing via ``_escalate`` still fires either way.
+
+    Splitting also normalizes the single-id case, so a value that merely carries
+    stray whitespace or a trailing comma (``' 5040 , '``) still resolves to
+    ``'5040'`` instead of being routed verbatim.
+    """
+    if value is None:
+        return None
+    # Same split shape as recon_report.py::_split_task_id_parts, kept as a local
+    # literal rather than an import: this module's purity contract (see the
+    # module docstring) keeps it free of server/ imports, and the expression is
+    # one line.
+    parts = {p.strip() for p in str(value).split(',') if p.strip()}
+    if len(parts) != 1:
+        return None
+    return parts.pop()
+
+
 def resolve_finding_task_target(
     finding: Mapping,
     project_id: str,
@@ -170,13 +218,15 @@ def resolve_finding_task_target(
     root and reasoning about a second orchestrator's liveness.  A finding whose
     only citations are foreign resolves to None and is simply not routed.
 
-    Both branches are LLM-authored input, so every value is coerced with
-    ``str()`` and stripped, and a malformed ``cited_tasks`` entry is SKIPPED
+    Both branches are LLM-authored input, so every value is passed through
+    :func:`_sole_task_id_part` (coerce, strip, and reject a comma-joined
+    multi-id value — see that docstring for why routing one verbatim is worse
+    than not routing it), and a malformed ``cited_tasks`` entry is SKIPPED
     rather than raised — a bad citation must not abort the remediation pass.
     """
     raw = finding.get('task_id')
     if raw is not None:
-        candidate = str(raw).strip()
+        candidate = _sole_task_id_part(raw)
         if candidate:
             return candidate
 
@@ -191,7 +241,11 @@ def resolve_finding_task_target(
         entry_task_id = entry.get('task_id')
         if entry_task_id is None:
             continue
-        candidate = str(entry_task_id).strip()
+        # Same multi-part rejection as the bare branch. `cite_task` is expected
+        # to write one id per entry, so this is defence in depth rather than a
+        # known shape -- but a joined value here would be just as unroutable,
+        # and skipping the entry lets a well-formed later citation still win.
+        candidate = _sole_task_id_part(entry_task_id)
         if candidate:
             return candidate
     return None
