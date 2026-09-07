@@ -476,6 +476,33 @@ class TestManifestTask:
         with pytest.raises(ValidationError):
             ManifestTask(label='α', task_id='not-an-int', capabilities=[])  # type: ignore[arg-type]
 
+    def test_external_task_id_accepted_verbatim(self):
+        """A block whose producer lives in ANOTHER project's registry.
+
+        The value is the repo's canonical qualified form
+        (``"project_id:task_id"``, docs/task-authoring.md §3.2) and is
+        exposed verbatim — the model validates the wire form, it does not
+        rewrite it.
+        """
+        task = ManifestTask(label='η', external_task_id='reify:5613', capabilities=[])
+        assert task.external_task_id == 'reify:5613'
+        assert task.task_id is None
+
+    def test_external_task_id_omitted_defaults_none(self):
+        task = ManifestTask(label='α', capabilities=[])
+        assert task.external_task_id is None
+
+    def test_external_task_id_loads_through_parse_capability_manifest(self):
+        doc = parse_capability_manifest(
+            {
+                'prd': 'plans/example-prd.md',
+                'schema_version': 1,
+                'tasks': [_task_dict('η', external_task_id='reify:5613')],
+            }
+        )
+        assert doc.tasks[0].external_task_id == 'reify:5613'
+        assert doc.tasks[0].task_id is None
+
     def test_empty_label_rejected(self):
         with pytest.raises(ValidationError) as exc_info:
             ManifestTask(label='', capabilities=[])
