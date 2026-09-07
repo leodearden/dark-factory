@@ -227,30 +227,49 @@ def is_guarded(tree: ast.Module) -> bool:
     return GUARD_CALLABLE in imported_names_from(tree, GUARD_MODULE)
 
 
+#: Pinned census mirroring EXPECTED_EXEMPT_SCRIPTS further below: any
+#: WIDENING of MUTATING_CALL_NAMES requires a deliberate edit here too.
+#: Parametrizing the test below directly off MUTATING_CALL_NAMES already
+#: catches a REMOVAL (the parametrize list, and so test coverage, shrinks
+#: with it); this pin is what catches the other direction -- an ADDITION
+#: would otherwise ship with a passing parametrized case and no reviewer
+#: ever forced to look at it.
+EXPECTED_TIER_A_NAMES = frozenset({
+    'delete_memory',
+    'update_memory',
+    'add_memory',
+    'add_episode',
+    'delete_episode',
+    'delete_entity',
+    'update_edge',
+    'delete_edge',
+    'delete_collection',
+    'create_collection',
+    'set_payload',
+    'overwrite_payload',
+    'delete_points',
+    'upsert',
+    'delete_all',
+    'reset',
+})
+
+
 class TestMutatingCallsTierA:
     """Tier A: a distinctive mutating callee name is flagged regardless of receiver."""
 
-    @pytest.mark.parametrize(
-        'callee',
-        [
-            'delete_memory',
-            'update_memory',
-            'add_memory',
-            'add_episode',
-            'delete_episode',
-            'delete_entity',
-            'update_edge',
-            'delete_edge',
-            'delete_collection',
-            'create_collection',
-            'set_payload',
-            'overwrite_payload',
-            'delete_points',
-            'upsert',
-            'delete_all',
-            'reset',
-        ],
-    )
+    def test_tier_a_census_matches_the_reviewed_list(self):
+        assert MUTATING_CALL_NAMES == EXPECTED_TIER_A_NAMES, (
+            'MUTATING_CALL_NAMES has drifted from the reviewed census.\n'
+            f'  unexpected additions: '
+            f'{sorted(MUTATING_CALL_NAMES - EXPECTED_TIER_A_NAMES)}\n'
+            f'  missing entries:      '
+            f'{sorted(EXPECTED_TIER_A_NAMES - MUTATING_CALL_NAMES)}\n'
+            'Update EXPECTED_TIER_A_NAMES here to match -- this pin exists so a '
+            'new Tier A name is always a deliberate, reviewed edit, exercised by '
+            'the parametrized test below rather than shipping silently.'
+        )
+
+    @pytest.mark.parametrize('callee', sorted(MUTATING_CALL_NAMES))
     def test_distinctive_mutating_callee_is_flagged_with_name_and_lineno(
         self, tmp_path, callee
     ):
