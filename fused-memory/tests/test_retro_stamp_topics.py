@@ -199,6 +199,18 @@ class TestTopicSlugNamespaceIsShared:
     def test_cap_is_the_same_object(self):
         assert _mod.TOPIC_SLUG_MAX_LEN is topic_slug_module.TOPIC_SLUG_MAX_LEN
 
+    def test_fold_is_the_same_object(self):
+        """The fold moved to ε (task 4878); this script must IMPORT it.
+
+        ``scripts/normalize_topic_slugs.py`` folds the same way over the
+        whole corpus.  Two copies of a fold that decides what a record's
+        topic BECOMES is exactly the drift the identity pins above exist
+        to catch, so the fold gets the same treatment as the constants:
+        an inlined re-definition here fails by design rather than by
+        review.
+        """
+        assert _mod.derive_topic_slug is topic_slug_module.derive_topic_slug
+
 
 # ===========================================================================
 # compute_patch — the idempotence heart
