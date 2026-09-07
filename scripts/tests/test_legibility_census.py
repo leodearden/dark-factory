@@ -5510,3 +5510,112 @@ def test_default_verify_fn_unparseable_banner_treats_a_raising_probe_as_no_headr
     assert exc.verified == 1
     assert exc.unverified == 3
     assert "raised" in (exc.reason or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-1: RED — W-A. `mine_to_saturation` must surface ONE
+# aggregated WARNING per FAILING batch. Today it surfaces nothing per batch:
+# the only trace of a failed digest is `coder.code_digests`' per-digest line,
+# which floods one WARNING per failure and is emitted by a module this task
+# is locked out of. The aggregate is the caller-side signal that says how
+# many digests failed, how many DISTINCT reasons there were, and which
+# sessions to look at — grouped by EXACT reason string, because the whole
+# point of the per-digest lines is telling N identical ENOENTs apart from N
+# genuinely distinct model errors, and any normalization is a guess that can
+# collapse the two.
+# ---------------------------------------------------------------------------
+
+_MINING_FAIL_REPLY_A = "this is not JSON and will fail to parse"
+_MINING_FAIL_REPLY_B = "[]"
+
+
+def _mining_response_fn_with_two_failure_reasons(novel_sessions, fail_a, fail_b):
+    """Like `_mining_response_fn_with_failures`, but splits the failing
+    sessions across TWO replies that fail to parse in DIFFERENT ways, so
+    `coder.code_digests` comes back with exactly two DISTINCT reason
+    strings ("could not parse a JSON object from coder output: ..." vs
+    "coder output parsed as list, expected a JSON object"). One reason
+    string cannot show that the aggregate groups rather than merely
+    counts."""
+    def _fn(prompt, model):
+        for session_id in fail_a:
+            if session_id in prompt:
+                return _MINING_FAIL_REPLY_A
+        for session_id in fail_b:
+            if session_id in prompt:
+                return _MINING_FAIL_REPLY_B
+        for session_id in novel_sessions:
+            if session_id in prompt:
+                return json.dumps(
+                    {"matches": [], "candidates": [{"title": f"novel shape {session_id}"}]}
+                )
+        return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+    return _fn
+
+
+def _two_batch_source_with_a_failing_second_batch():
+    """batch 0: 10/10 code cleanly (a HEALTHY batch — it must stay silent).
+    batch 1: 6 of 10 digests fail, 4 with reply A and 2 with reply B, giving
+    exactly two distinct reason strings with counts 4 and 2. Returns
+    (source, invoke, saturation, fail_a, fail_b)."""
+    batch0 = _batch_digests(10, "h0")
+    batch1 = _batch_digests(10, "f1")
+    fail_a = {f"f1-{i}" for i in range(4)}
+    fail_b = {f"f1-{i}" for i in range(4, 6)}
+    source = _TrackingBatchSource([batch0, batch1])
+    # dup_rate 0.9 / consecutive 3 with an all-duplicate healthy batch would
+    # saturate at batch 2; consecutive_batches=3 keeps both batches consumed.
+    saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=3)
+    fake_invoke = _make_fake_invoke(
+        _mining_response_fn_with_two_failure_reasons(set(), fail_a, fail_b)
+    )
+    return source, fake_invoke, saturation, fail_a, fail_b
+
+
+def _census_warnings(caplog):
+    """Only this module's own WARNING records — never `legibility.coder`'s
+    per-digest lines, which a bare substring match would happily pick up."""
+    return [
+        r for r in caplog.records
+        if r.name == "legibility.census" and r.levelno == logging.WARNING
+    ]
+
+
+def test_mine_to_saturation_emits_one_aggregated_warning_per_failing_batch(caplog):
+    live_codebook = _minimal_v2_codebook()
+    source, fake_invoke, saturation, fail_a, fail_b = (
+        _two_batch_source_with_a_failing_second_batch()
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=fake_invoke,
+        )
+
+    assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
+
+    census_warnings = _census_warnings(caplog)
+    batch1_lines = [r for r in census_warnings if "batch 1" in r.getMessage()]
+    assert len(batch1_lines) == 1, (
+        "exactly ONE aggregated census line for the failing batch, not one per "
+        f"failed digest; got {[r.getMessage() for r in census_warnings]}"
+    )
+    message = batch1_lines[0].getMessage()
+
+    # (b) how much of the batch failed, and how many distinct reasons
+    assert "6/10" in message, f"must name failed/total; got {message!r}"
+    assert "2 distinct" in message, f"must name the distinct-reason count; got {message!r}"
+
+    # (c) both reason texts, each with its own count and an example session
+    assert "could not parse a JSON object from coder output" in message
+    assert "coder output parsed as list, expected a JSON object" in message
+    assert "4" in message and "2" in message, "each reason's own count"
+    assert any(s in message for s in fail_a), f"an example session for reason A; got {message!r}"
+    assert any(s in message for s in fail_b), f"an example session for reason B; got {message!r}"
+
+    # (d) a healthy batch stays silent
+    assert not [r for r in census_warnings if "batch 0" in r.getMessage()], (
+        "a batch with zero failures must emit no aggregate line at all"
+    )
