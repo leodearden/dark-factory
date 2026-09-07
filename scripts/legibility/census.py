@@ -1016,12 +1016,37 @@ class VerifyCoverage:
     if the same confusion RECURS; a one-off deferred by the cap sits pending
     until a human adjudicates it.
 
-    ``None`` in place of this record means no verify cap was used and no
-    ``## Verification`` section is rendered."""
+    ``None`` in place of this record means no verify cap was used, so no
+    coverage line is rendered. The ``## Verification`` section itself may
+    still appear on the ``MassRejection`` path below -- the two signals are
+    independent and can render together."""
 
     novel: int
     verified: int
     cap: int | None = None
+
+
+@dataclass
+class MassRejection:
+    """Anomaly record: clusters were offered for verification and NOT ONE
+    survived.
+
+    ``offered`` is how many were handed to ``verify_fn``. This is the
+    observable signature of the 2026-08-03 sandbox incident, where the
+    verify subprocess was rooted outside the censused tree and every read
+    was permission-denied -- a run with real findings reported as an empty
+    census. It is deliberately NOT folded into ``VerifyCoverage``: that
+    record's ``verified`` means "handed to verify_fn", not "came back
+    TRUE", so on an uncapped mass-rejection run (``novel == verified``,
+    ``cap is None``) reusing it would render "verified all N novel
+    cluster(s)" -- an actively FALSE statement on precisely the run whose
+    report must not lie.
+
+    ``None`` in place of this record means the run did not mass-reject.
+    An all-rejected run is legitimately possible, so this is a SUSPICION
+    to be checked, never a failure."""
+
+    offered: int
 
 
 @dataclass
@@ -1103,6 +1128,7 @@ def census_report_sections(
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
+    mass_rejection: MassRejection | None = None,
 ) -> tuple[ReportSection, ...]:
     """The dated census report, decomposed -- see :func:`render_report` for
     the markdown an operator reads.
@@ -1118,6 +1144,15 @@ def census_report_sections(
     cost-control flags existed (locked by
     ``test_render_report_flagless_output_is_byte_identical_golden``). The same
     gating applies to every other cost-control rendering here.
+
+    ``## Verification`` is emitted when EITHER *verify_coverage* or
+    *mass_rejection* is present. The second path is an ANOMALY, not a cost
+    control: an uncapped run in which every offered cluster was rejected used
+    to commit a report byte-identical to a clean census, so the only trace was
+    an ephemeral log line and an info escalation. On a flagless run the mere
+    presence of the section is now itself the signal. A flagless run that did
+    NOT mass-reject still renders byte-identically, so the invariant above is
+    preserved rather than spent.
     """
     sections: list[ReportSection] = []
 
@@ -1200,9 +1235,31 @@ def census_report_sections(
         )
     emit(SECTION_SATURATION, saturation)
 
+    if verify_coverage is not None or mass_rejection is not None:
+        verification = ["", "## Verification", ""]
+    else:
+        verification = []
+
+    if mass_rejection is not None:
+        # FIRST inside the section: a cap line is routine, this is not. On a
+        # flagless run the mere PRESENCE of a ## Verification section is
+        # itself the anomaly -- a stronger signal than one more always-present
+        # line an operator learns to skim past. Same voice as the `suspect`
+        # string at the detector in run_census, deliberately.
+        verification.append(
+            f"- **ALL {mass_rejection.offered} verified-candidate cluster(s) were "
+            "REJECTED and none survived.** Suspect a SYSTEMIC verifier failure "
+            "(model unreachable, tool access denied, or unparseable verdicts) "
+            "rather than genuinely unfounded claims: this is the observable "
+            "signature of the 2026-08-03 sandbox incident, in which the verify "
+            "subprocess was rooted outside the censused tree and every read was "
+            "permission-denied. Check the run's per-cluster 'verify failed' "
+            "warnings before reading this census as unremarkable -- a run with "
+            "real findings is being reported as an empty one if this is systemic."
+        )
+
     if verify_coverage is not None:
         deferred = verify_coverage.novel - verify_coverage.verified
-        verification = ["", "## Verification", ""]
         if deferred > 0:
             verification.append(
                 f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
@@ -1227,6 +1284,8 @@ def census_report_sections(
                 f"- verified all {verify_coverage.novel} novel cluster(s); operator "
                 f"verify cap: {verify_coverage.cap} (not reached)."
             )
+
+    if verification:
         emit(SECTION_VERIFICATION, verification)
 
     if dropped_verdicts:
@@ -1305,6 +1364,7 @@ def render_report(
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
+    mass_rejection: MassRejection | None = None,
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
@@ -1328,6 +1388,7 @@ def render_report(
         verify_coverage=verify_coverage,
         dry_run=dry_run,
         dropped_verdicts=dropped_verdicts,
+        mass_rejection=mass_rejection,
     ))
 
 
