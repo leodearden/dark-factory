@@ -76,6 +76,7 @@ from df_pytest_isolation import (  # noqa: E402
     SYNTHETIC_UNIT_PREFIX,
     assert_synthetic_units,
     fixture_marker,
+    fleet_dir_redirect_target,
     fleet_dir_redirect_violation_reason,
     leaked_fleet_heartbeat_reason,
     load_scaled_grace,
@@ -502,6 +503,97 @@ class TestLoadScaledGrace:
 
         monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
         assert load_scaled_grace(20, cap_secs=5) == 20
+
+
+class TestFleetDirRedirectTarget:
+    """Which already-set ``ORCH_FLEET_DIR`` the session fixture may ADOPT.
+
+    THE FLAKE (task 4398): ``_df_fleet_dir_redirect`` is session-scoped AND
+    autouse, and each test root's conftest binds its OWN copy. A session
+    collecting two roots therefore runs both instances; each unconditionally
+    ``mktemp``s a fresh dir and overwrites the env var, so whichever ran
+    FIRST yields a path that no longer matches ``ORCH_FLEET_DIR`` and its
+    per-root identity assertion fails. Reachable from the ordinary
+    ``pytest scripts/tests/... tests/scripts/...`` command both roots are
+    actually gated by.
+
+    The helper answers "adopt this value, or create a fresh one?", and
+    defines adoption as "already passes the very rule the redirect tests
+    assert" -- so adoption can never accept a value
+    :func:`fleet_dir_redirect_violation_reason` would reject. That is what
+    makes it safe by construction rather than by a second, drifting copy of
+    the soundness test.
+    """
+
+    def test_a_sound_existing_value_is_adopted(self, tmp_path: Path) -> None:
+        """THE MULTI-ROOT CASE: a value already sound for this run is reused.
+
+        This is what stops a second root's session fixture clobbering the
+        first root's -- both end up yielding the same directory the env var
+        actually holds.
+        """
+        existing = tmp_path / 'fleet-dir0'
+        existing.mkdir()
+        assert fleet_dir_redirect_target(str(existing), tmp_path) == existing
+
+    def test_an_unset_value_means_create(self, tmp_path: Path) -> None:
+        """The ordinary single-root first-run case: nothing to adopt."""
+        assert fleet_dir_redirect_target(None, tmp_path) is None
+
+    def test_an_empty_value_means_create(self, tmp_path: Path) -> None:
+        """``''`` is not "set" to a ``${VAR:-…}`` default -- the same
+        distinction the fixture's own teardown already turns on, so an empty
+        value must never be adopted as though it were a redirect.
+        """
+        assert fleet_dir_redirect_target('', tmp_path) is None
+
+    def test_the_live_fleet_dir_is_never_adopted(self, tmp_path: Path) -> None:
+        """Adopting the machine-global cross-project dir would BE the defect
+        this whole family guards against.
+        """
+        assert fleet_dir_redirect_target(str(LIVE_FLEET_DIR), tmp_path) is None
+
+    def test_a_path_inside_the_live_fleet_dir_is_never_adopted(
+        self, tmp_path: Path,
+    ) -> None:
+        """A subdirectory is still inside the live rendezvous dir."""
+        assert fleet_dir_redirect_target(str(LIVE_FLEET_DIR / 'sub'), tmp_path) is None
+
+    def test_a_value_outside_this_runs_basetemp_means_create(
+        self, tmp_path: Path,
+    ) -> None:
+        """A stale env var left by a PREVIOUS session must not be inherited.
+
+        Adoption is scoped to this run's basetemp precisely so a leftover
+        value cannot silently make a fresh session write outside its own tmp
+        space -- which is the same thing the "outside basetemp" branch of the
+        violation rule already refuses.
+        """
+        leftover = tmp_path / 'another-run'
+        leftover.mkdir()
+        assert fleet_dir_redirect_target(str(leftover), tmp_path / 'basetemp') is None
+
+    def test_adoption_agrees_with_the_violation_rule_exactly(
+        self, tmp_path: Path,
+    ) -> None:
+        """The two helpers are one rule, not two: adopt iff no violation.
+
+        Pinned as a biconditional over every case above rather than left
+        implicit, so a later tightening of the violation rule cannot leave
+        adoption accepting something the tests now reject.
+        """
+        sound = tmp_path / 'fleet-dirX'
+        sound.mkdir()
+        for value in (
+            str(sound), None, '', str(LIVE_FLEET_DIR),
+            str(LIVE_FLEET_DIR / 'sub'), str(tmp_path / 'elsewhere'),
+        ):
+            adopted = fleet_dir_redirect_target(value, tmp_path)
+            clean = fleet_dir_redirect_violation_reason(value, tmp_path) is None
+            assert (adopted is not None) == clean, (
+                f'adoption and the violation rule disagree on {value!r}: '
+                f'adopted={adopted!r} violation_free={clean}'
+            )
 
 
 class TestSyntheticHeartbeatsIn:
