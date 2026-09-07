@@ -433,3 +433,106 @@ def test_shipped_default_is_reachable_by_a_plausible_fleet():
         'from a fresh measurement (see the RESUME_AGE_SAFETY_FACTOR '
         'provenance block in orchestrator/src/orchestrator/resume_age_bound.py).'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-7 (task 3730): the bound re-derived against the LIVE runs.db,
+# mirroring test_gc_agent_transcripts.py's
+# test_max_task_dirs_is_derived_from_live_archive_rate.
+#
+# Meaningful on a live host, inert in a fresh checkout: with no runs.db (or too
+# sparse a one) it SKIPS rather than passing, so silence stays legible in the
+# pytest output as "not measured" instead of masquerading as a green check.
+# ---------------------------------------------------------------------------
+
+
+def test_absolute_resume_age_is_derived_from_live_runs_db():
+    """DERIVED BOUND: absolute_resume_age_secs must cover the fleet's MEASURED
+    worst case — the longest legitimate invocation plus the longest outage.
+
+    A sidecar's started_at is stamped per invocation, so its age when the
+    _run_slot guard evaluates it is in-flight-time-at-crash plus orchestrator
+    downtime. If the bound sits below that sum, the backstop starts rejecting
+    sessions from tasks that never stopped being legitimately in flight — and
+    it does so silently, since 'aged_out' is by-design and files no L1. This
+    guard re-measures every run, so a fleet that gets slower or suffers longer
+    outages trips the test instead of quietly losing resumable sessions.
+    """
+    db = rab.default_runs_db_path()
+    if not db.is_file():
+        pytest.skip(
+            f'no live runs.db at {db} — nothing to derive the bound from '
+            f'(set ${rab.RUNS_DB_ENV_VAR} to point at one; host-independent '
+            'falsifiability for the same comparison is covered by '
+            'test_required_bound_comparison_can_fail and '
+            'test_shipped_default_is_reachable_by_a_plausible_fleet)'
+        )
+
+    sample = rab.observed_resume_age_inputs(db)
+    if sample is None:
+        pytest.skip(
+            f'runs.db at {db} holds fewer than {rab.MIN_SAMPLE_TASKS} '
+            'legitimate task_completed rows, or fewer than two parseable '
+            f'timestamps inside the trailing {rab.SAMPLE_WINDOW_DAYS} days — '
+            'too sparse to derive a bound from'
+        )
+
+    # NON-DEGENERATE before it is consumed. A zero term would make the bound
+    # below satisfiable by ANY value, leaving this guard permanently green
+    # while measuring nothing — the exact vacuity trap it exists to avoid.
+    assert sample.inflight_rows > 0, 'degenerate sample: no completions measured'
+    assert sample.gap_rows > 0, 'degenerate sample: no inter-event gaps measured'
+    assert sample.inflight_max_secs > 0, 'degenerate sample: zero in-flight max'
+    assert sample.downtime_max_secs > 0, 'degenerate sample: zero downtime max'
+
+    required = rab.required_absolute_resume_age_secs(
+        sample.inflight_max_secs,
+        sample.downtime_max_secs,
+        rab.RESUME_AGE_SAFETY_FACTOR,
+    )
+    shipped = SessionResumeConfig().absolute_resume_age_secs
+
+    assert required <= shipped, (
+        'session_resume.absolute_resume_age_secs is too small for the fleet\'s '
+        'MEASURED behaviour: the backstop will reject recovered sessions from '
+        'tasks that were still legitimately in flight, silently, because '
+        "'aged_out' is by-design and files no L1.\n"
+        f'  runs.db .......... {db}\n'
+        f'  in-flight sample . {sample.inflight_rows} legitimate completions, '
+        f'max {sample.inflight_max_secs:.0f}s ({sample.inflight_max_secs / 3600:.2f}h)\n'
+        f'  downtime sample .. {sample.gap_rows} inter-event gaps over '
+        f'{sample.span_days:.1f} days, max {sample.downtime_max_secs:.0f}s '
+        f'({sample.downtime_max_secs / 3600:.2f}h)\n'
+        f'  safety factor .... {rab.RESUME_AGE_SAFETY_FACTOR} (provenance and '
+        'the measurement it was derived from are in the '
+        'RESUME_AGE_SAFETY_FACTOR comment in '
+        'orchestrator/src/orchestrator/resume_age_bound.py — re-measure before '
+        'trusting it)\n'
+        f'  REQUIRED ......... {required}s = ceil(('
+        f'{sample.inflight_max_secs:.0f}s + {sample.downtime_max_secs:.0f}s) '
+        f'x {rab.RESUME_AGE_SAFETY_FACTOR})\n'
+        f'  current default .. {shipped}s ({shipped / 86400:.2f} days)\n'
+        'TO FIX: re-derive from the numbers above (ruling: '
+        'plans/session-resume-eligibility-seam-prd.md D3) and raise ALL FOUR '
+        'lock-step sites in ONE commit, or any single commit is red:\n'
+        '  1. orchestrator/src/orchestrator/config.py  '
+        'SessionResumeConfig.absolute_resume_age_secs default (+ its '
+        'description, which quotes the derived value)\n'
+        '  2. orchestrator/src/orchestrator/resume_age_bound.py  the '
+        'RESUME_AGE_SAFETY_FACTOR provenance block (measurement date, both '
+        'terms, requirement, margin, trip point)\n'
+        '  3. orchestrator/tests/test_config.py  '
+        'TestSessionResumeConfig::test_defaults\n'
+        '  4. OPERATIONS.md  the session-resume subsection of §14\n'
+        'The authoritative list is whatever '
+        "`grep -rn 'absolute_resume_age_secs' --include='*.py' --include='*.md' "
+        "--include='*.yaml'` returns outside plans/ and .worktrees/ — RE-RUN "
+        'IT; do not trust this list to have stayed complete (3621 shipped a '
+        'four-site list that was missing a fifth, and the commit raising the '
+        'other four left the tree red — esc-3621-2).\n'
+        'And CHECK THE RELATION while you are there: the bound must stay above '
+        'session_resume.freshness_window_secs '
+        '(test_config.py::test_absolute_bound_is_looser_than_the_freshness_window) '
+        'and below the ~2x ceiling the anti-inflation clamp enforces '
+        '(test_shipped_default_is_reachable_by_a_plausible_fleet).'
+    )
