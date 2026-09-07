@@ -72,18 +72,46 @@ import sys
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-# The probe IMPORTS the shipped regex and guard rather than re-spelling
-# them. This is load-bearing, not stylistic: a copied pattern measures a
-# stale spelling of the thing it claims to measure, and would keep
-# reporting a reassuring zero after the guard it audits had changed
-# underneath it. Any drift now surfaces as an ImportError, not as a wrong
-# number.
+# The probe IMPORTS what it measures rather than re-spelling it. This is
+# load-bearing, not stylistic, and it applies to all three imported things —
+# the regex, the guard, and the pagination engine below. A copied pattern
+# measures a stale spelling of the thing it claims to measure, and would keep
+# reporting a reassuring zero after the code it audits had changed underneath
+# it. Any drift now surfaces as an ImportError, not as a wrong number.
 _SRC = Path(__file__).resolve().parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+# The SHIPPED pagination engine and the SHIPPED population definition. The
+# probe DELEGATES to them rather than owning a second copy: two copies of a
+# fail-closed page loop is two places to fix a paging defect and one place to
+# forget, and a duplicated `_ALL_VALID_EDGES_MATCH` is worse still — the probe
+# would go on measuring the OLD population while reporting `complete: true`
+# over it, with nothing failing.
+#
+# `_census_count` is imported ALIASED, deliberately: the bare name is kept FREE
+# in this module's namespace as a tripwire, because the delegation test asserts
+# the probe defines no attribute by that name. That is how a future author
+# re-growing a private census helper gets caught. The alias also makes it
+# unambiguous at the call site that the SHIPPED helper is the one running.
+from fused_memory.backends.graphiti_client import (  # noqa: E402
+    _ALL_VALID_EDGES_MATCH,
+    _DEFAULT_READ_PAGE_SIZE,
+    _MAX_READ_PAGES,
+    _RESULTSET_SIZE,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
+    INCOMPLETE_STRUCTURAL_REFUSAL,
+    _paged_ro_query,
+)
+from fused_memory.backends.graphiti_client import (  # noqa: E402
+    _census_count as _shipped_census_count,
+)
+
+# The shipped regex and the guard whose recall this probe measures.
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
     _ENUM_PREP_WORD_RE,
     PLURAL_ENUM_SNAPSHOT_RE,
@@ -521,55 +549,42 @@ def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
 # Edge enumeration
 # ---------------------------------------------------------------------------
 
-# FalkorDB's server-wide RESULTSET_SIZE is 10000 and nothing in this repo
-# overrides it, so ANY single query returning more rows than that is
-# SILENTLY truncated — no error, no warning, no partial-result flag.
+# The three paging constants are REBOUND from graphiti_client, not re-spelled
+# here. The public names are retained — argparse help strings and the tests
+# use them — but the values are now the shipped objects, so there is exactly
+# one place a re-measurement has to correct.
 #
-# Measured on the live dark_factory graph (task 3949 planning):
-#   get_all_valid_edges' exact query      -> 24902 rows, 10000 returned
-#   distinct valid edges actually exposed -> 6376 of 12488 (51%)
+# Why that matters more than tidiness: RESULTSET_SIZE is an ASSUMPTION about
+# server configuration, not something this repo sets. A second copy of an
+# assumption is a copy that can go stale silently — the probe would keep
+# reasoning from the old number and keep reporting `complete` while the layer
+# it audits reasoned from the new one.
 #
-# Default page size is therefore well under the cap, so a page that comes
-# back short really is the end of the data rather than the server's ceiling.
-DEFAULT_PAGE_SIZE = 5000
+# The measured figures behind these values (FalkorDB's server-wide cap of
+# 10000, and what an unpaginated whole-graph read cost on the live corpus)
+# live in the RESULT-SET CAP AUDIT block of backends/graphiti_client.py,
+# which is the one place they are recorded.
+DEFAULT_PAGE_SIZE = _DEFAULT_READ_PAGE_SIZE
+RESULTSET_SIZE = _RESULTSET_SIZE
+MAX_ENUM_PAGES = _MAX_READ_PAGES
 
-# FalkorDB's server-wide result-set ceiling.
+# The population definition is SHARED with production, by construction rather
+# than by coincidence of spelling: both Cypher strings below are composed from
+# graphiti_client's own `_ALL_VALID_EDGES_MATCH`, the same constant
+# `enumerate_all_valid_edges` pages over.
 #
-# THIS IS AN ASSUMPTION ABOUT SERVER CONFIGURATION, not something this repo
-# sets — which is exactly why the census cross-check below does not trust it.
-# The value only has to be RIGHT for the structural check to be useful; the
-# empirical check is what stays correct when it is wrong.
-RESULTSET_SIZE = 10000
-
-# Hard safety cap on the number of SKIP/LIMIT pages a single graph's
-# enumeration will fetch, bounding worst-case pagination against a
-# pathological corpus. Normal use never approaches it: at the default page
-# size this is 5,000,000 edges against a live maximum near 16,000. Copied
-# from census_foreign_nodes' MAX_CENSUS_PAGES precedent
-# (scripts/migrate_cross_graph_leak.py:161), including its rule that hitting
-# the cap on a still-full page is reported, never swallowed.
-MAX_ENUM_PAGES = 1000
-
-# The same MATCH pattern GraphitiBackend.get_all_valid_edges uses, so this
-# measures the corpus the production sweep is aimed at — but issued with
-# SKIP/LIMIT and page-audited here. This is DELIBERATELY not a call to
-# get_all_valid_edges.
+# This is the same load-bearing argument the import block at the top of this
+# module makes about the regex and the guard, applied to the population. Two
+# independently-spelled MATCH/WHERE clauses can drift — production narrowing
+# its WHERE, say — and the probe would go on measuring the OLD population
+# while reporting `complete: true` over it. A shared constant cannot drift,
+# and `test_the_probe_and_production_read_the_same_population` fails if this
+# composition is ever unpicked.
 #
-# TENSE MATTERS HERE, and an earlier draft of this comment got it wrong (the
-# error reached the committed artifact, which is the deliverable): at this
-# task's PLANNING TIME get_all_valid_edges was a single unpaginated query and
-# was silently truncated by FalkorDB's server-wide RESULTSET_SIZE of 10000,
-# hiding about half the corpus. It is PAGINATED AS OF TASK 4340 and that
-# truncation is GONE — get_all_valid_edges' own docstring says so, and the
-# measured counts are recorded in the RESULT-SET CAP AUDIT block of
-# backends/graphiti_client.py. There is NO outstanding truncation bug in
-# graphiti_client.py to file or fix on this account.
-#
-# The probe keeps its own paging anyway, for independence rather than for
-# workaround: the coverage claim then rests on the page accounting audited
-# below, not on whatever a shared enumerator does next. (Separately, the
-# task-2613 miss RATE still carries the old truncated denominator; that
-# re-measurement is ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8.)
+# What is deliberately NOT shared is the PROJECTION. Production returns four
+# columns, one row per (edge, endpoint); this probe returns
+# `DISTINCT e.uuid, e.fact` — half the rows, and directly comparable to the
+# post-dedup `len(facts)` its completeness rule is stated in.
 #
 # ORDER BY is load-bearing, not cosmetic. Every page is a SEPARATE query, and
 # DISTINCT + SKIP/LIMIT with no total order gives the store no obligation to
@@ -577,48 +592,53 @@ MAX_ENUM_PAGES = 1000
 # page 1 never returned (silently dropped, permanently) or re-return rows it
 # did (harmlessly deduped here, which is what makes the drop so easy to miss).
 _EDGE_PAGE_CYPHER = (
-    'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    'WHERE e.invalid_at IS NULL '
-    'RETURN DISTINCT e.uuid, e.fact '
+    _ALL_VALID_EDGES_MATCH
+    + 'RETURN DISTINCT e.uuid, e.fact '
     'ORDER BY e.uuid '
     'SKIP {skip} LIMIT {limit}'
 )
 
-# The empirical completeness proof. Deliberately the SAME MATCH and WHERE as
-# the page query, so the two numbers describe the same population and are
+# The empirical completeness proof. Same MATCH and WHERE as the page query by
+# construction, so the two numbers describe the same population and are
 # therefore comparable; DISTINCT on e.uuid so the undirected match's
 # double-attribution collapses exactly as the paged dict-dedup collapses it.
+# (Production's own census returns `count(*)` — the count of ROWS, matching
+# its per-endpoint projection. Reusing it here would manufacture a mismatch
+# on every run, which is why the census is composed rather than imported.)
 #
 # It returns exactly ONE row, which is the whole point: a single-row result
 # can never be truncated by the row cap it is being used to detect. That is
-# what makes `len(facts) == expected` a proof rather than one more heuristic.
-_EDGE_COUNT_CYPHER = (
-    'MATCH (n:Entity)-[e:RELATES_TO]-() '
-    'WHERE e.invalid_at IS NULL '
-    'RETURN count(DISTINCT e.uuid)'
-)
+# what makes the count check a proof rather than one more heuristic.
+_EDGE_COUNT_CYPHER = _ALL_VALID_EDGES_MATCH + 'RETURN count(DISTINCT e.uuid)'
 
 
-async def _census_count(
-    query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
-) -> int | None:
-    """Distinct valid edges the store reports, or None if it did not say.
+class _QueryFnGraph:
+    """Adapt this module's ``query_fn(cypher)`` seam to a FalkorDB handle.
 
-    Every 'it did not say' shape collapses to None — no rows, a null result
-    set, a NULL count, a row with no columns, a non-integer — because the
-    caller treats None as fail-closed and there is nothing to gain by
-    distinguishing between flavours of missing evidence.
+    ``_paged_ro_query`` touches its ``graph`` argument in exactly one way —
+    ``await graph.ro_query(cypher, params)``, then reads ``.result_set`` — so
+    eight lines are enough to keep the ``query_fn`` seam every enumeration
+    test drives, while the paging LOGIC comes from the shipped engine.
+
+    Keeping the seam is not incidental. It is what lets the whole enumeration
+    band be exercised — page caps, server truncation, a census that stops
+    answering — with no FalkorDB anywhere near the test run.
     """
-    rows = list(await query_fn(_EDGE_COUNT_CYPHER) or [])
-    if not rows:
-        return None
-    row = rows[0]
-    if row is None or len(row) == 0 or row[0] is None:
-        return None
-    try:
-        return int(row[0])
-    except (TypeError, ValueError):
-        return None
+
+    __slots__ = ('_query_fn',)
+
+    def __init__(
+        self, query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
+    ) -> None:
+        self._query_fn = query_fn
+
+    async def ro_query(self, cypher: str, params: dict | None = None) -> Any:
+        # ``params`` is accepted and ignored: this module binds nothing, and
+        # the seam predates parameter support. Rows are normalised to a list
+        # so a fake returning None reads as an empty result set rather than
+        # as a missing attribute.
+        rows = list(await self._query_fn(cypher) or [])
+        return SimpleNamespace(result_set=rows)
 
 
 async def enumerate_valid_edge_facts(
@@ -630,10 +650,19 @@ async def enumerate_valid_edge_facts(
 ) -> tuple[dict[str, str], bool]:
     """Enumerate every valid RELATES_TO edge's fact text, keyed on edge uuid.
 
-    Pages with SKIP/LIMIT until a page comes back short or empty. Dedupes on
-    edge uuid: the undirected MATCH attributes each directed edge to BOTH of
-    its endpoints, so the same edge uuid legitimately arrives more than once
-    (documented on get_all_valid_edges). A NULL fact is coerced to ''.
+    The paging itself is DELEGATED to graphiti_client's ``_paged_ro_query``
+    — the same audited engine ``enumerate_all_valid_edges`` uses — rather
+    than re-derived here. This module used to own a second copy: its own
+    census helper, its own page loop, its own structural guard, and its own
+    spellings of 5000 / 10000 / 1000. Two copies of a fail-closed page loop
+    is two places to fix a paging defect and one place to forget.
+
+    What this function still owns, because it is what makes the measurement
+    comparable, is the UNIT: it dedupes on edge uuid, and its completeness
+    rule is stated in DISTINCT EDGES, not in rows. The undirected MATCH
+    attributes each directed edge to BOTH of its endpoints, so the same edge
+    uuid legitimately arrives more than once (documented on
+    get_all_valid_edges). A NULL fact is coerced to ''.
 
     Returns ``(facts_by_uuid, complete)``. The flag is the fail-closed hook:
     an under-enumerated corpus must be reported as a FAILURE rather than as a
@@ -648,115 +677,99 @@ async def enumerate_valid_edge_facts(
        the server cannot be what shortened it. At or above the cap the two
        causes are indistinguishable, so no enumeration is attempted at all
        and an EMPTY dict is returned: a partial dict invites a caller to use
-       it anyway.
+       it anyway. (``INCOMPLETE_STRUCTURAL_REFUSAL``, and the only path that
+       returns before the post-census, since zero queries were issued.)
     2. The ``max_pages`` bound is reached while the last page was still full
        — a suspected shortfall, reported rather than swallowed.
+       (``INCOMPLETE_PAGE_CAP``.)
     3. Either census probe did not answer with a usable count. An unavailable
        proof is not a passing proof.
     4. The corpus MOVED during enumeration — the census answers a different
        number before and after paging.
     5. A STABLE census count and the number enumerated disagree.
 
-    (1) and (2) are STRUCTURAL; (3), (4) and (5) are EMPIRICAL, and the two
-    kinds are deliberately independent rather than redundant.
+    (1) and (2) are STRUCTURAL — ``INCOMPLETE_STRUCTURAL_KINDS``, which this
+    function treats as never tolerable; (3), (4) and (5) are EMPIRICAL, and
+    the two kinds are deliberately independent rather than redundant. The
+    shipped engine names the same split for the same reason.
 
     THE CORPUS IS LIVE AND IS BEING WRITTEN WHILE THIS RUNS. The graphs
     measured here are the orchestrator's and the reconciler's working memory,
     so an add or an invalidate can land between the census probe and the last
-    page. That makes ``len(facts) != expected`` a genuinely ambiguous
-    observation, which is why the census is probed TWICE — once before paging
-    and once after. A shortfall against a count that MOVED is a benign,
-    retryable race; a shortfall against a count that held still is evidence of
+    page. That makes a count disagreement a genuinely ambiguous observation,
+    which is why the census is probed TWICE — once before paging (inside
+    ``_paged_ro_query``, surfaced as ``PagedRead.expected_rows``) and once
+    after. A shortfall against a count that MOVED is a benign, retryable
+    race; a shortfall against a count that held still is evidence of
     truncation or of dropped rows. Both fail closed, but they are reported as
     different things, because handing an operator 'suspected server cap' for
     what is actually a concurrent write sends them to configuration they do
     not need to change.
 
-    The structural check is ``>=`` and not ``>``: equality is arithmetically
-    safe on a server configured at exactly ``RESULTSET_SIZE``, but that
-    constant is an ASSUMPTION about server configuration, so equality leaves
-    zero margin — a server configured one row lower silently re-opens the
-    truncation. One page of throughput buys that margin.
-
-    The census check exists because that reasoning bottoms out on a guess,
-    and the defect class ('a short page was mistaken for end-of-data') does
-    not. If the live server is configured BELOW the assumed constant, then
-    ``page_size < resultset_size`` passes the structural check and the
-    short-page break lies exactly as it would have before — the identical
-    silent truncation, undetected. Comparing what was enumerated against a
-    single-row count that the cap cannot truncate catches that, and catches
-    causes not enumerated here: unstable DISTINCT+SKIP/LIMIT page
-    boundaries, a dropped page.
-
-    Both are kept because they fail differently and usefully. The structural
-    check fails FAST, before any work, with a specific operator-actionable
-    reason ('re-run with a smaller --page-size'); the census check catches
-    everything else, at the cost of only being able to report a bare count
-    mismatch.
+    WHY COMPLETENESS IS RE-DERIVED HERE rather than read off ``paged.complete``.
+    The two flags are stated in DIFFERENT UNITS and are not interchangeable:
+    ``paged.rows_seen`` counts ROWS as fetched, while this function's census
+    counts DISTINCT EDGE UUIDS and ``len(facts)`` is the post-dedup number.
+    Deferring to ``paged.complete`` would compare a row count against an edge
+    count and manufacture a verdict from two populations. The shipped engine's
+    structural verdict IS honoured verbatim, because that one is about the
+    read itself and is unit-free.
     """
-    if page_size >= resultset_size:
-        logger.warning(
-            'enumerate_valid_edge_facts: page_size=%d is at or above the '
-            "server's result-set cap (resultset_size=%d), so a short page "
-            'cannot be distinguished from a server-truncated one and '
-            'completeness is unprovable. Refusing to enumerate — re-run '
-            'with --page-size well below %d.',
-            page_size, resultset_size, resultset_size,
-        )
+    graph = _QueryFnGraph(query_fn)
+    paged = await _paged_ro_query(
+        graph,
+        _EDGE_PAGE_CYPHER,
+        _EDGE_COUNT_CYPHER,
+        page_size=page_size,
+        resultset_size=resultset_size,
+        max_pages=max_pages,
+    )
+
+    if paged.incomplete_kind == INCOMPLETE_STRUCTURAL_REFUSAL:
+        # Guard 1 refused before issuing a single query, and returned no rows
+        # for the reason its own comment gives: a partial dict invites the
+        # caller to use it anyway. Return here rather than fall through, so
+        # the post-census does not turn 'zero queries issued' into one.
         return {}, False
 
-    # Taken BEFORE paging so the target is fixed up front rather than
-    # inferred from the same pages whose completeness is in question.
-    expected = await _census_count(query_fn)
-    if expected is None:
-        logger.warning(
-            'enumerate_valid_edge_facts: the census probe returned no usable '
-            'count, so completeness cannot be proven. Reporting INCOMPLETE — '
-            'an unavailable proof is not a passing one.',
-        )
-
     facts: dict[str, str] = {}
-    skip = 0
-    paged_to_the_end = False
-    for _page in range(max_pages):
-        page = await query_fn(
-            _EDGE_PAGE_CYPHER.format(skip=skip, limit=page_size),
-        )
-        rows = list(page or [])
-        for row in rows:
-            edge_uuid = row[0]
-            if edge_uuid is None or edge_uuid in facts:
-                continue
-            facts[edge_uuid] = row[1] or ''
-        if len(rows) < page_size:
-            # Short (or empty) page, and page_size < resultset_size was
-            # checked above — so the server cannot be what shortened it and
-            # the data really is exhausted. A FULL page can never prove that,
-            # which is exactly why the loop continues. Note this is only the
-            # STRUCTURAL half of the argument; the census check below is what
-            # holds when the assumption behind it does not.
-            paged_to_the_end = True
-            break
-        skip += len(rows)
+    for row in paged.rows:
+        edge_uuid = row[0]
+        if edge_uuid is None or edge_uuid in facts:
+            continue
+        facts[edge_uuid] = row[1] or ''
 
-    # Re-probed AFTER paging. The pre-count alone cannot tell a truncated
-    # enumeration from one that raced a concurrent write, and those two want
-    # opposite responses from the operator (fix the config vs just re-run).
-    post_expected = None if expected is None else await _census_count(query_fn)
+    expected = paged.expected_rows
+    # Re-probed AFTER paging, through the SHIPPED census helper. The pre-count
+    # alone cannot tell a truncated enumeration from one that raced a
+    # concurrent write, and those two want opposite responses from the
+    # operator (fix the config vs just re-run). Skipped when the pre-count was
+    # unavailable: there is nothing to compare it against.
+    post_expected = (
+        None if expected is None else await _shipped_census_count(graph, _EDGE_COUNT_CYPHER)
+    )
     corpus_moved = (
         expected is not None
         and post_expected is not None
         and post_expected != expected
     )
 
-    if not paged_to_the_end:
+    structurally_incomplete = paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS
+
+    if structurally_incomplete:
         logger.warning(
             'enumerate_valid_edge_facts: hit the %d-page cap (page_size=%d, '
             'enumerated=%d) while the last page was still full — enumeration '
             'is incomplete. Re-run with a larger --page-size.',
             max_pages, page_size, len(facts),
         )
-    elif expected is not None and post_expected is None:
+    elif expected is None:
+        logger.warning(
+            'enumerate_valid_edge_facts: the census probe returned no usable '
+            'count, so completeness cannot be proven. Reporting INCOMPLETE — '
+            'an unavailable proof is not a passing one.',
+        )
+    elif post_expected is None:
         logger.warning(
             'enumerate_valid_edge_facts: the post-enumeration census probe '
             'returned no usable count, so a shortfall could not be told apart '
@@ -773,7 +786,7 @@ async def enumerate_valid_edge_facts(
             'INCOMPLETE — re-run.',
             expected, post_expected, len(facts), page_size,
         )
-    elif expected is not None and len(facts) != expected:
+    elif len(facts) != expected:
         logger.warning(
             'enumerate_valid_edge_facts: enumerated %d distinct edges but the '
             'census reports %d, stable across the whole run (page_size=%d) — '
@@ -785,12 +798,32 @@ async def enumerate_valid_edge_facts(
         )
 
     complete = (
-        paged_to_the_end
+        not structurally_incomplete
         and expected is not None
         and post_expected is not None
         and not corpus_moved
         and len(facts) == expected
     )
+
+    if paged.incomplete_kind == INCOMPLETE_SHORT_READ and complete:
+        # The shipped layer already logged a WARNING naming a suspected
+        # result-set cap, and this function has just concluded there was no
+        # shortfall. Both can be true at once — they count different things
+        # (rows fetched vs distinct edges) — so say so explicitly. Left
+        # unstated, an operator reading the log would take a WARNING from the
+        # layer below as this probe's verdict, which is the reverse of what
+        # the artifact reports.
+        logger.info(
+            'enumerate_valid_edge_facts: _paged_ro_query reported a short '
+            'read (rows_seen=%s, expected_rows=%s) but this probe enumerated '
+            '%d distinct edges against a census of %s and finds no shortfall. '
+            'The two are counted in different units — rows fetched vs '
+            'distinct edge uuids — so the WARNING above is NOT this probe\'s '
+            'verdict. Reason given below: %s',
+            paged.rows_seen, paged.expected_rows, len(facts), post_expected,
+            paged.reason,
+        )
+
     return facts, complete
 
 
@@ -1568,27 +1601,42 @@ def render_markdown(report: Report) -> str:
             '',
         ]
     lines += [
-        'This probe pages with `SKIP`/`LIMIT` instead of calling '
-        '`GraphitiBackend.get_all_valid_edges`. That is deliberate, and the '
-        'reason has a history worth stating in the right tense. FalkorDB\'s '
-        'server-wide `RESULTSET_SIZE` is 10000 and nothing in this repo '
-        'overrides it, so any UNPAGINATED whole-graph read is silently '
-        'truncated with no error and no marker. At this task\'s planning time '
-        '`get_all_valid_edges` was exactly such a read: measured on the live '
-        '`dark_factory` graph, its query returned 10000 of 24902 rows, '
-        'exposing 6376 of 12488 distinct valid edges (51%). Measuring recall '
-        'through a truncated enumerator would have produced a zero that means '
-        'nothing — hence this probe\'s own paging.',
+        'This probe reads its corpus in `SKIP`/`LIMIT` pages rather than in '
+        'one whole-graph query. That is deliberate, and the reason has a '
+        'history worth stating in the right tense. FalkorDB\'s server-wide '
+        '`RESULTSET_SIZE` is 10000 and nothing in this repo overrides it, so '
+        'any UNPAGINATED whole-graph read is silently truncated with no error '
+        'and no marker. At this task\'s planning time '
+        '`GraphitiBackend.get_all_valid_edges` was exactly such a read: '
+        'measured on the live `dark_factory` graph, its query returned 10000 '
+        'of 24902 rows, exposing 6376 of 12488 distinct valid edges (51%). '
+        'Measuring recall through a truncated enumerator would have produced '
+        'a zero that means nothing.',
         '',
         '`get_all_valid_edges` is **PAGINATED as of task 4340** and that '
         'truncation is GONE. The measured counts behind both statements live '
         'in the `RESULT-SET CAP AUDIT` block of '
         '`fused-memory/src/fused_memory/backends/graphiti_client.py`, which is '
-        'the one place they are recorded. This probe nonetheless keeps its own '
-        '`SKIP`/`LIMIT` paging, so the coverage claim below rests on the '
-        'page-accounting audited here rather than on whatever a shared '
-        'enumerator does next — but it is NOT working around a live bug, and '
-        'nothing in `graphiti_client.py` is owed a fix on this account.',
+        'the one place they are recorded. It is NOT working around a live bug, '
+        'and nothing in `graphiti_client.py` is owed a fix on this account.',
+        '',
+        'The paging is not this probe\'s own. It goes through '
+        '`graphiti_client._paged_ro_query` — the same audited engine the '
+        'production enumerator uses — and both of this probe\'s Cypher '
+        'strings are COMPOSED from that module\'s `_ALL_VALID_EDGES_MATCH`, '
+        'so the population measured here cannot drift from the population '
+        'production reads. An earlier draft kept a second private copy of the '
+        'page loop and the constants for independence; that traded one risk '
+        'for a worse one, because a probe measuring a stale `MATCH`/`WHERE` '
+        'reports `complete: true` over the wrong corpus and nothing fails.',
+        '',
+        'What the probe does retain is its own PROJECTION and its own census '
+        'bracket, and that is what the coverage claim below actually rests '
+        'on. It returns `DISTINCT e.uuid, e.fact` — half the rows of '
+        'production\'s per-endpoint projection — and brackets the paging with '
+        'two `count(DISTINCT e.uuid)` probes, so completeness is decided in '
+        'DISTINCT EDGES against a single-row count the row cap cannot '
+        'truncate, not in rows fetched.',
         '',
         'What has NOT been recomputed is the separate task-2613 stale-status '
         'MISS RATE, which was calculated against the old truncated '
