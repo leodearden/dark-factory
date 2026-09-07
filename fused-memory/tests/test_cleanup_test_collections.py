@@ -18,6 +18,7 @@ not slow.
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import functools
 import importlib.util
@@ -906,6 +907,51 @@ class TestTheSweepHoldsOffWhileARunIsLive:
             mod.main()
 
         capsys.readouterr()
+
+
+    def test_a_lease_taken_during_the_listing_still_stops_the_delete_loop(
+        self, monkeypatch, capsys,
+    ):
+        """The window that actually matters, and why one check is not enough.
+
+        `get_collections` is the network round-trip; under load it is where
+        essentially all of this sweep's wall clock goes.  A run that starts
+        while the cron is waiting on Qdrant would be invisible to a check
+        taken only before it — the lease would already exist by the time the
+        deletes issued, and the deletes would issue anyway.
+
+        Driven by giving the fake's listing a side effect that takes a real
+        lease, which is exactly the shape of that race.  The lease is held on
+        an ExitStack rather than a `with`, because it has to outlive the
+        listing call and still be live when the delete loop would run.
+        """
+        mod = _mod()
+        stale = self._stale(mod)
+        clients = _install_fake_qdrant(monkeypatch, [*stale, *LIVE_COLLECTIONS])
+        fake_client_cls = sys.modules['qdrant_client'].QdrantClient
+        listing = fake_client_cls.get_collections
+
+        with contextlib.ExitStack() as a_run_starts_mid_listing:
+            def _list_and_then_a_run_starts(client_self):
+                collections = listing(client_self)
+                a_run_starts_mid_listing.enter_context(
+                    mod.hold_lease(owner='a-run-that-started-mid-listing'),
+                )
+                return collections
+
+            monkeypatch.setattr(
+                fake_client_cls, 'get_collections', _list_and_then_a_run_starts,
+            )
+
+            mod.main()
+
+            captured = capsys.readouterr()
+
+        assert clients[0].deleted == []
+        # Unlike the step-10 path there IS a client here, so this return has
+        # to go out through the `finally` that closes it.
+        assert clients[0].closed is True
+        assert 'a-run-that-started-mid-listing' in captured.err
 
     def test_the_same_collections_are_reaped_when_no_lease_is_held(
         self, monkeypatch, capsys,
