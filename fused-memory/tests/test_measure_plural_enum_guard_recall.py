@@ -2114,6 +2114,176 @@ async def test_one_graphs_failure_is_a_shortfall_not_a_lost_run(caplog):
     ]
     assert '| `beta` | 0 |' in render_markdown(report)
 
+    # ...and the evidence has to say WHY. A `complete: false` row carrying no
+    # reason is indistinguishable in the artifact from a graph that enumerated
+    # cleanly and came back short, and the two call for opposite responses:
+    # the first is 'the graph went away, re-run', the second is 'the read was
+    # truncated, raise --page-size'. The reason lived only in the operator's
+    # terminal, which contradicts exit_code's own rule that the evidence of
+    # the shortfall is IN the artifact.
+    assert by_id['beta'].error_kind == _mod.ENUMERATION_FAILED, (
+        'the probe mints its own kind for a graph that never enumerated — no '
+        'graphiti_client INCOMPLETE_* kind describes a query that was never '
+        'issued through the paginator at all'
+    )
+    assert by_id['beta'].error is not None
+    assert 'KeyError' in by_id['beta'].error, (
+        'the exception TYPE is what separates a vanished graph from a '
+        'timeout or a refused connection'
+    )
+    assert 'beta' in by_id['beta'].error, 'and the message that named it'
+    assert 'Traceback' not in by_id['beta'].error, (
+        'the traceback belongs in the log, which already has it via '
+        'logger.exception — the artifact carries the identification'
+    )
+    assert by_id['alpha'].error is None and by_id['alpha'].error_kind is None
+
+    beta_block = next(p for p in payload['projects'] if p['project_id'] == 'beta')
+    assert beta_block['error_kind'] == _mod.ENUMERATION_FAILED
+    assert 'KeyError' in beta_block['error']
+
+
+@pytest.mark.asyncio
+async def test_every_incomplete_project_names_why_in_the_artifact():
+    """`complete: false` must never appear without the reason beside it.
+
+    THE INVARIANT, asserted here over a MIXED report rather than over one
+    failure mode at a time: ``(error is None) == (complete is True)``, for
+    every project. It rules out both defects at once — an unexplained
+    incomplete row, and a stray error string on a healthy one — which is what
+    makes the field trustworthy enough to read without cross-checking a log.
+
+    The three graphs are the three shapes a reader has to be able to tell
+    apart in a committed artifact months later, and today cannot:
+
+    - ``alpha`` enumerated cleanly;
+    - ``beta`` NEVER enumerated (its graph vanished mid-run — the KeyError
+      path), so no query reached the paginator at all;
+    - ``gamma`` enumerated and came back SHORT of a census that bracketed it.
+
+    ``beta`` and ``gamma`` are recorded identically today: ``valid_edges: 0``
+    versus a partial count, both ``complete: false``, neither saying why. The
+    responses they call for are opposite — re-run for the first, raise
+    ``--page-size`` for the second.
+
+    ONE TAXONOMY, not two. ``gamma``'s kind is graphiti_client's own
+    ``INCOMPLETE_*`` value and its reason is the paginator's own prose,
+    verbatim, so the artifact and the backend's logs name the same failure
+    with the same string and nobody has to build a mapping between them. Only
+    ``beta`` needs a probe-level kind, because no shipped kind describes a
+    read that was never attempted.
+
+    Both graphs are driven through the REAL enumerator over fake queries
+    rather than through canned outcomes: a hand-written outcome would assert
+    that this test knows the taxonomy, not that the two layers share one.
+    """
+    complete_query = _FakeCappedEdgeQuery(
+        [[f'alpha-edge-{i}', fact] for i, fact in enumerate(_ALPHA_FACTS)],
+        cap=_PAGE_SIZE,
+    )
+    # 40 rows read against a census that bracketed the run at 50 then 51 —
+    # ten edges present for the WHOLE run went unread, which the growth
+    # tolerance deliberately does not excuse.
+    short_query = _FakeMovingCorpusQuery(
+        _fake_rows(40), cap=_PAGE_SIZE, counts=[50, 51],
+    )
+    queries = {'alpha': complete_query, 'gamma': short_query}
+
+    # What the SHIPPED paginator says about that same read, read off a twin
+    # fake so the expectation is the layer's own wording rather than a copy
+    # of it pasted into this file, which would keep passing after a rewording
+    # that had stopped reaching the artifact.
+    short_query_reason = (await _mod._paged_ro_query(
+        _mod._QueryFnGraph(
+            _FakeMovingCorpusQuery(_fake_rows(40), cap=_PAGE_SIZE, counts=[50, 51]),
+        ),
+        _mod._EDGE_PAGE_CYPHER,
+        _mod._EDGE_COUNT_CYPHER,
+        page_size=_PAGE_SIZE,
+    )).reason
+    assert short_query_reason, 'the paginator must have something to say'
+
+    async def edge_source(project_id: str, *, page_size: int):
+        # 'beta' is absent — the vanished-graph case, raised from the same
+        # place a live backend would raise it.
+        return await enumerate_valid_edge_facts(
+            queries[project_id], page_size=page_size,
+        )
+
+    report = await run(
+        _args(project_id=None, page_size=_PAGE_SIZE),
+        edge_source=edge_source,
+        graph_lister=_lister('alpha', 'beta', 'gamma'),
+    )
+
+    by_id = {p.project_id: p for p in report.projects}
+    for project in report.projects:
+        assert (project.error is None) == project.complete, (
+            f'{project.project_id}: error and complete must agree — '
+            f'complete={project.complete} error={project.error!r}'
+        )
+        assert (project.error_kind is None) == project.complete, (
+            f'{project.project_id}: kind must follow the same biconditional'
+        )
+
+    assert by_id['alpha'].complete is True
+    assert by_id['alpha'].census_before == len(_ALPHA_FACTS)
+    assert by_id['alpha'].census_after == len(_ALPHA_FACTS)
+
+    assert by_id['beta'].complete is False
+    assert by_id['beta'].error_kind == _mod.ENUMERATION_FAILED
+    assert 'KeyError' in by_id['beta'].error
+    assert by_id['beta'].census_before is None, (
+        'no census was taken — a zero here would read as a proven-empty graph'
+    )
+    assert by_id['beta'].census_after is None
+
+    assert by_id['gamma'].complete is False
+    assert by_id['gamma'].valid_edges == 40
+    assert by_id['gamma'].error_kind in {
+        graphiti_client.INCOMPLETE_STRUCTURAL_REFUSAL,
+        graphiti_client.INCOMPLETE_PAGE_CAP,
+        graphiti_client.INCOMPLETE_CENSUS_UNAVAILABLE,
+        graphiti_client.INCOMPLETE_SHORT_READ,
+    }, (
+        'the shortfall kinds are REUSED from the layer that produced them, '
+        'not minted in parallel here'
+    )
+    assert by_id['gamma'].error_kind == graphiti_client.INCOMPLETE_SHORT_READ
+    assert by_id['gamma'].error == short_query_reason, (
+        "the paginator's own prose, verbatim — so the artifact and the "
+        'backend log name one failure with one string'
+    )
+    assert by_id['gamma'].census_before == 50
+    assert by_id['gamma'].census_after == 51
+
+    payload = json.loads(render_json(report))
+    assert payload['schema_version'] == 3, (
+        'the fields below are new; a schema-2 artifact beside this renderer '
+        'would misdescribe the script that claims to generate it'
+    )
+    assert _mod.SCHEMA_VERSION == 3
+    blocks = {p['project_id']: p for p in payload['projects']}
+    for project_id, project in by_id.items():
+        block = blocks[project_id]
+        assert block['error'] == project.error
+        assert block['error_kind'] == project.error_kind
+        assert block['census_before'] == project.census_before
+        assert block['census_after'] == project.census_after
+
+    markdown = render_markdown(report)
+    # The table's own `**NO**` cells are annotated, and the prose beneath
+    # carries the diagnostic reason. A bare `**NO**` is the defect.
+    assert _mod.ENUMERATION_FAILED in markdown
+    assert graphiti_client.INCOMPLETE_SHORT_READ in markdown
+    assert by_id['beta'].error in markdown
+    assert by_id['gamma'].error in markdown
+    for line in markdown.splitlines():
+        if line.startswith('| `') and '**NO**' in line:
+            assert line.count('`') > 2, (
+                f'an incomplete row must name its kind, not just fail: {line}'
+            )
+
 
 @pytest.mark.asyncio
 async def test_without_a_lister_the_report_says_its_graph_set_was_unchecked():
