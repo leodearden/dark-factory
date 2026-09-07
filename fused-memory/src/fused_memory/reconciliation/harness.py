@@ -5959,8 +5959,28 @@ class ReconciliationHarness:
                                 # VOLUME PARITY: at most one orchestrator-queue
                                 # record per finding that already files one recon
                                 # escalation today, folded across later cycles by
-                                # the filer's own dedupe.  This plumbing cannot
-                                # flood the orchestrator ladder.
+                                # the filer's own (level 0, category) pending
+                                # scan -- for as long as that record stays
+                                # PENDING AT LEVEL 0.
+                                #
+                                # KNOWN GAP, deliberately not closed by this arm.
+                                # That bound is per-cycle-while-pending-at-L0,
+                                # NOT an absolute one-record-per-finding cap.
+                                # `orchestrator/harness.py::
+                                # _reap_orphan_l0_escalations` promotes an aged
+                                # pending L0 to L1 with no category filter, and
+                                # this filer fires only when NO workflow is live
+                                # for the task -- the very condition that makes a
+                                # record an orphan candidate.  So a record filed
+                                # here is born eligible for promotion; once
+                                # promoted the `level == 0` scan stops matching
+                                # and the next cycle files a fresh L0 while the
+                                # finding persists.  Closing it needs a dedupe
+                                # key that survives promotion (any-level scan or
+                                # a terminal-record check) -- design work beyond
+                                # this arm.  Do not restore the previous
+                                # "cannot flood the orchestrator ladder" claim
+                                # here: it is false for exactly this reason.
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
                                 )

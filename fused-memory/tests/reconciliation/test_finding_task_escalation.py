@@ -328,16 +328,21 @@ class TestBuildFindingTaskEscalationKwargs:
 
     def test_dedupe_fingerprint_is_not_set(self):
         # Nothing on the orchestrator queue folds on a fingerprint for this
-        # category; cross-cycle dedupe is `has_open_l1`'s job. Setting one
+        # category; cross-cycle dedupe is the filer's own (level, category)
+        # pending-scan in `harness.py::_file_finding_task_escalation` -- NOT
+        # `has_open_l1`, which is level-1-only and would see nothing at all
+        # for these deliberately level-0 records.  Setting a fingerprint here
         # risks unintended folding if a future submit_or_dedupe config ever
         # names the category.
         payload = self._build()
-        assert payload.get('dedupe_fingerprint') is None
+        assert 'dedupe_fingerprint' not in payload
 
     def test_suggested_action_is_left_empty(self):
         # The correct disposition is exactly what the ladder exists to decide;
         # the finding's own suggested_action is carried in `detail`.
-        assert self._build().get('suggested_action', '') == ''
+        # Key-absence, not a falsy value: `.get(k, '') == ''` would pass
+        # vacuously whether the builder omits the key or sets it to ''.
+        assert 'suggested_action' not in self._build()
 
     def test_builder_does_not_mutate_the_finding(self):
         finding = _finding_with_task()
