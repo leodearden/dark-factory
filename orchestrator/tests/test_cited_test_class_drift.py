@@ -601,6 +601,34 @@ class TestDanglingCitations:
             _dangling_citations(src_dirs, test_dirs)
 
 
+def _src_dirs() -> list[Path]:
+    """Every ``<member>/src`` the workspace actually has, derived at runtime.
+
+    Read from the root ``pyproject.toml``'s ``[tool.uv.workspace].members``
+    rather than hard-coded, so adding or renaming a workspace member cannot
+    silently shrink this guard's reach. A member without a ``src`` directory is
+    skipped rather than assumed.
+    """
+    config = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
+    members = config['tool']['uv']['workspace']['members']
+    return sorted(d for d in (REPO_ROOT / m / 'src' for m in members) if d.is_dir())
+
+
+def _test_dirs() -> list[Path]:
+    """Every test root a cited class may legitimately be defined under.
+
+    ``*/tests`` is deliberately SHALLOW rather than an rglob: in the main
+    checkout a recursive search would descend into ``.worktrees/<id>/...`` and
+    multiply the corpus by every live task lane, while the shallow form still
+    picks up ``scripts/tests`` alongside the member test dirs without naming
+    any of them. The repo-root ``tests/`` is added explicitly because it is not
+    itself a ``*/tests`` match.
+    """
+    dirs = sorted(d for d in REPO_ROOT.glob('*/tests') if d.is_dir())
+    root_tests = REPO_ROOT / 'tests'
+    return [*dirs, root_tests] if root_tests.is_dir() else dirs
+
+
 #: FLOORS, deliberately set well below the live values so ordinary tree growth
 #: can never break them, and never equalities or "measured at authorship"
 #: figures — the house pattern
@@ -652,6 +680,11 @@ def _real_tree_sweep() -> _Sweep:
     )
 
 
+# Co-located on ONE xdist worker (addopts runs `--dist loadgroup`): the two
+# tests below share the module-scoped `_real_tree_sweep`, and without a group
+# tag xdist splits them across workers, each rebuilding that whole-workspace
+# sweep from scratch. MEASURED on this base: 103s split, 67s co-located.
+@pytest.mark.xdist_group('cited_test_class_drift_sweep')
 class TestCitedTestClassDrift:
     """The deliverable guard, wired to the REAL workspace.
 
