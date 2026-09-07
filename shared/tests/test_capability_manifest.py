@@ -503,6 +503,55 @@ class TestManifestTask:
         assert doc.tasks[0].external_task_id == 'reify:5613'
         assert doc.tasks[0].task_id is None
 
+    def test_both_task_id_and_external_task_id_rejected(self):
+        """A block binds exactly one producer, in exactly one registry.
+
+        Guards the concrete path in ``manifest_stamping`` step 4: it stamps
+        any label present in the current ``commit_planning`` batch without
+        consulting the block's existing contents, so a future dark-factory
+        decompose re-using a label already bound to a foreign producer
+        would write a local ``task_id`` alongside the ``external_task_id``.
+        Failing loudly at load is the point — the corpus sweep turns it
+        into a red CI signal naming the file.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            ManifestTask(label='η', task_id=5613, external_task_id='reify:5613', capabilities=[])
+        message = str(exc_info.value)
+        assert 'η' in message
+        assert 'reify:5613' in message
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            pytest.param('reify', id='no-colon'),
+            pytest.param('reify:', id='empty-task-id'),
+            pytest.param(':5613', id='empty-project-id'),
+            pytest.param('a:b:c', id='three-parts'),
+            pytest.param('  ', id='blank'),
+            pytest.param('', id='empty'),
+        ],
+    )
+    def test_malformed_external_task_id_rejected(self, value):
+        """Structural form is delegated to ``ExternalDep.parse``, not re-implemented."""
+        with pytest.raises(ValidationError) as exc_info:
+            ManifestTask(label='η', external_task_id=value, capabilities=[])
+        message = str(exc_info.value)
+        # The message names the offending value AND the label, so a
+        # corpus-sweep failure is self-locating without opening the file.
+        assert repr(value) in message
+        assert 'η' in message
+
+    def test_external_task_id_surrounding_whitespace_accepted(self):
+        """Whitespace the shared parser tolerates is tolerated here too.
+
+        ``ExternalDep.parse`` strips before splitting, so this is a
+        well-formed value. It is stored verbatim — the model validates the
+        wire form, it does not normalise it (``parse(s).render() == s``
+        holds for the stripped form; see ExternalDep's own docstring).
+        """
+        task = ManifestTask(label='η', external_task_id=' reify:5613 ', capabilities=[])
+        assert task.external_task_id == ' reify:5613 '
+
     def test_empty_label_rejected(self):
         with pytest.raises(ValidationError) as exc_info:
             ManifestTask(label='', capabilities=[])
