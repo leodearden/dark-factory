@@ -63,7 +63,10 @@ someone remembered. Here:
   and consumed by all builders through one aggregator — adding a section is a
   single edit, not one edit per builder;
 * the BUILDER set is DERIVED by AST introspection over the class body, so a
-  fourth builder is in scope the day it is added with no edit here.
+  fourth builder is in scope the day it is added with no edit here — and
+  EVERY payload-returning branch of each discovered builder is checked, not
+  just the first one found, so a second return added to an existing builder
+  is in scope the same way.
 
 The only hand-written literals are the registry itself (the intended single
 edit point) and a discovery FLOOR, which can only ever be too small — and being
@@ -93,31 +96,50 @@ CONSOLIDATOR_CLASS = 'MemoryConsolidator'
 _PAYLOAD_HEADER_PREFIX = '## '
 
 
-def _returns_a_whole_payload(node: ast.AST) -> ast.Return | None:
-    """The ``Return`` under *node* that returns a whole Stage-1 payload, if any.
+def _is_a_whole_payload(node: ast.Return) -> bool:
+    """True when *node* returns a whole Stage-1 payload.
 
     A whole payload is an f-string whose LEADING literal chunk opens with
     ``'## '`` — the top-level markdown header that makes a string an entire
-    payload rather than one section of one. Returns the node itself (not just a
-    bool) so callers can assert over the f-string's interpolations.
+    payload rather than one section of one.
     """
-    for descendant in ast.walk(node):
-        if not isinstance(descendant, ast.Return):
-            continue
-        if not isinstance(descendant.value, ast.JoinedStr):
-            continue
-        values = descendant.value.values
-        lead = values[0] if values else None
-        if (
-            isinstance(lead, ast.Constant)
-            and isinstance(lead.value, str)
-            and lead.value.startswith(_PAYLOAD_HEADER_PREFIX)
-        ):
-            return descendant
-    return None
+    if not isinstance(node.value, ast.JoinedStr):
+        return False
+    values = node.value.values
+    lead = values[0] if values else None
+    return (
+        isinstance(lead, ast.Constant)
+        and isinstance(lead.value, str)
+        and lead.value.startswith(_PAYLOAD_HEADER_PREFIX)
+    )
 
 
-def _discover_stage1_payload_builders() -> dict[str, tuple[ast.AST, ast.Return]]:
+def _payload_returns(node: ast.AST) -> list[ast.Return]:
+    """EVERY ``Return`` under *node* that returns a whole Stage-1 payload.
+
+    ALL of them, not the first one found. A builder may grow a second
+    payload-returning branch — an early-return short payload ahead of the full
+    one is the obvious shape — and checking only one branch would leave the
+    other free to omit the required sections silently, which is precisely the
+    drift this guard exists to prevent. Checking the whole set also removes a
+    trap for the next reader: ``ast.walk`` is BREADTH-first, so "the first
+    payload return" is not source order and which branch got checked would not
+    be obvious from reading the file. Sorted by position so failure messages
+    name the offending branches in source order.
+
+    Returns the nodes themselves (not a count or a bool) so callers can assert
+    over each f-string's interpolations and report its ``lineno``.
+    """
+    returns = [
+        descendant
+        for descendant in ast.walk(node)
+        if isinstance(descendant, ast.Return) and _is_a_whole_payload(descendant)
+    ]
+    returns.sort(key=lambda ret: (ret.lineno, ret.col_offset))
+    return returns
+
+
+def _discover_stage1_payload_builders() -> dict[str, tuple[ast.AST, list[ast.Return]]]:
     """Every Stage-1 payload builder on ``MemoryConsolidator``, by introspection.
 
     DERIVED, not hand-listed — that is the whole point. A fourth payload builder
@@ -157,13 +179,13 @@ def _discover_stage1_payload_builders() -> dict[str, tuple[ast.AST, ast.Return]]
         f'{CONSOLIDATOR_CLASS!r}. Builder discovery cannot run; fix the class name '
         f'here rather than letting this guard check nothing.'
     )
-    builders: dict[str, tuple[ast.AST, ast.Return]] = {}
+    builders: dict[str, tuple[ast.AST, list[ast.Return]]] = {}
     for node in class_def.body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        payload_return = _returns_a_whole_payload(node)
-        if payload_return is not None:
-            builders[node.name] = (node, payload_return)
+        payload_returns = _payload_returns(node)
+        if payload_returns:
+            builders[node.name] = (node, payload_returns)
     return builders
 
 
@@ -415,11 +437,26 @@ class TestEveryPayloadBuilderRendersTheRequiredSections:
     """
 
     def test_builder_interpolates_the_required_sections_aggregator(self, builder_name):
-        builder, payload_return = STAGE1_PAYLOAD_BUILDERS[builder_name]
+        """EVERY payload-returning branch of the builder must carry the sections.
 
-        assert _payload_interpolates_the_aggregator(builder, payload_return), (
+        Not just one of them: a builder that grows a second payload return —
+        an early-return short payload, say — must have that branch checked too,
+        or it becomes a fresh place for a required section to go missing.
+        """
+        builder, payload_returns = STAGE1_PAYLOAD_BUILDERS[builder_name]
+
+        offending_lines = [
+            payload_return.lineno
+            for payload_return in payload_returns
+            if not _payload_interpolates_the_aggregator(builder, payload_return)
+        ]
+
+        assert not offending_lines, (
             f'{CONSOLIDATOR_CLASS}.{builder_name} returns a Stage-1 payload that '
-            f'never interpolates self.{AGGREGATOR}(), so it can omit '
+            f'never interpolates self.{AGGREGATOR}() at '
+            f'{CONSOLIDATOR_SRC.name}:{",".join(str(n) for n in offending_lines)} '
+            f'(of {len(payload_returns)} payload-returning branch(es) in this '
+            f'builder), so that branch can omit '
             f'{sorted(s.header for s in MemoryConsolidator.REQUIRED_SECTIONS)} — '
             f"and the prompt's absence-inference then makes the model conclude "
             f'something FALSE rather than merely reading a terser payload. Fix: '
