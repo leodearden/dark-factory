@@ -47,6 +47,7 @@ from __future__ import annotations
 import re
 import tokenize
 from pathlib import Path
+from typing import cast
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -212,3 +213,69 @@ class TestRewordInvariance:
 
     def test_prose_citing_no_test_class_extracts_nothing_however_long(self):
         assert _cited_names('"""' + 'Prose naming no identifier at all. ' * 40 + '"""\n') == {}
+
+
+class TestDefinedTestClasses:
+    """Unit tests for the resolver ``_defined_test_classes``, on synthetic trees."""
+
+    @staticmethod
+    def _tree(root: Path, files: dict[str, str]) -> Path:
+        for name, text in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        return root
+
+    def test_a_class_in_a_nested_subdirectory_resolves_and_a_txt_sibling_does_not(self, tmp_path):
+        self._tree(tmp_path, {
+            'deep/nested/test_a.py': 'class TestFooBarBaz:\n    pass\n',
+            'deep/nested/notes.txt': 'class TestQuuxCorgeGrault:\n',
+        })
+        wanted = {'TestFooBarBaz', 'TestQuuxCorgeGrault'}
+        assert _defined_test_classes([tmp_path], wanted) == {'TestFooBarBaz'}
+
+    def test_a_name_defined_nowhere_is_absent_from_the_result(self, tmp_path):
+        self._tree(tmp_path, {'test_a.py': 'class TestFooBarBaz:\n    pass\n'})
+        assert _defined_test_classes([tmp_path], {'TestNotDefinedAnywhere'}) == set()
+
+    def test_a_class_inside_a_string_literal_is_not_resolved(self, tmp_path):
+        """THE soundness case. A ``class Test...`` at column 0 inside a
+        triple-quoted synthetic source matches the line-anchored prefilter, so
+        a regex-only resolver would let a genuinely dangling citation resolve —
+        the permissive direction, which hollows the guard out silently. This
+        module's own unit tests embed exactly such sources, so the trap is
+        self-inflicted, not hypothetical; it is the one
+        ``test_marker_registration_drift.py::test_marker_name_inside_a_string_literal_is_ignored``
+        guards for markers.
+        """
+        self._tree(tmp_path, {'test_a.py': 'SOURCE = """\nclass TestFooBarBaz:\n    pass\n"""\n'})
+        assert _defined_test_classes([tmp_path], {'TestFooBarBaz'}) == set()
+
+    def test_a_class_nested_inside_another_class_still_resolves(self, tmp_path):
+        """``ast.walk``, not ``tree.body`` — nesting depth is not a reason to
+        call a real class absent."""
+        self._tree(tmp_path, {'test_a.py': 'class Outer:\n    class TestFooBarBaz:\n        pass\n'})
+        assert _defined_test_classes([tmp_path], {'TestFooBarBaz'}) == {'TestFooBarBaz'}
+
+    def test_empty_wanted_short_circuits_without_scanning(self):
+        """Nothing is read at all — asserted directly, by handing the resolver a
+        root that raises if it is ever swept."""
+
+        class _ExplodingRoot:
+            def rglob(self, pattern: str):
+                raise AssertionError(f'swept for {pattern} despite an empty wanted set')
+
+        assert _defined_test_classes([cast(Path, _ExplodingRoot())], set()) == set()
+
+    def test_an_unparseable_file_matching_the_prefilter_raises_naming_it(self, tmp_path):
+        self._tree(tmp_path, {'test_broken.py': 'class TestFooBarBaz:\n    def f(:\n        pass\n'})
+        with pytest.raises(AssertionError, match='test_broken.py'):
+            _defined_test_classes([tmp_path], {'TestFooBarBaz'})
+
+    def test_an_unreadable_file_raises_naming_it(self, tmp_path):
+        """A dangling symlink is yielded by ``rglob`` and raises ``OSError`` on
+        read. Never swallowed, never silently skipped: a skipped file is a file
+        this guard is vacuous for."""
+        (tmp_path / 'test_dangling.py').symlink_to(tmp_path / 'missing.py')
+        with pytest.raises(AssertionError, match='test_dangling.py'):
+            _defined_test_classes([tmp_path], {'TestFooBarBaz'})
