@@ -2374,12 +2374,15 @@ class TestPagePrimitive:
             }
 
         monkeypatch.setattr(tasks_mod, 'mcp_tool_call', _fake)
-        rows, pagination = await tasks_mod._fetch_page(
+        page = await tasks_mod._fetch_page(
             dummy_client, 'http://x', self._read(), tasks_mod._OnePage(2, 4), 5.0,
         )
+        rows = page.rows
 
-        assert pagination == envelope
-        assert [r['id'] for r in rows] == ['1', '2']
+        assert page.pagination == envelope
+        assert page.delivered == 2, 'the RAW row count the server sent'
+        # _shape_task coerces the id to an int; the raw MCP row carries a str.
+        assert [r['id'] for r in rows] == [1, 2]
         # _shape_task-shaped, not raw MCP rows: 'updatedAt' becomes 'updated_at'.
         assert 'updated_at' in rows[0] and 'updatedAt' not in rows[0]
 
@@ -2395,11 +2398,11 @@ class TestPagePrimitive:
             return {'tasks': [_paged_task_raw(1)]}
 
         monkeypatch.setattr(tasks_mod, 'mcp_tool_call', _fake)
-        rows, pagination = await tasks_mod._fetch_page(
+        page = await tasks_mod._fetch_page(
             dummy_client, 'http://x', self._read(), None, 5.0,
         )
-        assert pagination is None
-        assert len(rows) == 1
+        assert page.pagination is None
+        assert len(page.rows) == 1
 
     async def test_a_structured_mcp_error_raises_value_error(
         self, dummy_client, monkeypatch
@@ -2432,10 +2435,10 @@ class TestPagePrimitive:
             return {'error': 'partial', 'tasks': [_paged_task_raw(1)]}
 
         monkeypatch.setattr(tasks_mod, 'mcp_tool_call', _fake)
-        rows, _ = await tasks_mod._fetch_page(
+        page = await tasks_mod._fetch_page(
             dummy_client, 'http://x', self._read(), None, 5.0,
         )
-        assert len(rows) == 1
+        assert len(page.rows) == 1
 
     async def test_the_window_and_statuses_come_from_wire_arguments(
         self, dummy_client, monkeypatch
@@ -2473,13 +2476,21 @@ class TestWalkPages:
 
     @staticmethod
     def _pager(pages, calls=None):
-        """Build a page fn serving *pages* in order, recording its windows."""
+        """Build a page fn serving *pages* in order, recording its windows.
+
+        Each entry is ``(rows, pagination)`` or ``(rows, pagination, delivered)``;
+        *delivered* defaults to ``len(rows)`` since a well-formed page shapes
+        one-for-one.
+        """
         served = iter(pages)
 
         async def _page_fn(window):
             if calls is not None:
                 calls.append(window)
-            return next(served)
+            entry = next(served)
+            rows, pagination = entry[0], entry[1]
+            delivered = entry[2] if len(entry) > 2 else len(rows)
+            return tasks_mod._Page(rows, delivered, pagination)
 
         return _page_fn
 
@@ -2519,7 +2530,7 @@ class TestWalkPages:
             ([r for r in rows if r], {'returned': 2, 'total': 2}),
         ])
         out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
-        assert [r['id'] for r in out] == ['1', '2']
+        assert [r['id'] for r in out] == [1, 2]
 
     # ---- (d) a server that ignores paging ---------------------------------
 
@@ -2554,9 +2565,36 @@ class TestWalkPages:
         )
 
         out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
-        assert [r['id'] for r in out] == ['1', '2', '3', '4']
+        assert [r['id'] for r in out] == [1, 2, 3, 4]
         # Asked for 3, given 2 -> the next window starts at 2, NOT at 3.
         assert [(w.page_size, w.offset) for w in calls] == [(3, 0), (3, 2)]
+
+    async def test_an_unparseable_row_does_not_look_like_a_truncated_page(self):
+        """`returned` is cross-checked against DELIVERED, never `len(rows)`.
+
+        `_shape_task` returns None for a missing or non-integer id, so a page
+        of 10 that the server really did send can shape to 9. Comparing the
+        server's `returned` against the SHAPED count would read that as a
+        truncated page and take the whole project offline — and would advance
+        the walk short, so the next page re-reads rows already held.
+
+        This is the hazard `_Page.delivered` exists to make unmissable: before
+        the extraction the raw page was in scope and the distinction lived in a
+        comment; a named field cannot be silently dropped by a later edit.
+        """
+        calls: list = []
+        # Three rows arrive; the middle one has an unparseable id, so exactly
+        # two survive shaping while the server correctly reports returned=3.
+        good = [r for r in (_shape_task(_paged_task_raw(i)) for i in (1, 3)) if r]
+        page_fn = self._pager(
+            [(good, {'returned': 3, 'total': 3}, 3)], calls,
+        )
+
+        out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
+        assert [r['id'] for r in out] == [1, 3], (
+            'the shaped rows are returned, minus the unparseable one'
+        )
+        assert len(calls) == 1, 'a complete page must not be re-requested'
 
     async def test_statuses_reach_every_page(self):
         """The tool filters BEFORE its in-memory slice.

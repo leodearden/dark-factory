@@ -40,9 +40,10 @@ whole key. ``fetch_external_statuses`` is uncached and returns live data.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -407,6 +408,187 @@ def _shape_task(task: dict) -> dict | None:
 STRANDED_HEARTBEAT_TTL = timedelta(minutes=10)
 
 
+@dataclass(frozen=True, slots=True)
+class _Page:
+    """One page as it came off the wire.
+
+    *rows* are :func:`_shape_task`-shaped and may be SHORTER than *delivered*:
+    ``_shape_task`` drops a row whose id is missing or non-integer. That gap is
+    a NAMED FIELD rather than a comment because the walk's ``returned``
+    cross-check and its offset advance must both use *delivered* — the count
+    the server actually sent. Checking ``len(rows)`` instead would turn ONE
+    unparseable task id into a whole-project offline marker, and would advance
+    the walk short so the next page re-read rows already held.
+    """
+
+    rows: list[dict]
+    delivered: int
+    pagination: dict | None
+
+
+async def _fetch_page(
+    client: httpx.AsyncClient,
+    url: str,
+    read: _TasksRead,
+    window: _OnePage | None,
+    timeout: float,
+) -> _Page:
+    """Issue ONE ``get_tasks`` call against ONE url and shape what comes back.
+
+    The pagination envelope is PRESERVED rather than discarded: the walk needs
+    ``returned``/``total``, and this is the only layer that sees them.
+
+    Raises ``ValueError`` for a structured MCP error — ``first_success``'s
+    documented soft-failure signal, so the fan-out falls through to the next
+    URL. The guard is ``'error' in result and 'tasks' not in result``
+    specifically: an ``error`` alongside ``tasks`` is a partial-warning payload
+    and must still be served.
+    """
+    result = await mcp_tool_call(
+        client, url, 'get_tasks', read.wire_arguments(window), timeout=timeout,
+    )
+    if 'error' in result and 'tasks' not in result:
+        raise ValueError(str(result.get('error')))
+    raw = result.get('tasks') or []
+    rows = [shaped for shaped in (_shape_task(task) for task in raw) if shaped is not None]
+    meta = result.get('pagination')
+    return _Page(rows, len(raw), meta if isinstance(meta, dict) else None)
+
+
+async def _walk_pages(
+    page_fn: Callable[[_OnePage], Awaitable[_Page]],
+    read: _TasksRead,
+    chunk_size: int,
+) -> list[dict]:
+    """Assemble the COMPLETE task set from repeated *page_fn* calls.
+
+    *page_fn* is injected and already bound to ONE url. That binding is
+    load-bearing rather than stylistic: ``first_success`` tries urls in order,
+    so a walk free to fan out mid-walk would assemble pages from DIFFERENT
+    servers and silently invalidate the grown-``total`` coherence check below —
+    pages from two different states of the world, with every counter still
+    self-consistent. Hence no url/config parameter here.
+
+    The walk starts at offset 0. A complete read starting mid-tree is not
+    complete, and after task 5018 the cache key for a complete read carries no
+    offset, so honouring one would put two different answers under one key.
+
+    TRUNCATION IS LOUD. Every failure below raises ``ValueError`` and DISCARDS
+    whatever rows were accumulated. ``fetch_tasks``' contract distinguishes only
+    ``list`` (a complete success) from the ``{'offline': True}`` marker, so a
+    truncated list is indistinguishable from a complete one at EVERY call site:
+    ``collect_snapshot`` triages on ``isinstance(result, list)`` and would write
+    a confident undercount into the APPEND-ONLY ``snapshots`` table. A plausible
+    dip in an append-only chart is unfalsifiable after the fact, whereas a gap
+    is visible. ``ValueError`` is ``first_success``'s soft-failure signal, so it
+    tries the next URL and, on exhaustion, yields the marker
+    ``collect_snapshot`` already skips on.
+    """
+    shaped: list[dict] = []
+    walk_offset = 0
+    pages = 0
+    page_budget: int | None = None
+    first_total: int | None = None
+    while True:
+        # Same record, different window — which is why wire_arguments takes the
+        # window as an argument rather than reading it off `read.mode`.
+        # `statuses` therefore reaches EVERY page: the tool applies the status
+        # filter BEFORE its in-memory slice, so `total` is the FILTERED count and
+        # an unfiltered page would both over-read and desynchronise the walk's
+        # terminator.
+        page = await page_fn(_OnePage(chunk_size, walk_offset))
+        shaped.extend(page.rows)
+        pages += 1
+
+        meta = page.pagination
+        if meta is None:
+            # An older fused-memory ignores page_size and answers with the
+            # whole bare list.  There is no `total` to page against, so this
+            # response IS the answer — take it and stop.  Looping blind
+            # would either spin or re-request the same rows forever.
+            break
+        returned = meta.get('returned')
+        total = meta.get('total')
+        if not isinstance(returned, int) or not isinstance(total, int):
+            # No usable counters: completeness is UNVERIFIABLE here, and an
+            # unverifiable read must not be reported as a complete one.
+            raise ValueError(
+                f'get_tasks pagination for {read.project_root} truncated at '
+                f'{len(shaped)} row(s), total={total!r}'
+            )
+        if returned != page.delivered:
+            # The SELF-REPORTED counter is what the walk advances on, so it
+            # must be cross-checked against what actually arrived — this is
+            # the one remaining way a bounded-but-incomplete read could be
+            # handed back as a plain list.  A server (or a proxy/serialiser
+            # that clips a page) claiming returned=10 while shipping 4 rows
+            # would otherwise skip 6 rows per page silently, terminate
+            # normally at offset >= total, and hand collect_snapshot a
+            # confident undercount to write into an append-only table.  The
+            # mirror case (under-reporting) re-requests rows already held
+            # and inflates the counts instead.  Neither is verifiable after
+            # the fact, so refuse the read.
+            #
+            # `page.delivered`, NOT `len(page.rows)`: _shape_task drops a row
+            # with an unparseable id, so a legitimately-shaped page can be
+            # shorter than what arrived.
+            raise ValueError(
+                f'get_tasks pagination for {read.project_root} inconsistent '
+                f'at offset {walk_offset}: server claims returned={returned} '
+                f'but sent {page.delivered} row(s)'
+            )
+        if first_total is None:
+            first_total = total
+            # BOUND THE WALK.  `total` is the loop's only terminator, and it
+            # is server-reported: a stale count, a bad merge of tag scopes,
+            # or a tree being written concurrently makes ceil(total/P)
+            # sequential round trips on the SAME httpx client the 2 s render
+            # polls share — the PoolTimeout hazard the burndown size probe
+            # exists to bound.  So derive one budget from the FIRST response
+            # and refuse to exceed it.  The +2 covers the final partial page
+            # plus one page of slack; a server that keeps handing back short
+            # pages is misbehaving in exactly the way that amplifies the
+            # walk, and is caught here rather than paid for.
+            page_budget = math.ceil(total / max(chunk_size, 1)) + 2
+        elif total > first_total:
+            # A `total` that GROWS mid-walk means the tree changed underneath
+            # the read: the pages in hand are from different states of the
+            # world, so the assembled list is not a coherent snapshot of
+            # either.  It also un-bounds the budget derived above.
+            raise ValueError(
+                f'get_tasks pagination for {read.project_root} raced a write '
+                f'at offset {walk_offset}: total grew from {first_total} to '
+                f'{total} mid-walk'
+            )
+        if returned <= 0:
+            # Guard the COMPLETE cases first.  An empty page with no rows
+            # still owed (total <= 0, or offset already past total) is a
+            # complete read of an empty or exhausted tree — it must keep
+            # returning [], or every empty project becomes a permanent
+            # burndown hole and loses its legitimate all-zero row.
+            if total <= 0 or walk_offset >= total:
+                break
+            # The server claims rows remain but hands back an empty page, so
+            # it cannot be paged past.  Detail lives in the exception rather
+            # than a second WARNING for the same event.
+            raise ValueError(
+                f'get_tasks pagination for {read.project_root} truncated at '
+                f'{len(shaped)} row(s) — empty page at offset {walk_offset}, '
+                f'total={total}'
+            )
+        walk_offset += page.delivered
+        if walk_offset >= total:
+            break
+        if page_budget is not None and pages >= page_budget:
+            raise ValueError(
+                f'get_tasks pagination for {read.project_root} exceeded its '
+                f'{page_budget}-page budget at offset {walk_offset} '
+                f'(total={total}, page_size={chunk_size}); refusing to keep '
+                f'walking'
+            )
+    return shaped
+
+
 def task_is_stranded(task: Mapping[str, Any], now: datetime | None = None) -> bool:
     """Return True when *task* is an in-progress task with no live claimant.
 
@@ -657,154 +839,25 @@ async def fetch_tasks(
         None if statuses is None else frozenset(statuses),
         mode,
     )
-    # `offset` is deliberately NOT consulted outside the `_OnePage` branch: a
-    # complete read starting mid-tree is not complete, and letting it into the
-    # key while it never reached the wire is the measured drift defect.
-    base_arguments = read.wire_arguments(
-        mode if isinstance(mode, _OnePage) else None
-    )
-
-    def _shape_all(raw_tasks: list, into: list[dict]) -> None:
-        for task in raw_tasks:
-            row = _shape_task(task)
-            if row is not None:
-                into.append(row)
-
-    async def _request(url: str, args: dict) -> dict:
-        result = await mcp_tool_call(
-            client, url, 'get_tasks', args, timeout=timeout,
-        )
-        if 'error' in result and 'tasks' not in result:
-            raise ValueError(str(result.get('error')))
-        return result
 
     async def _call(url: str) -> list[dict]:
-        if not paginate or page_size is None:
-            # Single-request path — byte-identical to main's pre-walk request,
-            # narrowing included.  ``paginate=True`` with no *page_size* has no
-            # page to walk, so it degrades here rather than spinning.
-            result = await _request(url, base_arguments)
-            shaped: list[dict] = []
-            _shape_all(result.get('tasks') or [], shaped)
-            return shaped
+        """Read the whole answer from ONE url, pinned for the duration."""
+        page_fn = functools.partial(_fetch_page, client, url, read, timeout=timeout)
 
-        shaped = []
-        walk_offset = offset
-        pages = 0
-        page_budget: int | None = None
-        first_total: int | None = None
-        while True:
-            # Same record, different window — which is why wire_arguments
-            # takes the window as an argument rather than reading it off
-            # `read.mode`.  `statuses` therefore reaches EVERY page: the tool
-            # applies the status filter BEFORE its in-memory slice, so `total`
-            # is the FILTERED count and an unfiltered page would both over-read
-            # and desynchronise the walk's terminator.
-            page_args = read.wire_arguments(_OnePage(page_size, walk_offset))
-            result = await _request(url, page_args)
-            # Capture the RAW page: `len(shaped)` is not a usable proxy for it,
-            # because _shape_all drops rows whose _shape_task returns None.
-            page = result.get('tasks') or []
-            _shape_all(page, shaped)
-            pages += 1
+        if isinstance(mode, _CompleteRead) and mode.chunk_size is not None:
+            # The walk binds a SINGLE url per first_success attempt — the
+            # coherence checks assume one server — and sits BELOW the cache, so
+            # a failed page cannot mint a per-page marker served mid-walk.
+            async def _page(window: _OnePage) -> _Page:
+                return await page_fn(window)
 
-            meta = result.get('pagination')
-            if not isinstance(meta, dict):
-                # An older fused-memory ignores page_size and answers with the
-                # whole bare list.  There is no `total` to page against, so this
-                # response IS the answer — take it and stop.  Looping blind
-                # would either spin or re-request the same rows forever.
-                break
-            returned = meta.get('returned')
-            total = meta.get('total')
-            # TRUNCATION IS LOUD, not silent.  The loop still never spins — that
-            # property is retained below — but a bounded-but-INCOMPLETE read must
-            # never be handed back as a plain list.  fetch_tasks's contract
-            # distinguishes only `list` (a complete success) from the
-            # {'offline': True} marker, so a truncated list is indistinguishable
-            # from a complete one at EVERY call site: collect_snapshot triages on
-            # isinstance(result, list) and would write _count_zones([]) — a
-            # confident zero — into the APPEND-ONLY `snapshots` table for a tree
-            # the server itself reported as non-empty.  A plausible dip in an
-            # append-only chart is unfalsifiable after the fact, whereas a gap is
-            # visible.  ValueError is first_success's documented soft-failure
-            # fall-through signal (mcp_fanout.py:250-252, already used by
-            # _request above), so it tries the next URL and, on exhaustion,
-            # yields the offline marker collect_snapshot already skips on.
-            if not isinstance(returned, int) or not isinstance(total, int):
-                # No usable counters: completeness is UNVERIFIABLE here, and an
-                # unverifiable read must not be reported as a complete one.
-                raise ValueError(
-                    f'get_tasks pagination for {project_root_str} truncated at '
-                    f'{len(shaped)} row(s), total={total!r}'
-                )
-            if returned != len(page):
-                # The SELF-REPORTED counter is what the walk advances on, so it
-                # must be cross-checked against what actually arrived — this is
-                # the one remaining way a bounded-but-incomplete read could be
-                # handed back as a plain list.  A server (or a proxy/serialiser
-                # that clips a page) claiming returned=10 while shipping 4 rows
-                # would otherwise skip 6 rows per page silently, terminate
-                # normally at offset >= total, and hand collect_snapshot a
-                # confident undercount to write into an append-only table.  The
-                # mirror case (under-reporting) re-requests rows already held
-                # and inflates the counts instead.  Neither is verifiable after
-                # the fact, so refuse the read.
-                raise ValueError(
-                    f'get_tasks pagination for {project_root_str} inconsistent '
-                    f'at offset {walk_offset}: server claims returned={returned} '
-                    f'but sent {len(page)} row(s)'
-                )
-            if first_total is None:
-                first_total = total
-                # BOUND THE WALK.  `total` is the loop's only terminator, and it
-                # is server-reported: a stale count, a bad merge of tag scopes,
-                # or a tree being written concurrently makes ceil(total/P)
-                # sequential round trips on the SAME httpx client the 2 s render
-                # polls share — the PoolTimeout hazard the burndown size probe
-                # exists to bound.  So derive one budget from the FIRST response
-                # and refuse to exceed it.  The +2 covers the final partial page
-                # plus one page of slack; a server that keeps handing back short
-                # pages is misbehaving in exactly the way that amplifies the
-                # walk, and is caught here rather than paid for.
-                page_budget = math.ceil(total / max(page_size, 1)) + 2
-            elif total > first_total:
-                # A `total` that GROWS mid-walk means the tree changed underneath
-                # the read: the pages in hand are from different states of the
-                # world, so the assembled list is not a coherent snapshot of
-                # either.  It also un-bounds the budget derived above.
-                raise ValueError(
-                    f'get_tasks pagination for {project_root_str} raced a write '
-                    f'at offset {walk_offset}: total grew from {first_total} to '
-                    f'{total} mid-walk'
-                )
-            if returned <= 0:
-                # Guard the COMPLETE cases first.  An empty page with no rows
-                # still owed (total <= 0, or offset already past total) is a
-                # complete read of an empty or exhausted tree — it must keep
-                # returning [], or every empty project becomes a permanent
-                # burndown hole and loses its legitimate all-zero row.
-                if total <= 0 or walk_offset >= total:
-                    break
-                # The server claims rows remain but hands back an empty page, so
-                # it cannot be paged past.  Detail lives in the exception rather
-                # than a second WARNING for the same event.
-                raise ValueError(
-                    f'get_tasks pagination for {project_root_str} truncated at '
-                    f'{len(shaped)} row(s) — empty page at offset {walk_offset}, '
-                    f'total={total}'
-                )
-            walk_offset += len(page)
-            if walk_offset >= total:
-                break
-            if page_budget is not None and pages >= page_budget:
-                raise ValueError(
-                    f'get_tasks pagination for {project_root_str} exceeded its '
-                    f'{page_budget}-page budget at offset {walk_offset} '
-                    f'(total={total}, page_size={page_size}); refusing to keep '
-                    f'walking'
-                )
-        return shaped
+            return await _walk_pages(_page, read, mode.chunk_size)
+
+        # Single-request path.  `_OnePage` sends its window; a `_CompleteRead`
+        # with no chunk_size has no page to walk and degrades here rather than
+        # spinning.
+        window = mode if isinstance(mode, _OnePage) else None
+        return (await page_fn(window)).rows
 
     async def _refresh() -> list[dict] | dict:
         return await first_success(
