@@ -12274,7 +12274,32 @@ class GitOps:
             merge_wt, checkout_ref, label='_create_merge_worktree',
         )
         if rc != 0:
-            raise RuntimeError(f'Failed to create merge worktree: {err}')
+            # The `Failed to create merge worktree: ` PREFIX is load-bearing
+            # beyond this module — three test modules construct it verbatim
+            # to simulate this failure (test_merge_queue_resolve_release.py,
+            # test_merge_queue_concurrent_verify.py) and
+            # docs/legibility/confusion-codebook.yaml keys two entries on it,
+            # so operator greps and the codebook both depend on it. Do not
+            # drop it in a later refactor; only the suffix is free.
+            #
+            # `rc` is carried because it, not stdout, is the decisive missing
+            # datum: FOUR of the five archived occurrences under
+            # data/verify-logs carried no cause line at all, and git writes
+            # both its `Preparing worktree` progress line and its fatals to
+            # stderr — so a stderr that stops after the progress line most
+            # likely means the child never printed a fatal, which a NEGATIVE
+            # rc (signal kill) would reveal and the old message could not.
+            # `!r` on both streams so an EMPTY stream renders as a visible
+            # '' rather than collapsing into whitespace, distinguishing "git
+            # said nothing" from "we never captured it". The attempt count
+            # tells the reader whether the failure was retried at all — how
+            # an operator tells an ENOSPC fast-fail from an exhausted
+            # transient.
+            raise RuntimeError(
+                f'Failed to create merge worktree: git worktree add --detach '
+                f'{merge_wt} {checkout_ref} failed after {attempts} attempt(s) '
+                f'(rc={rc}); stderr={err!r}; stdout={out!r}'
+            )
 
         logger.info(f'Created merge worktree at {merge_wt} (HEAD={pre_merge_sha[:8]})')
         return merge_wt, pre_merge_sha.strip()
