@@ -5998,3 +5998,66 @@ def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
         mass_rejection=None,
     )
     assert report == _GOLDEN_FLAGLESS_REPORT
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-11: RED — W-C, the WIRING. Step-10 taught render_report to
+# say it; run_census never builds a MassRejection, so the committed markdown
+# of an uncapped all-rejected run is still indistinguishable from a clean
+# census.
+# ---------------------------------------------------------------------------
+
+def test_run_census_uncapped_mass_rejection_is_stated_in_the_committed_report(tmp_path):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set()),   # all 3 reject
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    # A suspicious run is still a COMPLETED run: mining is already paid for.
+    assert outcome.status == "done"
+    assert kwargs["census_state_path"].exists(), "state is still persisted"
+
+    # The COMMITTED MARKDOWN, not caplog — that is the whole point.
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "## Verification" in report_text
+    section = report_text.split("## Verification", 1)[1].split("\n## ", 1)[0]
+    assert "3" in section, "the offered count"
+    lowered = section.lower()
+    assert "reject" in lowered and "systemic" in lowered
+    assert any(
+        phrase in lowered
+        for phrase in ("model unreachable", "tool access denied", "unparseable verdict")
+    ), f"the report names what to suspect; got {section!r}"
+
+
+def test_run_census_report_stays_silent_when_a_cluster_verifies(tmp_path):
+    """The negative control: the notice must fire only on the real signature,
+    not on any uncapped run. One cluster surviving is an ordinary census."""
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "## Verification" not in report_text, (
+        "an ordinary uncapped run must still render no Verification section"
+    )
