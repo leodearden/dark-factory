@@ -530,3 +530,120 @@ class TestSeverityWeightsVocabularyWarning:
             load_priorities(custom_path)
 
         assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+class TestProjectWeightKeyFolding:
+    """load_priorities folds project_weights KEYS onto the canonical project
+    token (task 3812), so a hand-edited priorities.yaml key actually matches
+    the canonical item.project score() now sees.
+
+    Mandatory, not an extra: panes.weight_editor.known_projects unions the
+    scanned record/decision projects with this table's own KEYS. Folding only
+    the record side would relocate the two-names-for-one-project bug INTO the
+    weights file -- a stale 'dark-factory' key would be offered as a second
+    weightable project alongside 'dark_factory', and a weight set on it would
+    silently never apply to anything. That is precisely the new silent
+    failure task 3807's design decision named as the reason it excluded this
+    work.
+
+    Load-time (rather than normalizing inside score()) keeps score() a pure
+    dict lookup, and makes a load->save cycle HEAL a drifted file in place.
+    """
+
+    def _load(self, tmp_path, text):
+        from cockpit.priority import load_priorities
+
+        path = tmp_path / 'priorities.yaml'
+        path.write_text(text)
+        return load_priorities(path)
+
+    def test_separator_and_case_variants_fold_onto_the_canonical_key(self, tmp_path):
+        result = self._load(tmp_path, 'project_weights:\n  dark-factory: 2.0\n')
+
+        assert result.project_weights == {'dark_factory': 2.0}
+
+    def test_an_aliased_key_folds_onto_the_canonical_key(self, tmp_path):
+        result = self._load(tmp_path, 'project_weights:\n  df: 1.0\n')
+
+        assert result.project_weights == {'dark_factory': 1.0}
+
+    def test_synthetic_and_basename_keys_are_folded_but_never_merged(self, tmp_path):
+        """The fold is mechanical: it merges SPELLINGS of one project, and
+        never absorbs a distinct token into a real project. Mirrors the
+        registry_reader collapse guard."""
+        result = self._load(
+            tmp_path,
+            'project_weights:\n'
+            '  fm-neutral-classifier-cwd-_3yp2s4h: 1.0\n'
+            '  orchestrator: 2.0\n'
+            '  _lane-3: 3.0\n',
+        )
+
+        assert result.project_weights == {
+            'fm_neutral_classifier_cwd_3yp2s4h': 1.0,
+            'orchestrator': 2.0,
+            'lane_3': 3.0,
+        }
+
+    def test_an_explicitly_empty_table_stays_empty(self, tmp_path):
+        """_weight_table's contract is preserved: an explicit ``{}`` means
+        "no per-project overrides", and folding it must not resurrect the
+        bundled table."""
+        result = self._load(tmp_path, 'project_weights: {}\n')
+
+        assert result.project_weights == {}
+
+    def test_an_already_canonical_key_wins_a_collision_in_either_yaml_order(self, tmp_path):
+        """The collision rule is deterministic and ORDER-INDEPENDENT: when a
+        canonical key and a variant both fold to the same token, the
+        canonical one's value wins regardless of which came first in the
+        file."""
+        variant_first = self._load(
+            tmp_path, 'project_weights:\n  dark-factory: 1.0\n  dark_factory: 2.0\n'
+        )
+        canonical_first = self._load(
+            tmp_path, 'project_weights:\n  dark_factory: 2.0\n  dark-factory: 1.0\n'
+        )
+
+        assert variant_first.project_weights == {'dark_factory': 2.0}
+        assert canonical_first.project_weights == {'dark_factory': 2.0}
+
+    def test_among_variants_alone_the_lexicographically_last_raw_key_wins(self, tmp_path):
+        """With no canonical key present, the tie is still broken
+        deterministically rather than by yaml order: the lexicographically
+        LAST raw key supplies the value ('dark-factory' > 'DARK-FACTORY')."""
+        variant_first = self._load(
+            tmp_path, 'project_weights:\n  dark-factory: 1.0\n  DARK-FACTORY: 3.0\n'
+        )
+        other_order = self._load(
+            tmp_path, 'project_weights:\n  DARK-FACTORY: 3.0\n  dark-factory: 1.0\n'
+        )
+
+        assert variant_first.project_weights == {'dark_factory': 1.0}
+        assert other_order.project_weights == {'dark_factory': 1.0}
+
+    def test_severity_and_category_weights_are_not_folded(self, tmp_path):
+        """Scope: only project_weights holds PROJECT TOKENS. severity and
+        category are unrelated key vocabularies -- folding them would
+        silently rewrite an operator's own category names."""
+        result = self._load(
+            tmp_path,
+            'severity_weights:\n  my-Severity: 2.0\n'
+            'category_weights:\n  my-bug: 1.0\n'
+            'project_weights:\n  dark-factory: 1.0\n',
+        )
+
+        assert result.category_weights == {'my-bug': 1.0}
+        assert result.severity_weights == {'my-Severity': 2.0}
+        assert result.project_weights == {'dark_factory': 1.0}
+
+    def test_a_priorities_built_in_memory_is_untouched(self, tmp_path):
+        """The fold is a LOAD-time rule over parsed YAML, not a Priorities
+        invariant: a table handed straight to dataclasses.replace keeps
+        whatever keys the caller chose (which is why test_priority.py's own
+        'mapped-project'/'proj-a' scoring tests still hold)."""
+        from cockpit.priority import Priorities
+
+        built = replace(Priorities.default(), project_weights={'dark-factory': 4.0})
+
+        assert built.project_weights == {'dark-factory': 4.0}
