@@ -3102,6 +3102,18 @@ class TestCollectTasksBudget:
         the entire 0.3s handler budget. Timers overshoot and never undershoot,
         so ``delta`` and ``epsilon`` are guaranteed to find a non-positive
         remaining budget — they can only be reached by the deadline branch.
+
+        ``_TASKS_ROOT_CONCURRENCY`` is pinned to 1 for exactly that reason,
+        and the pin is what makes the derivation above true rather than a
+        coincidence. This test is about the DEADLINE branch, not about the
+        width: at the shipped width the fast roots slot into the first wave
+        and the never-reached branch is simply not the one under test. That
+        the branch still fires at the shipped width is asserted separately by
+        ``TestCollectTasksWithCountsConcurrency::
+        test_degraded_is_preserved_under_concurrency`` (task 4884) — so
+        isolating the two here costs no coverage and buys a deterministic
+        arithmetic that does not have to be re-derived every time the width
+        moves.
         """
         invoked = _register_shaper(
             monkeypatch,
@@ -3109,6 +3121,9 @@ class TestCollectTasksBudget:
             done_counts={'alpha': 7},
         )
         self._tighten(monkeypatch, total=0.3, per_project=0.2)
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._TASKS_ROOT_CONCURRENCY', 1
+        )
         config = _budget_config(
             tmp_path, ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
         )

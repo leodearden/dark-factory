@@ -65,7 +65,7 @@ import logging
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
@@ -232,6 +232,35 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # are mutually constrained, and ``test_tasks_budget.py`` enforces that.
 # None of them may be raised toward ``memory.mcp_tool_call``'s 10 s default.
 _TASKS_TOTAL_BUDGET = 20.0
+
+# How many project roots ``collect_tasks_with_counts`` may have in flight.
+#
+# WHY > 1: the walk used to be SEQUENTIAL, so N roots cost the SUM of their
+# per-root costs against one ``_TASKS_TOTAL_BUDGET``. At the incident's 9
+# roots that sum exceeded the total, and because the walk order was fixed the
+# SAME trailing roots were reported degraded on every render (the journal's
+# repeated ``project pump-web-ui: skipped — the 20.0s Tasks budget was
+# already spent``). At width W the worst case becomes roughly
+# ``ceil(N / W) * _TASKS_PER_PROJECT_BUDGET``.
+#
+# WHY BOUNDED rather than a plain unbounded ``gather``: ``burndown.py``
+# records the measurement (see ``_SNAPSHOT_PAGE_SIZE`` and
+# ``_fetch_snapshot_tasks``). A full fan-out over every root goes against a
+# SINGLE fused-memory server where the requests serialise SERVER-side anyway,
+# on the SAME shared httpx client the 3 s render polls use — "a live
+# httpx.PoolTimeout risk for request-path handlers". Unbounded concurrency
+# would therefore buy this endpoint nothing (the server is the bottleneck)
+# while spending every other endpoint's connections.
+#
+# NOTE that ``app._build_http_limits`` scales ``max_connections`` with the
+# fleet size, which makes the POOL look like the constraint it is not. Raising
+# this width because the pool grew would be reading the wrong number: the
+# ceiling here is the single MCP server's own serialisation, not connections.
+#
+# 4 covers the measured shape of the fan-out — two big roots (dark-factory
+# 5128 tasks, reify 7279) and seven that finish in under 0.1 s — in
+# ``ceil(9/4) = 3`` waves. ``test_tasks_budget.py`` (f) holds it in (1, 8].
+_TASKS_ROOT_CONCURRENCY = 4
 
 # Defensive-visibility threshold: a PRD with an unusually large number of live
 # done/cancelled members beyond the per-bucket cap logs a warning, so a
@@ -919,14 +948,28 @@ async def collect_tasks_with_counts(
     - *done_counts* maps project label → total done task count (pre-cap)
     - *degraded_projects* lists project labels the budget did not deliver
 
-    **Bounded as a whole, not merely per call.**  The walk over project roots
-    is sequential, so without a deadline this function's worst case is the SUM
-    of every project's worst case — unbounded in the number of configured
-    roots, and behind a browser ``fetch`` that aborts at 30 s.  A
-    ``loop.time()`` deadline (``_TASKS_TOTAL_BUDGET``) is taken up front and
-    each project is run under ``asyncio.wait_for`` at
-    ``min(remaining, _TASKS_PER_PROJECT_BUDGET)``, copying ``app.healthz``'s
-    loop shape rather than inventing one.
+    **Bounded as a whole, not merely per call.**  A ``loop.time()`` deadline
+    (``_TASKS_TOTAL_BUDGET``) is taken up front and each project is run under
+    ``asyncio.wait_for`` at ``min(remaining, _TASKS_PER_PROJECT_BUDGET)``,
+    copying ``app.healthz``'s loop shape rather than inventing one.
+
+    **Concurrent at a bounded width.**  The walk used to be SEQUENTIAL, which
+    made this function's worst case the SUM of every project's worst case —
+    so at the 9 roots of the 2026-08-27 incident the total budget could not
+    fit them all and the trailing roots degraded on every render.  Roots are
+    now admitted through an ``asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)``, so
+    the worst case is roughly ``ceil(roots / _TASKS_ROOT_CONCURRENCY) *
+    _TASKS_PER_PROJECT_BUDGET``.  The deadline is still what BOUNDS it —
+    concurrency changes the cost, not the guarantee.  The width is bounded
+    rather than unbounded because the fan-out targets a single fused-memory
+    server (where the requests serialise server-side regardless) over the
+    shared httpx client the render polls use; see ``_TASKS_ROOT_CONCURRENCY``.
+
+    Concurrency changes ADMISSION order only.  ``remaining`` is computed after
+    a root acquires its slot — a root that waited for one pays for the wait
+    rather than being handed a stale budget — and every result is collected
+    into a per-root slot and re-assembled in ROOT order, so completion order
+    can never reach the payload.
 
     Expiry yields a PARTIAL payload with explicit per-project markers, never a
     truncated-but-confident one: every project that timed out or never got its
@@ -1003,73 +1046,118 @@ async def collect_tasks_with_counts(
     # them as a healthy project with a confident "0 done". That is the
     # invisible-failure class this task exists to close.
     count_unknown_projects: list[str] = []
-    for root in _all_project_roots(config):
+
+    roots = _all_project_roots(config)
+    # Admission control, not a work queue: the coroutines are all created up
+    # front and the semaphore decides how many are inside _shape_one_project
+    # at once. See _TASKS_ROOT_CONCURRENCY for why the width is bounded.
+    slots = asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)
+
+    async def _one(root: Path) -> dict[str, Any]:
+        """Shape ONE root, returning a result record — never mutating shared state.
+
+        Every branch returns a record instead of appending to the outer lists.
+        Appending from inside a concurrent coroutine would order the payload by
+        COMPLETION, and the Tasks tab renders ``all_active`` directly, so the
+        table would reshuffle on every 3 s poll. The caller re-assembles these
+        records in ROOT order below.
+        """
         label = _project_label(root)
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            # Never got its turn. A silently missing project reads as "no
-            # active work" on the Tasks tab, which is the same class of
-            # invisible failure the fan-out logging policy was raised to
-            # WARNING to close.
+        async with slots:
+            # AFTER admission, deliberately: a root that queued for a slot has
+            # already spent part of the whole-handler budget, and handing it a
+            # `remaining` measured before the wait would let the walk overrun
+            # the deadline by up to one wave.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # Never got its turn. A silently missing project reads as "no
+                # active work" on the Tasks tab, which is the same class of
+                # invisible failure the fan-out logging policy was raised to
+                # WARNING to close.
+                logger.warning(
+                    'project %s: skipped — the %.1fs Tasks budget was already '
+                    'spent before this project was reached; its rows and done '
+                    'count are UNKNOWN for this render (not zero, and not offline)',
+                    label, _TASKS_TOTAL_BUDGET,
+                )
+                return {'label': label, 'degraded': True}
+            try:
+                active, offline, done_count = await asyncio.wait_for(
+                    _shape_one_project(
+                        client, config, root,
+                        max_done_per_project=max_done_per_project,
+                        max_cancelled_per_project=max_cancelled_per_project,
+                        now=effective_now,
+                        runtime=runtime_by_label.get(label),
+                    ),
+                    timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
+                )
+            except TimeoutError:
+                logger.warning(
+                    'project %s: exceeded its %.1fs share of the %.1fs Tasks '
+                    'budget (%.1fs remained) — its rows and done count are '
+                    'UNKNOWN for this render (not zero, and not offline)',
+                    label, _TASKS_PER_PROJECT_BUDGET, _TASKS_TOTAL_BUDGET, remaining,
+                )
+                return {'label': label, 'degraded': True}
+            except Exception:
+                # DEFENSE IN DEPTH, and deliberately broad. The fan-out
+                # normally converts a failed read into the offline marker, so
+                # nothing here is a demonstrated crash — but without this
+                # clause ANY unexpected exception (a decode error, a shaping
+                # bug, an httpx transport error that escaped the fan-out)
+                # unwinds the whole GATHER and 500s the handler, throwing away
+                # every healthy project. That is the same "one bad root blanks
+                # the whole tab" failure TASKS_OFFLINE exists to close,
+                # relocated from the banner to the handler, and one root must
+                # not be able to cause it.
+                #
+                # It must stay INSIDE _one for that to hold: hoisted to the
+                # gather (as return_exceptions=True) it would still catch the
+                # exception, but only after asyncio.gather had already been
+                # given the chance to propagate it, and the per-root offline/
+                # degraded routing below would have nothing to key on.
+                #
+                # OFFLINE, not degraded: the read demonstrably FAILED, which is
+                # what offline means. degraded is reserved for "the budget
+                # never let us find out" — the distinction the two branches
+                # above draw, and merging them here would undo it.
+                #
+                # exc_info is load-bearing: an exception absorbed into a
+                # routine offline marker with no traceback is a bug that
+                # renders as an outage forever. The log is what separates
+                # "fused-memory is down" from "our own shaping code raised".
+                logger.warning(
+                    'project %s: unexpected error while shaping its rows — the '
+                    'project is marked offline for this render so the remaining '
+                    'roots still render; this is a BUG, not an outage',
+                    label, exc_info=True,
+                )
+                return {'label': label, 'offline': True}
+        return {
+            'label': label, 'active': active,
+            'offline': offline, 'done_count': done_count,
+        }
+
+    # return_exceptions=False is correct here BECAUSE the broad `except
+    # Exception` above lives INSIDE _one: nothing can escape to the gather, so
+    # there is no exception for it to swallow, and a real escape (a bug in this
+    # assembly code, a CancelledError) must still propagate rather than be
+    # silently converted into a result object.
+    results = await asyncio.gather(*(_one(root) for root in roots))
+
+    # ROOT order, not completion order. This is the only place the shared
+    # accumulators are written.
+    for result in results:
+        label = result['label']
+        if result.get('degraded'):
             degraded_projects.append(label)
-            logger.warning(
-                'project %s: skipped — the %.1fs Tasks budget was already '
-                'spent before this project was reached; its rows and done '
-                'count are UNKNOWN for this render (not zero, and not offline)',
-                label, _TASKS_TOTAL_BUDGET,
-            )
             continue
-        try:
-            active, offline, done_count = await asyncio.wait_for(
-                _shape_one_project(
-                    client, config, root,
-                    max_done_per_project=max_done_per_project,
-                    max_cancelled_per_project=max_cancelled_per_project,
-                    now=effective_now,
-                    runtime=runtime_by_label.get(label),
-                ),
-                timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
-            )
-        except TimeoutError:
-            degraded_projects.append(label)
-            logger.warning(
-                'project %s: exceeded its %.1fs share of the %.1fs Tasks '
-                'budget (%.1fs remained) — its rows and done count are '
-                'UNKNOWN for this render (not zero, and not offline)',
-                label, _TASKS_PER_PROJECT_BUDGET, _TASKS_TOTAL_BUDGET, remaining,
-            )
-            continue
-        except Exception:
-            # DEFENSE IN DEPTH, and deliberately broad. The fan-out normally
-            # converts a failed read into the offline marker, so nothing here
-            # is a demonstrated crash — but without this clause ANY unexpected
-            # exception (a decode error, a shaping bug, an httpx transport
-            # error that escaped the fan-out) unwinds the whole loop and 500s
-            # the handler, throwing away every healthy project already
-            # collected. That is the same "one bad root blanks the whole tab"
-            # failure TASKS_OFFLINE exists to close, relocated from the banner
-            # to the handler, and one root must not be able to cause it.
-            #
-            # OFFLINE, not degraded: the read demonstrably FAILED, which is
-            # what offline means. degraded is reserved for "the budget never
-            # let us find out" — the distinction the two branches above draw,
-            # and merging them here would undo it.
-            #
-            # exc_info is load-bearing: an exception absorbed into a routine
-            # offline marker with no traceback is a bug that renders as an
-            # outage forever. The log is what separates "fused-memory is down"
-            # from "our own shaping code raised".
+        if result.get('offline'):
             offline_projects.append(label)
-            logger.warning(
-                'project %s: unexpected error while shaping its rows — the '
-                'project is marked offline for this render so the remaining '
-                'roots still render; this is a BUG, not an outage',
-                label, exc_info=True,
-            )
             continue
-        if offline:
-            offline_projects.append(label)
-        elif done_count is not None:
+        done_count = result['done_count']
+        if done_count is not None:
             done_counts[label] = done_count
         else:
             # done_count is None => the compact status map read failed for an
@@ -1081,7 +1169,7 @@ async def collect_tasks_with_counts(
             # confident "0 done". Naming the root here is what lets the
             # banner and the header say UNKNOWN instead.
             count_unknown_projects.append(label)
-        all_active.extend(active)
+        all_active.extend(result['active'])
 
     if resolve_external:
         # Gather the deduped union of external dep ids for ACTIVE (non-done) rows only.
