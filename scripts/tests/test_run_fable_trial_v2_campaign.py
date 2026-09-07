@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import re
 from pathlib import Path
 
 import pytest
@@ -2460,42 +2459,28 @@ def test_the_banding_block_explains_that_a_decline_is_not_headroom():
     assert 'report_false_premise' in text
 
 
-def test_both_rendered_decline_blocks_name_the_whole_vocabulary_once():
-    """Neither prose block can go stale when a sixth architect exit is added.
+def test_every_decline_kind_gets_a_named_exit():
+    """The rendered exit list is DERIVED, so a sixth architect exit names itself.
 
-    metrics.py single-sources the kind <-> artifact correspondence off
-    ``_DECLINE_READERS`` "so a sixth architect exit cannot be half-added", and
-    ``_decline_kinds`` extends that discipline to the bander — but the RENDERER
-    carried two independently hand-typed copies of the five exit names, which
-    sat outside it entirely: a sixth exit would have left both legends silently
-    wrong with nothing failing.
-
-    The coverage half of this is deliberately NOT circular. It does not re-derive
-    the kind -> exit spelling; it reads the ``report_*`` tokens back out of the
-    rendered text and asks that each kind be named by one of them, which stays a
-    true requirement whatever a future exit is called. The single-source half
-    then pins that BOTH blocks render the one derived list, so they cannot drift
-    from each other either.
+    A unit test of the pure helper, deliberately NOT a pin on the renderer's
+    prose: task 4064's norm records that once a message derives its enumeration
+    from a single source of truth, the derivation IS the anti-drift guarantee,
+    and an "every member appears in the text" loop advertises coverage it does
+    not have (it passes on incidental occurrences elsewhere in the same output).
+    What is worth pinning is this function's contract — one ``report_*`` exit per
+    kind, in vocabulary order, each NAMING its kind — because two of the five
+    spellings are irregular and looked up from a hand-written map.
     """
     from orchestrator.evals.metrics import DECLINE_KINDS
 
-    results = _unanimously_declining_results()
-    report = {'candidates': mod.summarize_candidates(results),
-              'bands': mod.partition_bands(results, 0.80)}
+    names = mod.decline_exit_names().split(' / ')
 
-    text = mod.format_campaign_report(report)
-
-    tokens = set(re.findall(r'report_[a-z_]+', text))
-    assert [k for k in DECLINE_KINDS if any(k in t for t in tokens)] == list(
-        DECLINE_KINDS), f'a decline kind goes unnamed in the report: {tokens}'
-    assert len(tokens) == len(DECLINE_KINDS), (
-        f'an exit is rendered that is not in the vocabulary: {tokens}')
-
-    block = '\n'.join(mod._decline_exit_prose('plan-tools decline exit'))
-    assert text.count(block) == 2, (
-        'the banding NOTE and the declined legend must render the SAME derived '
-        'list — two copies is what went stale'
-    )
+    assert len(names) == len(DECLINE_KINDS)
+    assert all(n.startswith('report_') for n in names)
+    # Order-sensitive and kind-by-kind: an unregistered new kind still renders
+    # (as ``report_<kind>``) rather than dropping out of the list silently.
+    assert [k for k, name in zip(DECLINE_KINDS, names, strict=True) if k in name] == list(
+        DECLINE_KINDS), f'a kind is unnamed by its own exit: {names}'
 
 
 def test_the_decline_note_is_gated_on_a_nonzero_count():
