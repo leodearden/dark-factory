@@ -3229,9 +3229,17 @@ class GitOps:
         ``worktree_base/<kind.value><hex>`` (*kind*'s value IS both the
         directory-name prefix and its :data:`PROTECTED_PREFIXES` registry
         key — see :class:`WorktreeKind`), retry ``git worktree add
-        --detach`` up to 3 times with ``0.5 * (attempt + 1)``\\ s linear
-        backoff on transient lock contention (concurrent sibling probes
-        serialise on git's repo-level metadata lock), then yield the path.
+        --detach`` up to :data:`_WORKTREE_ADD_MAX_ATTEMPTS` times with
+        ``0.5 * attempt``\\ s linear backoff on a transient failure such as
+        lock contention (concurrent sibling probes serialise on git's
+        repo-level metadata lock), then yield the path.  That retry is NOT
+        spelled here: it is delegated to
+        git_ops.py::GitOps._worktree_add_with_retry, the single shared
+        driver this method and git_ops.py::GitOps._create_merge_worktree
+        both mint through (task 5140), so exactly one retry loop and one
+        retryability predicate exist in this module.  A NON-retryable add
+        failure (ENOSPC) is not retried at all — see case (c) under
+        ``Raises`` below.
 
         On exit — normal return OR an exception raised in the ``async
         with`` body — cleanup ALWAYS runs: scoped ``git worktree remove
@@ -3283,9 +3291,13 @@ class GitOps:
                 consumer (``fcntl.flock(LOCK_EX|LOCK_NB)`` denied) — raised
                 BEFORE ``git worktree add`` is even attempted, so no
                 worktree is minted and no add argv is issued; or (b)
-                ``git worktree add`` itself failed on all 3 attempts.  In
-                both cases the caller's ``async with`` body never runs.
-                For (b), because the add never succeeded, no cleanup ``git
+                ``git worktree add`` itself failed on all
+                :data:`_WORKTREE_ADD_MAX_ATTEMPTS` attempts; or (c) the add
+                failed with a NON-retryable cause (ENOSPC — a full disk
+                does not heal in 1.5s of backoff), in which case only ONE
+                attempt was made and no backoff was slept.  In all three
+                cases the caller's ``async with`` body never runs.
+                For (b) and (c), because the add never succeeded, no cleanup ``git
                 worktree remove`` is issued (there is nothing registered to
                 remove) — but a belt-and-suspenders ``shutil.rmtree`` of
                 *tmp_path* still runs before the exception propagates, in
@@ -3317,9 +3329,7 @@ class GitOps:
         # running probe/sweep (task 2507).
         lock_path = lane_lock_path(tmp_path)
 
-        _MAX_ADD_RETRIES = 3
         worktree_added = False
-        rc, _, err = 1, '', 'not attempted'
 
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
         acquired = False
@@ -3348,20 +3358,22 @@ class GitOps:
                 ) from e
 
             try:
-                for attempt in range(_MAX_ADD_RETRIES):
-                    rc, _, err = await _run(
-                        ['git', 'worktree', 'add', '--detach', str(tmp_path), sha],
-                        cwd=self.project_root,
-                    )
-                    if rc == 0:
-                        worktree_added = True
-                        break
-                    if attempt < _MAX_ADD_RETRIES - 1:
-                        await asyncio.sleep(0.5 * (attempt + 1))
+                # The SHARED driver — the single retry loop in this module,
+                # also used by git_ops.py::GitOps._create_merge_worktree
+                # (task 5140). It supplies the bounded attempts and the
+                # `0.5 * attempt` backoff this method used to spell inline,
+                # plus the ENOSPC fast-fail the inline loop lacked (it
+                # branched solely on `rc == 0`, so it blanket-retried a full
+                # disk three times).
+                rc, out, err, attempts = await self._worktree_add_with_retry(
+                    tmp_path, sha, label=f'ephemeral_worktree({kind.name})',
+                )
+                worktree_added = rc == 0
                 if not worktree_added:
                     raise EphemeralWorktreeError(
                         f'ephemeral_worktree({kind.name}): git worktree add failed '
-                        f'after {_MAX_ADD_RETRIES} retries (rc={rc}): {err}'
+                        f'after {attempts} attempt(s) (rc={rc}); '
+                        f'stderr={err!r}; stdout={out!r}'
                     )
             except EphemeralWorktreeError:
                 # Belt-and-suspenders: a failed `git worktree add` may still have
