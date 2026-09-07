@@ -612,6 +612,19 @@ AUTHORED_KEYS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_pending_refusals():
+    """Clear the pending buffer around every test in this module.
+
+    It is PROCESS-global state, mirroring ``plan_tools._REPORTED_REFUSALS`` and
+    the ``_clear_reported_refusals`` fixture that guards it — so one test's
+    buffered refusal cannot leak into the next and inflate its count.
+    """
+    plan_markup_stamp.clear_pending()
+    yield
+    plan_markup_stamp.clear_pending()
+
+
 @pytest.fixture()
 def artifacts(tmp_path) -> TaskArtifacts:
     """TaskArtifacts over a temp worktree — mirrors ``test_plan_tools_server``."""
@@ -794,3 +807,155 @@ class TestThePlanStampNeverRaises:
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
 
         assert await stamp('not a record at all') is None
+
+
+# ---------------------------------------------------------------------------
+# The pending buffer — the one gap the eager stamp cannot close alone.
+# ---------------------------------------------------------------------------
+
+
+class TestARefusalBeforeAnyPlanExistsIsBuffered:
+    """A refused ``create_plan`` has no document to stamp.
+
+    That is the LOUDEST leak shape on this server — an architect bounced
+    repeatedly before its plan even exists — so it is the one case the counter
+    least affords to lose. The existing ``test_no_plan_is_written`` pins that
+    no plan file appears, and the eager stamp must not violate it, so the event
+    goes to process-global state and is drained by ``_create_plan``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_plan_file_is_created_by_the_stamp(self, artifacts: TaskArtifacts):
+        """The stamp is a BOOKKEEPING channel, never a plan author.
+
+        Writing a plan here would manufacture a document out of a refusal —
+        one carrying no task_id, no title and no analysis — and every reader
+        downstream would inherit it as the architect's own work.
+        """
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        await stamp(make_fact(tool='create_plan', param='title'))
+
+        assert not (artifacts.root / 'plan.json').exists(), (
+            'a refusal must not conjure a plan that no architect authored'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_event_is_held_in_the_pending_buffer(
+        self, artifacts: TaskArtifacts
+    ):
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
+
+        await stamp(make_fact(tool='create_plan', param='title'))
+
+        pending = plan_markup_stamp.pending_block()
+        assert pending is not None
+        assert pending['count'] == 1
+        assert pending['by_tool'] == {'create_plan': 1}
+
+    @pytest.mark.asyncio
+    async def test_repeated_refusals_accumulate_in_the_buffer(
+        self, artifacts: TaskArtifacts
+    ):
+        clock = _Clock()
+        stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=clock)
+
+        for _ in range(3):
+            await stamp(make_fact(tool='create_plan', param='analysis'))
+            clock.advance(1.0)
+
+        assert plan_markup_stamp.pending_block()['count'] == 3
+
+    def test_an_empty_buffer_reports_nothing(self):
+        assert plan_markup_stamp.pending_block() is None
+
+
+class TestDrainPendingFoldsTheBufferIntoAPlan:
+    """``_create_plan`` adopts the losses that preceded the document."""
+
+    def test_draining_folds_the_buffer_and_returns_the_plan(self):
+        plan_markup_stamp.note_pending(
+            plan_markup_stamp.build_event(
+                make_fact(tool='create_plan', param='title'), now=_Clock()
+            )
+        )
+        plan = {'task_id': 'test-1', 'steps': []}
+
+        drained = plan_markup_stamp.drain_pending(plan)
+
+        block = drained[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 1
+        assert block['by_tool'] == {'create_plan': 1}
+        assert drained['task_id'] == 'test-1', 'the authored fields are untouched'
+
+    def test_draining_clears_the_buffer_so_a_second_drain_cannot_double_count(self):
+        plan_markup_stamp.note_pending(
+            plan_markup_stamp.build_event(make_fact(tool='create_plan'), now=_Clock())
+        )
+
+        first = plan_markup_stamp.drain_pending({'steps': []})
+        second = plan_markup_stamp.drain_pending({'steps': []})
+
+        assert first[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]['count'] == 1
+        assert plan_markup_stamp.pending_block() is None
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY not in second, (
+            'a re-plan must not re-adopt refusals a prior plan already carries'
+        )
+
+    def test_draining_merges_into_a_block_the_plan_already_carries(self):
+        """A carried-forward block and a buffered one are two sides of a merge.
+
+        ``_create_plan`` overwrites ``plan.json`` wholesale, so it carries the
+        existing block forward and drains the buffer into it — both must land.
+        """
+        carried = plan_markup_stamp.block_of(
+            plan_markup_stamp.build_event(
+                make_fact(tool='add_design_decision'), now=_Clock()
+            )
+        )
+        plan_markup_stamp.note_pending(
+            plan_markup_stamp.build_event(make_fact(tool='create_plan'), now=_Clock(2_000.0))
+        )
+
+        drained = plan_markup_stamp.drain_pending(
+            {'steps': [], plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY: carried}
+        )
+
+        block = drained[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 2
+        assert block['by_tool'] == {'add_design_decision': 1, 'create_plan': 1}
+
+    def test_draining_an_empty_buffer_leaves_the_plan_untouched(self):
+        """THE OVERWHELMINGLY COMMON PATH: no refusal, so no key at all.
+
+        Not present-and-zero. The block's PRESENCE is the whole signal, so a
+        clean plan must stay byte-identical to what it is today — otherwise
+        every plan in the fleet grows a key that means nothing.
+        """
+        plan = {'task_id': 'test-1', 'steps': [], 'design_decisions': []}
+
+        drained = plan_markup_stamp.drain_pending(plan)
+
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY not in drained
+        assert drained == {'task_id': 'test-1', 'steps': [], 'design_decisions': []}
+
+    def test_the_buffer_inherits_the_same_cap_as_the_on_disk_block(self):
+        """It holds a FOLDED block, not a growing list.
+
+        A long-leaking session that never creates a plan must not grow
+        unbounded process state, so the buffer reuses the on-disk block's cap
+        and merge algebra rather than inventing a second accounting.
+        """
+        cap = plan_markup_stamp.MARKUP_STAMP_MAX_EVENTS
+        clock = _Clock()
+        for _ in range(cap + 5):
+            plan_markup_stamp.note_pending(
+                plan_markup_stamp.build_event(make_fact(tool='create_plan'), now=clock)
+            )
+            clock.advance(1.0)
+
+        pending = plan_markup_stamp.pending_block()
+
+        assert pending['count'] == cap + 5
+        assert len(pending['events']) == cap
+        assert pending['events_truncated'] is True
