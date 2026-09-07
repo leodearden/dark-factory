@@ -111,6 +111,44 @@ class TestBuildHttpLimits:
             f'bound silently becomes wrong as projects are onboarded'
         )
 
+    def test_floor_binds_below_the_crossover_and_the_derived_term_takes_over_at_it(
+        self, tmp_path,
+    ):
+        """Pin both sides of the floor-vs-derived boundary.
+
+        ``max(_HTTP_MIN_CONNECTIONS, _HTTP_CONNS_PER_ENDPOINT *
+        _HTTP_ASSUMED_CONCURRENT_VIEWERS * endpoints)`` = ``max(100, 12 *
+        endpoints)``. The derived term only overtakes the floor at
+        ``endpoints >= 9`` (12*8=96 < 100; 12*9=108 > 100). Below that a small
+        install gets EXACTLY httpx's stock number — the derived term is inert
+        there — and no existing test located this boundary:
+        ``test_max_connections_scales_with_endpoint_count`` only compares 2
+        vs 48 endpoints, and ``test_small_install_is_never_tighter_than_httpx_stock``
+        only asserts ``>= 100``. A future re-tune of ``_HTTP_CONNS_PER_ENDPOINT``,
+        ``_HTTP_ASSUMED_CONCURRENT_VIEWERS`` or ``_HTTP_MIN_CONNECTIONS`` should
+        fail here with a legible reason rather than silently moving the crossover.
+        """
+        from dashboard.app import _build_http_limits
+
+        at_floor = _build_http_limits(_config(tmp_path, escalation=5, fused=3))
+        assert at_floor.max_connections == _HTTPX_STOCK_MAX_CONNECTIONS, (
+            f'8 endpoints: the derived term (12*8=96) must be discarded by the '
+            f'floor, so max_connections must equal the httpx stock '
+            f'{_HTTPX_STOCK_MAX_CONNECTIONS} exactly — got {at_floor.max_connections}'
+        )
+
+        past_crossover = _build_http_limits(_config(tmp_path, escalation=5, fused=4))
+        assert past_crossover.max_connections == 108, (
+            f'9 endpoints: the derived term (12*9=108) must bind and exceed the '
+            f'httpx stock {_HTTPX_STOCK_MAX_CONNECTIONS} floor — got '
+            f'{past_crossover.max_connections}'
+        )
+        assert past_crossover.max_connections > _HTTPX_STOCK_MAX_CONNECTIONS, (
+            f'past the crossover the derived term must strictly exceed the '
+            f'httpx stock floor of {_HTTPX_STOCK_MAX_CONNECTIONS} — got '
+            f'{past_crossover.max_connections}'
+        )
+
     def test_empty_config_still_gets_a_workable_floor(self, tmp_path):
         """A minimal/empty config must not yield 0 or None connections."""
         from dashboard.app import _HTTP_MIN_CONNECTIONS, _build_http_limits
