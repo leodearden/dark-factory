@@ -3547,6 +3547,17 @@ class Harness:
         # `dict` is a regression, not a tidy-up.
         session: object,
         config_dir: str | None,
+        *,
+        # Keyword-only and REQUIRED, not defaulted: since task 3730 this is an
+        # ELIGIBILITY input, so a caller that has not decided whether the
+        # session is still in the durable archive must fail loudly rather than
+        # silently inherit the pre-δ answer. Passed IN rather than looked up
+        # here so the predicate acquires no filesystem dependency of its own —
+        # a bool cannot raise, so the I3 totality contract below needs no new
+        # try/except — and so eligibility and the fallback event's
+        # `archive_available` field are structurally the SAME value. See the
+        # hoist in the _run_slot guard.
+        archive_available: bool,
     ) -> frozenset[str]:
         """Return EVERY reason a recovered session is ineligible (task β/3728).
 
@@ -3583,12 +3594,38 @@ class Harness:
                               never evaluated for resume at all — and the
                               corroboration leg's filesystem glob is pure waste
                               on the dispatch path while the feature is off.
-          - 'stale'         — (now - started_at) >= freshness_window_secs, OR
-                              started_at is missing/unparseable (fail-safe).
+          - 'stale'         — the session is OLD AND UNREACHABLE: a computed
+                              age >= freshness_window_secs with NO durable
+                              archive to redeem it. Since task 3730 (δ / D2)
+                              reachability outranks freshness, so an
+                              archive-backed session is never 'stale' on age
+                              — an archived transcript does not decay with
+                              wall-clock, which makes "how old is it" the
+                              wrong question for a session that is still
+                              reachable. ALSO returned, unconditionally and
+                              NEVER suppressed by the archive, when started_at
+                              is missing/unparseable/the wrong type: see the
+                              freshness leg for why that fail-safe is separate.
           - 'capped'        — resume_count >= max_resumes_per_task (B7).
-        Then transcript corroboration, which contributes AT MOST ONE of the
-        following two — they are the two arms of a single check, mutually
-        exclusive by construction:
+                              Deliberately MEDIATION-AGNOSTIC: an
+                              archive-mediated resume increments and is
+                              throttled by exactly the same counter as a
+                              live-dir one, because the archive is transport,
+                              not a fresh start — a rehydrated transcript is
+                              byte-identical to the live one it replaces, so
+                              the risk the cap bounds (a task looping on
+                              resumes, burning budget on the same wedged
+                              context) is identical either way. Resetting it
+                              on the archive path would make the cap
+                              unreachable on the one path δ opens (PRD §11
+                              open question 3).
+        Then transcript corroboration. Since task 3730 the question it asks
+        is REACHABILITY, and a durable archive answers it just as well as a
+        live transcript does: with *archive_available* true neither reason
+        below is added, because the transcript can be rehydrated from the
+        archive at the arm site. With no archive it contributes AT MOST ONE
+        of the following two — they are the two arms of a single check,
+        mutually exclusive by construction:
           - 'no_transcript' — no stashed config_dir, no session_id, the config
                               dir survives but this session's transcript is
                               absent, or the dir is present-but-unreadable
@@ -3634,16 +3671,34 @@ class Harness:
             # corroborates it.
             return frozenset({'stale', 'no_transcript'})
         reasons: set[str] = set()
-        # Freshness — any parse failure or absent started_at is 'stale'.
+        # Freshness — and note this leg folds TWO different facts into one
+        # token, which task 3730 (δ) had to prise apart. "This session is
+        # provably too old" and "we cannot date this session at all" are
+        # actioned differently the moment an archive can suppress the first.
         try:
             started_at = datetime.fromisoformat(session['started_at'])
             if started_at.tzinfo is None:
                 started_at = started_at.replace(tzinfo=UTC)
             age_secs = (datetime.now(UTC) - started_at).total_seconds()
-            if age_secs >= cfg.freshness_window_secs:
-                reasons.add('stale')
         except (KeyError, ValueError, TypeError):
+            # UNDATEABLE — 'stale' unconditionally, NEVER suppressed by the
+            # archive. D2's argument for suppression is that an archived
+            # transcript does not decay with wall-clock, so age is the wrong
+            # question; that applies only to a session whose age we KNOW. Here
+            # the age is unknown, so nothing bounds it — and the absolute
+            # backstop cannot be evaluated either, because there is no age to
+            # compare. Laundering an undateable sidecar into eligibility on
+            # the strength of an archive would be a fail-OPEN regression
+            # against the I3 contract this whole method rests on. Fail-safe
+            # direction: cannot date it, cannot resume it.
             reasons.add('stale')
+        else:
+            # AGE-DERIVED staleness, and the ONLY thing the archive suppresses
+            # (task 3730 / D2). 'stale' now means "old, with no archive to
+            # redeem it" — an actionable population (why is the archive
+            # missing?) rather than a mix of that and the backstop firing.
+            if age_secs >= cfg.freshness_window_secs and not archive_available:
+                reasons.add('stale')
         # Per-task resume cap (throttling of a healthy long-running task).
         try:
             resume_count = int(session.get('resume_count', 0))
@@ -3663,13 +3718,38 @@ class Harness:
         # positive evidence that the whole store was wiped by an acquire
         # reseed ('reseeded', expected), while a surviving dir missing only
         # this session's transcript is a genuine failure ('no_transcript').
-        # A never-stashed config_dir / session_id stays 'no_transcript': a
-        # reseed clears the out-of-lane meta root together with the lane
-        # (PRD I2), so it destroys the sidecar WITH the transcript and yields
-        # no adoption at all — an adopted session with no config dir is
-        # pathological and must stay loud.
+        # A never-stashed config_dir / session_id stays 'no_transcript' — but
+        # ONLY with no archive, and the reason this clause used to give for it
+        # was wrong. It argued that a reseed clears the out-of-lane meta root
+        # together with the lane (PRD I2), destroying the sidecar WITH the
+        # transcript and yielding no adoption at all, so "an adopted session
+        # with no config dir is pathological and must stay loud".
+        #
+        # CORRECTED (task 3730, from this task's own Details). Production
+        # reaches exactly that state on EVERY crash-recovery path, and by
+        # design: run()'s finally executes an unconditional cleanup_config_dir
+        # teardown (workflow.py::TaskWorkflow.run) while session_preserved
+        # keeps the sidecar, so the config dir is gone and
+        # _adopt_recovered_session's glob finds nothing. A reseed is not the
+        # only way to arrive here, and it is not the common one. With an
+        # archive present this shape is NORMAL, not pathological — which is
+        # why the archive branch above returns before this discrimination is
+        # reached. Without an archive the session really is uncorroborable and
+        # the LOUD arm is still correct.
         session_id = session.get('session_id')
-        if not config_dir or not session_id:
+        if archive_available:
+            # REACHABLE via the durable archive, so neither corroboration
+            # reason applies and the live-dir discrimination below is not even
+            # asked (task 3730 / D2). 3578's arm site restores from the archive
+            # into the config dir it is about to export and RE-CORROBORATES
+            # there, dispatching fresh with a session_resume_failed(
+            # stage='pre_flight') if the restore did not land — so gating on
+            # archive PRESENCE here cannot arm --resume against a transcript
+            # that never arrived. Presence is also the only thing knowable at
+            # this point: the guard runs BEFORE this dispatch's worktree and
+            # config dir exist, so there is nothing to restore INTO yet.
+            pass
+        elif not config_dir or not session_id:
             reasons.add('no_transcript')
         elif not transcript_exists(Path(config_dir), session_id):
             # Discriminate "PROVABLY gone" from "there but unreadable", and do
@@ -9181,7 +9261,14 @@ class Harness:
                     # a fresh run instead of chaining off an expired stamp.
                     self._last_session_resume_fallback_at = None
                 reasons = self._session_resume_reasons(
-                    recovered_session, recovered_config_dir
+                    recovered_session,
+                    recovered_config_dir,
+                    # TRANSITIONAL (task 3730): the predicate now takes the
+                    # archive as an eligibility input, but the single hoisted
+                    # lookup that feeds it — and the fallback emit below —
+                    # lands with the guard rewiring. Until then this preserves
+                    # the pre-δ answer exactly.
+                    archive_available=False,
                 )
                 # Capture the session identity for the event BEFORE any nulling.
                 resume_event_data = {

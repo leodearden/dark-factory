@@ -2717,7 +2717,13 @@ class TestSessionResumeStorm:
 
         ``restore_failed`` is deliberately the name ε is expected to use.
         """
-        def _reasons(session: dict, config_dir: str | None) -> frozenset[str]:
+        def _reasons(
+            session: dict, config_dir: str | None, *, archive_available: bool
+        ) -> frozenset[str]:
+            # Accepts δ's archive_available (task 3730) so the stub tracks the
+            # real signature — a **kwargs sponge would keep passing if the
+            # caller stopped supplying it, which is the one thing the hoist
+            # rows in TestSessionResumeArchiveAvailable exist to catch.
             return reasons
 
         harness._session_resume_reasons = _reasons  # type: ignore[method-assign]
