@@ -832,9 +832,10 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
 
     To stay strict while accommodating that case: once the crash signature
     is present, every ``^FAILED `` line is inspected individually. If ANY
-    names a test that is not on the narrow, enumerated
-    ``_KNOWN_LOAD_FLAKE_NODEID_RES`` allow-list (or has no extractable
-    node-id), this returns ``False`` — never mask a real failure. A
+    names a test that is neither on the narrow, enumerated
+    ``_KNOWN_LOAD_FLAKE_NODEID_RES`` allow-list NOR attributed to the crash
+    itself (see the next paragraph), or has no extractable node-id, this
+    returns ``False`` — never mask a real failure. A
     co-occurring ``INTERNALERROR>`` line or ``ERROR`` short-summary line
     (a fixture/setup error or a whole-module collection failure) is
     likewise never attributable to a known FAILED-line flake, so either one
@@ -850,6 +851,35 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     failure summary, an ``INTERNALERROR>`` line, or either ``ERROR``
     short-summary form (node-id or bare-file) — any one of which suppresses
     reclassification.
+
+    THIRD ACCEPTANCE CLAUSE (task 5082, esc-4292-3): a ``FAILED`` line whose
+    node-id is in ``_crash_attributed_nodeids(output)`` — the test the dead
+    worker itself had in flight — is likewise accepted. That line is not the
+    test's verdict: ``xdist/dsession.py::handle_crashitem`` SYNTHESIZED the
+    report after the worker died, with ``outcome="failed"``, ``when="???"``
+    and a longrepr that is the crash message rather than a traceback, and
+    pytest's terminal reporter then printed an ordinary-looking ``FAILED``
+    short-summary line for it and counted it in the tally. esc-4292-3
+    measured exactly this: the single test on a ``FAILED`` summary line was
+    THE SAME test the crashed worker was running, and it passes in isolation
+    — so the run was sent to the debugger to chase a failure that never
+    happened, instead of to the bounded infra retry.
+
+    This clause is stronger evidence than the ``_KNOWN_LOAD_FLAKE_NODEID_RES``
+    clause beside it, not weaker. The allow-list is a JUDGEMENT about which
+    tests are flaky; crash attribution is STRUCTURAL — ``when="???"`` is
+    xdist's own admission that no verdict was ever reached for that node-id.
+    Accepting it is the same "may never assert a property the gate did not
+    measure" contract ``_summarize_checks`` enforces. Attribution is read
+    from the UNTRIMMED crash notice in the FAILURES body, never from the
+    ``FAILED`` line's own `` - worker 'gwN' crashed...`` suffix — see
+    ``_crash_attributed_nodeids`` for why that suffix is unparseable in
+    general.
+
+    Every veto above is unaffected: an INTERNALERROR / ERROR-nodeid /
+    ERROR-file surface still forces ``False`` before this loop is reached,
+    and a co-occurring FAILED line for any OTHER test still forces ``False``
+    inside it.
 
     That last sentence used to name only the first two (task 4066): the two
     branches had drifted apart, since tasks 3514/3597 added the
@@ -911,9 +941,15 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
             # of its own, so the per-line allow-list check below would
             # never see it — veto here instead of silently masking it.
             return False
+        crash_attributed = _crash_attributed_nodeids(output)
         for line in failed_lines:
             match = _FAILED_LINE_NODEID_RE.match(line)
-            if match is None or not _is_known_load_flake_nodeid(match.group(1)):
+            if match is None:
+                return False
+            node_id = match.group(1)
+            if not (
+                _is_known_load_flake_nodeid(node_id) or node_id in crash_attributed
+            ):
                 return False
         return True
     # Same three surfaces the FAILED-lines branch vetoes on above. They
