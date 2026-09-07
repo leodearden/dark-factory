@@ -6061,3 +6061,105 @@ def test_run_census_report_stays_silent_when_a_cluster_verifies(tmp_path):
     assert "## Verification" not in report_text, (
         "an ordinary uncapped run must still render no Verification section"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-13: RED — W-D. `run_census`'s promote loop does
+# `cand_id = _find_pending_candidate_id(...)` / `if cand_id is None: continue`
+# — dropping a verify verdict the census PAID FOR with no log and no counter.
+# Post-4144 that None is a NORMAL outcome, not a defensive impossibility: for
+# a re-mined title whose only same-title candidate is already adjudicated,
+# `apply_coding_record` correctly declines to fabricate a pending twin (that
+# fabrication is how rejected cand-20260722-28 came back as pending
+# cand-20260724-2 in the live codebook). The standing prior verdict is the
+# right outcome; the SILENCE is the defect.
+# ---------------------------------------------------------------------------
+
+_STANDING_CANDIDATE_ID = "cand-20260701-9"
+_STANDING_FIRST_SEEN = "2026-07-01"
+
+
+def _codebook_with_a_rejected_candidate_for(title):
+    """A v2 codebook carrying one already-REJECTED candidate for *title*, so
+    re-mining that title routes the sighting to the standing record instead
+    of creating a pending twin."""
+    cb = _minimal_v2_codebook()
+    cb["candidates"] = [
+        {
+            "id": _STANDING_CANDIDATE_ID,
+            "title": title,
+            "first_seen": _STANDING_FIRST_SEEN,
+            "disposition": "rejected",
+            "sightings": [],
+        }
+    ]
+    return cb
+
+
+def _rejected_twin_kwargs(tmp_path, **overrides):
+    kwargs: dict[str, Any] = dict(
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES)),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+        codebook_dict=_codebook_with_a_rejected_candidate_for(_THREE_NOVEL_TITLES[0]),
+    )
+    kwargs.update(overrides)
+    return _run_census_kwargs(tmp_path, **kwargs)
+
+
+def test_run_census_warns_when_a_verified_clusters_verdict_finds_no_pending_candidate(
+    tmp_path, caplog,
+):
+    kwargs = _rejected_twin_kwargs(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", "a dropped verdict must not fail the run"
+    assert kwargs["census_state_path"].exists(), "state is still persisted"
+    assert outcome.unresolved_verdicts == 1
+
+    per_cluster = [
+        r for r in _census_warnings(caplog)
+        if _THREE_NOVEL_TITLES[0] in r.getMessage()
+    ]
+    assert len(per_cluster) == 1, (
+        f"exactly one per-cluster warning naming the title; got "
+        f"{[r.getMessage() for r in _census_warnings(caplog)]}"
+    )
+    message = per_cluster[0].getMessage()
+    assert _STANDING_CANDIDATE_ID in message, "the standing candidate's id"
+    assert "rejected" in message, "its disposition"
+    assert _STANDING_FIRST_SEEN in message, "and when it was first seen"
+
+    # The other two titles were promoted normally — the drop is scoped to the
+    # one title with a standing verdict, not a whole-run failure.
+    written = codebook.load(kwargs["codebook_path"])
+    promoted = [
+        c for c in written["candidates"] if c.get("disposition") == "promoted"
+    ]
+    assert {c["title"] for c in promoted} == set(_THREE_NOVEL_TITLES[1:])
+    standing = next(
+        c for c in written["candidates"] if c["id"] == _STANDING_CANDIDATE_ID
+    )
+    assert standing["disposition"] == "rejected", "the prior verdict still stands"
+
+
+def test_run_census_clean_run_emits_no_unresolved_verdict_warning(tmp_path, caplog):
+    """Negative control: with no standing same-title verdict every cluster
+    resolves, so there is nothing to say and nothing is said."""
+    kwargs = _rejected_twin_kwargs(tmp_path, codebook_dict=_minimal_v2_codebook())
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.unresolved_verdicts == 0
+    assert not [
+        r for r in _census_warnings(caplog) if "unresolved" in r.getMessage().lower()
+    ]
