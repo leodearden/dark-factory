@@ -586,33 +586,52 @@ ordinary `load_config` resolution on the remote takes it from there
 `config_path` is left `None`). Name it however you like, or omit it and
 rely on the remote's own `ORCH_CONFIG_PATH`.
 
-**Load-bearing vs. inert.** `verify-merge` only reads `project_root` and
-the `git.*` block from this file — scheduler, routing, budget, and
-escalation sections are inert for this subcommand and can be left at
-whatever value (or omitted) without effect. Don't spend effort keeping
-those sections in sync with the workstation; only `project_root` and
-`git.*` need to be right.
+**Load-bearing vs. inert.** `verify-merge` reads `project_root`, the
+`git.*` block, and — on the zero-module-config path only — `verify_env`
+from this file. Scheduler, routing, budget, and escalation sections are
+inert for this subcommand and can be left at whatever value (or omitted)
+without effect; don't spend effort keeping those sections in sync with
+the workstation.
 
-**The rule that decides whether verify commands belong in this file:**
-whether the project registers any per-module verify configs at all.
+**Never restate `test_command`/`lint_command`/`type_check_command` in
+this file — in both branches, a wire copy overrides whatever is set
+here.**
 
-- A project with **registered module configs** (module-level
-  `test_command`/`lint_command`/`type_check_command` entries) has those
+- A project with **registered module configs** has its per-module
   commands travel inside the `MergeVerifySpec` the workstation sends with
-  every dispatch, reconstructed remotely by
-  `run_merge_verify_on_worktree`. Restating `test_command`/`lint_command`/
-  `type_check_command`/`verify_env` in this file would create a **second
-  copy, free to drift** from the workstation's — omit them here.
-- A project with **zero** registered module configs ships a spec with an
-  empty module-config list, and the remote has nothing to reconstruct from
-  — it falls back to *this file's own* `test_command`/`lint_command`/
-  `type_check_command`/`verify_env`. Here, omitting them would leave the
-  remote with no verify commands at all — set them here.
+  every dispatch, reconstructed remotely by `run_merge_verify_on_worktree`.
+- A project with **zero** registered module configs is *not* a fallback
+  case: whenever the dispatcher has a global `test_command`/
+  `lint_command`/`type_check_command` set, `build_merge_verify_spec`
+  ships it as the spec's `global_verify_command` — the fix for the
+  fidelity hole behind incident 966f23a6 (INV-1, task 2883) — and
+  `run_merge_verify_on_worktree` applies it *over* the reconstructed
+  remote config.
 
-Get this backwards in either direction and the failure is silent: a
-restated command quietly drifts from the one the workstation actually
-runs, while a missing fallback command means the remote verify silently
-skips (or errors on) whatever step has no command.
+Either way, whatever is written here is a **second copy, free to drift**
+from what the wire actually carries — and restating it doesn't error or
+even drift loudly, it just silently does nothing: an operator who edits
+this file to change the remote gate observes no change, because the
+dispatch always wins.
+
+The one honest edge case: `global_verify_command` is sourced only when
+the dispatcher *has* a global command set. A project with neither module
+configs nor globals ships no commands in the spec at all — but such a
+project has no gate of its own on the workstation either, so commands set
+here would make the remote run a gate the workstation itself never runs.
+That's divergence from the workstation, not a legitimate fallback;
+"don't restate" holds regardless.
+
+**`verify_env` is the one genuine exception — set it here for a
+zero-module-config project.** The override in
+`run_merge_verify_on_worktree` never touches `verify_env`; the spec's
+copy is threaded only into per-module `ModuleConfig`s (by
+`_module_config_from_command`), and a zero-module project has no
+`ModuleConfig`s for it to land in. `_resolve_verify_env(config,
+module_config=None)` then merges `config.verify_env` alone (plus the
+authoritative `DF_VERIFY_ROLE` stamp) — so on that path, and only that
+one, this file's `verify_env` is what the remote verify actually runs
+with.
 
 ### Warm vs. ephemeral verify worktrees
 
