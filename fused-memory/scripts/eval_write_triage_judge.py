@@ -566,6 +566,13 @@ def run_judge_eval(
 
     A dangling candidate id raises ``KeyError`` for the same reason — a
     silently-skipped candidate narrows a slate the report claims was 5 wide.
+
+    THE MARKDOWN SIBLING NEVER OVERWRITES THE REPORT. It is composed as
+    ``report_path.parent / (report_path.stem + '.md')`` and a *report_path*
+    that composes back to itself RAISES before either file is written.
+    ``guard_committed_report`` does not cover this: that guard addresses
+    dry-run/``--limit`` publishing and returns early for any non-committed
+    path, so ``--report-path foo.md`` sailed straight through it.
     """
     cases = build_judge_cases(records, distractors=distractors)
     by_id = {str(r['memory_id']): r for r in records}
@@ -604,10 +611,24 @@ def run_judge_eval(
     report = build_report(scored=scored, provenance=run_provenance)
 
     report_path = Path(report_path)
+    # COMPOSED from the stem, not derived by replacing the last suffix.
+    # `with_suffix('.md')` maps `foo.md` back to `foo.md`, so the markdown
+    # overwrote the JSON that had just been written — every number the run
+    # paid for, gone, with no error. Raised BEFORE either write so the
+    # mistake costs nothing; a warning on a script whose output is a
+    # committed artifact would be read after the loss.
+    markdown_path = report_path.parent / (report_path.stem + '.md')
+    if markdown_path == report_path:
+        raise ValueError(
+            f'report_path {str(report_path)!r} composes the same path as its '
+            f'markdown sibling {str(markdown_path)!r}, so the markdown would '
+            f'overwrite the JSON report — pass a report_path whose stem+".md" '
+            f'differs from it (e.g. a .json suffix)',
+        )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + '\n')
-    report_path.with_suffix('.md').write_text(render_markdown(report))
-    logger.info('Wrote %s and its .md sibling', report_path)
+    markdown_path.write_text(render_markdown(report))
+    logger.info('Wrote %s and %s', report_path, markdown_path)
 
     return report
 
