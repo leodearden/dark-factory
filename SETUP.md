@@ -574,6 +574,46 @@ set is *discovered from the remote tree itself* (task 4536), so a stale
 remote checkout silently **narrows** the gate rather than failing loudly.
 Verify currency, every time, not just reachability.
 
+### The per-host YAML
+
+The remote-side config conventionally lives at
+`~/.config/orchestrator/<project>-<host>.yaml`, but that path is **pure
+operator convention — nothing in the code discovers it.** It is threaded
+through explicitly: the workstation's `verify_runners[].config_path` names
+it, passes it as `orchestrator verify-merge --config <path>`, and the
+ordinary `load_config` resolution on the remote takes it from there
+(`--config` wins over `ORCH_CONFIG_PATH`, which is the fallback when
+`config_path` is left `None`). Name it however you like, or omit it and
+rely on the remote's own `ORCH_CONFIG_PATH`.
+
+**Load-bearing vs. inert.** `verify-merge` only reads `project_root` and
+the `git.*` block from this file — scheduler, routing, budget, and
+escalation sections are inert for this subcommand and can be left at
+whatever value (or omitted) without effect. Don't spend effort keeping
+those sections in sync with the workstation; only `project_root` and
+`git.*` need to be right.
+
+**The rule that decides whether verify commands belong in this file:**
+whether the project registers any per-module verify configs at all.
+
+- A project with **registered module configs** (module-level
+  `test_command`/`lint_command`/`type_check_command` entries) has those
+  commands travel inside the `MergeVerifySpec` the workstation sends with
+  every dispatch, reconstructed remotely by
+  `run_merge_verify_on_worktree`. Restating `test_command`/`lint_command`/
+  `type_check_command`/`verify_env` in this file would create a **second
+  copy, free to drift** from the workstation's — omit them here.
+- A project with **zero** registered module configs ships a spec with an
+  empty module-config list, and the remote has nothing to reconstruct from
+  — it falls back to *this file's own* `test_command`/`lint_command`/
+  `type_check_command`/`verify_env`. Here, omitting them would leave the
+  remote with no verify commands at all — set them here.
+
+Get this backwards in either direction and the failure is silent: a
+restated command quietly drifts from the one the workstation actually
+runs, while a missing fallback command means the remote verify silently
+skips (or errors on) whatever step has no command.
+
 ---
 
 For hot-reloading config without a restart, understanding the fleet-redeploy
