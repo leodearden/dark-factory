@@ -5215,14 +5215,75 @@ class GraphitiBackend:
         recovering from it knows what already changed.  The propagate-don't-absorb
         contract is unchanged.
 
+        THE REBUILD WINDOW, and why the catalog is SETTLED before it is READ
+        (task 4777).  MEASURED against FalkorDB module v41800: ``DROP VECTOR
+        INDEX`` against a label whose merged index carries SURVIVING fields is
+        not an in-place catalog mutation.  FalkorDB builds a REPLACEMENT index,
+        and until that build finishes one ``CALL db.indexes()`` returns BOTH the
+        new ``['name']`` row at ``'[Indexing] N/M: UNDER CONSTRUCTION'`` AND the
+        stale ``['name_embedding','name']`` row at ``'OPERATIONAL'``, still
+        advertising the VECTOR property that is already gone.  Not a read-path
+        artifact — ``RO_QUERY`` and ``QUERY`` agree at every instant.  The window
+        is ~4 ms on a 1-node graph and 0.21-0.75 s at 50k nodes.
+
+        THE EXPOSURE that closed.  A SINGLE call was already safe: it read once,
+        before any drop.  But a SECOND call — or any retry — landing in the
+        window read the stale row, re-issued ``DROP VECTOR INDEX``, and got
+        ``'Unable to drop index on :Entity(name_embedding): no such index.'``
+        back, which this method deliberately does not absorb, so it propagated
+        after the ``'after dropping 0 index(es)'`` ERROR line.
+
+        THE SHAPE OF THE FIX: the barrier is on the READ, not on the DROP.
+        Settling BEFORE the read — rather than settling before RETURNING, the
+        other option weighed — protects the call that needs protecting no matter
+        WHO opened the window: a previous run killed between its drop and its
+        settle, a different fused-memory process, or a concurrent
+        :meth:`ensure_indices` build.  A post-drop settle only helps a
+        well-behaved successor inside the same process, and buys the sole caller
+        nothing anyway: ``reindex_and_replay`` re-embeds immediately after the
+        drop and never re-reads the catalog.  Framing it as a barrier on the READ
+        is also what leaves everything below literally untouched — the drop loop,
+        the ``{'label', 'field'}`` return shape, the ERROR-log-then-re-raise
+        partial-drop reporting and the propagate-don't-absorb contract are all
+        unchanged.  Only the trustworthiness of the read that feeds the loop
+        changes.
+
+        WHY NOT treat ``'no such index'`` as an already-satisfied no-op.  It
+        would be a load-bearing sentinel on FalkorDB's error WORDING, which D2
+        forbids repo-wide, and it would silently swallow the OTHER measured
+        producer of that identical string: the NODE drop statement issued against
+        a RELATIONSHIP vector index (see
+        :func:`~fused_memory.backends.falkor_indices.vector_drop_statement`) —
+        a drop that removes nothing while reporting success, i.e. the exact
+        silent fail-soft this method's contract exists to prevent.  The two
+        cannot be told apart from the string.
+
+        WHY :meth:`ensure_indices` IS DELIBERATELY NOT BARRIERED.  INV-6 makes
+        its no-wait behaviour a documented contract, and a stale diff read there
+        costs at worst an "already indexed" rejection it absorbs into ``failed``
+        by design.  A stale read HERE produces a hard propagating failure and, in
+        the other direction, a silent under-drop.  This barrier is scoped to the
+        DROP path.
+
         Returns:
             One ``{'label': ..., 'field': ...}`` dict per dropped index, with
             ``field`` a single property STRING.  The shape is deliberately
             unchanged: ``reindex.py``'s docstring documents it and
             ``test_returns_list_of_dropped_indices`` asserts exact dict equality,
             and ``label`` already disambiguates Entity from RELATES_TO.
+
+        Raises:
+            IndexCatalogUnsettledError: The index catalog did not settle within
+                :meth:`_await_index_catalog_settled`'s budget.  Fail closed:
+                dropping against an index state that was never determined is the
+                same silent-fail-soft class ``ensure_indices`` refuses for
+                provisioning (INV-4), and an under-construction read can
+                UNDER-report vector indices — leaving stale fixed-dimension ones
+                behind while the operator believes the rebuild was clean.
+            Exception: Whatever a failing DROP statement raised, re-raised
+                unchanged after the partial-``dropped`` ERROR line.
         """
-        indices = await self.list_indices(group_id=group_id)
+        indices = await self._await_index_catalog_settled(group_id)
         dropped: list[dict] = []
         try:
             for record in indices:
