@@ -375,6 +375,24 @@ def _last_before(
     return best
 
 
+def _any_between(
+    events: Sequence[dict[str, Any]], lo: datetime, hi: datetime
+) -> bool:
+    """True when any event's timestamp falls STRICTLY between *lo* and *hi*.
+
+    Both ends are open on purpose.  An event stamped exactly at *lo* is the
+    boundary event itself (the speculation the interval was opened from), and
+    one stamped exactly at *hi* is simultaneous with the landing rather than
+    before it — neither is evidence of something happening in between.  A row
+    with an unparseable timestamp is skipped, matching :func:`_last_before`.
+    """
+    for event in events:
+        ts = _parse_ts(event.get('timestamp'))
+        if ts is not None and lo < ts < hi:
+            return True
+    return False
+
+
 def _first_at_or_after(
     events: Sequence[dict[str, Any]], cutoff: datetime
 ) -> tuple[datetime, dict[str, Any]] | None:
@@ -830,13 +848,36 @@ def compute_speculation(
     ``speculative`` truthy — reported as ``matched``/``total`` as well as a
     share, because the share alone hides how thin the denominator can be.
 
+    TWO AHEAD MEASURES LIVE SIDE BY SIDE, and which one a caller wants is not
+    a matter of taste.  ``speculative_ahead`` is LOOSE: it credits a landing
+    for a speculation that was subsequently VOIDED, i.e. thrown away before it
+    could shorten anything.  That over-counts precisely in the project whose
+    voids dominate, so comparing two projects on the loose measure compares
+    partly on how often each one wasted work.  ``speculative_ahead_adopted``
+    is STRICT: a landing counts only when no `verdict_voided` row for that
+    task falls strictly between its LAST preceding speculation and the
+    landing.  The window opens at the LAST preceding speculation, not the
+    first, because a task that is voided and then re-speculated did have live
+    speculation running ahead of the landing that actually happened.
+
+    The loose key is KEPT, not redefined, even though it is the one that
+    disagrees with the throughput PRD's § Background rows: its printed line
+    and ``--json`` shape are the landed contract that the before/after
+    measurement reports compare against, and silently swapping in a different
+    definition would move their baseline underneath them.  Naming the artifact
+    is the point; hiding it is not.  DATED PROVENANCE, not a live assertion:
+    over 2026-08-04T16:10Z..2026-09-03T16:10Z the two measures read 351/507
+    loose vs 255/507 strict for dark_factory, and 191/323 vs 84/323 for reify
+    — the strict measure moves reify roughly three times as far, which is the
+    spread the loose measure was concealing.
+
     Every rate is ``None``, never ``0.0``, when its denominator is empty:
     "nothing was speculated in this window" is not "speculation was tried and
     never voided".
 
     Returns ``{'speculative_depth', 'verify_depth', 'void_rate',
     'n_speculative', 'n_voided_chain_dead', 'void_points',
-    'speculative_ahead'}``.
+    'speculative_ahead', 'speculative_ahead_adopted'}``.
     """
     n_speculative = len(speculative_events)
     chain_dead = [
@@ -849,9 +890,11 @@ def compute_speculation(
 
     speculative_by_task = _by_task(speculative_events)
     verify_by_task = _by_task(verify_events)
+    voided_by_task = _by_task(voided_events)
 
     total_landings = 0
     matched_landings = 0
+    adopted_landings = 0
     for event in finalized_events:
         if event.get('data', {}).get('state') != 'done':
             continue
@@ -870,6 +913,17 @@ def compute_speculation(
             ahead = _last_before(speculative_verifies, finalized_ts)
         if ahead is not None:
             matched_landings += 1
+            # STRICT: the speculation must still have been live at the
+            # landing.  `_last_before` already gave us the latest speculation
+            # preceding the landing, so the disqualifying interval is exactly
+            # (that speculation, the landing) — a void outside it either
+            # predates a re-speculation or postdates the landing, and in
+            # neither case did it throw away the work that ran ahead.
+            ahead_ts = ahead[0]
+            if not _any_between(
+                voided_by_task.get(task_id, []), ahead_ts, finalized_ts
+            ):
+                adopted_landings += 1
 
     return {
         'speculative_depth': _depth_distribution(speculative_events),
@@ -882,6 +936,11 @@ def compute_speculation(
             'matched': matched_landings,
             'total': total_landings,
             'share': matched_landings / total_landings if total_landings else None,
+        },
+        'speculative_ahead_adopted': {
+            'matched': adopted_landings,
+            'total': total_landings,
+            'share': adopted_landings / total_landings if total_landings else None,
         },
     }
 
