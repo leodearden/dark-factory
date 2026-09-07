@@ -45,9 +45,20 @@ from typing import Generic, TypeVar
 
 import httpx
 
+# PEP 696 TypeVar defaults, via typing_extensions rather than typing: pyright
+# rejects `typing.TypeVar(default=...)` under this package's
+# `pythonVersion = "3.11"` pin ("Type variable default types require Python
+# 3.13 or newer"), while accepting and APPLYING the typing_extensions
+# spelling at the same pin. Declared directly in pyproject.toml (task 5018).
+from typing_extensions import TypeVar as TypeVarD
+
 logger = logging.getLogger(__name__)
 
 V = TypeVar('V')
+# TTLCache's KEY type. Defaulted to `str` and declared TRAILING so every
+# existing single-argument `TTLCache[V]` keeps checking unedited — a
+# defaulted TypeVar may not precede a non-defaulted one, so V stays first.
+K = TypeVarD('K', default=str)
 
 
 # ── per-URL failure log policy (task 3871) ──────────────────────────
@@ -619,8 +630,8 @@ async def first_success(
     return offline_result(errors)
 
 
-class TTLCache(Generic[V]):
-    """Single-flight, short-TTL cache keyed by an arbitrary string.
+class TTLCache(Generic[V, K]):
+    """Single-flight, short-TTL cache keyed by an arbitrary HASHABLE.
 
     Generalizes scheduler.py's ``_scheduler_cache`` +
     ``_scheduler_refresh_lock`` double-checked-locking pattern: a warm entry
@@ -750,14 +761,14 @@ class TTLCache(Generic[V]):
         self._ttl_fn: Callable[[], float] = (
             ttl_seconds if callable(ttl_seconds) else (lambda: ttl_seconds)
         )
-        self._store: dict[str, tuple[float, V]] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._store: dict[K, tuple[float, V]] = {}
+        self._locks: dict[K, asyncio.Lock] = {}
         # Per-INSTANCE (not module-level) consecutive-bypass streaks, keyed
         # by cache key. Per-instance because the key space is per-cache:
         # tasks._fetch_tasks_cache and tasks._fetch_tasks_negative_cache
-        # share key strings exactly, and three more live instances key on a
+        # share keys exactly, and three more live instances key on a
         # bare project_root — a module-level dict would collapse them.
-        self._bypass_streaks: dict[str, int] = {}
+        self._bypass_streaks: dict[K, int] = {}
         # The in-flight bypass task for a key, if any, stamped with the
         # monotonic time it started. Bounds concurrent bypass refreshes to
         # ONE per key (see _bypass_refresh) rather than one per timed-out
@@ -769,7 +780,7 @@ class TTLCache(Generic[V]):
         # review fix). A completed entry is removed instantly by the task's
         # own done-callback; a superseded entry is dropped by the caller
         # that replaces it.
-        self._bypass_tasks: dict[str, tuple[float, asyncio.Task[V]]] = {}
+        self._bypass_tasks: dict[K, tuple[float, asyncio.Task[V]]] = {}
         # Every LIVE bypass task for a key, in creation order — not just the
         # one currently TRACKED as "the" bypass in _bypass_tasks above.
         # _bypass_tasks answers "who should the next caller join?", which is
@@ -781,9 +792,9 @@ class TTLCache(Generic[V]):
         # (see _MAX_LIVE_BYPASSES_PER_KEY). Entries are removed by the
         # task's own done-callback, and swept defensively by
         # _live_bypasses_for / _evict_expired.
-        self._live_bypasses: dict[str, list[asyncio.Task[V]]] = {}
+        self._live_bypasses: dict[K, list[asyncio.Task[V]]] = {}
 
-    def get_fresh(self, key: str) -> V | None:
+    def get_fresh(self, key: K) -> V | None:
         """Return the cached value for *key* iff still within TTL, else None."""
         cached = self._store.get(key)
         if cached is not None and (time.monotonic() - cached[0]) < self._ttl_fn():
@@ -921,7 +932,7 @@ class TTLCache(Generic[V]):
 
     async def _refresh_and_store(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         cache_ok: Callable[[V], bool],
     ) -> V:
@@ -957,7 +968,7 @@ class TTLCache(Generic[V]):
 
     def _start_bypass(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         cache_ok: Callable[[V], bool],
     ) -> asyncio.Task[V]:
@@ -1003,7 +1014,7 @@ class TTLCache(Generic[V]):
         task.add_done_callback(_forget_if_current)
         return task
 
-    def _live_bypasses_for(self, key: str) -> list[asyncio.Task[V]]:
+    def _live_bypasses_for(self, key: K) -> list[asyncio.Task[V]]:
         """Return *key*'s live bypass tasks, dropping any already finished.
 
         ``_start_bypass``'s done-callback is the primary reclaimer, but a
@@ -1021,7 +1032,7 @@ class TTLCache(Generic[V]):
 
     async def _start_or_join_at_cap(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         cache_ok: Callable[[V], bool],
     ) -> V:
@@ -1051,7 +1062,7 @@ class TTLCache(Generic[V]):
 
     async def _bypass_refresh(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         cache_ok: Callable[[V], bool],
     ) -> V:
@@ -1154,7 +1165,7 @@ class TTLCache(Generic[V]):
 
     def _note_lock_bypass(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         *,
         reason: str = 'lock_timeout',
@@ -1231,7 +1242,7 @@ class TTLCache(Generic[V]):
         else:
             logger.debug(repeat, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
 
-    def _note_lock_acquired(self, key: str) -> None:
+    def _note_lock_acquired(self, key: K) -> None:
         """Close an open bypass streak for *key*, logging recovery.
 
         Emits at WARNING — the same level as the streak's opening line — so
@@ -1252,7 +1263,7 @@ class TTLCache(Generic[V]):
 
     async def get_or_refresh(
         self,
-        key: str,
+        key: K,
         refresh: Callable[[], Awaitable[V]],
         *,
         cache_ok: Callable[[V], bool] = lambda v: True,
