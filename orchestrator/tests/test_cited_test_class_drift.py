@@ -1,13 +1,66 @@
-"""Static guard: a test class cited by name in a src docstring/comment must exist.
+"""Static guard: a test class CITED BY NAME in a src docstring or comment must exist.
 
-(Module docstring completed in step-4 — see plan.json step-4.)
+A src docstring saying "pinned by ``TestFooBarBaz``" is a load-bearing claim
+of coverage, and nothing checks it. ``orchestrator.verify_classify`` carried
+one for TEN DAYS naming a class that existed nowhere in the repo (citation
+landed 2026-08-05; the class was written 2026-08-15). A reader who trusts such
+a claim does not go and write the test.
+
+WHAT THIS ASSERTS, and nothing else: every cited IDENTIFIER RESOLVES to a real
+``class Test...`` under one of the workspace's test trees.
+
+WHAT IT DELIBERATELY DOES NOT DO:
+
+* It is NOT a wording pin. It asserts nothing whatever about the prose around
+  a citation — rewording a citing sentence is a no-op by construction, which
+  ``TestRewordInvariance`` below demonstrates executably rather than by
+  assertion. Do not extend this into a wording pin; same scope discipline as
+  ``tests/scripts/test_setup_host_unit_installation.py::test_setup_md_disable_block_covers_every_foreign_orchestrator_unit``.
+* There is NO allowlist and no carve-out table of any kind, so there is
+  nothing here that can go stale.
+* There is NO staleness assertion in EITHER direction: no "this name must
+  still be cited" arm, and no assertion that any src file mentions any
+  particular string. That direction makes another package's PROSE a
+  merge-blocking gate on this module. It is the detector task 3554 removed on
+  review, and the standing prohibition on reintroducing it — explicitly
+  including "as a word-boundary or regex variant" — lives in
+  ``tests/scripts/test_skills_module_config_decision.py``'s module docstring,
+  on the removed ``test_no_unlisted_skills_mentioning_test_escapes_triage``.
+  Here no carve-out entries exist at all, so that failure mode is
+  structurally unreachable rather than merely unimplemented.
+
+COVERAGE RULE — a rule, deliberately not a measured fraction: every ``Test`` +
+>=2-CamelCase-segment name appearing in a COMMENT or STRING token of any
+``<member>/src`` file is checked, in the backticked, bare, ``file.py::Name``
+and line-wrapped forms alike. Out of scope by shape: single-segment
+``Test<Word>`` names; citations in non-Python files; and names appearing in
+CODE rather than prose, which are uses, not coverage claims.
+
+Built in two halves, in that order — the layout of the precedent
+``orchestrator/tests/test_marker_registration_drift.py``: unit tests of the
+pure helpers against synthetic strings and ``tmp_path`` trees FIRST, then the
+wired guard against the REAL tree. The real tree is green on arrival, so the
+synthetic half carries the whole burden of proving the mechanism can FAIL.
 """
 from __future__ import annotations
 
 import re
 import tokenize
+from pathlib import Path
 
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+# This file rglob('*.py')s both corpora, so it belongs to the whole-tree-scan
+# family. The ceiling's derivation lives at its single canonical home,
+# _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT; the module-level mark is
+# REQUIRED by test_whole_tree_scan_timeout_guard.py, which recomputes its
+# scanner census from source on every run and checks this mark's VALUE.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+# Resolved from THIS FILE, never from the process CWD: merge-verify runs pytest
+# from orchestrator/ while a plain run starts at the repo root.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: A citation is ``Test`` followed by AT LEAST TWO CamelCase segments.  That
 #: one shape predicate covers the backticked, bare and ``file.py::Name`` forms
