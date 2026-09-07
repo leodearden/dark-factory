@@ -28,7 +28,7 @@ from typing import Literal, get_args
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from shared.task_metadata import register_metadata_submodel
+from shared.task_metadata import ExternalDep, register_metadata_submodel
 
 __all__ = [
     'CHECK_SUBJECT_FIELD',
@@ -325,6 +325,31 @@ class ManifestTask(BaseModel):
     title: str | None = None
     note: str | None = None
     capabilities: list[ManifestCapability]
+
+    @model_validator(mode='after')
+    def _check_producer_binding(self) -> ManifestTask:
+        if self.external_task_id is None:
+            return self
+        if self.task_id is not None:
+            raise ValueError(
+                f'ManifestTask {self.label!r}: binds BOTH a local task_id '
+                f'({self.task_id}) and external_task_id '
+                f'{self.external_task_id!r} — a block names exactly one producer.'
+            )
+        # ExternalDep.parse is the single authority for this wire form
+        # (shared/src/shared/task_metadata.py::ExternalDep) — the same one
+        # backing metadata.external_deps. Do not re-implement the
+        # split/strip check here. Re-raised so the message names the
+        # offending label, which ExternalDep cannot know.
+        try:
+            ExternalDep.parse(self.external_task_id)
+        except ValueError as exc:
+            raise ValueError(
+                f'ManifestTask {self.label!r}: malformed external_task_id '
+                f'{self.external_task_id!r}; expected the qualified '
+                f'"project_id:task_id" form (e.g. "reify:5613"). {exc}'
+            ) from exc
+        return self
 
 
 class CapabilityManifestDoc(BaseModel):
