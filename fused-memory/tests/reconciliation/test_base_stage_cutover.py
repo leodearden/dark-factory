@@ -7,6 +7,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, Watermark
@@ -420,6 +421,83 @@ class TestBuildMcpConfigReconReport:
         servers = stage._build_mcp_config()['mcpServers']
         assert 'fused-memory' in servers, 'fused-memory entry must remain'
         assert 'jcodemunch' in servers, 'jcodemunch entry must remain'
+
+
+class TestReconJcodemunchLaunchPinned:
+    """The recon-stage jcodemunch entry uses the shared launch contract.
+
+    Closes two defects in the hand-rolled entry this replaces
+    (``{'command': 'uvx', 'args': ['jcodemunch-mcp']}``):
+
+    1. ``uvx`` re-resolves the package and builds tree-sitter C-extension
+       sdists from source on every launch, which under host load stalled
+       agent startup past the 1200s wall (reify esc-4415-232).
+    2. The entry carried no ``env`` at all, so neither
+       JCODEMUNCH_NO_VERSION_HINT nor the JCODEMUNCH_GIT_ROOT_IDENTITY
+       identity lever reached the recon agent.
+
+    Defect 2 matters here more than it first appears.  Reconciliation stage
+    agents run at the canonical ``project_root``, never a linked worktree —
+    so this is the launch site most likely to MINT the shared
+    ``<owner>/<repo>`` index, which per the adoption precondition in
+    ``shared/jcodemunch_launch.py`` would render task 4562's per-agent lever
+    INERT for every orchestrator agent worktree until someone runs
+    ``jcodemunch-mcp delete-index``.  Mirrors
+    ``orchestrator/tests/test_mcp_lifecycle.py::TestJcodemunchLaunchPinned``.
+    """
+
+    def test_command_is_prebuilt_launcher_not_uvx(self):
+        """The recon entry launches the prebuilt launcher, never uvx."""
+        stage = _make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['command'] == JCODEMUNCH_COMMAND
+        assert 'uvx' not in jc['command']
+        assert not any('uvx' in str(a) for a in jc.get('args', []))
+
+    def test_env_matches_shared_constant(self):
+        """The recon entry's env is the shared contract in full.
+
+        Full dict equality, so a dropped or extra key fails.
+        """
+        stage = _make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['env'] == JCODEMUNCH_ENV
+
+    def test_env_is_a_copy_not_the_shared_dict(self):
+        """The entry carries a defensive copy, not the module-level constant.
+
+        A caller mutating the returned config must not be able to corrupt
+        the process-wide constant for every other consumer.
+        """
+        stage = _make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['env'] is not JCODEMUNCH_ENV
+
+    def test_git_root_identity_lever_reaches_the_recon_config(self):
+        """The identity lever reaches the generated recon config as '0'.
+
+        Asserted against the literal rather than against JCODEMUNCH_ENV as
+        defense-in-depth, so this still fails if
+        test_env_matches_shared_constant is later loosened to a subset
+        check.  The literal matters: jcodemunch's bool env parser reads '0'
+        as False (lever ON, per-worktree local identity) but '1'/'true' as
+        True (lever OFF, silently reverting to the worktree-collapsing
+        git-root default).
+        """
+        stage = _make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['env']['JCODEMUNCH_GIT_ROOT_IDENTITY'] == '0'
+
+    def test_no_version_hint_silencer_reaches_the_recon_config(self):
+        """The stderr version-drift silencer reaches the generated config."""
+        stage = _make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['env']['JCODEMUNCH_NO_VERSION_HINT'] == '1'
 
 
 class TestStartReportErrorHandling:
