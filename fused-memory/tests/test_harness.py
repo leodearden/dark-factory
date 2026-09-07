@@ -20374,7 +20374,21 @@ def _routed_records(orch_queue_dir):
 async def test_non_actionable_finding_naming_a_task_is_not_routed(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
-    """Inherited layer 1: the non-actionable partition."""
+    """Inherited layer 1: the non-actionable partition.
+
+    MUTATION-CHECKING THIS TEST (esc-4821-2): the partition is implemented at
+    TWO sites, and either one alone suffices to block the routing. Disabling
+    just one leaves this test passing, which reads as a false negative --
+    "the pin is not load-bearing" -- when in fact the other site caught it:
+
+      harness.py, _maybe_remediate:      actionable = [... if f.get('actionable', False)]
+      harness.py, _run_remediation_pass: actionable_remaining = [... if f.get('actionable', False)]
+
+    The routing call site sits inside `for finding in actionable_remaining`,
+    so the second is the proximate gate; the first decides whether the
+    remediation pass is dispatched with this finding at all. Mutate BOTH to
+    `list(...)` and this test fails as intended (verified 2026-09-07).
+    """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
