@@ -2473,6 +2473,105 @@ class TestExtractCauseHint:
         )
 
 
+
+# ---------------------------------------------------------------------------
+# task 5082 step-7: `_summarize_checks` must not assert a COMPLETE verdict for
+# a session xdist truncated.
+#
+# This is the task-3173 CONTRACT — "the summary may never assert a property
+# the gate did not measure" — applied to a SECOND cause of no-verdict.  A leg
+# SIGKILLed before it could emit diagnostics stopped being reported as "lint
+# issues" and now contributes `_killed_leg_note`.  A worker-death-truncated
+# test leg is the identical defect shape: ~97% of the suite never ran
+# (esc-4176-6: 1 failed/728 passed truncated vs 19622 passed on a clean re-run
+# of the identical command), yet the flat literal 'tests failed' claims a
+# complete measured verdict, and `merge_queue` surfaces it verbatim.
+# ---------------------------------------------------------------------------
+
+_TRUNCATED_TEST_LEG_OUTPUT = (
+    'orchestrator/tests/test_config.py ....\n'
+    '[gw3] node down: Not properly terminated\n'
+    "worker gw3 crashed while running "
+    "'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
+    'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar\n'
+    '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
+    '1 failed, 728 passed, 1 skipped in 209.67s\n'
+)
+
+
+class TestWorkerDeathLegSummary:
+    """A truncated test leg contributes a worker-death note, not 'tests failed'."""
+
+    @staticmethod
+    def _summarize(test_rc: int, test_out: str) -> str:
+        """The truncated test leg beside CLEAN lint and type legs."""
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, summary, _ = _summarize_checks(
+            test_rc, test_out, False, 'uv run pytest',
+            0, '', False, 'ruff check',
+            0, '', False, 'pyright',
+            test_duration=209.67,
+        )
+        return summary
+
+    def test_truncated_test_leg_does_not_claim_a_complete_verdict(self):
+        """The facet-2 core: 'tests failed' is a claim the gate cannot make."""
+        summary = self._summarize(1, _TRUNCATED_TEST_LEG_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
+
+    def test_failures_envelope_is_preserved(self):
+        """Every existing consumer prefix- or substring-matches on this
+        envelope (task 3173's wording for the same requirement)."""
+        summary = self._summarize(1, _TRUNCATED_TEST_LEG_OUTPUT)
+        assert summary.startswith('Failures: '), f'Unexpected summary: {summary!r}'
+        assert summary != 'Failures: ', f'Unexpected summary: {summary!r}'
+
+    def test_note_is_one_aggregation_fragment(self):
+        """THE WIRE FORMAT, pinned at the producer.
+
+        `_summarize_checks` joins fragments with ', ' and `_aggregate_results`
+        recovers them with `.split(', ')`, keeping only marker-bearing ones.
+        A ', ' inside the note splits it in two and only the marker half
+        survives — the exact silent truncation the carry-through exists to
+        prevent, and the constraint `_killed_leg_note`'s docstring already
+        pins for the signal-kill note.
+        """
+        summary = self._summarize(1, _TRUNCATED_TEST_LEG_OUTPUT)
+        note_fragment = summary.removeprefix('Failures: ')
+        assert ', ' not in note_fragment, (
+            f'a comma+space in the note splits it across `.split(", ")` in '
+            f'_aggregate_results and only the {WORKER_DEATH_SUMMARY_MARKER!r} '
+            f'half survives; use "; " to separate clauses. Got: {note_fragment!r}'
+        )
+        # Exactly the parse `_aggregate_results` performs: one fragment in,
+        # one fragment out.
+        assert note_fragment.split(', ') == [note_fragment]
+
+    def test_external_kill_still_wins_over_worker_death(self):
+        """ORDERING, pinned: `is_external_kill_rc` is checked FIRST.
+
+        An external kill is the STRONGER no-verdict claim — the process
+        produced no diagnostics at all — so task 3173's wording must not
+        regress just because the (necessarily truncated) output it did capture
+        happens to carry a bailout marker.
+        """
+        summary = self._summarize(-9, _TRUNCATED_TEST_LEG_OUTPUT)
+        assert SIGNAL_KILL_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'killed by signal 9' in summary, f'Unexpected summary: {summary!r}'
+        assert WORKER_DEATH_SUMMARY_MARKER not in summary, (
+            f'Unexpected summary: {summary!r}'
+        )
+
+    def test_untruncated_failing_test_leg_is_byte_identical(self):
+        """REGRESSION GUARD: with no bailout marker anywhere, the summary is
+        exactly today's."""
+        summary = self._summarize(1, 'FAILED orchestrator/tests/test_x.py::y\n')
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+
+
+
 class TestVerifyResultCauseHint:
     """Tests for the ``cause_hint`` field on ``VerifyResult`` and its population.
 
