@@ -486,14 +486,17 @@ class TestDropVectorIndices:
             {
                 'label': 'Entity', 'field': ['name_embedding'],
                 'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
             {
                 'label': 'Entity', 'field': ['name'],
                 'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
             {
                 'label': 'RELATES_TO', 'field': ['fact_embedding'],
                 'type': {'fact_embedding': ['VECTOR']}, 'entity_type': 'RELATIONSHIP',
+                'status': 'OPERATIONAL',
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
@@ -526,10 +529,12 @@ class TestDropVectorIndices:
             {
                 'label': 'Entity', 'field': ['name_embedding'],
                 'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
             {
                 'label': 'Entity', 'field': ['name'],
                 'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
@@ -561,6 +566,7 @@ class TestDropVectorIndices:
                 'field': ['name_embedding', 'name'],
                 'type': {'name_embedding': ['VECTOR'], 'name': ['RANGE']},
                 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
@@ -590,6 +596,7 @@ class TestDropVectorIndices:
             {
                 'label': 'Entity', 'field': ['name'],
                 'type': {'name': ['RANGE', 'VECTOR']}, 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
@@ -619,6 +626,7 @@ class TestDropVectorIndices:
                 'field': ['uuid', 'fact_embedding'],
                 'type': {'uuid': ['RANGE'], 'fact_embedding': ['VECTOR']},
                 'entity_type': 'RELATIONSHIP',
+                'status': 'OPERATIONAL',
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
@@ -649,6 +657,7 @@ class TestDropVectorIndices:
             {
                 'label': 'Entity', 'field': ['name_embedding'],
                 'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
@@ -680,6 +689,7 @@ class TestDropVectorIndices:
                     'name_embedding': ['VECTOR'], 'other_embedding': ['VECTOR'],
                 },
                 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
@@ -701,10 +711,12 @@ class TestDropVectorIndices:
             {
                 'label': 'Entity', 'field': ['name'],
                 'type': {'name': ['FULLTEXT']}, 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
             {
                 'label': 'Entity', 'field': ['created_at'],
                 'type': {'created_at': ['RANGE']}, 'entity_type': 'NODE',
+                'status': 'OPERATIONAL',
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
