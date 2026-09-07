@@ -191,7 +191,7 @@ def _make_transcript(base: Path, session_id: str) -> Path:
 
 def _sidecar(
     session_id: str, role: str, *, task_id: str, fresh: bool,
-    sidecar_version: int, resume_count: int,
+    sidecar_version: int, resume_count: int, age_secs: float | None = None,
 ) -> dict:
     """Build a v1 or v2 ``agent_session.json`` payload.
 
@@ -199,8 +199,18 @@ def _sidecar(
     γ guard rejects it as 'stale'. A v1 sidecar carries only the legacy keys
     (no ``task_id`` / ``resume_count`` / ``schema_version``) — the pre-deploy
     shape (B11).
+
+    ``age_secs`` (task 3730) back-dates by an EXACT age and overrides ``fresh``.
+    δ needs a third position on the age axis — past ``absolute_resume_age_secs``
+    — that ``fresh``'s two-valued vocabulary cannot express, and callers pass a
+    multiple of a config field rather than a literal so a re-derived bound
+    re-tunes the row. ``fresh`` is kept rather than reworked into
+    ``age_secs=0``: every B1–B11 row above reads as "fresh or stale", and
+    restating them in seconds would obscure which threshold each is about.
     """
-    if fresh:
+    if age_secs is not None:
+        started_at = (datetime.now(UTC) - timedelta(seconds=age_secs)).isoformat()
+    elif fresh:
         started_at = datetime.now(UTC).isoformat()
     else:
         window = SessionResumeConfig().freshness_window_secs
@@ -233,6 +243,7 @@ def _setup_warm_lane_session(
     sidecar_version: int = 2,
     resume_count: int = 0,
     lane: bool = True,
+    age_secs: float | None = None,
 ) -> Path:
     """Lay down an on-disk warm lane (or cold worktree) mid-invocation.
 
@@ -245,6 +256,15 @@ def _setup_warm_lane_session(
     ``with_sidecar=False`` models the POST-COMPLETION on-disk state (B10): the
     plan survives but α's ``_invoke`` ``finally`` already cleared the sidecar,
     so recovery finds a plan to recover but NO session to adopt.
+
+    ``with_transcript=False`` is what the δ rows use to model the CRASH-RECOVERY
+    state (task 3730): production's ``cleanup_config_dir`` teardown deletes the
+    live config dir on every such path, so no ``claude-config-*`` tree exists
+    for the boot glob to find and the guard is handed ``config_dir=None``. No
+    separate flag was added for it — this one already expresses exactly that,
+    and a second spelling of the same suppression would be a helper to keep in
+    sync for no gain. ``age_secs`` passes an exact sidecar age through to
+    :func:`_sidecar` (see there for why ``fresh`` was not reworked).
 
     For a warm lane (``lane=True``) a pool is attached and the dir is named
     ``_lane-0`` (≠ the real task_id, by pool-slot design); for a cold worktree
@@ -267,6 +287,7 @@ def _setup_warm_lane_session(
         (task_dir / 'agent_session.json').write_text(json.dumps(_sidecar(
             session_id, role, task_id=task_id, fresh=fresh,
             sidecar_version=sidecar_version, resume_count=resume_count,
+            age_secs=age_secs,
         )))
     if with_transcript:
         _make_transcript(task_dir, session_id)
