@@ -170,6 +170,15 @@ path and keeps all three outcomes distinguishable. Do not "tidy" it away.
 
 #### rc=0 — landed; ancestry has proved it, so not-landed is ruled out
 
+**Which train member actually lands here.** If you arrived from [step 3](#step-3)'s
+*coalesce-absorbed non-tip train member*, only one shape of it reaches this arm: a member whose
+pre-merge rebase was a **no-op** — it was already atop main, so nothing was rewritten, its own
+commits went into the group merge verbatim, and that is why ancestry says rc=0. The **ordinary**
+non-tip member — the one whose stacked shas the pre-merge rebase *did* rewrite while its own ref
+stayed put — can never become an ancestor of main, so it lands on the **rc=1** arm below,
+permanently; see [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
+successor" rule 3, and handle it there rather than here.
+
 Look for a group/train merge, and **verify it before stamping** — a non-empty result is not
 authoritative on its own:
 
