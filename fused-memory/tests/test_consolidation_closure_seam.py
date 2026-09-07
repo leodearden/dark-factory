@@ -15,6 +15,7 @@ event_buffer)``.
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -666,11 +667,16 @@ class _RecordingInterceptor:
 
     def __init__(self):
         self.wire_calls = 0
-        self.scroll = None
-        self.count = None
-        self.exists = None
+        # ``Any``, not ``Callable | None``: these hold the collaborators under
+        # test and are awaited directly below. Mirrors the real signature,
+        # whose parameters are ``Any`` for the same reason.
+        self.scroll: Any = None
+        self.count: Any = None
+        self.exists: Any = None
 
-    def set_consolidation_scroll(self, scroll, count=None, exists=None):
+    def set_consolidation_scroll(
+        self, scroll: Any, count: Any = None, exists: Any = None
+    ) -> None:
         self.wire_calls += 1
         self.scroll = scroll
         self.count = count
