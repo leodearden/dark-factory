@@ -564,6 +564,21 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # uv.lock — and, from a throwaway tree with an EMPTY npm cache (so no warm
 # `_npx` entry can supply a vacuous green), that `npx --offline pyright
 # --version` fails before the install and resolves the pin after it.
+#
+# MIRRORED IN CONTRIBUTING.md (task 4108). The package DIRECTORIES this
+# chain walks are restated there for contributors, inside a
+# `type-check-command-mirror` marker, and pinned by
+# tests/scripts/test_contributing_type_check_command_drift.py. Widening this
+# chain without updating that block is now a RED merge verify, not a silent
+# local-green/gate-red split — it drifted once before the guard existed
+# (task 3397 widened this chain from 3 members to 7; the bullet still named
+# 3 five months later), while CONTRIBUTING.md ALREADY carried a "treat this
+# file as the source of truth if these drift" pointer. That measured failure
+# is why the tie is now mechanical rather than prose. The doc mirrors the
+# DIRECTORIES and their ORDER only, never the runner: it documents `uv run
+# pyright` (wheel lane, uv.lock) against this chain's `npx pyright` (Node
+# lane, package.json), a divergence the guard pins from both ends and
+# tests/scripts/test_pyright_version_pin.py holds to one version.
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright && cd ../shared && npx pyright && cd ../escalation && npx pyright && cd ../sampler && npx pyright && cd ../cockpit && npx pyright"
 
 # Verification timeouts. verify_command_timeout_secs is a PER-COMMAND budget
