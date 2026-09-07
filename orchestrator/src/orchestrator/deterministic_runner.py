@@ -2819,6 +2819,14 @@ class DeterministicRunner:
             WorkflowOutcome.DONE  — gate resolved, task driven to done.
             WorkflowOutcome.BLOCKED — gate filed, open escalation, or deploy failure.
 
+        A unit-inspector failure — a spawn error or a timeout, on either the
+        pre-deploy baseline leg or the crash-window re-verify leg — is NOT
+        raised: task 4157 degrades it to the MainPID=0 sentinel via
+        ``_inspect_unit_guarded``, which routes it into the existing
+        fail-closed escalation for that leg. This discharges the "always
+        returns BLOCKED, never a raw exception" contract stated at
+        deterministic_runner.py:2073-2074 on the recovery paths too.
+
         Raises:
             ValueError — if ``always_escalates`` is False with ``before_done=None``
                 (unsupported misconfiguration in β).
@@ -3699,12 +3707,21 @@ class DeterministicRunner:
 
                 # Capture baseline unit state before the deploy fires
                 inspect_fn = self._unit_inspector or self._default_inspect_unit
-                baseline = await inspect_fn(target_unit)
+                baseline = await self._inspect_unit_guarded(inspect_fn, target_unit)
 
                 # Task 2091 (baseline-leg hardening): a wedged/failed baseline
                 # inspect returns the same MainPID=0/ActiveState='' sentinel
                 # dict used on the verify leg (see _default_inspect_unit's
-                # TimeoutError branch). On the VERIFY leg that sentinel is
+                # TimeoutError branch).
+                #
+                # Task 4157: that sentinel now also stands in for a SPAWN
+                # failure (missing `systemctl`, or a fork failure under
+                # resource pressure), not only a timeout. Both modes arrive
+                # here via `_inspect_unit_guarded` above — which is what keeps
+                # the gate below reachable at all, since an unguarded OSError
+                # would escape run() entirely and file no escalation.
+                #
+                # On the VERIFY leg that sentinel is
                 # already caught by the `pid > 0` half of the freshness check
                 # below. On the BASELINE leg it is NOT: baseline_monotonic
                 # would silently become 0, and `new_monotonic >
