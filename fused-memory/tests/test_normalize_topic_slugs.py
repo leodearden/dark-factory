@@ -1509,6 +1509,13 @@ class TestPairGateBlocks:
             groups[0].new_topic = 'other'  # type: ignore[misc]
 
 
+def _one_group(renames, gate_tasks=()) -> object:
+    """The single :class:`GateGroup` a writer test drives, unpacked."""
+    groups, _skips = _mod.pair_gate_blocks(renames, list(gate_tasks))
+    assert len(groups) == 1, groups
+    return groups[0]
+
+
 class TestGateLockstepWriter:
     """``rename_group(memory_service, group, *, apply, client)``.
 
@@ -1523,7 +1530,7 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'gate_topic'))
         service = _stateful_service(records)
         client = _client()
-        group, = _mod.pair_gate_blocks(
+        group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
@@ -1548,7 +1555,7 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'gate_topic'))
         service = _stateful_service(records)
         client = _client()
-        group, = _mod.pair_gate_blocks(
+        group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
@@ -1567,7 +1574,7 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'gate_topic'))  # m2 is absent -> memory_not_found
         service = _stateful_service(records)
         client = _client()
-        group, = _mod.pair_gate_blocks(
+        group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
              _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
@@ -1592,7 +1599,7 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'gate_topic'), ('m2', 'gate_topic'))
         service = _stateful_service(records)
         client = _client(result={'success': False, 'error': 'done_provenance_via_update_task'})
-        group, = _mod.pair_gate_blocks(
+        group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
              _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
@@ -1614,7 +1621,7 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'gate_topic'))
         service = _stateful_service(records)
         client = _client(error=RuntimeError('mcp down'))
-        group, = _mod.pair_gate_blocks(
+        group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
@@ -1630,7 +1637,7 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'gate_topic'))
         service = _stateful_service(records)
         client = _client(error=RuntimeError('mcp down'))
-        group, = _mod.pair_gate_blocks(
+        group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
@@ -1657,8 +1664,8 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'plain_topic'))
         service = _stateful_service(records)
         client = _client()
-        group, = _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')], [])
+        group = _one_group(
+            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
 
         results, gate_row = await _mod.rename_group(
             service, group, apply=True, client=client)
@@ -1671,8 +1678,8 @@ class TestGateLockstepWriter:
     async def test_an_ungated_group_runs_without_a_client_at_all(self):
         """A run that reaches no gate must not require an MCP handshake."""
         records = _store(('m1', 'plain_topic'))
-        group, = _mod.pair_gate_blocks(
-            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')], [])
+        group = _one_group(
+            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')])
 
         results, gate_row = await _mod.rename_group(
             _stateful_service(records), group, apply=True, client=None)
@@ -1685,7 +1692,7 @@ class TestGateLockstepWriter:
         """Unable to move the gate is the same verdict as refused to move it."""
         records = _store(('m1', 'gate_topic'))
         service = _stateful_service(records)
-        group, = _mod.pair_gate_blocks(
+        group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])
 
@@ -1701,7 +1708,7 @@ class TestGateLockstepWriter:
         records = _store(('m1', 'gate-topic'), ('m2', 'gate_topic'))
         service = _stateful_service(records)
         client = _client(error=RuntimeError('mcp down'))
-        group, = _mod.pair_gate_blocks(
+        group = _one_group(
             [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
              _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
             [_gate_task('4220', 'gate_topic')])

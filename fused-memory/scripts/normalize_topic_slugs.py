@@ -58,6 +58,7 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
+from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
@@ -82,6 +83,13 @@ _CENSUS_SCRIPT_PATH = (
 # be imported from, so its ``__all__`` grants the shared rule no second home.
 __all__ = [
     'DEFAULT_MAX_PAGES',
+    'GATE_METADATA_KEY',
+    'GateGroup',
+    'WriteRejectedError',
+    'assert_write_accepted',
+    'load_mcp_client_class',
+    'pair_gate_blocks',
+    'rename_group',
     'WRITE_REASON',
     'WRITE_SOURCE',
     'DEFAULT_PAGE_SIZE',
@@ -115,6 +123,7 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'topic_moved_since_plan',
     'update_failed',
     'rename_error',
+    'gate_lockstep_failed',
     'legacy_slug_residue',
 })
 
@@ -136,6 +145,9 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'topic_moved_since_plan',
     'update_failed',
     'rename_error',
+    # from pair_gate_blocks / rename_group — the two-store lockstep
+    'orphan_gate_topic',
+    'gate_lockstep_failed',
     # from verify_old_slugs_drained
     'legacy_slug_residue',
 )
@@ -729,6 +741,366 @@ async def rename_one(memory_service, rename: Rename, *, apply: bool) -> dict:
             'response': response,
         }
     return {**base, 'outcome': 'renamed', 'response': response}
+
+
+# ---------------------------------------------------------------------------
+# The two-store lockstep — memories and the consolidation gate move together
+# ---------------------------------------------------------------------------
+
+class WriteRejectedError(RuntimeError):
+    """An MCP tool call that returned an error envelope inside a success frame."""
+
+
+def assert_write_accepted(result: object, *, tool: str = 'update_task') -> None:
+    """Raise :class:`WriteRejectedError` on a tool-level rejection.
+
+    Restated locally from ``migrate_task_metadata_to_x_namespace.py`` for the
+    same reason it exists there: an accepted ``update_task`` returns
+    ``{'id', 'message', 'updated', 'updated_task'}`` and a REFUSED one returns
+    ``{'success': False, 'error': <code>, ...}`` — inside the SAME successful
+    JSON-RPC envelope.  Nothing raises.  A caller guarding only against
+    exceptions therefore scores a refused gate move as a completed one, which
+    is precisely the state this lockstep exists to make unreachable.
+
+    The rejection most likely to fire here is the ``done_provenance``
+    write-authority floor, which refuses any whole-blob metadata replace of a
+    done/merged task.  This writer never sends one — see :func:`rename_group`
+    — but the guard is what makes that a checked claim rather than a hope.
+    """
+    if not isinstance(result, dict):
+        return
+    if result.get('success') is False or result.get('error'):
+        raise WriteRejectedError(
+            f'{tool} was REJECTED by the server (the JSON-RPC envelope was '
+            f'still a success, so this would otherwise be invisible): '
+            f'error={result.get("error")!r} '
+            f'error_type={result.get("error_type")!r} '
+            f'hint={result.get("hint")!r}'
+        )
+
+
+@dataclass(frozen=True)
+class GateGroup:
+    """Every rename on one slug, plus the gate task that must move with them.
+
+    The unit of atomicity.  Renames are grouped by ``(project_id, old_topic)``
+    rather than handled one record at a time because the gate's closure scroll
+    addresses a TOPIC, not a record: moving four of a slug's five records
+    splits the cluster just as badly as moving none of them.
+
+    Attributes:
+        project_id: The corpus this slug lives in.
+        old_topic / new_topic: The slug's move, shared by every member.
+        renames: The frozen plan rows, in plan order.
+        gate_task_id: The consolidation gate filed against *old_topic*, or
+            ``None`` — most topics are not gates, and an ungated group needs
+            no MCP handshake at all.
+        gate_project_root: The gate task's project root (tasks are addressed
+            by root, memories by project id — a genuinely different store).
+        gate_block: The PATCHED ``x_recon_consolidation_gate`` block: the
+            live one with ``topic`` moved and every sibling key carried across
+            verbatim.  Built at plan time so the artifact shows exactly what
+            ``--apply`` will send.
+    """
+
+    project_id: str
+    old_topic: str
+    new_topic: str
+    renames: tuple[Rename, ...]
+    gate_task_id: str | None = None
+    gate_project_root: str | None = None
+    gate_block: dict[str, Any] | None = None
+
+
+def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
+    """Pair each slug's renames with the consolidation gate filed against it.
+
+    Pure.  Takes the plan rows and the gate tasks as plain dicts (``{'id',
+    'project_id', 'project_root', 'metadata'}`` — the shape MCP ``get_task``
+    hands over) and returns ``(groups, skips)``.
+
+    ``metadata.x_recon_consolidation_gate`` is a Tier-C block on TASK
+    metadata, read by ``reconciliation/consolidation_gate.py`` and enforced on
+    the ``done`` transition by ``middleware/task_interceptor.py``.  Its
+    ``topic`` is what the closure scroll matches on, so a gate left behind on
+    a slug this sweep vacated becomes permanently uncloseable — the trap this
+    task exists to remove, re-created at a new address.
+
+    The patch moves ``topic`` and NOTHING else: ``provenance``,
+    ``considered_and_kept`` and any future sibling are copied across verbatim.
+    A block rebuilt from scratch would silently drop the provenance a curator
+    needs to adjudicate the gate.  The source task is never mutated — the
+    planner's whole job is to leave the corpus untouched.
+
+    An unmatched gate on a NON-conforming slug is reported as
+    ``orphan_gate_topic``: this sweep found no live record carrying it, so
+    renaming would not help and staying silent would hide a gate that is
+    already uncloseable.  An unmatched gate on a CONFORMING slug is neither
+    work nor an orphan and is reported nowhere — nothing to migrate is not
+    the same fact as a dangling gate.
+    """
+    # (project_id, topic) -> the gate tasks carrying it, lowest id first so a
+    # pairing is a property of the corpus rather than of read order.
+    gates_by_topic: dict[tuple[str, str], list[dict]] = {}
+    for task in gate_tasks or ():
+        metadata = task.get('metadata') or {}
+        block = metadata.get(GATE_METADATA_KEY)
+        if not isinstance(block, dict):
+            continue
+        topic = block.get('topic')
+        if not isinstance(topic, str) or not topic:
+            continue
+        key = (str(task.get('project_id') or ''), topic)
+        gates_by_topic.setdefault(key, []).append(task)
+    for bucket in gates_by_topic.values():
+        bucket.sort(key=lambda t: str(t.get('id')))
+
+    by_slug: dict[tuple[str, str], list[Rename]] = {}
+    for rename in renames or ():
+        by_slug.setdefault((rename.project_id, rename.old_topic), []).append(rename)
+
+    groups: list[GateGroup] = []
+    paired: set[tuple[str, str]] = set()
+    for key, members in sorted(by_slug.items(), key=lambda kv: (kv[0][0], kv[1][0].new_topic)):
+        project_id, old_topic = key
+        gate = (gates_by_topic.get(key) or [None])[0]
+        block: dict[str, Any] | None = None
+        if gate is not None:
+            paired.add((project_id, old_topic, str(gate.get('id'))))
+            live_block = gate['metadata'][GATE_METADATA_KEY]
+            # Copy, then move exactly one key: the source task stays as read.
+            block = {**live_block, 'topic': members[0].new_topic}
+        groups.append(GateGroup(
+            project_id=project_id,
+            old_topic=old_topic,
+            new_topic=members[0].new_topic,
+            renames=tuple(members),
+            gate_task_id=None if gate is None else str(gate.get('id')),
+            gate_project_root=None if gate is None else gate.get('project_root'),
+            gate_block=block,
+        ))
+    groups.sort(key=lambda g: (g.project_id, g.new_topic))
+
+    skips: list[dict] = []
+    for (project_id, topic), bucket in gates_by_topic.items():
+        for task in bucket:
+            if (project_id, topic, str(task.get('id'))) in paired:
+                continue
+            if is_valid_topic_slug(topic):
+                continue
+            skips.append({
+                'reason': 'orphan_gate_topic',
+                'project_id': project_id,
+                'gate_task_id': str(task.get('id')),
+                'gate_project_root': task.get('project_root'),
+                'gate_topic': topic,
+                'note': (
+                    'a consolidation gate carries a non-conforming slug that '
+                    'THIS sweep matched to no live record, so normalizing the '
+                    'corpus will not close it — the gate needs hand work '
+                    '(check the under_enumerated bucket before concluding the '
+                    'cluster is genuinely empty)'
+                ),
+            })
+    skips.sort(key=lambda s: (s['project_id'], s['gate_topic'], s['gate_task_id']))
+    return groups, skips
+
+
+def _gate_row(group: GateGroup, outcome: str, **extra) -> dict:
+    return {
+        'project_id': group.project_id,
+        'gate_task_id': group.gate_task_id,
+        'gate_project_root': group.gate_project_root,
+        'old_topic': group.old_topic,
+        'new_topic': group.new_topic,
+        'memory_ids': [r.memory_id for r in group.renames],
+        'outcome': outcome,
+        **extra,
+    }
+
+
+async def _undo_group(memory_service, group: GateGroup, results: list[dict]) -> list[dict]:
+    """Put back exactly the writes THIS run made, and report what would not go.
+
+    An undo is just a rename in the opposite direction, so it runs through
+    :func:`rename_one` rather than a second write path — same live re-read,
+    same narrow metadata-only patch, same guard posture.
+
+    Only rows scored ``renamed`` are reversed.  A record that was
+    ``already_normalized`` arrived at the new value before this sweep touched
+    it; "undoing" it would be this script inventing a write of its own, and
+    would move a record the operator never asked it to move.
+    """
+    failures: list[dict] = []
+    for result in results:
+        if result.get('outcome') != 'renamed':
+            continue
+        undo = await rename_one(
+            memory_service,
+            Rename(
+                project_id=result['project_id'],
+                memory_id=result['memory_id'],
+                old_topic=result['new_topic'],
+                new_topic=result['old_topic'],
+            ),
+            apply=True,
+        )
+        if undo.get('outcome') != 'renamed':
+            failures.append({
+                'memory_id': result['memory_id'],
+                'outcome': undo.get('outcome'),
+                'error': undo.get('error') or undo.get('error_type'),
+            })
+        result['undone'] = undo.get('outcome') == 'renamed'
+        result['outcome'] = 'gate_lockstep_failed'
+    return failures
+
+
+async def rename_group(
+    memory_service,
+    group: GateGroup,
+    *,
+    apply: bool,
+    client: Any = None,
+) -> tuple[list[dict], dict | None]:
+    """Move one slug in both stores, or leave it exactly where it started.
+
+    Order, and why it is this way round:
+
+    1. **the memory renames**, all of them, through :func:`rename_one`;
+    2. **the gate patch**, and only once every one of them succeeded.
+
+    The gate is second because it is the single atomic write of the pair: N
+    record patches cannot be made atomic, so the one call that can be is the
+    commit point.  If it is refused, step 1 is UNDONE, so the pair's net state
+    is unchanged and the group is reported as ``gate_lockstep_failed``.  A
+    failed half never stands alone in either direction — memories on the new
+    slug with the gate on the old, or the gate on the new with the records on
+    the old, are the SAME uncloseable-gate failure, just seen from two sides.
+
+    (The undo is why "hold the whole group" is achievable at all with
+    memory-first ordering.  It is deliberately narrow: it reverses only the
+    writes this run made, and a reversal that itself fails is named on the row
+    — an operator must never have to infer that a half-applied state exists.)
+
+    An UNGATED group is the common case and short-circuits after step 1: it
+    needs no client, so a sweep that touches no gate never opens a socket.
+    A GATED group with no client is the same verdict as a refused gate —
+    unable to move it is not permission to leave it behind.
+
+    Returns:
+        ``(memory results, gate row or None)``.  Rows whose write was undone
+        are re-scored ``gate_lockstep_failed`` so the report never claims a
+        rename that no longer stands; rows that never wrote keep their own
+        diagnosis, which is the actionable one.
+    """
+    results = [
+        await rename_one(memory_service, rename, apply=apply)
+        for rename in group.renames
+    ]
+    if group.gate_task_id is None:
+        return results, None
+
+    stood = {'renamed', 'would_rename', 'already_normalized'}
+    failed = [r for r in results if r.get('outcome') not in stood]
+    if failed:
+        undo_failures = await _undo_group(memory_service, group, results)
+        logger.warning(
+            'GATE LOCKSTEP HELD project=%s topic=%s -> %s: %d of %d memory writes '
+            'did not stand, so gate task %s was NOT patched.',
+            group.project_id, group.old_topic, group.new_topic,
+            len(failed), len(results), group.gate_task_id,
+        )
+        return results, _gate_row(
+            group, 'gate_lockstep_failed',
+            half='memory',
+            error=f'{len(failed)} of {len(results)} memory renames did not stand',
+            failed_outcomes=sorted({str(r.get('outcome')) for r in failed}),
+            undo_failures=undo_failures,
+            note=(
+                'the gate patch was withheld, so the gate still points at the '
+                'legacy slug — resolve the memory-side failures and re-run'
+            ),
+        )
+
+    if not apply:
+        return results, _gate_row(group, 'would_patch_gate', patch=group.gate_block)
+
+    error: str | None = None
+    if client is None:
+        error = (
+            'no MCP client: the gate half of this pair could not be attempted, '
+            'and an unmovable gate is refused exactly like a refused one'
+        )
+    else:
+        payload = {
+            'id': group.gate_task_id,
+            'project_root': group.gate_project_root,
+            # A NARROW merge of one Tier-C block, never a whole-blob replace:
+            # `update_task` refuses any replace carrying `done_provenance`, and
+            # a replace here would also stake the task's entire metadata on
+            # this script having read it back correctly.
+            'metadata': {GATE_METADATA_KEY: dict(group.gate_block or {})},
+            'metadata_mode': 'merge',
+        }
+        try:
+            response = await client.call_tool('update_task', payload)
+            assert_write_accepted(response, tool='update_task')
+        except Exception as exc:
+            error = f'{type(exc).__name__}: {exc}'
+        else:
+            return results, _gate_row(
+                group, 'gate_patched', patch=group.gate_block, response=response)
+
+    undo_failures = await _undo_group(memory_service, group, results)
+    logger.warning(
+        'GATE LOCKSTEP HELD project=%s topic=%s -> %s: gate task %s was not '
+        'patched (%s); %d memory write(s) undone, %d undo failure(s).',
+        group.project_id, group.old_topic, group.new_topic, group.gate_task_id,
+        error, len(group.renames), len(undo_failures),
+    )
+    return results, _gate_row(
+        group, 'gate_lockstep_failed',
+        half='gate', error=error, undo_failures=undo_failures,
+        note=(
+            'the memory half was undone so the slug is unchanged in BOTH '
+            'stores; a gate left pointing at a slug no record carries is '
+            'permanently uncloseable, which is worse than not migrating'
+        ),
+    )
+
+
+def load_mcp_client_class() -> type:
+    """Reuse ``FusedMemoryClient`` from ``strip_leaked_control_keys.py``.
+
+    Loaded lazily and by path, exactly as
+    ``migrate_task_metadata_to_x_namespace._load_sibling_client`` does — that
+    script established this route for task-metadata writes, and there is ONE
+    JSON-RPC handshake in this repo (INV-5).  A second protocol client here
+    would be a second thing to keep in step with the server.
+
+    Lazy so the pure planner, the pairing and the CLI parser stay importable
+    with no HTTP dependency, and so the tests — which inject a double — never
+    reach this function at all.
+    """
+    import importlib.util  # noqa: PLC0415
+
+    sibling = Path(__file__).parent / 'strip_leaked_control_keys.py'
+    mod_name = 'strip_leaked_control_keys'
+    existing = sys.modules.get(mod_name)
+    if existing is not None and hasattr(existing, 'FusedMemoryClient'):
+        return existing.FusedMemoryClient
+    spec = importlib.util.spec_from_file_location(mod_name, sibling)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load the JSON-RPC client from {sibling}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module.FusedMemoryClient
 
 
 # ---------------------------------------------------------------------------
