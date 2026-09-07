@@ -390,6 +390,26 @@ def main() -> None:
             print(f'Qdrant unreachable ({exc}), skipping', file=sys.stderr)
             return
 
+        # SECOND lease check.  Two rather than one, and they buy different
+        # things: the first bought a zero-network exit, this one covers the
+        # listing round-trip above — the part of the sweep where the wall
+        # clock actually goes, so a lease taken during it would be invisible
+        # to a check placed only before it.  This return is INSIDE the `try`,
+        # so it leaves through the `finally` that closes the client.
+        #
+        # Re-checking before each individual delete was rejected: the deletes
+        # are the fast part, so it would add N directory scans to close a
+        # window this already collapsed.  What survives is a holder that
+        # writes its lease AND creates its collections entirely inside the
+        # delete loop — sub-second, against a job that runs every six hours.
+        # Named rather than implied: a guard described as airtight when it is
+        # not is how the next reader mis-diagnoses the failure it finally
+        # causes.
+        holders = live_leases()
+        if holders:
+            _report_hold_off(holders)
+            return
+
         for col in collections:
             if not col.name.startswith(PREFIXES):
                 continue
