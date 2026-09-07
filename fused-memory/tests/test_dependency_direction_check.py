@@ -16,10 +16,14 @@ no Graphiti and no I/O.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+import logging
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import MockAddEpisodeResult, MockEdge, install_identity_mocks
 
 from fused_memory.middleware.dependency_direction_check import (
     REVERSED,
@@ -32,6 +36,10 @@ from fused_memory.middleware.dependency_direction_check import (
     classify_dependency_assertion,
     extract_dependency_assertions,
 )
+from fused_memory.services.memory_service import MemoryService
+
+#: The logger the sub-pass emits its structured WARNING through.
+_MS_LOGGER = 'fused_memory.services.memory_service'
 
 # ── The frozen ground-truth fixture ────────────────────────────────────────
 #
@@ -442,3 +450,159 @@ class TestKnownBadEpisodeFacts:
         finding = check_dependency_direction(edges, index)[0]
         with pytest.raises(dataclasses.FrozenInstanceError):
             finding.classification = REVERSED  # type: ignore[misc]
+
+
+# ── The MemoryService adapter — the only place any I/O happens ─────────────
+
+GROUP = 'dark_factory'
+
+
+def _service(mock_config):
+    """MemoryService with fully-mocked backends.
+
+    `install_identity_mocks` is required, not decorative: the post-write
+    sub-passes run inside `_execute_graphiti_write`'s
+    `async with self.graphiti._identity_lock_for(...)`, which a bare MagicMock
+    cannot satisfy.
+    """
+    svc = MemoryService(mock_config)
+    svc.graphiti = MagicMock()
+    svc.graphiti.add_episode = AsyncMock(return_value=None)
+    svc.graphiti._require_client = MagicMock()
+    install_identity_mocks(svc.graphiti)
+    svc.update_edge = AsyncMock(return_value={})
+    svc.taskmaster = AsyncMock()
+    svc.taskmaster.get_dependency_edges = AsyncMock(return_value=LIVE_SHAPE_EDGES)
+    svc.set_known_projects({GROUP: '/srv/dark-factory'})
+    return svc
+
+
+def _result(facts: dict[str, str], *, field: str = 'edges'):
+    edges = [MockEdge(fact=fact, uuid=uuid) for uuid, fact in facts.items()]
+    return MockAddEpisodeResult(**{field: edges})
+
+
+class TestMemoryServiceSubPass:
+    """The thin adapter: gate, resolve, read, classify, flag. It never repairs."""
+
+    @pytest.mark.asyncio
+    async def test_a_out_of_scope_short_circuits_before_any_taskmaster_read(
+        self, mock_config
+    ):
+        svc = _service(mock_config)
+        result = _result({'e1': 'Task 3727 and task 3619 were both filed today'})
+
+        assert await svc._check_dependency_direction(result, group_id=GROUP) == 0
+
+        # The restriction to compact dependency shorthand is what keeps a
+        # blanket check off every write. Pinned so it cannot silently erode.
+        svc.taskmaster.get_dependency_edges.assert_not_awaited()
+        svc.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_b_flagged_edges_are_invalidated_never_rewritten(self, mock_config):
+        svc = _service(mock_config)
+        result = _result({**BAD_FACTS, **CORRECT_FACTS})
+
+        assert await svc._check_dependency_direction(result, group_id=GROUP) == 3
+
+        calls = svc.update_edge.await_args_list
+        assert {c.args[0] for c in calls} == set(BAD_FACTS)
+        for call in calls:
+            assert call.kwargs['invalid_at'] is not None
+            # Flag, never silently correct.
+            assert 'fact' not in call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_c_correct_facts_are_never_invalidated(self, mock_config):
+        svc = _service(mock_config)
+        result = _result({**BAD_FACTS, **CORRECT_FACTS})
+        await svc._check_dependency_direction(result, group_id=GROUP)
+        touched = {c.args[0] for c in svc.update_edge.await_args_list}
+        assert touched.isdisjoint(CORRECT_FACTS)
+
+    @pytest.mark.asyncio
+    async def test_d_each_mismatch_is_logged_at_warning_with_the_finding(
+        self, mock_config, caplog
+    ):
+        svc = _service(mock_config)
+        with caplog.at_level(logging.WARNING, logger=_MS_LOGGER):
+            await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
+
+        blob = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        for uuid, fact in BAD_FACTS.items():
+            assert uuid in blob
+            assert fact in blob
+        assert REVERSED in blob and SIBLING_SEQUENTIAL in blob
+
+    @pytest.mark.asyncio
+    async def test_e_project_root_resolution_and_its_fallback(self, mock_config):
+        svc = _service(mock_config)
+        result = _result(BAD_FACTS)
+
+        await svc._check_dependency_direction(result, group_id=GROUP)
+        assert svc.taskmaster.get_dependency_edges.await_args.args[0] == (
+            '/srv/dark-factory'
+        )
+
+        # Unknown group -> the _memory_metadata_project_root() fallback.
+        svc.taskmaster.get_dependency_edges.reset_mock()
+        svc.set_known_projects({})
+        svc._memory_metadata_project_root = MagicMock(return_value='/fallback')
+        await svc._check_dependency_direction(result, group_id=GROUP)
+        assert svc.taskmaster.get_dependency_edges.await_args.args[0] == '/fallback'
+
+        # Unresolvable -> 0, and no taskmaster call at all.
+        svc.taskmaster.get_dependency_edges.reset_mock()
+        svc._memory_metadata_project_root = MagicMock(return_value='')
+        assert await svc._check_dependency_direction(result, group_id=GROUP) == 0
+        svc.taskmaster.get_dependency_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_f_no_taskmaster_returns_zero_without_raising(self, mock_config):
+        svc = _service(mock_config)
+        svc.taskmaster = None
+        assert await svc._check_dependency_direction(
+            _result(BAD_FACTS), group_id=GROUP
+        ) == 0
+
+    @pytest.mark.asyncio
+    async def test_g_ground_truth_read_failure_returns_zero(self, mock_config):
+        svc = _service(mock_config)
+        svc.taskmaster.get_dependency_edges = AsyncMock(side_effect=RuntimeError('db'))
+        assert await svc._check_dependency_direction(
+            _result(BAD_FACTS), group_id=GROUP
+        ) == 0
+        svc.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_g_per_edge_failure_is_best_effort(self, mock_config):
+        svc = _service(mock_config)
+        svc.update_edge = AsyncMock(
+            side_effect=[RuntimeError('boom'), {}, {}]
+        )
+        # The remaining flagged edges are still attempted.
+        await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
+        assert svc.update_edge.await_count == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt])
+    async def test_g_lifecycle_exceptions_propagate(self, mock_config, exc):
+        svc = _service(mock_config)
+        svc.taskmaster.get_dependency_edges = AsyncMock(side_effect=exc)
+        with pytest.raises(exc):
+            await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
+
+        svc = _service(mock_config)
+        svc.update_edge = AsyncMock(side_effect=exc)
+        with pytest.raises(exc):
+            await svc._check_dependency_direction(_result(BAD_FACTS), group_id=GROUP)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['edges', 'entity_edges'])
+    async def test_h_both_result_edge_fields_are_honoured(self, mock_config, field):
+        svc = _service(mock_config)
+        result = _result(BAD_FACTS, field=field)
+        assert await svc._check_dependency_direction(result, group_id=GROUP) == 3
