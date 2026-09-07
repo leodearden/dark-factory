@@ -6,8 +6,10 @@ test-first.  See task 5147.)
 
 from __future__ import annotations
 
+import ast
 import re
 import textwrap
+from typing import NamedTuple
 
 import yaml
 from _orch_helpers import (
@@ -15,6 +17,8 @@ from _orch_helpers import (
     PYPROJECT_DEFAULT_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
 )
+
+from orchestrator.pytest_markers import _marker_name, _pytestmark_value
 
 #: The per-module merge-verify config whose ``test_command`` carries the
 #: ``--timeout=N`` that verify actually passes to pytest.  Resolved from
@@ -30,6 +34,212 @@ _ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
 #: on every per-module orchestrator.yaml).  Both the ``--timeout=300`` and
 #: ``--timeout 300`` spellings are accepted, exactly as it does.
 _TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
+
+#: Names a ``pytest.mark.timeout(...)`` argument may resolve to, and the
+#: seconds each one carries.  A literal MAP rather than an import, because none
+#: of the three is importable from ``_orch_helpers``: two are defined
+#: FILE-LOCALLY in the modules that use them --
+#: ``HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s``
+#: (test_merge_queue_concurrent_verify.py) and ``PYTEST_TIMEOUT = 960`` (in
+#: BOTH test_pytest_marker_deselection.py and test_warm_lane_bash_suite.py).
+#: This is where the shape departs from its template:
+#: ``_SANCTIONED_CEILING_NAMES`` in test_whole_tree_scan_timeout_guard.py is a
+#: one-element frozenset paired with a single hard-coded
+#: ``float(WHOLE_TREE_SCAN_TEST_TIMEOUT)``, which does not generalise to three
+#: names at two distinct values.
+#:
+#: These are cross-module MIRRORS, so state the failure mode plainly: a mirror
+#: that goes stale can only ever produce a false OFFENDER, never a false pass.
+#: Every value here sits OUTSIDE the inversion band (300 at its open upper
+#: edge, 960 well clear), so the only way a wrong number changes an answer is
+#: by dragging a name INTO the band -- which fails loudly at commit time and
+#: names the site.  Silence is not among the outcomes.
+_SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
+    'WHOLE_TREE_SCAN_TEST_TIMEOUT': 300.0,
+    'HEAVY_BARRIER_TEST_TIMEOUT': 300.0,
+    'PYTEST_TIMEOUT': 960.0,
+    'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
+}
+
+#: Qualname suffix for a ``pytestmark`` binding inside a class body, and the
+#: whole qualname for a module-level one.  Angle brackets because no Python
+#: identifier can contain them, so these can never collide with a real
+#: function or class name in the allowlist's ``(module, qualname)`` key.
+_MODULE_QUALNAME = '<module>'
+_PYTESTMARK_QUALNAME = '<pytestmark>'
+
+
+class _Site(NamedTuple):
+    """One ``pytest.mark.timeout(...)`` occurrence found in a source file.
+
+    ``seconds`` is None when the argument is present but UNRESOLVABLE, or
+    absent entirely -- "no opinion", never "too small".  See
+    :func:`_timeout_marker_sites`.
+    """
+
+    qualname: str
+    kind: str
+    seconds: float | None
+    lineno: int
+
+
+def _timeout_call_arg(call: ast.Call) -> ast.expr | None:
+    """The seconds expression a ``pytest.mark.timeout(...)`` *call* pins.
+
+    Both spellings pytest-timeout accepts are read: positional ``timeout(300)``
+    and keyword ``timeout(timeout=300)``.  A call with neither (``timeout()``,
+    or one passing only ``method=``) yields None.  Same contract as
+    test_whole_tree_scan_timeout_guard.py's function of this name; kept
+    separate rather than imported because that module is a guard, not a
+    helper library, and importing across two guards would couple their
+    collection order.
+    """
+    if call.args:
+        return call.args[0]
+    for keyword in call.keywords:
+        if keyword.arg == 'timeout':
+            return keyword.value
+    return None
+
+
+def _resolve_seconds(arg: ast.expr | None) -> float | None:
+    """Seconds *arg* pins, if statically knowable.
+
+    RESOLUTION, deliberately tiny -- generalised from
+    ``_module_level_timeout_ceiling``'s rules
+    (test_whole_tree_scan_timeout_guard.py):
+
+    * a numeric literal resolves to itself.  ``bool`` is excluded explicitly:
+      it is an ``int`` subclass, so ``timeout(True)`` would otherwise resolve
+      to 1.0 and read as an absurdly tight bound;
+    * a name in :data:`_SANCTIONED_TIMEOUT_NAMES`, bare (``ast.Name``, the
+      house ``from _orch_helpers import`` idiom) or dotted (``ast.Attribute``,
+      compared on the trailing name only), resolves to that constant's value;
+    * ANYTHING else -- arithmetic, an ``int(...)`` call, an f-string, an
+      unfamiliar constant -- is UNKNOWABLE and yields None.
+
+    None means "no opinion", never "too small": :func:`_inverts` must not treat
+    it as an offence.  The consequence, stated rather than hidden: a marker
+    that pins an in-band value through an indirection this grammar cannot
+    follow is NOT caught.  Like the whole sweep, this is a FLOOR.
+    """
+    if arg is None:
+        return None
+    if (
+        isinstance(arg, ast.Constant)
+        and isinstance(arg.value, int | float)
+        and not isinstance(arg.value, bool)
+    ):
+        return float(arg.value)
+    name: str | None = None
+    if isinstance(arg, ast.Name):
+        name = arg.id
+    elif isinstance(arg, ast.Attribute):
+        name = arg.attr
+    if name is None:
+        return None
+    return _SANCTIONED_TIMEOUT_NAMES.get(name)
+
+
+def _timeout_sites_in(elements: list[ast.expr], qualname: str, kind: str) -> list[_Site]:
+    """Every ``timeout`` mark among *elements*, as sites keyed *qualname*/*kind*.
+
+    *elements* is a decorator list or the unpacked value of a ``pytestmark``
+    binding.  Non-``timeout`` marks yield no site at all (rather than a site
+    with None seconds), so an ``@pytest.mark.asyncio`` never shows up in a
+    census of timeout coverage.
+    """
+    sites: list[_Site] = []
+    for element in elements:
+        if not isinstance(element, ast.Call) or _marker_name(element) != 'timeout':
+            continue
+        sites.append(
+            _Site(
+                qualname=qualname,
+                kind=kind,
+                seconds=_resolve_seconds(_timeout_call_arg(element)),
+                lineno=element.lineno,
+            )
+        )
+    return sites
+
+
+def _mark_elements(value: ast.expr) -> list[ast.expr]:
+    """A ``pytestmark`` binding's marks, unwrapping the list/tuple form."""
+    return list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+
+
+def _timeout_marker_sites(source: str) -> tuple[_Site, ...]:
+    """Every ``pytest.mark.timeout(...)`` site in *source*, with its resolved seconds.
+
+    WHY THIS EXISTS SEPARATELY from
+    ``test_whole_tree_scan_timeout_guard.py::_module_level_timeout_ceiling``:
+    that helper answers "what MODULE-LEVEL ceiling does this file pin", which
+    is the right question for a per-FILE family invariant and the wrong one
+    here.  A module-level ``pytestmark`` is the only form that is a sound LOWER
+    bound on every collected item, which is exactly why that guard reads it and
+    nothing else -- and exactly why it is blind to the population this module
+    polices.  The measured census found 62 in-band markers and only a handful
+    were module-level; the dominant spellings are the per-test DECORATOR and
+    the per-CLASS decorator, neither of which that helper can see.  So this
+    generalises its value resolution rather than replacing it: the existing
+    guard keeps its narrower, stricter family invariant untouched.
+
+    FOUR BINDING FORMS are collected, each keyed by a qualname that identifies
+    the site stably across ordinary edits (the allowlist is keyed on
+    ``(module, qualname)``, never a line number):
+
+    * a function/method decorator -> ``test_a`` or ``TestThing::test_a``;
+    * a class decorator -> ``TestThing``;
+    * a module-level ``pytestmark`` -> ``<module>``;
+    * a class-level ``pytestmark`` -> ``TestThing::<pytestmark>``.
+
+    Nesting deeper than one class is walked for classes but not for closures:
+    a decorator on a function defined INSIDE another function is not a
+    collected pytest item, so it is not a site.
+
+    ``_marker_name`` and ``_pytestmark_value`` are imported from
+    :mod:`orchestrator.pytest_markers` rather than re-derived, for the same
+    reason test_whole_tree_scan_timeout_guard.py imports them: the grammar of a
+    ``pytest.mark.NAME`` element and of a ``pytestmark`` binding (``Assign`` vs
+    ``AnnAssign``, list/tuple element forms) belongs in exactly one place, and
+    a rename there should break this import loudly at collection rather than
+    let two readings of the same syntax drift apart.
+
+    FAIL-SOFT: unparseable source yields an EMPTY tuple and never raises.  The
+    sweep reads every ``*.py`` under this directory, deliberately-malformed
+    fixtures included, and a parse failure must not turn a timeout-coverage
+    guard red for a reason unrelated to timeout coverage.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return ()
+
+    sites: list[_Site] = []
+
+    def walk(body: list[ast.stmt], prefix: str) -> None:
+        for statement in body:
+            bound = _pytestmark_value(statement)
+            if bound is not None:
+                qualname = f'{prefix}{_PYTESTMARK_QUALNAME}' if prefix else _MODULE_QUALNAME
+                kind = 'class-pytestmark' if prefix else 'module-pytestmark'
+                sites.extend(_timeout_sites_in(_mark_elements(bound), qualname, kind))
+            if isinstance(statement, ast.ClassDef):
+                qualname = f'{prefix}{statement.name}'
+                sites.extend(
+                    _timeout_sites_in(statement.decorator_list, qualname, 'class-decorator')
+                )
+                walk(statement.body, f'{qualname}::')
+            elif isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+                sites.extend(
+                    _timeout_sites_in(
+                        statement.decorator_list, f'{prefix}{statement.name}', 'decorator'
+                    )
+                )
+
+    walk(tree.body, '')
+    return tuple(sites)
 
 
 class TestVerifyCliBudgetConstant:
