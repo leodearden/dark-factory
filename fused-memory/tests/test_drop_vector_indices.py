@@ -39,6 +39,7 @@ plus a real ``select_graph`` call — do not add either.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -251,3 +252,129 @@ class TestAwaitIndexCatalogSettled:
             )
 
         assert 'empty key' in str(excinfo.value)
+
+
+class TestDropVectorIndicesInsideTheRebuildWindow:
+    """THE reported defect: a second call landing in FalkorDB's post-drop
+    rebuild window re-issues a DROP for an index that is already gone.
+
+    MEASURED.  ``DROP VECTOR INDEX`` against a label whose merged index carries
+    SURVIVING fields is not an in-place catalog mutation: FalkorDB builds a
+    REPLACEMENT index, and until that build finishes one ``CALL db.indexes()``
+    returns BOTH the new ``['name']`` row at ``'[Indexing] N/M: UNDER
+    CONSTRUCTION'`` and the stale ``['name_embedding','name']`` row at
+    ``'OPERATIONAL'``, still advertising the dropped VECTOR property.  A read
+    landing there produces ``DROP VECTOR INDEX FOR (n:Entity) ON
+    (n.name_embedding)``, and FalkorDB answers ``'Unable to drop index on
+    :Entity(name_embedding): no such index.'`` — which this method deliberately
+    does not absorb, so it propagates after the ``'after dropping 0 index(es)'``
+    ERROR line.
+
+    The race is mocked so the defect is DETERMINISTIC (see the module docstring
+    for why a live red-first test would be a new flake).  ``graph.query`` is
+    armed with the VERBATIM measured rejection, so pre-fix this class ERRORS with
+    exactly the production symptom.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_call_landing_in_the_window_drops_nothing_and_does_not_raise(
+        self, mock_config, make_backend,
+    ):
+        graph = _graph_returning(
+            _result([STALE_ENTITY_ROW, REBUILDING_ENTITY_ROW]),
+            _result([SETTLED_ENTITY_ROW]),
+        )
+        graph.query = AsyncMock(
+            side_effect=redis.exceptions.ResponseError(
+                'Unable to drop index on :Entity(name_embedding): no such index.'
+            )
+        )
+        backend = _backend_on(make_backend, mock_config, graph)
+
+        assert await backend.drop_vector_indices(group_id='test') == []
+
+    @pytest.mark.asyncio
+    async def test_no_drop_statement_is_issued_at_all(
+        self, mock_config, make_backend,
+    ):
+        """THE load-bearing assertion: it distinguishes the adopted fix from an
+        error-wording absorb.
+
+        Settling FIRST means the doomed statement is never BUILT.  A future edit
+        that "fixed" this by catching ``'no such index'`` instead would still
+        issue the DROP and merely swallow the response — passing the
+        returns-``[]`` test above and failing this one.  Absorbing the wording is
+        forbidden anyway (D2: no correctness property may rest on FalkorDB's
+        error wording), and it would silently swallow the OTHER measured producer
+        of that identical string — the NODE drop form issued against a
+        RELATIONSHIP vector index — i.e. a drop that removes nothing while
+        reporting success.
+        """
+        graph = _graph_returning(
+            _result([STALE_ENTITY_ROW, REBUILDING_ENTITY_ROW]),
+            _result([SETTLED_ENTITY_ROW]),
+        )
+        graph.query = AsyncMock(
+            side_effect=redis.exceptions.ResponseError(
+                'Unable to drop index on :Entity(name_embedding): no such index.'
+            )
+        )
+        backend = _backend_on(make_backend, mock_config, graph)
+
+        await backend.drop_vector_indices(group_id='test')
+
+        assert graph.query.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_the_settles_reads_precede_any_write_and_the_certified_read_is_used(
+        self, mock_config, make_backend,
+    ):
+        """Ordering, and no third read.
+
+        ``ro_query`` is awaited exactly twice — the window, then the settled
+        catalog — which proves the drop loop consumed the CERTIFIED read rather
+        than issuing a fresh ``list_indices`` afterwards.  That re-read would
+        reopen, narrowly, the very gap the barrier closes.
+        """
+        graph = _graph_returning(
+            _result([STALE_ENTITY_ROW, REBUILDING_ENTITY_ROW]),
+            _result([SETTLED_ENTITY_ROW]),
+        )
+        graph.query = AsyncMock(
+            side_effect=redis.exceptions.ResponseError(
+                'Unable to drop index on :Entity(name_embedding): no such index.'
+            )
+        )
+        backend = _backend_on(make_backend, mock_config, graph)
+
+        await backend.drop_vector_indices(group_id='test')
+
+        assert graph.ro_query.await_count == 2
+        assert graph.query.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failing_drop_on_a_settled_catalog_still_propagates(
+        self, mock_config, make_backend, caplog,
+    ):
+        """The UNCHANGED half of the contract.
+
+        The barrier is on the READ, not on the DROP.  Per-statement failures are
+        still NOT absorbed — the sole caller re-embeds immediately after the
+        drop, so a partial drop reported as success would leave stale
+        fixed-dimension indices behind while the operator believes the rebuild
+        was clean — and the ERROR line still names the partial ``dropped`` list.
+        """
+        graph = _graph_returning(_result([SETTLED_VECTOR_ROW]))
+        graph.query = AsyncMock(
+            side_effect=redis.exceptions.ResponseError('some other failure')
+        )
+        backend = _backend_on(make_backend, mock_config, graph)
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(redis.exceptions.ResponseError),
+        ):
+            await backend.drop_vector_indices(group_id='test')
+
+        assert graph.query.await_count == 1
+        assert 'drop_vector_indices failed on graph' in caplog.text
