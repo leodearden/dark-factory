@@ -367,3 +367,101 @@ class TestNeverRaises:
         with caplog.at_level('DEBUG'):
             assert _emit(tmp_path, project_root=None) is None
         assert not (tmp_path / 'data' / 'escalations').exists()
+
+
+class TestFoldHookAndLogging:
+    """`on_fold` exists so a caller can keep FOLD-TIME logging on ITS OWN
+    logger — `emit_markup_storm_escalation` compares the folded burst's
+    outcome against the open record's and logs at ERROR when they differ, and
+    `tests/server/test_markup_tripwire.py` asserts that record's `.name` is
+    `fused_memory.server.markup_tripwire`."""
+
+    def test_on_fold_is_called_once_with_the_existing_escalation(self, tmp_path):
+        first = _emit(tmp_path)
+        assert first is not None
+
+        seen: list = []
+        second = _emit(tmp_path, on_fold=seen.append)
+
+        assert second == first
+        assert len(seen) == 1
+        assert seen[0].id == first, (
+            'the hook receives the EXISTING escalation object, so a caller can '
+            'read fields off the open record (markup_storm reads its outcome)'
+        )
+        assert len(_filed(tmp_path)) == 1
+
+    def test_on_fold_is_not_called_when_no_fold_occurs(self, tmp_path):
+        seen: list = []
+        assert _emit(tmp_path, on_fold=seen.append) is not None
+        assert seen == []
+
+    def test_an_on_fold_that_raises_does_not_propagate(self, tmp_path):
+        """The hook is caller-supplied logging on a never-raise path; it must
+        not become a new way to break the write path."""
+        first = _emit(tmp_path)
+        assert first is not None
+
+        def _boom(_existing):
+            raise RuntimeError('the fold hook blew up')
+
+        second = _emit(tmp_path, on_fold=_boom)
+
+        assert second == first, (
+            'a broken hook must not cost the caller the fold result'
+        )
+        assert len(_filed(tmp_path)) == 1
+
+    def test_without_on_fold_the_helper_logs_its_own_fold_line(self, tmp_path, caplog):
+        first = _emit(tmp_path)
+        assert first is not None
+
+        with caplog.at_level('INFO'):
+            second = _emit(tmp_path)
+
+        assert second == first
+        assert any(first in r.getMessage() for r in caplog.records), (
+            'a fold is a suppression; it must stay visible in the log'
+        )
+
+    def test_log_label_and_context_appear_in_the_emitted_messages(
+        self, tmp_path, caplog,
+    ):
+        """`log_label` carries the operator-facing grep token that existing
+        detail text tells triagers to search for; `context` carries the
+        caller's own description of the subject."""
+        with caplog.at_level('DEBUG'):
+            _emit(
+                tmp_path,
+                log_label='write_triage',
+                context="fail-open storm 'unknown_key'",
+            )
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any('write_triage' in m for m in messages)
+        assert any("fail-open storm 'unknown_key'" in m for m in messages)
+
+    def test_records_are_attributed_to_the_PASSED_IN_logger(self, tmp_path, caplog):
+        """A helper logging under its OWN name would break both module
+        attribution and every existing caplog filter keyed on the caller."""
+        callers_logger = logging.getLogger('fused_memory.server.some_caller')
+
+        with caplog.at_level('DEBUG'):
+            _emit(tmp_path, logger=callers_logger)
+
+        names = {r.name for r in caplog.records}
+        assert 'fused_memory.server.some_caller' in names
+        assert 'fused_memory.middleware._folded_escalation' not in names
+
+    def test_context_reaches_the_no_op_arms_too(self, tmp_path, monkeypatch, caplog):
+        """The quiet arms are where an operator most needs to know WHAT went
+        unescalated, so `context` must not be dropped on them."""
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+
+        with caplog.at_level('DEBUG'):
+            assert _emit(tmp_path, context='the subject that went unescalated') is None
+
+        assert any(
+            'the subject that went unescalated' in r.getMessage()
+            for r in caplog.records
+        )
