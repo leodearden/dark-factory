@@ -66,6 +66,7 @@ async def inspect_systemd_unit(
     *,
     timeout_secs: float,
     reap_grace_secs: float = 5.0,
+    degradation_sink: dict | None = None,
 ) -> dict:
     """Query systemctl for unit state fields needed for fresh-PID verify / health checks.
 
@@ -85,6 +86,19 @@ async def inspect_systemd_unit(
     event loop with no subprocess support) is deliberately NOT caught — it
     signals a broken runtime, not a degraded systemd, and a sentinel would
     lie about the unit's state.
+
+    ``degradation_sink`` is an optional caller-supplied dict used as an OUT
+    parameter: when a degradation occurs, ``sink['cause']`` is set to a short
+    human-readable string naming WHICH mode fired and why (the errno/exception
+    repr for a spawn failure, the elapsed budget for a timeout). The four
+    sentinel fields stay byte-identical in both modes — classifiers
+    (``_deterministic_deploy_health_verdict``, the baseline ``ActiveState``
+    gate, ``FreshPidVerify``) must not be able to tell the modes apart — but a
+    HUMAN reading the resulting escalation must, since EMFILE, a missing
+    ``systemctl`` binary and a hung systemd call for three different operator
+    responses. Threading the cause here keeps that fact out of the journal-only
+    path that INV-2 ``structured-facts-at-failure`` forbids. Omitting the sink
+    (all pre-4157 callers) changes nothing.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -101,11 +115,19 @@ async def inspect_systemd_unit(
         # DeterministicRunner.run()'s "always returns BLOCKED, never a raw
         # exception" contract and past the escalations an operator needs.
         # Converge on the SAME sentinel the timeout branch returns below, so
-        # both degradation modes are indistinguishable to every consumer.
+        # both degradation modes are indistinguishable to every CLASSIFIER —
+        # deliberately NOT to the operator: the reviewer amendment threads the
+        # distinguishing cause out through `degradation_sink` instead, because
+        # EMFILE, a missing `systemctl` and a hung systemd need three different
+        # operator responses even though all three must fail closed identically.
         logger.warning(
             'systemctl show %s could not be spawned (%r) — returning MainPID=0 sentinel',
             unit, exc,
         )
+        if degradation_sink is not None:
+            degradation_sink['cause'] = (
+                f'systemctl show {unit} could not be spawned: {exc!r}'
+            )
         return _wedged_unit_sentinel()
     try:
         stdout, _ = await asyncio.wait_for(
@@ -130,6 +152,11 @@ async def inspect_systemd_unit(
             'systemctl show %s timed out after %ss — returning MainPID=0 sentinel',
             unit, timeout_secs,
         )
+        if degradation_sink is not None:
+            degradation_sink['cause'] = (
+                f'systemctl show {unit} timed out after {timeout_secs}s '
+                f'(systemd busy/hung)'
+            )
         # On the VERIFY leg, MainPID=0 routes through the existing
         # verify-fail path: fresh-PID verify already treats MainPID=0 as
         # a sentinel failure -> born-at-L2 escalate + blocked (matching
