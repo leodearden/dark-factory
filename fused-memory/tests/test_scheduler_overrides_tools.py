@@ -1,10 +1,21 @@
 """Tests for MCP scheduler-override tool behavior.
 
-Covers four tools:
-- get_pin_queue         (read-only, no audit)
-- set_task_priority_override  (write, emits audit)
-- clear_task_priority_override (write, emits audit)
-- reorder_pin_queue     (write, emits audit)
+Covers four tools, none of which emits a memory write:
+- get_pin_queue                 (read-only)
+- set_task_priority_override    (write)
+- clear_task_priority_override  (write)
+- reorder_pin_queue             (write)
+
+The three write tools used to mint a durable Graphiti edge per call via
+``add_memory(category='decisions_and_rationale')``.  Task 3853 (the esc-3834-1
+ruling) deleted that audit side effect outright: the edges went stale within the
+hour and duplicated state already recorded structurally in
+``data/orchestrator/runs.db`` (``priority_override_set`` /
+``priority_override_cleared`` / ``task_pinned`` / ``task_unpinned`` /
+``pin_queue_reordered``, surfaced by the ``get_scheduler_events`` MCP tool).
+Non-emission is a permanent regression lock here, asserted through
+``_assert_no_graphiti_write`` — do NOT "restore" the audit, and do not substitute
+a Mem0-category write (the ruling rejects that too).
 
 All tools open ``<project_root>/data/orchestrator/scheduler_overrides.db``
 via aiosqlite; these tests use a ``tmp_path``-rooted project_root with the
@@ -21,7 +32,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from fused_memory.models.scope import resolve_project_id
+from fused_memory.models.enums import GRAPHITI_PRIMARY
 from fused_memory.server.tools import create_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -99,7 +110,7 @@ def _row_count(project_root: str | Path) -> int:
 
 
 # ===========================================================================
-# get_pin_queue — read-only, no audit emit
+# get_pin_queue — read-only
 # ===========================================================================
 
 
@@ -118,7 +129,63 @@ async def test_get_pin_queue_empty_returns_empty_list(tmp_path, mcp_server, memo
 
 
 # ===========================================================================
-# set_task_priority_override — write + audit
+# task 3853 (esc-3834-1): override tools mint no Graphiti write
+# ===========================================================================
+
+
+def _assert_no_graphiti_write(memory_service):
+    """No durable Graphiti write escaped an override tool (esc-3834-1)."""
+    graphiti_cats = {c.value for c in GRAPHITI_PRIMARY}
+    offenders = [
+        kw.get('category') for _, kw in memory_service.add_memory.call_args_list
+        if kw.get('category') in graphiti_cats
+    ]
+    assert not offenders, (
+        f'override tool reached add_memory with GRAPHITI_PRIMARY category(s) {offenders}'
+    )
+    # Stronger than the acceptance criterion, and deliberately so: also forbids
+    # the Mem0-category substitution the esc-3834-1 ruling rejects.
+    memory_service.add_memory.assert_not_called()
+    # add_episode is the other Graphiti write path; the stage1 prompt warns
+    # against using it as a snapshot workaround, so close it here too.
+    memory_service.add_episode.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tool_name,tool_kwargs,pre_pins', [
+    ('set_task_priority_override',
+     {'task_id': '5', 'boost_tier': 'high', 'pinned': True}, []),
+    ('clear_task_priority_override', {'task_id': '5'}, ['5']),
+    ('reorder_pin_queue', {'ordered_task_ids': ['C', 'A', 'B']}, ['A', 'B', 'C']),
+])
+async def test_override_write_tools_emit_no_memory_write(
+    tmp_path, mcp_server, memory_service, tool_name, tool_kwargs, pre_pins,
+):
+    """Each override WRITE tool completes its happy path minting no Graphiti edge.
+
+    Seam-level lock on the esc-3834-1 ruling: asserted on the ``memory_service``
+    mock itself, not merely "the call raised no exception".  The structural audit
+    trail these tools used to duplicate lives in data/orchestrator/runs.db and is
+    read via ``get_scheduler_events``.
+    """
+    if pre_pins:
+        await _populate_pins(mcp_server, tmp_path, pre_pins)
+    # Reset AFTER setup — _populate_pins drives set_task_priority_override itself,
+    # so its own calls must not be counted against the tool under test.
+    memory_service.add_memory.reset_mock()
+    memory_service.add_episode.reset_mock()
+
+    result = await mcp_server._tool_manager.call_tool(
+        tool_name,
+        {'project_root': str(tmp_path), **tool_kwargs},
+    )
+    assert 'error' not in result
+
+    _assert_no_graphiti_write(memory_service)
+
+
+# ===========================================================================
+# set_task_priority_override — write, no memory write (esc-3834-1)
 # ===========================================================================
 
 
@@ -128,10 +195,10 @@ async def test_get_pin_queue_empty_returns_empty_list(tmp_path, mcp_server, memo
     ({'pinned': True}, {'pinned': 1}),
     ({'reserve_now': True}, {'reserve_now': 1}),
 ])
-async def test_set_task_priority_override_writes_row_and_emits_audit(
+async def test_set_task_priority_override_writes_row(
     tmp_path, mcp_server, memory_service, extra_kwargs, extra_row_checks,
 ):
-    """Happy-path: a row is written to SQLite and an audit add_memory is emitted."""
+    """Happy-path: a row is written to SQLite."""
     memory_service.add_memory.reset_mock()
     result = await mcp_server._tool_manager.call_tool(
         'set_task_priority_override',
@@ -157,13 +224,7 @@ async def test_set_task_priority_override_writes_row_and_emits_audit(
         idx = {'pinned': 3, 'reserve_now': 4}[col]
         assert row[idx] == val, f'{col} mismatch: expected {val}, got {row[idx]}'
 
-    memory_service.add_memory.assert_called_once()
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['category'] == 'decisions_and_rationale'
-    assert audit_kwargs['project_id'] == resolve_project_id(str(tmp_path))
-    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
-    assert audit_kwargs['metadata']['task_id'] == '5'
-    assert audit_kwargs['metadata']['fields']['boost_tier'] == 'high'
+    _assert_no_graphiti_write(memory_service)
 
 
 # ===========================================================================
@@ -254,8 +315,7 @@ async def test_set_task_priority_override_ttl_secs_converts_to_absolute_iso(
     high = after + timedelta(seconds=3600) + timedelta(seconds=5)
     assert low <= parsed <= high
 
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['metadata']['fields']['ttl_secs'] == 3600
+    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
@@ -431,10 +491,10 @@ async def test_set_task_priority_override_concurrent_pins_no_collision(
 
 
 @pytest.mark.asyncio
-async def test_clear_task_priority_override_field_none_deletes_row_and_emits_audit(
+async def test_clear_task_priority_override_field_none_deletes_row(
     tmp_path, mcp_server, memory_service,
 ):
-    """clear_task_priority_override with no field deletes the row and emits audit."""
+    """clear_task_priority_override with no field deletes the row."""
     await mcp_server._tool_manager.call_tool(
         'set_task_priority_override',
         {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': 'high'},
@@ -457,11 +517,7 @@ async def test_clear_task_priority_override_field_none_deletes_row_and_emits_aud
     finally:
         conn.close()
 
-    memory_service.add_memory.assert_called_once()
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['category'] == 'decisions_and_rationale'
-    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
-    assert audit_kwargs['metadata'] == {'task_id': '5', 'field': None}
+    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
@@ -519,9 +575,7 @@ async def test_clear_task_priority_override_field_specific_clears_one_column(
         else:
             assert cols[col] == expected, f'{col}: expected {expected!r}, got {cols[col]!r}'
 
-    memory_service.add_memory.assert_called_once()
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['metadata'] == {'task_id': '5', 'field': field}
+    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
@@ -594,10 +648,10 @@ def _pin_orders(tmp_path, task_ids):
 
 
 @pytest.mark.asyncio
-async def test_reorder_pin_queue_rewrites_pin_order_and_emits_audit(
+async def test_reorder_pin_queue_rewrites_pin_order(
     tmp_path, mcp_server, memory_service,
 ):
-    """reorder_pin_queue with a list rewrites pin_order columns and emits audit."""
+    """reorder_pin_queue with a list rewrites pin_order columns."""
     await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
     memory_service.add_memory.reset_mock()
 
@@ -610,11 +664,7 @@ async def test_reorder_pin_queue_rewrites_pin_order_and_emits_audit(
     orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
     assert orders == {'A': 2, 'B': 3, 'C': 1}
 
-    memory_service.add_memory.assert_called_once()
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['category'] == 'decisions_and_rationale'
-    assert audit_kwargs['agent_id'] == 'scheduler-overrides'
-    assert audit_kwargs['metadata'] == {'ordered_task_ids': ['C', 'A', 'B']}
+    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
@@ -634,8 +684,7 @@ async def test_reorder_pin_queue_accepts_csv_string(
     orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
     assert orders == {'A': 2, 'B': 3, 'C': 1}
 
-    _, audit_kwargs = memory_service.add_memory.call_args
-    assert audit_kwargs['metadata']['ordered_task_ids'] == ['C', 'A', 'B']
+    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
