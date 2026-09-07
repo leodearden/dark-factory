@@ -449,7 +449,8 @@ class TestFileUnknownKeyStormEscalation:
         )
 
     def test_files_one_escalation_naming_the_writer_and_the_keys(self, tmp_path, monkeypatch):
-        import fused_memory.services.memory_metadata_census as census
+        import fused_memory.services.memory_metadata_census as census  # noqa: F401
+        from fused_memory.middleware import _folded_escalation
 
         submitted = []
 
@@ -467,8 +468,8 @@ class TestFileUnknownKeyStormEscalation:
                 submitted.append(esc)
                 return esc.id
 
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', True)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _Queue)
 
         esc_id = self._file(tmp_path, project_id='dark_factory', agent_id='claude-drifter')
         assert len(submitted) == 1
@@ -485,7 +486,8 @@ class TestFileUnknownKeyStormEscalation:
 
     def test_dedups_against_an_already_open_escalation(self, tmp_path, monkeypatch):
         """A persistent drift must not mint a fresh escalation per restart."""
-        import fused_memory.services.memory_metadata_census as census
+        import fused_memory.services.memory_metadata_census as census  # noqa: F401
+        from fused_memory.middleware import _folded_escalation
 
         submitted = []
 
@@ -506,8 +508,8 @@ class TestFileUnknownKeyStormEscalation:
                 submitted.append(esc)
                 return esc.id
 
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', True)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _Queue)
 
         esc_id = self._file(tmp_path)
         assert submitted == []
@@ -520,7 +522,8 @@ class TestFileUnknownKeyStormEscalation:
         agree — a mismatch would make the dedup query look for an anchor
         nothing is ever filed under, silently disabling it.
         """
-        import fused_memory.services.memory_metadata_census as census
+        import fused_memory.services.memory_metadata_census as census  # noqa: F401
+        from fused_memory.middleware import _folded_escalation
 
         seen = {}
 
@@ -540,8 +543,8 @@ class TestFileUnknownKeyStormEscalation:
                 seen['task_id'] = esc.task_id
                 return esc.id
 
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', True)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _Queue)
 
         self._file(tmp_path, project_id='dark_factory', agent_id='claude-x')
         expected = 'memory-metadata-unknown-key-storm-dark-factory-claude-x'
@@ -559,7 +562,8 @@ class TestFileUnknownKeyStormEscalation:
         B's crossing and B survives only in an INFO log line — the operator
         sees one culprit named and no signal that anyone else crossed.
         """
-        import fused_memory.services.memory_metadata_census as census
+        import fused_memory.services.memory_metadata_census as census  # noqa: F401
+        from fused_memory.middleware import _folded_escalation
 
         open_by_task = {}
 
@@ -582,8 +586,8 @@ class TestFileUnknownKeyStormEscalation:
                 open_by_task[esc.task_id] = _Existing(esc.id)
                 return esc.id
 
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', True)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _Queue)
 
         first = self._file(tmp_path, agent_id='claude-drifter-a')
         second = self._file(tmp_path, agent_id='claude-drifter-b')
@@ -635,10 +639,11 @@ class TestFileUnknownKeyStormEscalation:
         Asserted by calling inside a try that fails the test on ANY
         exception, rather than by pytest.raises-style narrowing.
         """
-        import fused_memory.services.memory_metadata_census as census
+        import fused_memory.services.memory_metadata_census as census  # noqa: F401
+        from fused_memory.middleware import _folded_escalation
 
         caplog.set_level(logging.DEBUG, logger=_CENSUS_LOGGER)
-        monkeypatch.setattr(census, 'HAS_ESCALATION', False)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
         try:
             result = self._file(tmp_path)
         except Exception as exc:  # pragma: no cover — the contract being pinned
@@ -647,7 +652,8 @@ class TestFileUnknownKeyStormEscalation:
         assert caplog.records, 'a degraded no-op must still leave a trace'
 
     def test_returns_none_and_never_raises_on_queue_io_failure(self, tmp_path, monkeypatch):
-        import fused_memory.services.memory_metadata_census as census
+        import fused_memory.services.memory_metadata_census as census  # noqa: F401
+        from fused_memory.middleware import _folded_escalation
 
         class _Queue:
             def __init__(self, path):
@@ -662,8 +668,8 @@ class TestFileUnknownKeyStormEscalation:
             def submit(self, esc):
                 raise OSError('disk on fire')
 
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', True)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _Queue)
 
         try:
             result = self._file(tmp_path)
@@ -677,7 +683,8 @@ class TestFileUnknownKeyStormEscalation:
         Mirrors the precedent — failing closed here would mean a broken
         queue read silently swallows the storm signal entirely.
         """
-        import fused_memory.services.memory_metadata_census as census
+        import fused_memory.services.memory_metadata_census as census  # noqa: F401
+        from fused_memory.middleware import _folded_escalation
 
         submitted = []
 
@@ -695,8 +702,119 @@ class TestFileUnknownKeyStormEscalation:
                 submitted.append(esc)
                 return esc.id
 
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', True)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _Queue)
 
         assert self._file(tmp_path) == 'esc-x-1'
         assert len(submitted) == 1
+
+
+class TestDelegatesToTheSharedHelper:
+    """The filer BODY now lives in `middleware/_folded_escalation` (task 4854).
+
+    What stays here is this census's own identity — above all its COMPUTED
+    per-writer anchor, which `writer_anchor_task_id`'s docstring records as
+    load-bearing rather than tidy: a global anchor would fold every later
+    writer's crossing into the first writer's still-open escalation, leaving
+    writers B..N visible only in an INFO line.
+    """
+
+    def _file(self, tmp_path, *, project_id='dark_factory', agent_id='claude-x',
+              keys=('weird_key', 'other_key')):
+        from fused_memory.services.memory_metadata_census import (
+            file_unknown_key_storm_escalation,
+        )
+
+        return file_unknown_key_storm_escalation(
+            str(tmp_path), project_id=project_id, agent_id=agent_id, keys=list(keys)
+        )
+
+    def test_forwards_the_computed_per_writer_anchor_and_this_modules_identity(
+        self, tmp_path, monkeypatch,
+    ):
+        import fused_memory.services.memory_metadata_census as census
+
+        seen: dict = {}
+
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-anything-1'
+
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+
+        result = self._file(tmp_path, project_id='dark_factory', agent_id='claude-drifter')
+
+        assert result == 'esc-anything-1'
+        assert seen['anchor_task_id'] == census.writer_anchor_task_id(
+            'dark_factory', 'claude-drifter',
+        )
+        # The COMPUTED anchor, not the series base name: passing the bare
+        # prefix would restore exactly the masking the per-writer keying
+        # exists to remove.
+        assert seen['anchor_task_id'] != census._ANCHOR_TASK_ID
+        assert seen['anchor_task_id'].startswith(census._ANCHOR_TASK_ID)
+        assert seen['agent_role'] == 'fused-memory/memory-metadata-census'
+        assert seen['category'] == 'memory_metadata_unknown_key_storm'
+        assert seen['severity'] == 'info'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_two_writers_in_one_project_get_two_different_anchors(
+        self, tmp_path, monkeypatch,
+    ):
+        """The census docstring states the per-writer keying exists so a
+        second, different drifting writer is not masked — the anchor-collision
+        hazard in its per-writer form."""
+        import fused_memory.services.memory_metadata_census as census
+
+        anchors: list = []
+
+        def _spy(_project_root, **kwargs):
+            anchors.append(kwargs['anchor_task_id'])
+            return 'esc-anything-1'
+
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+        self._file(tmp_path, project_id='dark_factory', agent_id='writer-a')
+        self._file(tmp_path, project_id='dark_factory', agent_id='writer-b')
+
+        assert len(anchors) == 2
+        assert anchors[0] != anchors[1], (
+            f'two writers in one project must not fold together: {anchors!r}'
+        )
+        assert 'writer-a' in anchors[0] and 'writer-b' in anchors[1]
+
+    def test_the_identity_constants_are_still_attributes_of_THIS_module(self):
+        """They must not migrate into the helper: the pairwise
+        anchor-collision regression reads every filer's anchor FROM ITS OWN
+        HOME, which is what makes a colliding rename fail a test rather than go
+        silent in production.
+
+        This module keeps BOTH the series base name and the computed per-writer
+        anchor; only the computed one is ever passed to the helper.
+        """
+        import fused_memory.services.memory_metadata_census as census
+
+        assert census._ANCHOR_TASK_ID == 'memory-metadata-unknown-key-storm'
+        assert census._AGENT_ROLE == 'fused-memory/memory-metadata-census'
+        assert census._CATEGORY == 'memory_metadata_unknown_key_storm'
+        assert census._ANCHOR_COMPONENT_MAX_LEN == 48
+        assert census._anchor_slug('Weird Writer!') == 'weird-writer'
+
+    def test_the_key_list_and_detail_construction_stay_in_THIS_module(
+        self, tmp_path, monkeypatch,
+    ):
+        import fused_memory.services.memory_metadata_census as census
+
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-anything-1'
+
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+        self._file(tmp_path, keys=('weird_key', 'other_key'))
+
+        assert 'weird_key' in seen['detail'] and 'other_key' in seen['detail']
+        assert 'weird_key' in seen['summary']
+        assert 'memory_metadata_census' in seen['log_label']
