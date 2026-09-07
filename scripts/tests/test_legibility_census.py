@@ -5933,3 +5933,68 @@ def test_run_census_preflight_defer_message_carries_no_counts_clause(tmp_path):
         f"a preflight defer must carry no counts clause at all; got {blob!r}"
     )
     assert "rejected" not in blob.lower()
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-9: RED — W-C. `render_report`'s `## Verification` section is
+# gated on `verify_coverage is not None`, and `run_census` leaves that None
+# whenever `--max-verify-clusters` is absent. So an UNCAPPED run in which
+# every offered cluster was rejected — the observable signature of the
+# 2026-08-03 sandbox incident — commits a dated report byte-identical to a
+# clean census. The log line and the info escalation are ephemeral; the
+# markdown is what an operator reads weeks later, and it must not be silent.
+# ---------------------------------------------------------------------------
+
+def test_render_report_states_the_all_rejected_outcome_without_a_verify_cap():
+    report = _render(verify_coverage=None, mass_rejection=mod.MassRejection(offered=3))
+
+    assert "## Verification" in report, (
+        "the section must render on the mass-rejection path even with no cap"
+    )
+    section = report.split("## Verification", 1)[1].split("\n## ", 1)[0]
+    assert "3" in section, "the offered count"
+    lowered = section.lower()
+    assert "reject" in lowered, "that they were rejected"
+    assert "none" in lowered or "no cluster" in lowered, "and that none survived"
+    # The same voice as the existing `suspect` log string at the detector.
+    assert "systemic" in lowered
+    assert any(
+        phrase in lowered
+        for phrase in ("model unreachable", "tool access denied", "unparseable verdict")
+    ), f"the report must name what to suspect, not merely that something is off; got {section!r}"
+
+    assert report != _render(verify_coverage=None, mass_rejection=None), (
+        "the notice must actually change the rendered bytes"
+    )
+
+
+def test_render_report_renders_the_all_rejected_notice_before_an_existing_cap_line():
+    report = _render(
+        verify_coverage=mod.VerifyCoverage(novel=3, verified=3, cap=3),
+        mass_rejection=mod.MassRejection(offered=3),
+    )
+
+    section = report.split("## Verification", 1)[1].split("\n## ", 1)[0]
+    assert "systemic" in section.lower(), "the all-rejected notice renders"
+    assert "verify cap: 3" in section, "and the existing cap line still renders too"
+    assert section.lower().index("systemic") < section.index("verify cap: 3"), (
+        "the anomaly notice comes FIRST — a cap line is routine, this is not"
+    )
+
+
+def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
+    """`mass_rejection=None` must leave the module's byte-identical-flagless
+    invariant exactly as it was — that property is deliberate and documented,
+    and must not be spent to buy an anomaly signal."""
+    report = mod.render_report(
+        date="2026-07-14",
+        project_id="dark_factory",
+        force=False,
+        matrix_md="matrix",
+        mining_result=_sample_mining_result(),
+        synthesis_md="prose",
+        filed_task_ids=["1"],
+        cost_note="cost",
+        mass_rejection=None,
+    )
+    assert report == _GOLDEN_FLAGLESS_REPORT
