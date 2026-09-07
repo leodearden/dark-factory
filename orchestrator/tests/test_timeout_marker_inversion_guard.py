@@ -1,7 +1,66 @@
 """Guard: no ``@pytest.mark.timeout(N)`` may INVERT into a tighter clamp under verify.
 
-(Module docstring completed in a later step; this file is being built up
-test-first.  See task 5147.)
+THE PRECEDENCE RULE, read verbatim from ``pytest_timeout.py::_get_item_settings``
+in the installed package rather than inferred::
+
+    if marker is not None:
+        timeout = _validate_timeout(settings.timeout, "marker")
+    if timeout is None:
+        timeout = item.config._env_timeout
+
+The marker wins UNCONDITIONALLY.  ``config._env_timeout`` -- fed by CLI
+``--timeout``, then ``PYTEST_TIMEOUT``, then the ini ``timeout`` -- is consulted
+ONLY when the marker yielded None.  So ``@pytest.mark.timeout(N)`` is a TWO-WAY
+override and never a floor, which is the whole defect: the pyproject comment
+that sanctions it ("Slow tests opt out with ``@pytest.mark.timeout(N)``") is
+written from the perspective of a bare local ``pytest``, where the ini default
+is 60 and any larger N does loosen.
+
+THREE REGIMES fall out of the two budgets that bracket every test here -- the
+ini default (:data:`_orch_helpers.PYPROJECT_DEFAULT_TIMEOUT`, 60) and the
+budget verify actually passes
+(:data:`_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT`, 300):
+
+* ``N <= 60`` -- tightens under BOTH, so unambiguously a DELIBERATE tight
+  bound; its author chose tighter than even a bare local run would give them.
+  test_verify_clock_stop.py's 13 marks at 15s are the worked example: those
+  tests assert a watchdog fires FAST, and raising them would blunt the
+  assertion AND turn each hang test into a 300s stall.  NOT policed here;
+* ``60 < N < 300`` -- INVERTS.  Written to loosen against the default in front
+  of the author, it silently TIGHTENS the run that gates their merge.  The sign
+  of the marker's effect flips with context.  This band, and only this band, is
+  what this module rejects;
+* ``N >= 300`` -- loosens under both.  Safe, which is what keeps the sanctioned
+  ceilings (WHOLE_TREE_SCAN_TEST_TIMEOUT, HEAVY_BARRIER_TEST_TIMEOUT,
+  PYTEST_TIMEOUT) and this module's own ``pytestmark`` out of the guard's way.
+
+The band is OPEN AT BOTH ENDS for those reasons: a mark exactly at the ini
+default expresses no opinion against it, and one exactly at the CLI budget is
+the recommended remediation.
+
+WHY A BREACH IS EXPENSIVE, and why this is worth a guard at all.
+``timeout_method = "thread"`` means pytest-timeout answers a breach by
+``os._exit()``ing the xdist worker rather than failing the offending test, and
+``--max-worker-restart=0`` (task 1907) then declines to replace it -- degrading
+the run to a TRUNCATED whole-suite session whose surviving failure names some
+innocent test that merely shared the dead worker.  ONE marker at 120s in
+test_aiosqlite_leak_isolation.py was blamed for failures in tasks 4176, 4384
+and 4405 that way.  Same mechanism spelled out at
+:data:`_orch_helpers.WHOLE_TREE_SCAN_TEST_TIMEOUT`.
+
+A RATCHET, NOT A SWEEP.  61 pre-existing in-band sites are grandfathered in
+:data:`_GRANDFATHERED`; see its comment for why they were not migrated here and
+:func:`test_grandfather_allowlist_has_no_stale_entries` for what forces that
+list to shrink.
+
+WHAT THIS DOES NOT DUPLICATE.  test_whole_tree_scan_timeout_guard.py polices a
+per-FILE family invariant using MODULE-LEVEL marks only; test_marker_
+registration_drift.py sweeps marker NAMES and never argument values;
+tests/scripts/test_fallback_verify_config.py pins the CONFIG side (that every
+pytest segment really does carry ``--timeout``).  Nothing before this checked a
+per-test marker's VALUE against the verify budget.
+
+Task 5147.
 """
 
 from __future__ import annotations
@@ -12,14 +71,23 @@ import textwrap
 from pathlib import Path
 from typing import NamedTuple
 
+import pytest
 import yaml
 from _orch_helpers import (
     ORCH_DIR,
     PYPROJECT_DEFAULT_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
+    WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
 
 from orchestrator.pytest_markers import _marker_name, _pytestmark_value
+
+# This module is ITSELF a whole-tree AST scanner -- it rglob()s every *.py
+# under this directory and ast.parse()s each one -- so it is a member of the
+# family test_whole_tree_scan_timeout_guard.py polices and carries the mark
+# that guard demands.  WHOLE_TREE_SCAN_TEST_TIMEOUT is 300, at the inversion
+# band's OPEN upper edge, so this module does not flag its own mark.
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: The per-module merge-verify config whose ``test_command`` carries the
 #: ``--timeout=N`` that verify actually passes to pytest.  Resolved from
@@ -681,11 +749,110 @@ def test_the_aiosqlite_leak_isolation_regression_is_fixed() -> None:
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_MARKER_SITES = 100
 
-#: Pre-existing in-band sites, seeded in the next step.  EMPTY here so the
-#: sweep must prove itself against the real tree before anything is exempted
-#: from it -- an allowlist landed in the same commit as the sweep would make
-#: the two indistinguishable from a sweep that finds nothing.
-_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset()
+#: The pre-existing in-band sites, MEASURED at authorship time: 61 across 19
+#: modules, at 90/120/150/180s.  Entries may only ever be REMOVED, never added
+#: -- a new marker in the band is what this module exists to reject, and
+#: `test_no_new_inverting_timeout_marker`'s failure message says so outright.
+#:
+#: Not mechanically migrated in task 5147, deliberately: these are the hottest
+#: files in the repo (test_merge_queue.py and its deep_* siblings,
+#: test_crash_recovery.py), so rewriting ~20 of them at once would have taken
+#: concurrency locks on nearly every file in-flight fleet tasks were editing
+#: and would itself have risked destabilising the very verify path the task
+#: existed to de-flake.  Stopping the bleeding is what prevents a fourth task
+#: being blamed; the migration is ordinary follow-up work, filed as
+#: agent-followup ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY.
+#:
+#: Keyed on ``(module, qualname)`` rather than a line number so an entry
+#: survives ordinary edits above it, and per-SITE rather than a per-file COUNT
+#: because a count nets to zero when one marker is added and another removed in
+#: the same file -- a hole in a guard whose entire purpose is catching
+#: accidental additions.  Verbosity is cheap; a hole in the ratchet is not.
+#: :func:`test_grandfather_allowlist_has_no_stale_entries` is what stops this
+#: list rotting into a permanent blanket exemption.
+_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
+    {
+    # test_cli.py -- 1 site at 120s
+    ('test_cli.py', 'test_verify_merge_cancel_end_to_end'),
+    # test_crash_recovery.py -- 6 sites at 180s
+    ('test_crash_recovery.py', 'TestRecoverCrashedTasksWarmLane'),
+    ('test_crash_recovery.py', 'TestRecoverCrashedTasksWarmLaneEdgeCases'),
+    ('test_crash_recovery.py', 'TestRecoverCrashedTasksPoolStorageAbsentGuard'),
+    ('test_crash_recovery.py', 'TestRecoverCrashedTasksNoPoolConfiguredNoOp'),
+    ('test_crash_recovery.py', 'TestRecordDrivenRecovery'),
+    ('test_crash_recovery.py', 'TestRecordDrivenRecoveryCompatAndRelocation'),
+    # test_laptop_warm_verify_boundary.py -- 2 sites at 180s
+    ('test_laptop_warm_verify_boundary.py', 'test_flock_wait_env_override_speeds_up_contention_result'),
+    ('test_laptop_warm_verify_boundary.py', 'test_watchdog_timeout_env_override_fires_fast_without_heartbeat'),
+    # test_marker_registration_drift.py -- 2 sites at 120s
+    ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_every_marker_applied_under_tests_is_registered'),
+    ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_the_sweep_is_not_vacuous'),
+    # test_merge_queue.py -- 12 sites at 90s/120s
+    ('test_merge_queue.py', 'TestMergeWorker::test_cas_retry_limit_exhausted'),
+    ('test_merge_queue.py', 'TestMergeWorker::test_merge_worker_emits_duration_ms_on_non_done_outcomes'),
+    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_chain_invalidation_propagates'),
+    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_merger_phase_emits_duration_ms'),
+    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_follower_chain_invalidated_after_pickup_rebase'),
+    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_chain_invalidated_pre_rebased_n2_verify_runs'),
+    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_chain_invalidated_pre_rebased_n2_red_tree_blocked'),
+    ('test_merge_queue.py', 'TestBoundaryTableWorkerEntry::test_scenario_11_generation_chain_escalation'),
+    ('test_merge_queue.py', 'TestSpeculationSlotSemaphoreDepth::test_k2_builds_two_speculative_ahead'),
+    ('test_merge_queue.py', 'TestSpeculationPermitLeakOnMergerError::test_worktree_missing_releases_speculation_permit'),
+    ('test_merge_queue.py', 'TestSpeculationPermitLeakOnMergerError::test_merger_exception_releases_speculation_permit'),
+    ('test_merge_queue.py', 'TestSpeculationPermitLeakOnMergerError::test_abandoned_speculative_releases_speculation_permit'),
+    # test_merge_queue_build_chain.py -- 7 sites at 180s
+    ('test_merge_queue_build_chain.py', 'TestMergeBranchIntoWorktree'),
+    ('test_merge_queue_build_chain.py', 'TestChainBuildLane'),
+    ('test_merge_queue_build_chain.py', 'TestChainSnapshot'),
+    ('test_merge_queue_build_chain.py', 'TestBuildChainDegenerate'),
+    ('test_merge_queue_build_chain.py', 'TestBuildChainClean'),
+    ('test_merge_queue_build_chain.py', 'TestBuildChainTruncation'),
+    ('test_merge_queue_build_chain.py', 'TestMergeBranchIntoWorktreeRevParseGuard'),
+    # test_merge_queue_deep_dispatch.py -- 4 sites at 180s
+    ('test_merge_queue_deep_dispatch.py', 'TestDeepChainPlacementBuild'),
+    ('test_merge_queue_deep_dispatch.py', 'TestRunInflightVerifyChainRedirect'),
+    ('test_merge_queue_deep_dispatch.py', 'TestDeepTipVerifyNeverAdopts'),
+    ('test_merge_queue_deep_dispatch.py', 'TestDeepDispatchRoundsIntegration'),
+    # test_merge_queue_deep_landing.py -- 9 sites at 180s
+    ('test_merge_queue_deep_landing.py', 'TestTipPassAdoptionSignal'),
+    ('test_merge_queue_deep_landing.py', 'TestInOrderCasWalk'),
+    ('test_merge_queue_deep_landing.py', 'TestStaleCasAbortLeavesTheRestAlone'),
+    ('test_merge_queue_deep_landing.py', 'TestContendedLeaseDeferInheritance'),
+    ('test_merge_queue_deep_landing.py', 'TestHeadCancelOnAdoption'),
+    ('test_merge_queue_deep_landing.py', 'TestHeadCancelLeavesTheLaneIdle'),
+    ('test_merge_queue_deep_landing.py', 'TestAdoptedHeadLandsWithThePostVerifyWorktree'),
+    ('test_merge_queue_deep_landing.py', 'TestChainWalkConsumesNoPermits'),
+    ('test_merge_queue_deep_landing.py', 'TestDeepLandingEndToEnd'),
+    # test_merge_queue_request_liveness.py -- 1 site at 180s
+    ('test_merge_queue_request_liveness.py', 'TestDeadVerifyAbortSelfHealsEndToEnd'),
+    # test_merge_queue_restart_hook.py -- 1 site at 180s
+    ('test_merge_queue_restart_hook.py', 'test_stop_does_not_preempt_finalizing_head_mid_advance'),
+    # test_merge_verify_survivor_barrier.py -- 3 sites at 90s/120s
+    ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_knob_on_reaps_real_survivor_and_excludes_own_group'),
+    ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_residual_survivor_returns_false_and_logs_error'),
+    ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_integration_reap_then_reset_succeeds_on_clear_tree'),
+    # test_merge_worktree_lifecycle_integration_gate.py -- 1 site at 180s
+    ('test_merge_worktree_lifecycle_integration_gate.py', 'TestFiveThreeTwoSixReplayGate'),
+    # test_offline_lane_infra_integration.py -- 3 sites at 120s/150s
+    ('test_offline_lane_infra_integration.py', 'test_out_of_bound_spawn_counts_are_measured_not_asserted'),
+    ('test_offline_lane_infra_integration.py', 'test_ib2_infra_run_in_flight_never_gates_merge'),
+    ('test_offline_lane_infra_integration.py', 'test_ib4_same_infra_set_recurrence_updates_not_duplicates'),
+    # test_offline_lane_integration.py -- 3 sites at 120s/150s
+    ('test_offline_lane_integration.py', 'test_out_of_bound_spawn_counts_are_measured_not_asserted'),
+    ('test_offline_lane_integration.py', 'test_b3_never_a_gate'),
+    ('test_offline_lane_integration.py', 'test_b5_same_set_recurrence_updates_not_duplicates'),
+    # test_plan_tools_startup_load.py -- 1 site at 120s
+    ('test_plan_tools_startup_load.py', 'test_concurrent_startup_no_hang'),
+    # test_shutdown.py -- 1 site at 120s
+    ('test_shutdown.py', 'test_sigterm_exits_within_deadline'),
+    # test_warm_lane_bash_bucket_placement.py -- 1 site at 120s
+    ('test_warm_lane_bash_bucket_placement.py', 'test_the_configured_lane_command_actually_collects_the_bucket'),
+    # test_workflow_cancellation.py -- 3 sites at 180s
+    ('test_workflow_cancellation.py', 'TestRunSingleCatchHardCancel'),
+    ('test_workflow_cancellation.py', 'TestSoftCancelCoversNewAwait'),
+    ('test_workflow_cancellation.py', 'TestHarnessSyntheticCancelRetirement'),
+    }
+)
 
 
 def _all_timeout_sites() -> tuple[list[tuple[str, _Site]], int, list[str]]:
