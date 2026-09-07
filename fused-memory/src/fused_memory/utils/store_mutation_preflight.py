@@ -200,6 +200,7 @@ import uuid
 from pathlib import Path
 
 __all__ = [
+    'PREFLIGHT_EXEMPT_SCRIPTS',
     'StoreMutationUnavailable',
     'assert_store_mutation_allowed',
     'resolve_history_dir',
@@ -318,3 +319,62 @@ def assert_store_mutation_allowed(*, operation: str) -> None:
         # create leaves nothing to remove, hence the suppressed OSError.
         with contextlib.suppress(OSError):
             probe.unlink()
+
+
+# ---------------------------------------------------------------------------
+# The static conformance check's escape hatch (task 4280 / 4848)
+# ---------------------------------------------------------------------------
+#
+# tests/test_store_mutation_conformance.py asserts that every script under
+# fused-memory/scripts/ whose AST contains a mutating call (see that module's
+# docstring for the exact two-tier definition) also calls
+# assert_store_mutation_allowed. This dict is its ONLY escape hatch. It lives
+# HERE, beside the guard, rather than in the test module, for the same reason
+# this file's docstring carries the hand-maintained GUARDED /
+# GUARDED-BY-INHERITANCE / KNOWN-UNGUARDED audit as its main content: this
+# module IS the repo's self-audit surface, so keeping the machine-checked
+# exemption set one edit away from the prose audit is what keeps the two from
+# drifting apart the way the policy claim drifted from the code for a whole
+# task cycle before task 4293 caught it. It also makes the exemptions
+# importable by a future non-pytest consumer (an operator audit script, a
+# hooks/project-checks lint) rather than trapped behind a test module.
+#
+# The VALUE TYPE is what forces a justification: a bare set could not hold
+# one, but a str value can be inspected, and
+# tests/test_store_mutation_conformance.py's anti-rot suite polices that it
+# is non-empty, still accurate, and matches this exact key set -- so entries
+# cannot merely accumulate. Keyed by bare filename, not line number: line
+# numbers churn on every unrelated edit and would rot silently.
+PREFLIGHT_EXEMPT_SCRIPTS: dict[str, str] = {
+    'bake_off_storage_shape.py': (
+        "Its two unprobed mutations (drop_collections's delete_collection, "
+        "seed_arm's backend.add) are bounded to scratch substrate: the "
+        'collection prefix is force-set from the reaper\'s own '
+        'load_cleanup_script().E2_BAKEOFF_PREFIX on the run\'s own config '
+        "copy, and no CLI flag reaches it (--project-suffix moves only the "
+        "suffix), so neither call can be pointed at a 'fused'-prefixed "
+        'production collection; seed_arm also stubs mem0\'s shared '
+        'add_history writer before the first add, so it writes no shared '
+        'SQLite history either. Measured against this file as it stands '
+        '(task 4293), not a standing exemption: it dies the moment a CLI '
+        'flag reaches the collection prefix, or seed_arm stops stubbing the '
+        'shared history writer. Does not cover the live path\'s '
+        'MemoryService.initialize() call (Graphiti startup maintenance '
+        'against production FalkorDB) -- that residual is unaddressed here '
+        'and stays tracked by tasks 4318 and 4350.'
+    ),
+    'cleanup_test_collections.py': (
+        'Blast radius is statically bounded: only collection names starting '
+        'with a member of PREFIXES are deleted, and the production '
+        "'fused' collection_prefix default cannot match one. It never "
+        'constructs a MemoryService, so it writes no mem0 SQLite history '
+        'and needs none of the capability this probe tests for. It is also '
+        'an unattended cron job contracted to always exit 0 -- every '
+        "failure path here is a bare `return`, never `sys.exit` -- and this "
+        'probe refuses by raising, which would break that contract. '
+        'Measured against this file as it stands (task 4293), not a '
+        'standing exemption: it dies the moment this script constructs a '
+        'MemoryService, or any input can widen PREFIXES past its two '
+        'test-only names.'
+    ),
+}
