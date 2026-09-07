@@ -6049,6 +6049,51 @@ def test_project_token_aliases_maps_folded_to_folded() -> None:
         assert sr.normalize_project_token(canonical) == canonical
 
 
+def test_project_token_alias_declines_registry_shape() -> None:
+    """The DECLINE registry is the mirror image of PROJECT_TOKEN_ALIASES, and
+    it is what makes task 3813's decision durable rather than prose.
+
+    A decision task's product has to survive the session that made it. Task
+    3807 already tried a docstring ("KNOWN RESIDUAL GAP ... owned by its own
+    filed decision task") and prose cannot fail a test -- someone could add
+    ``solar_challenge -> my_solar_challenge`` tomorrow and nothing would
+    object. The DISJOINTNESS assertion below is that objection: promoting a
+    declined alias into the live table without first REMOVING the decline
+    fails here by name, forcing the next editor to read the recorded
+    evidence instead of rediscovering it from scratch.
+    """
+    declined = sr.PROJECT_TOKEN_ALIASES_DECLINED
+    assert isinstance(declined, dict)
+
+    # Exactly one recorded decline: the solar-challenge alias (task 3813).
+    assert set(declined) == {'solar_challenge'}
+    assert declined['solar_challenge'][0] == 'my_solar_challenge'
+
+    # A decline can never be added without STATING WHY. Existence and
+    # non-emptiness of the reason field only -- deliberately not a pin on
+    # its wording.
+    for alias, entry in declined.items():
+        assert len(entry) == 2, alias
+        assert isinstance(entry[1], str), alias
+        assert entry[1].strip(), alias
+
+    # THE GUARD: the two tables partition the alias space. Adding a declined
+    # alias to the live table without removing the decline fails right here.
+    assert set(declined) & set(sr.PROJECT_TOKEN_ALIASES) == set()
+
+    # Same folded-to-folded hygiene invariant the live table carries (see
+    # test_project_token_aliases_maps_folded_to_folded), so promoting an
+    # entry is a one-line move between the two dicts.
+    for alias, (canonical, _reason) in declined.items():
+        assert sr.normalize_project_token(alias) == alias
+        assert sr.normalize_project_token(canonical) == canonical
+
+    # The decline is IN FORCE in the fold, not merely recorded beside it.
+    assert sr.normalize_project_token('solar_challenge') != sr.normalize_project_token(
+        'my_solar_challenge'
+    )
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
