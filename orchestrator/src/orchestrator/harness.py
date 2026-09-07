@@ -3809,18 +3809,30 @@ class Harness:
     def _archive_available(self, task_id: str, session_id: str | None) -> bool:
         """Was *session_id* recoverable from the durable transcript archive?
 
-        Pure INSTRUMENTATION for the ``session_resume_fallback`` event (task
-        3727, plans/session-resume-eligibility-seam-prd.md §8 / D8): it reports
-        whether the session that just failed to resume still exists in the
-        durable archive, and changes NOTHING about what dispatches. Leaf δ is
-        what may later gate on this signal; task 3578 is what consumes
+        AN ELIGIBILITY INPUT SINCE TASK 3730 (δ / D2), and no longer the pure
+        instrument task 3727 added (plans/session-resume-eligibility-seam-prd.md
+        §8 / D8). The _run_slot guard hoists ONE call per dispatch and feeds
+        the answer both to ``_session_resume_reasons`` — where it is the second
+        source of REACHABILITY, so an archive-backed session is neither
+        'stale' on age nor uncorroborated — and to the
+        ``session_resume_fallback`` event that still reports it. 3727's
+        measurement is what authorised the change: ~91% of post-3578 fallbacks
+        (92 of 101, 2026-09-04) were recoverable and were dispatched fresh
+        anyway. Task 3578 is what consumes
         :func:`~shared.transcript_archive.durable_archive_path` for the actual
-        restore. Because it is an instrument, False-on-any-fault is the correct
-        degradation — an instrument must never be able to break dispatch — but
-        a fault is reported LOUDLY (one WARNING per process, then DEBUG) rather
-        than silently, so a broken instrument cannot masquerade as a genuinely
-        empty archive. See the handler below for why a plain miss never reaches
-        it and therefore cannot make that WARNING noisy.
+        restore, one layer down at the arm site.
+
+        WHAT A FAULT NOW COSTS, restated because it changed. False-on-any-fault
+        is still the correct degradation and still the fail-SAFE direction — a
+        faulted lookup can only send a dispatch down the pre-δ fresh-dispatch
+        path, never resume something unreachable — but it is no longer free:
+        it costs a RESUME (the session's accumulated context) rather than only
+        a wrong telemetry field. That is why the fault is reported LOUDLY (one
+        WARNING per process, then DEBUG) rather than silently: a broken lookup
+        must not masquerade as a genuinely empty archive, and under δ it also
+        must not masquerade as a quiet drop in the resume rate. See the handler
+        below for why a plain miss never reaches it and therefore cannot make
+        that WARNING noisy.
 
         Total, and the guard is NOT redundant with ``durable_archive_path``'s
         own totality: the LOOKUP is total, but the archive-root COMPOSITION
@@ -3880,10 +3892,12 @@ class Harness:
             if not self._archive_available_fault_logged:
                 self._archive_available_fault_logged = True
                 logger.warning(
-                    'archive_available: instrument faulted for task %s session %s '
-                    '(%s: %s) — the field now reports false for EVERY '
-                    'session_resume_fallback until this is fixed, so treat a 0%% '
-                    'recoverable rate as suspect. Further occurrences at DEBUG.',
+                    'archive_available: lookup faulted for task %s session %s '
+                    '(%s: %s) — until this is fixed the field reports false for '
+                    'EVERY session_resume_fallback (so treat a 0%% recoverable '
+                    'rate as suspect) AND no session resumes from the archive, '
+                    'because since task 3730 this answer is an eligibility '
+                    'input. Further occurrences at DEBUG.',
                     task_id,
                     session_id,
                     type(exc).__name__,
@@ -9247,14 +9261,24 @@ class Harness:
             # storm-escape at fallback_storm_threshold) is a separate question
             # from which event is emitted: see the streak branch below.
             #
-            # Every session_resume_fallback emit also carries archive_available
-            # (task 3727) — was this session still recoverable from the durable
-            # transcript archive? That is INSTRUMENTATION ONLY (D8 / INV-3
-            # instrument-before-acting): it reports the recoverable population
-            # so it can be MEASURED in production before anything is gated on
-            # it, and changes nothing about what resumes here. Leaf δ is what
-            # may later gate on the signal; task 3578 is what consumes
-            # durable_archive_path to perform an actual restore.
+            # THE DURABLE ARCHIVE IS AN ELIGIBILITY INPUT (task 3730 / δ / D2),
+            # no longer the pure instrument task 3727 added. 3727 wired
+            # archive_available onto every session_resume_fallback emit
+            # precisely so the recoverable population could be MEASURED before
+            # anything gated on it (INV-3 instrument-before-acting); the
+            # measurement came back at ~91% (92 of 101 post-3578 fallbacks,
+            # 2026-09-04), so δ acts on it. The lookup is HOISTED here, once
+            # per dispatch, and feeds two consumers that must never disagree:
+            # the predicate below and that same fallback emit. Two independent
+            # lookups would be two answers to one question — an archival pass
+            # landing between them would produce a fallback event whose
+            # archive_available contradicts the reasons printed beside it.
+            #
+            # Hoisted INSIDE the `enabled` check (see the assignment below) so
+            # the kill switch still costs zero filesystem I/O. The ELIGIBLE
+            # path, by contrast, now pays one glob it did not pay before —
+            # a stated, unavoidable regression against D8's "eligible / capped
+            # / disabled do no extra I/O", and the whole point of δ.
             if recovered_session is not None:
                 # Rolling-window decay, evaluated ONCE PER DISPATCH that
                 # carried a recovered session — BEFORE the reasons, because it
@@ -9291,15 +9315,24 @@ class Harness:
                     # Drop the comparison point too, so the next fallback opens
                     # a fresh run instead of chaining off an expired stamp.
                     self._last_session_resume_fallback_at = None
+                # THE ONE LOOKUP (task 3730). Guarded on `enabled` so the kill
+                # switch keeps its zero-I/O property: with the feature off the
+                # predicate returns {'disabled'} alone without consulting the
+                # archive, so there is nothing here to inform. False is the
+                # correct short-circuit value for that case — it is also what
+                # `_archive_available` degrades to on any fault, so the
+                # disabled path and the faulted path agree.
+                archive_available = (
+                    self._archive_available(
+                        assignment.task_id, recovered_session.get('session_id')
+                    )
+                    if self.config.session_resume.enabled
+                    else False
+                )
                 reasons = self._session_resume_reasons(
                     recovered_session,
                     recovered_config_dir,
-                    # TRANSITIONAL (task 3730): the predicate now takes the
-                    # archive as an eligibility input, but the single hoisted
-                    # lookup that feeds it — and the fallback emit below —
-                    # lands with the guard rewiring. Until then this preserves
-                    # the pre-δ answer exactly.
-                    archive_available=False,
+                    archive_available=archive_available,
                 )
                 # Capture the session identity for the event BEFORE any nulling.
                 resume_event_data = {
@@ -9345,19 +9378,17 @@ class Harness:
                         # EVERY other outcome emits session_resume_fallback
                         # carrying the whole reason set — by-design ones
                         # ('reseeded', a co-occurring 'capped') and genuine
-                        # ones alike. The emit is shared by all of them — ONE
-                        # archive lookup, one filesystem glob per dispatch
-                        # rather than several, and no chance of separate sites
-                        # drifting apart.
+                        # ones alike. The emit is shared by all of them, so no
+                        # two sites can drift apart in what they report.
                         #
-                        # Built INSIDE the event_store guard, not above it.
-                        # archive_available costs a filesystem glob, and with no
-                        # event store there is no consumer for it: the dict
-                        # would be built and dropped (the direct-_run_slot unit
-                        # path, and any event-store-less deployment). On the
-                        # fallback path only, so the eligible / capped /
-                        # disabled paths do no extra I/O and their events stay
-                        # byte-identical (D8).
+                        # archive_available is the HOISTED value (task 3730),
+                        # not a second lookup: it is by construction the same
+                        # bool the predicate above consumed, so this event's
+                        # reasons and its archive_available can never
+                        # contradict each other. It stays on the fallback event
+                        # ONLY — session_resume and session_resume_capped are
+                        # byte-identical to their pre-3727 shape, which is what
+                        # keeps event_store.py's ratio recipe meaningful (D8).
                         #
                         # The session id comes off the snapshot taken above, NOT
                         # off recovered_session — that was set to None at the top
@@ -9374,10 +9405,7 @@ class Harness:
                                     # census. A list, not a set — it has to
                                     # survive the JSON round-trip into runs.db.
                                     'reasons': sorted(reasons),
-                                    'archive_available': self._archive_available(
-                                        assignment.task_id,
-                                        resume_event_data['session_id'],
-                                    ),
+                                    'archive_available': archive_available,
                                 },
                             )
                         # What FEEDS the storm streak is whatever survives
