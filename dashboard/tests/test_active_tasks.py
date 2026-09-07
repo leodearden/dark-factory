@@ -3869,14 +3869,27 @@ class TestCollectTasksWithCountsFairness:
             project_root=roots[0], known_project_roots=roots[1:],
         )
 
-    def _admission_recorder(self, monkeypatch, *, dwell: float):
-        """Patch ``_shape_one_project`` to record ADMISSION order per call."""
+    def _admission_recorder(self, monkeypatch, *, dwell: float, serve_first=None):
+        """Patch ``_shape_one_project`` to record ADMISSION order per call.
+
+        With *serve_first* set to N, the first N admissions recorded in
+        ``admissions`` return WITHOUT awaiting at all and every admission
+        after them hangs forever.  That makes "which roots this render
+        served" a property of the ADMISSION ORDER alone — the thing these
+        tests are about — instead of a race between a dwell and a budget.
+        Callers using it must clear ``admissions`` between renders.
+        """
         admissions: list[str] = []
 
         async def _stub(client, config, project_root, **kwargs):
             label = project_root.name
             admissions.append(label)
-            await asyncio.sleep(dwell)
+            if serve_first is not None and len(admissions) > serve_first:
+                # A wedged MCP leg: never returns, so the caller's own budget
+                # is what ends it — and ends it whatever the host's speed.
+                await asyncio.Event().wait()
+            elif dwell:
+                await asyncio.sleep(dwell)
             return [{'_task_uid': f'{label}/T-1', 'project': label}], False, 1
 
         monkeypatch.setattr(
@@ -3906,15 +3919,30 @@ class TestCollectTasksWithCountsFairness:
 
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
-        self._admission_recorder(monkeypatch, dwell=0.05)
+        # DETERMINISTIC cut, not a wall-clock one. The served count must be a
+        # strict subset on EVERY host, so the first three admissions of each
+        # render return without awaiting at all and the rest hang until the
+        # budget kills them. The earlier form derived the cut from
+        # `asyncio.sleep(0.05)` against a 0.16s budget and read 0 of 9 served
+        # under xdist contention, tripping the vacuousness guard below.
+        admissions = self._admission_recorder(
+            monkeypatch, dwell=0.0, serve_first=3,
+        )
         # Width 1 so the served subset is a contiguous window of the admission
         # order and the arithmetic above is exact rather than probabilistic.
         monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
-        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.2)
-        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 0.16)
+        # Small enough that the six hung roots cost ~0.3s per render, large
+        # enough that no scheduling delay can starve a root that the stub
+        # above serves without awaiting. The TOTAL budget is deliberately NOT
+        # the constraint here: it is measured from before the runtime fan-out,
+        # so tightening it would reintroduce exactly the host-speed dependence
+        # this test just removed.
+        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.05)
+        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 5.0)
         at_mod._reset_root_rotation()
 
         async def _one_render() -> set[str]:
+            admissions.clear()  # serve_first counts within ONE render
             active, _offline, _counts, _degraded, _unknown = (
                 await collect_tasks_with_counts(client=dummy_client, config=config)
             )
