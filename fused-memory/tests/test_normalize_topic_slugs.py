@@ -1106,3 +1106,194 @@ class TestRenameOneOutcomesAreGraded:
         for outcome in ('memory_not_found', 'update_failed', 'rename_error',
                         'topic_moved_since_plan'):
             assert outcome in _mod.SKIP_BUCKETS, outcome
+
+
+# ===========================================================================
+# verify_old_slugs_drained — scope item 3, the post-apply verification
+# ===========================================================================
+
+def _result(outcome: str, **overrides) -> dict:
+    row = {
+        'project_id': 'dark_factory',
+        'memory_id': 'm1',
+        'old_topic': 'legacy_topic',
+        'new_topic': 'legacy-topic',
+        'outcome': outcome,
+    }
+    row.update(overrides)
+    return row
+
+
+class TestVerifyOldSlugsDrained:
+    """``verify_old_slugs_drained(memory_service, results, skips)``.
+
+    Scope item 3: "verify via ``count_memories_by_metadata`` on each OLD slug
+    expecting 0".  Adapted from ``retro_stamp_topics._probe_legacy_topic_
+    residue``, with ONE inversion a reader diffing the two must not mistake
+    for a copy bug: there, the sweep is id-bounded, so records outside it can
+    legitimately still carry the legacy spelling and a non-zero residue is
+    expected-and-merely-reported.  HERE the sweep is corpus-wide, so after
+    ``--apply`` a non-zero residue means a slug was STRANDED — an error.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_probe_per_distinct_project_and_slug(self):
+        """Not one per record — the probe is bounded by SLUGS, not by writes.
+
+        Eight records sharing one legacy value is one question, asked once.
+        Asking it eight times would multiply a bulk sweep's read load by its
+        own target count for no additional information.
+        """
+        service = _service()
+        service.count_memories_by_metadata.return_value = 0
+        results = [
+            _result('renamed', memory_id=f'm{i}') for i in range(8)
+        ] + [_result('renamed', memory_id='x1', old_topic='other_slug',
+                     new_topic='other-slug')]
+        await _mod.verify_old_slugs_drained(service, results, {})
+        probed = [
+            call.args for call in service.count_memories_by_metadata.await_args_list
+        ]
+        assert probed == [
+            ('dark_factory', {'topic': 'legacy_topic'}),
+            ('dark_factory', {'topic': 'other_slug'}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_drained_slug_files_nothing(self):
+        """Zero IS the expected outcome of an apply run — silence is correct.
+
+        Filing a line per successfully-drained slug would bury the stranded
+        ones, which are the only reason this pass exists.
+        """
+        service = _service()
+        service.count_memories_by_metadata.return_value = 0
+        skips: dict = {}
+        await _mod.verify_old_slugs_drained(service, [_result('renamed')], skips)
+        assert skips.get('legacy_slug_residue', []) == []
+
+    @pytest.mark.asyncio
+    async def test_a_stranded_slug_is_reported_with_its_count(self):
+        """Corpus-wide means nothing should be left — a remainder is an error."""
+        service = _service()
+        service.count_memories_by_metadata.return_value = 3
+        skips: dict = {}
+        await _mod.verify_old_slugs_drained(service, [_result('renamed')], skips)
+        entries = skips['legacy_slug_residue']
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry['project_id'] == 'dark_factory'
+        assert entry['legacy_topic'] == 'legacy_topic'
+        assert entry['new_topic'] == 'legacy-topic'
+        assert entry['residue_count'] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_clean_rehearsal_reports_zero_residue(self):
+        """Dry-run rows STILL carry the legacy value, so subtract them first.
+
+        Without this the rehearsal would report every record it is about to
+        fix as residue — a false alarm on exactly the run an operator uses to
+        decide whether to apply at all.
+        """
+        service = _service()
+        service.count_memories_by_metadata.return_value = 8
+        skips: dict = {}
+        results = [_result('would_rename', memory_id=f'm{i}') for i in range(8)]
+        await _mod.verify_old_slugs_drained(service, results, skips)
+        assert skips.get('legacy_slug_residue', []) == []
+
+    @pytest.mark.asyncio
+    async def test_a_rehearsal_still_surfaces_records_it_did_not_plan(self):
+        """8 rehearsed out of 10 counted: 2 records this run never saw.
+
+        That is a genuine coverage signal — an under-enumerated cell, or a
+        record whose topic was refused — and subtracting the rehearsed rows is
+        precisely what makes it visible instead of drowned.
+        """
+        service = _service()
+        service.count_memories_by_metadata.return_value = 10
+        skips: dict = {}
+        results = [_result('would_rename', memory_id=f'm{i}') for i in range(8)]
+        await _mod.verify_old_slugs_drained(service, results, skips)
+        assert skips['legacy_slug_residue'][0]['residue_count'] == 2
+
+    @pytest.mark.asyncio
+    async def test_the_subtraction_clamps_at_zero(self):
+        """More rehearsed than counted is churn, not negative residue.
+
+        A record consolidated away between the plan and the probe makes the
+        count smaller than the rehearsal. Reporting -1 residue would be
+        nonsense an operator has to decode.
+        """
+        service = _service()
+        service.count_memories_by_metadata.return_value = 1
+        skips: dict = {}
+        results = [_result('would_rename', memory_id=f'm{i}') for i in range(5)]
+        await _mod.verify_old_slugs_drained(service, results, skips)
+        assert skips.get('legacy_slug_residue', []) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_is_not_subtracted_in_an_apply_run(self):
+        """Only ``would_rename`` rows still carry the legacy value by design.
+
+        A row whose write FAILED also still carries it — and that is genuine
+        residue, correctly left in.
+        """
+        service = _service()
+        service.count_memories_by_metadata.return_value = 1
+        skips: dict = {}
+        await _mod.verify_old_slugs_drained(
+            service, [_result('update_failed')], skips,
+        )
+        assert skips['legacy_slug_residue'][0]['residue_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_files_unknown_not_zero(self):
+        """Unknown residue is NOT zero residue — a bucket entry says so.
+
+        Swallowing the failure would let the report claim a drained corpus on
+        the strength of a question that was never answered.
+        """
+        service = _service()
+        service.count_memories_by_metadata.side_effect = RuntimeError('qdrant down')
+        skips: dict = {}
+        await _mod.verify_old_slugs_drained(service, [_result('renamed')], skips)
+        entry = skips['legacy_slug_residue'][0]
+        assert 'RuntimeError' in entry['error']
+        assert 'residue_count' not in entry, 'an unanswered probe has no count'
+        assert 'not the same as zero' in entry['note']
+
+    @pytest.mark.asyncio
+    async def test_rows_that_did_not_rename_are_not_probed(self):
+        """A refused row never moved a slug, so there is nothing to drain."""
+        service = _service()
+        service.count_memories_by_metadata.return_value = 0
+        await _mod.verify_old_slugs_drained(
+            service,
+            [_result('memory_not_found'), _result('already_normalized')],
+            {},
+        )
+        service.count_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_probes_are_ordered_for_a_clean_diff(self):
+        service = _service()
+        service.count_memories_by_metadata.return_value = 0
+        results = [
+            _result('renamed', project_id='reify', old_topic='z_slug'),
+            _result('renamed', old_topic='b_slug'),
+            _result('renamed', old_topic='a_slug'),
+        ]
+        await _mod.verify_old_slugs_drained(service, results, {})
+        probed = [
+            call.args for call in service.count_memories_by_metadata.await_args_list
+        ]
+        assert probed == [
+            ('dark_factory', {'topic': 'a_slug'}),
+            ('dark_factory', {'topic': 'b_slug'}),
+            ('reify', {'topic': 'z_slug'}),
+        ]
+
+    def test_a_stranded_slug_fails_the_run(self):
+        assert 'legacy_slug_residue' in _mod.ERROR_OUTCOMES
+        assert 'legacy_slug_residue' in _mod.SKIP_BUCKETS
