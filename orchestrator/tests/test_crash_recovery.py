@@ -3016,7 +3016,7 @@ class TestSessionResumeStorm:
 
         producible = strings - non_reason_literals
         assert producible == {'disabled', 'stale', 'capped', 'no_transcript',
-                              'reseeded'}, (
+                              'reseeded', 'aged_out'}, (
             'the string literals in _session_resume_reasons no longer partition '
             'into the declared non-reasons and the known reason vocabulary. If '
             'you added a REASON, classify it in '
