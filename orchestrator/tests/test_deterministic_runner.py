@@ -6047,6 +6047,102 @@ class TestCrashWindowReverify:
             f'detail must record the re-inspected live unit state: {detail!r}'
         )
 
+    async def test_reverify_inspect_spawn_failure_escalates_instead_of_raising(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector OSError on the crash-window re-verify leg
+        must route into the crash-window escalation, not escape ``run()``.
+
+        Injected through the DOCUMENTED constructor seam — ``inspect_fn``
+        resolves to ``self._unit_inspector or self._default_inspect_unit``, so
+        the source-level guard in ``systemd_inspect`` (which the injected mock
+        never reaches) cannot discharge ``run()``'s own "always returns
+        BLOCKED, never a raw exception" contract. RED today: the OSError
+        propagates straight out of ``run()`` at deterministic_runner.py:3368,
+        bypassing the escalation entirely.
+        """
+        import errno
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='904',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — no prior escalation
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('904', status='pending')
+        assert len(pending) == 1, (
+            f'a failed re-verify must still escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'a failed re-verify must NOT drive to done'
+        script_runner.assert_not_awaited()
+        # The failure must route THROUGH the sentinel into
+        # _deterministic_deploy_health_verdict (which returns 'unconfirmed'
+        # for it) rather than skipping the re-verify branch — the enriched
+        # reverify_note is the observable proof it did.
+        detail = pending[0].detail
+        assert 'unconfirmed' in detail, (
+            f'detail must record that the re-verify came back unconfirmed: {detail!r}'
+        )
+        assert 'MainPID' in detail, (
+            f'detail must record the observed (sentinel) unit state: {detail!r}'
+        )
+
+    async def test_reverify_inspect_non_oserror_still_propagates(self, tmp_path: Path):
+        """Pins the NARROWNESS of the step-4 call-site guard.
+
+        ``run()`` deliberately raises ``ValueError`` (the only entry in its
+        documented ``Raises:`` section) and ``NotImplementedError`` (the "gate
+        resolved but before_done_ran_at is not set" operator guard). A guard
+        widened to a bare ``except Exception`` would swallow those into a
+        silent BLOCKED escalation — inverting this repo's
+        loud-over-silent-degradation norm — so a non-OSError inspector failure
+        must keep propagating.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='905',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=RuntimeError('not an OSError — must stay loud'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        with pytest.raises(RuntimeError, match='must stay loud'):
+            await runner.run(assignment)
+
     async def test_no_baseline_crash_window_does_not_reinspect(self, tmp_path: Path):
         """Pre-ζ shape (no deploy_state at all): the persisted-baseline gate
         must not re-inspect the unit and must fall straight through to the
