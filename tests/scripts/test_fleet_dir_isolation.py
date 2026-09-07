@@ -638,6 +638,7 @@ class TestSyntheticHeartbeatsIn:
         """
         assert synthetic_heartbeats_in(tmp_path / 'nope') == []
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores mode bits')
     def test_an_unreadable_directory_is_empty_not_an_error(
         self, tmp_path: Path,
     ) -> None:
