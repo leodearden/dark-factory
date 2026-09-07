@@ -2602,6 +2602,51 @@ class TestBeforeDoneTargetUnitlessDeploy:
         assert 'Baseline inspect failed' in pending[0].summary
         script_runner.assert_not_called()
 
+    async def test_baseline_inspect_spawn_failure_blocks_without_running_deploy(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector OSError on the PRE-DEPLOY baseline leg must
+        be indistinguishable from a wedged inspect once routed into the
+        sentinel — same BLOCKED, same single infra_issue, same untouched
+        deploy.
+
+        Injected through the documented ``unit_inspector`` seam, so (like the
+        crash-window leg) this is un-GREENable by the source-level guard
+        alone. RED today: the OSError propagates out of ``run()`` at
+        deterministic_runner.py:3649, BEFORE the task-2091
+        ``if not baseline.get('ActiveState')`` gate can fire — so the deploy
+        is not attempted, but neither is the escalation filed, and the task is
+        left neither done nor cleanly blocked.
+        """
+        import errno
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2635', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2635', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        # before_done_ran_at is already stamped (I1 once-only), so the deploy
+        # must NOT be attempted against a baseline that was never established.
+        script_runner.assert_not_called()
+
     async def test_named_target_happy_path_still_double_inspects_and_drives_done(
         self, tmp_path: Path,
     ):
