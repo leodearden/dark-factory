@@ -826,6 +826,103 @@ class TestReportingIsQuietWhenThereIsNothingToSay:
         assert 7 in reported[7] and 3 not in reported[7], reported[7]
 
 
+class TestTheSweepHoldsOffWhileARunIsLive:
+    """The hazard this task exists to close.
+
+    A live ``-m integration`` run or an E2 bake-off seeds its corpus under
+    ``E2_BAKEOFF_PREFIX``, which is a prefix this cron deletes.  Unguarded,
+    a sweep landing between that run's seed and measure phases deletes the
+    corpus out from under it, and leaves nothing behind pointing at the
+    reaper — the run simply measures a world that quietly emptied.
+
+    A live lease holds off the ENTIRE sweep, not just the collections that
+    run happens to own.  A per-name guard would need the lease to enumerate
+    what it protects and the reaper to trust that list; it cannot, because
+    runs grow their collection set mid-setup and a future driver adds names
+    the lease format knows nothing about.  A deferred sweep costs nothing —
+    it runs again in six hours over debris nothing depends on — while a
+    wrong delete corrupts a live experiment.  With the error directions that
+    asymmetric, the guard stays one cell wide and fails toward not deleting.
+    """
+
+    STALE = ('{prefix}dark_factory', '{bakeoff}_c_peers_main')
+
+    def _stale(self, mod) -> list[str]:
+        return [
+            name.format(prefix=mod.PREFIX, bakeoff=mod.E2_BAKEOFF_PREFIX)
+            for name in self.STALE
+        ]
+
+    def test_it_deletes_nothing_and_never_constructs_a_client(
+        self, monkeypatch, capsys,
+    ):
+        """Both halves in one assertion, and the stronger one is the client:
+        a held-off sweep must cost ZERO network, so there is no client for a
+        delete to have gone through in the first place."""
+        mod = _mod()
+        clients = _install_fake_qdrant(
+            monkeypatch, [*self._stale(mod), *LIVE_COLLECTIONS],
+        )
+
+        with mod.hold_lease(owner='e2-bake-off gw0'):
+            mod.main()
+
+        assert clients == []
+        capsys.readouterr()
+
+    def test_it_names_the_holder_and_its_pid_on_stderr(self, monkeypatch, capsys):
+        """An operator reading cron mail has to be able to attribute the
+        hold-off to a specific run rather than guess at one."""
+        mod = _mod()
+        _install_fake_qdrant(monkeypatch, [*self._stale(mod), *LIVE_COLLECTIONS])
+
+        with mod.hold_lease(owner='e2-bake-off gw0'):
+            mod.main()
+
+        captured = capsys.readouterr()
+        assert 'e2-bake-off gw0' in captured.err
+        assert str(os.getpid()) in captured.err
+
+    def test_it_says_nothing_on_stdout_because_it_deleted_nothing(
+        self, monkeypatch, capsys,
+    ):
+        """stdout stays the deletion report and only that — a cron job that
+        prints on every no-op trains its reader to ignore it."""
+        mod = _mod()
+        _install_fake_qdrant(monkeypatch, [*self._stale(mod), *LIVE_COLLECTIONS])
+
+        with mod.hold_lease(owner='e2-bake-off gw0'):
+            mod.main()
+
+        assert capsys.readouterr().out == ''
+
+    def test_it_still_returns_normally(self, monkeypatch, capsys):
+        """The standing contract: always exits 0, idempotent.  Returning at
+        all IS the assertion — a cron job that raised would page someone."""
+        mod = _mod()
+        _install_fake_qdrant(monkeypatch, [*self._stale(mod), *LIVE_COLLECTIONS])
+
+        with mod.hold_lease(owner='e2-bake-off gw0'):
+            mod.main()
+
+        capsys.readouterr()
+
+    def test_the_same_collections_are_reaped_when_no_lease_is_held(
+        self, monkeypatch, capsys,
+    ):
+        """The complement, and the reason the tests above mean anything: a
+        guard that had simply disabled the sweep would pass every one of
+        them."""
+        mod = _mod()
+        stale = self._stale(mod)
+        clients = _install_fake_qdrant(monkeypatch, [*stale, *LIVE_COLLECTIONS])
+
+        mod.main()
+
+        assert sorted(clients[0].deleted) == sorted(stale)
+        capsys.readouterr()
+
+
 @pytest.mark.parametrize('suffix', ['main', 'gw0', 'gw11'])
 def test_every_worker_suffix_produces_a_reapable_collection(suffix):
     """The per-xdist-worker project id must not be able to dodge the prefix."""
