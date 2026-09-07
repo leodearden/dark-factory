@@ -5733,3 +5733,121 @@ def test_mine_to_saturation_bound_is_removed_when_the_batch_loop_unwinds(caplog)
     assert logging.getLogger("legibility.coder").filters == [], (
         "the bound must be removed even when the loop unwinds abnormally"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-5: RED — W-B. `CensusHeadroomExhausted` carries `verified`
+# and `unverified` but NOT `rejected`, so on any run where a cluster was
+# rejected before the hit the two counts silently fail to account for the
+# whole run: an operator reading "1 verified, 3 unverified" of a 5-cluster
+# run cannot tell whether the missing cluster was work already spent or a
+# bookkeeping bug. A rejection is real, paid-for adjudication, not an
+# absence. Every case below drives the REAL `_build_default_verify_fn` (never
+# a hand-raised exception) and arranges at least one PRECEDING rejection, so
+# the divergence the current two counts hide is actually present.
+# ---------------------------------------------------------------------------
+
+_UNPARSEABLE_PLAIN_PROSE = (
+    "The rotation looks fine to me and I have nothing further to add about it."
+)
+_UNPARSEABLE_BANNERED_PROSE = (
+    "I cannot answer right now: this account has hit its weekly limit."
+)
+
+
+def _no_headroom(reason="probe reports no capacity"):
+    return mod.HeadroomResult(ok=False, reason=reason)
+
+
+def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_the_backstop():
+    """(a) The periodic backstop site, with the hitting cluster ALREADY
+    adjudicated (so `unverified == remaining - 1`)."""
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return _UNPARSEABLE_PLAIN_PROSE   # cluster 0 rejects, no banner, no probe
+        return _verdict()                      # clusters 1 and 2 verify
+
+    clusters = _clusters(5)
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke,
+        headroom_probe=_make_recording_probe(_no_headroom()),
+        probe_every=3,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(clusters, model="sonnet")
+
+    exc = excinfo.value
+    assert exc.verified == 2, "clusters 1 and 2 came back verified"
+    assert exc.rejected == 1, "cluster 0's unparseable verdict is real work already spent"
+    assert exc.unverified == 2, "clusters 3 and 4 were never attempted"
+    assert exc.verified + exc.rejected + exc.unverified == len(clusters)
+
+
+def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_the_invoke_error():
+    """(b) The invocation-error site, where the hitting cluster is NOT yet
+    appended (so `unverified == remaining`)."""
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return _verdict()                  # cluster 0 verifies
+        if len(calls) == 2:
+            return _UNPARSEABLE_PLAIN_PROSE    # cluster 1 rejects
+        raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+
+    clusters = _clusters(5)
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke,
+        headroom_probe=_make_recording_probe(_no_headroom()),
+        probe_every=100,                       # no backstop — isolate this site
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(clusters, model="sonnet")
+
+    exc = excinfo.value
+    assert exc.verified == 1
+    assert exc.rejected == 1
+    assert exc.unverified == 3, "the hitting cluster 2, plus 3 and 4"
+    assert exc.verified + exc.rejected + exc.unverified == len(clusters)
+
+
+def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_the_banner():
+    """(c) The unparseable-banner site — also a not-yet-appended site."""
+    assert mod.looks_like_blocking_banner(_UNPARSEABLE_BANNERED_PROSE) is not None, (
+        "fixture sanity: the bannered reply must actually match a marker"
+    )
+    assert mod.looks_like_blocking_banner(_UNPARSEABLE_PLAIN_PROSE) is None, (
+        "fixture sanity: the plain reply must NOT match, so it spends no probe"
+    )
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return _verdict()                  # cluster 0 verifies
+        if len(calls) == 2:
+            return _UNPARSEABLE_PLAIN_PROSE    # cluster 1 rejects, no probe spent
+        return _UNPARSEABLE_BANNERED_PROSE     # cluster 2: unparseable WITH a marker
+
+    clusters = _clusters(5)
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke,
+        headroom_probe=_make_recording_probe(_no_headroom()),
+        probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(clusters, model="sonnet")
+
+    exc = excinfo.value
+    assert "banner" in exc.reason, "this must be the banner site, not the backstop"
+    assert exc.verified == 1
+    assert exc.rejected == 1
+    assert exc.unverified == 3
+    assert exc.verified + exc.rejected + exc.unverified == len(clusters)
