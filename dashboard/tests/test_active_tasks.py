@@ -3816,3 +3816,204 @@ class TestCollectTasksWithCountsConcurrency:
             'WARNING — an exception logged as a routine outage is a bug that '
             'renders as an outage forever'
         )
+
+
+# ---------------------------------------------------------------------------
+# workstream C cause 3 (task 4884, #4795): the walk ORDER rotates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCollectTasksWithCountsFairness:
+    """A budget that cannot serve every root must not starve the SAME ones.
+
+    Concurrency (cause 2) shrinks the wall clock but does not make the walk
+    fair: at 9 roots and a 20 s total, some render will still run out, and
+    with a FIXED order the roots that lose are always the last ones. That is
+    what the journal shows — ``project solar-challenge-platform: skipped — the
+    20.0s Tasks budget was already spent before this project was reached``
+    and ``project pump-web-ui: skipped ...``, the same trailing pair, render
+    after render. Those two projects were effectively invisible on the Tasks
+    tab while the dashboard reported itself healthy.
+
+    Rotation makes the starvation FAIR, not absent. These tests assert the
+    fairness, not the absence.
+    """
+
+    def _n_root_config(self, tmp_path, n: int) -> DashboardConfig:
+        roots = []
+        for i in range(n):
+            root = tmp_path / f'proj-{i:02d}'
+            root.mkdir()
+            roots.append(root)
+        return DashboardConfig(
+            project_root=roots[0], known_project_roots=roots[1:],
+        )
+
+    def _admission_recorder(self, monkeypatch, *, dwell: float):
+        """Patch ``_shape_one_project`` to record ADMISSION order per call."""
+        admissions: list[str] = []
+
+        async def _stub(client, config, project_root, **kwargs):
+            label = project_root.name
+            admissions.append(label)
+            await asyncio.sleep(dwell)
+            return [{'_task_uid': f'{label}/T-1', 'project': label}], False, 1
+
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._shape_one_project', _stub,
+        )
+        return admissions
+
+    async def test_no_root_is_systematically_starved(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(a) Across enough consecutive renders, EVERY root gets served.
+
+        This is stronger than "two runs differ": a two-cycle alternation would
+        satisfy that and still leave roots 5-9 permanently invisible. The
+        assertion is on the UNION over consecutive calls covering all nine.
+
+        The number of calls is DERIVED from the observed rotation stride
+        rather than hard-coded. With ``s`` roots served per render and the
+        offset advancing by ONE slot per render, the served window is
+        contiguous and slides by one, so covering ``N`` roots takes
+        ``N - s + 1`` renders — not ``ceil(N / s)``, which would be the count
+        for a stride of ``s``. Stride one is the finer-grained rotation and
+        the one ``_rotated_project_roots`` implements; deriving the count here
+        keeps this test correct if that choice is ever revisited.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        self._admission_recorder(monkeypatch, dwell=0.05)
+        # Width 1 so the served subset is a contiguous window of the admission
+        # order and the arithmetic above is exact rather than probabilistic.
+        monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
+        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.2)
+        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 0.16)
+        at_mod._reset_root_rotation()
+
+        async def _one_render() -> set[str]:
+            active, _offline, _counts, _degraded, _unknown = (
+                await collect_tasks_with_counts(client=dummy_client, config=config)
+            )
+            return {row['project'] for row in active}
+
+        first = await _one_render()
+        served_per_render = len(first)
+        assert 0 < served_per_render < 9, (
+            f'the budget served {served_per_render} of 9 roots — this test is '
+            'vacuous unless a STRICT subset is served (0 means nothing ran, 9 '
+            'means the budget was never the constraint and starvation cannot '
+            'be observed at all). Adjust the tightened budgets, not the claim.'
+        )
+
+        union = set(first)
+        for _ in range(9 - served_per_render):
+            union |= await _one_render()
+
+        missing = {f'proj-{i:02d}' for i in range(9)} - union
+        assert not missing, (
+            f'{sorted(missing)} were never served across '
+            f'{9 - served_per_render + 1} consecutive renders while '
+            f'{served_per_render} roots were served each time — the walk '
+            'order is FIXED, so the same trailing roots starve on every '
+            'render. That is the incident behaviour: solar-challenge-platform '
+            'and pump-web-ui were skipped render after render while the '
+            'dashboard reported itself healthy.'
+        )
+
+    async def test_rotation_advances_by_exactly_one_slot_per_call(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(b) The rotation is a DETERMINISTIC round-robin, not randomised.
+
+        Determinism is the point: an operator reading two consecutive renders
+        can predict which roots were served, and this test can assert it.
+        A random shuffle would also spread the starvation but would make both
+        of those impossible.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 5)
+        _register_runtime(monkeypatch, {})
+        admissions = self._admission_recorder(monkeypatch, dwell=0.0)
+        # Width 1 so admission order is unambiguous rather than a race between
+        # concurrently-admitted roots.
+        monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
+        at_mod._reset_root_rotation()
+
+        await collect_tasks_with_counts(client=dummy_client, config=config)
+        first = list(admissions)
+        admissions.clear()
+        await collect_tasks_with_counts(client=dummy_client, config=config)
+        second = list(admissions)
+
+        assert len(first) == 5 and len(second) == 5, (
+            f'expected all 5 roots admitted in each render, got {first!r} then '
+            f'{second!r} — the budget must not be the constraint in this test'
+        )
+        assert second == first[1:] + first[:1], (
+            f'render 2 admitted {second!r}; expected {first[1:] + first[:1]!r} '
+            f'— render 1 admitted {first!r} and the offset must advance by '
+            'exactly ONE slot, so the order is a predictable round-robin an '
+            'operator can reason about across two consecutive renders'
+        )
+
+    async def test_all_project_roots_stays_primary_first(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(c) The rotation must NOT leak into the shared root helper.
+
+        ``_all_project_roots`` has four other callers that depend on
+        primary-first ordering (``app.py``, ``scheduler.py``,
+        ``active_tasks.collect_done_counts``, and ``test_app.py``'s patch
+        point). Rotating it in place would silently repoint every one of them
+        at a different project — a far larger blast radius than the Tasks tab.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 5)
+        _register_runtime(monkeypatch, {})
+        self._admission_recorder(monkeypatch, dwell=0.0)
+        at_mod._reset_root_rotation()
+
+        for render in range(4):
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+            roots = at_mod._all_project_roots(config)
+            assert roots[0] == config.project_root, (
+                f'after {render + 1} render(s) _all_project_roots returned '
+                f'{[r.name for r in roots]} — the primary root is no longer '
+                'first, so the rotation has leaked into the shared helper and '
+                'every other caller now reads a different project'
+            )
+
+    async def test_output_order_is_unaffected_by_rotation(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(d) Rotation changes ADMISSION order only, never rendered order.
+
+        If the rotated order reached the payload, the Tasks table would
+        reshuffle on every 3 s poll — a fix for invisibility that trades it
+        for unreadability.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 5)
+        _register_runtime(monkeypatch, {})
+        self._admission_recorder(monkeypatch, dwell=0.0)
+        at_mod._reset_root_rotation()
+
+        expected = [f'proj-{i:02d}' for i in range(5)]
+        for render in range(4):
+            active, _offline, _counts, _degraded, _unknown = (
+                await collect_tasks_with_counts(client=dummy_client, config=config)
+            )
+            got = [row['project'] for row in active]
+            assert got == expected, (
+                f'render {render + 1} returned rows in {got}, expected '
+                f'{expected} — the rendered order must stay canonical '
+                'primary-first root order at every rotation offset'
+            )
