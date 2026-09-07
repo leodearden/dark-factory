@@ -679,6 +679,119 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 )
 
 
+# pytest-xdist's BAILOUT marker (task 5082) — a signal RELATED TO, but
+# deliberately DISTINCT FROM, _XDIST_WORKER_CRASH_RE above. The crash
+# signature says "a worker died"; this says "and xdist therefore gave up",
+# which is a strictly stronger and much rarer claim.
+#
+# Grounded in `xdist/dsession.py::DSession.worker_workerdown`: on every worker
+# death it increments `_failed_nodes_count`, then branches on whether the
+# configured `--max-worker-restart` cap has been exceeded.
+#   * EXCEEDED -> it sets `msg` to one of exactly two literals — ``f"worker
+#     {node.gateway.id} crashed and worker restarting disabled"`` when the cap
+#     is 0 (dark-factory's own setting, orchestrator/pyproject.toml's addopts),
+#     or ``f"maximum crashed workers reached: {N}"`` for a non-zero cap — and
+#     then calls `triggershutdown()`. Every test still queued on every worker
+#     is ABANDONED, so the tally pytest subsequently prints is PARTIAL.
+#   * NOT EXCEEDED -> it prints ``replacing crashed worker gwN``, clones the
+#     node, and the session runs to COMPLETION with a full, trustworthy tally.
+# The marker below is emitted on the first branch only, i.e. exactly at
+# `triggershutdown()`, which is why it means "truncated" and nothing else.
+# Keying truncation detection on the crash signature instead would relabel
+# every recovering (`--max-worker-restart > 0`) target's COMPLETE run as
+# aborted — and verify.py verifies multiple projects (see the multi-project
+# rationale on _KNOWN_LOAD_FLAKE_NODEID_RES below), so such a target is
+# reachable, not hypothetical.
+#
+# NOT line-anchored, unlike the _PYTEST_* patterns above, because xdist emits
+# the same message through two writers with different decoration: `report_line`
+# prints it bare, while `pytest_terminal_summary` re-emits it via
+# ``terminalreporter.write_sep("=", f"xdist: {msg}")`` — wrapped in ``=`` bars
+# with an ``xdist: `` prefix. Both must match.
+#
+# ACCEPTED, DOCUMENTED LIMITATION: both emission paths are gated on
+# ``config.option.verbose >= 0`` (dsession.py's `report_line` and
+# `pytest_terminal_summary`), so under ``-q`` the marker is absent and every
+# consumer below falls back to today's behaviour exactly. That is the fail-safe
+# direction — the abort label is only ever ADDED when certain, never asserted
+# on a run that may have completed. It cannot be repaired by keying on the
+# ABSENCE of ``replacing crashed worker``, because that line is suppressed
+# under ``-q`` too: the negative signal is unsound precisely in the case it
+# would be meant to cover. dark-factory's own addopts do not use ``-q``.
+_XDIST_SESSION_ABORTED_RE = re.compile(
+    r"worker gw\d+ crashed and worker restarting disabled"
+    r"|maximum crashed workers reached: \d+",
+)
+
+
+def _is_worker_death_truncated_session(output: str) -> bool:
+    """Return True when *output* shows xdist ABANDONING the rest of the suite.
+
+    True means: a worker died, the `--max-worker-restart` cap was exceeded,
+    and `xdist/dsession.py` called `triggershutdown()` — so every test still
+    queued never ran and any pass/fail/skip tally in *output* is PARTIAL.
+
+    This is NOT the same question as "did a worker crash"
+    (``_XDIST_WORKER_CRASH_RE``): a target configured with
+    ``--max-worker-restart > 0`` takes xdist's sibling branch, replaces the
+    worker, and completes normally. See ``_XDIST_SESSION_ABORTED_RE`` above
+    for the full grounding and for the accepted ``-q`` limitation.
+
+    Returns ``False`` for falsy *output*.
+    """
+    return bool(output) and _XDIST_SESSION_ABORTED_RE.search(output) is not None
+
+
+def _crash_attributed_nodeids(output: str) -> set[str]:
+    """Return the node-ids *output* attributes to a dead worker, not to a verdict.
+
+    When a worker dies, `xdist/dsession.py::handle_crashitem` FABRICATES a
+    report for whatever test that worker had in flight::
+
+        rep = pytest.TestReport(nodeid=..., outcome="failed",
+                                longrepr=f"worker {gw!r} crashed while "
+                                         f"running {nodeid!r}",
+                                when="???")
+
+    pytest's terminal reporter then prints an ordinary-looking ``FAILED
+    <nodeid>`` short-summary line for it and counts it in the tally — but that
+    report is not the test's own verdict. The worker died before producing
+    one; ``when="???"`` is xdist's own admission of exactly that, and the
+    longrepr is the crash message rather than a traceback. A node-id in this
+    set is therefore POSITIVE EVIDENCE that no verdict was reached for it.
+
+    The union of the two extractors already used by
+    ``_extract_failing_test_ids`` — ``_XDIST_CRASH_NODEID_RE`` (the explicit
+    ``crashed while running '<nodeid>'`` notice) and
+    ``_XDIST_NODE_DOWN_PRECEDING_NODEID_RE`` (the in-progress node-id line
+    immediately preceding ``node down: Not properly terminated``, for the runs
+    where the explicit phrasing is absent). No new regex: both already cover
+    the shapes xdist emits and both are already quote-tolerant (esc-2971-13).
+
+    Correlation against those UNTRIMMED notices in the FAILURES-section body
+    is deliberate, and the reason this helper exists at all rather than the
+    caller simply parsing the FAILED line's own `` - worker 'gwN' crashed
+    while running ...`` suffix. pytest renders that suffix through
+    ``_pytest/terminal.py::_format_trimmed``, which ellipsizes it to the
+    remaining terminal width and, per its own docstring, "Returns None if even
+    the ellipsis can't fit". It survives intact only under ``running_on_ci()``
+    or ``-vv``; at a default 80-column non-tty width a realistic ``FAILED
+    orchestrator/tests/test_x.py::test_y`` line leaves far too few columns for
+    the ~85-character message. A parser keyed on it would work in CI and
+    silently fail locally.
+
+    Returns an empty set for falsy *output* or output carrying no crash notice
+    — never guess.
+    """
+    if not output:
+        return set()
+    return {
+        m.group(1)
+        for pattern in (_XDIST_CRASH_NODEID_RE, _XDIST_NODE_DOWN_PRECEDING_NODEID_RE)
+        for m in pattern.finditer(output)
+    }
+
+
 # Small, ENUMERATED allow-list of known load-induced test flakes (esc-2496-3),
 # grounded in the same config.yaml task-2361 worker-kill-catalog reasoning as
 # _XDIST_WORKER_CRASH_RE above: under host CPU oversubscription, a bare
