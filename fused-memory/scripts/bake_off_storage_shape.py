@@ -5578,6 +5578,19 @@ async def run_bake_off(
     # because `resolve_guard_threshold` navigates the SERVICE to find the
     # threshold production would really run at, and hard-coding or defaulting
     # that number is what its docstring exists to forbid.
+
+    # Resolved HERE, before the first acquisition below — never in the `with`
+    # header further down.  `load_cleanup_script()` can raise
+    # (`_load_sibling_script` raises `FixtureError` when the spec cannot be
+    # built), and evaluated there it would sit after `mkdtemp` and after
+    # `MemoryService(...)` but before the `try` — the one window in which a
+    # raise leaks the queue directory and skips `close()` on a half-built
+    # service.  That it is unreachable today (the `ephemeral_collection_prefix`
+    # call above has already cached the module) is an accident of ordering
+    # rather than a property, and reordering those two lines would restore the
+    # leak silently.
+    reaper = load_cleanup_script()
+
     queue_dir = tempfile.mkdtemp(prefix='e2-bakeoff-queue-')
     config.queue.data_dir = queue_dir
 
@@ -5608,16 +5621,15 @@ async def run_bake_off(
     # pre-run `drop_collections` creates anything, and stay live until the
     # teardown in the `finally` has finished dropping.
     #
-    # Reached through `load_cleanup_script()`, never by re-deriving a path,
-    # for the reason `ephemeral_collection_prefix` (:3747) already gives: the
-    # guard and the sweep it guards must move together under a rename.
+    # Reached through `load_cleanup_script()` (resolved above), never by
+    # re-deriving a path, for the reason `ephemeral_collection_prefix` (:3747)
+    # already gives: the guard and the sweep it guards must move together
+    # under a rename.
     #
     # This also covers the `__main__` CLI path, where no pytest conftest
     # exists to take a lease on the run's behalf — and that is how a bake-off
     # is usually driven.
-    with load_cleanup_script().hold_lease(
-        owner=f'bake_off_storage_shape {worker_suffix()}',
-    ):
+    with reaper.hold_lease(owner=f'bake_off_storage_shape {worker_suffix()}'):
         try:
             drop_collections(collections.values(), qdrant_url=qdrant_url)
             await memory.initialize()

@@ -3701,6 +3701,48 @@ class TestFetchProductionRankingsHoldsALease:
 
         assert reaper.live_leases() == []
 
+    async def test_the_reaper_is_resolved_before_any_resource_is_acquired(
+        self, monkeypatch,
+    ):
+        """The same acquisition-window property `run_bake_off` carries.
+
+        The temp queue directory is this pass's FIRST acquisition and the
+        service is built right after it, both before the `with`.  A
+        `bake.load_cleanup_script()` evaluated in the `with` header would sit
+        after both and before the `try` — the one window where a raise
+        (`_load_sibling_script` raises `FixtureError` when the spec cannot be
+        built) leaks the directory and skips `close()`.
+
+        Asserted as "NO resolution happens once a resource exists": the
+        `ephemeral_collection_prefix()` call above resolves the reaper either
+        way, so an index comparison would pass on the unfixed driver.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        bake = _bake_off()
+        self._install_doubles(monkeypatch)
+        order: list[str] = []
+        resolve = bake.load_cleanup_script
+        mkdtemp = tempfile.mkdtemp
+
+        def _record_resolve():
+            order.append('reaper')
+            return resolve()
+
+        def _record_mkdtemp(*args, **kwargs):
+            order.append('queue_dir')
+            return mkdtemp(*args, **kwargs)
+
+        monkeypatch.setattr(bake, 'load_cleanup_script', _record_resolve)
+        monkeypatch.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert 'queue_dir' in order, order
+        assert 'reaper' in order, order
+        assert 'reaper' not in order[order.index('queue_dir'):], order
+
     async def test_the_raising_flag_is_restored_rather_than_left_set(self):
         """`initialize_raises` is a CLASS attribute, so setting it directly
         would leave the double raising for the rest of the pytest process.

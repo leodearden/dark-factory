@@ -4660,6 +4660,52 @@ class TestRunBakeOffWiring:
 
         assert reaper.live_leases() == []
 
+    async def test_the_reaper_is_resolved_before_any_resource_is_acquired(
+        self, monkeypatch,
+    ):
+        """Nothing that can raise may sit between an acquisition and the
+        `try` whose `finally` releases it.
+
+        The temp queue directory is the run's FIRST acquisition, and the
+        service is built right after it — both before the `with`.  A
+        `load_cleanup_script()` evaluated in the `with` header therefore sits
+        in the one unprotected window: `_load_sibling_script` raises
+        `FixtureError` when the spec cannot be built, and that raise would
+        leak the queue directory and skip `close()` on a half-built service.
+        (It is unreachable TODAY only because `ephemeral_collection_prefix()`
+        has already cached the module — an accident of ordering, not a
+        property, and reordering two lines restores the leak silently.)
+
+        Asserted as "NO resolution happens once a resource exists", not as
+        "some resolution happens first": `ephemeral_collection_prefix()`
+        resolves the reaper three times before `mkdtemp` either way, so an
+        index comparison would pass on the unfixed driver.
+        """
+        import tempfile  # noqa: PLC0415
+
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        order: list[str] = []
+        resolve = mod.load_cleanup_script
+        mkdtemp = tempfile.mkdtemp
+
+        def _record_resolve():
+            order.append('reaper')
+            return resolve()
+
+        def _record_mkdtemp(*args, **kwargs):
+            order.append('queue_dir')
+            return mkdtemp(*args, **kwargs)
+
+        monkeypatch.setattr(mod, 'load_cleanup_script', _record_resolve)
+        monkeypatch.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert 'queue_dir' in order, order
+        assert 'reaper' in order, order
+        assert 'reaper' not in order[order.index('queue_dir'):], order
+
     async def test_it_seeds_exactly_three_collections_for_six_arms(self, monkeypatch):
         mod = _mod()
         _install_driver_doubles(monkeypatch)
