@@ -1733,6 +1733,7 @@ def _defer(
     *,
     escalate_fn,
     verified: int = 0,
+    rejected: int = 0,
     unverified: int = 0,
 ) -> CensusOutcome:
     """Abort the census at *stage*: log loudly, escalate, return the outcome.
@@ -1751,16 +1752,25 @@ def _defer(
     reason = reason or f"headroom gate failed at the {stage} stage"
     logger.warning("census deferred at the %s stage: %s", stage, reason)
 
+    # Derived here, not threaded from the raise sites, so they cannot
+    # disagree about what "total" means (CensusHeadroomExhausted's INVARIANT
+    # guarantees the three terms sum to the clusters offered at every site).
+    total = verified + rejected + unverified
+
     detail = reason
     if stage != "preflight":
-        # BOTH counts. They size the interruption from either side, which is
-        # what tells "capped on cluster 2 of 5" apart from "capped before a
-        # single cluster was adjudicated" -- the stage-boundary gate always
-        # reports 0 verified, an in-verify abort reports where it got to.
+        # All THREE counts plus the derived total, so the numbers account for
+        # every offered cluster. A REJECTION is adjudication already paid for,
+        # not an absence: with only verified/unverified, "1 verified, 3
+        # unverified" of a 5-cluster run left an operator unable to tell work
+        # already spent from a bookkeeping bug. The stage-boundary gate still
+        # reports 0 verified and 0 rejected -- nothing was adjudicated there.
         detail = (
             f"{reason}\n\n"
-            f"{verified} novel cluster(s) were verified before the cap; "
-            f"{unverified} were NOT verified. Nothing was "
+            f"Of {total} novel cluster(s) offered: "
+            f"{verified} were verified before the cap and "
+            f"{rejected} were rejected before it (both are adjudication "
+            f"already paid for); {unverified} were NOT verified. Nothing was "
             "persisted: no report, no matrix, no codebook merge, no filed "
             "tasks, and last_census_at was NOT advanced -- so this window "
             "WILL be re-mined and these sightings are not lost. The mining "
@@ -1775,7 +1785,8 @@ def _defer(
             severity="info",
             summary=(
                 f"legibility census deferred at the {stage} stage "
-                f"({verified} cluster(s) verified, {unverified} unverified): {reason}"
+                f"({verified} cluster(s) verified, {rejected} rejected, "
+                f"{unverified} unverified of {total} offered): {reason}"
                 if stage != "preflight"
                 else f"legibility census deferred: {reason}"
             ),
@@ -2102,6 +2113,7 @@ def run_census(
             f"headroom exhausted during verification: {exc.reason}",
             escalate_fn=escalate_fn,
             verified=exc.verified,
+            rejected=exc.rejected,
             unverified=exc.unverified,
         )
     # The default verifier probes internally (detectors (a)/(b)/(c)) and
