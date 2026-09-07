@@ -348,6 +348,16 @@ def score_cases(
     cases out of the denominator and report an accuracy over a population
     nobody chose.
 
+    An ``expected_class`` outside :data:`EVAL_CLASSES` and a verdict outside
+    :data:`EVAL_OUTCOMES` RAISE for the same reason, and the pre-seeded
+    ``per_class``/``confusion`` dicts are therefore never widened here. An
+    absorbed row inflates ``case_count`` in :func:`build_report` while
+    :func:`render_markdown` iterates only ``EVAL_CLASSES``/``EVAL_OUTCOMES``,
+    so it vanishes from the artifact entirely: the denominator moves and
+    nothing in the report says so. ``UnknownLabelError`` is reused rather than
+    re-invented so this boundary and :func:`_acceptable_for`'s
+    case-construction boundary agree about what an unknown label is.
+
     Returned shape, all of it JSON-serializable (it is written to disk
     verbatim):
 
@@ -381,12 +391,23 @@ def score_cases(
 
     for case, verdict in zip(cases, verdicts, strict=True):
         name = str(case['expected_class'])
-        bucket = per_class.setdefault(name, {'n': 0, 'correct': 0})
+        if name not in per_class:
+            raise UnknownLabelError(
+                f'no report class for expected_class {name!r}; known classes '
+                f'are {sorted(EVAL_CLASSES)}. Add it to EVAL_CLASSES rather '
+                f'than bucketing it.',
+            )
+        if verdict not in EVAL_OUTCOMES:
+            raise ValueError(
+                f'verdict {verdict!r} is outside the closed triage vocabulary '
+                f'{sorted(EVAL_OUTCOMES)}: an absorbed verdict grows the '
+                f'confusion row a column render_markdown never emits',
+            )
+        bucket = per_class[name]
         bucket['n'] += 1
         if verdict in case['acceptable_outcomes']:
             bucket['correct'] += 1
-        row = confusion.setdefault(name, dict.fromkeys(EVAL_OUTCOMES, 0))
-        row[verdict] = row.get(verdict, 0) + 1
+        confusion[name][verdict] += 1
         if name == LABEL_DUPLICATE and verdict in duplicate_split:
             duplicate_split[verdict] += 1
         if verdict == OUTCOME_CONTESTED:
