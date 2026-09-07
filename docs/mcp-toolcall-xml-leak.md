@@ -86,12 +86,19 @@ Top victims: `add_design_decision.rationale` (109), `add_memory.content` (90),
 `add_design_decision.decision` (33), `add_reuse_item.how` (33),
 `submit_review_verdict.summary` (19), `escalate_info.detail` (17).
 
-The "no" rows are not permanent. Closing that coverage gap is owned by the
-containment PRD's middleware-registration task (task 3690, registering
-`MarkupGuardMiddleware` on all four servers) — once that lands, three of the
-rows above go stale. The column is dated for exactly that reason: it
-describes coverage **at measurement**, not coverage today, so this table
-cannot silently rot into a false present-tense claim.
+The "no" rows are not permanent, and **no single task closes them** — they span
+four servers, and PRD §9 split that registration work three ways on 2026-08-19
+(operator commit `965f3206eb`). Per row of the table above:
+`orchestrator/plan-tools` is **γ2 / task 4457**, `fused-memory` is **γ3 / task
+4458**, and `orchestrator/verdict-tools` and `escalation` are **γ1 / task 3690**.
+
+**Those rows went stale on 2026-08-20**, when all three leaves landed — `07a967fab0`
+(escalation), `0beb3c706a` (verdict-tools), `37eed69c97` (plan-tools), `60293e0d8c`
+(fused-memory); γ1, γ2 and γ3 are all `done`. The column is dated for exactly that
+reason: it describes coverage **at measurement**, not coverage today, so this table
+cannot silently rot into a false present-tense claim. The 2026-08-05 figures above
+are therefore left exactly as measured, and this update is recorded alongside them
+rather than written over them.
 
 ### The negative evidence that settles it
 
@@ -143,16 +150,31 @@ collapse their membership, which still differs by calibration —
 the invoke closer) while `PREFILTER_NEEDLES` carries the four parameter
 closers, and `ENVELOPE_LITERALS` is their union.
 
-So the write-time **diagnostic gap is still open today**.
-`markup_tripwire.find_markup_pattern` (`markup_tripwire.py:170`) still
-scans `MCP_MARKUP_PATTERNS` only, so a mis-closed `description` at the
-fused-memory write boundary still cannot report its own tag and still
-blames whatever happens to follow it. What closes that gap is `detect()`
-over `ENVELOPE_LITERALS` — the earliest literal by position over the full
-union — reaching the write boundary when `MarkupGuardMiddleware` is
-registered on the four servers (task 3690, the same task the coverage
-table above is dated against). Until then, read a write-time `matched_pattern`
-as "an envelope literal was seen here", not as "this is the tag that was
+So the write-time **diagnostic gap was still open when this was written**.
+`markup_tripwire.find_markup_pattern` (then at `markup_tripwire.py:170`) scanned
+`MCP_MARKUP_PATTERNS` only, so a mis-closed `description` at the fused-memory
+write boundary could not report its own tag and blamed whatever happened to
+follow it. What closes that gap is `detect()` over `ENVELOPE_LITERALS` — the
+earliest literal by position over the full union — reaching the write boundary
+when `MarkupGuardMiddleware` is registered across the servers: **γ1 / task 3690**
+(escalation, verdict-tools), **γ2 / task 4457** (plan-tools) and **γ3 / task
+4458** (fused-memory) — the same *set* the coverage table above is dated against,
+not any one task.
+
+**Re-verified 2026-08-20: that gap is CLOSED, and the mechanism described above no
+longer exists.** All three leaves are `done`. `find_markup_pattern` and
+`find_markup_violation` were **deleted by γ3 / task 4458**, together with the
+write-time gate they served — `markup_tripwire.py` records the deletion in place
+and now re-exports `MCP_MARKUP_PATTERNS` only to feed a same-file drift guard. The
+live path is `shared.toolcall_markup.detect` / `detect_for` over
+`ENVELOPE_LITERALS`, which `shared/src/shared/mcp_markup_middleware.py` imports and
+calls at the boundary — that is, precisely the generalisation this paragraph names
+as the fix.
+
+**How to read a write-time `matched_pattern`, by date.** On or after 2026-08-20 it
+may be read as the tag that was mis-closed, within `ENVELOPE_LITERALS`. Before that
+date — which is every specimen catalogued in this document — the narrower reading
+still holds: "an envelope literal was seen here", not "this is the tag that was
 mis-closed".
 
 ---
