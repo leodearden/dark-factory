@@ -4394,6 +4394,41 @@ def test_boundary_fake_systemctl_rejects_a_real_unit_name(
     assert "_boundary_make_fake_systemctl" in message, message
 
 
+def test_boundary_write_heartbeat_rejects_a_real_unit_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_boundary_write_heartbeat must refuse a genuinely installed unit name.
+
+    THE HAZARD (cycle-4 review #6): the guard
+    `_df_no_synthetic_heartbeats_in_live_fleet` is keyed on the
+    `orchestrator-fake` prefix, but the helper that actually CREATES heartbeat
+    files accepts any name. If a `monkeypatch.setenv("ORCH_FLEET_DIR", ...)`
+    were ever dropped AND the session redirect regressed, a production-SHAPED
+    heartbeat would land in the live cross-project fleet dir and the guard
+    would report all-clear -- blind to the one code path that literally
+    creates heartbeat files.
+
+    This is a CONSTRUCTION-POINT check, exactly like the one on
+    `_boundary_make_fake_systemctl`: a name starts naming a FILE here, in
+    whatever directory ORCH_FLEET_DIR currently resolves to, so checking at
+    the seam covers every caller including the ones nobody has written yet,
+    and cannot touch the ~40 in-process contract pins elsewhere in this file.
+
+    Protects FUTURE callers rather than fixing a live defect -- all current
+    call sites already pass `synthetic_unit(...)` values -- which is the same
+    thing the fake-systemctl seam guard does and for the same reason.
+    """
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _boundary_write_heartbeat(
+            tmp_path / "fleet", "orchestrator-reify.service", merge_idle=True,
+        )
+    message = str(excinfo.value)
+    assert "orchestrator-reify.service" in message, message
+    assert "_boundary_write_heartbeat" in message, message
+    # Points at the REMEDY symbol, so a reader is not left to guess the fix.
+    assert "synthetic_unit" in message, message
+
+
 def test_boundary_drain_run_budget_is_load_scaled_off_the_unchanged_base(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
