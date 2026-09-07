@@ -1320,15 +1320,36 @@ def _confirm_plan(
     plan['_finalized_at'] = now
     plan['_revalidated_at'] = now
     artifacts.write_plan(plan)
-    return _with_markup_repairs(
-        {
-            'status': 'ok',
-            'finalized': True,
-            'steps': len(plan['steps']),
-            'files': len(plan.get('files', [])),
-        },
-        markup_facts,
-    )
+    response = {
+        'status': 'ok',
+        'finalized': True,
+        'steps': len(plan['steps']),
+        'files': len(plan.get('files', [])),
+    }
+    # THE ARCHITECT'S LAST TOOL RESULT (task 4597), and therefore the one place
+    # a refusal reaches the durable agent transcript. The block is already on
+    # disk by now, but plan.json is read by LATER agents; this is the only
+    # surface on which the architect itself, still mid-session, can see that
+    # calls it believed it made were refused and can decide to resend them.
+    #
+    # OMIT-WHEN-ABSENT, exactly as `_with_markup_repairs` below: absent on the
+    # clean path, never present-and-zero, so every existing confirm_plan
+    # response stays byte-identical and the key's PRESENCE is an unambiguous
+    # signal.
+    #
+    # A SUMMARY, not the block: `summary` returns {count, by_tool} only. The
+    # events and the note are already two keys away in the document, and
+    # echoing them here would put the block's bulk into the largest response
+    # the architect reads, to say what the two numbers already say.
+    #
+    # COMPOSED WITH `_with_markup_repairs` rather than folded into it: the two
+    # diagnostics answer different questions (what this read REPAIRED, versus
+    # what this plan has REFUSED over its life) and neither should be able to
+    # suppress the other.
+    rejections = plan_markup_stamp.summary(plan)
+    if rejections is not None:
+        response['markup_rejections'] = rejections
+    return _with_markup_repairs(response, markup_facts)
 
 
 # ---------------------------------------------------------------------------
