@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -677,6 +678,23 @@ def _decline_kinds():
     return DECLINE_KINDS
 
 
+def _non_decline_kinds():
+    """The REST of the closed vocabulary — every terminal kind that is NOT a decline.
+
+    Derived as ``TERMINAL_KINDS - DECLINE_KINDS`` rather than typed out as
+    ``('none', 'planned')``, for the same reason :func:`_decline_kinds` is
+    derived: a non-decline terminal kind added later must be exercised HERE the
+    moment it exists, instead of leaving ``band_for_cell``'s treatment of it
+    unpinned while its decline siblings are covered. Together the two helpers
+    span the closed vocabulary with no third, hand-maintained list in between.
+    """
+    from orchestrator.evals.metrics import DECLINE_KINDS, TERMINAL_KINDS
+
+    kinds = tuple(k for k in TERMINAL_KINDS if k not in DECLINE_KINDS)
+    assert kinds, 'premise: an empty parametrize would SKIP this test silently'
+    return kinds
+
+
 @pytest.mark.parametrize('kind', _decline_kinds())
 def test_a_no_plan_cell_that_explicitly_declined_bands_declined(kind):
     """Each of the five plan-tools decline exits bands ``declined``, not ``no_plan``.
@@ -692,14 +710,15 @@ def test_a_no_plan_cell_that_explicitly_declined_bands_declined(kind):
     assert mod.band_for_cell(m, 0.80) == 'declined'
 
 
-@pytest.mark.parametrize('kind', ('none', 'planned'))
+@pytest.mark.parametrize('kind', _non_decline_kinds())
 def test_a_no_plan_cell_with_a_non_decline_kind_still_bands_no_plan(kind):
     """Only DECLINE_KINDS moves the rung. The rest of the closed vocabulary does not.
 
-    ``none`` is the real silent-failure shape and ``planned`` a member of
-    TERMINAL_KINDS that is not a decline; both must stay in the band that means
-    "this candidate emitted no plan", because that is the headroom evidence the
-    screen exists to find.
+    Today that is ``none`` — the real silent-failure shape — and ``planned``, a
+    member of TERMINAL_KINDS that is not a decline; the parametrization is read
+    off the instrument, so a kind added tomorrow arrives here on its own. All of
+    them must stay in the band that means "this candidate emitted no plan",
+    because that is the headroom evidence the screen exists to find.
     """
     m = _metrics(plan_steps=0, plan_quality=0.0,
                  extra_metrics={'judged_without_reference': False,
@@ -2354,9 +2373,9 @@ def test_one_silent_cell_beside_a_decline_keeps_the_fixture_in_no_plan():
 
     One arm declined and the other emitted nothing and said nothing about why.
     That second cell is real headroom evidence, so the fixture keeps the label
-    that reports it. ``declined`` means every no-plan cell was an explicit
-    refusal — which is exactly what ``_BAND_PRECEDENCE`` placing ``no_plan``
-    ahead of ``declined`` buys.
+    that reports it. ``declined`` means every ADMITTED no-plan cell was an
+    explicit refusal — which is exactly what ``_BAND_PRECEDENCE`` placing
+    ``no_plan`` ahead of ``declined`` buys.
     """
     results = [
         _cell('f', 'architect-opus-max', plan_steps=0, plan_quality=0.0,
@@ -2372,6 +2391,34 @@ def test_one_silent_cell_beside_a_decline_keeps_the_fixture_in_no_plan():
     assert part['by_fixture'] == {'f': 'no_plan'}
     assert part['counts']['no_plan'] == 1
     assert part['counts']['declined'] == 0
+    assert part['retained'] == ['f']
+
+
+def test_a_declined_fixture_can_still_hold_a_cap_excluded_cell():
+    """ADMITTED is the load-bearing word in the rendered NOTE, so pin what it admits.
+
+    A cap-tainted cell with ``plan_steps = 0`` never reaches the split: it bands
+    ``unmeasured`` one rung EARLIER, and ``unmeasured`` sits after ``declined``
+    in the precedence — so this fixture bands ``declined`` while holding a
+    zero-step cell that said NOTHING about why it produced no plan. Reading that
+    label as "every cell here refused" is the same over-strong inference the
+    whole band exists to prevent, one level down, which is why the NOTE names
+    the admitted population and points at cap_excl.
+    """
+    results = [
+        _cell('f', 'architect-opus-max', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'false_premise'}),
+        _cell('f', 'architect-fable-high', plan_steps=0, plan_quality=0.0,
+              extra_metrics={'judged_without_reference': False,
+                             'terminal_kind': 'none', 'cap_tainted': True}),
+    ]
+    bands = [mod.band_for_cell(r.metrics, 0.80) for r in results]
+    assert bands == ['declined', 'unmeasured'], 'premise: the cap cell skips the rung'
+
+    part = mod.partition_bands(results, 0.80)
+
+    assert part['by_fixture'] == {'f': 'declined'}
     assert part['retained'] == ['f']
 
 
@@ -2411,6 +2458,44 @@ def test_the_banding_block_explains_that_a_decline_is_not_headroom():
     # Named exits, not a gesture at "a decline": the closed vocabulary is what
     # makes the band decidable.
     assert 'report_false_premise' in text
+
+
+def test_both_rendered_decline_blocks_name_the_whole_vocabulary_once():
+    """Neither prose block can go stale when a sixth architect exit is added.
+
+    metrics.py single-sources the kind <-> artifact correspondence off
+    ``_DECLINE_READERS`` "so a sixth architect exit cannot be half-added", and
+    ``_decline_kinds`` extends that discipline to the bander — but the RENDERER
+    carried two independently hand-typed copies of the five exit names, which
+    sat outside it entirely: a sixth exit would have left both legends silently
+    wrong with nothing failing.
+
+    The coverage half of this is deliberately NOT circular. It does not re-derive
+    the kind -> exit spelling; it reads the ``report_*`` tokens back out of the
+    rendered text and asks that each kind be named by one of them, which stays a
+    true requirement whatever a future exit is called. The single-source half
+    then pins that BOTH blocks render the one derived list, so they cannot drift
+    from each other either.
+    """
+    from orchestrator.evals.metrics import DECLINE_KINDS
+
+    results = _unanimously_declining_results()
+    report = {'candidates': mod.summarize_candidates(results),
+              'bands': mod.partition_bands(results, 0.80)}
+
+    text = mod.format_campaign_report(report)
+
+    tokens = set(re.findall(r'report_[a-z_]+', text))
+    assert [k for k in DECLINE_KINDS if any(k in t for t in tokens)] == list(
+        DECLINE_KINDS), f'a decline kind goes unnamed in the report: {tokens}'
+    assert len(tokens) == len(DECLINE_KINDS), (
+        f'an exit is rendered that is not in the vocabulary: {tokens}')
+
+    block = '\n'.join(mod._decline_exit_prose('plan-tools decline exit'))
+    assert text.count(block) == 2, (
+        'the banding NOTE and the declined legend must render the SAME derived '
+        'list — two copies is what went stale'
+    )
 
 
 def test_the_decline_note_is_gated_on_a_nonzero_count():

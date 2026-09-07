@@ -67,6 +67,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -268,6 +269,50 @@ UNMEASURED = 'unmeasured'
 # work already landed, the other says the premise is false — and only one of
 # them says anything about the fixture corpus needing a refresh.
 DECLINE_KINDS_KEY = 'declined_by_kind'
+
+# The plan-tools exit each decline kind NAMES, spelled the way an operator
+# reading this report would grep for it. DERIVED from ``DECLINE_KINDS`` rather
+# than typed out: the renderer's two decline blocks (the PRD-D6 banding NOTE and
+# the ``declined`` column legend) each carried their own hand-written copy of
+# the five names, which put the prose outside the very discipline metrics.py's
+# ``_DECLINE_READERS`` comment exists to enforce — "a sixth architect exit
+# cannot be half-added". Three kinds spell their exit mechanically as
+# ``report_<kind>``; the two that do not are listed here and ONLY here, so a new
+# kind renders by the rule instead of going silently missing from both blocks.
+_IRREGULAR_DECLINE_EXITS = {
+    'already_done': 'report_task_already_done',
+    'unactionable': 'report_unactionable_task',
+}
+
+
+def decline_exit_names() -> str:
+    """Every decline kind's ``report_*`` exit, in vocabulary order, for prose.
+
+    ONE string with two consumers inside :func:`format_campaign_report`, so the
+    two blocks cannot drift from each other or from the instrument. Deferred
+    import, like every other ``orchestrator`` import in this module.
+    """
+    from orchestrator.evals.metrics import DECLINE_KINDS
+
+    return ' / '.join(
+        _IRREGULAR_DECLINE_EXITS.get(kind, f'report_{kind}') for kind in DECLINE_KINDS
+    )
+
+
+def _decline_exit_prose(lead: str) -> list[str]:
+    """``lead (exit / exit / ...).`` as report lines, wrapped like its neighbours.
+
+    A DERIVED enumeration cannot be hand-wrapped the way the prose around it is,
+    so it is wrapped here instead. :func:`textwrap.wrap` is a pure function of
+    its input, which is what keeps the block byte-identical run to run — the
+    property ``test_rendering_is_deterministic`` requires of every committed
+    artifact — while still absorbing a sixth exit with no edit to either caller.
+    """
+    return textwrap.wrap(
+        f'{lead} ({decline_exit_names()}).',
+        width=88, initial_indent='  ', subsequent_indent='  ',
+        break_on_hyphens=False, break_long_words=False,
+    )
 
 
 def marker_available(results: list[Any]) -> bool:
@@ -638,14 +683,20 @@ def format_campaign_report(report: dict[str, Any]) -> str:
             # artifact's schema must not shift with its contents — so only the
             # prose is gated.
             lines += [
-                '  NOTE: declined counts fixtures whose every no-plan cell was an '
-                'EXPLICIT plan-tools',
-                '  decline (report_task_already_done / report_blocking_dependency / '
-                'report_false_premise /',
-                '  report_unactionable_task / report_ready_to_merge). A DECLINE IS A '
-                'CORRECT REFUSAL of',
-                '  moot, blocked or ill-posed work — NOT the headroom this pool is '
-                'selected for.',
+                '  NOTE: declined counts fixtures whose every ADMITTED no-plan cell '
+                'took an EXPLICIT',
+                *_decline_exit_prose('plan-tools decline exit'),
+                '  A DECLINE IS A CORRECT REFUSAL of moot, blocked or ill-posed work '
+                '— NOT the headroom',
+                '  this pool is selected for.',
+                '  ADMITTED is the load-bearing word: a CAP-TAINTED cell bands '
+                'unmeasured one rung',
+                '  EARLIER, and a transport refusal says nothing about why that cell '
+                'produced no plan, so',
+                '  a fixture bands declined while still holding a cap-excluded '
+                'zero-step cell. Read the',
+                '  cap_excl column against this band before concluding every cell '
+                'here was a refusal.',
                 '  It is RETAINED nonetheless: D6 discards only the unambiguous '
                 'ceiling band, so this',
                 '  band changes what the partition is CALLED and never which side a '
@@ -694,10 +745,7 @@ def format_campaign_report(report: dict[str, Any]) -> str:
             '',
             'LEGEND — declined: how many of that candidate\'s SCORED cells ended on an '
             'explicit',
-            '  plan-tools decline exit (report_false_premise / report_task_already_done '
-            '/',
-            '  report_blocking_dependency / report_unactionable_task / '
-            'report_ready_to_merge).',
+            *_decline_exit_prose('plan-tools decline exit'),
             '  A DECLINE IS A CORRECT REFUSAL, not a planning failure: the architect '
             'read the fixture',
             '  and stated why it cannot be planned. Read against no_plan — when the two '
