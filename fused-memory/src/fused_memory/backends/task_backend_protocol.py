@@ -263,6 +263,22 @@ class TaskBackendProtocol(Protocol):
         tag: str | None = None,
     ) -> DependencyResult: ...
 
+    async def get_dependency_edges(
+        self, project_root: str, tag: str | None = None
+    ) -> dict[int, list[int]]:
+        """Return ``{task_id: [depends_on, ...]}`` — the dependency edge set alone.
+
+        Declared here (unlike some backend-only reads) because
+        ``MemoryService.taskmaster`` is annotated ``TaskBackendProtocol | None``
+        and its caller must type-check without a ``getattr`` escape hatch, which
+        would itself be the silent-degradation anti-pattern this repo forbids.
+
+        Implementations inherit the SQLite shape: lists sorted ascending, and a
+        task with no dependencies ABSENT from the map rather than present with
+        an empty list.
+        """
+        ...
+
     async def validate_dependencies(
         self, project_root: str, tag: str | None = None
     ) -> ValidateDependenciesResult: ...
