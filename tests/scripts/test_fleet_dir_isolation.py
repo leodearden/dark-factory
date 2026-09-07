@@ -805,6 +805,10 @@ _NESTED_INI = '[pytest]\n'
 # so a change to SYNTHETIC_UNIT_PREFIX moves the nested harness with it.
 _NESTED_HEARTBEAT = f'{synthetic_unit("nested")}.json'
 
+# A DISTINCT stem, so the two filenames are individually addressable in the
+# assertions: the before-snapshot tests turn on which of the two is named.
+_PREEXISTING_HEARTBEAT = f'{synthetic_unit("preexisting")}.json'
+
 _NESTED_CONFTEST = f'''\
 import sys
 from pathlib import Path
@@ -891,3 +895,61 @@ class TestTheGuardFailsTheRunEndToEnd:
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
         assert _NESTED_HEARTBEAT not in result.stdout
+
+    def test_a_heartbeat_that_predates_the_session_is_not_reported(
+        self, tmp_path: Path,
+    ) -> None:
+        """The BEFORE-SNAPSHOT branch: the guard subtracts what it inherited.
+
+        ``_df_no_synthetic_heartbeats_in_live_fleet`` snapshots the fleet dir at
+        session start and reports only names that appear AFTER. Nothing else in
+        this file exercises that subtraction -- the leaking variant writes its
+        heartbeat DURING the nested test, and the nested conftest creates the
+        fleet dir EMPTY, so no existing case has a file present before the
+        snapshot runs. Deleting ``before = set(...)`` outright would leave every
+        other test here green.
+
+        That matters in production, not just for coverage: this repo runs
+        several worktrees' suites concurrently against one machine-global fleet
+        dir, so a session inheriting ANOTHER session's in-flight synthetic
+        heartbeat must not attribute it to itself. Without the subtraction the
+        guard would fail runs for leaks they did not cause -- and a guard that
+        cries wolf gets deleted.
+        """
+        result = _nested_run(tmp_path, leaks=False, preexisting=True)
+
+        assert result.returncode == 0, (
+            'a session that merely INHERITED a synthetic heartbeat was failed; '
+            'the guard must subtract its before-snapshot. '
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert _PREEXISTING_HEARTBEAT not in result.stdout + result.stderr, (
+            'the inherited heartbeat was named in the output of a run that did '
+            f'not create it. stdout={result.stdout!r}'
+        )
+
+    def test_a_new_leak_is_reported_and_the_inherited_one_is_not(
+        self, tmp_path: Path,
+    ) -> None:
+        """The DISCRIMINATING half, and the reason the case above is not enough.
+
+        A guard that simply ignored everything would pass the previous test.
+        This one proves the subtraction is a SET difference rather than a mute
+        button: with both files present the run must still fail, and must name
+        the newly-leaked file WITHOUT naming the inherited one -- which is what
+        makes the failure attributable to the session that actually caused it.
+        """
+        result = _nested_run(tmp_path, leaks=True, preexisting=True)
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a genuine leak went unreported because an inherited heartbeat was '
+            f'also present -- the subtraction is too broad. output={combined!r}'
+        )
+        assert _NESTED_HEARTBEAT in combined, (
+            f'the newly-leaked file was not named. output={combined!r}'
+        )
+        assert _PREEXISTING_HEARTBEAT not in combined, (
+            'the INHERITED file was named as a leak of this session. '
+            f'output={combined!r}'
+        )
