@@ -19,10 +19,15 @@ drift is invisible until a destructive consumer acts on the stale half.
 
 The same rule governs the vocabulary's CAPTURE classes, which is why the digit
 captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative site
-rather than re-narrowed per caller. Scoped to CAPTURES on purpose, and not to
-every class: the '\\s' padding and the '\\w' lookbehinds stay Unicode-broad (see
-the comment on _QUALIFIED_NODE_NAME_PATTERN). The vocabulary is ASCII-explicit
-exactly where a character reaches a consumer as DATA, and broad where it only
+rather than re-narrowed per caller. Task 4850 extended the same rule to the
+literal task-vocabulary WORD ('[Tt][Aa][Ss][Kk][Ss]?', never 'tasks?' plus
+re.IGNORECASE — see the comment on _TASK_NODE_NAME_PATTERN), which decides
+whether the word 'task' was written at all rather than handing a character
+onward as data, so the rule is no longer scoped to captures alone. Still not
+every class: the '\\s' padding and the '\\w' lookbehinds stay Unicode-broad
+(see the comment on _QUALIFIED_NODE_NAME_PATTERN). The vocabulary is
+ASCII-explicit wherever a character reaches a consumer as DATA or decides
+that the task-vocabulary word was written, and broad only where it merely
 decides whether to refuse. Before that,
 utils/referent_resolution._is_task_number was the only guard enforcing "a
 Unicode digit is not a task id" — it does so with ``isascii() and isdigit()``
@@ -595,7 +600,14 @@ def scan_content(
     nothing rather than a truncated 'Task 12') — the deliberate, negligible
     recall loss that is the price of the ``[0-9]`` capture classes above, which
     exist because '\\d' matched those spellings and minted referents naming no
-    task at all. Recall is the consumer's problem; precision is this module's.
+    task at all. A mention whose WORD is spelled with a Unicode lookalike that
+    case-folds onto ASCII under re.IGNORECASE — U+017F LATIN SMALL LETTER LONG
+    S ('ta\u017fk 5') or U+212A KELVIN SIGN ('tas\u212a 5') — is likewise
+    invisible now that the word is matched with explicit ASCII case classes
+    instead of a flag (task 4850): the negligible recall loss that is the
+    price of refusing referents IGNORECASE would otherwise have minted with a
+    REAL ASCII task number. Recall is the consumer's problem; precision is
+    this module's.
 
     One blind spot was MEASURED and accepted rather than merely designed
     around: a genuine qualified ref split across lines by HARD WRAPPING is
