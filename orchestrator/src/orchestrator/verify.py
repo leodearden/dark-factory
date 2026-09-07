@@ -6604,12 +6604,24 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # `_summarize_checks` matched none of them and a multi-subproject
         # verify silently degraded to a bare 'Failures: ' with no parts at
         # all — erasing the one fact that says the run produced no verdict.
-        # Carry every distinct kill note through verbatim, in child order,
-        # de-duplicated (two subprojects killed identically must not stutter
-        # the same sentence twice).
+        # Carry every distinct no-verdict note through verbatim, in child
+        # order, de-duplicated (two subprojects killed identically must not
+        # stutter the same sentence twice).
+        #
+        # THIS LOOP IS THE REQUIRED THIRD EDIT for any new no-verdict note
+        # (task 5082 added the second, WORKER_DEATH_SUMMARY_MARKER): a marker
+        # constant and a note producer alone leave the aggregate degrading
+        # exactly as above. Add the marker to the tuple below rather than
+        # rediscovering that bug. The `', '` split is also why every producer
+        # must keep its note free of `', '` — see the CONSTRAINT ON PRODUCERS
+        # on SIGNAL_KILL_SUMMARY_MARKER.
+        _no_verdict_markers = (SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER)
         for r in results:
             for fragment in r.summary.removeprefix('Failures: ').split(', '):
-                if SIGNAL_KILL_SUMMARY_MARKER in fragment and fragment not in parts:
+                if (
+                    any(marker in fragment for marker in _no_verdict_markers)
+                    and fragment not in parts
+                ):
                     parts.append(fragment)
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
