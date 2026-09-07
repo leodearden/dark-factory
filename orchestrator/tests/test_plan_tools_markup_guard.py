@@ -1791,3 +1791,174 @@ class TestTheTwoArmsAreIsolatedFromEachOther:
         await plan_tools._markup_fact_sink(artifacts)({'tool': 'add_design_decision'})
 
         assert order == ['journal', 'stamp']
+
+
+# ---------------------------------------------------------------------------
+# The rejected-call counter, end to end on the real server (task 4597).
+# ---------------------------------------------------------------------------
+
+
+class TestTheRefusalIsCountedOnThePlan:
+    """esc-4528-1: ``design_decisions: []`` must stop being ambiguous.
+
+    Before this, a refused call left the plan untouched, so an empty list read
+    identically whether the architect never called or called six times and was
+    refused six times. In task 4528 a reviewer could tell the two apart only
+    because the architect happened to hand-file an info note.
+
+    Driven through the REAL ``create_server`` over a ``Client``, because
+    middleware is bypassed by ``tool.fn`` / ``tool.run`` /
+    ``_tool_manager.call_tool`` — a test written any of those ways would pass
+    while running none of the guard.
+    """
+
+    @staticmethod
+    def _block(rig: ResidueRig) -> dict[str, Any]:
+        return rig.harness.plan()[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_call_is_counted_with_its_tool_and_parameter(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': ABSORBED_RATIONALE}
+        )
+
+        assert payload['error_type'] == 'mcp_markup_detected'
+        block = self._block(rig)
+        assert block['count'] == 1
+        assert block['by_tool'] == {'add_design_decision': 1}
+        assert len(block['events']) == 1
+        assert block['events'][0]['param'] == 'decision'
+        assert block['events'][0]['outcome'] == 'rejected'
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+        assert 'events_truncated' not in block, 'one event is not a cut list'
+
+    @pytest.mark.asyncio
+    async def test_the_authored_document_is_exactly_what_it_was(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The counter records the LOSS; it does not stand in for the call.
+
+        ``design_decisions`` is still the empty list the tool body would have
+        appended to — the whole point of the reject policy is that nothing
+        guessed reaches the document.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+        before = rig.harness.plan()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        after = rig.harness.plan()
+        assert after.pop(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY)
+        assert after == before, 'the block is the ONLY difference'
+        assert after['design_decisions'] == []
+
+    @pytest.mark.asyncio
+    async def test_the_block_carries_no_markup_and_no_refused_payload(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The load-bearing control, on the artifact every reader opens.
+
+        ``plan.json`` is embedded verbatim into four architect-facing prompts
+        and walked recursively by ``scripts/sweep_toolcall_markup.py``, so a
+        stored literal would both reproduce the defect and inflate the census
+        the sweep exists to report. The raw payload has exactly one owner, the
+        residue escalation.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        encoded = json.dumps(self._block(rig))
+        assert detect(encoded) is None
+        for sequence in (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter '):
+            assert sequence not in encoded, f'the block carries {sequence!r}'
+        assert _RATIONALE_PROSE not in encoded, 'the absorbed payload stayed out'
+        assert _DECISION_PROSE not in encoded, 'the refused payload stayed out'
+
+    @pytest.mark.asyncio
+    async def test_the_unrepairable_path_is_counted_under_its_own_outcome(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The seventh-call shape from esc-4528 — a payload that cannot be repaired.
+
+        ``outcome`` is the fact channel's own name for what the caller-facing
+        error renders as ``error_type``, recorded verbatim rather than
+        respelled: the reject-path literal lives inline in the middleware's
+        private ``_reject`` and is not exported.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
+        )
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        block = self._block(rig)
+        assert block['count'] == 1
+        assert block['events'][0]['outcome'] == 'unrepairable'
+        assert block['by_tool'] == {'add_design_decision': 1}
+
+    @pytest.mark.asyncio
+    async def test_repeated_refusals_accumulate_across_tools(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The question the block exists to answer: were five calls lost?"""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        for _ in range(3):
+            await rig.refuse(
+                'add_design_decision', {'decision': ABSORBED_RATIONALE}
+            )
+        await rig.refuse('add_reuse_item', {'what': ABSORBED_RATIONALE})
+
+        block = self._block(rig)
+        assert block['count'] == 4
+        assert block['by_tool'] == {'add_design_decision': 3, 'add_reuse_item': 1}
+
+    @pytest.mark.asyncio
+    async def test_the_journal_line_is_still_written(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """The composition JOINED a channel; it did not displace one.
+
+        The journal is what the storm escalation points an operator at, so a
+        fan-out that silently cost it its line would move the dead end task
+        4744 closed rather than close it.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        (line,) = journal_lines(tmp_path)
+        assert line['tool'] == 'add_design_decision'
+        assert line['outcome'] == 'rejected'
+        assert self._block(rig)['count'] == 1, 'and the stamp landed too'
+
+    @pytest.mark.asyncio
+    async def test_a_clean_plan_never_grows_the_key(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """THE OVERWHELMINGLY COMMON PATH stays byte-identical to today.
+
+        Absent, not present-and-zero: the block's PRESENCE is the whole signal,
+        so a key that appeared on every plan in the fleet would mean nothing.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.harness.call(
+            'add_design_decision',
+            {'decision': 'A clean decision.', 'rationale': 'A clean rationale.'},
+        )
+
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY not in rig.harness.plan()
