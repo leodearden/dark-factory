@@ -544,6 +544,42 @@ class TestScoreCases:
         got = _mod().score_cases(cases, [OUTCOME_STORED, OUTCOME_RESTATED])
         assert got['per_class']['distractor'] == {'n': 2, 'correct': 1, 'accuracy': 0.5}
 
+    def test_an_unknown_expected_class_raises_rather_than_being_absorbed(
+        self,
+    ) -> None:
+        """A fifth class must not be silently bucketed at SCORING time either.
+
+        `_acceptable_for` already raises for the same condition at
+        case-construction time; the two boundaries have to agree. An absorbed
+        row inflates `case_count` in `build_report` while `render_markdown`
+        iterates only `EVAL_CLASSES`, so the row vanishes from the artifact
+        entirely — the denominator moves and nothing in the report says so.
+        """
+        cases = _cases(('a', 'newly_invented_class'))
+        with pytest.raises(_mod().UnknownLabelError) as excinfo:
+            _mod().score_cases(cases, [OUTCOME_STORED])
+        message = str(excinfo.value)
+        assert 'newly_invented_class' in message, message
+        for name in _mod().EVAL_CLASSES:
+            assert name in message, f'{name} not named in: {message}'
+
+    def test_a_verdict_outside_the_closed_vocabulary_raises(self) -> None:
+        """`row.get(verdict, 0) + 1` would grow the row a fifth column.
+
+        `render_markdown` iterates `EVAL_OUTCOMES`, so that column is dropped
+        from the markdown the operator reads while it still sits in the JSON —
+        two artifacts disagreeing about what was measured, which is the same
+        traceability failure gate item 2 exists for.
+        """
+        cases = _cases(('a', 'duplicate'))
+        with pytest.raises(ValueError) as excinfo:
+            _mod().score_cases(cases, ['not_a_triage_outcome'])
+        message = str(excinfo.value)
+        assert 'not_a_triage_outcome' in message, message
+        assert not isinstance(excinfo.value, _mod().UnknownLabelError), (
+            'a bad VERDICT is not an unknown LABEL — they name different holes'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Report assembly / rendering / the runner
