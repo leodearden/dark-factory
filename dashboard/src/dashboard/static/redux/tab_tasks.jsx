@@ -4,7 +4,7 @@ const { ProjectGroup: PG_T, Segmented: SEG_T } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
-const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
+const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
 const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
@@ -240,26 +240,18 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
   );
 }
 
-// Per-project wrapper around TaskGraph: memoizes the focus-mode subset so
-// it isn't recomputed (rebuilding focusSubset's Map + re-walking
-// computeNeighborhood) on every TasksTab render that doesn't actually
-// change this project's filtered tasks, selection, or focus state — e.g.
-// re-renders driven by unrelated live-data ticks elsewhere on the page.
-// This has to be a real component (not an inline computation inside the
-// projects.map() callback below) so the useMemo call follows the Rules of
-// Hooks: one consistent hook per mounted project instance, not a
-// variable-count hook call inside a loop.
+// Per-project wrapper around TaskGraph. `graphTasks` arrives ALREADY
+// focus-narrowed, from the single focusGroupView call in the projects.map()
+// callback below — the same call that produces the header's shown count, so
+// the header cannot display a number for an array this component did not
+// render (task 4137: it used to, "N/N shown" over an empty graph).
 //
-// Guarding on selectedId != null (not just focusMode) keeps the existing
-// immediate-passthrough behavior when a node is deselected by clicking it
-// again — that only clears selectedId, and without this guard the subset
-// would still reflect the stale focusAnchorId for one render until the
-// effect above catches focusMode up to it.
-function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSelect, onEnterFocus }) {
-  const graphTasks = uM_T(
-    () => (focusMode && selectedId != null ? focusSubset(filtered, focusAnchorId) : filtered),
-    [filtered, focusMode, selectedId, focusAnchorId]
-  );
+// The deselect guard that used to live here now lives in focusGroupView's
+// `focused` term (graph_layout.js), which reproduces `focusMode &&
+// selectedId != null` verbatim: re-clicking a selected node clears only
+// selectedId, and without that term the subset would narrow against a stale
+// focusAnchorId for one render until the focus effect catches up.
+function ProjectTaskGraph({ graphTasks, selectedId, onSelect, onEnterFocus }) {
   return <TaskGraph tasks={graphTasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} />;
 }
 
@@ -282,19 +274,18 @@ function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSe
 // renderEdges={false} (skip its own overlay) and handed the SAME shared
 // nodeRefs map (via the nodeRefs prop) so its nodes register into the map
 // the hoisted overlay reads from.
-function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, focusMode, focusAnchorId, onSelect, onEnterFocus }) {
+function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
 
-  // Mirrors ProjectTaskGraph's focus-subset narrowing above: onEnterFocus is
-  // wired into every rendered node's double-click below exactly like the
-  // list view, so without this the "focus" affordance would silently do
-  // nothing while grouped — the boxes would keep showing every group's full
-  // filtered membership instead of narrowing to the anchor's neighborhood.
-  const graphTasks = uM_T(
-    () => (focusMode && selectedId != null ? focusSubset(filtered, focusAnchorId) : filtered),
-    [filtered, focusMode, selectedId, focusAnchorId]
-  );
+  // `graphTasks` arrives ALREADY focus-narrowed as a prop, from the single
+  // focusGroupView call in the projects.map() callback below (shared with
+  // ProjectTaskGraph and with the header's shown count). It is still the
+  // focus-narrowed set and not the project's full membership: onEnterFocus is
+  // wired into every rendered node's double-click below exactly like the list
+  // view, so were it not narrowed the "focus" affordance would silently do
+  // nothing while grouped. `allProjectTasks` below is deliberately NOT
+  // narrowed — see fullMembersByPrd.
 
   // Content signatures so the pricier work below (bucketing + PRD-level
   // mini-DAG tiering, and the full-member summaries) only reruns when
@@ -875,6 +866,22 @@ function TasksTab({ projectFilter, search }) {
                     ? '—'
                     : (_fallbackDone >= 50 ? '50+' : _fallbackDone)),
             };
+            // The ONE focus-narrowing site. Both the header count below and
+            // the group body read this single result, so they cannot be fed
+            // different arrays — which is exactly what went wrong before
+            // (task 4137): focus state is global, narrowing was applied per
+            // group, and the header counted the PRE-focus `filtered`, so every
+            // non-anchor project rendered an empty graph under "N/N shown".
+            // A plain call, not a hook, so it is legal here inside map().
+            //
+            // This replaces a useMemo in each of ProjectTaskGraph and
+            // ProjectPrdGroups. Dropping them costs no measured work: both
+            // were reference-keyed on `filtered`, which projTasks.filter(...)
+            // above rebuilds as a fresh array on every TasksTab render —
+            // including the app-wide 1s clock tick — so both already
+            // recomputed every render. That is the same hazard
+            // ProjectPrdGroups documents for its own signature-keyed memos.
+            const groupView = focusGroupView(filtered, { focusMode, selectedId, focusAnchorId });
             const isOpen = openMap[p.id] !== false; // default-open
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const summary = (
@@ -887,7 +894,9 @@ function TasksTab({ projectFilter, search }) {
                 ))}
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.warn }}></span>{counts.pending} pending</span>
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.ok }}></span>{counts.complete} done</span>
-                <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{filtered.length}/{counts.total} shown</span>
+                <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>
+                  {groupView.shownCount}/{counts.total} shown{groupView.emptiedByFocus ? ' — none in focus' : ''}
+                </span>
               </>
             );
             const summaryRight = (
@@ -901,12 +910,13 @@ function TasksTab({ projectFilter, search }) {
             return (
               <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)}
                     summary={summary} summaryRight={summaryRight}>
-                {groupByPrd
-                  ? <ProjectPrdGroups filtered={filtered} allProjectTasks={projTasks} selectedId={selectedId}
-                                      focusMode={focusMode} focusAnchorId={focusAnchorId}
-                                      onSelect={setSelectedId} onEnterFocus={enterFocus} />
-                  : <ProjectTaskGraph filtered={filtered} selectedId={selectedId} focusMode={focusMode}
-                                      focusAnchorId={focusAnchorId} onSelect={setSelectedId} onEnterFocus={enterFocus} />}
+                {groupView.emptiedByFocus
+                  ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
+                  : groupByPrd
+                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={projTasks} selectedId={selectedId}
+                                        onSelect={setSelectedId} onEnterFocus={enterFocus} />
+                    : <ProjectTaskGraph graphTasks={groupView.shown} selectedId={selectedId}
+                                        onSelect={setSelectedId} onEnterFocus={enterFocus} />}
               </PG_T>
             );
           })}
