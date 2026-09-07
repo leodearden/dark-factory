@@ -50,6 +50,17 @@ import check closes.
 
 WHAT THIS CHECK PROVABLY DOES NOT COVER
 ----------------------------------------
+  * PRESENCE, not PLACEMENT: ``is_guarded`` proves a call to
+    ``assert_store_mutation_allowed`` exists somewhere in the module and is
+    correctly imported, but never compares its line number against the
+    first mutating call, and cannot tell a probe made once per run from one
+    made once per RECORD inside a loop. Both of
+    ``store_mutation_preflight.py``'s "Two placement rules" -- probe before
+    the scan, and a refusal that RAISES rather than returning a
+    report-shaped outcome -- remain entirely hand-enforced; this check would
+    not have caught a misplaced probe on its own, which is the shape closest
+    to the sweep_toolcall_xml_leak incident this whole module exists
+    because of;
   * raw Cypher/SQL built inside a STRING LITERAL is invisible to a
     call-shaped AST check -- ``migrate_cross_graph_leak.py``'s graph
     ``DETACH DELETE`` is classified a non-candidate by this detector. It is
