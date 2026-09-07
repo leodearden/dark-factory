@@ -21,9 +21,13 @@ import dataclasses
 import pytest
 
 from fused_memory.middleware.dependency_direction_check import (
+    REVERSED,
+    SIBLING_SEQUENTIAL,
+    UNSUPPORTED,
     DependencyAssertion,
     DependencyIndex,
     build_dependency_index,
+    classify_dependency_assertion,
     extract_dependency_assertions,
 )
 
@@ -239,3 +243,85 @@ class TestBuildDependencyIndex:
         before = {k: list(v) for k, v in edges.items()}
         build_dependency_index(edges)
         assert edges == before
+
+
+# ── classify_dependency_assertion — the decision core, and its ORDERING ────
+
+
+def _assertion(dependent: int, dependency: int) -> DependencyAssertion:
+    return DependencyAssertion(dependent, dependency, 'waits behind')
+
+
+class TestClassifyDependencyAssertion:
+    """Five rules evaluated in a STRICT order. The order is behaviour, not an
+    implementation detail: case (f) below fails outright if the sibling check is
+    ever hoisted above the closure check.
+    """
+
+    @pytest.fixture
+    def index(self):
+        return build_dependency_index(LIVE_SHAPE_EDGES)
+
+    def test_a_supported_direct_edge_is_not_flagged(self, index):
+        assert classify_dependency_assertion(_assertion(3578, 3619), index) is None
+
+    def test_b_supported_transitively_is_not_flagged(self, index):
+        """3618 is reachable from 3730 only transitively — a direct-edge-only
+        check would false-positive here."""
+        assert 3618 not in index.direct[3730]
+        assert classify_dependency_assertion(_assertion(3730, 3618), index) is None
+
+    def test_c_inverted_transitive_chain_is_reversed(self, index):
+        """Invisible against direct[3578]; detectable only via closure[3578]."""
+        assert 3618 not in index.direct[3578]
+        assert (
+            classify_dependency_assertion(_assertion(3618, 3578), index) == REVERSED
+        )
+
+    def test_d_shared_dependent_arm_is_sibling_sequential(self, index):
+        """3619 and 3727 are both depended on by 3578."""
+        assert (
+            classify_dependency_assertion(_assertion(3727, 3619), index)
+            == SIBLING_SEQUENTIAL
+        )
+
+    def test_e_shared_dependency_arm_is_sibling_sequential(self, index):
+        """3730 and 3733 both depend on 3728 and 3578, and in the FROZEN
+        fixture share NO dependent — a predicate limited to the escalation's
+        literal "share a dependent" would MISS this one."""
+        assert not (index.dependents[3730] & index.dependents[3733])
+        assert (
+            classify_dependency_assertion(_assertion(3730, 3733), index)
+            == SIBLING_SEQUENTIAL
+        )
+
+    def test_f_closure_precedence_beats_the_sibling_arm(self, index):
+        """3730 and 3728 share the dependency 3727, so arm (e) matches — yet
+        3730 -> 3728 is a REAL direct edge. Flagging it would be exactly the
+        false-positive class the task forbids, so the closure check MUST be
+        evaluated strictly before the sibling check."""
+        assert index.direct[3730] & index.direct[3728] == frozenset({3727})
+        assert classify_dependency_assertion(_assertion(3730, 3728), index) is None
+
+    @pytest.mark.parametrize(
+        'pair', [(99999, 3619), (3727, 99999), (99999, 88888)]
+    )
+    def test_g_an_unknown_id_is_never_flagged(self, index, pair):
+        """Fail-safe under-selection: unknown means unknown, not wrong."""
+        assert classify_dependency_assertion(_assertion(*pair), index) is None
+
+    def test_h_no_path_and_not_siblings_is_unsupported(self):
+        index = build_dependency_index({1: [2], 3: [4]})
+        assert (
+            classify_dependency_assertion(_assertion(1, 3), index) == UNSUPPORTED
+        )
+
+    def test_i_a_self_referential_assertion_is_never_flagged(self, index):
+        assert classify_dependency_assertion(_assertion(3727, 3727), index) is None
+
+    def test_vocabulary_has_one_normative_site(self):
+        assert (REVERSED, SIBLING_SEQUENTIAL, UNSUPPORTED) == (
+            'reversed',
+            'sibling_sequential',
+            'unsupported',
+        )
