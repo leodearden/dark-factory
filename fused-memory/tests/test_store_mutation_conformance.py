@@ -81,9 +81,12 @@ configuration least able to notice a regression here.
 from __future__ import annotations
 
 import ast
+import pathlib
 
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
+
+from fused_memory.utils.store_mutation_preflight import PREFLIGHT_EXEMPT_SCRIPTS
 
 # ---------------------------------------------------------------------------
 # The classifier (task 4280 / 4848)
@@ -400,4 +403,106 @@ class TestReadOnlyModuleIsNotACandidate:
         assert hits == [], (
             'constructing a MemoryService and calling only read methods must '
             f'never make a module a mutation candidate; got {hits}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Repo-wide conformance (task 4280 / 4848)
+# ---------------------------------------------------------------------------
+#
+# Everything above pins the classifier's own semantics against synthetic
+# sources. Everything below applies it to the real fused-memory/scripts/
+# tree -- the actual enforcement this task exists to add.
+# ---------------------------------------------------------------------------
+
+SCRIPTS_ROOT = pathlib.Path(__file__).parents[1] / 'scripts'
+
+#: Union of every token a qualifying ast.Call's callee name could possibly
+#: be. Used only as a raw-text prefilter, never as the classification
+#: itself -- see _discover_candidate_scripts.
+_PREFILTER_TOKENS = MUTATING_CALL_NAMES | GENERIC_MUTATING_VERBS
+
+#: Measured at plan time (task 4848) by running this same two-tier detector
+#: over the repo's 43 scripts. A FLOOR, not a pin: discovery is free to find
+#: MORE as new mutating scripts are added (and does -- the live count already
+#: exceeds it, since two scripts landed guarded after the measurement was
+#: taken). It must never find FEWER, which is what would mean the detection
+#: criteria regressed.
+CANDIDATE_FLOOR = 14
+
+
+def _discover_candidate_scripts() -> list[pathlib.Path]:
+    """Every script under SCRIPTS_ROOT whose AST contains a Tier A/B mutating call.
+
+    A raw ``read_text()`` prefilter runs first: a file whose text contains
+    NONE of the Tier A names nor any Tier B verb cannot possibly contain a
+    qualifying ``ast.Call`` -- the identifier has to appear literally in the
+    source for the call to exist -- so the prefilter is a strict superset of
+    the AST criterion and cannot hide a real candidate. It exists purely so
+    the majority of scripts that plainly never mutate are not parsed and
+    memoised (via parse_python_module's session cache) for the rest of the
+    run.
+    """
+    found: list[pathlib.Path] = []
+    for path in sorted(SCRIPTS_ROOT.glob('*.py')):
+        text = path.read_text()
+        if not any(token in text for token in _PREFILTER_TOKENS):
+            continue
+        if mutating_calls(parse_python_module(path)):
+            found.append(path)
+    return found
+
+
+CANDIDATE_SCRIPTS = _discover_candidate_scripts()
+
+
+class TestCandidateDiscoveryIsNotVacuous:
+    """Discovery must keep finding at least the measured candidate count.
+
+    Without this floor, a detector whose criteria silently stopped matching
+    (a rename of the Tier A/B tokens, a broken prefilter) would parametrize
+    the conformance test below over an empty set and report green having
+    checked nothing.
+    """
+
+    def test_candidate_discovery_is_not_vacuous(self):
+        assert len(CANDIDATE_SCRIPTS) >= CANDIDATE_FLOOR, (
+            f'candidate discovery under {SCRIPTS_ROOT} found only '
+            f'{len(CANDIDATE_SCRIPTS)} mutation candidate(s), below the measured '
+            f'floor of {CANDIDATE_FLOOR}. Fix the criteria; do NOT lower the '
+            f'floor, or this guard silently checks nothing.'
+        )
+
+
+@pytest.mark.parametrize('path', CANDIDATE_SCRIPTS, ids=lambda p: p.name)
+class TestEveryMutatingScriptCallsTheGuard:
+    """Repo-wide conformance: every discovered candidate calls the guard,
+    unless explicitly exempted in PREFLIGHT_EXEMPT_SCRIPTS."""
+
+    def test_every_mutating_script_calls_the_guard(self, path):
+        if path.name in PREFLIGHT_EXEMPT_SCRIPTS:
+            return
+
+        tree = parse_python_module(path)
+        if is_guarded(tree):
+            return
+
+        hits = mutating_calls(tree)
+        offenders = '; '.join(
+            f'scripts/{path.name}:{lineno} calls {name}(...)' for name, lineno in hits
+        )
+        pytest.fail(
+            f'{offenders} -- found: no call to {GUARD_CALLABLE} anywhere in this '
+            f'module; expected: guarded. Remedy: call {GUARD_CALLABLE} from '
+            f'{GUARD_MODULE} once per run before the scan, NOT per record. This '
+            f'matters because a probe placed after the scan (or inside a '
+            f'per-record loop) is exactly the shape that let '
+            f'sweep_toolcall_xml_leak --apply destroy memory '
+            f'7d073281-4c5d-4ba3-a01c-3a167f4460f4 -- a half-completed '
+            f'delete-then-re-add split across the Qdrant/mem0 substrate '
+            f"boundary. Do not add an allowlist entry unless this script's "
+            f'blast radius is statically bounded to scratch substrate; write '
+            f'the reasoning into the script itself first (see '
+            f'bake_off_storage_shape.py / cleanup_test_collections.py for the '
+            f'shape that reasoning takes).'
         )
