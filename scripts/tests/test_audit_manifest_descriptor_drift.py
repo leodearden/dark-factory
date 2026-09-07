@@ -661,6 +661,165 @@ def test_external_registry_task_block_is_its_own_coverage_class(
     assert audit.coverage.mechanical_capabilities_compared == 0
 
 
+def _declare_project_id(root: Path, project_id: str) -> None:
+    """Give a synthetic root the manifest that names its project_id.
+
+    ``resolve_project_id_for_root`` reads the declared id from
+    ``dark-factory-orchestrator.yaml`` first and falls back to the
+    basename derivation. Declaring it makes the tests below say WHICH id
+    they mean instead of depending on tmp_path's directory naming.
+    """
+    (root / "dark-factory-orchestrator.yaml").write_text(
+        f"project_id: {project_id}\n", encoding="utf-8")
+
+
+def test_external_task_id_naming_the_audited_project_is_not_excused(
+        tmp_path, make_tasks_db):
+    """A block cannot excuse ITSELF from comparison by claiming to be foreign.
+
+    ``external_task_id`` is only an explanation while the registry it names
+    belongs to somebody else. The model can validate the SHAPE of the value
+    (``ExternalDep.parse`` wants two non-empty parts) but has no idea which
+    project a sidecar is being swept for — so ``home_proj:5613`` in
+    home_proj's OWN corpus validates fine, and folding it into
+    external_registry_task_blocks would permanently and silently drop a
+    block's capabilities out of the eligible population under a row that
+    reads as an explained absence. That is the same misattribution the field
+    exists to prevent, pointed at the side this audit is responsible for.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(5613, [_entry("gate", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml",
+                    _manifest_doc(None, label="η",
+                                  external_task_id="home_proj:5613"))],
+    )
+    _declare_project_id(root, "home_proj")
+
+    coverage = audit_project(str(root)).coverage
+
+    assert coverage.self_bound_external_task_blocks == 1
+    # THE TWO MUST NOT COLLAPSE, in this direction either: a mis-authored
+    # binding is not an explained absence, and its remediation is neither
+    # of the other two rows' (fix the binding — a local producer is a task_id).
+    assert coverage.external_registry_task_blocks == 0
+    assert coverage.manifest_tasks_without_db_row == 0
+
+
+def test_a_self_bound_external_block_is_NAMED_not_merely_counted(
+        tmp_path, make_tasks_db):
+    """A count alone cannot be acted on — the details locate the block.
+
+    Same rule as every other uncomparable class here: an operator told only
+    that "1 block is self-bound" cannot find out WHICH, which swallows the
+    failure at exactly the reporting boundary no-silent-fail-soft is about.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(5613, [_entry("gate", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml",
+                    _manifest_doc(None, label="η",
+                                  external_task_id="home_proj:5613"))],
+    )
+    _declare_project_id(root, "home_proj")
+
+    details = audit_project(str(root)).coverage.uncomparable_details
+
+    (detail,) = [d for d in details if "external_task_id" in d]
+    assert "plans/a-prd.capability-manifest.yaml" in detail
+    assert "η" in detail
+    assert "home_proj:5613" in detail
+
+
+def test_a_foreign_block_whose_number_collides_with_a_local_row_stays_foreign(
+        tmp_path, make_tasks_db):
+    """The check keys on the PROJECT half, never on the number.
+
+    Task ids are per-registry, so a collision between reify's 5613 and this
+    project's 5613 is ordinary and says nothing: dark-factory's own ids were
+    at 5173 when this field was introduced against reify's 5332-5616, and
+    they will pass them. A guard that fired on "the numeric part resolves to
+    a local row" would therefore start misreporting the six legitimately
+    foreign blocks in this repo's corpus as mis-authored, on a schedule set
+    by task numbering. This test pins that it does not.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(5613, [_entry("gate", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml",
+                    _manifest_doc(None, label="η",
+                                  external_task_id="reify:5613"))],
+    )
+    _declare_project_id(root, "home_proj")
+
+    coverage = audit_project(str(root)).coverage
+
+    assert coverage.external_registry_task_blocks == 1
+    assert coverage.self_bound_external_task_blocks == 0
+    assert coverage.uncomparable_details == ()
+
+
+def test_self_binding_check_uses_the_declared_id_not_the_directory_name(
+        tmp_path, make_tasks_db):
+    """Resolution goes through the repo's own rename-stable resolver.
+
+    ``resolve_project_id_for_root`` prefers the id declared in
+    ``dark-factory-orchestrator.yaml`` over the directory basename, so a
+    checkout whose directory was renamed still self-identifies. Re-deriving
+    that rule locally would give this audit a second, drifting answer to
+    "which project is this" — the same single-authority argument that keeps
+    the wire-form check in ``ExternalDep.parse``.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db, name="renamed-checkout",
+        tasks=[_task(5613, [_entry("gate", _GREP_CHECK)])],
+        manifests=[("plans/a-prd.capability-manifest.yaml",
+                    _manifest_doc(None, label="η",
+                                  external_task_id="home_proj:5613"))],
+    )
+    _declare_project_id(root, "home_proj")
+
+    coverage = audit_project(str(root)).coverage
+
+    # Caught on the DECLARED id, though the directory is named otherwise.
+    assert coverage.self_bound_external_task_blocks == 1
+    assert coverage.external_registry_task_blocks == 0
+
+
+def test_seen_arithmetic_is_untouched_by_a_self_bound_block(
+        tmp_path, make_tasks_db):
+    """The mis-authored class skips in the SAME place as the explained one.
+
+    Both branches classify above the capability loop, so neither grows a
+    fifth term in the seen == compared + skips identity. A reader who learned
+    the arithmetic from the two tests above does not have to relearn it.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("paired", _GREP_CHECK)])],
+        manifests=[
+            ("plans/a-prd.capability-manifest.yaml",
+             _manifest_doc(100, checks=(("paired", _GREP_CHECK),))),
+            ("plans/b-prd.capability-manifest.yaml",
+             _manifest_doc(None, label="η", external_task_id="home_proj:5613",
+                           checks=(("self-bound-gate", _GREP_CHECK),))),
+        ],
+    )
+    _declare_project_id(root, "home_proj")
+
+    c = audit_project(str(root)).coverage
+
+    assert c.self_bound_external_task_blocks == 1
+    # 1, not 2: the self-bound block's capability is never seen either.
+    assert c.mechanical_capabilities_seen == 1
+    assert c.mechanical_capabilities_compared == (
+        c.mechanical_capabilities_seen
+        - c.capabilities_without_task_entry
+        - c.malformed_task_entries
+        - c.unconvertible_sidecar_descriptors
+    )
+
+
 @pytest.mark.parametrize("bad_entry,why", [
     ({"name": "gate", "kind": "grep", "pattern": "p", "expect": "present",
       "typo_key": "x"}, "unknown key (extra='forbid')"),
@@ -856,6 +1015,13 @@ def test_report_coverage_rows_render_with_their_column_alignment(
     assert "    external-registry task blocks:      0" in lines
     assert lines.index("    external-registry task blocks:      0") == (
         lines.index("    manifest tasks with no db row:      0") + 1)
+    # And the MIS-AUTHORED form of that class renders directly beneath it, on
+    # the same gutter, for the mirror-image reason: printed apart, a nonzero
+    # count here would read as more of the explained kind. 27-char label, so
+    # its value lands at column 40 too.
+    assert "    self-bound external blocks:         0" in lines
+    assert lines.index("    self-bound external blocks:         0") == (
+        lines.index("    external-registry task blocks:      0") + 1)
     assert "    unvalidatable task entries:         0" in lines
     assert "    unconvertible sidecar descriptors:  0" in lines
     assert "    manifests that failed to parse:     0" in lines
@@ -920,6 +1086,7 @@ def test_format_json_emits_an_object_with_projects_coverage_and_findings(
     # sweep: a machine consumer that only ever sees a key when it is nonzero
     # cannot tell "none of these" from "this build does not report them".
     assert project["coverage"]["external_registry_task_blocks"] == 0
+    assert project["coverage"]["self_bound_external_task_blocks"] == 0
     assert project["coverage"]["git_discovery_failed"] is False
     (finding,) = project["findings"]
     assert finding["manifest"] == "plans/a-prd.capability-manifest.yaml"
@@ -1025,6 +1192,7 @@ def test_main_json_payload_shape(tmp_path, make_tasks_db):
     (project,) = payload["projects"]
     assert project["coverage"]["mechanical_capabilities_compared"] == 1
     assert project["coverage"]["external_registry_task_blocks"] == 0
+    assert project["coverage"]["self_bound_external_task_blocks"] == 0
     assert [f["capability"] for f in project["findings"]] == ["gate"]
 
 

@@ -93,10 +93,23 @@ _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
+# Same __file__-relative form, and for the same reason, as the `shared` bind
+# above: `resolve_project_id_for_root` must answer for the checkout this script
+# is sweeping, not whichever copy an editable install happens to put on
+# sys.path. Binding `fused_memory` from a scripts/ audit is an established
+# pattern here (scripts/check_consolidation_closure.py:78-96); the module
+# imported below pulls only yaml + pydantic + fused_memory.utils.validation,
+# no backend clients.
+_FUSED_MEMORY_SRC = Path(__file__).resolve().parent.parent / "fused-memory" / "src"
+if str(_FUSED_MEMORY_SRC) not in sys.path:
+    sys.path.insert(0, str(_FUSED_MEMORY_SRC))
+
+from fused_memory.models.scope import resolve_project_id_for_root  # noqa: E402
 from shared.capability_manifest import (  # noqa: E402
     DeliveredCheckMeta,
     load_capability_manifest,
 )
+from shared.task_metadata import ExternalDep  # noqa: E402
 
 # The kinds the stamper actually copies. manifest_stamping.py step 5 reads
 # `if check is None or check.kind not in ('grep', 'script'): continue`, so a
@@ -349,6 +362,20 @@ class AuditCoverage(NamedTuple):
     correct as authored — which is exactly how task 4731 came to be filed, on a
     hypothesis the corpus falsified.
 
+    ``self_bound_external_task_blocks`` is the MIS-AUTHORED form of that same
+    class, and it is counted apart from it because the two are opposites.
+    ``external_task_id`` is only an explanation while the registry it names is
+    somebody ELSE'S. A block that spells the AUDITED project's own id there —
+    ``dark_factory:5613`` in this repo — passes the model's structural check
+    (``ExternalDep.parse`` only requires two non-empty parts) and would then be
+    permanently excused from comparison, with its capabilities never even SEEN.
+    That is real LOCAL coverage disappearing under a row that reads as an
+    explained absence: the same misattribution this field exists to prevent,
+    pointed the other way. It gets its own row AND a named detail naming the
+    manifest, label and value, because the remediation is different again —
+    neither re-stamp nor accept, but FIX THE BINDING (a local producer belongs
+    in ``task_id``).
+
     ``git_discovery_failed`` marks a run whose manifest corpus could not be
     enumerated at all — the one case where a zero finding count means nothing.
     Every field after the counts is defaulted so it is purely additive to
@@ -365,9 +392,28 @@ class AuditCoverage(NamedTuple):
     unconvertible_sidecar_descriptors: int = 0
     task_entries_with_no_sidecar_capability: int = 0
     external_registry_task_blocks: int = 0
+    self_bound_external_task_blocks: int = 0
     manifest_parse_failure_details: tuple[str, ...] = ()
     uncomparable_details: tuple[str, ...] = ()
     git_discovery_failed: bool = False
+
+
+def _external_project_id(wire: str) -> str | None:
+    """The project_id half of an ``external_task_id``, or None if unreadable.
+
+    ``ManifestTask``'s own validator already rejects a malformed value at load
+    and normalises what survives, so None is unreachable through
+    ``load_capability_manifest``. Guarded anyway, in the same spirit as the
+    ``int(task.task_id)`` guard below: a value this function cannot read is
+    treated exactly as the pre-existing code treated every external block, so
+    an impossible input degrades to the old behaviour rather than aborting a
+    multi-root sweep. ``ExternalDep`` stays the single authority for the wire
+    form — no local split.
+    """
+    try:
+        return ExternalDep.parse(wire).project_id
+    except ValueError:
+        return None
 
 
 class ProjectAudit(NamedTuple):
@@ -432,6 +478,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
                 unconvertible_sidecar_descriptors=0,
                 task_entries_with_no_sidecar_capability=0,
                 external_registry_task_blocks=0,
+                self_bound_external_task_blocks=0,
                 uncomparable_details=(str(exc),),
                 git_discovery_failed=True,
             ),
@@ -447,8 +494,24 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     unconvertible = 0
     orphaned_entries = 0
     external_blocks = 0
+    self_bound_blocks = 0
     parse_failure_details: list[str] = []
     uncomparable_details: list[str] = []
+
+    # Resolved ONCE per root, ahead of the sweep: this is what makes
+    # "external" checkable rather than taken on the block's word. Guarded and
+    # NAMED rather than defaulted silently — a root whose id could not be
+    # resolved cannot run the self-binding check at all, and a reader must be
+    # told that instead of reading a zero as "none found".
+    try:
+        audited_project_id: str | None = resolve_project_id_for_root(root)
+    except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+        audited_project_id = None
+        uncomparable_details.append(
+            f"{root}: could not resolve this project's own project_id "
+            f"({exc}) — external_task_id bindings are counted as foreign "
+            f"WITHOUT the self-binding check"
+        )
 
     for relpath in relpaths:
         try:
@@ -462,14 +525,39 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
         manifests_swept += 1
         for task in doc.tasks:
             if task.external_task_id is not None:
-                # The producer lives in ANOTHER project's registry, so it is
-                # absent from THIS project's tasks.db by construction — an
-                # EXPLAINED absence, not the stale binding
-                # manifest_tasks_without_db_row means. Classified here, ABOVE
-                # the capability loop and beside the other whole-block skips,
-                # so this block's capabilities never enter the eligible
-                # population and the seen == compared + skips identity is
-                # arithmetically untouched. See AuditCoverage.
+                # ANOTHER project's registry, so absent from THIS project's
+                # tasks.db by construction — an EXPLAINED absence, not the
+                # stale binding manifest_tasks_without_db_row means.
+                #
+                # But "another" is CHECKED, not taken on the block's word. The
+                # model can only validate the SHAPE of this value; it has no
+                # idea which project a given sidecar is being swept for, so
+                # `dark_factory:5613` in dark-factory's own corpus validates
+                # fine and would otherwise be excused here forever — local
+                # coverage vanishing under a row that reads as explained.
+                # That block is a mis-authoring, not an absence, and it is
+                # counted and NAMED separately. See AuditCoverage.
+                #
+                # Both branches classify HERE, above the capability loop and
+                # beside the other whole-block skips, so neither block's
+                # capabilities enter the eligible population and the
+                # seen == compared + skips identity is arithmetically
+                # untouched.
+                external_project = _external_project_id(task.external_task_id)
+                if (
+                    audited_project_id is not None
+                    and external_project == audited_project_id
+                ):
+                    self_bound_blocks += 1
+                    uncomparable_details.append(
+                        f"{relpath} label {task.label!r}: external_task_id "
+                        f"{task.external_task_id!r} names the project being "
+                        f"audited ({audited_project_id!r}), so it declares a "
+                        f"FOREIGN producer that is in fact LOCAL — the block "
+                        f"is excused from drift comparison on a binding that "
+                        f"is wrong; a local producer belongs in task_id"
+                    )
+                    continue
                 external_blocks += 1
                 continue
             if task.task_id is None:
@@ -582,6 +670,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             unconvertible_sidecar_descriptors=unconvertible,
             task_entries_with_no_sidecar_capability=orphaned_entries,
             external_registry_task_blocks=external_blocks,
+            self_bound_external_task_blocks=self_bound_blocks,
             manifest_parse_failure_details=tuple(parse_failure_details),
             uncomparable_details=tuple(uncomparable_details),
         ),
@@ -595,8 +684,10 @@ _COVERAGE_CAVEAT = (
     "capability with no same-named task-record entry, a manifest binding a "
     "task_id with no tasks.db row, a block whose producer lives in ANOTHER "
     "project's registry (external_task_id - absent from this store by "
-    "construction, and remediable by neither re-stamping nor retiring), an "
-    "unvalidatable task entry, an "
+    "construction, and remediable by neither re-stamping nor retiring), a "
+    "block whose external_task_id names THIS project (a mis-authored binding, "
+    "NOT an explained absence - it is excused from comparison on a binding "
+    "that is wrong, and the details name it), an unvalidatable task entry, an "
     "unconvertible sidecar descriptor and an unparseable sidecar are all "
     "counted here and are NONE of them drift; the missing-entry class is owned "
     "by audit_combine_gate_marker_loss.py and is never remediated from this "
@@ -665,6 +756,11 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
             # most likely to conflate. Printing them together is what says
             # which of the two a given block is in. See AuditCoverage.
             ("external-registry task blocks:", coverage.external_registry_task_blocks),
+            # ADJACENT again, and for the mirror-image reason: this row is the
+            # MIS-AUTHORED form of the row above, and printing them apart would
+            # let a nonzero count here be read as more of the explained kind.
+            # See AuditCoverage; the offending blocks are NAMED in the details.
+            ("self-bound external blocks:", coverage.self_bound_external_task_blocks),
             ("unvalidatable task entries:", coverage.malformed_task_entries),
             ("unconvertible sidecar descriptors:",
              coverage.unconvertible_sidecar_descriptors),
