@@ -30,8 +30,11 @@ from shared.merge_state import (
     LIVE_STATES,
     OUTCOME_STATES,
     POLL_STOP_STATES,
+    SUBMIT_NON_TERMINAL,
+    SUBMIT_TERMINAL,
     TERMINAL_STATES,
     MergeState,
+    MergeSubmitStatus,
 )
 
 # Same src-root expression as shared/tests/conftest.py and
@@ -67,6 +70,33 @@ _LEGACY_FOUND_ON_MAIN = 'done'
 # escalation/src/escalation/server.py — the Tier-4 "honest unknown" return, and
 # merge_cancel's no-live-waiter miss path.
 _LEGACY_TIER4 = 'unknown'
+
+# orchestrator/src/orchestrator/merge_types.py::MergeOutcome.status — the full
+# 12-member Literal, inlined verbatim.  escalation/src/escalation/server.py
+# returns ``'status': outcome.status`` VERBATIM, so this Literal IS the submit
+# wire vocabulary's terminal half.  This is the pin that makes a future
+# MergeOutcome.status widening visible here.
+_LEGACY_MERGE_OUTCOME_STATUS = frozenset(
+    {
+        'done',
+        'conflict',
+        'blocked',
+        'already_merged',
+        'wip_halted',
+        'done_wip_recovery',
+        'wip_recovery_no_advance',
+        'unmerged_state',
+        'stash_failed',
+        'unknown_branch',
+        'superseded',
+        'error',
+    }
+)
+
+# escalation/src/escalation/server.py::merge_request — the two NON-terminal
+# response shapes: wait_secs=0 dispatched -> 'queued', coalesced -> 'attached'
+# (a wait_secs>0 timeout also returns the 'queued' shape).
+_LEGACY_SUBMIT_NON_TERMINAL = frozenset({'queued', 'attached'})
 
 
 # ---------------------------------------------------------------------------
@@ -301,3 +331,143 @@ class TestStandaloneLoadability:
             'scripts/tests/ drift guard can load it by file path; found: '
             f'{sorted(set(offenders))}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Pair 2 — MergeSubmitStatus enum (step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestMergeSubmitStatusEnum:
+    def test_is_str_enum(self):
+        assert issubclass(MergeSubmitStatus, enum.StrEnum)
+
+    def test_members_are_str_equal(self):
+        assert MergeSubmitStatus.already_merged == 'already_merged'
+        assert isinstance(MergeSubmitStatus.queued, str)
+
+    def test_member_names_are_the_wire_values(self):
+        for member in MergeSubmitStatus:
+            assert member.name == member.value, (
+                f'MergeSubmitStatus.{member.name} has wire value {member.value!r}; '
+                'member names must BE the wire values'
+            )
+
+    def test_exact_vocabulary(self):
+        # 14 = MergeOutcome.status's 12-member Literal + the 2 non-terminal
+        # response shapes.  NOT the 6 the PRD's illustrative contract block
+        # sketches — PRD Open Question 3 delegates membership to this task,
+        # and the server returns outcome.status verbatim.
+        assert {
+            s.value for s in MergeSubmitStatus
+        } == _LEGACY_MERGE_OUTCOME_STATUS | _LEGACY_SUBMIT_NON_TERMINAL
+        assert len(MergeSubmitStatus) == 14
+
+
+class TestSubmitPartitions:
+    def test_submit_terminal_matches_merge_outcome_status(self):
+        # orchestrator/src/orchestrator/merge_types.py::MergeOutcome.status
+        assert {s.value for s in SUBMIT_TERMINAL} == _LEGACY_MERGE_OUTCOME_STATUS
+
+    def test_submit_non_terminal(self):
+        assert {
+            MergeSubmitStatus.queued,
+            MergeSubmitStatus.attached,
+        } == SUBMIT_NON_TERMINAL
+
+    def test_partitions_are_frozensets_of_members(self):
+        for name, partition in (
+            ('SUBMIT_TERMINAL', SUBMIT_TERMINAL),
+            ('SUBMIT_NON_TERMINAL', SUBMIT_NON_TERMINAL),
+        ):
+            assert isinstance(partition, frozenset), f'{name} must be a frozenset'
+            for value in partition:
+                assert isinstance(value, MergeSubmitStatus), (
+                    f'{name} contains {value!r}, which is not a MergeSubmitStatus member'
+                )
+
+    def test_submit_partitions_exhaustive(self):
+        assert frozenset(MergeSubmitStatus) == SUBMIT_TERMINAL | SUBMIT_NON_TERMINAL, (
+            'SUBMIT_TERMINAL | SUBMIT_NON_TERMINAL must cover every '
+            'MergeSubmitStatus member; unassigned: '
+            f'{sorted(frozenset(MergeSubmitStatus) - (SUBMIT_TERMINAL | SUBMIT_NON_TERMINAL))}'
+        )
+
+    def test_submit_partitions_disjoint(self):
+        assert frozenset() == SUBMIT_TERMINAL & SUBMIT_NON_TERMINAL, (
+            'SUBMIT_TERMINAL and SUBMIT_NON_TERMINAL must be disjoint; both claim: '
+            f'{sorted(SUBMIT_TERMINAL & SUBMIT_NON_TERMINAL)}'
+        )
+
+
+class TestSubmitVocabularyRejectsInventedValues:
+    """The two values the runbooks invent but the server never returns."""
+
+    def test_failed_is_not_a_submit_status(self):
+        assert 'failed' not in {s.value for s in MergeSubmitStatus}, (
+            "'failed' is not a merge_request status — it appears NOWHERE in "
+            'escalation/src/escalation/server.py.  The real value is '
+            f'{MergeSubmitStatus.error.value!r}.  Named by '
+            'skills/merge-queue/SKILL.md and skills/escalation-watcher/SKILL.md.'
+        )
+
+    def test_needs_rebase_is_not_a_submit_status(self):
+        assert 'needs_rebase' not in {s.value for s in MergeSubmitStatus}, (
+            "'needs_rebase' is not a merge_request status — it exists only in "
+            'orchestrator/src/orchestrator/suffix_graph.py as an internal '
+            'structured BOUNCE LOG line, never as a response status.  Named by '
+            'skills/merge-queue/SKILL.md.'
+        )
+
+
+class TestVocabulariesAreDistinct:
+    """Two vocabularies, not one — the PRD contract's central property.
+
+    This is why the drift guard pins each prose list against the RIGHT
+    vocabulary: a poll terminal set naming ``already_merged`` (DEFECT 2) is
+    wrong precisely because that value can only ever appear on the submit
+    wire.
+    """
+
+    def test_they_are_distinct_types(self):
+        assert MergeState is not MergeSubmitStatus
+        assert not issubclass(MergeSubmitStatus, MergeState)
+        assert not issubclass(MergeState, MergeSubmitStatus)
+
+    def test_submit_only_values(self):
+        # Present on the submit wire, absent from the poll vocabulary.
+        submit_only = {
+            'already_merged',
+            'unknown_branch',
+            'wip_halted',
+            'wip_recovery_no_advance',
+            'unmerged_state',
+            'stash_failed',
+            'done_wip_recovery',
+            'error',
+            'attached',
+        }
+        assert submit_only <= {s.value for s in MergeSubmitStatus}
+        assert set() == submit_only & {s.value for s in MergeState}
+
+    def test_poll_only_values(self):
+        # Present on the poll wire, absent from the submit vocabulary.
+        poll_only = {
+            'abandoned',
+            'verifying',
+            'gate',
+            'finalizing',
+            'no_record',
+            'stale_record',
+            'journaled',
+            'unknown',
+        }
+        assert poll_only <= {s.value for s in MergeState}
+        assert set() == poll_only & {s.value for s in MergeSubmitStatus}
+
+    def test_the_shared_spellings_are_the_overlap(self):
+        # Exactly five spellings appear in BOTH vocabularies.  They are
+        # distinct members of distinct enums that happen to share a wire
+        # spelling — not one value used twice.
+        overlap = {s.value for s in MergeState} & {s.value for s in MergeSubmitStatus}
+        assert {'queued', 'done', 'conflict', 'blocked', 'superseded'} == overlap
