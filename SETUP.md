@@ -485,12 +485,20 @@ requirement for a working install — skip this section unless you need it.
 - **`receive.denyCurrentBranch = updateInstead`**, set on that checkout
   (`git config receive.denyCurrentBranch updateInstead`). This is required
   because the dispatcher's best-effort keep-alive push targets
-  `main:refs/heads/main` — the branch the remote checkout has checked out,
-  which git refuses to accept a push to by default. `updateInstead` tells
-  git to update the working tree in place instead of rejecting the push. The
-  **load-bearing** push — the actual commit under verification — goes to a
-  separate, namespaced ref instead, `refs/merge-verify/<request-id>`, which
-  is never checked out and so needs no such configuration.
+  `<main-branch>:refs/heads/<main-branch>` — the configured
+  `git.main_branch` (threaded into `RemoteRunner` as `main_branch`, and
+  skipped entirely when that setting is unset) — which is the branch the
+  remote checkout has checked out, and git refuses to accept a push to a
+  checked-out branch by default. `updateInstead` tells git to update the
+  working tree in place instead of rejecting the push. When that push is
+  rejected (typically a non-fast-forward — the remote's own `main` moved),
+  the dispatcher retries **once** with a **force** refspec
+  (`+<main-branch>:refs/heads/<main-branch>`) to restore mirror semantics;
+  worth knowing before treating `updateInstead` as a passive convenience,
+  since a force push can overwrite whatever is currently on that checked-out
+  branch. The **load-bearing** push — the actual commit under verification —
+  goes to a separate, namespaced ref instead, `refs/merge-verify/<request-id>`,
+  which is never checked out and so needs no such configuration.
 - **A PATH wrapper** for the orchestrator CLI (e.g.
   `/usr/local/bin/orchestrator`), needed because a non-interactive
   `ssh host cmd` does not source `~/.bashrc`/`~/.profile`, so a bare
@@ -548,12 +556,14 @@ npm ci
 
 ### Checking the host answers
 
-Two probes, both run exactly as the dispatcher itself runs them —
-`orchestrator/src/orchestrator/verify_runner.py`:
+Two probes, run with the same ssh options the dispatcher itself uses
+(`_SSH_BASE_OPTS`, `orchestrator/src/orchestrator/verify_runner.py`):
 
 ```bash
-ssh -o BatchMode=yes <host> 'orchestrator verify-merge --help'   # REMOTE_LIVENESS_CMD
-ssh -o BatchMode=yes <host> true                                  # RemoteRunner.health()
+ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 <host> 'orchestrator verify-merge --help'  # REMOTE_LIVENESS_CMD
+ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 <host> true                                 # RemoteRunner.health()
 ```
 
 - The CLI probe must be spelled **bare** — `orchestrator verify-merge
@@ -562,7 +572,12 @@ ssh -o BatchMode=yes <host> true                                  # RemoteRunner
   resolution (through the host's `orchestrator` wrapper — "What lives on
   the remote host" above) that a real dispatch does; a qualified spelling
   can pass while the real dispatch still fails `rc=127`.
-- Assert exit code `0` on both.
+- Assert exit code `0` on both. Hand-running a probe without the
+  `ConnectTimeout`/`ServerAlive*` options can hang on an unreachable host
+  instead of failing fast the way the dispatcher's own probe does — the
+  options above aren't cosmetic. `RemoteRunner.health()` also swallows
+  every exception and returns `False`, so a transport error and a
+  live-but-failing host look identical from the caller's side.
 
 **A passing probe proves the CLI is reachable, not that the checkout is
 current.** The CLI probe already exits `0` against a stale checkout — it
@@ -596,12 +611,24 @@ ordinary `load_config` resolution on the remote takes it from there
 `config_path` is left `None`). Name it however you like, or omit it and
 rely on the remote's own `ORCH_CONFIG_PATH`.
 
-**Load-bearing vs. inert.** `verify-merge` reads `project_root`, the
-`git.*` block, and — on the zero-module-config path only — `verify_env`
-from this file. Scheduler, routing, budget, and escalation sections are
-inert for this subcommand and can be left at whatever value (or omitted)
-without effect; don't spend effort keeping those sections in sync with
-the workstation.
+**Load-bearing vs. inert.** The dispatcher's wire override
+(`run_merge_verify_on_worktree`'s `config_update`) touches only
+`merge_verify_workspace`, `merge_verify_breadth`, the three verify
+commands (when the spec carries a `global_verify_command` — see below),
+and the module set (the task-4536 `_module_configs` overwrite). Every
+other verify-behaviour key comes from **this file** and is genuinely
+load-bearing: `project_root`, the `git.*` block, `verify_env`, and the
+full timeout/concurrency/admission/cgroup surface —
+`verify_command_timeout_secs`, `verify_cold_command_timeout_secs`,
+`merge_verify_cold_command_timeout_secs`, `verify_timeout_retries`,
+`concurrent_verify`, `max_concurrent_module_verifies`, the
+`verify_admission_*` and `verify_clock_stop_*` families, `cpu_governance`,
+`scope_cargo`, and `verify_cold_preprovision_command` (the cost recorded
+further down only lands *because* the remote reads that key from this
+file). Scheduler, routing, budget, and escalation sections are the
+genuinely inert ones for this subcommand and can be left at whatever
+value (or omitted) without effect; don't spend effort keeping those
+sections in sync with the workstation.
 
 **Never restate `test_command`/`lint_command`/`type_check_command` in
 this file — in both branches, a wire copy overrides whatever is set
@@ -632,16 +659,18 @@ here would make the remote run a gate the workstation itself never runs.
 That's divergence from the workstation, not a legitimate fallback;
 "don't restate" holds regardless.
 
-**`verify_env` is the one genuine exception — set it here for a
-zero-module-config project.** The override in
-`run_merge_verify_on_worktree` never touches `verify_env`; the spec's
-copy is threaded only into per-module `ModuleConfig`s (by
-`_module_config_from_command`), and a zero-module project has no
-`ModuleConfig`s for it to land in. `_resolve_verify_env(config,
-module_config=None)` then merges `config.verify_env` alone (plus the
-authoritative `DF_VERIFY_ROLE` stamp) — so on that path, and only that
-one, this file's `verify_env` is what the remote verify actually runs
-with.
+**`verify_env` behaves differently from the three commands above: the
+wire override never touches it, on either branch.** `config_update` has
+no `verify_env` key, so `_resolve_verify_env` always starts from this
+file's `config.verify_env` (plus the authoritative `DF_VERIFY_ROLE`
+stamp) — unconditionally, not just for a zero-module-config project. On
+a project **with** registered module configs, a module's own
+`verify_env` (threaded in by `_module_config_from_command`) is merged on
+top and can add to or override individual keys; on a **zero-module**
+project there is no `ModuleConfig` for that, so this file's top-level
+`verify_env` is the whole answer, unmasked. Either way, setting it here
+has real, non-silent effect — unlike restating a command, it is never
+overridden into a no-op.
 
 ### Warm vs. ephemeral verify worktrees
 
@@ -762,8 +791,9 @@ verify_runners:
                                       # automatic currency sync at dispatch time
                                       # (HEAD-compare vs. the dispatcher, then
                                       # git pull --ff-only + uv sync --all-packages
-                                      # when stale). Omit (null, the default) to
-                                      # keep the checkout's currency a manual
+                                      # when stale -- npm ci is NOT part of this
+                                      # sync; see below). Omit (null, the default)
+                                      # to keep the checkout's currency a manual
                                       # concern, refreshed as in this section.
     enabled: true
 verify_drift_check_every_n_lands: 20   # companion setting: periodic remote/local
@@ -784,7 +814,7 @@ verify_runners:
 verify_drift_check_every_n_lands: 20
 ```
 
-Three operator-facing facts:
+Four operator-facing facts:
 
 - **`enabled: false` is the kill switch — no need to delete the block.**
   Every consumer reads runners through the `enabled_verify_runners`
@@ -800,6 +830,19 @@ Three operator-facing facts:
   Worth knowing before opting into the `df_checkout_path` auto-sync in
   that configuration — the sync and the thing being verified are then the
   same checkout, not two independent ones.
+- **The `df_checkout_path` auto-sync covers the `uv` half only.** Nothing
+  in `verify_runner.py` invokes `npm` — `sync_if_stale` runs `git pull
+  --ff-only` then `uv sync --all-packages` and stops there — so a commit
+  that bumps `package-lock.json` (a new pinned `npx pyright`, say) leaves
+  the remote's Node-installed tools stale even with the automatic sync
+  enabled; `npm ci` stays a manual concern in "Provisioning the remote
+  host" above either way. Two more things the automation does silently:
+  it asserts a post-sync liveness probe (`REMOTE_LIVENESS_CMD`) and
+  **benches the runner** if that fails rather than leaving it looking
+  synced, and it compares the remote's head against the dispatcher's
+  `@{upstream}` before declaring the runner stale, so a dispatcher that is
+  merely ahead of a healthy, origin-current remote doesn't trigger a false
+  `runner_stale` alert.
 
 For the environment-parity checklist between a workstation and a laptop
 verify host, and day-2 operational notes for a live laptop runner, see
