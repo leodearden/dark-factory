@@ -1465,13 +1465,30 @@ spelling, for the cases case/separator folding alone cannot merge (task
 3807). Applied as the LAST step of normalize_project_token, so both key and
 value must themselves already be canonical under the fold.
 
-ADMISSION RULE for a new entry -- the canonical value must be the
-``memory.project_id`` declared by a real project root's
-``dark-factory-orchestrator.yaml``. That keeps the table mechanical and
-auditable instead of a per-case judgement call, and it is the reason this
-table is deliberately NOT a config read: this module is stdlib-only with no
+ADMISSION RULE for a new entry -- TWO clauses, BOTH necessary (clause 2
+added by task 3813, which was filed to keep this rule honest):
+
+  1. The canonical value must be the ``memory.project_id`` declared by a
+     real project root's ``dark-factory-orchestrator.yaml``.
+  2. The alias must heal an ACTUAL SPLIT: after case/separator folding,
+     that project's rows must still sit in >=2 buckets. A bucket whose
+     NAME merely disagrees with the declared ``project_id``, with every
+     row already in ONE bucket, is COSMETIC and admits nothing.
+
+Together they keep the table mechanical and auditable instead of a
+per-case judgement call, and clause 1 is the reason this table is
+deliberately NOT a config read: this module is stdlib-only with no
 intra-orchestrator imports (see module docstring), so the mapping is a
 hand-maintained constant kept in sync with those configs.
+
+Clause 2 states the principle the table already embodies rather than
+adding a new one. ``df -> dark_factory`` qualifies because it healed a
+MEASURED 22/17/2 three-way split in which each partition was invisible to
+a reap scoped to either of the others -- a correctness bug. An alias that
+heals no split can only ever move rows out from under whatever reaps them
+today, which is a strictly larger risk than the naming mismatch it tidies.
+The solar-challenge entry fails clause 2 and is recorded as declined in
+PROJECT_TOKEN_ALIASES_DECLINED below.
 
 EVIDENCE for the sole seeded entry: three independent declarations name
 ``dark_factory`` as this project's identity -- ``dark-factory-orchestrator
@@ -1488,20 +1505,101 @@ entry here. It does NOT reconcile a project whose filed tokens fold to
 something OTHER than its declared ``memory.project_id``; only an alias can
 bridge that.
 
-KNOWN RESIDUAL GAP (measured 2026-08-07, 407 records):
+RESIDUAL NAMING MISMATCH -- DECIDED (task 3813): DECLINED. See
+PROJECT_TOKEN_ALIASES_DECLINED below for the evidence.
 ``/home/leo/src/solar-challenge`` declares ``my_solar_challenge``, but its
 5 OPEN decisions are filed under ``solar-challenge`` (3) and
-``solar_challenge`` (2). Folding merges those two into ONE bucket --
-strictly better than before, when a reap scoped to either missed the other
--- but the bucket is named ``solar_challenge``, so a reaper passing the
+``solar_challenge`` (2) (re-measured 2026-09-07, 748 records; unchanged
+from 2026-08-07). Folding merges those two into ONE bucket -- strictly
+better than before, when a reap scoped to either missed the other -- but
+the bucket is named ``solar_challenge``, so a reaper passing the
 config-declared ``my_solar_challenge`` matches ZERO of them. Adding
-``'solar_challenge': 'my_solar_challenge'`` would close it and the
-admission rule above already licenses it; that call is deliberately NOT
-made here because it is a cross-project behaviour change owned by its own
-filed decision task (3813). Until it lands, reap that project with a token
-that folds to ``solar_challenge`` -- and note the collapse guard is
-unaffected either way, since ``solar_challenge_platform`` is a distinct
-project root with a distinct folded token."""
+``'solar_challenge': 'my_solar_challenge'`` would rename that bucket, and
+the amended admission rule above does NOT license it: clause 2 fails,
+because folding already left every row in ONE bucket, so there is no split
+left to heal. Reap that project with a token that folds to
+``solar_challenge`` -- permanently, not "until 3813 lands" -- and note the
+collapse guard is unaffected either way, since ``solar_challenge_platform``
+is a distinct project root with a distinct folded token."""
+
+
+PROJECT_TOKEN_ALIASES_DECLINED: dict[str, tuple[str, str]] = {
+    'solar_challenge': (
+        'my_solar_challenge',
+        'No split left to heal (fold already merged 3+2 into one bucket), and '
+        'the identity question is an OPEN human gate in that project (esc-98-1, '
+        '"Do NOT auto-act").',
+    ),
+}
+"""Aliases CONSIDERED and DELIBERATELY DECLINED (task 3813), keyed
+already-folded-alias -> (already-folded declined canonical, one-line reason).
+
+WHAT THIS IS. The deliberate mirror image of PROJECT_TOKEN_ALIASES above:
+same folded-to-folded key/value invariant (pinned by a named test), so
+PROMOTING a declined entry is a one-line move between the two dicts and
+DECLINING a live one is the same move in reverse. It is read by
+``declined_project_token_hint`` and by two guard tests; it is deliberately
+NOT consulted by ``normalize_project_token``, so it costs nothing on the
+fold's hot path and every existing test of that fold is untouched. The
+in-repo precedent for encoding a deliberate exclusion next to the table it
+governs is ``fused-memory/scripts/consolidate_namespace_families.py``
+::``GRAPH_FAMILY_ALIASES``; recording it as data rather than a comment is
+what makes it checkable.
+
+THE DECISION. ``solar_challenge -> my_solar_challenge`` is DECLINED. Not
+deferred, not an oversight, not "pending a decision task" -- 3813 WAS that
+decision task, and this is its answer.
+
+THE EVIDENCE (re-measured 2026-09-07 over 748 fleet decision records:
+``solar-challenge`` 3, ``solar_challenge`` 2, ``my_solar_challenge`` ZERO,
+all 5 ``state=open`` -- identical to the 2026-08-07 measurement a month
+earlier):
+
+  - NO SPLIT REMAINS, so there is nothing for an alias to heal. Task 3807's
+    case/separator fold already merged the two filed spellings into ONE
+    bucket. Adding the alias would not MERGE anything; it would only RENAME
+    a populated bucket (5 rows) onto an empty one (0 rows), moving those
+    rows out from under whatever reaps them today. That is why the amended
+    admission rule's clause 2 exists and why this entry fails it.
+
+  - THE IDENTITY QUESTION IS AN OPEN HUMAN GATE IN THAT PROJECT, and the
+    alias would settle it from dark-factory's side. Decision record
+    ``esc-98-1`` (``state=open``, filed under ``solar_challenge``, queue
+    ``<dark-factory>/data/reconciliation/escalations``) reads: "one-way
+    policy decision -- (a) MIGRATE ~1400 orphaned 'my_solar_challenge'
+    items (876 graphiti + 524 mem0) into canonical 'solar_challenge' ...
+    or (b) ARCHIVE the 'my_solar_challenge' namespace in place. Do NOT
+    auto-act. Forward project_id-misconfig fix tracked via a separate
+    sibling task (finding 116ceed2)." That gate calls ``solar_challenge``
+    the CANONICAL token, ``my_solar_challenge`` the ORPHANED namespace, and
+    the config declaration itself a MISCONFIG whose forward fix is already
+    tracked elsewhere. Aliasing onto ``my_solar_challenge`` here would
+    resolve that gate silently, in the direction it calls "orphaned", with
+    no human sign-off.
+
+  - IN-REPO PRECEDENT for keep-separate on this exact family:
+    ``consolidate_namespace_families.py::GRAPH_FAMILY_ALIASES`` excludes the
+    solar family on the stated ground that keep-separate is the default
+    absent an explicit human decision.
+
+  - THE COLLAPSE GUARD IS UNAFFECTED either way:
+    ``solar_challenge_platform`` is a distinct project root with a distinct
+    declared ``project_id`` and folds to itself. Nothing here touches it.
+
+THE OPERATOR CONSEQUENCE. Reap and file that project with a token that
+folds to ``solar_challenge`` -- PERMANENTLY, not "until 3813 lands". The
+mismatch with its declared ``memory.project_id`` is now a decided,
+standing state, so ``write-decision`` and ``reap-decisions`` WARN when
+handed ``my_solar_challenge`` (see ``declined_project_token_hint``): the
+trap announces itself at the moment someone types the config-declared
+token, instead of returning a silent zero-row no-op that reads as "nothing
+to reap".
+
+WHAT WOULD REOPEN IT. Either ``esc-98-1`` resolving in favour of
+``my_solar_challenge`` (which would make it the canonical bucket and this
+decline wrong), or solar-challenge's config being changed to declare
+``solar_challenge`` (which would make the decline moot -- delete the entry
+and its hint together)."""
 
 
 def normalize_project_token(value: object) -> str:
