@@ -28,7 +28,10 @@
 // against pre-seam data.js too, which is what step-1's RED depends on.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
 const EXPECTED_FUNCTION_NAMES = [
@@ -52,6 +55,12 @@ const EXPECTED_DF_DATA_KEYS = [
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS', 'SCHEDULER',
   'MEMORY_EVALS',
+  // Per-endpoint staleness, published by refreshOne (task 4884, #4791).
+  // Nested under DF_DATA alongside __loaded rather than added as a second
+  // global, and seeded here for the same reason every domain key is: the
+  // first render happens before any fetch resolves, and a consumer reading
+  // DF_DATA.__stale[path] must not have to guard the container itself.
+  '__stale',
 ];
 
 // Number of rows in endpointsFor() (data.js:16-34). Several tests below assert
@@ -1053,4 +1062,217 @@ test("preserved behaviour: refreshDFData(win) updates the ?window= param on the 
       `the flow-control state for ${path} must be the SAME object across a chip change (path-keyed, not reset)`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Per-endpoint staleness publication (task 4884, #4791)
+//
+// The 2026-08-27 incident ran 19.8h with the dashboard serving a fully
+// rendered UI whose numbers had stopped advancing. Keeping the prior values
+// on failure is deliberate (see the keep-last-good tests above) — the defect
+// is that nothing RECORDED that they were old, so no consumer could say so.
+// These tests pin the producer half: refreshOne publishes, per endpoint PATH,
+// how many consecutive attempts have failed and when the last success landed.
+// endpoint_staleness.js holds the decision of what to do with that;
+// dashboard/tests/js/endpoint_staleness.test.mjs covers it.
+// ---------------------------------------------------------------------------
+
+// The contract constants, stated as literals rather than read back out of the
+// module under test. data.js prefers window.DF_ENDPOINT_STALENESS's threshold
+// when that module has loaded and falls back to its own literal otherwise
+// (data.js is the FIRST classic script in index.html, so it must not gain a
+// hard load-order dependency on a later one); under this node harness the
+// window shim carries no DF_ENDPOINT_STALENESS, so the fallback is what runs.
+// endpoint_staleness.test.mjs asserts the two agree.
+const STALE_FAILURE_THRESHOLD = 3;
+const STALE_TIMEOUT_MS = 5000;
+
+const CURATOR_PATH = '/api/v2/dashboard/curator';
+const COSTS_PATH = '/api/v2/dashboard/costs';
+
+const DATA_JS_SOURCE = fs.readFileSync(
+  path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../src/dashboard/static/redux/data.js',
+  ),
+  'utf8',
+);
+
+test('staleness: __stale is seeded as an empty object alongside __loaded', () => {
+  const { window: win } = loadDataJs();
+
+  assert.deepEqual(win.DF_DATA.__stale, {}, 'DF_DATA.__stale must be seeded as {}');
+  assert.ok(win.DF_DATA.__loaded, 'DF_DATA.__loaded must still be seeded');
+});
+
+test('staleness: a successful refresh publishes failures 0 and the success instant', async () => {
+  const fetchImpl = () => Promise.resolve({ ok: true, json: async () => ({}) });
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  const T = 1_700_000_000_000;
+  const deps = { fetchImpl, now: () => T, random: () => 0, sleep: () => Promise.resolve() };
+
+  await api.refreshDFData(undefined, { state, deps, jitterMaxMs: 0 });
+
+  const entry = win.DF_DATA.__stale[CURATOR_PATH];
+  assert.ok(entry, `nothing published for ${CURATOR_PATH}`);
+  assert.equal(entry.failures, 0);
+  assert.equal(entry.lastSuccessAt, T, 'lastSuccessAt must be the injected clock reading, not Date.now()');
+});
+
+test('staleness: entries are keyed by PATH, not URL, and survive a chip change', async () => {
+  // Same reason the flow-control state is path-keyed (see pollKey): the four
+  // ?window= endpoints change URL on every chip click, so a URL-keyed map
+  // would strand the old entry and start a fresh one each time — exactly the
+  // shape in which a wedged endpoint's failure history disappears.
+  const fetchImpl = url =>
+    (pollKey(url) === COSTS_PATH
+      ? Promise.reject(new Error('simulated costs failure'))
+      : Promise.resolve({ ok: true, json: async () => ({}) }));
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = { fetchImpl, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  await api.refreshDFData(undefined, opts);           // timer path: failure 1
+  assert.equal(win.DF_DATA.__stale[COSTS_PATH].failures, 1);
+
+  // A chip change forces the windowed endpoints past their backoff. A forced
+  // attempt that fails deliberately does NOT escalate the timer path's
+  // backoff (see recordFailure), so the count holds rather than inflating on
+  // user clicks — but the entry must still be there, under the same key.
+  await api.refreshDFData('7d', opts);
+  assert.equal(win.DF_DATA.__stale[COSTS_PATH].failures, 1);
+
+  t = state.get(COSTS_PATH).nextAllowedAt;
+  await api.refreshDFData(undefined, opts);           // timer path: failure 2
+  assert.equal(win.DF_DATA.__stale[COSTS_PATH].failures, 2);
+
+  for (const key of Object.keys(win.DF_DATA.__stale)) {
+    assert.ok(!key.includes('?'), `__stale key ${key} must be query-stripped (pollKey), not a full URL`);
+  }
+});
+
+test('staleness: the last success instant survives a later failure', async () => {
+  // "Loaded once, but failing for N minutes" is precisely the state __loaded
+  // alone cannot express — it flips true on the first success and never back,
+  // so during the 19.8h wedge every key read as loaded and current.
+  let fail = false;
+  const fetchImpl = url =>
+    (pollKey(url) === CURATOR_PATH && fail
+      ? Promise.reject(new Error('simulated curator failure'))
+      : Promise.resolve({ ok: true, json: async () => ({}) }));
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 1_000;
+  const deps = { fetchImpl, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  await api.refreshDFData(undefined, opts);
+  const successAt = win.DF_DATA.__stale[CURATOR_PATH].lastSuccessAt;
+  assert.equal(successAt, 1_000);
+
+  fail = true;
+  t = 500_000;
+  await api.refreshDFData(undefined, opts);
+
+  const entry = win.DF_DATA.__stale[CURATOR_PATH];
+  assert.equal(entry.failures, 1);
+  assert.equal(
+    entry.lastSuccessAt,
+    successAt,
+    'a failure must not overwrite or clear the recorded success instant — the age is derived from it',
+  );
+});
+
+test('staleness: applyKey cannot clobber __stale', () => {
+  // The same guarantee __loaded already has: __stale is not an endpoint key,
+  // so no server payload can overwrite the map that reports the server is
+  // failing.
+  const { api, window: win } = loadDataJs();
+
+  win.DF_DATA.__stale[CURATOR_PATH] = { failures: 7, lastSuccessAt: 42 };
+  api.applyKey('__stale', {});
+
+  assert.deepEqual(
+    win.DF_DATA.__stale[CURATOR_PATH],
+    { failures: 7, lastSuccessAt: 42 },
+    'applyKey must not replace the published staleness map',
+  );
+});
+
+test('staleness: past the threshold the per-attempt deadline drops to STALE_TIMEOUT_MS', async () => {
+  // THE SECOND-ORDER EFFECT. Three wedged endpoints each holding a socket for
+  // the full 30s deadline consumed about half the page's ~6-concurrent-
+  // connections-per-origin budget continuously, which is why the HEALTHY tabs
+  // also felt sluggish during the incident. Once an endpoint has demonstrated
+  // it is failing, there is nothing left to wait 30s for.
+  const armed = [];
+  const fetchImpl = () => Promise.reject(new Error('simulated failure'));
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = {
+    fetchImpl,
+    now: () => t,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: (fn, ms) => { armed.push(ms); return armed.length; },
+    clearTimeoutImpl: () => {},
+  };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
+    await api.refreshOne(CURATOR_PATH, [], state, deps);
+    t = state.get(CURATOR_PATH).nextAllowedAt;
+  }
+
+  assert.equal(armed[0], 30000, 'the FIRST attempt must still use the full 30s deadline');
+  assert.equal(state.get(CURATOR_PATH).failures, STALE_FAILURE_THRESHOLD);
+
+  const before = armed.length;
+  await api.refreshOne(CURATOR_PATH, [], state, deps);
+  assert.equal(
+    armed[before],
+    STALE_TIMEOUT_MS,
+    `an endpoint at ${STALE_FAILURE_THRESHOLD} consecutive failures must arm a ` +
+      `${STALE_TIMEOUT_MS}ms deadline, not 30000 — got ${armed[before]}`,
+  );
+});
+
+test('staleness: an explicit deps.timeoutMs still wins over both defaults', () => {
+  // The reduced deadline is a DEFAULT selection, not an override: the timeout
+  // test above hands refreshOne an explicit timeoutMs: 30000 and asserts the
+  // armed deadline equals it, so `deps.timeoutMs ?? ...` must stay the
+  // outermost choice.
+  assert.match(
+    DATA_JS_SOURCE,
+    /deps\.timeoutMs\s*\?\?/,
+    'refreshOne must still prefer an explicitly injected deps.timeoutMs',
+  );
+});
+
+test('staleness: DEFAULT_TIMEOUT_MS survives untouched as a parsable literal', () => {
+  // TWO Python structural tests parse this constant out of the shipped source
+  // with exactly this regex — test_tasks_budget.py and
+  // test_fetch_tasks_whole_operation_budget.py — where it is the ONLY ceiling
+  // on the server-side budgets. A rename or a computed expression makes both
+  // fail loudly, which is why STALE_TIMEOUT_MS had to be a NEW, separately
+  // named constant rather than a redefinition of this one.
+  const match = DATA_JS_SOURCE.match(/DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/);
+  assert.ok(match, 'DEFAULT_TIMEOUT_MS is no longer a literal assignment in data.js');
+  assert.equal(Number(match[1]), 30000);
+
+  const stale = DATA_JS_SOURCE.match(/STALE_TIMEOUT_MS\s*=\s*(\d+)/);
+  assert.ok(stale, 'STALE_TIMEOUT_MS must be its own named literal constant');
+  assert.equal(Number(stale[1]), STALE_TIMEOUT_MS);
+  assert.notEqual(
+    Number(stale[1]),
+    Number(match[1]),
+    'the reduced deadline must actually be shorter than the default one',
+  );
 });
