@@ -47,7 +47,10 @@ Nothing is written without ``--apply``.  See the operator runbook below.
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import functools
+import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -82,7 +85,10 @@ _CENSUS_SCRIPT_PATH = (
 # defined locally.  This script is loaded by path via ``importlib`` and cannot
 # be imported from, so its ``__all__`` grants the shared rule no second home.
 __all__ = [
+    'DEFAULT_JSON_OUT',
     'DEFAULT_MAX_PAGES',
+    'DEFAULT_MD_OUT',
+    'DEFAULT_PROJECTS',
     'GATE_METADATA_KEY',
     'GateGroup',
     'WriteRejectedError',
@@ -105,7 +111,13 @@ __all__ = [
     'enumerate_topic_bearing',
     'is_valid_topic_slug',
     'load_census_module',
+    'main',
     'plan_renames',
+    'render_json',
+    'render_markdown',
+    'resolve_exit_code',
+    'resolve_projects',
+    'run',
     'rename_one',
     'verify_old_slugs_drained',
 ]
@@ -290,6 +302,15 @@ async def enumerate_topic_bearing(
     records: list[dict] = []
     coverage: dict[str, dict] = {}
     skips: list[dict] = []
+    # The conforming half of the corpus is DISCARDED as records but its topic
+    # VALUES are kept, because a collision is a statement about the values a
+    # fold could land on and most of those live on records this sweep will
+    # never rename.  Retaining the values (a few hundred distinct strings)
+    # rather than the records keeps peak memory bounded by the namespace, not
+    # by the ~49.4k-record corpus, while leaving the collision guard able to
+    # see the incumbent it exists to protect.
+    occupied_topics: set[str] = set()
+    canonical_ids_by_topic: dict[str, list[str]] = {}
 
     for category in category_values:
         filters = {'category': category}
@@ -304,7 +325,18 @@ async def enumerate_topic_bearing(
                 scrolled += 1
                 metadata = record.get('metadata') or {}
                 topic = metadata.get('topic')
-                if topic is None or is_valid_topic_slug(topic):
+                if not isinstance(topic, str) or not topic:
+                    continue
+                occupied_topics.add(topic)
+                # ``is True``, not truthiness: metadata off a live store is
+                # not schema-enforced here, and ``canonical: 'false'`` would
+                # otherwise read as a canonical claim and escalate a mild
+                # collision into the severe bucket.
+                if metadata.get('canonical') is True:
+                    memory_id = record.get('id')
+                    if isinstance(memory_id, str) and memory_id:
+                        canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
+                if is_valid_topic_slug(topic):
                     continue
                 # The residue triple: the id to write to, the topic to fold,
                 # and whether this record claims canonical (which decides
@@ -380,6 +412,10 @@ async def enumerate_topic_bearing(
     return {
         'project_id': project_id,
         'records': records,
+        'occupied_topics': sorted(occupied_topics),
+        'canonical_ids_by_topic': {
+            topic: sorted(ids) for topic, ids in sorted(canonical_ids_by_topic.items())
+        },
         'coverage': coverage,
         'skips': skips,
         'complete': all(cell['complete'] for cell in coverage.values()),
@@ -422,7 +458,13 @@ class Rename:
 # Pure core — planning
 # ---------------------------------------------------------------------------
 
-def plan_renames(records, *, project_id: str) -> tuple[list[Rename], list[dict]]:
+def plan_renames(
+    records,
+    *,
+    project_id: str,
+    occupied_topics=None,
+    canonical_ids_by_topic=None,
+) -> tuple[list[Rename], list[dict]]:
     """Decide what to rename in one project's records, and what to refuse.
 
     Pure: takes scroll-shaped ``{'id', 'created_at', 'metadata'}`` dicts and no
@@ -476,8 +518,18 @@ def plan_renames(records, *, project_id: str) -> tuple[list[Rename], list[dict]]
     #   observed_topics       every topic value present, conforming or not
     #   canonical_ids_by_topic  which records under a topic claim canonical
     #   sources_by_target     which legacy values want to fold onto a target
-    observed_topics: set[str] = set()
-    canonical_ids_by_topic: dict[str, list[str]] = {}
+    #
+    # *occupied_topics* / *canonical_ids_by_topic* carry the incumbents that
+    # are NOT in *records*.  ``enumerate_topic_bearing`` discards conforming
+    # records to keep a corpus sweep affordable, so on the live path the
+    # incumbent a fold would collide with has already been thrown away by the
+    # time this function runs — and a collision guard that cannot see the
+    # incumbent silently degrades into a namespace merger.  Tests that pass a
+    # complete record set (conforming rows included) need neither argument.
+    observed_topics: set[str] = set(occupied_topics or ())
+    canonical_ids_by_topic = {
+        topic: list(ids) for topic, ids in (canonical_ids_by_topic or {}).items()
+    }
     sources_by_target: dict[str, set[str]] = {}
     for record in records:
         metadata = record.get('metadata') or {}
@@ -491,7 +543,9 @@ def plan_renames(records, *, project_id: str) -> tuple[list[Rename], list[dict]]
         # escalate a mild refusal into the severe bucket.
         if metadata.get('canonical') is True:
             memory_id = record.get('id')
-            if isinstance(memory_id, str) and memory_id:
+            if isinstance(memory_id, str) and memory_id and memory_id not in (
+                canonical_ids_by_topic.get(topic) or ()
+            ):
                 canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
         if not is_valid_topic_slug(topic):
             folded = derive_topic_slug(topic)
@@ -1199,3 +1253,452 @@ async def verify_old_slugs_drained(memory_service, results, skips) -> None:
                     'buckets and the failed writes before re-running'
                 ),
             })
+
+
+# ---------------------------------------------------------------------------
+# The sweep
+# ---------------------------------------------------------------------------
+
+#: Both live corpora.  ``--project`` REPLACES this list; see
+#: :func:`resolve_projects` for why that matters.
+DEFAULT_PROJECTS: tuple[str, ...] = ('dark_factory', 'reify')
+
+
+async def run(
+    memory_service,
+    *,
+    projects: tuple[str, ...] = DEFAULT_PROJECTS,
+    apply: bool = False,
+    client: Any = None,
+    gate_tasks: list[dict] | None = None,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    max_pages: int = DEFAULT_MAX_PAGES,
+) -> dict:
+    """Enumerate, plan, pair, write, verify — and report all of it.
+
+    Sequential awaits throughout.  The target population is bounded in the low
+    hundreds (~141 records at the ad707e72 baseline), so concurrency would buy
+    little, and it would break the one ordering that matters: the collision
+    check is decided against a per-project index built from a COMPLETED scroll,
+    and two concurrent renames onto the same target slug could each observe an
+    unoccupied namespace and both write.
+
+    Args:
+        memory_service: Injected; serves both the scroll (as ``.mem0``) and
+            the writes, so a run cannot read one store and write another.
+        projects: Which corpora to sweep.
+        apply: ``False`` (default) rehearses every read and decision and
+            withholds only the writes.
+        client: The MCP client for the gate half.  ``None`` is fine for a
+            sweep that reaches no gate; a GATED group with no client is
+            refused exactly like a refused gate.
+        gate_tasks: Consolidation-gate tasks, each stamped with the
+            ``project_id`` whose corpus its topic lives in.  Injected so the
+            tests never open a socket.
+
+    Returns:
+        The report dict — rendered by :func:`render_json` /
+        :func:`render_markdown` and graded by :func:`resolve_exit_code`.
+    """
+    # Fail-CLOSED capability preflight: ONE probe per run, ABOVE the scroll.
+    #
+    # ``run`` is the choke point precisely because ``rename_one``'s own
+    # ``apply`` gate is PER RECORD: probing there would run the check once per
+    # target and -- since ``StoreMutationUnavailable`` subclasses
+    # ``RuntimeError`` -- be swallowed by the per-record ``except Exception``
+    # around the write, downgrading a run-wide environment denial into N error
+    # rows inside a report that otherwise reads as a completed sweep.
+    #
+    # Emitted through the logger, never ``print``: stdout is reserved for the
+    # machine-read artifact rendered at the end of ``main``.
+    if apply:
+        try:
+            assert_store_mutation_allowed(operation='normalize_topic_slugs --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'normalize_topic_slugs: --apply NOT started (fail-closed) -- '
+                "this process cannot write mem0's history directory, so each "
+                'rename would patch a record and then fail to journal the '
+                'change, leaving the corpus HALF-RENAMED: one claim split '
+                'across two topic values, which is strictly worse for an '
+                "exact-match get_memories_by_metadata({'topic': T}) read -- "
+                'the way consolidation clusters and the canonical-uniqueness '
+                'probe address a topic -- than either uniform state. Nothing '
+                'was scrolled and no record was renamed. Route the migration '
+                'through the fused-memory MCP server (the unsandboxed owner '
+                'of the store), or re-run from an unsandboxed operator shell. '
+                'To obtain the sweep report safely from anywhere, re-run '
+                'without --apply.'
+            )
+            raise
+
+    # Pre-seeded, because an ABSENT bucket reads as "nothing was skipped",
+    # which is a different claim from "we looked and found nothing".
+    skips: dict[str, list[dict]] = {bucket: [] for bucket in SKIP_BUCKETS}
+
+    def _record_skips(entries: list[dict]) -> None:
+        """File each entry under its own reason, inventing a bucket if new.
+
+        An unrecognised reason is appended to a bucket created on the spot
+        rather than dropped: a reason this function has not heard of is
+        exactly the kind of thing that must not vanish between the planner
+        that raised it and the artifact.
+        """
+        for entry in entries:
+            skips.setdefault(entry.get('reason', 'unclassified'), []).append(entry)
+
+    coverage: dict[str, dict] = {}
+    coverage_complete = True
+    all_renames: list[Rename] = []
+    candidate_count = 0
+
+    for project_id in projects:
+        enumerated = await enumerate_topic_bearing(
+            memory_service, project_id, page_size=page_size, max_pages=max_pages,
+        )
+        coverage[project_id] = enumerated['coverage']
+        coverage_complete = coverage_complete and enumerated['complete']
+        candidate_count += len(enumerated['records'])
+        _record_skips(enumerated['skips'])
+
+        renames, plan_skips = plan_renames(
+            enumerated['records'],
+            project_id=project_id,
+            occupied_topics=enumerated['occupied_topics'],
+            canonical_ids_by_topic=enumerated['canonical_ids_by_topic'],
+        )
+        _record_skips(plan_skips)
+        all_renames.extend(renames)
+
+    groups, gate_skips = pair_gate_blocks(all_renames, gate_tasks or [])
+    _record_skips(gate_skips)
+
+    results: list[dict] = []
+    gate_results: list[dict] = []
+    for group in groups:
+        group_results, gate_row = await rename_group(
+            memory_service, group, apply=apply, client=client)
+        results.extend(group_results)
+        if gate_row is not None:
+            gate_results.append(gate_row)
+
+    # Scope item 3, in the same run that did the writing.
+    await verify_old_slugs_drained(memory_service, results, skips)
+
+    outcomes: dict[str, int] = {}
+    renamed_by_topic: dict[str, int] = {}
+    would_rename_by_topic: dict[str, int] = {}
+    for row in results:
+        outcome = str(row.get('outcome'))
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if outcome == 'renamed':
+            topic = str(row.get('new_topic'))
+            renamed_by_topic[topic] = renamed_by_topic.get(topic, 0) + 1
+        elif outcome == 'would_rename':
+            topic = str(row.get('new_topic'))
+            would_rename_by_topic[topic] = would_rename_by_topic.get(topic, 0) + 1
+    for row in gate_results:
+        outcome = str(row.get('outcome'))
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+
+    # A skip that grades as an error must reach the exit code even when no
+    # RESULT row carries it: a collision is refused at plan time, so it never
+    # produces a rename row, and grading outcomes alone would exit 0 on a run
+    # that declined to migrate the most dangerous slug it found.
+    for bucket, entries in skips.items():
+        if entries and bucket in ERROR_OUTCOMES:
+            outcomes[bucket] = outcomes.get(bucket, 0) + len(entries)
+
+    return {
+        'apply': apply,
+        # The inverse of the sibling's claim, stated where a reader can check
+        # it: `retro_stamp_topics` reports `bounded: True` and means it.
+        'bounded': False,
+        'scope': (
+            'corpus-wide — every record in every census category of every '
+            'listed project is enumerated by scroll, not addressed by id'
+        ),
+        'projects': list(projects),
+        'coverage': coverage,
+        'coverage_complete': coverage_complete,
+        'candidate_count': candidate_count,
+        'rename_count': len(all_renames),
+        'group_count': len(groups),
+        'gate_count': sum(1 for g in groups if g.gate_task_id is not None),
+        'renamed_total': sum(renamed_by_topic.values()),
+        'renamed_by_topic': renamed_by_topic,
+        'would_rename_total': sum(would_rename_by_topic.values()),
+        'would_rename_by_topic': would_rename_by_topic,
+        'outcomes': outcomes,
+        'results': results,
+        'gate_results': gate_results,
+        'skips': skips,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Report rendering, exit code, CLI
+# ---------------------------------------------------------------------------
+
+#: Default artifact paths, beside the sibling sweep's and the census's.
+#:
+#: Deliberately NOT committed: this report snapshots live corpus state that
+#: rots immediately, and a committed copy invites trusting a stale count.  The
+#: committed number in this migration is :data:`BASELINE_DISTINCT_NON_CONFORMING`
+#: — one measurement, dated and attributed — which is what the report diffs
+#: against.
+DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.json')
+DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.md')
+
+#: The skip keys worth printing inline, in reading order.  A whitelist rather
+#: than a dump: rows that land in error buckets carry a whole ``response``
+#: envelope, which would bury the fields that identify the record.
+_SKIP_DETAIL_KEYS: tuple[str, ...] = (
+    'project_id', 'category', 'memory_id', 'memory_ids', 'gate_task_id',
+    'topic', 'raw_topic', 'old_topic', 'new_topic', 'gate_topic',
+    'legacy_topic', 'existing_topic', 'target_topic', 'source_topics',
+    'canonical_memory_ids', 'incumbent_ids', 'record_count', 'residue_count',
+    'expected', 'scrolled', 'recount', 'delta', 'half', 'error', 'error_type',
+    'undo_failures', 'note',
+)
+
+
+def render_json(report: dict) -> str:
+    """The machine-readable artifact.
+
+    ``sort_keys=True`` so two dry runs over an unchanged corpus render
+    byte-comparably and a real change is the only thing that shows in a diff.
+    ``default=str`` because a report can carry a datetime that wandered in off
+    a scroll row, and a renderer that raised on one would lose the whole run's
+    evidence over a formatting detail.
+    """
+    return json.dumps(report, indent=2, default=str, sort_keys=True)
+
+
+def _render_skip_entry(entry: dict) -> str:
+    parts = [
+        f'{key}={entry[key]!r}'
+        for key in _SKIP_DETAIL_KEYS
+        if entry.get(key) is not None
+    ]
+    # An entry the renderer does not recognise is exactly the one worth
+    # showing verbatim, rather than as a bare bullet.
+    return '- ' + (', '.join(parts) if parts else repr(entry))
+
+
+def render_markdown(report: dict) -> str:
+    """The human-readable artifact.
+
+    Every EMPTY bucket is stated as an explicit ``: 0`` heading rather than
+    omitted.  That is this renderer's most load-bearing rule: an artifact that
+    silently drops empty buckets reads identically whether the sweep skipped
+    nothing or never computed the bucket at all — and the second case is a
+    hole in coverage that, being invisible, nobody ever closes.
+    """
+    mode = 'APPLY' if report.get('apply') else 'DRY RUN'
+    lines: list[str] = [
+        '# Topic-slug normalization — corpus-wide migration (task 4878)',
+        '',
+        f'**Mode:** {mode}',
+        f'**Projects:** {", ".join(report.get("projects") or [])}',
+        (
+            '**Scope:** corpus-wide — every record in every census category '
+            'of every listed project is enumerated by scroll, not addressed '
+            'by id. (The sibling `retro_stamp_topics.py` reports '
+            '`bounded: True` and means it; this one does not.)'
+        ),
+        (
+            '**Coverage:** '
+            + ('complete' if report.get('coverage_complete', False)
+               else 'INCOMPLETE — see the under_enumerated / '
+                    'scroll_budget_exhausted buckets; this run is a LOWER BOUND')
+        ),
+        '',
+        '## Coverage',
+        '',
+        '| project | category | expected | scrolled | recount | complete |',
+        '| --- | --- | --- | --- | --- | --- |',
+    ]
+    coverage = report.get('coverage') or {}
+    if not coverage:
+        lines.append('| _none_ | | | | | |')
+    for project_id, cells in sorted(coverage.items()):
+        for category, cell in sorted(cells.items()):
+            lines.append(
+                f'| {project_id} | {category} | {cell.get("expected")} | '
+                f'{cell.get("scrolled")} | {cell.get("recount")} | '
+                f'{cell.get("complete")} |'
+            )
+
+    renamed = report.get('renamed_by_topic') or {}
+    would = report.get('would_rename_by_topic') or {}
+    lines += [
+        '',
+        '## Renamed by new slug',
+        '',
+        '| new topic | renamed | would rename |',
+        '| --- | --- | --- |',
+    ]
+    for topic in sorted(set(renamed) | set(would)):
+        lines.append(f'| {topic} | {renamed.get(topic, 0)} | {would.get(topic, 0)} |')
+    if not renamed and not would:
+        lines.append('| _none_ | 0 | 0 |')
+    lines += [
+        '',
+        f'**Non-conforming records enumerated:** {report.get("candidate_count", 0)}  ',
+        f'**Renames planned:** {report.get("rename_count", 0)}  ',
+        f'**Slug groups:** {report.get("group_count", 0)} '
+        f'(gate-backed: {report.get("gate_count", 0)})  ',
+        f'**Total renamed:** {report.get("renamed_total", 0)}  ',
+        f'**Total would-rename:** {report.get("would_rename_total", 0)}',
+        '',
+        '## Outcomes',
+        '',
+    ]
+    outcomes = report.get('outcomes') or {}
+    if outcomes:
+        lines.extend(f'- `{name}`: {count}' for name, count in sorted(outcomes.items()))
+    else:
+        lines.append('- _nothing to rename_')
+
+    gate_results = report.get('gate_results') or []
+    lines += ['', '## Consolidation gates', '']
+    if gate_results:
+        for row in gate_results:
+            lines.append(
+                f'- task {row.get("gate_task_id")}: `{row.get("old_topic")}` -> '
+                f'`{row.get("new_topic")}` — {row.get("outcome")}'
+                + (f' ({row.get("error")})' if row.get('error') else '')
+            )
+    else:
+        lines.append('_no gate-backed topic in this sweep_')
+
+    lines += ['', '## Skips', '']
+    skips = report.get('skips') or {}
+    # Iterate the CANONICAL bucket order first, so a bucket `run` forgot to
+    # emit shows up as a 0 line rather than as an absence, then any extra
+    # bucket a planner invented at runtime.
+    ordered = list(SKIP_BUCKETS) + sorted(set(skips) - set(SKIP_BUCKETS))
+    for bucket in ordered:
+        entries = skips.get(bucket) or []
+        lines += ['', f'### {bucket}: {len(entries)}', '']
+        if not entries:
+            lines.append('_none_')
+            continue
+        lines.extend(_render_skip_entry(entry) for entry in entries)
+    return '\n'.join(lines) + '\n'
+
+
+def resolve_exit_code(report: dict) -> int:
+    """0 on a clean run, 1 when anything did not land as planned.
+
+    Graded off :data:`ERROR_OUTCOMES` — the SAME set the writers and the
+    report use — so the exit code and the artifact can never disagree about
+    whether a run was clean.
+
+    A refusal counts.  This sweep's most valuable outcomes are the ones where
+    it declined to act (a collision, an unfoldable value, a held gate pair),
+    and every one of them is unfinished work an operator has to resolve by
+    hand.  Exiting 0 on those would make the refusals invisible to anything
+    that reads only the exit status.
+    """
+    outcomes = report.get('outcomes') or {}
+    return 1 if any(outcomes.get(name) for name in ERROR_OUTCOMES) else 0
+
+
+def resolve_projects(args) -> tuple[str, ...]:
+    """``--project`` REPLACES the default list; it does not extend it.
+
+    ``action='append'`` appends to whatever default argparse holds, so a plain
+    ``default=DEFAULT_PROJECTS`` would turn ``--project reify`` into both
+    corpora — silently widening a corpus-wide mutation an operator had
+    deliberately narrowed.  Hence ``default=None`` here and the fallback in
+    one named place.
+    """
+    return tuple(args.projects) if args.projects else DEFAULT_PROJECTS
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Corpus-wide metadata.topic slug normalization (task 4878). '
+            'Dry run by default.'
+        ),
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='Commit the renames. Without it the run is a full rehearsal that '
+             'reads and decides everything but writes nothing.',
+    )
+    parser.add_argument(
+        '--project', dest='projects', action='append', default=None,
+        help=f'Project to sweep; repeatable. Replaces the default '
+             f'({", ".join(DEFAULT_PROJECTS)}) rather than extending it.',
+    )
+    parser.add_argument(
+        '--json-out', dest='json_out', default=DEFAULT_JSON_OUT,
+        help=f'Machine-readable report path (default: {DEFAULT_JSON_OUT}).',
+    )
+    parser.add_argument(
+        '--md-out', dest='md_out', default=DEFAULT_MD_OUT,
+        help=f'Human-readable report path (default: {DEFAULT_MD_OUT}).',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Build a live service, run the sweep, write both artifacts, exit graded."""
+    # This script is otherwise print-based, so without this the module logger
+    # carrying the fail-closed refusal and the coverage warnings would have no
+    # handler and would reach the operator only through ``logging.lastResort``
+    # -- a bare line with no timestamp, level or logger name. ``stream`` is
+    # named explicitly because stdout is reserved for the machine-read report.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        stream=sys.stderr,
+    )
+
+    args = _build_parser().parse_args(argv)
+
+    if args.config:
+        import os  # noqa: PLC0415
+
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    async def _run_live() -> dict:
+        # Deferred so importing this module -- which the tests do, by path --
+        # never constructs a backend.
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        memory = MemoryService(config)
+        try:
+            await memory.initialize()
+            return await run(
+                memory, projects=resolve_projects(args), apply=args.apply,
+            )
+        finally:
+            if hasattr(memory, 'close'):
+                await memory.close()
+
+    report = asyncio.run(_run_live())
+
+    Path(args.json_out).write_text(render_json(report), encoding='utf-8')
+    Path(args.md_out).write_text(render_markdown(report), encoding='utf-8')
+
+    print(render_markdown(report))
+    print(f'wrote {args.json_out}')
+    print(f'wrote {args.md_out}')
+    if not args.apply:
+        print('DRY RUN — nothing was modified. Re-run with --apply to commit.')
+    return resolve_exit_code(report)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -2010,9 +2010,11 @@ class TestRunApplyStoreMutationPreflight:
         monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
         service, _corpus = _run_service({'dark_factory': []})
 
-        with caplog.at_level('ERROR', logger='normalize_topic_slugs'):
-            with pytest.raises(_mod.StoreMutationUnavailable):
-                await run_sweep(service, projects=('dark_factory',), apply=True)
+        with (
+            caplog.at_level('ERROR', logger='normalize_topic_slugs'),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            await run_sweep(service, projects=('dark_factory',), apply=True)
 
         assert capsys.readouterr().out == ''
         message = '\n'.join(r.message for r in caplog.records)
