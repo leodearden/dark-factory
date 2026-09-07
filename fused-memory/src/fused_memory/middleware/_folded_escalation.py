@@ -85,6 +85,7 @@ def file_folded_escalation(
     logger: logging.Logger,
     log_label: str,
     level: int = 1,
+    dedupe: bool = True,
 ) -> str | None:
     """File one escalation under *anchor_task_id* into *project_root*'s queue.
 
@@ -130,11 +131,40 @@ def file_folded_escalation(
             regression not be absorbed silently, a built-in delay is the wrong
             default. ``emit_markup_residue_escalation`` overrides this with a
             caller-supplied level.
+        dedupe: When true (the default), fold into an already-open escalation
+            under *anchor_task_id* instead of filing a duplicate. Set false
+            only when each record is the sole surviving copy of a DIFFERENT
+            payload — ``emit_markup_residue_escalation`` is the one such caller,
+            where folding two records together would destroy the very data the
+            record exists to preserve.
 
-    Returns the escalation id, or ``None`` when filing was not possible.
-    NEVER raises.
+    Returns the escalation id — freshly filed, or the id of the already-open
+    escalation under this anchor when one exists — or ``None`` when filing was
+    not possible. NEVER raises.
     """
     queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)  # type: ignore[arg-type]
+
+    # DEDUPE-FOLD. Once a project is storming, EVERY subsequent event breaches
+    # the threshold again — the streak only grows until a clean pass resets it.
+    # Filing per breach would bury the operator queue under near-identical
+    # entries and make the real signal (one project, one regression) harder to
+    # see, not easier. `anchor_task_id` is a stable per-caller anchor, so any
+    # still-pending escalation under it IS this caller's open alarm.
+    #
+    # THE ANCHOR MUST STAY PER-CALLER, and it is threaded through BOTH this
+    # lookup and `make_id`/`task_id` below from the SAME parameter, so it is
+    # structurally impossible to file under one anchor while deduping against
+    # another. Two filers sharing an anchor is not a cosmetic collision: the
+    # second one goes permanently silent behind the first one's open record,
+    # and that silence reads exactly like health. See the module docstring for
+    # the measured incident.
+    existing = queue.get_by_task(anchor_task_id, status='pending') if dedupe else []
+    if existing:
+        logger.info(
+            '%s: %s already open; folding into it rather than filing a duplicate',
+            log_label, existing[0].id,
+        )
+        return existing[0].id
 
     esc = Escalation(  # type: ignore[possibly-unbound]
         id=queue.make_id(anchor_task_id),
