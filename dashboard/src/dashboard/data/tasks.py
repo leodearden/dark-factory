@@ -966,12 +966,18 @@ async def fetch_tasks(
     each binding a named module constant to
     :data:`DEFAULT_WHOLE_OPERATION_BUDGET`.
 
-    One caller remains UNBOUNDED and is named here so a reader is not misled
-    into thinking every caller is covered: ``burndown.collect_snapshot``
-    gathers ``fetch_tasks`` with no whole-operation bound. It is a background
-    collector rather than one of the dashboard routes, so a hang there does
-    not wedge an endpoint — which is why it was left out of scope, not
-    because it is bounded.
+    EVERY caller is now whole-operation bounded, including the background
+    ones (task 4884 / #4424 closed the last gap). ``burndown.collect_snapshot``
+    binds ``burndown._SNAPSHOT_PER_ROOT_BUDGET`` around each root's read rather
+    than :data:`DEFAULT_WHOLE_OPERATION_BUDGET`, and that discrepancy is
+    DELIBERATE — do not "fix" it. Its read can fall back to
+    ``paginate=True``, ONE call that internally walks ``ceil(N/page_size)``
+    SEQUENTIAL round trips (measured ~209 s for one root of this repo's size),
+    so a 7.0 s bound would time out every big root on every cycle and hole an
+    APPEND-ONLY chart that no later cycle backfills. It shares this
+    convention's SHAPE — a named module constant, ``asyncio.wait_for``, expiry
+    surfacing as a handled per-root exception — and differs only in its value;
+    the derivation is on that constant.
     """
     read = _TasksRead(
         str(project_root),
