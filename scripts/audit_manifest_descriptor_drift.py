@@ -334,6 +334,21 @@ class AuditCoverage(NamedTuple):
     failed to parse" cannot find out WHICH, which swallows the failures at
     exactly the reporting boundary the rule is about.
 
+    ``external_registry_task_blocks`` is a THIRD kind of absence from this
+    project's tasks.db, and it is separate from ``manifest_tasks_without_db_row``
+    for the same reason that bucket is separate from the missing-entry class:
+    the two imply DIFFERENT REMEDIATIONS. ``manifest_tasks_without_db_row``
+    means a stale or unstamped binding — an integer that was supposed to name a
+    row here and does not — which an operator fixes by re-stamping the block or
+    retiring it. A block bound by ``external_task_id`` declares that its
+    producer lives in ANOTHER project's registry, so its absence here is
+    EXPLAINED and permanent, and NEITHER remediation applies: re-stamping it to
+    a local id would assert a producer that does not exist, and retiring it
+    would destroy real cross-repo provenance. Counting it in the stale bucket
+    tells an operator to go do one of those two things to blocks that are
+    correct as authored — which is exactly how task 4731 came to be filed, on a
+    hypothesis the corpus falsified.
+
     ``git_discovery_failed`` marks a run whose manifest corpus could not be
     enumerated at all — the one case where a zero finding count means nothing.
     Every field after the counts is defaulted so it is purely additive to
@@ -349,6 +364,7 @@ class AuditCoverage(NamedTuple):
     mechanical_capabilities_seen: int = 0
     unconvertible_sidecar_descriptors: int = 0
     task_entries_with_no_sidecar_capability: int = 0
+    external_registry_task_blocks: int = 0
     manifest_parse_failure_details: tuple[str, ...] = ()
     uncomparable_details: tuple[str, ...] = ()
     git_discovery_failed: bool = False
@@ -415,6 +431,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
                 mechanical_capabilities_seen=0,
                 unconvertible_sidecar_descriptors=0,
                 task_entries_with_no_sidecar_capability=0,
+                external_registry_task_blocks=0,
                 uncomparable_details=(str(exc),),
                 git_discovery_failed=True,
             ),
@@ -429,6 +446,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     malformed = 0
     unconvertible = 0
     orphaned_entries = 0
+    external_blocks = 0
     parse_failure_details: list[str] = []
     uncomparable_details: list[str] = []
 
@@ -443,6 +461,17 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
         manifests_swept += 1
         for task in doc.tasks:
+            if task.external_task_id is not None:
+                # The producer lives in ANOTHER project's registry, so it is
+                # absent from THIS project's tasks.db by construction — an
+                # EXPLAINED absence, not the stale binding
+                # manifest_tasks_without_db_row means. Classified here, ABOVE
+                # the capability loop and beside the other whole-block skips,
+                # so this block's capabilities never enter the eligible
+                # population and the seen == compared + skips identity is
+                # arithmetically untouched. See AuditCoverage.
+                external_blocks += 1
+                continue
             if task.task_id is None:
                 # Authoring time, before commit_planning stamps the id. It
                 # binds no producer, so there is nothing to compare against.
@@ -552,6 +581,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             mechanical_capabilities_seen=seen,
             unconvertible_sidecar_descriptors=unconvertible,
             task_entries_with_no_sidecar_capability=orphaned_entries,
+            external_registry_task_blocks=external_blocks,
             manifest_parse_failure_details=tuple(parse_failure_details),
             uncomparable_details=tuple(uncomparable_details),
         ),
