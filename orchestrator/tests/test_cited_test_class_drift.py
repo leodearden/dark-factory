@@ -415,3 +415,132 @@ class TestWrappedCandidates:
         assert _wrapped_candidates(source, 'TestFileExtensionsDriftGuard') == {
             'TestFileExtensionsDriftGuardDrift'
         }
+
+
+class TestDanglingCitations:
+    """THE efficacy proof: evidence that the mechanism can actually FAIL.
+
+    The real tree is green on arrival, so the wired guard below can only ever
+    demonstrate that it passes. Everything that shows this guard is not vacuous
+    lives here, on synthetic trees — the same division of labour as
+    ``test_marker_registration_drift.py::TestUnregisteredMarkers``.
+    """
+
+    @staticmethod
+    def _corpus(root: Path, src: dict[str, str], tests: dict[str, str]):
+        src_dir, test_dir = root / 'pkg' / 'src', root / 'pkg' / 'tests'
+        for target, files in ((src_dir, src), (test_dir, tests)):
+            for name, text in files.items():
+                path = target / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+        return [src_dir], [test_dir]
+
+    _UNRELATED = {'test_a.py': 'class TestSomethingElseEntirely:\n    pass\n'}
+
+    def test_a_planted_dangling_citation_is_reported_with_its_file_and_line(self, tmp_path):
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'mod.py': '"""Summary.\n\nPinned by ``TestNoSuchClassAnywhere``.\n"""\n'},
+            self._UNRELATED,
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {
+            'TestNoSuchClassAnywhere': f'{src_dirs[0] / "mod.py"}:3'
+        }
+
+    def test_a_citation_naming_a_real_class_is_not_reported(self, tmp_path):
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'mod.py': '"""Pinned by ``TestSomethingElseEntirely``."""\n'},
+            self._UNRELATED,
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {}
+
+    def test_the_historical_defect_reproduced_in_miniature(self, tmp_path):
+        """The exact shape ``orchestrator.verify_classify`` carried for ten
+        days: a backticked pin naming a class nobody had written yet."""
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'verify_classify.py': (
+                '"""Pinned by ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``,\n'
+                'which exercises the classifier end to end."""\n'
+            )},
+            self._UNRELATED,
+        )
+        assert set(_dangling_citations(src_dirs, test_dirs)) == {
+            'TestAnchoredSlotTimeoutWithCollateralIsEnvTransient'
+        }
+
+    def test_both_wrap_shapes_resolve_when_the_joined_name_exists(self, tmp_path):
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'mod.py': (
+                '# double-add. Pinned by TestRunScopedVerificationReverse-\n'
+                '# DependencyGuards (the sibling suite).\n'
+                '# the REAL _mark_blocked (TestAlreadyLandedLadderWith\n'
+                '# RealMarkBlocked) rather than a stub:\n'
+            )},
+            {'test_a.py': (
+                'class TestRunScopedVerificationReverseDependencyGuards:\n    pass\n\n'
+                'class TestAlreadyLandedLadderWithRealMarkBlocked:\n    pass\n'
+            )},
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {}
+
+    def test_a_wrap_looking_pair_whose_bare_name_resolves_is_not_mangled(self, tmp_path):
+        """The ``shared.locking`` false positive stays absent end to end: the
+        bare name resolves, so the join is never even attempted."""
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'locking.py': (
+                '# Drift guard (this copy): tests/test_locking.py::TestFileExtensionsDriftGuard\n'
+                '# Drift guard (other copy): tests/test_charter.py::TestExtensionlessNamesDriftGuard\n'
+            )},
+            {'test_a.py': (
+                'class TestFileExtensionsDriftGuard:\n    pass\n\n'
+                'class TestExtensionlessNamesDriftGuard:\n    pass\n'
+            )},
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {}
+
+    def test_a_wrapped_citation_whose_joined_name_is_absent_is_still_reported(self, tmp_path):
+        src_dirs, test_dirs = self._corpus(
+            tmp_path,
+            {'mod.py': '# Pinned by TestNoSuchClassAnywhere-\n# ButWrapped (see below).\n'},
+            self._UNRELATED,
+        )
+        dangling = _dangling_citations(src_dirs, test_dirs)
+        assert set(dangling) == {'TestNoSuchClassAnywhere'}
+        reported = dangling['TestNoSuchClassAnywhere']
+        assert f'{src_dirs[0] / "mod.py"}:1' in reported
+        assert 'TestNoSuchClassAnywhereButWrapped' in reported
+
+    def test_the_same_resolving_citation_reworded_is_empty_both_ways(self, tmp_path):
+        """The reword discriminator at GUARD level, not just extractor level."""
+        tests = {'test_a.py': 'class TestOrderingIsPreserved:\n    pass\n'}
+        terse = self._corpus(
+            tmp_path / 'terse', {'mod.py': '"""Pinned by ``TestOrderingIsPreserved``."""\n'}, tests
+        )
+        verbose = self._corpus(
+            tmp_path / 'verbose',
+            {'mod.py': (
+                '"""A completely different summary sentence.\n\n'
+                '    What this function guarantees is ordering across the whole\n'
+                '        batch, and that property is exercised end to end by\n'
+                '        ``TestOrderingIsPreserved``.\n'
+                '    """\n'
+            )},
+            tests,
+        )
+        assert _dangling_citations(*terse) == {}
+        assert _dangling_citations(*verbose) == {}
+
+    def test_a_src_tree_with_no_citations_at_all_raises(self, tmp_path):
+        """LIVENESS. A sweep that finds nothing is broken, not clean — the one
+        outcome that would let this guard pass forever while checking nothing.
+        """
+        src_dirs, test_dirs = self._corpus(
+            tmp_path, {'mod.py': '"""Prose citing no test class at all."""\n'}, self._UNRELATED
+        )
+        with pytest.raises(AssertionError, match='no cited test class names'):
+            _dangling_citations(src_dirs, test_dirs)
