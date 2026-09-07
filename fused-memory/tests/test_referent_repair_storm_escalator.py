@@ -24,13 +24,14 @@ import json
 
 import pytest
 
+from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware import referent_repair_storm_escalator as rrse_mod
 from fused_memory.middleware.referent_repair_storm_escalator import (
     emit_referent_repair_storm_escalation,
 )
 
 pytestmark = pytest.mark.skipif(
-    not rrse_mod.HAS_ESCALATION,
+    not _folded_escalation.HAS_ESCALATION,
     reason='escalation package unavailable (minimal env); the HAS_ESCALATION '
            'no-op arm is covered separately below',
 )
@@ -290,7 +291,7 @@ class TestNeverRaises:
             def submit(self, _esc):
                 raise OSError('read-only filesystem')
 
-        monkeypatch.setattr(rrse_mod, 'EscalationQueue', _BrokenQueue)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _BrokenQueue)
 
         with caplog.at_level('ERROR'):
             assert _emit(tmp_path) is None
@@ -299,13 +300,13 @@ class TestNeverRaises:
     def test_a_get_by_task_failure_falls_through_to_filing(self, tmp_path, monkeypatch):
         """A read failure must not BLOCK the alarm — better a possible
         duplicate than a silenced storm."""
-        real_queue = rrse_mod.EscalationQueue
+        real_queue = _folded_escalation.EscalationQueue
 
         class _UnreadableQueue(real_queue):  # type: ignore[misc,valid-type]
             def get_by_task(self, *_a, **_kw):
                 raise OSError('queue scan failed')
 
-        monkeypatch.setattr(rrse_mod, 'EscalationQueue', _UnreadableQueue)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _UnreadableQueue)
 
         esc_id = _emit(tmp_path)
         assert isinstance(esc_id, str)
@@ -315,7 +316,7 @@ class TestNeverRaises:
         def _explode(*_a, **_kw):
             raise OSError('cannot create queue dir')
 
-        monkeypatch.setattr(rrse_mod, 'EscalationQueue', _explode)
+        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _explode)
 
         assert _emit(tmp_path) is None
 
@@ -324,7 +325,7 @@ def test_without_the_escalation_package_it_no_ops(tmp_path, monkeypatch, caplog)
     """The minimal-env path: logged, nothing filed, `None` returned. The
     repair pass must behave identically whether or not the optional
     `escalation` workspace package is installed."""
-    monkeypatch.setattr(rrse_mod, 'HAS_ESCALATION', False)
+    monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
 
     with caplog.at_level('DEBUG'):
         result = emit_referent_repair_storm_escalation(
@@ -339,3 +340,62 @@ def test_without_the_escalation_package_it_no_ops(tmp_path, monkeypatch, caplog)
     assert result is None
     assert not (tmp_path / 'data' / 'escalations').exists()
     assert caplog.records, 'a no-op alarm must still say so'
+
+
+class TestDelegatesToTheSharedHelper:
+    """The filer BODY now lives in `middleware/_folded_escalation`; what stays
+    here is this module's own identity and content.
+
+    The constants must NOT migrate into the helper: two filers sharing an
+    anchor go silent behind each other's open records, and
+    `tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor` can only
+    catch a colliding rename if each anchor is still readable FROM ITS OWN
+    HOME.
+    """
+
+    def test_forwards_this_modules_own_anchor_role_and_category(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: dict = {}
+
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-referent-repair-storm-1'
+
+        monkeypatch.setattr(rrse_mod, 'file_folded_escalation', _spy)
+
+        assert _emit(tmp_path) == 'esc-referent-repair-storm-1'
+
+        assert seen['anchor_task_id'] == 'referent-repair-storm'
+        assert seen['agent_role'] == 'fused-memory/referent-repair-guard'
+        assert seen['category'] == 'referent_repair_storm'
+        assert seen['severity'] == 'blocking'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_the_anchor_is_still_a_module_attribute_of_THIS_module(self):
+        """Not re-exported from the helper: read straight off this module, so a
+        rename that collides with a sibling filer's anchor fails the pairwise
+        test rather than going silent in production."""
+        assert rrse_mod._ANCHOR_TASK_ID == 'referent-repair-storm'
+        assert rrse_mod._AGENT_ROLE == 'fused-memory/referent-repair-guard'
+        assert rrse_mod._CATEGORY == 'referent_repair_storm'
+
+    def test_the_detail_construction_stays_in_THIS_module(self, tmp_path, monkeypatch):
+        """The helper owns the skeleton, not the content: the record cap and
+        the evidence rendering are this alarm's own."""
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-referent-repair-storm-1'
+
+        monkeypatch.setattr(rrse_mod, 'file_folded_escalation', _spy)
+
+        _emit(tmp_path, streak=13, threshold=10, repairs=2)
+
+        assert 'streak=13' in seen['detail']
+        assert 'threshold=10' in seen['detail']
+        assert 'dark_factory' in seen['summary']
+        assert 'canonical_labels' in seen['suggested_action']
