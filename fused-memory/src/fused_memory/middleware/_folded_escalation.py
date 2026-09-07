@@ -142,7 +142,30 @@ def file_folded_escalation(
     escalation under this anchor when one exists — or ``None`` when filing was
     not possible. NEVER raises.
     """
-    queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)  # type: ignore[arg-type]
+    if project_root is None:
+        logger.debug(
+            '%s: no project_root, so there is no project queue to file into; '
+            'nothing escalated', log_label,
+        )
+        return None
+
+    if not HAS_ESCALATION:
+        logger.debug(
+            '%s: escalation package unavailable; nothing will be escalated',
+            log_label,
+        )
+        return None
+
+    try:
+        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+    except Exception:
+        # Constructing the queue creates its directory; a read-only or missing
+        # project_root must not turn an alarm into a crash on a write path.
+        logger.exception(
+            '%s: could not open the escalation queue at project_root=%r; '
+            'nothing escalated', log_label, project_root,
+        )
+        return None
 
     # DEDUPE-FOLD. Once a project is storming, EVERY subsequent event breaches
     # the threshold again — the streak only grows until a clean pass resets it.
@@ -158,7 +181,25 @@ def file_folded_escalation(
     # second one goes permanently silent behind the first one's open record,
     # and that silence reads exactly like health. See the module docstring for
     # the measured incident.
-    existing = queue.get_by_task(anchor_task_id, status='pending') if dedupe else []
+    #
+    # A read failure falls THROUGH to filing rather than aborting: a possible
+    # duplicate is a far cheaper failure than a silenced alarm, and this arm is
+    # reached only when the queue directory is already misbehaving. This guard
+    # must never `return` — returning early here would convert a transient
+    # queue-scan error into exactly the permanent silence the fold's anchor
+    # discipline exists to prevent.
+    existing = []
+    if dedupe:
+        try:
+            existing = queue.get_by_task(anchor_task_id, status='pending')
+        except Exception:
+            logger.exception(
+                '%s: failed to check for an already-open alarm under anchor %r '
+                'in project_root=%r; proceeding to file a new one rather than '
+                'silencing the alarm',
+                log_label, anchor_task_id, project_root,
+            )
+            existing = []
     if existing:
         logger.info(
             '%s: %s already open; folding into it rather than filing a duplicate',
@@ -166,18 +207,31 @@ def file_folded_escalation(
         )
         return existing[0].id
 
-    esc = Escalation(  # type: ignore[possibly-unbound]
-        id=queue.make_id(anchor_task_id),
-        task_id=anchor_task_id,
-        agent_role=agent_role,
-        severity=severity,
-        category=category,
-        summary=summary,
-        detail=detail,
-        suggested_action=suggested_action,
-        level=level,
-    )
-    esc_id = queue.submit(esc)
+    # `Escalation(...)` is constructed INSIDE the guard deliberately, matching
+    # `ScopeViolationEscalator._submit`'s stated reason: a malformed payload
+    # must degrade to "no escalation", never to an exception out of the guard.
+    # The events these filers complain about have already committed by the time
+    # this runs; a queue I/O failure must cost the operator a heads-up, never
+    # the write.
+    try:
+        esc = Escalation(  # type: ignore[possibly-unbound]
+            id=queue.make_id(anchor_task_id),
+            task_id=anchor_task_id,
+            agent_role=agent_role,
+            severity=severity,
+            category=category,
+            summary=summary,
+            detail=detail,
+            suggested_action=suggested_action,
+            level=level,
+        )
+        esc_id = queue.submit(esc)
+    except Exception:
+        logger.exception(
+            '%s: failed to submit the alarm under anchor %r in '
+            'project_root=%r', log_label, anchor_task_id, project_root,
+        )
+        return None
 
     logger.warning('%s: queued %s', log_label, esc_id)
     return esc_id
