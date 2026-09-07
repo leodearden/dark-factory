@@ -95,7 +95,7 @@ def sweep_root(tmp_path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> None:
+def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> Iterator[None]:
     """Re-base the dead-PID sweep under ``tmp_path`` for EVERY test in this module.
 
     ``run_live_probe``'s first statement is ``_sweep_stale_probe_dirs_once()``,
