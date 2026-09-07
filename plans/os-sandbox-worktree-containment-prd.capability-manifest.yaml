@@ -181,7 +181,7 @@ tasks:
       kind: manual
       reason: predicate exit code drives done/escalate at runtime; nothing to grep
 - label: γ6a
-  task_id: 5332
+  external_task_id: reify:5332
   title: Reify config flip (reify registry)
   capabilities:
   - name: reify-sandbox-config-flipped
@@ -193,7 +193,7 @@ tasks:
       reason: foreign-registry task; DF stamper/scheduler cannot carry this check
         — reify verify owns it
 - label: γ6b
-  task_id: 5333
+  external_task_id: reify:5333
   title: Reify orchestrator redeploy-restart (reify registry)
   capabilities:
   - name: reify-restart-deployed

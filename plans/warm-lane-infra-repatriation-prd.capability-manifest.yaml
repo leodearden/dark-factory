@@ -204,7 +204,7 @@ tasks:
       reason: operational go/no-go; evidence is a recorded log observation, not a
         repo artifact
 - label: η
-  task_id: 5613
+  external_task_id: reify:5613
   title: Repoint the reify warm-lane GC systemd unit at dark-factory's sweep
   capabilities:
   - name: systemd-unit-points-at-df
@@ -217,7 +217,7 @@ tasks:
       - deploy/systemd/
       expect: absent
 - label: θ
-  task_id: 5614
+  external_task_id: reify:5614
   title: Narrow reify to the §5 contract — generalize the RUSTFLAGS stamp to --build-fingerprint
   capabilities:
   - name: build-fingerprint-generalized
@@ -231,7 +231,7 @@ tasks:
       - scripts/refresh-warm-base.sh
       expect: present
 - label: ι
-  task_id: 5615
+  external_task_id: reify:5615
   title: Docs truth — rewrite the warm-lane invariants and the cross-repo seam claim
   capabilities:
   - name: docs-no-longer-claim-reclaim-time-enforcement
@@ -245,7 +245,7 @@ tasks:
       - CLAUDE.md
       expect: absent
 - label: κ
-  task_id: 5616
+  external_task_id: reify:5616
   title: Delete reify's relocated script copies and retire the duplicated tests
   capabilities:
   - name: reify-scripts-reduced-to-contract-primitives
