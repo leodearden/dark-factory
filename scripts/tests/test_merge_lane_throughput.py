@@ -1371,6 +1371,142 @@ def test_speculation_void_rate_is_none_when_voids_exist_without_speculation():
 
 
 # ---------------------------------------------------------------------------
+# compute_speculation — the STRICT "adopted" speculative-ahead measure.
+#
+# `speculative_ahead` counts a landing whenever the task had ANY speculation
+# strictly before it, INCLUDING speculations subsequently voided. That
+# over-counts precisely in the project whose voids dominate, which is the
+# artifact task 5058's diagnosis had to name. `speculative_ahead_adopted`
+# additionally requires that no `verdict_voided` row for that task falls
+# strictly between the LAST preceding speculation and the landing — so a
+# speculation that was thrown away before it could help does not count as
+# having run ahead of the landing.
+#
+# Both measures live side by side; the loose one is the landed contract that
+# the downstream before/after reports compare against and is never redefined.
+# ---------------------------------------------------------------------------
+
+
+def _adopted_fixture():
+    """Five landings that separate the LOOSE ahead measure from the STRICT one.
+
+    ``_sm`` stamps 03:MM, ``_vv`` stamps 07:MM, ``_f`` stamps HH:MM — so the
+    orderings below are read straight off the helper arguments.
+
+      A1  spec 03:00, void 07:00, lands 09:00 -> loose YES, adopted NO
+      A2  spec 03:01,             lands 09:01 -> loose YES, adopted YES
+      A3  spec 03:02, lands 05:00, void 07:02 -> loose YES, adopted YES
+                                                 (the void is AFTER the landing)
+      A4  no speculation at all,   lands 09:03 -> loose NO,  adopted NO
+      A5  spec 03:04, void 07:04, RE-spec 08:00, lands 09:04
+                                              -> loose YES, adopted YES
+                                                 (the void precedes the LAST
+                                                  speculation, so it does not
+                                                  disqualify the landing)
+    """
+    speculative = [
+        _sm('A1', 0, '0'), _sm('A2', 1, '0'), _sm('A3', 2, '1'),
+        _sm('A5', 4, '1'),
+        {'timestamp': _ts(11, 8, 0), 'task_id': 'A5',
+         'data': {'base_sha': 'sha-re', 'depth': '1'}},
+    ]
+    voided = [
+        _vv('A1', 0, 'dispatch'), _vv('A3', 2, 'dispatch'),
+        _vv('A5', 4, 'dispatch'),
+    ]
+    finalized = [
+        _f('A1', 9, 0), _f('A2', 9, 1), _f('A3', 5, 0), _f('A4', 9, 3),
+        _f('A5', 9, 4),
+    ]
+    return speculative, voided, [], finalized
+
+
+def _adopted_result():
+    return mlt.compute_speculation(*_adopted_fixture())
+
+
+def test_adopted_ahead_drops_a_landing_whose_speculation_was_voided_first():
+    result = _adopted_result()
+    # A1 speculated at 03:00, was voided at 07:00, and only landed at 09:00.
+    # The loose measure still credits it; the strict one must not.
+    assert result['speculative_ahead']['matched'] == 4
+    assert result['speculative_ahead_adopted']['matched'] == 3
+
+
+def test_adopted_ahead_keeps_a_landing_whose_speculation_was_never_voided():
+    result = _adopted_result()
+    # A2 is the plain case: speculated, never voided, landed. Both measures
+    # must count it, or the strict measure is not a subset but a different one.
+    assert result['speculative_ahead']['total'] == 5
+    assert result['speculative_ahead_adopted']['total'] == 5
+    assert result['speculative_ahead']['share'] == pytest.approx(4 / 5)
+    assert result['speculative_ahead_adopted']['share'] == pytest.approx(3 / 5)
+
+
+def test_adopted_ahead_ignores_a_void_that_lands_after_the_landing():
+    # A3 landed at 05:00 and was voided at 07:02 — a void for a LATER
+    # speculation cannot retroactively disqualify a landing that already
+    # happened. Isolate it so the count is unambiguous.
+    speculative = [_sm('A3', 2, '1')]
+    voided = [_vv('A3', 2, 'dispatch')]
+    result = mlt.compute_speculation(speculative, voided, [], [_f('A3', 5, 0)])
+    assert result['speculative_ahead']['matched'] == 1
+    assert result['speculative_ahead_adopted']['matched'] == 1
+
+
+def test_adopted_ahead_void_must_fall_after_the_LAST_preceding_speculation():
+    # A5 was voided at 07:04 and then re-speculated at 08:00 before landing at
+    # 09:04. The disqualifying window is (last preceding speculation, landing),
+    # so a void that precedes the re-speculation is not disqualifying.
+    speculative = [
+        _sm('A5', 4, '1'),
+        {'timestamp': _ts(11, 8, 0), 'task_id': 'A5',
+         'data': {'base_sha': 'sha-re', 'depth': '1'}},
+    ]
+    result = mlt.compute_speculation(
+        speculative, [_vv('A5', 4, 'dispatch')], [], [_f('A5', 9, 4)]
+    )
+    assert result['speculative_ahead_adopted']['matched'] == 1
+    # Drop the re-speculation and the same void now disqualifies it.
+    result = mlt.compute_speculation(
+        speculative[:1], [_vv('A5', 4, 'dispatch')], [], [_f('A5', 9, 4)]
+    )
+    assert result['speculative_ahead']['matched'] == 1
+    assert result['speculative_ahead_adopted']['matched'] == 0
+
+
+def test_adopted_ahead_has_the_same_shape_as_the_loose_measure():
+    result = _adopted_result()
+    assert set(result['speculative_ahead_adopted']) == set(
+        result['speculative_ahead']
+    ) == {'matched', 'total', 'share'}
+
+
+def test_adopted_ahead_share_is_none_not_zero_on_an_empty_denominator():
+    adopted = mlt.compute_speculation([], [], [], [])['speculative_ahead_adopted']
+    # None, not 0.0 — same contract as every other rate in this module: an
+    # empty window is "nobody landed", not "nobody landed with speculation".
+    assert adopted['share'] is None
+    assert adopted == {'matched': 0, 'total': 0, 'share': None}
+
+
+def test_adopted_ahead_leaves_the_existing_loose_measure_untouched():
+    # The landed contract: the loose key's known answers from
+    # test_speculation_ahead_landing_share_is_matched_over_total must be
+    # byte-identical after the strict measure is added beside it.
+    result = _spec_result()
+    assert result['speculative_ahead'] == {
+        'matched': 1, 'total': 3, 'share': pytest.approx(1 / 3),
+    }
+    # No task in that fixture was voided between its speculation and its
+    # landing, so the strict measure agrees there — the two only diverge on
+    # the voided-then-landed population.
+    assert result['speculative_ahead_adopted'] == {
+        'matched': 1, 'total': 3, 'share': pytest.approx(1 / 3),
+    }
+
+
+# ---------------------------------------------------------------------------
 # compute_queue_depth / compute_mixes
 # ---------------------------------------------------------------------------
 
