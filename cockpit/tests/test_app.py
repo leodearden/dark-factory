@@ -1837,6 +1837,67 @@ class TestDropRemovesAndPersists:
             assert reread.status == sr.Status.AWAITING_INPUT
 
 
+class TestDecisionProjectIsCanonicalAtEveryReadSite:
+    """The app reads decisions through registry_reader.scan_decisions at ALL
+    THREE of its read sites (task 3812), not just the initial scan.
+
+    _scan_registry is the obvious one, but action_boost and action_drop each
+    RE-READ decisions from disk after their write, and the on-disk record
+    stays raw (the cockpit is a pure consumer -- set_manual_boost/
+    update_decision_state mutate one field and never renormalize .project).
+    So a partial rewiring that folded only _scan_registry would hand back a
+    canonical token on mount and then quietly refragment the queue on the
+    very first boost or drop keypress -- and that is precisely the state in
+    which an operator's project weight silently stops applying.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_project_stays_canonical_across_the_boost_and_drop_re_reads(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        decision = sr.DecisionRecord(
+            id='dec-1',
+            project='df',
+            text='Which port?',
+            filed_at='2026-07-07T00:00:00+00:00',
+        )
+        assert sr.write_decision(decision, root=tmp_path)
+        # Baseline: the raw spelling is what is actually on disk, so each
+        # re-read below really does read 'df' back and really does have to
+        # fold it. (These are the legacy rows migrate_decision_project_tokens
+        # has not been run over.)
+        assert [d.project for d in sr.list_decisions(root=tmp_path)] == ['df']
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            # (1) the initial scan (_scan_registry).
+            assert [d.project for d in app._decisions] == ['dark_factory']
+
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            # (2) the post-boost re-read (action_boost -> _apply_boost).
+            await pilot.press('b')
+            await pilot.pause()
+            persisted = sr.list_decisions(root=tmp_path)
+            assert persisted[0].manual_boost != 0  # the write really happened
+            assert persisted[0].project == 'df'  # ...and left the disk raw
+            assert [d.project for d in app._decisions] == ['dark_factory']
+
+            # (3) the post-drop re-read (action_drop).
+            await pilot.press('x')
+            await pilot.pause()
+            persisted = sr.list_decisions(root=tmp_path)
+            assert persisted[0].state == sr.DecisionState.DROPPED  # the write happened
+            assert persisted[0].project == 'df'  # ...and left the disk raw
+            assert [d.project for d in app._decisions] == ['dark_factory']
+
+
 class TestDroppedOverlayExpiresWithTheAsk:
     @pytest.mark.timeout(10)
     async def test_dropped_session_key_does_not_suppress_a_later_unrelated_ask(self, tmp_path):
