@@ -115,11 +115,60 @@ def resolve_hook_identity(
     (``role='session'``, ``project=basename(cwd)``) since hook stdin carries
     no title to parse. *cwd* comes from the hook's stdin JSON, falling back
     to ``os.getcwd()`` when absent.
+
+    Callers on the fork path (a forked-inheritor's env slug rejected -- see
+    ``_HookSlugResolution.rejected_env_slug``) must pass an *env* already
+    stripped of the SPAWNER-describing identity keys via
+    ``_non_spawner_identity_env`` rather than the raw hook env -- see that
+    function's docstring for why.
     """
     cwd = str(hook_input.get('cwd') or os.getcwd())
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
     return session_registry.parse_spawn_identity(env, title, prompt, cwd)
+
+
+_SPAWNER_IDENTITY_ENV_KEYS = frozenset({
+    'CLAUDE_SPAWN_ROLE',
+    'CLAUDE_SPAWN_PROJECT',
+    'CLAUDE_SPAWN_TASK_ID',
+    'CLAUDE_SPAWN_ESCALATION_ID',
+    'CLAUDE_SPAWN_TITLE',
+    'CLAUDE_SPAWN_PROMPT',
+})
+"""``CLAUDE_SPAWN_*`` keys that ``parse_spawn_identity``/``hook_display_title``
+read to build role/project/task_id/escalation_id/title.
+
+Named separately from the handful of ``CLAUDE_SPAWN_*`` keys
+``run_session_start`` already knows describe the SPAWNER on the fork path
+(``CLAUDE_SPAWN_PARENT_ID``, ``CLAUDE_SPAWN_LAUNCHER_PID``,
+``CLAUDE_SPAWN_WM_TITLE``) because those are consulted directly by name at
+their own call sites, not funneled through identity resolution -- this set
+exists purely to drive ``_non_spawner_identity_env``.
+"""
+
+
+def _non_spawner_identity_env(env: Mapping[str, str]) -> Mapping[str, str]:
+    """*env* with the inherited role/project/task/escalation/title/prompt stripped.
+
+    Forked-inheritor fix (task 4663, review of task 4193): once
+    ``_resolve_hook_slug`` REJECTS an inherited ``CLAUDE_SPAWN_SESSION_ID``
+    (this event belongs to a nested ``claude`` that merely inherited the
+    variable, not the session that minted it), every remaining
+    ``CLAUDE_SPAWN_*`` identity value still in scope describes the SPAWNER,
+    not this forked session -- the same principle ``run_session_start``
+    already applies to ``parent_session_id``/display/``launcher_pid`` (see
+    its docstring). Without this, ``resolve_hook_identity`` and
+    ``hook_display_title`` would read the spawner's role/task_id/
+    escalation_id/title straight through, and the forked session's cockpit
+    row would be indistinguishable from its spawner's except by slug.
+
+    Stripping these keys makes both functions fall through to their own
+    non-spawn defaults (``role='session'``, ``project=basename(cwd)``,
+    ``task_id=None``, ``escalation_id=None``) instead of parroting the
+    spawner's identity.
+    """
+    return {k: v for k, v in env.items() if k not in _SPAWNER_IDENTITY_ENV_KEYS}
 
 
 def _hook_session_id(hook_input: Mapping[str, Any]) -> str:
@@ -1241,9 +1290,18 @@ def run_session_start(
     ``CLAUDE_SPAWN_WM_TITLE`` display resolution is skipped (see
     ``_resolve_display``) and ``launcher_pid`` comes from
     ``_nested_claude_liveness_pid`` so the forked record stays reapable.
+
+    RESIDUAL sibling fixed (task 4663): the three overrides above left
+    ``resolve_hook_identity``/``hook_display_title`` still reading
+    role/task_id/escalation_id/title straight out of the inherited env, so a
+    forked record got the SPAWNER's role, task_id, escalation_id and display
+    title -- two cockpit rows identical except for slug. ``identity_env`` is
+    the raw hook env on every other path, and ``_non_spawner_identity_env``
+    (role/project/task_id/escalation_id/title/prompt stripped) on the fork
+    path, so identity resolution falls through to this session's own
+    defaults instead of the spawner's.
     """
     probes = _EventProbes(env)
-    identity = resolve_hook_identity(hook_input, env)
     resolution = _resolve_hook_slug(
         hook_input, env, root, allow_remint=True, probes=probes
     )
@@ -1252,6 +1310,8 @@ def run_session_start(
         resolution.rejected_env_slug,
         resolution.may_bind,
     )
+    identity_env = env if forked_from is None else _non_spawner_identity_env(env)
+    identity = resolve_hook_identity(hook_input, identity_env)
     # THE event's only read of the slug it writes: on the adopt path the
     # ownership probe already read this very record, so its snapshot is
     # handed forward rather than re-read (task 4662).
@@ -1282,7 +1342,7 @@ def run_session_start(
         record = session_registry.SessionRecord(
             session_slug=slug,
             status=session_registry.Status.RUNNING,
-            title=hook_display_title(identity, env, record=None),
+            title=hook_display_title(identity, identity_env, record=None),
             role=identity.role,
             project=identity.project,
             task_id=identity.task_id,
@@ -1301,7 +1361,7 @@ def run_session_start(
         parent_session_id = _resolve_parent_session_id(env)
         if parent_session_id is not None:
             record.parent_session_id = parent_session_id
-    title = record.title or hook_display_title(identity, env, record)
+    title = record.title or hook_display_title(identity, identity_env, record)
     display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
     if display is not None:
         record.display = display

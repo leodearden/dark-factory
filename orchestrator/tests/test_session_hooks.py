@@ -1421,6 +1421,41 @@ def test_forked_inheritor_does_not_claim_the_spawners_window(
     assert forked.display is None
 
 
+def test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title(
+    tmp_path: Path,
+) -> None:
+    # Task 4663 (task-4193-review residual): parent_session_id/display/
+    # launcher_pid were already guarded above, but resolve_hook_identity
+    # still read CLAUDE_SPAWN_ROLE/TASK_ID/ESCALATION_ID/TITLE straight out
+    # of the inherited env, so a forked record got the SPAWNER's role,
+    # task_id, escalation_id and display title -- two cockpit rows
+    # identical except for slug. These must resolve to this session's own
+    # non-spawn defaults instead.
+    slug = 'session-cockpit-3215093'
+    _write_bound_parent(slug, tmp_path, 3215093)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': slug,
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_TASK_ID': '9999',
+        'CLAUDE_SPAWN_ESCALATION_ID': 'esc-9999-1',
+        'CLAUDE_SPAWN_TITLE': 'unblock:dark-factory#9999 spawner-title',
+    }
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.role == 'session'
+    assert forked.task_id is None
+    assert forked.escalation_id is None
+    assert forked.title == 'session:dark-factory'
+    # And the spawning session's own record is untouched -- role/title
+    # never carried spawn env in the first place (see _write_bound_parent).
+    spawner = sr.read_record(slug, root=tmp_path)
+    assert spawner.role == ''
+    assert spawner.title == ''
+
+
 def test_adopted_session_still_resolves_the_spawn_window_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
