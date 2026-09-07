@@ -630,6 +630,32 @@ def format_campaign_report(report: dict[str, Any]) -> str:
                 '  NOTE: reference validity is UNMEASURED, so the ceiling band is '
                 'unsatisfiable and nothing can be discarded (D6: ambiguity -> retain).'
             )
+        if bands['counts'].get('declined'):
+            # Gated on a nonzero count, like the declined_any legend below: a
+            # campaign where nothing was refused must not grow a paragraph about
+            # refusals it never made, and the gate is what keeps this
+            # byte-deterministic. The COUNT line above is unconditional — the
+            # artifact's schema must not shift with its contents — so only the
+            # prose is gated.
+            lines += [
+                '  NOTE: declined counts fixtures whose every no-plan cell was an '
+                'EXPLICIT plan-tools',
+                '  decline (report_task_already_done / report_blocking_dependency / '
+                'report_false_premise /',
+                '  report_unactionable_task / report_ready_to_merge). A DECLINE IS A '
+                'CORRECT REFUSAL of',
+                '  moot, blocked or ill-posed work — NOT the headroom this pool is '
+                'selected for.',
+                '  It is RETAINED nonetheless: D6 discards only the unambiguous '
+                'ceiling band, so this',
+                '  band changes what the partition is CALLED and never which side a '
+                'fixture lands on.',
+                '  Provenance: tranche 1 read 47 of 53 plan_steps = 0 cells as an 89% '
+                'planning failure',
+                '  when every one was a verified-true decline (ruling D9, task 3636: '
+                'the no-plan band',
+                '  is decline-shaped, not incapability-shaped).',
+            ]
 
     if unmeasured_marker:
         lines += [
