@@ -37,6 +37,11 @@ from fused_memory.memory_metadata import (
     parent_liveness_violation,
     validate_memory_metadata,
 )
+from fused_memory.middleware.dependency_direction_check import (
+    build_dependency_index,
+    check_dependency_direction,
+    extract_dependency_assertions,
+)
 from fused_memory.middleware.entity_mint_storm_escalator import (
     emit_entity_mint_storm_escalation,
 )
@@ -1641,6 +1646,11 @@ class ReconcileStats:
 #: outright: it "folds in", and is "not a distinct leaf".
 REFERENT_CHECKS: tuple[str, ...] = ('set-membership', 'per-edge-pairing')
 
+#: Stable actor id stamped on every edge the dependency-direction check
+#: (task 3770) retires, so an operator reading an edge's provenance can tell
+#: an automated direction flag from an interactive or reconciliation write.
+_DEPENDENCY_DIRECTION_ACTOR = 'dependency-direction-check'
+
 #: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
 #: the ``entity_mint.lock_timeout_seconds`` config hop is missing, None or the
 #: wrong type. Matches the schema default; the LIVE config value is what
@@ -2449,6 +2459,10 @@ class MemoryService:
         # constructor. Used to resolve an escalation queue's filesystem root
         # from the project_id update_memory carries.
         self._known_projects: dict[str, str] = {}
+        #: Structured records from the most recent
+        #: ``_check_dependency_direction`` run (task 3770), read by
+        #: ``_reconcile_episode_identity`` on its non-raising path only.
+        self._dependency_direction_findings: list[dict] = []
         # INV-4 storm escape for update_memory's silent-rewrite primitive (task
         # 3088). Both are constructed UNCONDITIONALLY — never obtained from
         # ReconciliationHarness (built behind `if config.reconciliation ...
@@ -3418,6 +3432,134 @@ class MemoryService:
                 failed,
             )
         return invalidated
+
+    async def _check_dependency_direction(self, result: Any, *, group_id: str) -> int:
+        """Flag freshly-extracted facts whose dependency DIRECTION ground truth rejects.
+
+        The ninth post-write sub-pass (task 3770). The extraction LLM does not
+        invent task numbers here — every id it names is real and adjacent — but
+        it FLATTENS parallel relations into sequential ones and INVERTS
+        transitive chains, producing facts that read as entirely plausible and
+        that a planning read then accepts. See
+        ``middleware/dependency_direction_check`` for the mechanism and the
+        three live examples.
+
+        SCOPE GATE FIRST, and it is the whole cost story. Assertions are parsed
+        out of the edge facts BEFORE anything else happens; if none parse, this
+        returns 0 having touched no backend at all — the same short-circuit
+        shape as ``sweep_stale_status_snapshot_edges``' ``if not candidate_ids:
+        return stats``. The overwhelmingly common write therefore costs one
+        regex scan per edge and zero I/O, which is what makes a per-write check
+        affordable where a blanket one would not be.
+
+        FLAG, NEVER REPAIR. A flagged edge is superseded via ``update_edge``
+        with ``invalid_at`` only — never with a ``fact=`` kwarg. The extraction
+        being wrong is itself the signal worth surfacing, so rewriting the fact
+        into what ground truth says would destroy the evidence; this mirrors
+        ``citation_verifier.verify_cited_memories``, which drops a phantom
+        citation and records it rather than repairing it. A pure ``invalid_at``
+        supersede is also the one ``update_edge`` path documented as NOT
+        readback-verified, which is correct here precisely because this is a
+        flag rather than a repair whose persistence a caller must confirm.
+
+        Findings are stashed on ``self._dependency_direction_findings`` for
+        ``_reconcile_episode_identity`` to fold into ``ReconcileStats``, and each
+        is logged at WARNING with its full structured record so the flag is
+        adjudicable from the log alone.
+
+        Best-effort throughout, matching the sibling sub-passes: an unresolvable
+        project root, an absent taskmaster or a failing ground-truth read all
+        return 0 rather than raising, and a per-edge ``update_edge`` failure is
+        logged and skipped so the remaining flagged edges are still attempted.
+        ``CancelledError``/``KeyboardInterrupt``/``SystemExit`` propagate on
+        every path.
+
+        Returns:
+            Number of edges flagged (0 when out of scope or unadjudicable).
+        """
+        self._dependency_direction_findings = []
+        if result is None:
+            return 0
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        if not edges:
+            return 0
+
+        # THE SCOPE GATE. No dependency shorthand anywhere in this episode ->
+        # no ground-truth read, no lock time, no cost.
+        if not any(
+            extract_dependency_assertions(getattr(edge, 'fact', '') or '')
+            for edge in edges
+        ):
+            return 0
+
+        if self.taskmaster is None:
+            return 0
+        project_root = (
+            self._known_projects.get(group_id) or self._memory_metadata_project_root()
+        )
+        if not project_root:
+            logger.warning(
+                'Dependency-direction check skipped for group %s: no project root '
+                'resolved from _known_projects or config.taskmaster.project_root',
+                group_id,
+            )
+            return 0
+
+        try:
+            edge_map = await self.taskmaster.get_dependency_edges(project_root)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # Under-flagging is the fail-safe direction: a transient read
+            # failure must never be read as "these facts are wrong".
+            logger.exception(
+                'Dependency-direction check could not read ground truth for %s; '
+                'skipping this episode',
+                project_root,
+            )
+            return 0
+
+        index = build_dependency_index(edge_map or {})
+        findings = check_dependency_direction(edges, index)
+        if not findings:
+            return 0
+
+        flagged = 0
+        for finding in findings:
+            record = finding.to_dict()
+            logger.warning(
+                'Extracted dependency fact contradicts Taskmaster ground truth '
+                '(%s): %r on edge %s — %s',
+                finding.classification,
+                finding.fact,
+                finding.edge_uuid,
+                record['ground_truth'],
+            )
+            try:
+                # invalid_at ONLY — never a fact= kwarg. This flags the
+                # extraction, it does not correct it.
+                await self.update_edge(
+                    finding.edge_uuid,
+                    invalid_at=datetime.now(UTC),
+                    project_id=group_id,
+                    agent_id=_DEPENDENCY_DIRECTION_ACTOR,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.exception(
+                    'Failed to invalidate direction-mismatched edge %s; '
+                    'will retry on the next episode that re-asserts it',
+                    finding.edge_uuid,
+                )
+                continue
+            self._dependency_direction_findings.append(record)
+            flagged += 1
+        return flagged
 
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
         """Canonicalize non-canonical task-entity node names to 'Task N'.
