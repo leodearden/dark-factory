@@ -844,11 +844,16 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
     merges spellings that differ only by case or separator; only an entry in
     `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
-    **solar-challenge is the known open case**: its config declares `my_solar_challenge`, but its
-    decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but not
-    onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
-    pass `solar_challenge` there until the alias decision (task 3813) lands. To check your own
-    project, list the tokens its rows actually carry:
+    **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
+    its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
+    not onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
+    pass `solar_challenge` there. That guidance is **permanent, not provisional**: task 3813
+    decided the alias question and **declined** it (the fold left no split to heal, and the
+    identity question is an open human gate in that project marked "Do NOT auto-act"), recording
+    the evidence in `PROJECT_TOKEN_ALIASES_DECLINED`. You no longer have to remember this
+    unaided — `write-decision` and `reap-decisions` both **warn** if you pass
+    `my_solar_challenge`, so the mismatch announces itself instead of returning a silent
+    zero-row no-op. To check your own project, list the tokens its rows actually carry:
     ```bash
     python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
     ```
