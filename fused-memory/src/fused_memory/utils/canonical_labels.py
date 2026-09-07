@@ -121,8 +121,28 @@ _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 # digit is not a task id". Narrowing it HERE means no consumer has to re-narrow
 # it per caller. An explicit class rather than re.ASCII, which would silently
 # re-scope this pattern's '\s' too.
+#
+# The word 'tasks?' is spelled with explicit ASCII case classes
+# ('[Tt][Aa][Ss][Kk][Ss]?'), NOT 'tasks?' plus re.IGNORECASE. MEASURED, not
+# stylistic: Python's re performs FULL Unicode case folding under
+# re.IGNORECASE on str patterns, so U+017F LATIN SMALL LETTER LONG S folds
+# onto 's' and U+212A KELVIN SIGN folds onto 'k' — 'Ta\u017fk 5' and
+# 'Tas\u212a 5' (and any mixture of the two) matched and minted a
+# referent carrying a REAL ASCII number, worse than the digit case above
+# because the number names a task that actually exists, rather than obvious
+# junk. Dropping the flag changes nothing else: 'tasks?' was the only cased
+# literal in this pattern, so '\s', '[ \t]', '[#:]' and '[0-9]' are
+# unaffected, and every ASCII spelling ('task', 'TASK', 'Tasks', 'TaSkS',
+# 'task#1153', ...) is unchanged by construction — proven by the standing
+# regression guards in TestParseNodeNameMatchesLocalForms. This matches the
+# in-module precedent on _QUALIFIED_NODE_NAME_PATTERN below, whose comment
+# already spells case as an explicit class rather than a flag
+# ("Case-SENSITIVE start class with no IGNORECASE flag needed, since
+# [A-Za-z] already spans both cases") — this finishes that half-committed
+# convention. Not re.ASCII: it would silently re-scope this pattern's '\s'
+# padding too, an axis this task never measured.
 _TASK_NODE_NAME_PATTERN = re.compile(
-    r'^\s*tasks?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)\s*$', re.IGNORECASE
+    r'^\s*[Tt][Aa][Ss][Kk][Ss]?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)\s*$'
 )
 
 # The ANCHORED twin of _QUALIFIED_REF_PATTERN: a whole-string cross-project node
@@ -236,8 +256,14 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   means fewer contests, which means MORE confident splits on prose that
 #   pre-3667 refused. A false positive here only ever adds ambiguity, which the
 #   consumer refuses; a false negative lets destructive surgery proceed.
+# - The word 'tasks?' is spelled with explicit ASCII case classes
+#   ('[Tt][Aa][Ss][Kk][Ss]?'), NOT 'tasks?' plus re.IGNORECASE, for the reason
+#   recorded on _TASK_NODE_NAME_PATTERN above: re.IGNORECASE performs FULL
+#   Unicode case folding on str patterns, so 'ta\u017fk 5' and
+#   'tas\u212a 5' matched and minted a referent from a word that was
+#   never actually 'task'. Dropping the flag changes nothing else here either.
 _LOCAL_MENTION_PATTERN = re.compile(
-    r'(?<![\w:-])tasks?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)', re.IGNORECASE
+    r'(?<![\w:-])[Tt][Aa][Ss][Kk][Ss]?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)'
 )
 
 # A project-qualified task reference: '<qualifier>:<digits>'. Moved VERBATIM
