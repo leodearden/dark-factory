@@ -17,6 +17,7 @@ constant and the tests pin the arithmetic against it, never the live number.
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import importlib.util
 import sys
@@ -1734,3 +1735,377 @@ class TestGateLockstepOutcomesAreGraded:
     def test_an_orphan_gate_does_not_by_itself_fail_the_run(self):
         """A dangling gate predates this sweep; reporting it is the deliverable."""
         assert 'orphan_gate_topic' not in _mod.ERROR_OUTCOMES
+
+
+# ===========================================================================
+# run(), the fail-closed preflight, the artifacts and the CLI
+# ===========================================================================
+
+async def run_sweep(service, **kwargs) -> dict:
+    """``_mod.run`` under a name that reads as a sweep at the call site."""
+    return await _mod.run(service, **kwargs)
+
+
+def resolve_exit(report: dict) -> int:
+    return _mod.resolve_exit_code(report)
+
+
+class _FakeCorpus:
+    """A STATEFUL Mem0 double: scroll, count, read and write over one dict.
+
+    Everything below this point is a claim about the store's END STATE rather
+    than about a call list — that an apply run's writes are visible to the
+    residue probe, and that a SECOND run over the resulting store plans
+    nothing.  A stateless double cannot express either: it would answer the
+    verification probe from the same fixture the first run was planned off,
+    so a sweep that wrote nothing at all would still look idempotent.
+    """
+
+    def __init__(self, records: dict[str, list[dict]]):
+        self.by_project: dict[str, dict[str, dict]] = {
+            project_id: {r['id']: copy.deepcopy(r) for r in rows}
+            for project_id, rows in records.items()
+        }
+        self.scrolls: list[tuple[str, dict]] = []
+        self.writes: list[tuple[str, dict]] = []
+
+    def _rows(self, project_id: str) -> list[dict]:
+        return list(self.by_project.get(project_id, {}).values())
+
+    @staticmethod
+    def _match(record: dict, filters: dict) -> bool:
+        metadata = record.get('metadata') or {}
+        return all(metadata.get(key) == value for key, value in filters.items())
+
+    def topic_of(self, project_id: str, memory_id: str) -> object:
+        return self.by_project[project_id][memory_id]['metadata'].get('topic')
+
+    def service(self) -> MagicMock:
+        corpus = self
+        service = MagicMock()
+        backend = MagicMock()
+
+        async def _scroll_all_by_metadata(scope, filters, **_kwargs):
+            corpus.scrolls.append((scope.project_id, dict(filters)))
+            for record in corpus._rows(scope.project_id):
+                if corpus._match(record, filters):
+                    yield copy.deepcopy(record)
+
+        async def _count_by_metadata(scope, filters):
+            return sum(
+                1 for r in corpus._rows(scope.project_id) if corpus._match(r, filters)
+            )
+
+        backend.scroll_all_by_metadata = _scroll_all_by_metadata
+        backend.count_by_metadata = AsyncMock(side_effect=_count_by_metadata)
+        service.mem0 = backend
+
+        async def _get_memory_by_id(*, project_id, memory_id):
+            record = corpus.by_project.get(project_id, {}).get(memory_id)
+            return copy.deepcopy(record) if record is not None else None
+
+        async def _update_memory(*, memory_id, project_id, metadata_patch, **_kw):
+            record = corpus.by_project.get(project_id, {}).get(memory_id)
+            if record is None:
+                return {'error_type': 'not_found', 'error': memory_id}
+            corpus.writes.append((memory_id, dict(metadata_patch)))
+            record['metadata'].update(metadata_patch)
+            return {'status': 'updated', 'id': memory_id, 'metadata_patched': True}
+
+        async def _count_memories_by_metadata(project_id, filters):
+            return sum(1 for r in corpus._rows(project_id) if corpus._match(r, filters))
+
+        service.get_memory_by_id = AsyncMock(side_effect=_get_memory_by_id)
+        service.update_memory = AsyncMock(side_effect=_update_memory)
+        service.count_memories_by_metadata = AsyncMock(
+            side_effect=_count_memories_by_metadata)
+        return service
+
+
+def _crec(memory_id: str, topic: object, *,
+          category: str = 'procedural_knowledge', **meta) -> dict:
+    """A corpus record: like ``_rec`` but carrying the partition key."""
+    metadata: dict = {'category': category}
+    metadata.update(meta)
+    if topic is not None:
+        metadata['topic'] = topic
+    return {'id': memory_id, 'created_at': '2026-01-01T00:00:00Z', 'metadata': metadata}
+
+
+def _run_service(records: dict[str, list[dict]] | None = None) -> tuple[MagicMock, _FakeCorpus]:
+    corpus = _FakeCorpus(records if records is not None else {})
+    return corpus.service(), corpus
+
+
+class TestRun:
+    """``run(memory_service, *, projects, apply, client, gate_tasks)``.
+
+    The whole sweep: enumerate, plan, pair, write, verify, report.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_plans_the_work_and_writes_nothing(self):
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'legacy_topic'), _crec('m2', 'good-topic')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=False)
+
+        assert report['apply'] is False
+        assert report['outcomes'].get('would_rename') == 1
+        assert corpus.writes == []
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy_topic'
+
+    @pytest.mark.asyncio
+    async def test_an_apply_run_moves_the_slug(self):
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'legacy_topic')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert report['outcomes'].get('renamed') == 1
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-topic'
+
+    @pytest.mark.asyncio
+    async def test_a_second_run_over_the_mutated_store_plans_zero_writes(self):
+        """Idempotence — only a stateful double can state this at all."""
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'legacy_topic'), _crec('m2', 'legacy_topic')],
+        })
+
+        await run_sweep(service, projects=('dark_factory',), apply=True)
+        writes_after_first = len(corpus.writes)
+        second = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert writes_after_first == 2
+        assert len(corpus.writes) == 2
+        assert second['rename_count'] == 0
+        assert second['outcomes'] == {}
+        assert resolve_exit(second) == 0
+
+    @pytest.mark.asyncio
+    async def test_the_report_carries_every_skip_bucket_pre_seeded(self):
+        service, _corpus = _run_service({'dark_factory': []})
+
+        report = await run_sweep(service, projects=('dark_factory',))
+
+        for bucket in _mod.SKIP_BUCKETS:
+            assert bucket in report['skips'], bucket
+            assert report['skips'][bucket] == []
+
+    @pytest.mark.asyncio
+    async def test_it_sweeps_every_requested_project(self):
+        service, _corpus = _run_service({
+            'dark_factory': [_crec('m1', 'a_topic')],
+            'reify': [_crec('m2', 'b_topic')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory', 'reify'))
+
+        assert report['projects'] == ['dark_factory', 'reify']
+        assert {r['project_id'] for r in report['results']} == {'dark_factory', 'reify'}
+
+    @pytest.mark.asyncio
+    async def test_the_report_states_it_is_NOT_bounded(self):
+        """The sibling reports ``bounded: True``; this one must not."""
+        service, _corpus = _run_service({'dark_factory': []})
+
+        report = await run_sweep(service, projects=('dark_factory',))
+
+        assert report['bounded'] is False
+        assert 'corpus' in report['scope']
+
+    @pytest.mark.asyncio
+    async def test_a_collision_is_refused_and_recorded_end_to_end(self):
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'dup_topic'), _crec('m2', 'dup-topic')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert report['skips']['slug_collision']
+        assert corpus.topic_of('dark_factory', 'm1') == 'dup_topic'
+        assert resolve_exit(report) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_residue_probe_runs_and_files_nothing_when_drained(self):
+        service, _corpus = _run_service({
+            'dark_factory': [_crec('m1', 'legacy_topic')],
+        })
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert report['skips']['legacy_slug_residue'] == []
+
+    @pytest.mark.asyncio
+    async def test_coverage_is_reported_per_project_and_category(self):
+        service, _corpus = _run_service({'dark_factory': [_crec('m1', 'a_topic')]})
+
+        report = await run_sweep(service, projects=('dark_factory',))
+
+        assert set(report['coverage']['dark_factory']) == set(_mod.census_categories())
+        assert report['coverage_complete'] is True
+
+
+class TestRunApplyStoreMutationPreflight:
+    """The fail-closed capability probe, hoisted above the enumeration.
+
+    Probing per record instead would run the check N times and — since
+    ``StoreMutationUnavailable`` subclasses ``RuntimeError`` — be swallowed by
+    ``rename_one``'s per-record ``except Exception``, downgrading a run-wide
+    environment denial into N error rows inside a report that otherwise reads
+    as a completed sweep.  The consequence is sharper for a rename than for a
+    stamp: a half-applied rename splits one claim across two topic values,
+    which is worse for an exact-match ``{'topic': T}`` read than either
+    uniform state.
+    """
+
+    @pytest.mark.asyncio
+    async def test_apply_probes_exactly_once_with_the_operation_named(self, monkeypatch):
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw))
+        service, _corpus = _run_service({
+            'dark_factory': [_crec('m1', 'a_topic'), _crec('m2', 'b_topic')],
+        })
+
+        await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert calls == [{'operation': 'normalize_topic_slugs --apply'}]
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_never_probes(self, monkeypatch):
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw))
+        service, _corpus = _run_service({'dark_factory': [_crec('m1', 'a_topic')]})
+
+        await run_sweep(service, projects=('dark_factory',), apply=False)
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_scrolls_nothing_and_re_raises(self, monkeypatch):
+        def _refuse(**_kw):
+            raise _mod.StoreMutationUnavailable('cannot write ~/.mem0/history')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        service, corpus = _run_service({'dark_factory': [_crec('m1', 'a_topic')]})
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert corpus.scrolls == []
+        assert corpus.writes == []
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_goes_through_the_logger_not_stdout(
+        self, monkeypatch, caplog, capsys,
+    ):
+        """stdout carries the machine-read artifact; a diagnosis must not."""
+        def _refuse(**_kw):
+            raise _mod.StoreMutationUnavailable('cannot write ~/.mem0/history')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        service, _corpus = _run_service({'dark_factory': []})
+
+        with caplog.at_level('ERROR', logger='normalize_topic_slugs'):
+            with pytest.raises(_mod.StoreMutationUnavailable):
+                await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert capsys.readouterr().out == ''
+        message = '\n'.join(r.message for r in caplog.records)
+        assert 'normalize_topic_slugs' in message
+        assert 'fail-closed' in message.lower()
+        # The remedy must name the hazard, not merely the denial.
+        assert 'two topic values' in message or 'half' in message.lower()
+
+
+class TestReportRenderAndCli:
+    """The artifacts, the grade and the argument surface."""
+
+    def test_markdown_states_every_empty_bucket_explicitly(self):
+        report = {'apply': False, 'projects': ['dark_factory'],
+                  'skips': {bucket: [] for bucket in _mod.SKIP_BUCKETS},
+                  'outcomes': {}}
+
+        rendered = _mod.render_markdown(report)
+
+        for bucket in _mod.SKIP_BUCKETS:
+            assert f'### {bucket}: 0' in rendered, bucket
+
+    def test_markdown_names_the_mode(self):
+        assert 'DRY RUN' in _mod.render_markdown({'apply': False})
+        assert 'APPLY' in _mod.render_markdown({'apply': True})
+
+    def test_markdown_says_the_sweep_is_corpus_wide(self):
+        rendered = _mod.render_markdown({'apply': False, 'bounded': False})
+        assert 'corpus' in rendered.lower()
+
+    def test_markdown_shows_a_populated_bucket_with_its_entries(self):
+        report = {'apply': False, 'skips': {'slug_collision': [
+            {'reason': 'slug_collision', 'project_id': 'dark_factory',
+             'topic': 'dup_topic', 'note': 'occupied'}]}}
+
+        rendered = _mod.render_markdown(report)
+
+        assert '### slug_collision: 1' in rendered
+        assert 'dup_topic' in rendered
+
+    def test_json_is_stable_and_never_raises_on_an_odd_value(self):
+        import datetime as _dt
+
+        report = {'b': 1, 'a': _dt.datetime(2026, 1, 1)}
+
+        rendered = _mod.render_json(report)
+
+        assert rendered.index('"a"') < rendered.index('"b"')
+        assert '2026-01-01' in rendered
+
+    def test_json_of_an_unchanged_report_is_byte_comparable(self):
+        one = _mod.render_json({'z': 1, 'a': {'y': 2, 'b': 3}})
+        two = _mod.render_json({'a': {'b': 3, 'y': 2}, 'z': 1})
+        assert one == two
+
+    def test_exit_code_is_zero_on_a_clean_run(self):
+        assert _mod.resolve_exit_code({'outcomes': {'renamed': 12}}) == 0
+        assert _mod.resolve_exit_code({}) == 0
+
+    def test_exit_code_is_one_for_any_error_outcome(self):
+        for outcome in sorted(_mod.ERROR_OUTCOMES):
+            assert _mod.resolve_exit_code({'outcomes': {outcome: 1}}) == 1, outcome
+
+    def test_a_zero_count_error_outcome_is_still_clean(self):
+        assert _mod.resolve_exit_code({'outcomes': {'update_failed': 0}}) == 0
+
+    def test_project_replaces_the_default_rather_than_extending_it(self):
+        args = _mod._build_parser().parse_args(['--project', 'reify'])
+        assert _mod.resolve_projects(args) == ('reify',)
+
+    def test_the_default_project_list_is_both_corpora(self):
+        args = _mod._build_parser().parse_args([])
+        assert _mod.resolve_projects(args) == ('dark_factory', 'reify')
+        assert _mod.DEFAULT_PROJECTS == ('dark_factory', 'reify')
+
+    def test_project_is_repeatable(self):
+        args = _mod._build_parser().parse_args(
+            ['--project', 'a', '--project', 'b'])
+        assert _mod.resolve_projects(args) == ('a', 'b')
+
+    def test_dry_run_is_the_default(self):
+        assert _mod._build_parser().parse_args([]).apply is False
+        assert _mod._build_parser().parse_args(['--apply']).apply is True
+
+    def test_the_parser_exposes_every_documented_flag(self):
+        args = _mod._build_parser().parse_args(
+            ['--json-out', '/tmp/a.json', '--md-out', '/tmp/a.md',
+             '--config', '/tmp/c.yaml'])
+        assert args.json_out == '/tmp/a.json'
+        assert args.md_out == '/tmp/a.md'
+        assert args.config == '/tmp/c.yaml'
+
+    def test_the_default_artifact_paths_sit_beside_the_siblings(self):
+        args = _mod._build_parser().parse_args([])
+        assert args.json_out.endswith('plans/topic-slug-normalization-report.json')
+        assert args.md_out.endswith('plans/topic-slug-normalization-report.md')
