@@ -614,6 +614,52 @@ restated command quietly drifts from the one the workstation actually
 runs, while a missing fallback command means the remote verify silently
 skips (or errors on) whatever step has no command.
 
+### Warm vs. ephemeral verify worktrees
+
+`git.persistent_merge_worktree` controls what a `verify-merge` invocation
+materialises its detached checkout into. **Off** (the default): every
+invocation gets its own fresh `<worktree_dir>/_merge-<uuid>`, used once and
+discarded. **On:** invocations on that host instead reuse one fixed-path
+warm worktree, `<worktree_dir>/_merge-verify`, resetting it in place each
+time — trading the cost of materialising a worktree from scratch for
+reuse of whatever build caches already live inside it.
+
+Two things must both hold before turning it on for a project, not just one:
+
+1. **The dispatcher-side serial-lane guard must be live** — which means
+   the knob is set on **both** the dispatching workstation and the remote
+   host, not the remote alone. A shared warm worktree is only safe with at
+   most one verify in flight against it per host at a time; the
+   workstation-startup guard that enforces that serial lane reads the
+   *workstation's* copy of this knob. Flip it on the remote only, and the
+   host gets the shared warm worktree with **nothing enforcing** the
+   serial-lane invariant that worktree depends on.
+2. **The project's cold-preprovision cost must be high enough to make
+   reuse worth wanting.** If a project pays a full dependency
+   install/build on every cold verify (a `verify_cold_preprovision_command`
+   with no in-process memoisation across invocations — which is exactly
+   what a stateless `ssh host orchestrator verify-merge ...` dispatch is),
+   warm reuse is what makes that cost bearable. A project with a cheap cold
+   path gets little from the knob and takes on the concurrency constraint
+   for nothing.
+
+**Failure mode if you set it on the remote alone:** nothing stops a second,
+concurrent verify from landing on the same host while the first is still
+running. Both share the one warm worktree, and concurrent use of it is
+exactly the hazard invariant 4 (PRD §A) exists to prevent — a race over the
+same `target`/build directory. Set the knob on both sides together, or not
+at all.
+
+**Dark Factory's answer, as a worked example (decided 2026-09-07, task
+5051):** `false` — deliberately mirroring the workstation's own setting.
+The dispatcher-side guard is not the blocker here (dark-factory has none
+of the arbitration machinery this would need to make safe today); the
+decisive fact is that flipping only the laptop half would hand out a
+shared warm worktree with the workstation guard reading its own `false`
+and enforcing nothing. Revisit after measuring the actual remote-verify
+cold-preprovision cost in practice, and only by flipping both sides
+together in the same change.
+
 ---
 
 For hot-reloading config without a restart, understanding the fleet-redeploy
