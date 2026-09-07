@@ -54,6 +54,9 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectScope
+from fused_memory.reconciliation.curator_gate_resolution_sweep import (
+    GATE_RESOLUTION_FLAG_TYPE,
+)
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     CANONICAL_HUMAN_GATE_ACTION,
 )
@@ -5220,7 +5223,14 @@ class TestGateOwnedActionPhrasingWiring:
         }
 
     async def _run(self, stage, items_flagged=None, run_id='run-4814-step9'):
-        """Drive run() with dedup_flags passing everything through unchanged."""
+        """Drive run() with dedup_flags passing everything through unchanged.
+
+        The curator-gate sweep is stubbed to emit nothing so each test below
+        asserts one thing.  Left UNSTUBBED it appends a real
+        build_gate_resolution_flag for any gate task in the tree — see
+        ``test_carve_out_holds_against_the_live_sweep_in_production_ordering``,
+        which deliberately does not stub it.
+        """
         with (
             patch.object(
                 BaseStage, 'run',
@@ -5229,6 +5239,12 @@ class TestGateOwnedActionPhrasingWiring:
             patch(
                 'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kw: kw['flags']),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.sweep_resolved_curator_gates',
+                new=AsyncMock(return_value={
+                    'flags': [], 'scanned': 0, 'resolved': 0, 'errors': 0,
+                }),
             ),
         ):
             return await stage.run(
@@ -5377,4 +5393,68 @@ class TestGateOwnedActionPhrasingWiring:
         )
         assert report.stats.get(self._STAT) == 0, (
             f'no gate-owned finding means the stat stays 0; got {report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_carve_out_holds_against_the_live_sweep_in_production_ordering(self):
+        """The REAL curator-gate flag, appended by the REAL sweep, is not normalized.
+
+        Deliberately does NOT stub sweep_resolved_curator_gates, so the
+        GATE_RESOLUTION_FLAG_TYPE flag reaches the normalizer the way it does
+        in production — appended upstream, by the sweep, for a gate task that
+        is by construction in the gate id set the normalizer is keying on.
+
+        This is what makes ground 2 of the normalizer's placement comment a
+        fact rather than an argument: the carve-out is exercised on the real
+        builder's output in the real chain order, not only against a fixture.
+        Without it, this task would ship a rule contradicting a live sibling
+        flag whose suggested_action legitimately asks Stage 2 to transcribe a
+        ruling a human curator ALREADY recorded.
+        """
+        stage = make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('645')])
+        stage.memory.count_memories_by_metadata = AsyncMock(return_value=1)
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[{'id': 'mem-a'}])
+
+        with (
+            patch.object(
+                BaseStage, 'run',
+                new=AsyncMock(return_value=self._base_report([self._citing_flag('645')])),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kw: kw['flags']),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-4814-carveout',
+            )
+
+        by_type = {f['flag_type']: f for f in report.items_flagged}
+        assert set(by_type) == {'task_memory_divergence', GATE_RESOLUTION_FLAG_TYPE}, (
+            'guard on the scenario itself: this only tests the carve-out if the '
+            'live sweep actually appended its flag alongside the LLM one; got '
+            f'{report.items_flagged!r}'
+        )
+
+        carved = by_type[GATE_RESOLUTION_FLAG_TYPE]
+        assert CANONICAL_HUMAN_GATE_ACTION not in carved['suggested_action'], (
+            f'the {GATE_RESOLUTION_FLAG_TYPE} flag must be left alone — its '
+            'suggested_action deliberately asks Stage 2 to set the gate task\'s '
+            'status, because it is transcribing a ruling a human curator ALREADY '
+            f'recorded; got {carved["suggested_action"]!r}'
+        )
+        assert 'gate_owned_action_normalized' not in carved, (
+            'the carved-out flag must not even be marked as normalized'
+        )
+
+        assert by_type['task_memory_divergence']['suggested_action'].startswith(
+            CANONICAL_HUMAN_GATE_ACTION,
+        ), 'the LLM finding citing the same gate IS still corrected'
+        assert report.stats.get(self._STAT) == 1, (
+            'exactly one of the two flags citing gate 645 is normalized; got '
+            f'stats={report.stats!r}'
         )
