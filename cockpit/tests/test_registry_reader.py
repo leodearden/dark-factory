@@ -41,6 +41,21 @@ def _make_record(**overrides):
     return sr.SessionRecord(**fields)
 
 
+def _make_decision(**overrides):
+    """Build a DecisionRecord with sane defaults; overrides tweak individual fields.
+
+    Mirrors test_decision_queue.py's _make_decision helper convention.
+    """
+    fields: dict = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'Which port?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+    }
+    fields.update(overrides)
+    return sr.DecisionRecord(**fields)
+
+
 class TestScanSessions:
     def test_returns_all_seeded_records(self, tmp_path):
         from cockpit.registry_reader import scan_sessions
@@ -470,6 +485,85 @@ class TestProjectTokenCanonicalization:
         # Exhaustive backstop: swap .project back and the whole record is
         # equal, so no OTHER field moved either.
         assert dataclasses.replace(scanned, project=written.project) == written
+
+
+class TestScanDecisions:
+    """scan_decisions is the DECISION-side twin of scan_sessions (task 3812).
+
+    The cockpit unions both record kinds onto one project_weights key and
+    one weight picker, so both must enter through the same canonicalization
+    rule. The fold is idempotent and therefore a no-op for decisions written
+    after task 3807 (write-decision already stamps the canonical token); it
+    exists for the legacy rows still on disk that
+    migrate_decision_project_tokens has not been run over (measured
+    2026-09-07: 19 OPEN 'df' + 2 OPEN 'dark-factory'), and so that the
+    guarantee does not depend on a migration having been run.
+    """
+
+    def test_every_spelling_scans_as_one_canonical_token(self, tmp_path):
+        from cockpit.registry_reader import scan_decisions
+
+        for i, project in enumerate(('dark-factory', 'df', 'dark_factory')):
+            assert sr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
+
+        result = scan_decisions(tmp_path)
+
+        assert len(result) == 3
+        assert {d.project for d in result} == {'dark_factory'}
+
+    def test_only_the_project_field_is_rewritten(self, tmp_path):
+        import dataclasses
+
+        from cockpit.registry_reader import scan_decisions
+
+        written = _make_decision(
+            id='dec-verbatim',
+            project='DARK-Factory',
+            text='Which port?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            state=sr.DecisionState.OPEN,
+            manual_boost=3,
+            task_id='2085',
+            escalation_id='esc-2085-1',
+            severity='blocking',
+        )
+        assert sr.write_decision(written, root=tmp_path)
+
+        (scanned,) = scan_decisions(tmp_path)
+
+        assert scanned.project == 'dark_factory'
+        assert scanned.id == written.id
+        assert scanned.text == written.text
+        assert scanned.state == written.state
+        assert scanned.filed_at == written.filed_at
+        assert scanned.manual_boost == written.manual_boost
+        assert scanned.task_id == written.task_id
+        assert scanned.escalation_id == written.escalation_id
+        assert scanned.severity == written.severity
+        # Exhaustive backstop: swap .project back and the whole record is
+        # equal, so no OTHER field moved either.
+        assert dataclasses.replace(scanned, project=written.project) == written
+
+    def test_missing_decisions_dir_returns_empty_list(self, tmp_path):
+        """The fail-soft contract is INHERITED from list_decisions rather
+        than re-implemented here -- an absent decisions/ dir is [] , not a
+        raise."""
+        from cockpit.registry_reader import scan_decisions
+
+        assert scan_decisions(tmp_path) == []
+
+    def test_returns_the_same_ids_in_the_same_order_as_list_decisions(self, tmp_path):
+        """scan_decisions is a FOLD OVER list_decisions, not a second
+        implementation of it: same ids, same order, same count."""
+        from cockpit.registry_reader import scan_decisions
+
+        for i, project in enumerate(('dark-factory', 'df', 'dark_factory', 'other-project')):
+            assert sr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
+
+        result = scan_decisions(tmp_path)
+        expected = sr.list_decisions(tmp_path)
+
+        assert [d.id for d in result] == [d.id for d in expected]
 
 
 class TestBuildSnapshot:
