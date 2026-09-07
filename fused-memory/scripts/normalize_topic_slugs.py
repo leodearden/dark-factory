@@ -99,6 +99,7 @@ __all__ = [
     'load_census_module',
     'plan_renames',
     'rename_one',
+    'verify_old_slugs_drained',
 ]
 
 
@@ -114,6 +115,7 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'topic_moved_since_plan',
     'update_failed',
     'rename_error',
+    'legacy_slug_residue',
 })
 
 #: Every bucket the report carries, PRE-SEEDED TO EMPTY.  Seeding is the
@@ -134,6 +136,8 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'topic_moved_since_plan',
     'update_failed',
     'rename_error',
+    # from verify_old_slugs_drained
+    'legacy_slug_residue',
 )
 
 #: Written to every ``update_memory`` so the write journal attributes each
@@ -725,3 +729,101 @@ async def rename_one(memory_service, rename: Rename, *, apply: bool) -> dict:
             'response': response,
         }
     return {**base, 'outcome': 'renamed', 'response': response}
+
+
+# ---------------------------------------------------------------------------
+# Scope item 3 — did the old slugs actually drain?
+# ---------------------------------------------------------------------------
+
+#: Outcomes whose rows still carry the LEGACY topic value at probe time and
+#: were put there by this run's own rehearsal.  Only these are subtracted.
+#: A failed write also still carries it — and that is genuine residue,
+#: correctly left in.
+_REHEARSED_OUTCOMES = frozenset({'would_rename'})
+
+#: Outcomes that actually moved (or intended to move) a slug.  Anything else
+#: never touched one, so there is nothing to drain and nothing to probe.
+_MOVED_OUTCOMES = frozenset({'renamed', 'would_rename', 'update_failed', 'rename_error'})
+
+
+async def verify_old_slugs_drained(memory_service, results, skips) -> None:
+    """Count records still carrying each legacy slug this run moved.
+
+    Scope item 3, folded into the script so the next operator gets the answer
+    without re-deriving it.  One ``count_memories_by_metadata`` per distinct
+    ``(project_id, old slug)`` — bounded by the number of SLUGS moved, not by
+    the number of writes.  Eight records sharing one legacy value is one
+    question, asked once.
+
+    The arithmetic is adapted from
+    ``retro_stamp_topics._probe_legacy_topic_residue`` and makes the number
+    mean one thing in both modes.  In a dry run this sweep's own targets still
+    carry the legacy value and so are counted, so the rehearsed rows are
+    subtracted (clamped at 0 — a record consolidated away mid-run makes the
+    count smaller than the rehearsal, and negative residue is nonsense).  In
+    an apply run the writes that landed no longer carry it and the count
+    already excludes them, while a write that FAILED still carries it and is
+    correctly left in.
+
+    **ONE INVERSION FROM THE SOURCE, and it is not a copy bug.**  That sweep
+    is id-bounded, so records outside it can legitimately still carry the
+    legacy spelling: there, a non-zero residue is expected-and-merely-reported.
+    This sweep is corpus-wide, so after ``--apply`` there should be nothing
+    left anywhere — a non-zero residue means a slug was STRANDED, and
+    ``legacy_slug_residue`` is therefore in :data:`ERROR_OUTCOMES`.
+
+    A probe that raises is filed in the same bucket carrying its error and NO
+    count: unknown residue is not zero residue, and swallowing the failure
+    would let the report claim a drained corpus on the strength of a question
+    that was never answered.
+
+    Mutates *skips* in place; returns nothing.
+    """
+    pending: dict[tuple[str, str], dict] = {}
+    for result in results:
+        if result.get('outcome') not in _MOVED_OUTCOMES:
+            continue
+        legacy = result.get('old_topic')
+        if not isinstance(legacy, str) or not legacy:
+            continue
+        entry = pending.setdefault(
+            (result['project_id'], legacy),
+            {'new_topic': result.get('new_topic'), 'rehearsed': 0},
+        )
+        if result.get('outcome') in _REHEARSED_OUTCOMES:
+            entry['rehearsed'] += 1
+
+    bucket = skips.setdefault('legacy_slug_residue', [])
+    for (project_id, legacy), entry in sorted(pending.items()):
+        try:
+            count = int(await memory_service.count_memories_by_metadata(
+                project_id, {'topic': legacy},
+            ))
+        except Exception as exc:
+            bucket.append({
+                'reason': 'legacy_slug_residue',
+                'project_id': project_id,
+                'legacy_topic': legacy,
+                'new_topic': entry['new_topic'],
+                'error': f'{type(exc).__name__}: {exc}',
+                'note': (
+                    'residue UNKNOWN — the probe failed, which is not the same '
+                    'as zero; do not read this run as a drained corpus'
+                ),
+            })
+            continue
+        residue = max(0, count - entry['rehearsed'])
+        if residue:
+            bucket.append({
+                'reason': 'legacy_slug_residue',
+                'project_id': project_id,
+                'legacy_topic': legacy,
+                'new_topic': entry['new_topic'],
+                'residue_count': residue,
+                'note': (
+                    'records still carry the legacy slug after a CORPUS-WIDE '
+                    'sweep, so the claim is split across two topic values — '
+                    'check the under_enumerated / scroll_budget_exhausted '
+                    'buckets and the failed writes before re-running'
+                ),
+            })
