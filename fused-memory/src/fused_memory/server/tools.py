@@ -9989,36 +9989,26 @@ def create_mcp_server(
     # test_set_task_status_done_does_not_clear_override_row pins both:
     #   (1) delegation wiring — task_interceptor.set_task_status.assert_called_once()
     #   (2) cross-store separation — override row survives the status transition.
+    #
+    # These tools intentionally emit NO memory write of any kind.  Until task
+    # 3853 (the esc-3834-1 ruling) the three write tools each awaited an
+    # ``_emit_override_audit`` helper that called
+    # ``add_memory(category='decisions_and_rationale')`` — a GRAPHITI_PRIMARY
+    # category, so every call was LLM-extracted into durable graph edges.  That
+    # helper and its three call sites were deleted outright: pin order, pinned
+    # status, boost tier, reserve_now and TTL all churn and are cleared without
+    # any corresponding write, so the edges went stale within the hour, and
+    # extraction produced unattributable facts naming no task at all.
+    #
+    # No audit value was lost.  The structural per-change trail already lives in
+    # ``data/orchestrator/runs.db`` (``priority_override_set``,
+    # ``priority_override_cleared``, ``task_pinned``, ``task_unpinned``,
+    # ``pin_queue_reordered``) and is surfaced by the ``get_scheduler_events``
+    # MCP tool; live override state is read via ``get_pin_queue`` below.  Do NOT
+    # reinstate a memory write here — including under a Mem0-primary category,
+    # which the ruling rejects for the same reason.  Locked by
+    # tests/test_scheduler_overrides_tools.py::_assert_no_graphiti_write.
     # ------------------------------------------------------------------
-
-    async def _emit_override_audit(
-        project_root: str,
-        tool_name: str,
-        task_id: str | None,
-        content: str,
-        metadata: dict,
-    ) -> None:
-        """Best-effort audit write — awaited inline; failures are logged but never propagated.
-
-        Mirrors the _log_read pattern at tools.py:272 — audit failures log
-        a warning but never fail the user-visible tool response.
-        """
-        try:
-            pid = resolve_project_id(project_root)
-            await memory_service.add_memory(
-                content=content,
-                category='decisions_and_rationale',
-                project_id=pid,
-                agent_id='scheduler-overrides',
-                metadata=metadata,
-            )
-        except Exception as audit_exc:
-            logger.warning(
-                'override audit emit failed (tool=%s task_id=%s): %s',
-                tool_name,
-                task_id,
-                audit_exc,
-            )
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -10183,31 +10173,6 @@ def create_mcp_server(
         if collision_response is not None:
             return collision_response
 
-        # Build changed_fields for audit (use original ttl_secs, not derived absolute).
-        changed_fields: dict[str, Any] = {}
-        if boost_tier is not None:
-            changed_fields['boost_tier'] = boost_tier
-        if pinned is not None:
-            changed_fields['pinned'] = pinned
-        if pin_order is not None:
-            # Intentionally the post-auto-assignment value — if pinned=True was
-            # supplied without an explicit pin_order, this records the integer
-            # that was actually written to the DB (auto-MAX+1 logic above).
-            # Contrast with ttl_secs below, which is intentionally the raw
-            # caller-supplied input rather than the derived ttl_until ISO string.
-            changed_fields['pin_order'] = pin_order
-        if reserve_now is not None:
-            changed_fields['reserve_now'] = reserve_now
-        if ttl_secs is not None:
-            changed_fields['ttl_secs'] = ttl_secs
-
-        await _emit_override_audit(
-            project_root,
-            'set_task_priority_override',
-            task_id,
-            f'Set priority override for task {task_id}: {changed_fields}',
-            {'task_id': task_id, 'fields': changed_fields},
-        )
         return {'success': True, 'task_id': task_id}
 
     @mcp.tool()
@@ -10279,14 +10244,6 @@ def create_mcp_server(
         finally:
             await db.close()
 
-        label = 'all' if field is None else field
-        await _emit_override_audit(
-            project_root,
-            'clear_task_priority_override',
-            task_id,
-            f'Cleared {label} priority override(s) for task {task_id}',
-            {'task_id': task_id, 'field': field},
-        )
         return {'success': True, 'task_id': task_id, 'field': field}
 
     @mcp.tool()
@@ -10383,13 +10340,6 @@ def create_mcp_server(
         finally:
             await db.close()
 
-        await _emit_override_audit(
-            project_root,
-            'reorder_pin_queue',
-            None,
-            f'Reordered pin queue: {ordered_task_ids}',
-            {'ordered_task_ids': list(ordered_task_ids)},
-        )
         return {'success': True}
 
     @mcp.tool()
@@ -10399,7 +10349,7 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Return the current pinned-task queue in ascending pin_order.
 
-        Read-only.  Does NOT emit an audit add_memory call.
+        Read-only.
 
         Args:
             project_root: Absolute path to project root.
