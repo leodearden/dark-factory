@@ -4718,7 +4718,7 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
 
-        Each record is a dict with keys: label, field, type, entity_type.
+        Each record is a dict with keys: label, field, type, entity_type, status.
 
         Columns are resolved BY NAME from ``result.header``, not positionally.
         The measured live header (2026-08-06, task 3706) is 9 two-tuples::
@@ -4748,6 +4748,20 @@ class GraphitiBackend:
         ``(type, name)`` pair — raises ``IndexHeaderShapeError`` (a ``ValueError``
         subclass, preserving this method's historical contract) rather than
         returning a record with a silently-wrong or absent value.
+
+        ``status`` is the READINESS column: ``'OPERATIONAL'`` when the index is
+        serving, ``'[Indexing] N/M: UNDER CONSTRUCTION'`` while FalkorDB is
+        building it.  It is consumed by
+        :meth:`_await_index_catalog_settled` — the barrier
+        :meth:`drop_vector_indices` puts in front of its catalog read — through
+        ``falkor_indices.unsettled_index_statuses`` (task 4777).  Resolving it
+        HERE, as one more entry in the ``wanted`` map below rather than in a new
+        reader, is what keeps the by-name resolution in ONE place: this file,
+        ``resolve_header_positions`` and ``tests/_fm_helpers.await_index_operational``
+        are already three copies of the header walk and a fourth is forbidden.
+        It is a REQUIRED column like the rest, so a FalkorDB shape change that
+        drops it fails closed in ``resolve_header_positions`` instead of
+        silently disarming the settle barrier.
 
         Note the returned ``type`` value is the ``types`` COLUMN — a dict of
         property -> list of index-type strings, e.g. ``{'uuid': ['RANGE']}`` —
@@ -4788,6 +4802,7 @@ class GraphitiBackend:
                 'field': 'properties',
                 'type': 'types',
                 'entity_type': 'entitytype',
+                'status': 'status',
             },
         )
 
