@@ -652,17 +652,62 @@ class TestQualifiedNodeNameNeverSpansALineBreak:
         which is what proves this change narrows ONLY across line breaks and
         is not an undeclared tightening of human spacing. Asserts on
         ``.node_name``, not just non-None, so a referent that parsed to the
-        WRONG thing would still fail this."""
+        WRONG thing would still fail this.
+
+        Includes leading/trailing SPACE and TAB around the whole name
+        ('  reify:132  ', '\\treify:132\\t') alongside the colon-adjacent
+        spellings, so this guard also covers the ANCHORING padding that
+        :class:`TestQualifiedNodeNameAnchoringRejectsNewlines` below narrows —
+        proving that narrowing is scoped to newlines only, not to human
+        spacing in general."""
         for name in (
             'reify:132',
             'reify: 132',
             'reify :132',
             'reify : 132',
             'reify\t:\t132',
+            '  reify:132  ',
+            '\treify:132\t',
         ):
             referent = parse_node_name(name)
             assert referent is not None, name
             assert referent.node_name == 'reify:132', name
+
+
+class TestQualifiedNodeNameAnchoringRejectsNewlines:
+    """The ANCHORING padding of :data:`_QUALIFIED_NODE_NAME_PATTERN` —
+    ``^\\s*`` and ``\\s*$`` — must not span a line break either: a leading or
+    trailing newline means the string as a whole is not a task-node NAME,
+    even when the qualifier-colon-number core is otherwise well-formed.
+
+    CRITICAL, and the reason ``'reify:132\\n'`` gets its own fixture here:
+    Python's ``$`` (without ``re.MULTILINE``) matches at end-of-string AND
+    just before a single trailing newline. So the naive narrowing
+    ``[ \\t]*$`` would STILL accept ``'reify:132\\n'`` while rejecting
+    ``'reify:132\\n\\n'`` — an incoherent half-fix that refuses a doubled
+    trailing newline but accepts a single one. MEASURED on the candidate
+    pattern during planning. The terminator must be ``\\Z``, which refuses
+    both. Do not "simplify" ``\\Z`` back to ``$``: ``'reify:132\\n'`` is
+    precisely the fixture that would catch that regression reopening the gap
+    silently, with the rest of the suite still green.
+    """
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            '\nreify:132',
+            'reify:132\n',
+            'reify:132\n\n',
+            '\n\nreify:132\n\n',
+            # Trailing space THEN newline — catches a '[ \t]*$' spelling that
+            # would otherwise slip through even after the '$' -> '\Z' fix,
+            # since the space would be consumed by '[ \t]*' leaving only the
+            # newline for '$' to (wrongly) tolerate.
+            'reify:132 \n',
+        ],
+    )
+    def test_leading_or_trailing_newline_is_not_a_qualified_node_name(self, name):
+        assert parse_node_name(name) is None
 
 
 class TestScanContentOrderingAndDedup:
