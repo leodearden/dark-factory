@@ -645,14 +645,22 @@ reuse of whatever build caches already live inside it.
 
 Two things must both hold before turning it on for a project, not just one:
 
-1. **The dispatcher-side serial-lane guard must be live** — which means
-   the knob is set on **both** the dispatching workstation and the remote
-   host, not the remote alone. A shared warm worktree is only safe with at
-   most one verify in flight against it per host at a time; the
-   workstation-startup guard that enforces that serial lane reads the
-   *workstation's* copy of this knob. Flip it on the remote only, and the
-   host gets the shared warm worktree with **nothing enforcing** the
-   serial-lane invariant that worktree depends on.
+1. **The dispatcher-side serial-lane guard must be live too** — which
+   means the knob is set on **both** the dispatching workstation and the
+   remote host, not the remote alone. This isn't the only thing standing
+   between a remote-only flip and trouble — the remote enforces its own
+   per-host serial lane regardless (see the failure mode below) — but the
+   two guards do different jobs at different times. The remote's is a
+   *runtime* lock: contention there turns into an aborted verify, not a
+   race. The workstation-startup guard,
+   `merge_liveness.py::enforce_persistent_worktree_serial_lane`, is a
+   *fail-closed refusal at config time* instead — it reads the
+   **workstation's** copy of this knob at startup and raises
+   `PersistentWorktreeConfigError` when the per-host worst case,
+   `ceil(merge_ahead_bound / num_hosts)`, exceeds `1` (PRD §A invariant
+   4). Flip the knob on the remote alone and you keep the runtime lock but
+   lose the startup check that would have told you your concurrency
+   budget makes contention routine, before you ever dispatch a verify.
 2. **The project's cold-preprovision cost must be high enough to make
    reuse worth wanting.** If a project pays a full dependency
    install/build on every cold verify (a `verify_cold_preprovision_command`
@@ -662,22 +670,43 @@ Two things must both hold before turning it on for a project, not just one:
    path gets little from the knob and takes on the concurrency constraint
    for nothing.
 
-**Failure mode if you set it on the remote alone:** nothing stops a second,
-concurrent verify from landing on the same host while the first is still
-running. Both share the one warm worktree, and concurrent use of it is
-exactly the hazard invariant 4 (PRD §A) exists to prevent — a race over the
-same `target`/build directory. Set the knob on both sides together, or not
-at all.
+**Failure mode if you set it on the remote alone:** not a race. The
+remote's own `verify-merge` serialises the span itself, under a
+bounded-wait `fcntl.flock` on the shared `_merge-verify.lock` lane lock
+(plus a compat co-lock held across the span), whenever *its own* copy of
+the knob is on (task 2306 α, converged in task 2830). On contention it
+returns a distinguished `flock_contention` result rather than ever
+touching the tree — no second worktree gets materialised, no build runs
+concurrently. The cost is throughput and pages, not corruption: the
+dispatcher's `is_flock_contention_failure` check classifies that result,
+files a born-at-L2 escalation, and blocks the merge (task 2307 β). A
+remote-only flip trades a data race you don't get for repeated blocked
+merges and pages you do — which is why "set the knob on both sides
+together, or not at all" is still the right call, on a
+throughput-and-paging basis rather than a corruption one.
 
 **Dark Factory's answer, as a worked example (decided 2026-09-07, task
-5051):** `false` — deliberately mirroring the workstation's own setting.
-The dispatcher-side guard is not the blocker here (dark-factory has none
-of the arbitration machinery this would need to make safe today); the
-decisive fact is that flipping only the laptop half would hand out a
-shared warm worktree with the workstation guard reading its own `false`
-and enforcing nothing. Revisit after measuring the actual remote-verify
-cold-preprovision cost in practice, and only by flipping both sides
-together in the same change.
+5051):** `false`. Two verified legs:
+
+1. **Paging, the decisive leg.** At this project's `merge_ahead_bound`
+   (`K=2`), two dark_factory verifies can reach the remote host
+   concurrently. With the knob on, that ordinary concurrency converts
+   into `flock_contention` results — each one a born-at-L2 escalation and
+   a blocked merge. The PRD assigned the remedy for that (host-level
+   arbitration) to task C, which is **cancelled**; turning the knob on
+   today would re-arm a paging hazard with no landed fix.
+2. **With the knob off**, `cli.py` is explicit — "Knob OFF -> lane_fd/
+   compat_fd stay None -> byte-identical back-compat (no lock)" —
+   concurrent verifies simply get disjoint ephemeral worktrees, no
+   contention outcome at all.
+
+The recorded **cost** of "no": dark_factory sets a
+`verify_cold_preprovision_command`, and `verify.py`'s `_PREPROVISION_DONE`
+memo is in-process, so every stateless remote verify pays it cold — a
+full `uv sync --all-packages && npm ci`, every time. **Revisit path:**
+after measuring that cost over its own 14-day window, and only by
+flipping both sides together in the same change — never the remote
+alone.
 
 ### What stays on the workstation
 
