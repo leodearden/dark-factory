@@ -44,8 +44,10 @@ synthetic half carries the whole burden of proving the mechanism can FAIL.
 """
 from __future__ import annotations
 
+import ast
 import re
 import tokenize
+from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import cast
 
@@ -213,6 +215,55 @@ class TestRewordInvariance:
 
     def test_prose_citing_no_test_class_extracts_nothing_however_long(self):
         assert _cited_names('"""' + 'Prose naming no identifier at all. ' * 40 + '"""\n') == {}
+
+
+def _defined_test_classes(test_dirs: Iterable[Path], wanted: Collection[str]) -> set[str]:
+    """The subset of *wanted* that is actually DEFINED as a class under *test_dirs*.
+
+    Two stages, and only the second one decides. A bytes-level line-anchored
+    prefilter (``^[ \\t]*class[ \\t]+<name>\\b``, MULTILINE, one alternation over
+    the whole wanted set) is a CHEAP NARROWING that reads each test file once
+    without decoding it; ``ast.parse`` then confirms — or refuses — every file
+    that survives. Accepting a prefilter hit on its own would let a ``class
+    TestX`` sitting inside a triple-quoted synthetic source string resolve a
+    genuinely dangling citation, i.e. fail PERMISSIVE and hollow the guard out
+    silently (``test_a_class_inside_a_string_literal_is_not_resolved`` pins
+    this; ``test_marker_registration_drift.py::_applied_marker_names`` made the
+    same AST-not-grep choice). The narrowing is what keeps that soundness
+    affordable: parsing only the candidates costs a small fraction of parsing
+    the whole test corpus, which was measured to dominate the sweep.
+
+    Files are visited in sorted order so failure messages are deterministic
+    under xdist. A file that cannot be read or parsed is re-raised as an
+    ``AssertionError`` naming it — never swallowed, never skipped, because a
+    skipped file is a file this guard is silently vacuous for.
+    """
+    if not wanted:
+        return set()
+    prefilter = re.compile(
+        (r'^[ \t]*class[ \t]+(?:' + '|'.join(map(re.escape, sorted(wanted))) + r')\b').encode(),
+        re.MULTILINE,
+    )
+    found: set[str] = set()
+    for test_dir in test_dirs:
+        for path in sorted(test_dir.rglob('*.py')):
+            try:
+                raw = path.read_bytes()
+                if not prefilter.search(raw):
+                    continue
+                tree = ast.parse(raw)
+            except (SyntaxError, ValueError, OSError) as exc:
+                raise AssertionError(
+                    f'{path} could not be read/parsed while resolving cited test '
+                    f'class names: {exc!r}. Fix the file — a silently skipped '
+                    f'file would make this guard vacuous for it.'
+                ) from exc
+            found.update(
+                node.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef) and node.name in wanted
+            )
+    return found
 
 
 class TestDefinedTestClasses:
