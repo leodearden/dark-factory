@@ -857,15 +857,33 @@ class TestFetchTasksNarrowing:
             'four full-tree callers'
         )
 
-    async def test_statuses_forwarded_verbatim(self, dummy_client, dummy_config):
-        """(b) ``statuses`` crosses the wire verbatim — not re-sorted, not coerced."""
+    async def test_statuses_forwarded_in_canonical_order(
+        self, dummy_client, dummy_config
+    ):
+        """(b) ``statuses`` crosses the wire ``sorted()`` — canonical, not verbatim.
+
+        AMENDS the former `test_statuses_forwarded_verbatim`, which asserted
+        the list was "not re-sorted". Statuses are now held as a
+        `frozenset[str]` so that `['a','b']` and `['b','a']` hit ONE cache
+        entry, and a frozenset has no iteration order — something must
+        canonicalise the wire list. `sorted()` is the only sane choice:
+        arbitrary frozenset order would make the wire bytes nondeterministic
+        across runs and this very assertion FLAKY.
+
+        Safe against production: `get_tasks` turns `statuses` into a SQL `IN`
+        list, which is order-insensitive by construction, and both live
+        narrowing call sites already pass `sorted(...)`. So the wire does not
+        actually move — the test just pins a strictly stronger property.
+        """
         from dashboard.data.tasks import fetch_tasks
 
         mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(
                 dummy_client, dummy_config, '/proj/A',
-                statuses=['in-progress', 'pending'],
+                # Deliberately UNSORTED input, so a pass-through implementation
+                # could not satisfy this by accident.
+                statuses=['pending', 'in-progress'],
             )
 
         assert self._args_of(mock_mcp) == {
@@ -892,12 +910,16 @@ class TestFetchTasksNarrowing:
     async def test_page_size_and_offset_added_together(
         self, dummy_client, dummy_config
     ):
-        """(c) ``page_size``/``offset`` add exactly those two keys."""
-        from dashboard.data.tasks import fetch_tasks
+        """(c) ``page_size``/``offset`` add exactly those two keys.
+
+        Now a `fetch_task_page` call: a window is the PARTIAL read's whole
+        reason to exist, so it moved with the contract.
+        """
+        from dashboard.data.tasks import fetch_task_page
 
         mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            await fetch_tasks(
+            await fetch_task_page(
                 dummy_client, dummy_config, '/proj/A', page_size=100, offset=25,
             )
 
@@ -907,27 +929,21 @@ class TestFetchTasksNarrowing:
             'offset': 25,
         }
 
-    async def test_offset_omitted_when_page_size_is_none(
-        self, dummy_client, dummy_config
-    ):
-        """(c) ``offset`` is meaningless without ``page_size`` per the tool docstring."""
-        from dashboard.data.tasks import fetch_tasks
-
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            await fetch_tasks(dummy_client, dummy_config, '/proj/A', offset=25)
-
-        assert self._args_of(mock_mcp) == {'project_root': '/proj/A'}, (
-            'offset without page_size must not reach the wire'
-        )
+    # RETIRED: `test_offset_omitted_when_page_size_is_none`, which called
+    # `fetch_tasks(..., offset=25)` and asserted the wire stayed
+    # `{'project_root': '/proj/A'}`. `fetch_tasks` no longer HAS an offset to
+    # omit — the only read carrying one is `fetch_task_page`, which always
+    # sends it. `TestPublicReadContracts.test_fetch_tasks_rejects_offset` is
+    # the strictly stronger statement that replaces it: unrepresentable beats
+    # representable-but-dropped.
 
     async def test_statuses_and_page_size_compose(self, dummy_client, dummy_config):
         """The terminal-window call shape: narrowed statuses PLUS a bounded window."""
-        from dashboard.data.tasks import fetch_tasks
+        from dashboard.data.tasks import fetch_task_page
 
         mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            await fetch_tasks(
+            await fetch_task_page(
                 dummy_client, dummy_config, '/proj/A',
                 statuses=['cancelled', 'done'], page_size=400, offset=3600,
             )
@@ -939,21 +955,24 @@ class TestFetchTasksNarrowing:
             'offset': 3600,
         }
 
-    @pytest.mark.parametrize('kwargs', [
-        {},
-        {'statuses': ['pending']},
-        {'page_size': 10, 'offset': 5},
+    @pytest.mark.parametrize(('reader', 'kwargs'), [
+        ('fetch_tasks', {}),
+        ('fetch_tasks', {'statuses': ['pending']}),
+        # The windowed case routes to the PARTIAL read — `fetch_tasks` has no
+        # window any more. Both public readers must carry the budget, which is
+        # why the parametrize now varies the function too.
+        ('fetch_task_page', {'page_size': 10, 'offset': 5}),
     ])
     async def test_every_call_carries_the_per_request_budget(
-        self, dummy_client, dummy_config, kwargs
+        self, dummy_client, dummy_config, reader, kwargs
     ):
         """(d) Every call — narrowed or not — passes ``timeout=`` as a keyword."""
         import dashboard.data.tasks as tasks_mod
-        from dashboard.data.tasks import fetch_tasks
 
+        read = getattr(tasks_mod, reader)
         mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            await fetch_tasks(dummy_client, dummy_config, '/proj/A', **kwargs)
+            await read(dummy_client, dummy_config, '/proj/A', **kwargs)
 
         call = mock_mcp.call_args_list[0]
         assert call.kwargs.get('timeout') == tasks_mod.DEFAULT_PER_CALL_TIMEOUT
@@ -1134,7 +1153,7 @@ class TestFetchTasksNarrowing:
         self, dummy_client, dummy_config
     ):
         """(c) The window position is part of the identity of a result."""
-        from dashboard.data.tasks import fetch_tasks
+        from dashboard.data.tasks import fetch_task_page
 
         async def _by_window(client, url, tool, args, **_kw):
             return self._payload(
@@ -1144,13 +1163,13 @@ class TestFetchTasksNarrowing:
 
         mock_mcp = AsyncMock(side_effect=_by_window)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            first = await fetch_tasks(
+            first = await fetch_task_page(
                 dummy_client, dummy_config, '/proj/O', page_size=10, offset=0,
             )
-            second = await fetch_tasks(
+            second = await fetch_task_page(
                 dummy_client, dummy_config, '/proj/O', page_size=10, offset=10,
             )
-            third = await fetch_tasks(
+            third = await fetch_task_page(
                 dummy_client, dummy_config, '/proj/O', page_size=20, offset=10,
             )
 
@@ -1165,15 +1184,15 @@ class TestFetchTasksNarrowing:
         self, dummy_client, dummy_config
     ):
         """(d) Regression guard — the existing single-flight contract is unchanged."""
-        from dashboard.data.tasks import fetch_tasks
+        from dashboard.data.tasks import fetch_task_page
 
         mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            first = await fetch_tasks(
+            first = await fetch_task_page(
                 dummy_client, dummy_config, '/proj/P',
                 statuses=['pending'], page_size=50, offset=5,
             )
-            second = await fetch_tasks(
+            second = await fetch_task_page(
                 dummy_client, dummy_config, '/proj/P',
                 statuses=['pending'], page_size=50, offset=5,
             )
@@ -1679,7 +1698,7 @@ def _paging_mcp(tasks: list[dict], calls: list[dict], *, envelope: bool = True):
 
 
 class TestFetchTasksPagination:
-    """``fetch_tasks(..., page_size=N)`` — opt-in, delivery-only pagination.
+    """``fetch_tasks(..., chunk_size=N)`` — opt-in, delivery-only pagination.
 
     The burndown collector reads the whole task tree every cycle and writes one
     row per cycle into an APPEND-ONLY history table.  An oversize MCP response
@@ -1713,7 +1732,7 @@ class TestFetchTasksPagination:
             new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/pag', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/pag', chunk_size=3,
             )
 
         assert isinstance(result, list)
@@ -1770,7 +1789,7 @@ class TestFetchTasksPagination:
             new=AsyncMock(side_effect=_paging_mcp(tasks, calls, envelope=False)),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/old', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/old', chunk_size=3,
             )
 
         assert isinstance(result, list)
@@ -1815,7 +1834,7 @@ class TestFetchTasksPagination:
             'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_stuck),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/stuck', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/stuck', chunk_size=3,
             )
 
         assert isinstance(result, dict), (
@@ -1865,7 +1884,7 @@ class TestFetchTasksPagination:
             'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_garbled),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/garbled', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/garbled', chunk_size=3,
             )
 
         assert isinstance(result, dict) and result.get('offline') is True, (
@@ -1907,7 +1926,7 @@ class TestFetchTasksPagination:
             new=AsyncMock(side_effect=_stalls_after_two_pages),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/stall', page_size=2, paginate=True,
+                dummy_client, dummy_config, '/proj/stall', chunk_size=2,
             )
 
         assert isinstance(result, dict) and result.get('offline') is True, (
@@ -1949,7 +1968,7 @@ class TestFetchTasksPagination:
             'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_empty),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/empty', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/empty', chunk_size=3,
             )
 
         assert result == [], (
@@ -2002,7 +2021,7 @@ class TestFetchTasksPagination:
             'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_over_reports),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/miscount', page_size=10, paginate=True,
+                dummy_client, dummy_config, '/proj/miscount', chunk_size=10,
             )
 
         assert isinstance(result, dict), (
@@ -2063,7 +2082,7 @@ class TestFetchTasksPagination:
             'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_growing),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/racing', page_size=10, paginate=True,
+                dummy_client, dummy_config, '/proj/racing', chunk_size=10,
             )
 
         assert isinstance(result, dict), (
@@ -2120,7 +2139,7 @@ class TestFetchTasksPagination:
             new=AsyncMock(side_effect=_one_row_at_a_time),
         ):
             result = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/dribble', page_size=10, paginate=True,
+                dummy_client, dummy_config, '/proj/dribble', chunk_size=10,
             )
 
         assert isinstance(result, dict), (
@@ -2191,7 +2210,7 @@ class TestFetchTasksPagination:
             'dashboard.data.tasks.mcp_tool_call', new=AsyncMock(side_effect=_flaky),
         ):
             first = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/flaky', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/flaky', chunk_size=3,
             )
             assert isinstance(first, dict) and first.get('offline') is True, first
 
@@ -2211,7 +2230,7 @@ class TestFetchTasksPagination:
             # inside it is main's deliberate retry suppression.
             tasks_mod._fetch_tasks_negative_cache.clear()
             second = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/flaky', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/flaky', chunk_size=3,
             )
 
         assert isinstance(second, list), (
@@ -2225,10 +2244,11 @@ class TestFetchTasksPagination:
         """The cache holds the ASSEMBLED list, under the walk's own key.
 
         Caching per PAGE would break the documented ~20 s TTL contract and
-        re-issue the whole fan-out on every render.  The key is the full
-        (root, statuses, page_size, offset, paginate) tuple — `paginate` is
-        what keeps this assembled entry from being served to a caller that
-        asked for one page of the same size (and vice versa).
+        re-issue the whole fan-out on every render.  The key is the whole
+        `_TasksRead` record, and its `mode` being a `_CompleteRead` rather
+        than an `_OnePage` is what keeps this assembled entry from being
+        served to a caller that asked for one page of the same size (and
+        vice versa).
         """
         from dashboard.data.tasks import fetch_tasks
 
@@ -2239,11 +2259,11 @@ class TestFetchTasksPagination:
             new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
         ):
             first = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/cached', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/cached', chunk_size=3,
             )
             assert len(calls) == 3
             second = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/cached', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/cached', chunk_size=3,
             )
 
         assert len(calls) == 3, (
@@ -2255,21 +2275,25 @@ class TestFetchTasksPagination:
     async def test_a_walk_and_a_same_size_page_do_not_share_a_cache_entry(
         self, dummy_client, dummy_config,
     ):
-        """`paginate` MUST discriminate the cache key (task 4360, esc-4360-8).
+        """The RETURN CONTRACT MUST discriminate the cache key (esc-4360-8).
 
-        `page_size=3, paginate=False` is ONE 3-row page; `page_size=3,
-        paginate=True` is the complete 7-row tree walked 3 rows at a time.
-        Every other key component is identical, so without the `paginate`
+        `fetch_task_page(page_size=3, offset=0)` is ONE 3-row page;
+        `fetch_tasks(chunk_size=3)` is the complete 7-row tree walked 3 rows
+        at a time. Every other key component is identical, so without the
         discriminator whichever ran first inside the 20 s TTL would be served
         to the other — handing a one-page caller the whole tree, or handing
         `burndown.collect_snapshot` a 3-row page to write into an APPEND-ONLY
         history table as the project's true size.
 
-        This asserts the two results DIFFER, not merely that two keys differ:
-        it fails if the discriminator is dropped, and it cannot pass by
-        accident the way an `in`-only key assertion could.
+        Since task 5018 the discriminator is the `_TasksRead.mode` record's
+        TYPE (`_OnePage` vs `_CompleteRead`) rather than a `paginate` flag, and
+        the two contracts are separate FUNCTIONS. This test is the unit-level
+        twin of `TestPublicReadContracts`' end-to-end signal and is KEPT: it
+        asserts the two results DIFFER, not merely that two keys differ, so it
+        fails if the discriminator is dropped and cannot pass by accident the
+        way an `in`-only key assertion could.
         """
-        from dashboard.data.tasks import fetch_tasks
+        from dashboard.data.tasks import fetch_task_page, fetch_tasks
 
         tasks = [_paged_task_raw(i) for i in range(1, 8)]
         calls: list[dict] = []
@@ -2278,15 +2302,15 @@ class TestFetchTasksPagination:
             new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
         ):
             walked = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/disc', page_size=3, paginate=True,
+                dummy_client, dummy_config, '/proj/disc', chunk_size=3,
             )
-            one_page = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/disc', page_size=3,
+            one_page = await fetch_task_page(
+                dummy_client, dummy_config, '/proj/disc', page_size=3, offset=0,
             )
 
         assert [t['id'] for t in walked] == list(range(1, 8)), walked
         assert [t['id'] for t in one_page] == [1, 2, 3], (
-            f'paginate=False must return exactly one page, got {one_page!r}'
+            f'a page read must return exactly one page, got {one_page!r}'
         )
 
     async def test_statuses_and_timeout_reach_every_page_of_a_walk(
@@ -2316,7 +2340,7 @@ class TestFetchTasksPagination:
         ):
             rows = await fetch_tasks(
                 dummy_client, dummy_config, '/proj/thread',
-                statuses=['pending'], page_size=3, paginate=True, timeout=7.5,
+                statuses=['pending'], chunk_size=3, timeout=7.5,
             )
 
         assert isinstance(rows, list), rows
@@ -2695,6 +2719,210 @@ class TestWalkPages:
 
         with pytest.raises(ValueError, match='transport said no'):
             await tasks_mod._walk_pages(_page_fn, self._read(), 3)
+
+
+class TestPublicReadContracts:
+    """The public split is on the RETURN CONTRACT, not on a transport flag.
+
+    RED source (step-8): `fetch_task_page` does not exist and `fetch_tasks`
+    still takes `offset`/`paginate`.
+
+    One function returns a PARTIAL answer and says so in its name; the other
+    returns the COMPLETE set, always. `chunk_size` selects how that complete
+    set crosses the wire and never what it contains. esc-4360-7 was two reads
+    with opposite contracts sharing one signature and one cache key — this
+    class pins that they can no longer be confused, at the public surface.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_fetch_tasks_cache(self):
+        tasks_mod._fetch_tasks_cache_clear()
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    # -- (a) the partial read announces itself -----------------------------
+
+    def test_fetch_task_page_exists_and_is_a_coroutine_function(self):
+        assert inspect.iscoroutinefunction(tasks_mod.fetch_task_page)
+
+    @pytest.mark.parametrize('omitted', ['page_size', 'offset'])
+    async def test_page_size_and_offset_are_both_required(
+        self, dummy_client, dummy_config, omitted
+    ):
+        """A partial read with an implicit window is the defect, not a nicety.
+
+        Defaulting either one would let a caller ask for "a page" without
+        saying WHICH page, and the answer would silently be the first — the
+        shape that made a page and a whole tree look alike.
+        """
+        kwargs = {'page_size': 10, 'offset': 0}
+        kwargs.pop(omitted)
+
+        with pytest.raises(TypeError, match=omitted):
+            await tasks_mod.fetch_task_page(
+                dummy_client, dummy_config, '/proj/req', **kwargs
+            )
+
+    def test_page_size_and_offset_are_keyword_only(self):
+        """Positional windows read as noise at the call site."""
+        params = inspect.signature(tasks_mod.fetch_task_page).parameters
+        for name in ('page_size', 'offset'):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+            assert params[name].default is inspect.Parameter.empty, name
+
+    # -- (b) the complete read has no window at all -------------------------
+
+    @pytest.mark.parametrize('rejected', ['offset', 'paginate'])
+    async def test_fetch_tasks_rejects_the_retired_arguments(
+        self, dummy_client, dummy_config, rejected
+    ):
+        """THE root-cause fix, stated as a contract.
+
+        `offset` used to enter the cache key unconditionally while only
+        reaching the wire alongside `page_size`, so `offset=5` and `offset=7`
+        minted two entries for a byte-identical request. Removing it means the
+        only read that HAS an offset is the one that ALWAYS sends it — the key
+        and the wire cannot disagree again because the disagreement is no
+        longer expressible.
+
+        `paginate` is gone for the same reason at the contract level: the walk
+        vs slice distinction is now WHICH FUNCTION you call.
+        """
+        with pytest.raises(TypeError, match=rejected):
+            await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/gone', **{rejected: 5},
+            )
+
+    async def test_fetch_tasks_accepts_chunk_size(self, dummy_client, dummy_config):
+        params = inspect.signature(tasks_mod.fetch_tasks).parameters
+        assert params['chunk_size'].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params['chunk_size'].default is None
+        assert 'page_size' not in params, (
+            'the complete read must not carry the slice spelling too — having '
+            'both meanings under one name in one module is exactly the '
+            'ambiguity that produced esc-4360-7'
+        )
+
+    # -- (c) chunk size is transport, never contract ------------------------
+
+    async def test_chunked_and_unchunked_return_the_same_complete_set(
+        self, dummy_client, dummy_config
+    ):
+        """A tree of 7 read whole, and read 3 at a time, must agree exactly."""
+        tasks = [_paged_task_raw(i) for i in range(1, 8)]
+        calls: list[dict] = []
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
+        ):
+            unchunked = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/same',
+            )
+            chunked = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/same', chunk_size=3,
+            )
+
+        assert [t['id'] for t in unchunked] == list(range(1, 8))
+        assert chunked == unchunked, (
+            'chunk_size selects TRANSPORT, never the contract — both reads '
+            'are the complete set'
+        )
+
+    # -- (d) the esc-4360-7 signal, end to end ------------------------------
+
+    async def test_a_page_and_a_same_size_walk_are_different_answers(
+        self, dummy_client, dummy_config
+    ):
+        """THE user-observable signal, at the public surface.
+
+        `fetch_task_page(page_size=10, offset=0)` and
+        `fetch_tasks(chunk_size=10)` against ONE project must issue TWO MCP
+        reads and return DIFFERENT answers. They can no longer share a cache
+        entry, and — the part that matters for the next reader — they can no
+        longer be confused for one another at the call site either.
+        """
+        tasks = [_paged_task_raw(i) for i in range(1, 26)]
+        calls: list[dict] = []
+        with patch(
+            'dashboard.data.tasks.mcp_tool_call',
+            new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
+        ):
+            page = await tasks_mod.fetch_task_page(
+                dummy_client, dummy_config, '/proj/signal', page_size=10, offset=0,
+            )
+            whole = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/signal', chunk_size=10,
+            )
+
+        assert [t['id'] for t in page] == list(range(1, 11)), page
+        assert [t['id'] for t in whole] == list(range(1, 26)), whole
+        assert page != whole
+        assert len(calls) == 4, (
+            f'one page read plus a three-page walk, got {calls!r} — a shared '
+            'cache entry would show up here as a missing read'
+        )
+
+    # -- (e) statuses order-insensitivity, end to end -----------------------
+
+    async def test_reordered_statuses_hit_one_cache_entry(
+        self, dummy_client, dummy_config
+    ):
+        """The second measured defect, closed at the public surface.
+
+        `['a','b']` and `['b','a']` are the same SQL `IN` list, so they must be
+        the same read. They used to mint `s=a\\x1fb` and `s=b\\x1fa` — two
+        entries, two round trips, one answer.
+        """
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            first = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/order',
+                statuses=['pending', 'in-progress'],
+            )
+            second = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/order',
+                statuses=['in-progress', 'pending'],
+            )
+
+        assert mock_mcp.call_count == 1, (
+            f'an order-only difference must reuse the entry, got '
+            f'{mock_mcp.call_count} call(s)'
+        )
+        assert first == second
+
+    async def test_genuinely_different_statuses_still_key_separately(
+        self, dummy_client, dummy_config
+    ):
+        """The order fix must not over-collapse into a status-blind key."""
+        async def _by_statuses(client, url, tool, args, **_kw):
+            return {'tasks': [{
+                'id': '1', 'title': f'rows for {args.get("statuses")}',
+                'status': 'done', 'dependencies': [], 'metadata': {},
+            }]}
+
+        mock_mcp = AsyncMock(side_effect=_by_statuses)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            done = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/distinct', statuses=['done'],
+            )
+            pending = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/distinct', statuses=['pending'],
+            )
+            whole = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/distinct',
+            )
+            nothing = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/distinct', statuses=[],
+            )
+
+        assert mock_mcp.call_count == 4, (
+            f'four distinct narrowings, got {mock_mcp.call_count} call(s)'
+        )
+        assert done[0]['title'] != pending[0]['title']
+        # `None` (whole tree) and `[]` (nothing at all) are OPPOSITE requests
+        # and must never collapse onto one entry — `frozenset()` is falsy, so
+        # a truthiness guard anywhere on this path would do exactly that.
+        assert whole[0]['title'] != nothing[0]['title']
 
 
 class TestCachedFanoutCore:
