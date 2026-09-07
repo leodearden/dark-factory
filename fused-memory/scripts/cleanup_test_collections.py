@@ -55,6 +55,7 @@ die and the guard becomes required.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -203,6 +204,84 @@ def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
             os.close(fd)
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
+
+
+def _is_held(path: Path) -> bool | None:
+    """Is some living process holding *path*'s flock?
+
+    ``True`` a holder is live, ``False`` the holder is gone (or there never
+    was one), ``None`` the question could not be asked at all — the file
+    vanished under us, or is unreadable.
+
+    The probe is ``LOCK_SH``, not ``LOCK_EX``: two sweepers running at once
+    must not exclude each other and mistake a peer's probe for a live run.
+    Shape copied from
+    ``fused_memory/middleware/ticket_janitor.py::_orchestrator_running``;
+    copied rather than imported because cron runs this file under the system
+    ``python3``, where ``fused_memory`` is not importable.
+    """
+    try:
+        handle = path.open('rb')
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return True
+            return None
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def _describe(path: Path) -> dict:
+    """Read a held lease's diagnostics, falling back to its filename.
+
+    Nothing branches on the result: the guard has already decided the lease
+    is live before this is called.  A holder killed between creating its
+    file and writing its record therefore degrades what an operator reads in
+    cron mail, and never whether the sweep holds off.
+    """
+    record = {'owner': path.name, 'pid': None, 'path': str(path)}
+    try:
+        body = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return record
+    if isinstance(body, dict):
+        record['owner'] = body.get('owner') or path.name
+        record['pid'] = body.get('pid')
+    return record
+
+
+def live_leases(*, directory: Path | None = None) -> list[dict]:
+    """Return one record per lease a LIVING process is holding.
+
+    Liveness is the flock and nothing else — not the file's existence, not
+    an age, not a pid.  A lease file left behind by a SIGKILLed holder is
+    unlocked the moment that process dies, so it is reported here as absent
+    and collected later by :func:`reap_dead_leases`.
+
+    Never raises.  A missing directory, a file that vanishes mid-scan, an
+    unreadable file and an unparseable body are each ordinary rather than
+    exceptional: this is called from an unattended cron job whose contract
+    is "Always exits 0 (idempotent)".
+    """
+    target = lease_dir() if directory is None else Path(directory)
+    try:
+        entries = sorted(target.iterdir())
+    except OSError:
+        return []
+
+    held = []
+    for path in entries:
+        if _is_held(path) is True:
+            held.append(_describe(path))
+    return held
 
 
 def main() -> None:
