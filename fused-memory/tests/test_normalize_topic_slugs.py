@@ -845,3 +845,264 @@ class TestCensusCategoriesAreImportedNotRestated:
     def test_the_census_module_is_loaded_once(self):
         """``sys.modules``-first, memoized — re-executing hands back new classes."""
         assert _mod.load_census_module() is _mod.load_census_module()
+
+
+# ===========================================================================
+# rename_one — the single write boundary
+# ===========================================================================
+
+_UNSET = object()
+
+
+def _service(
+    *,
+    record: object = _UNSET,
+    update_response: object = _UNSET,
+) -> AsyncMock:
+    """A stateless ``MemoryService`` double for the write boundary.
+
+    Children are configured through ``.return_value`` rather than reassigned
+    to fresh ``AsyncMock``s, because a reassigned child stops propagating into
+    the parent's ``mock_calls`` — and the ORDER of the live re-read relative to
+    the write is one of the things this suite has to pin.
+    """
+    service = AsyncMock()
+    service.get_memory_by_id.return_value = (
+        {'id': 'm1', 'metadata': {'topic': 'legacy_topic'}}
+        if record is _UNSET else record
+    )
+    if update_response is _UNSET:
+        service.update_memory.side_effect = lambda **kwargs: {
+            'status': 'updated',
+            'store': 'mem0',
+            'id': kwargs['memory_id'],
+            'content_amended': False,
+            'metadata_patched': True,
+        }
+    else:
+        service.update_memory.return_value = update_response
+    return service
+
+
+def _rename(**overrides) -> object:
+    fields = {
+        'project_id': 'dark_factory',
+        'memory_id': 'm1',
+        'old_topic': 'legacy_topic',
+        'new_topic': 'legacy-topic',
+    }
+    fields.update(overrides)
+    return _mod.Rename(**fields)
+
+
+def _call_names(service: AsyncMock) -> list[str]:
+    return [name for name, _a, _kw in service.mock_calls if name]
+
+
+class TestRenameOne:
+    """``rename_one(memory_service, rename, *, apply)``.
+
+    The only function here that touches a store.  Order is load-bearing and
+    copied from ``retro_stamp_topics.stamp_one``: live re-read, decide, then
+    write.  The re-read is not a formality — the plan's ids come off a scroll
+    that may be minutes old on a corpus orchestrators are writing to, so a
+    record consolidated away since must become a report line rather than a
+    Qdrant ``set_payload`` that acknowledges a write to nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reads_live_before_it_writes(self):
+        service = _service()
+        await _mod.rename_one(service, _rename(), apply=True)
+        assert _call_names(service) == ['get_memory_by_id', 'update_memory']
+
+    @pytest.mark.asyncio
+    async def test_the_write_is_metadata_only_and_carries_only_topic(self):
+        """A migration must not touch content, and must not touch a sibling key.
+
+        ``metadata_mode='merge'`` with a patch containing exactly ``topic``
+        leaves every other metadata key alone.  A wider patch would let a
+        normalization silently clobber ``canonical``, ``supersedes`` or the
+        consolidation bookkeeping on ~141 records at once.
+        """
+        service = _service()
+        await _mod.rename_one(service, _rename(), apply=True)
+        service.update_memory.assert_awaited_once()
+        kwargs = service.update_memory.await_args.kwargs
+        assert kwargs['memory_id'] == 'm1'
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['metadata_patch'] == {'topic': 'legacy-topic'}
+        assert kwargs['metadata_mode'] == 'merge'
+        assert 'content' not in kwargs
+        assert 'messages' not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_the_write_is_attributed_to_this_sweep(self):
+        """``_source`` / ``reason`` so the amendment-storm alarm can tell.
+
+        A bulk run under the default ``mcp_tool`` source looks exactly like
+        the runaway rewrite that alarm exists to catch.
+        """
+        service = _service()
+        await _mod.rename_one(service, _rename(), apply=True)
+        kwargs = service.update_memory.await_args.kwargs
+        assert kwargs['_source'] == _mod.WRITE_SOURCE == 'normalize_topic_slugs'
+        assert kwargs['reason'] == _mod.WRITE_REASON
+        assert '4878' in _mod.WRITE_REASON
+
+    @pytest.mark.asyncio
+    async def test_no_delete_is_ever_issued(self):
+        """A topic rename is a metadata patch, never a delete-and-recreate.
+
+        Re-creating would mint a new memory id, orphaning every reference to
+        the old one and destroying ``created_at`` — the field consolidation
+        uses to pick a canonical.
+        """
+        service = _service()
+        await _mod.rename_one(service, _rename(), apply=True)
+        service.delete_memory.assert_not_awaited()
+        assert 'delete_memory' not in _call_names(service)
+
+    @pytest.mark.asyncio
+    async def test_a_successful_write_is_renamed(self):
+        service = _service()
+        result = await _mod.rename_one(service, _rename(), apply=True)
+        assert result['outcome'] == 'renamed'
+        assert result['memory_id'] == 'm1'
+        assert result['old_topic'] == 'legacy_topic'
+        assert result['new_topic'] == 'legacy-topic'
+        assert result['response']['status'] == 'updated'
+
+    @pytest.mark.asyncio
+    async def test_dry_run_reads_and_decides_but_never_writes(self):
+        """The rehearsal must exercise the SAME decision path as the apply.
+
+        A dry run that skipped the live re-read would rehearse a different
+        function from the one ``--apply`` runs, and its report would be a
+        prediction rather than a rehearsal.
+        """
+        service = _service()
+        result = await _mod.rename_one(service, _rename(), apply=False)
+        assert result['outcome'] == 'would_rename'
+        service.get_memory_by_id.assert_awaited_once()
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_record_is_memory_not_found(self):
+        """Consolidated away between the scroll and the write.
+
+        Measured precedent: retro_stamp's gate 3036 id ``19705df4`` no longer
+        resolves. Writing to it anyway would be acknowledged by the backend
+        and would appear in the report as a successful rename.
+        """
+        service = _service(record=None)
+        result = await _mod.rename_one(service, _rename(), apply=True)
+        assert result['outcome'] == 'memory_not_found'
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_topic_that_moved_since_the_plan_is_refused(self):
+        """Somebody else rewrote it — this plan row is stale, so do not write.
+
+        Applying anyway would overwrite a live value with a fold of a value
+        that no longer exists, which is a data loss the report would score as
+        a success.
+        """
+        service = _service(record={'id': 'm1', 'metadata': {'topic': 'something_else'}})
+        result = await _mod.rename_one(service, _rename(), apply=True)
+        assert result['outcome'] == 'topic_moved_since_plan'
+        assert result['existing_topic'] == 'something_else'
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_already_normalized_costs_zero_writes(self):
+        """A second run plans zero WRITES, not merely zero net effect.
+
+        A no-op ``update_memory`` would still journal a write op, still count
+        toward the amendment-storm alarm, and would inflate the report's
+        renamed count with records that gained nothing.
+        """
+        service = _service(record={'id': 'm1', 'metadata': {'topic': 'legacy-topic'}})
+        result = await _mod.rename_one(service, _rename(), apply=True)
+        assert result['outcome'] == 'already_normalized'
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_error_envelope_is_update_failed_not_renamed(self):
+        """``update_memory`` reports some rejections by RETURNING, not raising.
+
+        A caller guarding only against exceptions would score a refused write
+        as a rename — and then the residue probe would find the legacy slug
+        still populated with no explanation in the report.
+        """
+        service = _service(update_response={
+            'error': 'memory not found', 'error_type': 'MemoryNotFound',
+        })
+        result = await _mod.rename_one(service, _rename(), apply=True)
+        assert result['outcome'] == 'update_failed'
+        assert result['error_type'] == 'MemoryNotFound'
+        assert result['error'] == 'memory not found'
+        assert result['response'] == {
+            'error': 'memory not found', 'error_type': 'MemoryNotFound',
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_raising_read_is_one_row_not_an_unwound_sweep(self):
+        """Every await is individually guarded.
+
+        One backend hiccup must cost one report row, not the whole run — the
+        artifact is written after the loop, so an exception escaping here
+        would discard everything the sweep had already learned.
+        """
+        service = _service()
+        service.get_memory_by_id.side_effect = RuntimeError('qdrant timeout')
+        result = await _mod.rename_one(service, _rename(), apply=True)
+        assert result['outcome'] == 'rename_error'
+        assert 'RuntimeError' in result['error']
+        assert 'qdrant timeout' in result['error']
+
+    @pytest.mark.asyncio
+    async def test_a_raising_write_is_one_row_too(self):
+        service = _service()
+        service.update_memory.side_effect = RuntimeError('set_payload failed')
+        result = await _mod.rename_one(service, _rename(), apply=True)
+        assert result['outcome'] == 'rename_error'
+        assert 'set_payload failed' in result['error']
+
+    @pytest.mark.asyncio
+    async def test_the_memory_id_is_never_changed(self):
+        """Whatever the outcome, the row reports the id it was handed.
+
+        The report is how an operator re-addresses a failed row; an id that
+        drifted between the plan and the artifact makes it unusable.
+        """
+        for record in (None, {'id': 'm1', 'metadata': {'topic': 'other_x'}}):
+            result = await _mod.rename_one(
+                _service(record=record), _rename(), apply=True,
+            )
+            assert result['memory_id'] == 'm1'
+
+    @pytest.mark.asyncio
+    async def test_every_outcome_carries_what_it_needs_to_be_actionable(self):
+        """No follow-up query should be needed to act on a report row."""
+        result = await _mod.rename_one(_service(), _rename(), apply=True)
+        for key in ('project_id', 'memory_id', 'old_topic', 'new_topic', 'outcome'):
+            assert key in result
+
+
+class TestRenameOneOutcomesAreGraded:
+    """The write-boundary failures fail the run."""
+
+    def test_failure_outcomes_are_errors(self):
+        for outcome in ('memory_not_found', 'update_failed', 'rename_error',
+                        'topic_moved_since_plan'):
+            assert outcome in _mod.ERROR_OUTCOMES, outcome
+
+    def test_success_outcomes_are_not_errors(self):
+        for outcome in ('renamed', 'would_rename', 'already_normalized'):
+            assert outcome not in _mod.ERROR_OUTCOMES, outcome
+
+    def test_failure_outcomes_are_pre_seeded_buckets(self):
+        for outcome in ('memory_not_found', 'update_failed', 'rename_error',
+                        'topic_moved_since_plan'):
+            assert outcome in _mod.SKIP_BUCKETS, outcome
