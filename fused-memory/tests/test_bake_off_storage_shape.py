@@ -4593,6 +4593,73 @@ class TestGuardProbeSelfDrop:
 class TestRunBakeOffWiring:
     """What the driver does to the world, measured through doubles."""
 
+
+    async def test_it_holds_a_live_lease_at_the_moment_it_seeds(self, monkeypatch):
+        """The bake-off seeds under a prefix the 6-hourly cron deletes, so a
+        sweep landing between its seed and measure phases empties the corpus
+        out from under it.
+
+        Asserted on lease LIVENESS observed from inside the run, at two
+        instants: the pre-run drop (the first statement in the run's `try`,
+        before any collection exists) and the seeding itself.  A call-count
+        assertion would pass even if the lease were taken and dropped again
+        before the seeding began, which is the failure this has to exclude.
+        """
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        reaper = mod.load_cleanup_script()
+        at_drop: list[list[dict]] = []
+        at_seed: list[list[dict]] = []
+        seed_arm = mod.seed_arm
+
+        def _drop_and_look(*args, **kwargs):
+            at_drop.append(reaper.live_leases())
+            return drops(*args, **kwargs)
+
+        async def _seed_and_look(*args, **kwargs):
+            at_seed.append(reaper.live_leases())
+            return await seed_arm(*args, **kwargs)
+
+        monkeypatch.setattr(mod, 'drop_collections', _drop_and_look)
+        monkeypatch.setattr(mod, 'seed_arm', _seed_and_look)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert at_drop and at_seed, 'the observation seams never fired'
+        for live in (at_drop[0], at_seed[0]):
+            assert len(live) == 1, live
+            owner = live[0]['owner']
+            assert mod.__name__ in owner, owner
+            assert mod.worker_suffix() in owner, owner
+
+    async def test_the_lease_is_released_once_the_run_returns(self, monkeypatch):
+        """Held for the run, not for the process.  A lease that outlived the
+        run would wedge the cron until the pytest session ended."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        reaper = mod.load_cleanup_script()
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert reaper.live_leases() == []
+
+    async def test_the_lease_is_released_when_the_run_raises(self, monkeypatch):
+        """A failed bake-off must not hold the cron off — the case a TTL
+        would exist to bound, and the reason none is needed."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        reaper = mod.load_cleanup_script()
+
+        async def _initialize_explodes(self):
+            raise RuntimeError('qdrant unreachable')
+
+        monkeypatch.setattr(_FakeMemoryService, 'initialize', _initialize_explodes)
+
+        with pytest.raises(RuntimeError, match='qdrant unreachable'):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        assert reaper.live_leases() == []
+
     async def test_it_seeds_exactly_three_collections_for_six_arms(self, monkeypatch):
         mod = _mod()
         _install_driver_doubles(monkeypatch)
