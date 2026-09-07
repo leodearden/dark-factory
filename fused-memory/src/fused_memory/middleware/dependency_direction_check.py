@@ -392,3 +392,123 @@ def classify_dependency_assertion(
     if shares_dependent or shares_dependency:
         return SIBLING_SEQUENTIAL
     return UNSUPPORTED
+
+
+@dataclass(frozen=True)
+class DependencyDirectionFinding:
+    """One extracted fact whose DIRECTION ground truth does not support.
+
+    Carries everything a reader needs to adjudicate the flag from the log line
+    alone — the INV-2 structured-facts-at-failure posture, and the same
+    evidence-carrying shape ``ReferentFinding`` uses. ``ground_truth`` records
+    the actual direct dependencies of BOTH ids plus the shared-neighbour set
+    that triggered a sibling classification, so nobody has to re-query the graph
+    to understand why the edge was retired.
+
+    ``fact`` is the extraction's OWN wording, copied VERBATIM and never
+    rewritten. That is deliberate and is the operator's standing
+    loud-over-silent preference restated in this task: the extraction being
+    wrong is itself the signal worth surfacing, so the record must not be a
+    corrected paraphrase that hides it.
+
+    Frozen: a finding justifies a destructive edge action, so it must not be
+    widenable after construction.
+    """
+
+    edge_uuid: str
+    fact: str
+    dependent: int
+    dependency: int
+    classification: str
+    ground_truth: Mapping[str, object]
+
+    def to_dict(self) -> dict[str, object]:
+        """A JSON-safe structured record — every set rendered as a sorted list.
+
+        ``json.dumps`` on the result must never raise: this record goes into a
+        WARNING log line and onto ``ReconcileStats``, and a checker that can
+        throw while REPORTING a finding is worse than one that never fired.
+        """
+        return {
+            'edge_uuid': self.edge_uuid,
+            'fact': self.fact,
+            'dependent': self.dependent,
+            'dependency': self.dependency,
+            'classification': self.classification,
+            'ground_truth': {
+                key: sorted(value) if isinstance(value, (set, frozenset)) else value
+                for key, value in dict(self.ground_truth).items()
+            },
+        }
+
+
+def _edge_field(edge: object, name: str) -> str:
+    """Read *name* off an attribute-shaped OR dict-shaped edge, as ``str``.
+
+    graphiti_core ``EntityEdge`` objects are attribute-shaped and every
+    post-write sweep in ``memory_service`` reads them with ``getattr``; dicts
+    are accepted too so this pure core stays testable without importing
+    graphiti_core. Anything unreadable degrades to ``''`` — never an exception.
+    """
+    value = (
+        edge.get(name) if isinstance(edge, Mapping) else getattr(edge, name, None)
+    )
+    return value if isinstance(value, str) else ''
+
+
+def check_dependency_direction(
+    edges: Iterable[object], index: DependencyIndex
+) -> list[DependencyDirectionFinding]:
+    """Return one finding per edge whose asserted direction ground truth rejects.
+
+    Whole-episode pass: for each edge, parse its fact with
+    ``extract_dependency_assertions`` (the scope gate), classify each assertion
+    with ``classify_dependency_assertion``, and emit a finding for every
+    non-``None`` classification.
+
+    DETECT AND RECORD ONLY. This function never repairs a fact and never
+    proposes a corrected wording — the caller's action is to FLAG (invalidate
+    the edge, log the record), and the fact text travels through unmodified.
+
+    An edge with no uuid, no fact, or a fact carrying no parseable assertion is
+    SKIPPED, never raised on: this runs post-write inside the identity lock, and
+    an exception here would be an exception about an episode that is already
+    durable.
+    """
+    findings: list[DependencyDirectionFinding] = []
+    for edge in edges or ():
+        edge_uuid = _edge_field(edge, 'uuid')
+        fact = _edge_field(edge, 'fact')
+        if not edge_uuid or not fact:
+            continue
+        for assertion in extract_dependency_assertions(fact):
+            classification = classify_dependency_assertion(assertion, index)
+            if classification is None:
+                continue
+            findings.append(
+                DependencyDirectionFinding(
+                    edge_uuid=edge_uuid,
+                    fact=fact,
+                    dependent=assertion.dependent,
+                    dependency=assertion.dependency,
+                    classification=classification,
+                    ground_truth=_ground_truth(assertion, index),
+                )
+            )
+    return findings
+
+
+def _ground_truth(
+    assertion: DependencyAssertion, index: DependencyIndex
+) -> dict[str, object]:
+    """The evidence block attached to a finding — enough to adjudicate it alone."""
+    dependent, dependency = assertion.dependent, assertion.dependency
+    return {
+        'phrase': assertion.phrase,
+        'dependent_direct_dependencies': index.direct.get(dependent, frozenset()),
+        'dependency_direct_dependencies': index.direct.get(dependency, frozenset()),
+        'shared_dependents': index.dependents.get(dependent, frozenset())
+        & index.dependents.get(dependency, frozenset()),
+        'shared_dependencies': index.direct.get(dependent, frozenset())
+        & index.direct.get(dependency, frozenset()),
+    }
