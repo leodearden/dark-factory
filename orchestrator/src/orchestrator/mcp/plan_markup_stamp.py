@@ -65,11 +65,14 @@ PRD: ``plans/toolcall-markup-containment-prd.md``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
+
+from orchestrator.artifacts import TaskArtifacts
 
 logger = logging.getLogger(__name__)
 
@@ -336,3 +339,96 @@ def summary(plan: object) -> dict[str, Any] | None:
         'count': _as_int(block.get('count'), field='count'),
         'by_tool': _as_by_tool(block.get('by_tool')),
     }
+
+
+# ---------------------------------------------------------------------------
+# The sink — the third write-side channel on this boundary.
+# ---------------------------------------------------------------------------
+
+
+def make_plan_stamp(
+    *,
+    artifacts: TaskArtifacts,
+    now: Callable[[], float] = time.time,
+) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
+    """Build the emitter that stamps a markup fact onto ``plan.json``.
+
+    Returns the plan path as a locator string — the same contract
+    ``markup_journal.make_fact_journal`` keeps with its journal path and
+    ``markup_sink.make_escalation_sink`` with the queued record's id, so all
+    three injected channels on this boundary report their result the same way.
+
+    A THIRD WRITE-SIDE CHANNEL, on a boundary whose contract previously read "a
+    refusal writes nothing". That contract is NARROWED here, deliberately and
+    loudly:
+
+        OLD: a refused call leaves ``plan.json`` byte-identical.
+        NEW: a refused call leaves every AUTHORED field identical. The only
+             difference is this block, which contains no caller-supplied bytes
+             at all — ``tool`` and ``param`` come from the invoked tool's own
+             registration and schema, ``outcome`` from the guard's closed
+             vocabulary, ``ts`` from the clock.
+
+    What the byte pin was a PROXY for is preserved in full. ``create_server``'s
+    comment justifies the reject policy because "forwarding a repair would
+    write a guessed-at document that every later reader inherits", and the
+    middleware header says "no middleware-repaired value can ever reach
+    plan.json". Both are about VALUES. Nothing guessed, repaired or
+    caller-authored reaches the document through here.
+
+    READ THROUGH A PLAIN ``artifacts.read_plan()``, never
+    ``plan_tools._read_plan_repaired``. A refusal must not trigger the
+    read-time repair path: that is how two mechanisms on one boundary become
+    one tangled one, and the guard's own header forbids invoking it from here.
+    This is a bookkeeping read of one machine-written key and touches no prose
+    field.
+
+    WRITTEN THROUGH ``artifacts.write_plan``, the single owner of
+    ``plan.json``'s byte format and of its atomic/durable write — never an
+    open-and-dump here, which would drop ``_schema_version`` and the atomicity
+    every other writer on this file depends on.
+
+    ASYNC, with the blocking work on a worker thread: the middleware calls this
+    from inside the server's event loop, and one record costs a read and a
+    write.
+    """
+    plan_path = artifacts.root / 'plan.json'
+
+    def stamp(record: dict[str, Any]) -> str | None:
+        """The blocking body, run on a worker thread."""
+        event = build_event(record, now=now)
+        plan = artifacts.read_plan()
+        if not isinstance(plan, dict):
+            logger.warning(
+                'markup stamp: the plan at %s read back as %r rather than a '
+                'mapping; the refusal of %s.%s will not be stamped',
+                plan_path, type(plan).__name__, event.get('tool'),
+                event.get('param'),
+            )
+            return None
+        plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
+            plan.get(PLAN_MARKUP_REJECTIONS_KEY), block_of(event)
+        )
+        artifacts.write_plan(plan)
+        return str(plan_path)
+
+    async def plan_stamp(record: dict[str, Any]) -> str | None:
+        try:
+            return await asyncio.to_thread(stamp, record)
+        except Exception:
+            # BROAD ON PURPOSE, and it is the whole floor rather than a
+            # fallback: the call's outcome is already DECIDED by the time this
+            # runs, so a bookkeeping failure must cost an operator visibility
+            # and never turn a working guard into an outage of its own. Same
+            # never-raises contract ``markup_journal``'s own emitter keeps,
+            # with the floor UNDER the thread hop so it holds for the whole
+            # emitter and not merely for its body.
+            logger.exception(
+                'markup stamp: could not stamp the markup fact for %r onto '
+                '%s; the outcome stands',
+                record.get('tool') if isinstance(record, dict) else record,
+                plan_path,
+            )
+            return None
+
+    return plan_stamp
