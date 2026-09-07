@@ -7,7 +7,8 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -188,6 +189,72 @@ async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate |
             logger.warning('shutdown of the discarded empty UsageGate failed', exc_info=True)
         return None
     return gate
+
+
+@asynccontextmanager
+async def campaign_usage_gate(
+    base_config: OrchestratorConfig | None,
+) -> AsyncIterator[UsageGate | None]:
+    """Own ONE account-failover gate for a whole eval campaign (task 4427).
+
+    A campaign is any loop that runs several cells in ONE process: the four
+    methodology stages here (:func:`run_ofat_stage` / :func:`run_matrix_stage` /
+    :func:`run_confirm_stage` / :func:`run_eval_matrix`, each expanding
+    ``fixtures × candidates × trials``) and ``cli._run_single_eval``'s config
+    loop. Each of those needs build-once + tear-down-exactly-once, and five
+    hand-rolled copies is precisely the shape :func:`_build_eval_usage_gate`
+    itself was extracted to avoid, so the lifecycle lives here in one place.
+
+    WHY ``base_config`` IS THE RIGHT THING TO BUILD FROM.
+    :func:`_build_eval_usage_gate` reads exactly one leaf,
+    ``orch_config.usage_cap``. Every cell's orch config is
+    ``build_eval_orch_config(...)`` =
+    ``apply_eval_profile(base_config).model_copy(update=...)``, and neither
+    ``EVAL_PROFILE`` nor that update dict mentions ``usage_cap`` — so the leaf
+    is inherited verbatim and this gate is byte-identical to the one each cell
+    would have built for itself. That equivalence is emergent across two files
+    rather than enforced, so it is pinned as a tripwire by
+    ``test_eval_architect.py::TestCampaignGatePremise``.
+
+    WHY SHARING ONE GATE ACROSS CONCURRENT CELLS IS SAFE. It is the production
+    shape, not a new one: :class:`orchestrator.harness.Harness` builds exactly
+    ONE ``UsageGate`` per orchestrator process and shares it across every
+    concurrently-running workflow, tearing it down once in its own shutdown.
+    The gate's account leasing exists precisely to arbitrate concurrent
+    consumers — and sharing is what makes cap state MEAN anything: a cell that
+    proves an account capped must inform its in-flight siblings, not merely its
+    successors.
+
+    A ``None`` yield means "this campaign is deliberately UNGATED" — either
+    ``base_config`` was ``None`` (nothing to build from; the stage functions all
+    default it) or :func:`_build_eval_usage_gate` degraded. It MUST be threaded
+    to cells as an explicit ``usage_gate=None``, never dropped: a cell reads a
+    missing argument as "build your own" (see the ``_GATE_UNSET`` sentinel), so
+    dropping a degraded ``None`` would silently restore the per-cell
+    construction this exists to remove.
+    """
+    if base_config is None:
+        yield None
+        return
+    gate = await _build_eval_usage_gate(base_config)
+    try:
+        yield gate
+    finally:
+        if gate is not None:
+            # Best-effort, exactly as in run_architect_eval's finally: the
+            # campaign's results are already collected by the time we get here,
+            # so a teardown failure must never turn a finished campaign into a
+            # raise. Left un-torn-down, the gate leaks a live account-resume
+            # probe loop firing real CLI probes, and the next gate built in this
+            # process steals the SIGHUP handler from it.
+            try:
+                await gate.shutdown()
+            except Exception:
+                logger.warning(
+                    'campaign UsageGate shutdown failed — continuing '
+                    '(the campaign is already complete)',
+                    exc_info=True,
+                )
 
 
 @dataclass
