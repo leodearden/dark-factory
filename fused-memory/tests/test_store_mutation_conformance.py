@@ -506,3 +506,116 @@ class TestEveryMutatingScriptCallsTheGuard:
             f'bake_off_storage_shape.py / cleanup_test_collections.py for the '
             f'shape that reasoning takes).'
         )
+
+
+# ---------------------------------------------------------------------------
+# PREFLIGHT_EXEMPT_SCRIPTS anti-rot suite (task 4280 / 4848)
+# ---------------------------------------------------------------------------
+#
+# The allowlist is the conformance check's ONLY escape hatch, and an
+# allowlist with no staleness policing silently becomes a graveyard: a stale
+# entry keeps suppressing the check for a path nothing occupies, and would
+# grandfather a NEW script later created at that name. The closest in-repo
+# precedent, DRAIN_ALLOWLIST in test_gather_convention_guard.py, has exactly
+# this gap -- its check only fires on an OVER-count. The four checks below
+# are adapted instead from test_check_bare_magicmock_config.py, the one
+# module in the repo where entry-exists, still-a-live-violation,
+# reason-non-empty and key-set-equality all exist together.
+# ---------------------------------------------------------------------------
+
+#: A reason shorter than this cannot be a real blast-radius argument -- it
+#: catches an empty string or a placeholder like "safe" or "TODO" without
+#: going anywhere near the length of a genuine paragraph (every real reason
+#: in PREFLIGHT_EXEMPT_SCRIPTS today runs past 400 characters).
+_MIN_SUBSTANTIVE_REASON_LENGTH = 40
+
+#: The reviewed census this allowlist is expected to hold, pinned here so
+#: any WIDENING of PREFLIGHT_EXEMPT_SCRIPTS requires a deliberate edit in
+#: BOTH this file and fused_memory/utils/store_mutation_preflight.py. The
+#: list is expected to SHRINK as scripts are migrated onto the guard
+#: directly, never to grow -- a newly-written mutating script should call
+#: assert_store_mutation_allowed, not earn an entry here.
+EXPECTED_EXEMPT_SCRIPTS = frozenset({
+    'bake_off_storage_shape.py',
+    'cleanup_test_collections.py',
+})
+
+
+class TestPreflightExemptScriptsAntiRot:
+    """Anti-rot suite for PREFLIGHT_EXEMPT_SCRIPTS, the conformance check's
+    only escape hatch.
+
+    Without these four checks an allowlist entry can silently outlive the
+    condition that justified it: a renamed/deleted file leaves a blanket
+    suppression nothing occupies; a script that starts calling the guard, or
+    stops mutating altogether, stays quietly exempted forever; an empty or
+    placeholder reason defeats the entire point of a str-valued allowlist;
+    and with no key-set pin, a third exemption could be added alongside an
+    unrelated change with no reviewer ever forced to look at it.
+    """
+
+    def test_every_exempt_entry_names_an_existing_script(self):
+        """A deleted or renamed script must not leave a stale blanket exemption behind."""
+        missing = [
+            name for name in PREFLIGHT_EXEMPT_SCRIPTS if not (SCRIPTS_ROOT / name).is_file()
+        ]
+        assert missing == [], (
+            f'PREFLIGHT_EXEMPT_SCRIPTS names script(s) that no longer exist: {missing}. '
+            'A stale entry silently exempts a path nothing occupies -- and would '
+            'grandfather a NEW file later created at that name. Remove the entry in '
+            'fused_memory/utils/store_mutation_preflight.py.'
+        )
+
+    def test_no_exempt_entry_is_stale(self):
+        """Every exempt key must still be a live, unguarded mutation candidate.
+
+        If a script later calls the guard, or stops mutating altogether, its
+        entry has outlived the condition that justified it and must be deleted
+        -- not left behind to grandfather whatever that file becomes next.
+        """
+        stale: list[tuple[str, str]] = []
+        for name in PREFLIGHT_EXEMPT_SCRIPTS:
+            path = SCRIPTS_ROOT / name
+            if not path.is_file():
+                continue  # covered by test_every_exempt_entry_names_an_existing_script
+            tree = parse_python_module(path)
+            if is_guarded(tree):
+                stale.append((name, 'it now calls the guard'))
+            elif not mutating_calls(tree):
+                stale.append((name, 'it no longer contains a mutating call'))
+        assert stale == [], '\n'.join(
+            f"remove PREFLIGHT_EXEMPT_SCRIPTS['{name}'] in "
+            f'fused_memory/utils/store_mutation_preflight.py -- {reason}'
+            for name, reason in stale
+        ) + (
+            '\nAn exemption that no longer matches a live, unguarded candidate is '
+            'dead weight that would silently grandfather any future edit to that '
+            'file.'
+        )
+
+    def test_every_exempt_entry_has_a_substantive_reason(self):
+        """A blank or placeholder reason is a silent exemption."""
+        weak = {
+            name: reason
+            for name, reason in PREFLIGHT_EXEMPT_SCRIPTS.items()
+            if len(reason.strip()) < _MIN_SUBSTANTIVE_REASON_LENGTH
+        }
+        assert weak == {}, (
+            f'PREFLIGHT_EXEMPT_SCRIPTS entries with no substantive reason: {weak!r}. '
+            'A blank or placeholder reason is a silent exemption -- write the actual '
+            'blast-radius argument (see bake_off_storage_shape.py / '
+            'cleanup_test_collections.py for the shape it takes).'
+        )
+
+    def test_exempt_key_set_matches_the_reviewed_census(self):
+        """The allowlist may only shrink; widening it is a deliberate two-file edit."""
+        actual = set(PREFLIGHT_EXEMPT_SCRIPTS)
+        assert actual == EXPECTED_EXEMPT_SCRIPTS, (
+            'PREFLIGHT_EXEMPT_SCRIPTS has drifted from the reviewed census.\n'
+            f'  unexpected additions: {sorted(actual - EXPECTED_EXEMPT_SCRIPTS)}\n'
+            f'  missing entries:      {sorted(EXPECTED_EXEMPT_SCRIPTS - actual)}\n'
+            'This list is expected to SHRINK, never grow: a newly-written mutating '
+            'script should call assert_store_mutation_allowed directly rather than '
+            'earn an allowlist entry. Widening it requires a deliberate edit both '
+            'here and in fused_memory/utils/store_mutation_preflight.py.'
+        )
