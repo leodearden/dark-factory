@@ -73,7 +73,7 @@ from shared.toolcall_markup import (
 )
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, plan_tools
+from orchestrator.mcp import markup_journal, plan_markup_stamp, plan_tools
 from orchestrator.workflow import _is_gating_escalation
 
 # ---------------------------------------------------------------------------
@@ -183,6 +183,20 @@ def _clear_reported_refusals():
     plan_tools._REPORTED_REFUSALS.clear()
     yield
     plan_tools._REPORTED_REFUSALS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_refusals():
+    """Clear the markup stamp's pending buffer around every test.
+
+    THE SAME shape and the same reason as ``_clear_reported_refusals`` above:
+    process-global state on a per-agent stdio server, which one test would
+    otherwise leak into the next — here inflating a stamped count, which
+    several rows below assert exactly.
+    """
+    plan_markup_stamp.clear_pending()
+    yield
+    plan_markup_stamp.clear_pending()
 
 
 def journal_lines(root: Path) -> list[dict[str, Any]]:
@@ -1635,3 +1649,145 @@ class TestTheStormRecordNamesTheJournal:
         assert len(lines) == 2, 'one line per rejection in the window'
         assert {line['subject_task_id'] for line in lines} == {'test-1'}
         assert {line['outcome'] for line in lines} == {'rejected'}
+
+
+# ---------------------------------------------------------------------------
+# The composed fact sink — two channels, isolated per arm (task 4597).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingArm:
+    """One fake fact-sink arm: records what it saw, or raises on demand."""
+
+    def __init__(self, locator: str | None = None, error: Exception | None = None):
+        self.locator = locator
+        self.error = error
+        self.seen: list[Any] = []
+
+    async def __call__(self, record):
+        self.seen.append(record)
+        if self.error is not None:
+            raise self.error
+        return self.locator
+
+
+def _compose(monkeypatch, artifacts, journal: _RecordingArm, stamp: _RecordingArm):
+    """Build ``_markup_fact_sink`` over two fake arms.
+
+    Substitutes the module-level SEAMS rather than reaching into the built
+    sink, which is the convention ``_markup_escalation_sink`` and
+    ``_markup_fact_journal`` already keep on this module.
+    """
+    monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
+    monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
+    return plan_tools._markup_fact_sink(artifacts)
+
+
+class TestTheFactSinkFansOutToBothChannels:
+    """The middleware takes exactly ONE ``fact_sink``, so plan-tools composes.
+
+    Teaching ``MarkupGuardMiddleware`` about a list of sinks would change a
+    boundary shared with verdict-tools and the escalation server for a need
+    only this one has — neither of the others has a ``plan.json`` to stamp.
+    Composing at the registration site is where every other server-specific
+    answer on this boundary already lives.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_arms_see_the_same_record(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        journal, stamp = _RecordingArm('journal.jsonl'), _RecordingArm('plan.json')
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+        record = {'fact': 'markup_detected', 'tool': 'add_design_decision'}
+
+        await sink(record)
+
+        assert journal.seen == [record]
+        assert stamp.seen == [record]
+
+    @pytest.mark.asyncio
+    async def test_the_journals_locator_is_what_comes_back(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The existing fact-sink return contract is unchanged.
+
+        The journal is the established durable record and the one the storm
+        escalation points an operator at, so it keeps ownership of the return
+        value; the stamp is additive.
+        """
+        journal, stamp = _RecordingArm('journal.jsonl'), _RecordingArm('plan.json')
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+
+        assert await sink({'tool': 'add_design_decision'}) == 'journal.jsonl'
+
+
+class TestTheTwoArmsAreIsolatedFromEachOther:
+    """PER-ARM isolation, and it is load-bearing rather than defensive style.
+
+    ``MarkupGuardMiddleware._call_sink`` wraps the WHOLE sink in one
+    try/except. A composed sink that let the journal's exception propagate
+    would therefore silently skip the stamp entirely — one channel's outage
+    taking the other down, which is the exact fail-soft the containment PRD
+    exists to end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failing_journal_still_lets_the_stamp_run(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        journal = _RecordingArm(error=OSError('the journal is unwritable'))
+        stamp = _RecordingArm('plan.json')
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+
+        result = await sink({'tool': 'add_design_decision'})
+
+        assert stamp.seen, 'the stamp was skipped by the journal outage'
+        assert result is None, 'no journal line, so no journal locator to report'
+
+    @pytest.mark.asyncio
+    async def test_a_failing_stamp_still_returns_the_journals_locator(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        journal = _RecordingArm('journal.jsonl')
+        stamp = _RecordingArm(error=ValueError('the plan is unwritable'))
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+
+        assert await sink({'tool': 'add_design_decision'}) == 'journal.jsonl'
+
+    @pytest.mark.asyncio
+    async def test_the_composed_sink_never_raises_even_when_both_arms_fail(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The outcome is already DECIDED by the time either arm runs."""
+        journal = _RecordingArm(error=OSError('boom'))
+        stamp = _RecordingArm(error=OSError('boom'))
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+
+        assert await sink({'tool': 'add_design_decision'}) is None
+
+    @pytest.mark.asyncio
+    async def test_the_journal_runs_first(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """Order is a DECLARATION, not an accident.
+
+        The journal is the established durable record, so a stamp failure can
+        never delay it.
+        """
+        order: list[str] = []
+
+        async def journal(record):
+            order.append('journal')
+            return 'journal.jsonl'
+
+        async def stamp(record):
+            order.append('stamp')
+            return 'plan.json'
+
+        monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
+        monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
+
+        await plan_tools._markup_fact_sink(artifacts)({'tool': 'add_design_decision'})
+
+        assert order == ['journal', 'stamp']
