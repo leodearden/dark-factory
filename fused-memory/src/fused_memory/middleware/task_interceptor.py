@@ -617,8 +617,10 @@ class TaskInterceptor:
 
         *exists* (task 4808) is an async ``(memory_id, *, project_id) -> bool``
         — in production a wrapper over ``MemoryService.get_memory_by_id``,
-        built by ``server/main.py::_closure_exists_for``. It is what lets the
-        seam derive ``unstamped_live_ids`` from the gate block's inert
+        built by ``consolidation_gate.py::closure_exists_probe`` (the shared
+        factory ``server/main.py::_wire_closure_collaborators`` and
+        ``scripts/check_consolidation_closure.py`` both bind). It is what lets
+        the seam derive ``unstamped_live_ids`` from the gate block's inert
         provenance, and it is scoped for the same non-optional reason the
         scroll is. Like *count* it falls back to ``scroll.exists`` when
         omitted, so one bound collaborator object still carries all three.
