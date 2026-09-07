@@ -6094,6 +6094,68 @@ def test_project_token_alias_declines_registry_shape() -> None:
     )
 
 
+def test_declined_project_token_hint_names_both_tokens() -> None:
+    """The hint must name BOTH tokens: what the operator typed, and where the
+    rows actually are.
+
+    Declining the alias makes the naming mismatch PERMANENT, so the honest
+    companion to the decline is that the mismatch announces itself. A message
+    naming only one side leaves the operator exactly where the silent
+    zero-row no-op did.
+    """
+    hint = sr.declined_project_token_hint('my_solar_challenge')
+
+    assert hint is not None
+    assert isinstance(hint, str)
+    # Token PRESENCE, deliberately not sentence wording.
+    assert 'my_solar_challenge' in hint
+    assert 'solar_challenge' in hint
+
+    # The fold runs FIRST, so a spelling variant still hits. This is the case
+    # that matters: an operator copying the config-declared value with
+    # different case/separators must still be warned.
+    assert sr.declined_project_token_hint('My-Solar-Challenge') is not None
+    assert sr.declined_project_token_hint('  MY_SOLAR_CHALLENGE  ') is not None
+
+
+@pytest.mark.parametrize(
+    'token',
+    [
+        'dark_factory',
+        # Aliases to dark_factory -- a healthy project must never be warned.
+        'df',
+        # The RECOMMENDED token, in both spellings. A warning here would be
+        # pure noise a watcher accrues every Main Loop cycle.
+        'solar_challenge',
+        'solar-challenge',
+        # The collapse-guard sibling: a distinct project root. A false
+        # warning here would be actively misleading.
+        'solar_challenge_platform',
+        'reify',
+        '',
+        '   ',
+    ],
+)
+def test_declined_project_token_hint_is_none_for_everything_else(token: str) -> None:
+    """The hint fires on the declined VALUE, never on the declined KEY.
+
+    The trap being closed is "operator reads their project's config, types
+    the declared ``memory.project_id``, matches zero rows". So the warning
+    must land on ``my_solar_challenge`` and stay SILENT on
+    ``solar_challenge`` -- the token both SKILL.md files tell people to
+    pass -- or the signal degrades into noise.
+    """
+    assert sr.declined_project_token_hint(token) is None
+
+
+@pytest.mark.parametrize('token', [None, 42, 3.5, Path('/tmp/x'), object()])
+def test_declined_project_token_hint_fail_soft_on_non_str(token: object) -> None:
+    """Fail-soft, mirroring normalize_project_token's contract: a helper a C8
+    watch loop calls on its filing path never raises into the caller.
+    """
+    assert sr.declined_project_token_hint(token) is None
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
