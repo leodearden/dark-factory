@@ -731,8 +731,9 @@ async def judge_write(
     only a canonical ID cannot classify anything.
 
     Flow: resolve config LIVE → return ``stored`` early if disabled or if the
-    slate selects to empty → build the prompt → call the provider under
-    ``asyncio.wait_for`` → parse.
+    slate selects to empty → build the prompt, which NAMES the attach target
+    (``decision.canonical_id``, the same id the selector was given) → call the
+    provider under ``asyncio.wait_for`` → parse.
 
     RAISES on every failure — transport, timeout, unparseable output,
     out-of-vocabulary verdict — and catches nothing. ``triage_write`` owns the
@@ -764,10 +765,16 @@ async def judge_write(
     if not resolve_judge_enabled(memory_service):
         return OUTCOME_STORED
 
+    # ONE expression for "the band's winner" on this path. The selector
+    # guarantees it is in the slate; the renderer marks it wherever it landed.
+    # Reading `decision.canonical_id` twice would let a future edit hand the
+    # selector one id and the renderer another, and neither call site would
+    # look wrong on its own.
+    attach_target_id = getattr(decision, 'canonical_id', None)
     selected = select_judge_candidates(
         candidates,
         resolve_judge_candidate_count(memory_service),
-        canonical_id=getattr(decision, 'canonical_id', None),
+        canonical_id=attach_target_id,
     )
     if not selected:
         return OUTCOME_STORED
@@ -775,7 +782,9 @@ async def judge_write(
     raw = await _call_llm(
         provider=resolve_judge_provider(memory_service),
         model=resolve_judge_model(memory_service),
-        prompt=build_judge_prompt(content, selected),
+        prompt=build_judge_prompt(
+            content, selected, attach_target_id=attach_target_id,
+        ),
         memory_service=memory_service,
         timeout=resolve_judge_timeout(memory_service),
     )
