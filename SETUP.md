@@ -559,9 +559,9 @@ ssh -o BatchMode=yes <host> true                                  # RemoteRunner
 - The CLI probe must be spelled **bare** — `orchestrator verify-merge
   --help`, not `uv run orchestrator ...` and not an absolute `.venv/bin`
   path. It is bare on purpose so the probe exercises the exact same PATH
-  resolution (through the host's `orchestrator` wrapper — previous
-  subsection) that a real dispatch does; a qualified spelling can pass while
-  the real dispatch still fails `rc=127`.
+  resolution (through the host's `orchestrator` wrapper — "What lives on
+  the remote host" above) that a real dispatch does; a qualified spelling
+  can pass while the real dispatch still fails `rc=127`.
 - Assert exit code `0` on both.
 
 **A passing probe proves the CLI is reachable, not that the checkout is
@@ -659,6 +659,74 @@ shared warm worktree with the workstation guard reading its own `false`
 and enforcing nothing. Revisit after measuring the actual remote-verify
 cold-preprovision cost in practice, and only by flipping both sides
 together in the same change.
+
+### What stays on the workstation
+
+The `verify_runners:` block lives in the **dispatching** project's own
+`dark-factory-orchestrator.yaml` — never on the remote host. The remote's
+per-host yaml (above) has no knowledge of the pool it belongs to; the
+workstation is what decides which hosts participate.
+
+Entry shape (`VerifyRunnerConfig`):
+
+```yaml
+verify_runners:
+  - name: <short-id>              # e.g. "laptop"
+    ssh_host: <ssh-alias>         # used for git push and ssh invocations
+    git_remote: <git-remote-name> # git remote pointing at the remote's PROJECT checkout
+    config_path: <remote-path>    # passed as --config; omit (null) to let the
+                                   # remote fall back to its own ORCH_CONFIG_PATH
+    df_checkout_path: <remote-path>  # remote path to the Dark-Factory orchestrator
+                                      # CODE checkout -- distinct from git_remote's
+                                      # project checkout. When set, opts into an
+                                      # automatic currency sync at dispatch time
+                                      # (HEAD-compare vs. the dispatcher, then
+                                      # git pull --ff-only + uv sync --all-packages
+                                      # when stale). Omit (null, the default) to
+                                      # keep the checkout's currency a manual
+                                      # concern, refreshed as in this section.
+    enabled: true
+verify_drift_check_every_n_lands: 20   # companion setting: periodic remote/local
+                                        # verdict cross-check cadence
+```
+
+Worked example, modelled on a live deployment (reify's, which does not set
+`df_checkout_path` — its checkout currency is managed manually, the same
+way this section documents):
+
+```yaml
+verify_runners:
+  - name: laptop
+    ssh_host: leo-laptop
+    git_remote: leo-laptop
+    config_path: /home/leo/.config/orchestrator/reify-laptop.yaml
+    enabled: true
+verify_drift_check_every_n_lands: 20
+```
+
+Three operator-facing facts:
+
+- **`enabled: false` is the kill switch — no need to delete the block.**
+  Every consumer reads runners through the `enabled_verify_runners`
+  property (never `verify_runners` directly), which already filters to
+  `enabled=True`. Disabling a runner is a one-line edit, and the config
+  keeps its history of what's been tried.
+- **`verify_runners` is restart-only, not hot-reloadable.** A config
+  reload accepts the edit into the file but reports it under
+  `restart_required` — see `OPERATIONS.md`'s config-reload tiers. Don't
+  expect a live pool change from a reload alone.
+- **A project that self-hosts its own verify runner has `git_remote`'s
+  project checkout and `df_checkout_path` pointing at the *same* tree.**
+  Worth knowing before opting into the `df_checkout_path` auto-sync in
+  that configuration — the sync and the thing being verified are then the
+  same checkout, not two independent ones.
+
+For the environment-parity checklist between a workstation and a laptop
+verify host, and day-2 operational notes for a live laptop runner, see
+`docs/verdict-parity-report.md` (§1, §6) — this section covers the
+generic wiring and precedence, not environment fingerprints or ongoing
+operational notes, which already live there. For the full config
+hot-reload tier reference, see `OPERATIONS.md`.
 
 ---
 
