@@ -870,15 +870,46 @@ class EscalationQueue:
         that same nonexistent id do not re-scan the archive, at the cost of
         a bounded staleness window that clears on this instance's next
         self-archival.
+
+        TOCTOU retry (task 5118): ``_locate_path`` and ``read_text`` are two
+        separate filesystem operations with no lock held across them, so the
+        archive sweep (or a concurrent ``resolve()``) can relocate the record
+        in between -- ``_locate_path`` can return a path that is gone by the
+        time it is read.  That is a MOVE, not a vanish, so a single retry
+        re-locates (a fresh ``_locate_path`` call, which finds the record at
+        its new location via the archive fallback/re-probe logic above) and
+        re-reads before concluding the id is genuinely absent, rather than
+        raising ``FileNotFoundError`` or silently returning ``None`` on the
+        first miss.  This is the per-record case ``read_escalation_for_scan``'s
+        docstring named "EXPLICITLY OUT OF SCOPE" for that helper (this
+        method's blast radius is one record, not a whole listing); it is
+        handled here instead, with the same re-locate-and-retry shape.
         """
-        path = self._locate_path(escalation_id)
-        if path is None:
-            return None
-        try:
-            return Escalation.from_json(path.read_text())
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-            return None
+        for attempt in range(2):
+            path = self._locate_path(escalation_id)
+            if path is None:
+                return None
+            try:
+                text = path.read_text()
+            except FileNotFoundError:
+                if attempt == 0:
+                    logger.debug(
+                        f'get: {escalation_id} vanished between locate and read '
+                        '(likely concurrent archive-sweep relocation); '
+                        're-locating and retrying'
+                    )
+                    continue
+                logger.debug(
+                    f'get: {escalation_id} still missing after re-locate retry; '
+                    'treating as genuinely absent'
+                )
+                return None
+            try:
+                return Escalation.from_json(text)
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return None
+        return None  # pragma: no cover - loop always returns within 2 attempts
 
     def get_by_task(
         self, task_id: str, status: str | None = None, level: int | None = None,
