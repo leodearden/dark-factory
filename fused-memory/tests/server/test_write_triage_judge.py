@@ -36,6 +36,7 @@ import pytest
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage
+from fused_memory.server import write_triage_judge as judge_module
 from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
@@ -1092,6 +1093,104 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
             )
         assert verdict == OUTCOME_STORED
         client.chat.completions.create.assert_not_awaited()
+
+
+class TestJudgeWriteNamesTheAttachTarget:
+    """The band names the target; the prompt has to say which candidate it is.
+
+    `select_judge_candidates` guarantees the winner is IN the slate but not
+    WHERE — the hoisted-parent rescue appends it — so a judge shown an
+    unmarked slate is answering about a set, while the attach touches exactly
+    one record in it. Gate item 1
+    (`scripts/check_write_triage_flip_preconditions.sh`) is that gap.
+    """
+
+    @staticmethod
+    def _sent_prompt(client: MagicMock) -> str:
+        """The user turn that actually reached the provider."""
+        messages = client.chat.completions.create.await_args.kwargs['messages']
+        return next(m['content'] for m in messages if m['role'] == 'user')
+
+    @pytest.mark.asyncio
+    async def test_the_bands_hoisted_winner_is_marked_in_the_sent_prompt(
+        self,
+    ) -> None:
+        """`decision.canonical_id` names a parent absent from the slate.
+
+        Read off the prompt the fake provider was actually handed, not off a
+        patched renderer — what matters is what the model sees.
+        """
+        child = _result(
+            'child-1', 0.60,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        client = _openai_client(_payload('restates'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision('parent-1'),
+                candidates=[_result('m0', 0.90), _result('m1', 0.89), child],
+            )
+        prompt = self._sent_prompt(client)
+        marked = [line for line in prompt.splitlines() if 'attach_target:' in line]
+        assert marked == ['  attach_target: child-1'], prompt
+
+    @pytest.mark.asyncio
+    async def test_a_decision_naming_nothing_marks_nothing(self) -> None:
+        """A band decision with no canonical id must not mark an arbitrary row.
+
+        Marking `candidates[0]` "because something has to be the target" is
+        the exact defect: it would tell the model a record is the attach
+        target when nothing said so.
+        """
+        client = _openai_client(_payload('restates'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision(None),
+                candidates=[_result('m0', 0.90), _result('m1', 0.89)],
+            )
+        prompt = self._sent_prompt(client)
+        assert [line for line in prompt.splitlines() if 'attach_target:' in line] == []
+
+    @pytest.mark.asyncio
+    async def test_the_selector_and_the_renderer_are_given_the_same_id(self) -> None:
+        """ONE expression for "the band's winner" on this path.
+
+        The selector guarantees the winner is present and the renderer marks
+        it; feeding them different ids would let the prompt mark a record the
+        selector never promised to keep, and neither call site would look
+        wrong on its own.
+        """
+        client = _openai_client(_payload('restates'))
+        with (
+            patch('openai.AsyncOpenAI', return_value=client),
+            patch.object(
+                judge_module, 'select_judge_candidates',
+                wraps=judge_module.select_judge_candidates,
+            ) as selector,
+            patch.object(
+                judge_module, 'build_judge_prompt',
+                wraps=judge_module.build_judge_prompt,
+            ) as renderer,
+        ):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m0', 0.90), _result('m1', 0.89)],
+            )
+        assert selector.call_args.kwargs['canonical_id'] == 'm1'
+        assert renderer.call_args.kwargs['attach_target_id'] == 'm1'
+        assert (
+            renderer.call_args.kwargs['attach_target_id']
+            == selector.call_args.kwargs['canonical_id']
+        )
 
 
 class TestJudgeWriteOpenAIArm:
