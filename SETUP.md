@@ -546,6 +546,34 @@ npm ci
   `/usr/bin`, so this trap tends to bite `uv` (or `cargo`, `~/.local/bin`
   toolchains generally) more often than the Node half of this step.
 
+### Checking the host answers
+
+Two probes, both run exactly as the dispatcher itself runs them —
+`orchestrator/src/orchestrator/verify_runner.py`:
+
+```bash
+ssh -o BatchMode=yes <host> 'orchestrator verify-merge --help'   # REMOTE_LIVENESS_CMD
+ssh -o BatchMode=yes <host> true                                  # RemoteRunner.health()
+```
+
+- The CLI probe must be spelled **bare** — `orchestrator verify-merge
+  --help`, not `uv run orchestrator ...` and not an absolute `.venv/bin`
+  path. It is bare on purpose so the probe exercises the exact same PATH
+  resolution (through the host's `orchestrator` wrapper — previous
+  subsection) that a real dispatch does; a qualified spelling can pass while
+  the real dispatch still fails `rc=127`.
+- Assert exit code `0` on both.
+
+**A passing probe proves the CLI is reachable, not that the checkout is
+current.** The CLI probe already exits `0` against a stale checkout — it
+only executes `--help`, which needs no correct code, just a resolvable
+entry point. The currency check is separate: `git rev-parse HEAD` on the
+remote must equal the dispatching workstation's `origin/main`. This
+distinction is not cosmetic — under `merge_verify_breadth=full` the module
+set is *discovered from the remote tree itself* (task 4536), so a stale
+remote checkout silently **narrows** the gate rather than failing loudly.
+Verify currency, every time, not just reachability.
+
 ---
 
 For hot-reloading config without a restart, understanding the fleet-redeploy
