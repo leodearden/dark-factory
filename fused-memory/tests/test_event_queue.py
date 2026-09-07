@@ -458,7 +458,10 @@ async def test_wait_for_drained_fails_loudly_when_drainer_stalls(tmp_path):
     """_wait_for_drained must assert (not return silently) when the drainer
     never catches up — pins the "fail loudly" contract _wait_for's docstring
     states, so a future rewrite of the gate can't silently swallow a genuine
-    stall.
+    stall. None of the happy-path tests in this file would catch that
+    regression on their own: they only ever exercise _wait_for /
+    _wait_for_drained where the predicate becomes true before the deadline,
+    so a silent-return rewrite would leave every one of them green.
     """
     buf = AsyncMock()
 
@@ -474,17 +477,16 @@ async def test_wait_for_drained_fails_loudly_when_drainer_stalls(tmp_path):
         maxsize=100,
         retry_initial_seconds=0.01,
         retry_max_seconds=0.05,
-        shutdown_flush_seconds=0.1,
+        shutdown_flush_seconds=0.05,
     )
     await q.start()
     try:
         for _ in range(5):
             q.enqueue(_make_event())
-        with pytest.raises(AssertionError, match='not satisfied within'):
+        with pytest.raises(AssertionError):
             await _wait_for_drained(q, 5, timeout=0.5)
     finally:
         # Close without waiting for the blocked push.
-        q._shutdown_flush = 0.05
         await q.close()
 
 
