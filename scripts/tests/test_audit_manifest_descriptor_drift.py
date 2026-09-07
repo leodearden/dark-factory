@@ -20,10 +20,11 @@ would be a guessed threshold going red on unrelated branches. Every
 tasks.db-dependent assertion below runs against synthetic temp databases built
 by the helpers here, whose contents the test controls exactly.
 
-The ONE live-corpus test in this file
-(:func:`test_live_sidecars_carry_the_resynced_descriptors`) reads only TRACKED
-GIT FILES and opens no database at all — the same legitimacy as
-shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus and
+The TWO live-corpus tests in this file
+(:func:`test_live_sidecars_carry_the_resynced_descriptors` and
+:func:`test_live_foreign_producer_blocks_declare_their_external_registry`)
+read only TRACKED GIT FILES and open no database at all — the same legitimacy
+as shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus and
 scripts/tests/test_lms_marker_contract.py.
 """
 from __future__ import annotations
@@ -1476,4 +1477,98 @@ def test_live_sidecars_carry_the_resynced_descriptors(
         f"would re-stamp the stale spelling over the repair), OR this check was "
         f"legitimately re-repaired on BOTH sides since — in which case update "
         f"this row's `resynced` element and see this test's maintenance contract."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The six tracked manifest blocks whose PRODUCER lives in reify's registry,
+# not dark-factory's: (manifest relpath, label, expected external_task_id).
+#
+# PROVENANCE (task 4731). Each id was verified as a live `tag='master'` row in
+# /home/leo/src/reify/.taskmaster/tasks/tasks.db whose TITLE matches the block
+# it is bound to. Corroborated three independent ways: γ6a/γ6b's own
+# delivered_check reasons say "foreign-registry task; DF stamper/scheduler
+# cannot carry this check - reify verify owns it"; η/θ/ι/κ's check paths
+# (deploy/systemd/, scripts/refresh-warm-base.sh,
+# scripts/verify-pipeline-paths.txt) are absent from `git ls-files` in THIS
+# repo; and plans/warm-lane-infra-repatriation-prd.md assigns leaf η to a
+# reify-side file by name.
+# ---------------------------------------------------------------------------
+_EXTERNAL_REGISTRY_BLOCKS = (
+    ("plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml",
+     "γ6a", "reify:5332"),
+    ("plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml",
+     "γ6b", "reify:5333"),
+    ("plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+     "η", "reify:5613"),
+    ("plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+     "θ", "reify:5614"),
+    ("plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+     "ι", "reify:5615"),
+    ("plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+     "κ", "reify:5616"),
+)
+
+
+@pytest.mark.parametrize(
+    "relpath,label,external_task_id",
+    _EXTERNAL_REGISTRY_BLOCKS,
+    ids=[f"{label}" for _, label, _ in _EXTERNAL_REGISTRY_BLOCKS],
+)
+def test_live_foreign_producer_blocks_declare_their_external_registry(
+        relpath, label, external_task_id):
+    """The six foreign-producer blocks bind external_task_id, not task_id.
+
+    Parametrized so a failure NAMES its own manifest and label rather than
+    reporting "one of six".
+
+    MAINTENANCE CONTRACT — READ THIS BEFORE "FIXING" A FAILURE HERE. These ids
+    are not guesses: each was verified as a live `tag='master'` row in reify's
+    task store with a title matching its block (see the provenance note on
+    _EXTERNAL_REGISTRY_BLOCKS above). A failure here means a SIDECAR WAS
+    EDITED, not that the test needs relaxing. Two shapes to expect:
+
+      - `task_id` came back on one of these blocks. That is the exact hazard
+        the model's mutual-exclusion validator guards, arriving through the
+        one path the validator cannot see coming: a dark-factory decompose
+        re-using one of these Greek labels, which manifest_stamping step 4
+        stamps without consulting the block's existing contents. The producer
+        is still reify's; do NOT let the local stamp stand.
+      - the label or the id changed. Confirm against reify's registry FIRST,
+        then update the row here in the SAME commit.
+
+    Reads only TRACKED GIT FILES and opens no database — the same legitimacy
+    as test_live_sidecars_carry_the_resynced_descriptors above.
+    """
+    root = _repo_root()
+    if root is None:
+        pytest.skip("not a git checkout")
+
+    # NON-VACUITY FLOOR: assert the sidecar is TRACKED before reading it, so a
+    # renamed or deleted manifest cannot make this test pass by finding
+    # nothing to check.
+    tracked = subprocess.run(
+        ["git", "-C", root, "ls-files", "--", relpath],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert tracked.stdout.strip(), f"{relpath} is not tracked in {root}"
+
+    doc = load_capability_manifest(Path(root) / relpath)
+    matches = [task for task in doc.tasks if task.label == label]
+    assert len(matches) == 1, (
+        f"expected exactly one task block labelled {label!r} in {relpath}, "
+        f"found {len(matches)}"
+    )
+
+    block = matches[0]
+    assert block.external_task_id == external_task_id, (
+        f"{relpath} label {label} binds external_task_id "
+        f"{block.external_task_id!r}, expected {external_task_id!r} — see this "
+        f"test's maintenance contract before changing the expectation."
+    )
+    # THE OTHER HALF, and the one that actually matters: a local task_id here
+    # would misattribute a reify task's capability claim to a dark-factory one.
+    assert block.task_id is None, (
+        f"{relpath} label {label} carries a LOCAL task_id ({block.task_id}) "
+        f"alongside its reify producer {external_task_id!r}."
     )
