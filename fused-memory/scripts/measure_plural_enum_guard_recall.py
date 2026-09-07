@@ -1909,13 +1909,82 @@ def _build_live_edge_source(config: Any) -> Any:
     return edge_source
 
 
-def _write_artifacts(report: Report, json_out: str, md_out: str) -> None:
+# Suffix for the pair an incomplete run writes when a COMPLETE measurement is
+# already committed at the target paths. A sibling of the real artifact on
+# purpose: an operator who has been told a shortfall happened finds the
+# evidence next to the thing it failed to replace, not in a temp directory.
+_INCOMPLETE_SUFFIX = '.incomplete'
+
+
+def _existing_artifact_is_complete(json_path: Path) -> bool:
+    """Does *json_path* hold a measurement that claims to be COMPLETE?
+
+    Every 'cannot tell' shape answers False — no file, unreadable, malformed
+    JSON, a payload that is not an object, a missing or non-``True``
+    ``complete`` key. That direction is deliberate and is NOT the fail-closed
+    one: a file that cannot be shown to be a good measurement is not one worth
+    protecting, and treating it as protected would divert every future run to
+    a sidecar and leave the deliverable permanently stale.
+    """
+    try:
+        payload = json.loads(json_path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get('complete') is True
+
+
+def _write_artifacts(report: Report, json_out: str, md_out: str) -> str:
+    """Write the report, without letting a bad run destroy a good one.
+
+    The artifacts ARE the deliverable — the whole reason this is a committed
+    script and not a transcript is that 'zero matches today' is only as good
+    as its re-checkability. ``exit_code`` already encodes the fail-closed
+    instinct for the STATUS: the evidence lands, and the exit code refuses to
+    call an under-enumerated measurement a success. This applies the same
+    instinct to the FILE.
+
+    An INCOMPLETE report aimed at paths that already hold a COMPLETE one is
+    written to ``<path>.incomplete`` sidecars instead, and the committed
+    measurement is left byte-intact. Without this, one benign raced run — a
+    single edge written by an unrelated cycle while 43 graphs paged — replaced
+    a good measurement with a truncated one, and the recovery was
+    ``git checkout``, if anyone noticed.
+
+    The guard protects a KNOWN-GOOD artifact; it does not refuse to record
+    evidence. When there is nothing to protect (no file, an existing report
+    that is itself incomplete, an unparseable one) the incomplete report
+    writes straight to the primary paths, because diverting there would leave
+    the deliverable permanently empty and make every later sidecar the real
+    report. A COMPLETE report always writes in place — that is what the
+    committed artifact is for.
+
+    Returns the paths actually written, as a display string, so the caller can
+    tell the operator where the report went. A run that silently wrote
+    somewhere else is worse than one that clobbered: the reader of the
+    committed file would have no way to know a newer, worse measurement
+    exists. The EXIT CODE is unaffected — a sidecar write is still a shortfall
+    and still exits 1.
+    """
     json_path = Path(json_out)
     md_path = Path(md_out)
+
+    if not report.complete and _existing_artifact_is_complete(json_path):
+        protected_json, protected_md = json_path, md_path
+        json_path = Path(f'{json_out}{_INCOMPLETE_SUFFIX}')
+        md_path = Path(f'{md_out}{_INCOMPLETE_SUFFIX}')
+        logger.warning(
+            'this measurement is INCOMPLETE and %s already holds a COMPLETE '
+            'one, so the committed measurement was left intact and this run '
+            'was written to %s and %s instead. Read the shortfall out of the '
+            'sidecar; do NOT promote it over %s without re-running.',
+            protected_json, json_path, md_path, protected_md,
+        )
+
     json_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(render_json(report))
     md_path.write_text(render_markdown(report))
+    return f'{json_path} {md_path}'
 
 
 async def _main(argv: list[str] | None = None) -> int:
@@ -1941,14 +2010,19 @@ async def _main(argv: list[str] | None = None) -> int:
         report = await run(
             args, edge_source=edge_source, graph_lister=edge_source.list_graphs,
         )
-        _write_artifacts(report, args.json_out, args.md_out)
+        # The paths ACTUALLY written, which are not always the ones asked
+        # for: an incomplete run that would have clobbered a complete
+        # artifact is diverted to sidecars. Logging the request rather than
+        # the outcome would leave the operator looking at a file this run
+        # never touched.
+        written = _write_artifacts(report, args.json_out, args.md_out)
         logger.info(
             'measured graphs=%d (%s) edges=%d matched=%d rejected=%d '
-            'complete=%s json=%s md=%s',
+            'complete=%s written=%s',
             len(report.projects), report.project_ids_source,
             report.total_valid_edges, report.totals.regex_matched,
             report.totals.guard_rejected, report.complete,
-            args.json_out, args.md_out,
+            written,
         )
         if not report.complete:
             if not report.projects:
