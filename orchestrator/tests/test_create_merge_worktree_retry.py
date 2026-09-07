@@ -459,3 +459,151 @@ class TestWorktreeAddWithRetry:
             f'expected WorktreeMissing to escape after ONE attempt; got {_add_argvs(calls)}'
         )
         assert mock_sleep.await_args_list == []
+
+
+# ---------------------------------------------------------------------------
+# step-5: _create_merge_worktree absorbs the transient flake
+# ---------------------------------------------------------------------------
+
+BASE_SHA = 'b' * 40
+MAIN_HEAD_SHA = 'e' * 40
+
+
+def _make_fake_merge_run(
+    add_results: list[tuple[int, str, str]],
+    calls: list[list[str]],
+    *,
+    rev_parse_sha: str = MAIN_HEAD_SHA,
+):
+    """Fake ``_run`` for ``_create_merge_worktree``.
+
+    Beyond the per-attempt ``git worktree add`` results, this also answers
+    the ``git fetch`` / ``git rev-parse`` calls the ``base_sha is None``
+    branch makes — ``rev-parse`` returns *rev_parse_sha* on stdout with a
+    trailing newline, exactly as real git does, so the caller's ``.strip()``
+    is genuinely exercised.
+    """
+    state = {'add_calls': 0}
+
+    async def _fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if 'worktree' in cmd and 'add' in cmd:
+            detach_idx = cmd.index('--detach')
+            target = Path(cmd[detach_idx + 1])
+            idx = state['add_calls']
+            rc, out, err = (
+                add_results[idx] if idx < len(add_results) else add_results[-1]
+            )
+            state['add_calls'] += 1
+            if rc == 0:
+                target.mkdir(parents=True, exist_ok=True)
+            return (rc, out, err)
+        if 'rev-parse' in cmd:
+            return (0, f'{rev_parse_sha}\n', '')
+        return (0, '', '')
+
+    return _fake_run
+
+
+class TestCreateMergeWorktreeRetry:
+    """step-5: the recurring cross-task flake, absorbed.
+
+    Five archived occurrences under ``data/verify-logs`` (2026-08-10 ->
+    2026-09-06) blocked a merge outright on a single non-zero
+    ``git worktree add`` rc. With the shared driver wired in, the transient
+    shapes are retried and the merge proceeds.
+
+    RED on base: ``_create_merge_worktree`` is single-shot, so the first
+    non-zero rc raises ``RuntimeError`` and every case here fails.
+    """
+
+    def test_transient_4215_shape_is_absorbed_and_the_worktree_is_returned(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body():
+            return await git_ops._create_merge_worktree(base_sha=BASE_SHA)
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_make_fake_merge_run(
+                    [(1, '', TRANSIENT_4215_STDERR), (0, '', '')], calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            path, sha = asyncio.run(_body())
+
+        assert sha == BASE_SHA
+        assert path.parent == git_ops.worktree_base, (
+            f'expected the minted path under worktree_base; got {path}'
+        )
+        assert path.name.startswith('_merge-'), (
+            f'expected a _merge-<hex> directory name; got {path.name!r}'
+        )
+        adds = _add_argvs(calls)
+        assert len(adds) == 2, f'expected the flake to be retried once; got {len(adds)} adds'
+        assert mock_sleep.await_args_list == [call(0.5)], (
+            f'expected exactly one 0.5s backoff; got {mock_sleep.await_args_list}'
+        )
+
+    def test_retry_reuses_the_same_minted_path(self, tmp_path: Path) -> None:
+        """One uuid is minted per CALL, not per attempt — so nothing else can
+        own the path and the between-attempts rmtree is safe."""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body():
+            return await git_ops._create_merge_worktree(base_sha=BASE_SHA)
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_make_fake_merge_run(
+                    [(1, '', TRANSIENT_4545_STDERR), (0, '', '')], calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            path, _sha = asyncio.run(_body())
+
+        adds = _add_argvs(calls)
+        detach_targets = {c[c.index('--detach') + 1] for c in adds}
+        assert detach_targets == {str(path)}, (
+            f'expected both attempts to target the single minted path {path}; '
+            f'got {detach_targets}'
+        )
+
+    def test_base_sha_none_branch_also_retries(self, tmp_path: Path) -> None:
+        """The main-HEAD branch (the normal merge path) inherits the retry
+        too, and still returns main's rev-parsed SHA, stripped."""
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body():
+            return await git_ops._create_merge_worktree()
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_make_fake_merge_run(
+                    [(1, '', TRANSIENT_4215_STDERR), (0, '', '')], calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            path, sha = asyncio.run(_body())
+
+        assert sha == MAIN_HEAD_SHA, (
+            f"expected main's rev-parsed SHA stripped of its newline; got {sha!r}"
+        )
+        assert path.name.startswith('_merge-')
+        adds = _add_argvs(calls)
+        assert len(adds) == 2, f'expected 2 adds on the base_sha=None branch; got {len(adds)}'
+        # The add must target main_branch, not a raw sha, on this branch.
+        assert adds[0][-1] == git_ops.config.main_branch, (
+            f'expected the add to check out {git_ops.config.main_branch!r}; got {adds[0][-1]!r}'
+        )
