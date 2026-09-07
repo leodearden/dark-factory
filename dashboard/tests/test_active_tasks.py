@@ -3502,3 +3502,302 @@ class TestCountUnknownProjectsAreNamedOnTheWire:
             'never measured must still be NAMED, or it renders as a healthy '
             f'project with a confident "0 done"; got {count_unknown!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# workstream C cause 2 (task 4884, #4795): the per-root walk is CONCURRENT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCollectTasksWithCountsConcurrency:
+    """The per-root walk must be parallel-but-bounded, and still deterministic.
+
+    The starvation this closes is arithmetic. The walk used to be SEQUENTIAL,
+    so with N roots the wall clock was the SUM of the per-root costs against a
+    single ``_TASKS_TOTAL_BUDGET`` — and the incident's 9 roots could not fit,
+    so the same trailing roots were reported degraded on every render
+    (``project pump-web-ui: skipped — the 20.0s Tasks budget was already
+    spent``). Concurrency at width W turns the worst case into roughly
+    ``ceil(N / W) * _TASKS_PER_PROJECT_BUDGET``.
+
+    (a) and (b) are the fix. (c)-(f) are the REGRESSION FENCE around it: the
+    offline/degraded/order semantics are load-bearing product facts and
+    concurrency is exactly the kind of change that quietly breaks them, so
+    they are asserted here rather than assumed to be covered elsewhere.
+    """
+
+    def _n_root_config(self, tmp_path, n: int) -> DashboardConfig:
+        """A config with *n* roots: the primary plus ``n - 1`` known roots."""
+        roots = []
+        for i in range(n):
+            root = tmp_path / f'proj-{i:02d}'
+            root.mkdir()
+            roots.append(root)
+        return DashboardConfig(
+            project_root=roots[0], known_project_roots=roots[1:],
+        )
+
+    def _tracking_stub(self, monkeypatch, *, dwell: float = 0.05, rows=None,
+                       offline_for=None, raise_for=None):
+        """Patch ``_shape_one_project`` with a stub that records enter/exit.
+
+        Returns the shared ``events`` list of ``(label, 'enter'|'exit', t)``.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        events: list[tuple[str, str, float]] = []
+        offline_for = set(offline_for or ())
+        raise_for = set(raise_for or ())
+
+        async def _stub(client, config, project_root, **kwargs):
+            label = project_root.name
+            loop = asyncio.get_running_loop()
+            events.append((label, 'enter', loop.time()))
+            try:
+                await asyncio.sleep(dwell)
+                if label in raise_for:
+                    raise RuntimeError(f'shaping blew up for {label}')
+                if label in offline_for:
+                    return [], True, 0
+                row = (
+                    [dict(rows_for_label) for rows_for_label in rows(label)]
+                    if rows is not None
+                    else [{'_task_uid': f'{label}/T-1', 'project': label}]
+                )
+                return row, False, 7
+            finally:
+                events.append((label, 'exit', asyncio.get_running_loop().time()))
+
+        monkeypatch.setattr(at_mod, '_shape_one_project', _stub)
+        return events
+
+    @staticmethod
+    def _max_simultaneous(events) -> int:
+        """Peak number of roots inside the stub at once, from the event log."""
+        live = peak = 0
+        for _label, kind, _t in sorted(events, key=lambda e: (e[2], e[1] == 'enter')):
+            if kind == 'enter':
+                live += 1
+                peak = max(peak, live)
+            else:
+                live -= 1
+        return peak
+
+    async def test_walk_saturates_the_semaphore_and_never_exceeds_it(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(a) The peak in-flight root count is EXACTLY the configured width.
+
+        Asserting equality rather than ``> 1`` is deliberate and is the whole
+        value of this test: a semaphore that is present but never saturated
+        proves nothing (the walk could still be effectively serial), and an
+        unbounded ``gather`` would show all 9 — the ``httpx.PoolTimeout``
+        hazard ``burndown.py`` records against the shared client.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        events = self._tracking_stub(monkeypatch)
+
+        await collect_tasks_with_counts(client=dummy_client, config=config)
+
+        peak = self._max_simultaneous(events)
+        assert peak == at_mod._TASKS_ROOT_CONCURRENCY, (
+            f'peak in-flight roots was {peak}, expected exactly '
+            f'_TASKS_ROOT_CONCURRENCY={at_mod._TASKS_ROOT_CONCURRENCY} over 9 '
+            'roots — 1 means the sequential walk that starved the tail is '
+            'still in place, 9 means the semaphore is missing (an unbounded '
+            'fan-out against the single fused-memory server on the httpx '
+            'client the 3s render polls share), and anything strictly between '
+            '1 and the width means the semaphore is never saturated so the '
+            'concurrency it claims to provide is not actually delivered'
+        )
+
+    async def test_wall_clock_is_ceil_n_over_w_not_n(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(b) Elapsed time tracks ``ceil(N/W)`` waves, not N sequential roots.
+
+        This is the assertion that actually pins the user-visible symptom —
+        "a cold render costs the entire 20 s budget and the tail degrades".
+        """
+        import math
+
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        dwell = 0.05
+        self._tracking_stub(monkeypatch, dwell=dwell)
+
+        started = time.monotonic()
+        await collect_tasks_with_counts(client=dummy_client, config=config)
+        elapsed = time.monotonic() - started
+
+        waves = math.ceil(9 / at_mod._TASKS_ROOT_CONCURRENCY)
+        concurrent_cost = waves * dwell
+        sequential_cost = 9 * dwell
+        # Generous tolerance: this asserts the SHAPE of the cost (waves, not
+        # roots), not a latency budget. The midpoint is the only threshold
+        # that cannot be met by the wrong implementation.
+        midpoint = (concurrent_cost + sequential_cost) / 2
+        assert elapsed < midpoint, (
+            f'the 9-root walk took {elapsed:.3f}s, closer to the sequential '
+            f'{sequential_cost:.3f}s than to the concurrent {concurrent_cost:.3f}s '
+            f'({waves} waves at width {at_mod._TASKS_ROOT_CONCURRENCY}) — the '
+            'roots are still being walked one at a time, which is the cost '
+            'model that made the cold render exhaust _TASKS_TOTAL_BUDGET'
+        )
+
+    async def test_row_order_is_root_order_not_completion_order(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(c) Concurrency must not be allowed to reorder the payload.
+
+        The Tasks tab renders ``all_active`` directly, so completion order
+        leaking into the payload would reshuffle the table on every 3 s poll.
+        The stub finishes roots in REVERSE root order to force the issue.
+        """
+        config = self._n_root_config(tmp_path, 6)
+        _register_runtime(monkeypatch, {})
+
+        async def _stub(client, config_, project_root, **kwargs):
+            label = project_root.name
+            # Earlier roots dwell LONGER, so completion order is the reverse
+            # of root order and an append-as-you-finish implementation would
+            # emit proj-05 first.
+            await asyncio.sleep(0.01 * (6 - int(label.split('-')[1])))
+            return [{'_task_uid': f'{label}/T-1', 'project': label}], False, 1
+
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._shape_one_project', _stub,
+        )
+
+        active, _offline, _counts, _degraded, _unknown = (
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+        )
+
+        got = [row['project'] for row in active]
+        assert got == [f'proj-{i:02d}' for i in range(6)], (
+            f'rows came back in {got}, not primary-first ROOT order — the '
+            'concurrent walk is appending rows from inside the per-root '
+            'coroutines, so completion order (here deliberately the reverse) '
+            'leaks into the rendered table'
+        )
+
+    async def test_degraded_is_preserved_under_concurrency(
+        self, monkeypatch, tmp_path, dummy_client, caplog,
+    ):
+        """(d) A root the budget never served is degraded, not offline, and has NO count."""
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        # Each root costs more than its own share, and the total admits only
+        # the first wave or two.
+        self._tracking_stub(monkeypatch, dwell=0.05)
+        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.03)
+        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 0.12)
+
+        with caplog.at_level(logging.WARNING):
+            active, offline, counts, degraded, _unknown = (
+                await collect_tasks_with_counts(client=dummy_client, config=config)
+            )
+
+        assert degraded, (
+            'no root was reported degraded even though the total budget '
+            'admitted only a fraction of the 9 roots — a root the handler '
+            'never served must be NAMED, or it renders as "no active work"'
+        )
+        served = {row['project'] for row in active}
+        for label in degraded:
+            assert label not in served, f'{label} is both degraded and served'
+            assert label not in counts, (
+                f'{label} timed out but carries a done_count of '
+                f'{counts.get(label)!r} — no count was measured, so none may '
+                'be fabricated (not even a 0, which renders as a confident '
+                '"this project has zero done tasks")'
+            )
+            assert label not in offline, (
+                f'{label} is reported BOTH degraded and offline — the two are '
+                'distinct facts: offline means the read demonstrably failed, '
+                'degraded means the budget expired so the state is UNKNOWN. '
+                'Merging them tells an operator to restart a healthy service.'
+            )
+
+    async def test_offline_is_preserved_under_concurrency(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(e) #4795 acceptance 3: a genuinely unreachable root still reports OFFLINE.
+
+        Acceptance 1 (a clean cold render) may not be bought by widening
+        budgets until nothing can fail — so the offline marker must survive
+        the concurrency change under a budget generous enough that nothing
+        degrades.
+        """
+        config = self._n_root_config(tmp_path, 4)
+        _register_runtime(monkeypatch, {})
+        self._tracking_stub(monkeypatch, dwell=0.0, offline_for={'proj-02'})
+
+        active, offline, counts, degraded, _unknown = (
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+        )
+
+        assert offline == ['proj-02'], (
+            f'expected proj-02 offline, got offline={offline!r} — a fetch that '
+            'demonstrably failed must still be reported offline under the '
+            'concurrent walk'
+        )
+        assert 'proj-02' not in degraded, (
+            'proj-02 is offline (the read failed), not degraded (the budget '
+            'expired) — the concurrent walk must not collapse the two'
+        )
+        assert 'proj-02' not in counts, (
+            'an offline project must contribute no done_count'
+        )
+        assert {row['project'] for row in active} == {
+            'proj-00', 'proj-01', 'proj-03',
+        }, 'one offline root must not cost the other three their rows'
+
+    async def test_broad_exception_path_is_preserved_under_concurrency(
+        self, monkeypatch, tmp_path, dummy_client, caplog,
+    ):
+        """(f) A raising root is marked offline and the other eight still render.
+
+        The broad ``except Exception`` must stay INSIDE the per-root unit. If
+        it moved out to the gather, one shaping bug would unwind the whole
+        walk and 500 the handler — the "one bad root blanks the whole tab"
+        failure relocated from the banner to the aggregator.
+        """
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        self._tracking_stub(monkeypatch, dwell=0.0, raise_for={'proj-04'})
+
+        with caplog.at_level(logging.WARNING):
+            active, offline, _counts, degraded, _unknown = (
+                await collect_tasks_with_counts(client=dummy_client, config=config)
+            )
+
+        assert offline == ['proj-04'], (
+            f'expected proj-04 offline after it raised, got {offline!r}'
+        )
+        assert 'proj-04' not in degraded, (
+            'a root that RAISED is offline (the read demonstrably failed), '
+            'never degraded (which means the budget expired first)'
+        )
+        assert len(active) == 8, (
+            f'only {len(active)} of the 8 healthy roots rendered — one root '
+            'raising must not unwind the concurrent gather and take the '
+            'others with it; the broad except must stay inside the per-root '
+            'coroutine'
+        )
+        assert any(
+            'proj-04' in rec.message or 'proj-04' in str(rec.args)
+            for rec in caplog.records
+        ), (
+            'the raising root was absorbed into an offline marker with no '
+            'WARNING — an exception logged as a routine outage is a bug that '
+            'renders as an outage forever'
+        )
