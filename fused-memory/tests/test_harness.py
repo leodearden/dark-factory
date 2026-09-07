@@ -19861,6 +19861,33 @@ def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
     return _orch_queue_dir(tmp_path)
 
 
+def _wire_remediation_tree(harness, task_ids):
+    """Make `_run_remediation_pass` see a task tree containing *task_ids*.
+
+    The remediation pass builds `task_by_id` from the FilteredTaskTree, and the
+    routed-filing existence gate reads it. Under the plain `mock_memory_service`
+    fixture `_fetch_filtered_task_tree` degrades to an EMPTY tree (the taskmaster
+    call is an unawaited AsyncMock), which puts the gate on its fail-OPEN branch
+    — correct behaviour, but not the branch a test about task existence wants to
+    exercise. Wiring a real tree here is what lets a test distinguish "the tree
+    says no such task" from "there is no tree".
+    """
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+    tree = FilteredTaskTree(
+        active_tasks=[
+            {'id': tid, 'status': 'pending', 'title': f'task {tid}', 'metadata': {}}
+            for tid in task_ids
+        ],
+    )
+
+    async def _fetch(_project_root, _tree=tree):
+        return _tree
+
+    harness._fetch_filtered_task_tree = _fetch
+    return tree
+
+
 def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
@@ -19922,18 +19949,19 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
     """THE LOAD-BEARING ASSERTION — the record reaches the ladder without
     answering YES to any level-1 guard.
 
-    `EscalationQueue.has_open_l1` is LEVEL-1-ONLY (`escalation/queue.py`:
+    `EscalationQueue.has_open_l1` is LEVEL-1-ONLY
+    (`escalation/queue.py::EscalationQueue.has_open_l1`, which delegates to
     `get_by_task(task_id, status='pending', level=1)`), and the orchestrator
-    reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at
-    guards that divert or suppress real work:
-
-      - `orchestrator/harness.py:7532`  `_file_external_dep_block`
-      - `orchestrator/harness.py:8356`  cross-repo dep filer
-      - `orchestrator/harness.py:8478`  substrate-flip filer
-      - `orchestrator/harness.py:12985` `_reap_orphan_l0_escalations` (dismiss)
-      - `orchestrator/harness.py:13912` sentinel filer
-      - `orchestrator/workflow.py:13961` `_await_steward_completion`
-      - `orchestrator/workflow.py:17218` the requeue-diversion override
+    reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at a
+    spread of guards that divert or suppress real work: the external-dep,
+    cross-repo and substrate-flip block-and-escalate paths and the orphan-L0
+    reaper's DISMISS branch in `orchestrator/harness.py`, plus
+    `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`. That
+    population is enumerated authoritatively, in `path::symbol` form, in the
+    `FINDING_TASK_ESCALATION_LEVEL` comment block of
+    `fused_memory/reconciliation/finding_task_escalation.py` — read it there
+    rather than restating it, and do not reintroduce bare line pins (CLAUDE.md:
+    cite as `path/to/module.py::symbol`, never `module.py:1234`).
 
     A recon-authored L1 would answer YES to every one of them, turning a
     PASSIVE observation into a gate on dispatch. The two assertions below are
@@ -19942,7 +19970,7 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
     own ladder, it simply is not an L1.
 
     Do not weaken either half: raising the level to satisfy some future dedupe
-    convenience silently re-opens all seven sites at once.
+    convenience silently re-opens every one of those sites at once.
     """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
@@ -19957,7 +19985,8 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
     # (1) Invisible to every uncategorized L1 guard above.
     assert queue.has_open_l1('4458') is False, (
         'a routed recon finding must NOT register as an open L1 — that is the '
-        'signal seven orchestrator guards read as "a human is handling this task"'
+        'signal every uncategorized orchestrator guard reads as "a human is '
+        'handling this task"'
     )
 
     # (2) ...while still landing on task 4458's own ladder. This is the
@@ -20017,19 +20046,32 @@ def test_file_finding_task_escalation_folds_across_cycles(
 def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
-    """Dedupe matrix (b) and (c): only a SAME-(level, category) record folds.
+    """Dedupe matrix (b) and (c): only a SAME-CATEGORY record folds.
 
     (b) A pending LEVEL-0 record of a different category must not swallow a
-        recon finding — the `category` half of the scan filter. Without it, a
-        lingering `risk_identified` INFO on the task would silently suppress
-        every recon finding for that task forever, the failure mode
-        `has_open_l1`'s own category filter (task 2757) exists to prevent.
+        recon finding — the `category` filter, which is the ONLY filter the
+        scan applies. Without it, a lingering `risk_identified` INFO on the
+        task would silently suppress every recon finding for that task forever,
+        the failure mode `has_open_l1`'s own category filter (task 2757) exists
+        to prevent.
 
-    (c) A pending LEVEL-1 record must not suppress either — NEW, and worth
-        pinning explicitly. The filer no longer reads L1s at all, so a future
-        refactor back to `has_open_l1` would silently reintroduce exactly the
-        suppression (b) forbids, via the level axis instead of the category
-        one. This test is what makes that refactor fail loudly.
+    (c) A pending LEVEL-1 record OF A DIFFERENT CATEGORY must not suppress
+        either. The scan is level-BLIND (see
+        `test_promoted_record_folds_the_next_cycle` for why), so the category
+        filter is doing all the work on this axis too: a refactor to an
+        UNCATEGORIZED `has_open_l1(task_id)` read — "is any human on this
+        task?" — would start swallowing recon findings behind an unrelated open
+        L1, and this case is what makes that fail loudly.
+
+    NOTE the deliberate change of shape from an earlier revision, which used a
+    SAME-category L1 here to pin that no L1 ever suppresses. That is no longer
+    the contract: a same-category L1 is this filer's OWN record after the
+    orphan reaper promoted it, and folding onto it is required — see
+    `test_promoted_record_folds_the_next_cycle`. The refactor-to-`has_open_l1`
+    guard this case used to provide is not lost: `has_open_l1` is level-1-only,
+    so it cannot see the pending L0 that
+    `test_file_finding_task_escalation_folds_across_cycles` pins, and that test
+    fails under either the categorized or the uncategorized spelling.
     """
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -20052,14 +20094,14 @@ def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
         summary='Task 4458 starved for 6h',
         level=0,
     ))
-    # (c) Same task, same category, LEVEL 1 — the axis a refactor back to
-    # has_open_l1 would start reading.
+    # (c) Same task, DIFFERENT category, LEVEL 1 — an unrelated human-facing
+    # record, the thing an uncategorized has_open_l1 read would fold onto.
     queue.submit(Escalation(
         id=queue.make_id('4458'),
         task_id='4458',
-        agent_role='reconciler',
+        agent_role='steward',
         severity='blocking',
-        category=FINDING_TASK_ESCALATION_CATEGORY,
+        category='scope_violation',
         summary='Escalated by a human to L1',
         level=1,
     ))
@@ -20067,14 +20109,75 @@ def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
     esc_id = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
 
     assert esc_id, (
-        'neither an unrelated level-0 record nor ANY level-1 record may '
-        'suppress a recon finding'
+        'neither an unrelated level-0 record nor an unrelated level-1 record '
+        'may suppress a recon finding'
     )
     filed = [
         e for e in EscalationQueue(queue_dir).get_pending()
         if e.category == FINDING_TASK_ESCALATION_CATEGORY and e.level == 0
     ]
     assert [e.id for e in filed] == [esc_id]
+
+
+def test_promoted_record_folds_the_next_cycle(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """file -> promote-to-L1 -> refile must NOT produce a second record.
+
+    This is the unbounded-churn regression (esc-4821 amendment pass). The
+    filer writes at level 0, and
+    `orchestrator/harness.py::Harness._reap_orphan_l0_escalations` promotes an
+    aged pending L0 to L1 — with no category filter, and gated on the task
+    having NO live workflow, which is the very condition under which this filer
+    fires at all. So every record it writes is born eligible for promotion.
+
+    Under the earlier `level == 0 and category == ...` dedupe scan, promotion
+    broke the fold: the next reconciliation cycle saw no matching L0 and filed
+    a fresh one, which the reaper then DISMISSED as a duplicate of the open L1
+    (its `has_open_l1` branch). One born-and-dismissed record per cycle,
+    forever, on a task already represented by an open L1.
+
+    Making the scan level-BLIND folds onto the promoted record instead — the
+    L1 *is* this finding, escalated. The promotion is simulated here by
+    rewriting the record's level in place, exactly as the reaper does.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first, 'the first filing must land'
+
+    # Simulate the orphan reaper promoting it: same record, level 1, still
+    # pending. (The reaper mutates level via its own escalate path; what the
+    # dedupe scan sees is only the stored level, so rewriting it is faithful.)
+    queue = EscalationQueue(queue_dir)
+    promoted = queue.get_by_task('4458', status='pending')
+    assert len(promoted) == 1
+    promoted[0].level = 1
+    (queue_dir / f'{first}.json').write_text(promoted[0].to_json())
+    assert queue.has_open_l1('4458') is True, 'promotion must be visible as an open L1'
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert second is None, (
+        f'the promoted L1 already represents this finding; refiling an L0 here '
+        f'is the unbounded churn loop (the reaper dismisses it, next cycle '
+        f'files another). Got {second!r}'
+    )
+    routed = [
+        e for e in EscalationQueue(queue_dir).get_pending()
+        if e.category == FINDING_TASK_ESCALATION_CATEGORY
+    ]
+    assert [e.id for e in routed] == [first], (
+        f'exactly one routed record must survive promotion, got '
+        f'{[(e.id, e.level) for e in routed]}'
+    )
 
 
 def test_resolved_prior_record_does_not_suppress_a_refile(
@@ -20186,127 +20289,6 @@ def test_queue_submit_failure_is_swallowed_and_warned(
     )
 
 
-@pytest.mark.asyncio
-async def test_persistent_finding_naming_a_task_lands_on_both_queues(
-    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
-):
-    """THE ACCEPTANCE TEST — item (c) of task 4764's acceptance sketch.
-
-    A recon finding tagged with a task id must land as a QUEUED ESCALATION ON
-    THAT TASK, not merely as a note in memory. Driven through a real full cycle
-    plus remediation pass, so it exercises the production call site rather than
-    the filer in isolation.
-
-    Two assertions, and the second matters as much as the first:
-
-    (1) the NEW orchestrator-queue record lands under the finding's REAL task id;
-    (2) NO REGRESSION — the existing `recon_integrity_issue` still lands on the
-        RECON queue with its synthetic `recon-<run8>` task id, unchanged. The
-        recon-queue filing is not replaced or displaced by the new one; the two
-        queues have different readers and both must keep working.
-    """
-    import uuid as _uuid
-
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
-    from fused_memory.reconciliation.finding_task_escalation import (
-        FINDING_TASK_ESCALATION_CATEGORY,
-    )
-    from fused_memory.reconciliation.harness import (
-        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
-    )
-
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
-    # The RECON queue (config.escalation_queue_dir, port-8103 watcher) — a
-    # DIFFERENT directory from the per-project orchestrator queue below.
-    recon_queue = EscalationQueue(tmp_path / 'recon-esc')
-    harness._escalation_queue = recon_queue
-    orch_queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
-
-    # No cited_tasks: the live-workflow gate iterates cited task ids only, so an
-    # empty list leaves `any_live` False and the escalation branch is reached.
-    finding = _orch_finding()
-    assert finding['actionable'] is True
-
-    # Seed N-2 prior completed runs; the parent full run and the remediation run
-    # supply the remaining two, so persistence reaches the threshold exactly.
-    n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
-    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
-    for i in range(n_seed):
-        run_id = str(_uuid.uuid4())
-        await journal.start_run(ReconciliationRun(
-            id=run_id,
-            project_id='test-project',
-            run_type=RunType.full,
-            trigger_reason='buffer_size:1',
-            started_at=base_time + timedelta(minutes=i),
-            events_processed=1,
-            status=RunStatus.running,
-        ))
-        await journal.update_run_stage_reports(run_id, {
-            'integrity_check': {'items_flagged': [finding]},
-        })
-        await journal.complete_run(run_id, 'completed')
-
-    await event_buffer.push(_make_event())
-
-    async def s3_always_returns_finding(
-        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2],
-    ):
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[finding],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    _mock_stage_run(harness.stages[0])
-    _mock_stage_run(harness.stages[1])
-    harness.stages[2].run = s3_always_returns_finding
-
-    await harness.run_full_cycle('test-project', 'buffer_size:1')
-
-    # (1) THE NEW BEHAVIOUR — a record on task 4458's own ladder.
-    orch_pending = EscalationQueue(orch_queue_dir).get_pending()
-    routed = [e for e in orch_pending if e.category == FINDING_TASK_ESCALATION_CATEGORY]
-    assert len(routed) == 1, (
-        f'expected exactly one routed record on the orchestrator queue, got '
-        f'{[(e.id, e.category) for e in orch_pending]}'
-    )
-    esc = routed[0]
-    assert esc.task_id == '4458', (
-        f'the finding named task 4458; get_by_task filters on the STORED task_id '
-        f'field, so this is what decides whether it surfaces there. Got {esc.task_id!r}'
-    )
-    assert esc.id.startswith('esc-4458-'), f'unexpected id stem: {esc.id!r}'
-    assert esc.level == 0, 'routed records stay off the level-1 guard surface'
-    assert json.loads(esc.detail)['persistence'] >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
-
-    # (2) NO REGRESSION — the recon-queue filing is untouched.
-    recon_pending = recon_queue.get_pending()
-    integrity = [
-        e for e in recon_pending
-        if e.category == 'recon_integrity_issue'
-        and e.summary.startswith('Persistently unresolved after remediation')
-    ]
-    assert len(integrity) == 1, (
-        f'the pre-existing recon_integrity_issue filing must be unchanged, got '
-        f'{[(e.id, e.category, e.summary) for e in recon_pending]}'
-    )
-    assert integrity[0].task_id.startswith('recon-'), (
-        f'the recon queue keeps its synthetic recon-<run8> task id, got '
-        f'{integrity[0].task_id!r}'
-    )
-
-    # The two records are on genuinely different queues, under different ids.
-    assert integrity[0].task_id != esc.task_id
-    assert orch_queue_dir != recon_queue.queue_dir
-
-
 async def _drive_cycle(harness, journal, event_buffer, finding, *, n_seed):
     """Seed *n_seed* prior completed runs flagging *finding*, then run a cycle."""
     import uuid as _uuid
@@ -20361,6 +20343,95 @@ def _routed_records(orch_queue_dir):
         e for e in EscalationQueue(orch_queue_dir).get_pending()
         if e.category == FINDING_TASK_ESCALATION_CATEGORY
     ]
+
+
+@pytest.mark.asyncio
+async def test_persistent_finding_naming_a_task_lands_on_both_queues(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """THE ACCEPTANCE TEST — item (c) of task 4764's acceptance sketch.
+
+    A recon finding tagged with a task id must land as a QUEUED ESCALATION ON
+    THAT TASK, not merely as a note in memory. Driven through a real full cycle
+    plus remediation pass, so it exercises the production call site rather than
+    the filer in isolation.
+
+    Two assertions, and the second matters as much as the first:
+
+    (1) the NEW orchestrator-queue record lands under the finding's REAL task id;
+    (2) NO REGRESSION — the existing `recon_integrity_issue` still lands on the
+        RECON queue with its synthetic `recon-<run8>` task id, unchanged. The
+        recon-queue filing is not replaced or displaced by the new one; the two
+        queues have different readers and both must keep working.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # The RECON queue (config.escalation_queue_dir, port-8103 watcher) — a
+    # DIFFERENT directory from the per-project orchestrator queue below.
+    recon_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness._escalation_queue = recon_queue
+    orch_queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    # A real remediation tree containing task 4458, so this test crosses the
+    # existence gate the way production does rather than on its fail-open
+    # branch (see `test_routed_target_absent_from_the_remediation_tree_...`).
+    _wire_remediation_tree(harness, ['4458'])
+
+    # No cited_tasks: the live-workflow gate iterates cited task ids only, so an
+    # empty list leaves `any_live` False and the escalation branch is reached.
+    finding = _orch_finding()
+    assert finding['actionable'] is True
+
+    # Seed N-2 prior completed runs; the parent full run and the remediation run
+    # supply the remaining two, so persistence reaches the threshold exactly.
+    await _drive_cycle(
+        harness, journal, event_buffer, finding,
+        n_seed=max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2),
+    )
+
+    # (1) THE NEW BEHAVIOUR — a record on task 4458's own ladder.
+    orch_pending = EscalationQueue(orch_queue_dir).get_pending()
+    routed = [e for e in orch_pending if e.category == FINDING_TASK_ESCALATION_CATEGORY]
+    assert len(routed) == 1, (
+        f'expected exactly one routed record on the orchestrator queue, got '
+        f'{[(e.id, e.category) for e in orch_pending]}'
+    )
+    esc = routed[0]
+    assert esc.task_id == '4458', (
+        f'the finding named task 4458; get_by_task filters on the STORED task_id '
+        f'field, so this is what decides whether it surfaces there. Got {esc.task_id!r}'
+    )
+    assert esc.id.startswith('esc-4458-'), f'unexpected id stem: {esc.id!r}'
+    assert esc.level == 0, 'routed records stay off the level-1 guard surface'
+    assert json.loads(esc.detail)['persistence'] >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    # (2) NO REGRESSION — the recon-queue filing is untouched.
+    recon_pending = recon_queue.get_pending()
+    integrity = [
+        e for e in recon_pending
+        if e.category == 'recon_integrity_issue'
+        and e.summary.startswith('Persistently unresolved after remediation')
+    ]
+    assert len(integrity) == 1, (
+        f'the pre-existing recon_integrity_issue filing must be unchanged, got '
+        f'{[(e.id, e.category, e.summary) for e in recon_pending]}'
+    )
+    assert integrity[0].task_id.startswith('recon-'), (
+        f'the recon queue keeps its synthetic recon-<run8> task id, got '
+        f'{integrity[0].task_id!r}'
+    )
+
+    # The two records are on genuinely different queues, under different ids.
+    assert integrity[0].task_id != esc.task_id
+    assert orch_queue_dir != recon_queue.queue_dir
 
 
 # The four tests below are the VOLUME-PARITY guarantee made executable. Each
@@ -20494,6 +20565,93 @@ async def test_finding_suppressed_by_the_live_workflow_gate_is_not_routed(
         e for e in harness._escalation_queue.get_pending()
         if e.summary.startswith('Persistently unresolved after remediation')
     ] == []
+
+
+@pytest.mark.asyncio
+async def test_routed_target_absent_from_the_remediation_tree_is_not_filed(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A finding naming a task that does not exist files NOTHING on the ladder.
+
+    Stage-3 findings are LLM-authored free text, and the bare-`task_id` branch
+    of `resolve_finding_task_target` INTERPRETS whatever string it finds as a
+    task in this project — it does not confirm one exists. Without an existence
+    gate a hallucinated or stale id ('9999' here; a subtask spelling like
+    '4458.2' is the other shape) files `esc-9999-N` onto the orchestrator queue,
+    and `orchestrator/harness.py::Harness._reap_orphan_l0_escalations` scans
+    `get_pending()` with NO task-existence check — so after
+    `orphan_l0_timeout_secs` the phantom L0 is promoted into a phantom L1 in
+    front of a human.
+
+    The same hazard is already reasoned about, for the comma-joined case, in
+    `finding_task_escalation.py::_sole_task_id_part`'s docstring; this closes it
+    for the hallucinated-id case.
+
+    (b) is the narrowness check, as everywhere else in this group: the
+    recon-queue `_escalate` filing is UNAFFECTED, so the finding is not lost —
+    it simply does not manufacture a ladder record against a task that is not
+    there.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    # A populated tree that does NOT contain 9999 — the gate needs a tree to
+    # read, or it (deliberately) fails open. See the next test.
+    _wire_remediation_tree(harness, ['4458', '4764'])
+
+    finding = _orch_finding(task_id='9999', affected_ids=['9999'])
+
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=4)
+
+    assert _routed_records(orch_dir) == [], (
+        'task 9999 is not in the remediation tree; routing it would file '
+        'esc-9999-N, which the orphan reaper eventually promotes to a phantom L1'
+    )
+    assert [
+        e for e in harness._escalation_queue.get_pending()
+        if e.summary.startswith('Persistently unresolved after remediation')
+    ] != [], (
+        'the existence gate must narrow only the NEW routed filing — the '
+        'recon-queue escalation for this finding still files today and must'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_task_tree_does_not_disable_routing(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """The existence gate fails OPEN when there is no tree to read.
+
+    `_fetch_filtered_task_tree` degrades to an EMPTY FilteredTaskTree whenever
+    taskmaster is disabled or the fetch fails — so an empty `task_by_id` is
+    evidence that we do not KNOW which tasks exist, never evidence that a task
+    is absent. Reading it as absence would switch this whole arm off for the
+    duration of any taskmaster hiccup: a total, silent loss of the feature,
+    which is exactly the degradation the surrounding gate already refuses (its
+    coverage caveat degrades a missing entry to the fail-safe value for that ONE
+    id, not for every id).
+
+    This test is the pin on that direction. It is deliberately the ONLY thing
+    separating the gate from a one-character change (`task_by_id and ...` ->
+    `...`) that would look like a simplification.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    # No tree at all — the shape a failed/disabled taskmaster fetch produces.
+    _wire_remediation_tree(harness, [])
+
+    await _drive_cycle(harness, journal, event_buffer, _orch_finding(), n_seed=4)
+
+    routed = _routed_records(orch_dir)
+    assert [e.task_id for e in routed] == ['4458'], (
+        f'with no task tree the gate has no evidence of absence and must not '
+        f'suppress; got {[(e.id, e.task_id) for e in routed]}'
+    )
 
 
 @pytest.mark.asyncio

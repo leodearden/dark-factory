@@ -42,6 +42,7 @@ from typing import Any
 
 __all__ = [
     'FINDING_TASK_ESCALATION_CATEGORY',
+    'FINDING_TASK_ESCALATION_LEVEL',
     'build_finding_task_escalation_kwargs',
     'resolve_finding_task_target',
 ]
@@ -78,16 +79,27 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # collision — only the level can.  It is level-1-ONLY, so a level-0 record is
 # invisible to every one of them by construction:
 #
-#   - `orchestrator/harness.py::_file_external_dep_block` and the sibling
-#     cross-repo and substrate-flip filers, each of which skips filing when an
-#     L1 is already open;
-#   - `orchestrator/harness.py::_reap_orphan_l0_escalations`, which DISMISSES
-#     an orphan L0 rather than promoting it when an L1 is open;
-#   - `orchestrator/workflow.py::_await_steward_completion` and the
-#     requeue-diversion source-of-truth override, which divert a task's
-#     workflow on the strength of an open L1.
+#   - `orchestrator/harness.py::Harness._block_and_escalate_external_dep`, and
+#     its siblings `::Harness._block_and_escalate_cross_repo` and
+#     `::Harness._block_and_escalate_substrate_flip`, each of which SUPPRESSES
+#     its own human-facing L1 and downgrades to a WARNING log when one is
+#     already open;
+#   - `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`, which
+#     DISMISSES a pending orphan L0 on the task rather than promoting it when
+#     an L1 is open;
+#   - `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`, which
+#     raises `_StewardReescalated` and diverts the workflow on the strength of
+#     an open L1.
 #
-# That is the population this closes.  A passive observation must not start
+# That is the population this closes.  Two classes of `has_open_l1` reader are
+# deliberately NOT in it, and were re-measured rather than assumed: the
+# sentinel filers (`_ARCHIVAL_STORM_SENTINEL`, `_SCHEDULER_PAUSE_SENTINEL`, the
+# `main-sweep-<sha12>` tip sweep, ...) key on SYNTHETIC ids that no real task id
+# can collide with, and the CATEGORIZED reads in `orchestrator/workflow.py`
+# pass their own `category=`, which `FINDING_TASK_ESCALATION_CATEGORY` never
+# matches.  Keep this list in `path::symbol` form (CLAUDE.md) — an earlier
+# revision carried bare line pins and two of them had already drifted onto
+# unrelated statements.  A passive observation must not start
 # gating dispatch as a side effect of a PLUMBING change, and level 0 is the
 # only spelling that guarantees it — pinned executably by
 # `test_routed_record_is_invisible_to_the_orchestrator_l1_guards`.
@@ -110,7 +122,17 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # (liveness, hold state, duplicate suppression), while an attended one is
 # correctly folded away.  Re-deriving any of that at this filer would mean
 # re-deriving all three signals from a process that cannot see them.
-_ESCALATION_LEVEL = 0
+#
+# PUBLIC (and in `__all__`), like `FINDING_TASK_ESCALATION_CATEGORY` above:
+# the level a routed record is filed at is part of this module's CROSS-MODULE
+# contract, not an implementation detail.  It is what
+# `ReconciliationHarness._file_finding_task_escalation`'s docstring, the
+# call-site comment in `_run_remediation_pass` and
+# `test_routed_record_is_invisible_to_the_orchestrator_l1_guards` all reason
+# about.  A leading underscore would have signalled module-local and invited a
+# future reader to inline the literal — and, worse, to weaken it without
+# noticing the seven guard sites enumerated above.
+FINDING_TASK_ESCALATION_LEVEL = 0
 
 # `severity='info'`, NOT the 'blocking' used by the `_sweep_escalate_l1`
 # template this filer is otherwise transcribed from.  This is an OBSERVATION
@@ -123,8 +145,8 @@ _ESCALATION_LEVEL = 0
 # escalator.py`, in its severity choice.
 #
 # Note that severity is NOT what keeps this record off the orchestrator's guard
-# surface — `has_open_l1` never reads it.  `_ESCALATION_LEVEL` above does that
-# work, alone.
+# surface — `has_open_l1` never reads it.  `FINDING_TASK_ESCALATION_LEVEL`
+# above does that work, alone.
 #
 # Severity is deliberately NOT derived from the finding's own
 # 'minor'/'moderate'/'serious' field: that vocabulary is LLM-authored free text
@@ -326,5 +348,5 @@ def build_finding_task_escalation_kwargs(
         'category': FINDING_TASK_ESCALATION_CATEGORY,
         'summary': summary,
         'detail': detail,
-        'level': _ESCALATION_LEVEL,
+        'level': FINDING_TASK_ESCALATION_LEVEL,
     }

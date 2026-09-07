@@ -52,9 +52,6 @@ from fused_memory.reconciliation.cli_stage_runner import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
-    _ESCALATION_LEVEL as FINDING_TASK_ESCALATION_LEVEL,
-)
-from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
     resolve_finding_task_target,
@@ -2743,6 +2740,7 @@ class ReconciliationHarness:
         run_id: str,
         finding: dict,
         persistence: int,
+        task_id: str | None = None,
     ) -> str | None:
         """File a level-0 record for *finding* on its named task's ORCHESTRATOR queue.
 
@@ -2758,18 +2756,21 @@ class ReconciliationHarness:
         Returns the escalation id, or None when nothing was filed.  Every
         no-file path is a deliberate gate:
 
-        - the finding names no same-project task (see
-          :func:`~fused_memory.reconciliation.finding_task_escalation.resolve_finding_task_target`);
+        - the finding names no same-project task -- either *task_id* was
+          supplied as None and
+          :func:`~fused_memory.reconciliation.finding_task_escalation.resolve_finding_task_target`
+          also returned None;
         - the project is not registered in ``_known_projects``;
         - no orchestrator is live for that root, so nothing would drain the
           record;
-        - a pending record of this same (level, category) is already on the
-          task.
+        - a pending record of this same CATEGORY is already on the task, at
+          ANY level -- level-blind so the fold survives the orphan reaper
+          promoting an earlier record from L0 to L1.
 
         LEVEL 0, deliberately: `EscalationQueue.has_open_l1` is level-1-only
         and is what a spread of orchestrator guards read as "a human is already
         on this task", so an L1 here would turn a passive observation into a
-        gate on dispatch.  See the `_ESCALATION_LEVEL` comment block in
+        gate on dispatch.  See the `FINDING_TASK_ESCALATION_LEVEL` comment block in
         `finding_task_escalation.py` for the full guard-site population and for
         why an unattended record still reaches L1 (via
         `Harness._reap_orphan_l0_escalations`) without this filer asserting it.
@@ -2790,7 +2791,16 @@ class ReconciliationHarness:
         if not HAS_ESCALATION:
             return None
 
-        task_id = resolve_finding_task_target(finding, project_id)
+        # *task_id* is an OPTIONAL pre-resolved target.  The production call
+        # site in `_run_remediation_pass` already has to resolve it — it gates
+        # the routed target on the live-workflow check before calling — so it
+        # passes the value through rather than paying for a second, silently
+        # divergable resolution here.  Resolving on None keeps the filer
+        # self-sufficient for direct callers (and keeps the no-target gate
+        # below reachable and tested) without making the two paths disagree:
+        # both end up at the same `resolve_finding_task_target` result.
+        if task_id is None:
+            task_id = resolve_finding_task_target(finding, project_id)
         if task_id is None:
             logger.debug(
                 'reconciliation.finding_task_escalation_no_target',
@@ -2836,28 +2846,50 @@ class ReconciliationHarness:
             # cycle.
             #
             # NOT `has_open_l1`: that helper is LEVEL-1-ONLY, and these records
-            # are level 0 precisely so they stay off the orchestrator's L1 guard
-            # surface, so it would see nothing and the filer would refile every
-            # cycle.  This is the level-0 pending-scan idiom transcribed from
+            # are written at level 0 precisely so they stay off the
+            # orchestrator's L1 guard surface, so it would see nothing and the
+            # filer would refile every cycle.  This is the pending-scan idiom
+            # transcribed from
             # `orchestrator/harness.py::_file_warm_base_hard_down_notice`.
             #
-            # BOTH filters are load-bearing.  `category` is the task-2757
-            # property in its level-0 form: it lets a NEW root cause escape
-            # being silently suppressed by an UNRELATED open record — without
-            # it, a lingering starvation INFO on the task would swallow every
-            # recon finding for it forever.  `level` keeps a human's promotion
-            # of a prior record to L1 from suppressing the next finding, which
-            # would otherwise silence the ladder exactly when someone is
-            # already engaged with it.  Both constants are IMPORTED, never
-            # re-spelled, so the scan and the builder cannot drift apart.
+            # The scan filters on `category` ONLY, and is deliberately
+            # LEVEL-BLIND even though the write side is pinned to
+            # FINDING_TASK_ESCALATION_LEVEL.  The asymmetry is load-bearing in
+            # both directions:
+            #
+            #   - `category` is the task-2757 property: it lets a NEW root cause
+            #     escape being silently suppressed by an UNRELATED open record.
+            #     Without it a lingering starvation INFO on the task would
+            #     swallow every recon finding for it forever, and an
+            #     uncategorized `has_open_l1`-style read would do the same via
+            #     the level axis.
+            #   - Level-blindness makes the fold survive PROMOTION.
+            #     `orchestrator/harness.py::_reap_orphan_l0_escalations`
+            #     promotes an aged pending L0 to L1 with no category filter, and
+            #     this filer fires only when NO workflow is live for the task —
+            #     the very condition that makes a record an orphan candidate. So
+            #     a record filed here is born eligible for promotion. A
+            #     `level == 0` scan stopped matching the moment that happened,
+            #     the next cycle filed a fresh L0, and the reaper dismissed it as
+            #     a duplicate of the open L1 — one born-and-dismissed record per
+            #     reconciliation cycle, forever, while the finding persists.
+            #     Matching at ANY level folds onto the promoted record instead,
+            #     which is the right answer: the L1 IS this finding, escalated.
+            #
+            # `FINDING_TASK_ESCALATION_CATEGORY` is IMPORTED, never re-spelled,
+            # so the scan and the builder cannot drift on the one axis they
+            # BOTH read.  The level is set by the builder alone
+            # (`FINDING_TASK_ESCALATION_LEVEL`, public and exported for exactly
+            # that contract) and deliberately not imported here — this scan does
+            # not read it, and an import that only appeared in a comment would
+            # imply a coupling that no longer exists.
             #
             # `status='pending'` skips the archive by construction, so a finding
             # that recurs after a human adjudicated the last record reaches the
             # ladder again.
             if [
                 e for e in queue.get_by_task(task_id, status='pending')
-                if e.level == FINDING_TASK_ESCALATION_LEVEL
-                and e.category == FINDING_TASK_ESCALATION_CATEGORY
+                if e.category == FINDING_TASK_ESCALATION_CATEGORY
             ]:
                 logger.info(
                     'reconciliation.finding_task_escalation_deduped',
@@ -5939,10 +5971,79 @@ class ReconciliationHarness:
                             # widened to the resolved target: that would silence
                             # recon-queue escalations that file today, a
                             # behaviour change outside this arm's scope.
+                            #
+                            # Resolved ONCE, here, and passed through to the
+                            # filer: this branch has to know the target anyway
+                            # (to gate it), and a second resolution inside the
+                            # filer would be free to drift from this one should
+                            # the resolver ever grow a caller-visible input.
                             routed_task_id = resolve_finding_task_target(finding, project_id)
-                            if (
-                                routed_task_id is not None
-                                and routed_task_id not in cited_task_ids
+                            if routed_task_id is None:
+                                # Nothing to route.  Do NOT call the filer just
+                                # to have it re-resolve to None: that is a pure
+                                # no-op call, and skipping it keeps the "was a
+                                # target found" decision at exactly one site.
+                                pass
+                            elif task_by_id and routed_task_id not in task_by_id:
+                                # EXISTENCE GATE (esc-4821 amendment pass).
+                                # Stage-3 findings are LLM-authored free text and
+                                # the bare-`task_id` branch of the resolver
+                                # INTERPRETS whatever string it finds as a task
+                                # in this project without confirming one exists.
+                                # A hallucinated or stale id ('9999', or a
+                                # subtask spelling like '4458.2') would otherwise
+                                # file `esc-9999-N` onto the orchestrator queue,
+                                # and `orchestrator/harness.py::
+                                # Harness._reap_orphan_l0_escalations` scans
+                                # `get_pending()` with NO task-existence check —
+                                # so after `orphan_l0_timeout_secs` the phantom
+                                # L0 becomes a phantom L1 in front of a human.
+                                # This is the same hazard `_sole_task_id_part`'s
+                                # docstring already reasons about for the
+                                # comma-joined case; `task_by_id` is in scope
+                                # here, so the check is free.
+                                #
+                                # `task_by_id and ...` is load-bearing, and is
+                                # the ONE place this gate deliberately fails
+                                # OPEN.  `_fetch_filtered_task_tree` degrades to
+                                # an EMPTY tree whenever taskmaster is disabled
+                                # or the fetch fails, and an empty map is not
+                                # evidence that a task is absent — it is evidence
+                                # that we do not know.  Treating "no tree" as
+                                # "no such task" would silently switch this whole
+                                # arm off for the duration of any taskmaster
+                                # hiccup, which is precisely the silent
+                                # degradation the surrounding gate already
+                                # refuses (see the coverage caveat on
+                                # `task_by_id`'s construction, which degrades a
+                                # missing entry to the fail-safe value for that
+                                # ONE id rather than for every id).
+                                #
+                                # RETENTION CAVEAT, and why failing closed on a
+                                # POPULATED tree is still right: `task_by_id` is
+                                # built from active_tasks (uncapped) plus
+                                # done/cancelled capped at
+                                # MAX_DONE_TASKS_RETAINED=30 /
+                                # MAX_CANCELLED_TASKS_RETAINED=15, so a finding
+                                # about a long-since-done task is also dropped
+                                # here.  That is the case where a fresh ladder
+                                # record is least useful — nobody is going to
+                                # act on an L1 for a task that finished 40
+                                # completions ago — while the recon-queue
+                                # `_escalate` filing above still fires, so the
+                                # finding is not lost.
+                                logger.info(
+                                    'reconciliation.integrity_escalation_routed_target_not_in_tree',
+                                    extra={
+                                        'project_id': project_id,
+                                        'run_id': run_id,
+                                        'task_id': routed_task_id,
+                                        'description': finding.get('description', ''),
+                                        'finding_category': finding.get('category', ''),
+                                    },
+                                )
+                            elif (
+                                routed_task_id not in cited_task_ids
                                 and _task_is_live(routed_task_id)
                             ):
                                 logger.info(
@@ -5959,30 +6060,23 @@ class ReconciliationHarness:
                                 # VOLUME PARITY: at most one orchestrator-queue
                                 # record per finding that already files one recon
                                 # escalation today, folded across later cycles by
-                                # the filer's own (level 0, category) pending
-                                # scan -- for as long as that record stays
-                                # PENDING AT LEVEL 0.
+                                # the filer's own pending scan on
+                                # FINDING_TASK_ESCALATION_CATEGORY.
                                 #
-                                # KNOWN GAP, deliberately not closed by this arm.
-                                # That bound is per-cycle-while-pending-at-L0,
-                                # NOT an absolute one-record-per-finding cap.
-                                # `orchestrator/harness.py::
-                                # _reap_orphan_l0_escalations` promotes an aged
-                                # pending L0 to L1 with no category filter, and
-                                # this filer fires only when NO workflow is live
-                                # for the task -- the very condition that makes a
-                                # record an orphan candidate.  So a record filed
-                                # here is born eligible for promotion; once
-                                # promoted the `level == 0` scan stops matching
-                                # and the next cycle files a fresh L0 while the
-                                # finding persists.  Closing it needs a dedupe
-                                # key that survives promotion (any-level scan or
-                                # a terminal-record check) -- design work beyond
-                                # this arm.  Do not restore the previous
-                                # "cannot flood the orchestrator ladder" claim
-                                # here: it is false for exactly this reason.
+                                # That scan is deliberately level-BLIND (see the
+                                # dedupe comment in
+                                # `_file_finding_task_escalation`) so the fold
+                                # survives `orchestrator/harness.py::
+                                # _reap_orphan_l0_escalations` promoting the
+                                # record from L0 to L1.  Without that, promotion
+                                # broke the fold and the next cycle filed a fresh
+                                # L0 that the reaper then dismissed as a
+                                # duplicate — one born-and-dismissed record per
+                                # reconciliation cycle, forever, on a task
+                                # already represented by an open L1.
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
+                                    task_id=routed_task_id,
                                 )
                     else:
                         logger.info(
