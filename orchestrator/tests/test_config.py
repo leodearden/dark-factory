@@ -3811,6 +3811,15 @@ class TestRecoveryEmissionConfig:
         # The narrower kill switch for the only part that WRITES to the
         # escalation queue — separate from `enabled` on purpose.
         assert cfg.recovery_emission.streak_escalation_enabled is True
+        # Task 4647: the landing-detector git_error storm escape hatch shares
+        # this section because it is the same KIND of knob — a recovery-site
+        # detector whose alarm an operator must be able to retune or silence
+        # live.  10/hour is well above any healthy rate (the recovery sweeps
+        # run every 900s) and well below a storm.
+        assert cfg.recovery_emission.landing_git_error_rate_per_hour == 10
+        # Its own narrow kill switch, for the same reason
+        # streak_escalation_enabled has one.
+        assert cfg.recovery_emission.landing_git_error_escalation_enabled is True
 
     def test_veto_streak_threshold_must_be_at_least_one(self):
         """threshold=0 would file an L1 on the very first observed veto."""
@@ -3829,6 +3838,20 @@ class TestRecoveryEmissionConfig:
         with pytest.raises(ValidationError):
             RecoveryEmissionConfig(veto_streak_min_span_secs=-1)
 
+    def test_landing_git_error_rate_must_be_at_least_one(self):
+        """rate=0 would file the storm L1 on the very first git_error.
+
+        One git_error is a transient — a repo lock, a ref that lost a race.
+        The alarm exists for the REPEATED shape, which is the one that means
+        the detector rather than the repo.
+        """
+        from orchestrator.config import RecoveryEmissionConfig
+
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(landing_git_error_rate_per_hour=0)
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(landing_git_error_rate_per_hour=-1)
+
     def test_defaults_yaml_block_matches_the_field_defaults(self):
         """The shipped stanza must not drift from the pydantic defaults.
 
@@ -3846,6 +3869,11 @@ class TestRecoveryEmissionConfig:
         assert block['veto_streak_threshold'] == 3
         assert block['veto_streak_min_span_secs'] == 1500.0
         assert block['streak_escalation_enabled'] is True
+        # Task 4647 — a Field(default=...) with no stanza key is exactly the
+        # silent drift this test exists to catch, so the new leaves are pinned
+        # here alongside the sibling four rather than trusted to pydantic.
+        assert block['landing_git_error_rate_per_hour'] == 10
+        assert block['landing_git_error_escalation_enabled'] is True
 
     def test_leaves_are_green_tier_hot_reloadable(self):
         """Every leaf is in RELOADABLE_FIELDS (whole-submodel-group idiom).

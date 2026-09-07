@@ -7,9 +7,10 @@ over an already-fetched hit list, so every test here injects hand-built
 ranked lists with exactly-known answers — which is what permits exact
 assertions with no tolerances.
 
-Both scripts are loaded via importlib so they can be tested without sys.path
-pollution — the loader is copied verbatim from
-``test_bake_off_storage_shape.py:48-73`` and is invoked lazily.
+Both scripts are loaded via ``fused-memory/tests/_fm_helpers.py``
+``::load_script_module`` so they can be tested without sys.path pollution:
+that helper reuses an already-loaded module for the same file instead of
+re-executing it under the same key.  Both are invoked lazily.
 
 LANE DISCIPLINE — READ BEFORE ADDING A TEST
 -------------------------------------------
@@ -33,9 +34,10 @@ in-progress and claims that module.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import types
 from pathlib import Path
+
+from _fm_helpers import load_script_module
 
 SCRIPTS_DIR = Path(__file__).parent.parent / 'scripts'
 SCRIPT_PATH = SCRIPTS_DIR / 'read_transform_selection.py'
@@ -49,21 +51,15 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
     The module is registered in sys.modules under its bare name so that
     @dataclass and other reflection-based decorators work correctly (they
-    call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
+    call sys.modules.get(cls.__module__)).  Both keys are SHARED — with
+    ``test_bake_off_storage_shape.py``, with ``test_bake_off_fetch_cache.py``
+    and with the script-side ``read_transform_selection._load_script`` — which
+    is what makes reuse, rather than an unconditional re-exec, correct here.
 
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    A named seam rather than a direct call at each use site, so the
+    load-once property has something uncached to assert against.
+    """
+    return load_script_module(path, mod_name=mod_name)
 
 
 @functools.cache
@@ -74,6 +70,42 @@ def _mod() -> types.ModuleType:
 @functools.cache
 def _bake_off() -> types.ModuleType:
     return _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+
+
+class TestTheScriptsAreLoadedOnceNotReExecuted:
+    """The loader seam must REUSE each script, not re-execute it.
+
+    An unconditional re-exec mints a SECOND module object under the same
+    ``sys.modules`` key, and whichever loader ran last wins.  The concrete
+    hazard: ``scripts/read_transform_selection.py::_load_script`` returns
+    ``sys.modules[name]`` BY NAME ONLY, with no ``__file__`` check, so it
+    serves whichever object a test module last registered under
+    ``'bake_off_storage_shape'``.  Three test modules register that key, and
+    ``fused-memory/pyproject.toml`` sets ``addopts = "-n auto --dist
+    loadgroup"``, so collection order is not stable.
+
+    The UNCACHED two-argument seam is what these call: ``_mod()`` and
+    ``_bake_off()`` are ``functools.cache``d and would pass vacuously.
+    """
+
+    def test_the_bake_off_script_is_loaded_once(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+        second = _load_script(BAKE_OFF_PATH, 'bake_off_storage_shape')
+        assert first is second
+        # The invariant `_assert_reexported_from_bake_off` leans on: it
+        # deliberately bypasses `_bake_off()` and compares against the LIVE
+        # `sys.modules` entry, so this is what keeps its premise honest.
+        assert sys.modules['bake_off_storage_shape'] is first
+
+    def test_the_selection_script_is_loaded_once(self):
+        import sys  # noqa: PLC0415
+
+        first = _load_script(SCRIPT_PATH, 'read_transform_selection')
+        second = _load_script(SCRIPT_PATH, 'read_transform_selection')
+        assert first is second
+        assert sys.modules['read_transform_selection'] is first
 
 
 def _assert_reexported_from_bake_off(mod: types.ModuleType, name: str) -> None:
@@ -458,8 +490,9 @@ class TestPromotingAnchorNeedsNoContestedKey:
     """Arm (1) is landable today: it reads `topic` and nothing else.
 
     `contested` is a hand-labelled bake-off FIXTURE field — it is absent from
-    the live `RESERVED_VOCABULARY_KEYS` (fused_memory/memory_metadata.py:601)
-    and has no writer — so an arm that needed it would be unimplementable.
+    the live `RESERVED_VOCABULARY_KEYS`
+    (`fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS`) and has no
+    writer — so an arm that needed it would be unimplementable.
     """
 
     @pytest.mark.parametrize('extra_key', ['contested', 'supersedes'])
@@ -756,7 +789,8 @@ class TestTheContestedTermIsStructurallyZeroToday:
     """Arm (2) suppresses, and cannot implement V2's protection.
 
     `contested` is a hand-labelled bake-off FIXTURE field: it is absent from
-    the live `RESERVED_VOCABULARY_KEYS` (fused_memory/memory_metadata.py:601
+    the live `RESERVED_VOCABULARY_KEYS`
+    (`fused_memory/memory_metadata.py::RESERVED_VOCABULARY_KEYS`
     — `{topic, canonical, kind, parent_id, supersedes}`), has no writer and
     no adjudication surface.  So the `+ contested` term above is arithmetic
     that production cannot currently make non-zero, and the report says so

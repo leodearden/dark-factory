@@ -665,12 +665,12 @@ _RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
 
 
 async def _annotate_pins_recovery(
-    queue: EscalationQueue,
     harness: Any,
     escalations: Sequence[Any],
     dicts: list[dict[str, Any]],
     *,
     level: int | None,
+    all_pending: Sequence[Any],
 ) -> None:
     """Stamp ``pins_recovery`` on *dicts* in place, or leave the key ABSENT.
 
@@ -678,6 +678,12 @@ async def _annotate_pins_recovery(
     omitted rather than defaulted to ``[]`` on every path where the answer is
     unknown, because ``[]`` reads as "nothing pins this task" — the esc-3163
     collapse that routes a genuinely-pinned strand down the wrong branch.
+
+    *escalations* is the caller's (possibly ``level``-filtered) VIEW, paired
+    positionally with *dicts*.  *all_pending* is the caller's UNFILTERED
+    pending read, from which the classification's per-task open set is grouped.
+    This function performs NO queue I/O of its own: the caller already read
+    every pending record, so re-reading is pure waste (see the group-by below).
     """
     if not dicts:
         return
@@ -719,23 +725,34 @@ async def _annotate_pins_recovery(
         for esc in escalations:
             open_by_task.setdefault(esc.task_id, []).append(esc)
     else:
+        # The full open set, recovered from the read the CALLER already made
+        # rather than re-read here.  `all_pending` is the unfiltered pending
+        # list `get_pending_escalations` holds before it narrows to `level`, so
+        # this costs zero additional scans — where the loop it replaces cost
+        # one full-directory scan per distinct task id, on a dashboard poll.
+        #
+        # Grouped on the PARSED `esc.task_id` only, never on a filename stem:
+        # task_ids may contain hyphens, and queue.py:1266-1272 records that the
+        # retired parse-after-last-hyphen derivation was a real bug (task 3238).
+        #
+        # No try/except here any more, and that is not an oversight.  The guard
+        # this replaces wrapped `queue.get_by_task`; with no queue I/O left
+        # inside this function there is nothing for it to catch.  Its advertised
+        # per-task granularity was also nominal for the only failure that could
+        # ever reach it: get_by_task swallows per-file (JSONDecodeError,
+        # KeyError, TypeError) at queue.py:485-487, so a corrupt record never
+        # raised out of it, while an OSError from read_text() did — and since
+        # get_by_task(tid) scanned the WHOLE root for EVERY tid, one unreadable
+        # file already degraded every task rather than one.  The single read now
+        # backing this is `queue.get_pending()`, which globs the same root with
+        # the identical per-file swallow, so it degrades identically; it sits in
+        # the caller, where it was already unguarded, and the seam guard at the
+        # call site still blankets every line in here.
+        wanted = set(task_ids)
         open_by_task = {}
-        for tid in task_ids:
-            try:
-                open_by_task[tid] = queue.get_by_task(tid, status='pending')
-            except Exception as exc:  # noqa: BLE001 — real I/O, see below
-                # The ONE genuinely-reachable failure in this function (a
-                # filesystem scan plus JSON parse over esc-*.json), and the one
-                # place per-task recovery is real rather than nominal: a single
-                # unreadable file degrades exactly one task.  Leaving `tid` out
-                # of open_by_task makes the loop below skip it, so its key stays
-                # ABSENT (= UNKNOWN) instead of becoming a false [].  WARNING
-                # because a queue directory this process cannot read is
-                # operator-actionable and otherwise invisible on this surface.
-                logger.warning(
-                    'pins_recovery UNKNOWN for task %s: pending re-read failed: %s',
-                    tid, exc,
-                )
+        for esc in all_pending:
+            if esc.task_id in wanted:
+                open_by_task.setdefault(esc.task_id, []).append(esc)
 
     reports: dict[str, Any] = {}
     live_by_task: dict[str, bool] = {}
@@ -781,6 +798,7 @@ def create_server(
     harness: Any = None,
     dedupe_config: DedupeConfig | None = None,
     task_status_lookup: Callable[[str], Awaitable[str | None]] | None = None,
+    task_claimant_lookup: Callable[[str], Awaitable[str | None]] | None = None,
     merge_inflight_registry: Any = None,
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
@@ -804,6 +822,19 @@ def create_server(
     already in a terminal state (``'done'`` or ``'cancelled'``).  When omitted
     (the default), the auto-resolve chokepoint is disabled and all escalations
     are submitted normally.
+
+    *task_claimant_lookup* is the deliberate MIRROR of *task_status_lookup*
+    (task 3550): an optional async callable ``(task_id) -> str|None`` returning
+    the task's current ``claimant_run_id``.  When provided, ``escalate_blocker``
+    and ``escalate_info`` stamp that value onto the filed record's
+    ``filing_claimant_run_id``, which is what lets ``escalation.pins`` Link 4
+    tell a LIVE agent handoff from one filed by a dead incarnation.  The DB row
+    is the right source because it holds the identity ``TaskWorkflow``'s
+    dispatch stamp wrote via ``shared.task_claimant.compose_claimant_run_id``,
+    so an agent-filed escalation carries the identity of the incarnation that
+    dispatched that agent.  When omitted (the default — the standalone
+    escalation server, and every caller that predates 3550) the field stays
+    ``None``, which ``pins`` reads as UNKNOWN and fails safe to pinning.
 
     *merge_inflight_registry* is an optional ``InFlightMergeRegistry`` injected
     for testing.  When *merge_queue* is not None and no registry is supplied, a
@@ -934,6 +965,10 @@ def create_server(
             '',
             str(record.get('raw_value') or ''),
         ])
+        # Task 3550 deliberately does NOT stamp filing_claimant_run_id here:
+        # filed under the synthetic _MARKUP_RESIDUE_ANCHOR_TASK_ID and bypassing
+        # _chokepoint_or_submit entirely, so no task-workflow incarnation filed it
+        # and there is no honest identity to record.
         esc = Escalation(
             id=queue.make_id(_MARKUP_RESIDUE_ANCHOR_TASK_ID),
             task_id=_MARKUP_RESIDUE_ANCHOR_TASK_ID,
@@ -1012,6 +1047,9 @@ def create_server(
             return open_alarm.id
 
         outcome = record.get('outcome')
+        # Task 3550: unstamped by design — synthetic _MARKUP_STORM_ANCHOR_TASK_ID,
+        # level=1 (pins Link 3 -> QUEUE_HANDOFF regardless of filing identity),
+        # and not filed by any task-workflow incarnation.
         return queue.submit(Escalation(
             id=queue.make_id(_MARKUP_STORM_ANCHOR_TASK_ID),
             task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
@@ -1170,6 +1208,9 @@ def create_server(
             if storm is None:
                 return
             labels = ', '.join(storm['labels']) or l2_id
+            # Task 3550: unstamped by design — synthetic anchor task id and
+            # severity='info' (pins Link 1 -> NON_PINNING), so the filing
+            # identity is never read, and no incarnation filed it anyway.
             _submit_or_dedupe(Escalation(
                 # Filed under the synthetic anchor, NOT the triggering promote's
                 # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
@@ -1315,6 +1356,38 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
+        # Task 3550 — stamp the FILING incarnation, ABOVE everything else.
+        #
+        # Placement is the whole design: this runs before the C4/D3 downgrade,
+        # before the born-at-L2 `esc.level = 2` assignment, and before all four
+        # gates, so EVERY exit path carries the identity — the two bypass
+        # gates, the lookup-disabled gate, _submit_or_dedupe, the fail-open
+        # except branch below, and the terminal-task submit_resolved
+        # auto-resolve.  No gate can lose it, so those cases need no
+        # special-casing.
+        #
+        # `escalation.pins` Link 4 reads this to tell a LIVE agent handoff from
+        # one filed by a dead incarnation.  None means UNKNOWN, which pins
+        # fails safe to pinning — so every degraded path here leaves it None
+        # rather than inventing a value.
+        if task_claimant_lookup is not None and not esc.filing_claimant_run_id:
+            # Never overwrite a caller-supplied value.
+            try:
+                _claimant = await task_claimant_lookup(esc.task_id)
+            except Exception as exc:
+                # Same fail-open discipline as gate 4's status lookup: a
+                # filing must NEVER be dropped because an identity lookup
+                # broke.  Loud, not silent — the record is named at WARNING.
+                logger.warning(
+                    'task_claimant_lookup raised for task %s, leaving filing '
+                    'identity unknown: %s',
+                    esc.task_id, exc,
+                )
+            else:
+                # Normalise blank/whitespace-only to None so an empty string
+                # never reaches pins._norm_id as a pseudo-value.
+                esc.filing_claimant_run_id = (_claimant or '').strip() or None
+
         # C4/D3: Agent-role severity downgrade — runs FIRST, before the born-at-L2
         # stamp, so the existing level=2 gate and the _submit_or_dedupe L2-bypass
         # both naturally observe 'blocking' and route the downgraded record through
@@ -2003,16 +2076,27 @@ def create_server(
         prevent, so callers must treat an absent key as UNKNOWN and render
         nothing rather than "not pinning".
         """
+        # Read the pending set ONCE, unfiltered, and narrow it in memory.  The
+        # `level` filter is applied here rather than pushed into the queue
+        # because `_annotate_pins_recovery` needs the UNFILTERED set to classify
+        # each record against its task's whole open set (a filtered VIEW must
+        # not become a filtered CLASSIFICATION).  Reading with `level=` and then
+        # re-reading per task to recover what was just discarded is what made
+        # this O(T) full-directory scans.
         if task_id:
-            escalations = queue.get_by_task(task_id, status='pending', level=level)
+            all_pending = queue.get_by_task(task_id, status='pending')
         else:
-            escalations = queue.get_pending()
-            if level is not None:
-                escalations = [e for e in escalations if e.level == level]
+            all_pending = queue.get_pending()
+        escalations = (
+            all_pending if level is None
+            else [e for e in all_pending if e.level == level]
+        )
 
         dicts = [e.to_dict() for e in escalations]
         try:
-            await _annotate_pins_recovery(queue, harness, escalations, dicts, level=level)
+            await _annotate_pins_recovery(
+                harness, escalations, dicts, level=level, all_pending=all_pending,
+            )
         except Exception:
             # THE seam guard.  `harness` is duck-typed Any because this package
             # deliberately does not import orchestrator, so the annotation can
@@ -2541,6 +2625,9 @@ def create_server(
         # Create path: build a fresh L2 and submit it.
         # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input
         # do not create duplicate entries in the on-disk record.
+        # Task 3550: unstamped by design — level=2 (pins Link 3 -> QUEUE_HANDOFF
+        # regardless of filing identity) and filed by a human/watcher promotion,
+        # not by a task-workflow incarnation.
         esc = Escalation(
             id=queue.make_id(task_id),
             task_id=task_id,

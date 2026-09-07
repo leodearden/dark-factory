@@ -65,8 +65,10 @@ journalctl --user -u orchestrator-<NAME>.service --since '1 min ago'   # confirm
 The live unit alone is lost if `setup-host.sh` re-provisions the host. Persist it:
 
 1. Copy the unit into the repo: `<DF>/scripts/orchestrator-<NAME>.service` (concrete, verbatim).
-2. In `<DF>/scripts/setup-host.sh`, add a `cp "$REPO_ROOT/scripts/orchestrator-<NAME>.service" "$UNIT_DIR/"` next to the other orchestrator `cp` lines, and a `systemctl --user enable orchestrator-<NAME>.service` next to the other `enable` lines.
-3. Commit both to dark-factory.
+2. In `<DF>/scripts/setup-host.sh` section 5 ("Orchestrator systemd units + watchdog"), add `orchestrator-<NAME>.service` to the `_orch_units` array. No separate enable-line edit is needed: the enable loop derives the obligation at run time from `grep -q '^\[Install\]'` on the committed template.
+3. Register the same unit in `UNITS` in `<DF>/scripts/check_orchestrator_unit_parity.py`, and add it to `_EXPECTED_UNITS` in `tests/scripts/test_check_orchestrator_unit_parity.py`. Both are hand-maintained lists the per-unit parity gate (and its test) cross-check against `_orch_units` — a unit missing from either silently escapes the gate.
+4. Run `cd <DF> && uv run --project orchestrator pytest tests/scripts/test_check_orchestrator_unit_parity.py` before committing.
+5. Commit all of the above to dark-factory.
 
 ## Layer 3 — watchdog port-probe (optional)
 

@@ -5,7 +5,7 @@ import dataclasses
 import json
 from pathlib import Path
 from typing import Any, ClassVar
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
@@ -438,6 +438,304 @@ class TestVerifyResultPlan:
 
 
 # ---------------------------------------------------------------------------
+# Task 3789 (ε) step-3: VerifyResult.flake_suppression — the TYPED wire carrier
+# that moves a discriminator observation from wherever the worktree is to the
+# dispatcher that records it (flake-ledger-prd.md §8, §8.4).
+# ---------------------------------------------------------------------------
+
+
+def _make_suppression(**overrides):
+    """A fully-populated FlakeSuppression; override any field by keyword."""
+    from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
+
+    kwargs = {
+        'verdict': FlakeVerdict.passes_in_isolation,
+        'test_ids': ('tests/test_a.py::test_one', 'tests/test_b.py::test_two'),
+        'observed_at': '2026-08-06T12:00:00+00:00',
+        'call_site': FlakeCallSite.merge_gate,
+        'runner': 'remote-lab-1',
+        'psi_cpu_some10': 12.5,
+        'unconfirmable_reason': None,
+    }
+    kwargs.update(overrides)
+    return FlakeSuppression(**kwargs)
+
+
+class TestVerifyResultFlakeSuppressionWire:
+    """VerifyResult carries an optional TYPED `flake_suppression` across the wire.
+
+    Deliberately NOT a plain JSON-native dict like `contention`/`plan`/
+    `failing_test_ids`: PRD §8 specifies a typed carrier and the dispatcher-side
+    recorder consumes a `FlakeSuppression`, so a bare dict would make the annotation
+    a lie on exactly the deserialized path this exists to serve.  `result_to_dict`
+    (asdict) already serialises it losslessly; only `result_from_dict` needs the
+    reconstruction hook — the same shape `MergeVerifySpec.from_dict` uses for its
+    optional nested `global_verify_command`.
+    """
+
+    def test_defaults_to_none(self):
+        """(a) Every existing hand-built VerifyResult is unaffected."""
+        vr = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok'
+        )
+        assert vr.flake_suppression is None
+
+    def test_round_trips_through_json_as_a_typed_value(self):
+        """(b) The headline: what comes back off the wire is a FlakeSuppression with
+        its enums and tuple intact, not a bare dict of strings and lists.
+
+        Asserted on the FIELD, never via VerifyResult.__eq__ — the field is
+        `compare=False` (see test_differs_only_in_suppression_still_compares_equal),
+        so a whole-object assertion would pass VACUOUSLY here.
+        """
+        from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
+
+        s = _make_suppression()
+        vr = VerifyResult(
+            passed=False,
+            test_output='FAILED test_a',
+            lint_output='',
+            type_output='',
+            summary='1 failure',
+            flake_suppression=s,
+        )
+        rt = result_from_json(result_to_json(vr))
+
+        assert isinstance(rt.flake_suppression, FlakeSuppression)
+        assert rt.flake_suppression == s
+        assert rt.flake_suppression.verdict is FlakeVerdict.passes_in_isolation
+        assert rt.flake_suppression.call_site is FlakeCallSite.merge_gate
+        assert isinstance(rt.flake_suppression.test_ids, tuple)
+        assert rt.flake_suppression.test_ids == (
+            'tests/test_a.py::test_one',
+            'tests/test_b.py::test_two',
+        )
+        assert rt.flake_suppression.runner == 'remote-lab-1'
+        assert rt.flake_suppression.psi_cpu_some10 == 12.5
+        assert rt.flake_suppression.observed_at == '2026-08-06T12:00:00+00:00'
+
+    def test_round_trips_an_unconfirmable_observation(self):
+        """(c) §5.5 records the OBSERVATION, not the remedy — an `unconfirmable` rides
+        the wire too, and its reason and NULL psi must survive (None means "PSI was
+        unreadable", never "the host was idle")."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s = _make_suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(),
+            psi_cpu_some10=None,
+            unconfirmable_reason='node-ids mapped to no discovered subproject',
+        )
+        vr = VerifyResult(
+            passed=False,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='red',
+            flake_suppression=s,
+        )
+        rt = result_from_json(result_to_json(vr))
+
+        assert rt.flake_suppression is not None
+        assert rt.flake_suppression == s
+        assert rt.flake_suppression.verdict is FlakeVerdict.unconfirmable
+        assert rt.flake_suppression.test_ids == ()
+        assert rt.flake_suppression.psi_cpu_some10 is None
+        assert (
+            rt.flake_suppression.unconfirmable_reason
+            == 'node-ids mapped to no discovered subproject'
+        )
+
+    def test_to_dict_needs_no_allowlist_change(self):
+        """asdict flattens the nested dataclass and json.dumps flattens its StrEnums —
+        the WRITE half of the codec is untouched by this field."""
+        vr = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='ok',
+            flake_suppression=_make_suppression(),
+        )
+        d = result_to_dict(vr)
+        assert isinstance(d['flake_suppression'], dict)
+        payload = json.loads(json.dumps(d, sort_keys=True))
+        assert payload['flake_suppression']['verdict'] == 'passes_in_isolation'
+        assert payload['flake_suppression']['test_ids'] == [
+            'tests/test_a.py::test_one',
+            'tests/test_b.py::test_two',
+        ]
+
+    # -- (d) B13: NEW dispatcher, OLD remote -------------------------------------
+
+    def test_b13_omitted_key_yields_none(self):
+        """B13 — an older remote's payload simply has no such key.  The default
+        applies: no suppression, no ledger row, no crash."""
+        vr = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='red'
+        )
+        d = result_to_dict(vr)
+        d.pop('flake_suppression')
+        assert result_from_dict(d).flake_suppression is None
+
+    def test_b13_explicit_null_yields_none(self):
+        payload = json.dumps(
+            {
+                'passed': False,
+                'test_output': '',
+                'lint_output': '',
+                'type_output': '',
+                'summary': 'red',
+                'flake_suppression': None,
+            }
+        )
+        assert result_from_json(payload).flake_suppression is None
+
+    @pytest.mark.parametrize(
+        'malformed',
+        [
+            'passes_in_isolation',
+            {'verdict': 'passes_in_isolation'},
+            [],
+            17,
+        ],
+        ids=['str', 'missing_keys', 'list', 'int'],
+    )
+    def test_b13_malformed_payload_degrades_to_none_without_raising(self, malformed):
+        """A malformed sub-payload must cost ONE observation, not a whole re-verify:
+        anything raising out of result_from_json becomes a RunnerUnavailable in
+        orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify,
+        which the pool pays for with a local re-run."""
+        payload = json.dumps(
+            {
+                'passed': False,
+                'test_output': '',
+                'lint_output': '',
+                'type_output': '',
+                'summary': 'red',
+                'flake_suppression': malformed,
+            }
+        )
+        rt = result_from_json(payload)
+        assert rt.flake_suppression is None
+        assert rt.passed is False
+        assert rt.summary == 'red'
+
+    def test_from_dict_does_not_mutate_the_callers_dict(self):
+        """The hook rebuilds into a shallow COPY — a caller inspecting the payload it
+        just handed over must not find it silently retyped underneath."""
+        vr = VerifyResult(
+            passed=True,
+            test_output='',
+            lint_output='',
+            type_output='',
+            summary='ok',
+            flake_suppression=_make_suppression(),
+        )
+        d = json.loads(result_to_json(vr))
+        before = json.dumps(d, sort_keys=True)
+        result_from_dict(d)
+        assert json.dumps(d, sort_keys=True) == before
+
+    # -- (e) compare=False -------------------------------------------------------
+
+    def test_differs_only_in_suppression_still_compares_equal(self):
+        """`observed_at` is a wall-clock stamp taken by the discriminator, so two
+        independent runs of the same logical verification carry different values —
+        the identical argument already written out for `duration_secs`.  Without
+        compare=False, attaching the field on the NON-suppressed branch too (which
+        §5.5 requires) would break test_cli's
+        test_verify_merge_cli_wrapper_transparency the moment a failing CLI verify
+        produced an `unconfirmable` observation."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        base: dict[str, Any] = dict(
+            passed=False, test_output='', lint_output='', type_output='', summary='red'
+        )
+        a = VerifyResult(**base, flake_suppression=None)
+        b = VerifyResult(**base, flake_suppression=_make_suppression())
+        c = VerifyResult(
+            **base,
+            flake_suppression=_make_suppression(
+                verdict=FlakeVerdict.fails_in_isolation,
+                observed_at='2099-01-01T00:00:00+00:00',
+            ),
+        )
+        assert a == b == c
+
+    def test_field_is_declared_compare_false(self):
+        """Structural pin: a later hand-edit that drops compare=False would break the
+        CLI transparency invariant in a distant file, so assert the declaration."""
+        f = {f.name: f for f in dataclasses.fields(VerifyResult)}['flake_suppression']
+        assert f.compare is False
+        assert f.default is None
+
+    # -- (f) the OTHER skew direction — characterization only --------------------
+
+    def test_characterization_unknown_top_level_key_raises_typeerror(self):
+        """CHARACTERIZATION PIN of PRE-EXISTING behaviour, not a new capability.
+
+        §8.4 says an unknown key "is ignored" by an OLD dispatcher.  It is not:
+        `result_from_dict` is a bare `VerifyResult(**d)`, so an unknown top-level key
+        is a TypeError.  This property is shared by every optional field added before
+        this one (contention, plan, failing_test_ids, failing_leg_categories,
+        trivial), so it is neither introduced nor worsened here — and the OUTCOME
+        still holds (see the twin below): degrade to a local re-verify, never a wrong
+        verdict.  This task deliberately does NOT change the codec's strictness.
+        """
+        payload = json.dumps(
+            {
+                'passed': True,
+                'test_output': '',
+                'lint_output': '',
+                'type_output': '',
+                'summary': 'ok',
+                'a_field_from_a_newer_remote': 1,
+            }
+        )
+        with pytest.raises(TypeError):
+            result_from_json(payload)
+
+    @pytest.mark.asyncio
+    async def test_characterization_remote_typeerror_becomes_runner_unavailable(self):
+        """The twin of the above, at the boundary that matters: RemoteRunner converts
+        that TypeError into RunnerUnavailable
+        (orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify),
+        which VerifyRunnerPool.dispatch turns into a LOCAL re-verify.  Degraded, never
+        wrong — and never an unhandled crash in the merge path."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        async def fake_run(argv, *, cwd=None):
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (
+                0,
+                json.dumps(
+                    {
+                        'passed': True,
+                        'test_output': '',
+                        'lint_output': '',
+                        'type_output': '',
+                        'summary': 'ok',
+                        'a_field_from_a_newer_remote': 1,
+                    }
+                ),
+                '',
+            )
+
+        runner = RemoteRunner(
+            name='laptop',
+            ssh_host='laptop.local',
+            git_remote='origin',
+            cwd='/repo',
+            run=fake_run,
+            id_factory=lambda: 'fixed-id',
+        )
+        with pytest.raises(RunnerUnavailable):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+
+# ---------------------------------------------------------------------------
 # Task 2306 step-3: FLOCK_CONTENTION_CATEGORY + make_flock_contention_result —
 # the contention-result builder consumed by task beta (workstation side).
 # ---------------------------------------------------------------------------
@@ -828,13 +1126,25 @@ class TestLocalRunnerBundle:
         run_unscoped.assert_not_awaited()
 
     async def test_scoped_fail_returns_scoped_result_unchanged(self):
+        """The red is returned unchanged — EQUAL, not identical.
+
+        Task 3789 (ε): the merge-flake gate now ATTACHES its observation to the
+        result on the non-suppressed branch too (§5.5 records the observation,
+        not the remedy), so the returned object is a `replace()` copy. It
+        compares EQUAL because `flake_suppression` is `compare=False`, and every
+        merge-deciding field is untouched — which is what "unchanged" meant here
+        all along.
+        """
         scoped_result = _make_fail_result(category='test_failure', cause_hint='assertion error')
         run_scoped = AsyncMock(return_value=scoped_result)
         runner = _make_local_runner(run_scoped=run_scoped)
 
         result = await runner.run_merge_verify('abc123', _make_spec())
 
-        assert result is scoped_result
+        assert result == scoped_result
+        assert result.passed is False
+        assert result.category == 'test_failure'
+        assert result.cause_hint == 'assertion error'
 
     async def test_unscoped_broken_returns_sentinel_category_result(self):
         from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY
@@ -1329,6 +1639,177 @@ class TestDispatchChainItems:
         assert data['runner'] == 'local'      # the fallback ran
         assert data['chain_items'] == 7       # ...and telemetry survived it
 
+
+# ---------------------------------------------------------------------------
+# Task 3789 (ε) step-13: dispatch re-stamps FlakeSuppression.runner
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDispatchStampsFlakeSuppressionRunner:
+    """``VerifyRunnerPool.dispatch`` re-stamps the carried observation's ``runner``.
+
+    ``FlakeSuppression.runner`` means WHERE the isolated re-run actually executed.
+    The discriminator stamps ``'local'`` — honest, but host-RELATIVE: on a remote
+    runner it means "local to that remote", and read back on the dispatcher it is
+    simply wrong.  Left uncorrected, the ledger's ``runner`` column would read
+    ``'local'`` for every observation in the fleet, which is exactly the column θ's
+    class-3 systemic check reads to tell a bad HOST from a bad SUITE.
+
+    ``dispatch`` is the only scope that knows which runner really ran, and it knows
+    it only AFTER the ``RunnerUnavailable``->local fallback — which is what makes
+    ``merge_queue``'s own ``runner`` parameter an unreliable source and puts the
+    stamp here rather than at the recorder's call site.
+    """
+
+    @staticmethod
+    def _runner(name: str, *, is_local: bool, result=None, unavailable: bool = False):
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        r = MagicMock(spec=VerifyRunner)
+        r.name = name
+        r.is_local = is_local
+        r.run_merge_verify = AsyncMock(
+            side_effect=RunnerUnavailable(f'{name} down') if unavailable else None,
+            return_value=result,
+        )
+        return r
+
+    @staticmethod
+    def _result_with(suppression):
+        return _make_pass_result(
+            category='merge_flake_suppressed', flake_suppression=suppression,
+        )
+
+    async def test_remote_dispatch_restamps_the_runner_name(self):
+        """(a) The headline: a remote's honest self-report of ``'local'`` becomes the
+        remote's NAME, and nothing else about the observation is disturbed."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        s = _make_suppression(runner='local')
+        remote = self._runner('remote-lab-1', is_local=False, result=self._result_with(s))
+        pool = VerifyRunnerPool([remote])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result.flake_suppression is not None
+        assert result.flake_suppression.runner == 'remote-lab-1'
+        # Every other field survives untouched — the stamp is a correction of ONE
+        # column, not a re-derivation of the observation.
+        assert result.flake_suppression == dataclasses.replace(s, runner='remote-lab-1')
+
+    async def test_local_dispatch_leaves_local(self):
+        """(b) On a local dispatch the discriminator's stamp was already right, so
+        the correction is a no-op rather than a rename."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        s = _make_suppression(runner='local')
+        local = self._runner('local', is_local=True, result=self._result_with(s))
+        pool = VerifyRunnerPool([local])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result.flake_suppression is not None
+        assert result.flake_suppression.runner == 'local'
+
+    async def test_runner_unavailable_fallback_stamps_the_runner_that_actually_ran(self):
+        """(c) The case that decides WHERE the stamp lives.
+
+        The remote is selected and dies; the LOCAL runner produces the observation.
+        The stamp must name the runner that actually ran, never the one that was
+        selected — otherwise a fallback verify would file its flakes against an
+        innocent host, and that host is precisely what θ's class-3 check indicts.
+        """
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        # A deliberately WRONG incoming value, so a missing stamp cannot pass by
+        # coincidence and a stamp taken from `selected` fails loudly.
+        s = _make_suppression(runner='stale-stamp')
+        remote = self._runner('remote-lab-1', is_local=False, unavailable=True)
+        local = self._runner('local', is_local=True, result=self._result_with(s))
+        pool = VerifyRunnerPool([remote, local])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result.flake_suppression is not None
+        assert result.flake_suppression.runner == 'local'
+
+    async def test_no_suppression_passes_through_untouched(self):
+        """(d) B13 — an old remote carries no observation at all.  The stamp must be
+        a no-op on None, not an AttributeError inside the merge path."""
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        remote = self._runner('remote-lab-1', is_local=False, result=_make_pass_result())
+        pool = VerifyRunnerPool([remote])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result.flake_suppression is None
+        assert result.passed is True
+
+    async def test_a_non_dataclass_result_is_not_destroyed_by_the_stamp(self):
+        """(d2) BOTH objects ``replace`` touches are guarded, not just the inner one.
+
+        The inner ``isinstance(carried, FlakeSuppression)`` check protects the
+        observation, but the OUTER ``dataclasses.replace(result, ...)`` needs
+        ``result`` to be a dataclass instance too.  A runner returning a
+        Protocol-conformant fake or a test double that happens to carry a real
+        ``FlakeSuppression`` would otherwise raise ``TypeError`` out of ``dispatch``
+        and into the merge path — which has no ``VerifyInfraError`` handler, so a
+        bookkeeping correction would take down a real verdict.
+
+        Same discipline as ``verify._is_attachable``: an observation is evidence
+        ABOUT a verdict and must never be able to destroy the verdict it describes.
+        The stamp degrades to a no-op and the caller keeps its result.
+        """
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        class _NotADataclass:
+            passed = True
+            category = 'merge_flake_suppressed'
+            trivial = False
+
+            def __init__(self, suppression):
+                self.flake_suppression = suppression
+
+        carried = _make_suppression(runner='local')
+        fake = _NotADataclass(carried)
+        remote = self._runner('remote-lab-1', is_local=False, result=fake)
+        pool = VerifyRunnerPool([remote])
+
+        result = await pool.dispatch('sha1', _make_spec())
+
+        assert result is fake, 'the caller keeps its own verdict'
+        # Un-stamped rather than crashed: the observation is still the one the
+        # discriminator produced, just without the runner correction.
+        assert result.flake_suppression is carried
+
+    async def test_stamping_is_pure(self):
+        """(e) ``dispatch`` stays a TRANSPORT concern: it corrects one field and
+        records nothing.  Recording belongs to the dispatcher's merge path, which
+        alone holds the project root, merge SHA and task id — and doing it twice
+        would double-count every observation in the ledger."""
+        from orchestrator import flake_recorder
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        flake_recorder._merge_flake_suppression_streak = 0
+        remote = self._runner(
+            'remote-lab-1', is_local=False,
+            result=self._result_with(_make_suppression(runner='local')),
+        )
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append(a[0]))
+
+        record = MagicMock()
+        with patch.object(flake_recorder, 'record_merge_flake_suppression', record):
+            pool = VerifyRunnerPool([remote], event_store=event_store, task_id='t-1')
+            await pool.dispatch('sha1', _make_spec())
+
+        record.assert_not_called()
+        # The pre-existing merge_verify telemetry is unaffected; nothing else is emitted.
+        assert emitted == [EventType.merge_verify]
+        assert flake_recorder._merge_flake_suppression_streak == 0
 
 # ---------------------------------------------------------------------------
 # retry_scope_event_fields — merge_verify event honesty (task 2837, PRD D5)

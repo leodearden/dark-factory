@@ -648,12 +648,12 @@ abandoned work is recorded as a successful run."""
 # sighting every census cycle, and a number baked into a role prompt goes
 # stale silently while "catalogued sightings all show the same shape" stays
 # true.
-TOOL_CALL_REJECTION_GUIDANCE = """
+_TOOL_CALL_REJECTION_KNOWN_SHAPES = """
 ## Reading a tool-call rejection before you retry
 
 `InputValidationError` reports a defect in the CALL you just made, and it
 echoes back the exact bytes you sent — read that echo before retrying. It
-reports two different shapes, and they need OPPOSITE fixes:
+reports several distinct shapes, and they do not share a fix:
 
 - "could not be parsed as JSON" means the call's SYNTAX is broken and no
   parameter VALUE is implicated. Re-emit the entire call from scratch; never
@@ -666,6 +666,139 @@ reports two different shapes, and they need OPPOSITE fixes:
   problem: the call parsed fine, but a field is wrong — typically a deferred
   tool called before `ToolSearch` loaded its schema. Consult the schema; do
   not re-emit blindly.
+"""
+
+
+# Census-2026-08-21 §1.1 companion to _TOOL_CALL_REJECTION_KNOWN_SHAPES above
+# (task 4578; plans/confusion-census-2026-08-21.md). A dispatched session
+# called the `Agent` tool supplying only a `prompt` field; the schema also
+# requires `description`, and the omission was rejected by
+# `InputValidationError: The required parameter 'description' is missing`
+# before any sub-agent launched.
+#
+# WHAT IS AND IS NOT ADDRESSED. The CAUSE is upstream of this repository --
+# harness-side tool-call construction for a Claude Code builtin -- and no
+# in-repo code path produces or can intercept it, so this constant does not
+# attempt to detect or repair the malformed call. Only the RECOVERY facet is
+# in scope, the same carve-out the constant above already takes for the
+# stray-comma sighting: a dispatched agent's response to the rejection is
+# this repo's to fix, through the role system prompts.
+#
+# DISCRIMINATION, NOT DUPLICATION. This is a THIRD `InputValidationError`
+# shape, not a rewording of either bullet above -- do not fold it into, or
+# delete, either existing bullet as redundant. The raw error string ("The
+# required parameter `X` is missing") is IDENTICAL to the deferred-tool
+# shape's founding evidence above, so the string alone does not discriminate
+# between the two mechanisms; read the echo instead. The deferred-tool case
+# carries a trailer stating the tool's schema was not sent to the API, and
+# names a parameter the schema does not have -- an INVENTED name. This case
+# carries neither: the named parameter is real and accepted, and only a
+# required sibling is missing.
+#
+# HARD CONSTRAINTS, same as the block above. No `mcp__<family>__<name>`
+# example -- the ancestry-check test that guards role/tool-grant consistency
+# is parametrized over every role and would fail for whichever of the 8
+# roles lacks the grant; `Agent`, `ToolSearch` and `InputValidationError` are
+# all builtins and do not match that test's regex, so naming them is safe,
+# and `Agent` is genuinely reachable by a dispatched role regardless of
+# whether it appears in that role's allowed_tools -- the same fact the
+# comment above already records for `ToolSearch`. No literal `{`/`}` braces
+# -- role prompts reach this only by plain `+` concatenation. No sighting
+# COUNT -- the codebook accrues a new sighting every census cycle, and a
+# number baked into a role prompt goes stale silently.
+MISSING_REQUIRED_PARAMETER_REJECTION = """\
+- A rejection naming a REQUIRED parameter that is MISSING is a third shape,
+  distinct from both above: the call parsed fine and the parameter it
+  names IS a real, accepted field — a required sibling was left out. No
+  schema-not-sent trailer, and the named parameter is real rather than
+  invented, means a required sibling is missing rather than the
+  deferred-tool problem above — re-emit the whole call with every required
+  field supplied; do not edit or drop the field that was already accepted,
+  and do not reach for `ToolSearch`. Catalogued sighting: an `Agent` call
+  that supplied `prompt` and omitted the required `description`, rejected
+  before any sub-agent launched.
+"""
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# own -- test_roles_tool_call_rejection.py asserts the composition so the
+# three shapes cannot drift apart.
+TOOL_CALL_REJECTION_GUIDANCE = _TOOL_CALL_REJECTION_KNOWN_SHAPES + MISSING_REQUIRED_PARAMETER_REJECTION
+
+
+# Census-2026-08-31 §1.1 finding (task 4964; plans/confusion-census-2026-08-31.md),
+# codebook entry entry-cand-20260827-23, founding session
+# 7dae04c6-f0a5-400d-b199-8932d65a8790. An `Edit` call landed
+# `<tool_use_error>Found 3 matches of the string to replace, but replace_all
+# is false...`, and the very next turn called a bare `replace_all({})` --
+# rejected with `Error: No such tool available: replace_all`, one turn lost.
+# The agent read the rejection's remedy clause ("set replace_all to true")
+# and bound the bare identifier `replace_all` to the wrong syntactic
+# category: a callable tool rather than a parameter on a re-issued `Edit`
+# call.
+#
+# WHAT IS AND IS NOT ADDRESSED. `Edit`'s multi-match error text is emitted
+# by the harness and is upstream of this repository; no in-repo code path
+# produces or can intercept it, so this constant does not attempt to
+# change, wrap or detect that message. Only the RESPONSE facet is in
+# scope -- an agent that reads the remedy clause correctly does not spend a
+# turn on a phantom tool call. This is the same carve-out tasks 4273 and
+# 4578 documented for the two `InputValidationError` findings above, and it
+# is why a harness-rooted census finding still lands in this file.
+#
+# DISCRIMINATION, NOT DUPLICATION -- now against THREE neighbouring shapes,
+# not two. `TOOL_CALL_REJECTION_GUIDANCE` above covers `InputValidationError`:
+# a defect in the CALL you just made, with the echoed bytes to read, in
+# three shapes (unparseable JSON / invented parameter name / missing
+# required sibling). This constant covers a DIFFERENT error class: a
+# well-formed call that succeeded in parsing, failed on CONTENT, and
+# printed a remedy -- where the failure is in parsing the remedy, not the
+# call. The census recorded "No such tool available" as spanning at least
+# five catalogued mechanisms, so neither block may be collapsed into the
+# other and neither may be deleted as redundant with the other.
+#
+# ACCURACY CAVEAT the text below must honour: the census explicitly does
+# NOT establish that `replace_all: true` was the semantically correct fix
+# for that particular edit. The guidance presents both remedies as chosen
+# on intent -- it must never assert that setting the parameter is always
+# right.
+#
+# HARD CONSTRAINTS, same as both neighbours above. No `mcp__<family>__<name>`
+# example -- this constant is spliced into 8 roles with differing
+# allowlists, and
+# test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
+# asserts any fully-qualified MCP tool a prompt names is in THAT role's
+# allowed_tools; `Edit` and `ToolSearch` are both builtins and do not
+# match that regex. No literal `{`/`}` braces -- role prompts reach this
+# only by plain `+` concatenation. No sighting COUNT in the prose -- the
+# codebook accrues a new sighting every census cycle, and a number baked
+# into a role prompt goes stale silently.
+ERROR_REMEDY_HINT_GUIDANCE = """
+## A tool error's remedy hint may name a parameter — check your tool list first
+
+When a tool result rejects your call and its remedy clause names a bare
+identifier ("set X to true", "pass Y"), the discriminator is whether that
+identifier is in your own tool list. If it is NOT, it is a PARAMETER of
+the tool that just errored — not a tool you can call. Re-issue THAT SAME
+tool call with the parameter set, carrying over every argument from the
+failed call; the remedy names the one field to change, not a standalone
+action. If it IS in your tool list — e.g. a deferred tool's rejection
+naming `ToolSearch` — call it for real: that is a genuine "call this tool
+first," already covered by the section above, not this one.
+
+Catalogued sighting of the parameter case: `Edit` failed with "Found 3
+matches of the string to replace, but replace_all is false", and the next
+turn called a bare `replace_all` with an empty argument object — rejected
+with "No such tool available: replace_all", one turn lost. `replace_all`
+never appears in any tool list; the empty argument object is the other
+tell: read as a tool, the name carries nothing from the failed edit, so
+there is nothing for it to act on.
+
+For that `Edit` case both remedies are legitimate and you choose on
+INTENT: re-issue `Edit` with `replace_all: true` only if you really do
+mean every occurrence; otherwise lengthen `old_string` until it matches
+uniquely. The hint reports why the edit was refused; it is not a claim
+that replacing all of them is what you wanted.
 """
 
 
@@ -863,7 +996,7 @@ ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -975,7 +1108,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -1039,7 +1172,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1242,7 +1375,7 @@ JUDGE = AgentRole(
 You are a completion judge. You decide whether an implementer agent has
 *substantively* completed a task's work, regardless of whether the plan.json
 bookkeeping reflects that.
-""" + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
 ## Context
 
 You run AFTER each implementer iteration inside the orchestrator's execute
@@ -1308,7 +1441,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1671,7 +1804,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -1948,7 +2081,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
 ## What You Do
 
 You receive:
@@ -2068,7 +2201,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is

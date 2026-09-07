@@ -350,11 +350,31 @@ Every decision must respect this order:
 **Hard constraints — violating these is never acceptable:**
 - Never delete tasks, databases, or anything outside the project directory
 - Never kill processes belonging to other orchestrators, the user, or the system
-- Never directly modify `.taskmaster/tasks/tasks.json` — all task mutations go through fused-memory MCP
+- Never directly modify `.taskmaster/tasks/tasks.db` — all task mutations go through fused-memory MCP
 - If the MCP is down, ask the human for help. MCP task mutations trigger reconciliation that maintains memory quality; bypassing it silently degrades the system.
 
-**tasks.json corruption detection:**
-If tasks.json has shrunk, task IDs are mismatched/duplicated, or tasks have disappeared — this is a **critical infrastructure error**:
+**tasks.db corruption detection:**
+Task state lives in fused-memory's SQLite at `<project_root>/.taskmaster/tasks/tasks.db` (the older on-disk
+`tasks.json` was superseded by SQLite and later deleted, so a doc naming it is stale). **Do not use the
+file's size as the signal** — it was a usable proxy for the JSON and is not one for SQLite: the file does
+not shrink when rows are deleted (freed pages go on the freelist), so mass task loss can show *no* size
+change at all, while a routine `VACUUM` or WAL checkpoint changes the size with nothing wrong. Use these
+two instead:
+
+- **Task count, cycle over cycle.** `mcp__fused-memory__get_statuses(project_root=<project_root>, page_size=1)`
+  returns the exact count as `pagination['total']` in a response small enough to note every cycle (see
+  "Draining pending escalations" for why full dumps are the context sink to avoid). Compare against the
+  previous cycle's.
+- **`PRAGMA integrity_check`** — SQLite's own structural check. Read the db **read-only** so you never
+  contend with the live orchestrator, per the hard constraint above:
+  `sqlite3.connect('file:<project_root>/.taskmaster/tasks/tasks.db?mode=ro', uri=True)`. Anything other
+  than a single `ok` row is corruption. `SELECT COUNT(*) FROM tasks` on that same connection is the
+  fallback count when the MCP is down — measured 2026-08-30 against the live df store, it agrees exactly
+  with `pagination['total']` (both 4907), and the whole check runs in ~0.2s.
+
+If the count drops with no cause you can name (a `remove_task` you ran, an operator prune), if
+`integrity_check` returns anything but `ok`, or if task IDs are mismatched/duplicated or tasks have
+disappeared — this is a **critical infrastructure error**:
 1. Find the orchestrator process **for this project only** — verify its command-line args reference this project's root before doing anything
 2. Send SIGTERM (not SIGKILL) and let it finish gracefully
 3. Tell the human immediately with full details
@@ -575,7 +595,7 @@ a record is ever hand-edited.
 It is read-only with respect to escalations (it only ever writes the decision's own state field)
 and fail-soft, exactly like `write-decision` — a registry fault is logged and swallowed, never
 raised, so it can never crash the watch loop. A decision filed with **no** `escalation_id` (e.g.
-the tasks.json-corruption park) is never auto-closed this way and needs explicit human closure.
+the tasks.db-corruption park) is never auto-closed this way and needs explicit human closure.
 Likewise, a decision whose `escalation_id` never resolves to a status — the escalation was purged
 by archive retention pruning, or never existed — also stays `open` forever and needs the same
 explicit human closure; until then, every cycle repeats a full scan of the escalations archive
@@ -1019,15 +1039,84 @@ pending L2 (also runnable across all queues via `scripts/member-chain-sweep.py`,
 
 When the probe fires, the item's ask changes from "human must decide" to **"human must ratify and
 propagate"** — a much cheaper request. Present it that way, with the recovered ruling attached.
+Unless it clears the carve-out below, in which case the ask changes to NOTHING and you close it
+yourself: ratification is only needed for a ruling that is not already Leo's own, executed, and
+orphaned by a terminated session.
 
-**This check is REPORT-ONLY — it must never close anything on its own.** A record can be a
-deliberately-preserved PIN whose value is its *existence*, not its question: esc-3105-3 scores
-15/15 ruled members on this probe and must NOT be closed (it is the last hold on task 3105 /
-task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk close cascade on
-2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag). From the member chain alone, a
-pin and an answered question are indistinguishable. Until task 4377 lands `pin_declared_by` as the
-machine-readable opt-out, the only protection is reading the record and its companions before
-proposing any disposition.
+**This check is REPORT-ONLY — with exactly ONE carve-out (below), it must never close anything on
+its own.** A record can be a deliberately-preserved PIN whose value is its *existence*, not its
+question: esc-3105-3 scores 15/15 ruled members on this probe and must NOT be closed (it is the
+last hold on task 3105 / task 3546's mu-gate specimen; its sibling 3371 was destroyed by a bulk
+close cascade on 2026-08-08; companion esc-3105-5 carries the DO-NOT-CLOSE flag as
+`root_cause = veto-pin-do-not-close:3105`). From the member chain alone, a pin and an answered
+question are indistinguishable. Until task 4377 lands `pin_declared_by` as the machine-readable
+opt-out, the only protection is reading the record and its companions before proposing any
+disposition.
+
+**Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's
+permission a second time to do the bookkeeping on a decision he has already made and that has
+already been executed. When a session ruled a record, did the world-facing work, and then
+terminated without closing the record, closing it is **mechanical, not a new decision** — close it
+yourself and report afterwards. This is safe only because the checklist below demands positive
+documentary evidence of a *specific human ruling*, which a pin by construction never has: the
+report-only default exists because a pin and an answered question are indistinguishable FROM THE
+MEMBER CHAIN ALONE, and nothing here takes the member chain as its authority. esc-3105-3 /
+esc-3105-5 fails at item 5 and keeps working exactly as it does today.
+
+**All six gates must hold. Any miss ⇒ report-only, unchanged.**
+
+1. **The ruling is Leo's OWN and EXPLICIT — never inferred.** It must be attributable in writing:
+   a task description, a commit message, a fused-memory ruling record, or another escalation's
+   `resolution` text that names him ruling it. An agent's recommendation, a `triage_note`'s
+   conclusion, a `suggested_action`, or your own read that "this looks settled" does NOT qualify.
+2. **The ruling names THIS record** — by escalation id, or it unambiguously answers this record's
+   specific question. A ruling on an adjacent topic in the same programme does not qualify.
+3. **The ruling was EXECUTED, and that is verifiable NOW.** The world-facing change — task
+   retargeted or rewritten, dependencies wired, commit landed, config flipped — must be observable
+   at close time, not merely promised in the ruling text. Go look; never take the ruling's own word
+   for its own execution.
+4. **The originating session has TERMINATED.** Do not race a live session. Peer sessions are
+   enumerable via the `ListAgents` tool; a session that ran out of context, was closed, or whose
+   work landed hours ago with the record still open is terminated for this purpose. If it may still
+   be running, leave the record and note it.
+5. **The record is NOT a pin.** `pins_recovery` is empty, `root_cause` is not a
+   `veto-pin-do-not-close:*` key, and no DO-NOT-CLOSE companion record exists for the same task.
+   **This is the protection that must not be weakened** — if any of the three is unclear, treat the
+   record as a pin and stop.
+6. **The sideways check has been run** — `get_pending_escalations(task_id=...)` for the subject
+   task, dispositioning any twin L2 sharing a member in the same sitting (see "At every resolve,
+   look sideways before moving on" under "Resolving Escalations" below).
+
+**When all six hold:**
+
+- Resolve with the appropriate C1 action — usually `resume`; `close_only` when the record is a
+  re-report of an already-ruled class and nothing about the task should change.
+- Write the recovered ruling into the `resolution` verbatim-in-substance, and **name where the
+  ruling lives** (briefing artifact id, commit sha, task id) so the next reader does not re-derive
+  it — and record which residual questions are owned by which tasks, rather than letting the close
+  imply those closed too.
+- **Report the action to Leo afterwards.** No permission needed; the close is never silent.
+
+Worked example — **esc-3881-3** (`design_concern`, `info`, task 3881) asked for sign-off on
+retargeting task 3881 away from a named consumer (`_split_cross_project_task_nodes`) that does not
+exist. Leo ruled it option C on 2026-09-01 via the "The Identity Seam" briefing (artifact
+`b9b4c172-6853-4a12-b242-1a139bd4bb50`) and the ruling was fully executed — task 3881's description
+now opens `RETARGETED 2026-09-01 — option C of esc-3881-3, ruled by Leo via "The Identity Seam"
+briefing`, its scope was rewritten to the safe-A shape, and deps were wired to 3669/3672/4932/4985
+— but that session ran out of context before closing the record, so the L2 sat pending with its
+question already answered. `pins_recovery` empty, `root_cause` the substantive
+`design-concern:3881:…` key rather than a veto-pin key, no DO-NOT-CLOSE companion, sole member
+`esc-3881-2` cascade-closing cleanly: all six hold, so the watcher closes it and reports.
+
+**Expect orphans; they are not anomalies.** That same sitting's docs commit (`3057ffedfd`) recorded
+the esc-3673-1 / esc-3375-1 half of the ruling and never mentioned 3881 at all — which is exactly
+how the record got orphaned. A ruling's propagation is routinely PARTIAL, so a ruled-and-executed
+record left open is the expected residue of a large sitting, not a sign that something went wrong.
+
+**Everything that FAILS the checklist stays report-only**: the ask is still "human must ratify and
+propagate", and if you park it, park with a world-facing predicate naming where the candidate
+ruling lives — never a predicate about the record's own status (see "Reading a triage-ack
+annotation" above).
 
 **If you run a dedup/consolidation pass over pending L2s** (the 2026-08-19 sweep was such a pass,
 done by hand): before designating any survivor, run this check on the shared members. Never keep
@@ -1103,25 +1192,28 @@ Resolve with `action='resume'`, carrying the scope grant as `granted_files` — 
 mcp__escalation__resolve_issue(
   escalation_id="...",
   resolution="Scope expanded to include [<files>]; resuming.",
-  action='resume',   # flips blocked→pending; see the caveat below — the re-pend does NOT fold the grant
+  action='resume',   # re-pends the task AND folds the grant — see below
   granted_files=["<project-relative file path>", ...],   # file-level paths, not module names
   resolved_by="escalation-watcher"
 )
 ```
 
-**Pass `granted_files`, but do not assume it takes effect on the next dispatch.** It is persisted durably on the escalation record either way. The fold into `plan.files` / `metadata.files` / file-locks happens at exactly one place — `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` has a single call site, in `workflow.py::TaskWorkflow._drive`, on the **live L0 in-workflow** resume path (reached only after `_wait_for_resolution()` returns for a still-alive workflow process) → `_set_task_scope`. That is the per-task steward's path, which is why the identical wording is correct in `orchestrator/src/orchestrator/agents/roles.py::STEWARD` and not here.
+**`granted_files` is now delivered on the re-pend path, not just to a live workflow.** It is persisted durably on the escalation record either way, and there are two consumers:
 
-This queue is L2, and the `scope_violation` items reaching it are normally on a `blocked` task whose workflow slot is gone. Resolution then takes the orphan branch (in `orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved`) into `harness.py::Harness._cascade_unblock_member`, which **only flips `blocked` → `pending`** — it never reads `granted_files`, never calls `_set_task_scope`, never touches `plan.files` / `metadata.files` / locks. That is visible in the method body, and `plans/task-escalation-state-graph-prd.md` **D8** confirms it by listing “`granted_files` scope grants deliver on the re-pend path” as semantics still to be *built*. (`docs/task-escalation-state-spec.md` **E9** phrases the same gap as “deliver to nobody”, but scoped to the **strand** case, where no re-pend happens at all — it is not the authority for a `blocked` record.)
+- **Live workflow (per-task steward's path).** `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._collect_granted_files` → `_set_task_scope`, from a single call site in `workflow.py::TaskWorkflow._drive`, reached only after `_wait_for_resolution()` returns for a still-alive workflow process. That is why the same wording is correct in `orchestrator/src/orchestrator/agents/roles.py::STEWARD`.
+- **No live workflow (this queue's normal case).** The `scope_violation` items reaching an L2 queue are usually on a `blocked` — or stranded `in-progress` — task whose workflow slot is gone. Resolution takes the orphan/cascade branch (`orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved`) into `harness.py::Harness._cascade_unblock_member`, which since **task 3540** calls `harness.py::Harness._fold_granted_files_on_repend` between the re-block guard and the status write. That helper unions `granted_files` across **every resolved** escalation for the task (the whole history, order-preserving — the same union `_collect_granted_files` computes) and writes it to **both** `plan.json`'s `files` and `metadata.files`, before the row goes re-pendable.
 
-So a bare `resume` + `granted_files` on a blocked task re-pends it with its ORIGINAL `plan.files`, the agent hits the same wall and re-escalates.
+So `resume` + `granted_files` on a blocked or stranded task with no live claimant now widens the scope the redispatched agent actually works to. `plans/task-escalation-state-graph-prd.md` **D8** and `docs/task-escalation-state-spec.md` **E9** list this as semantics to be built; 3540 built it.
 
-**No mechanism persists a scope widening for a blocked task with no live workflow. Do not go looking for one, and do not tell the next reader you used one.** Traced end-to-end rather than assumed, because a recipe naming a mechanism that does not exist is the exact defect this section was rewritten to remove:
+**Three caveats that survive, so state them accurately rather than promising more than the fold delivers:**
 
-- `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._set_task_scope` is the only choke point that writes **both** `plan.files` and `metadata.files`. It is an instance method on a **live** `TaskWorkflow` (it needs `self.plan` / `self.artifacts` / `self.session_id`), and its only call sites are the in-workflow grant consumer and the post-replan reconcile. Nothing can reach it for a dead workflow.
-- `mcp__fused-memory__update_task(id=..., updates={"metadata": {"files": [...]}})` **is** a real durable write — metadata merges by default, so it will not clobber your other keys — but it does **not** reliably widen the scheduler's locks either. `orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules` is **cache-first**: its own docstring gives the priority as “deterministic short-circuit > in-memory cache > metadata.files > fallback”, and the body returns out of `self._module_cache` *before* it ever reads `metadata.get('files')`. That cache is written on the dispatch read (`scheduler.py::Scheduler._write_module_cache`, the sole assigning call site) and evicted in exactly one place — `scheduler.py::Scheduler._phase_stale_sweep` — and only for tasks that are (a) in a terminal status or (b) absent from `ctx.tasks_by_id`. A `blocked` task is **neither**: `blocked` lives in `orchestrator/src/orchestrator/task_status.py::ACTIVE_TASK_STATUSES`, not `TERMINAL_STATUSES`, and the active-only `get_tasks` fetch that seeds `tasks_by_id` drops only done/cancelled producers. So the narrow cache entry from the task's prior dispatch **survives the escalation**, and your durable write is not consulted for lock derivation on the next `_get_modules` read. It does **not** widen the agent's working scope either: the implementer works to `plan.json`, and `workflow.py::TaskWorkflow._task_files` reads `plan['files']`, which the durable `.task-meta/<task>/plan.json` still holds narrow.
-- **Independently** — and this bites even in the rarer case where the cache *had* been evicted and the widening did reach lock derivation — that write is **self-reverting** exactly when it matters. `workflow.py::TaskWorkflow._reconcile_scope_locks` is the choke point “used by every path that (re)establishes plan.files” — `_plan()`, `_apply_revalidation_skip()`, `_run_simple_task()`, and `_set_task_scope()`, per its own docstring — and it persists `metadata.files = plan_files` on *every* successful refinement ("widen, narrow, **or shift**"), skipping only when the derived module set is unchanged. A `scope_violation` widening **usually** crosses a module boundary, and whenever it does the next dispatch narrows your widened `metadata.files` straight back down to the old `plan.files`. (A widening that stays inside an already-locked module leaves the derived module set unchanged, so `_reconcile_scope_locks` no-ops on its early return and the write survives — but it also bought you nothing: `plan.files` is still narrow, and that is what the implementer works to.)
+- **The fold is best-effort.** A failed plan write or a failed `update_task` logs a WARNING and the task re-pends anyway, against the *unwidened* scope — deliberately, because withholding the re-pend would park the task with its escalation already closed and nothing left to advance it. Re-check `plan.files` after the redispatch rather than assuming the widening took.
+- **No plan, no widen.** A task that never reached the architect (no `plan.json` in either `.task-meta/<worktree>/` or the legacy `<worktree>/.task/`) has no scope to widen; the fold logs a DEBUG and skips, and the re-pend still happens.
+- **The re-block guard outranks the grant.** If the guard withholds the flip, nothing is re-pended, so nothing is widened.
 
-**What to do instead: re-plan, don't re-lock.** The plan boundary is the sanctioned widening path — `scripts/migrate_metadata_modules_to_files.py` states the same rule for a deferred scope ("Scope is deferred to the architect, which widens it at plan time"). A `metadata.files` write is still worth making before you resume, for one narrow reason: on a re-dispatch with a finalized plan the architect runs its **revalidation** branch, and `orchestrator/src/orchestrator/agents/briefing.py::BriefingBuilder._format_task` emits a `**Files:** <metadata.files>` line into that prompt (default `include_files=True` — unlike the fresh-plan `build_architect_prompt`, which passes `include_files=False` to anti-anchor the first derivation). So the widened list reaches the architect's eyes. Treat it as **advisory input to a re-plan, not a scope grant**: nothing forces the architect to fold it in, and `_apply_revalidation_skip` can bypass the architect entirely. Write that caveat into your `resolution`, and re-check `plan.files` after the re-dispatch instead of assuming the widening took.
+Module **locks** are a separate question from working scope, and the fold does not touch them directly: `orchestrator/src/orchestrator/scheduler.py::Scheduler._get_modules` is cache-first (its own docstring: "deterministic short-circuit > in-memory cache > metadata.files > fallback"), and the narrow `_module_cache` entry from the task's prior dispatch survives an escalation — `blocked` is in `orchestrator/src/orchestrator/task_status.py::ACTIVE_TASK_STATUSES`, so `scheduler.py::Scheduler._phase_stale_sweep` does not evict it. Lock widening is re-established branch-side instead, by `workflow.py::TaskWorkflow._reconcile_scope_locks` — the choke point every path that (re)establishes `plan.files` runs through (`_plan()`, `_apply_revalidation_skip()`, `_run_simple_task()`, `_set_task_scope()`). That is also why writing **`plan.json`** is the load-bearing half of the fold: `_reconcile_scope_locks` persists `metadata.files = plan_files` on every successful refinement, so a metadata-only widen would be narrowed straight back down on the next dispatch, while a plan-level widen propagates the other way.
+
+Do **not** hand-write `metadata.files` yourself to simulate the fold. Beyond being redundant now, a metadata-only write is self-reverting for exactly that reason, and it is not consulted for lock derivation while the module cache is warm.
 
 Do **not** try to widen scope by writing `modules` into task metadata. Lock derivation (`Scheduler._get_modules`) reads `metadata.files` and has never read that key, so such a write is a silent no-op that reports success. A lock conflict on the grant is handled orchestrator-side — the task requeues rather than resuming under another task's lock.
 

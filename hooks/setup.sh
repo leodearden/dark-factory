@@ -15,7 +15,7 @@ ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$ROOT"
 
 # --- hooksPath ---------------------------------------------------------
-git config core.hooksPath hooks
+git config --replace-all core.hooksPath hooks
 echo "hooks: core.hooksPath set to hooks/"
 
 # --- .task/ gitignore ---------------------------------------------------

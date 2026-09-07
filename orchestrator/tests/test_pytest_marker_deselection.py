@@ -33,6 +33,21 @@ Taking the executed config is also what makes the over-fire task 3494's
 docstring feared structurally impossible: by then any subproject rescoping has
 already happened, so the command's own shape decides.
 
+CLASS-LEVEL MARKERS (task 4561 — Gap 2 of task 3513, re-specced by esc-3513-2,
+tracing to the same esc-3292-1 above).  The detector grew a THIRD proof tier,
+``guaranteed_marker_names``: a module-wide lower bound that reads a class's
+decorators and its class-body ``pytestmark`` and folds them across every
+collectable class as an INTERSECTION — but only under an
+all-items-accounted-for guard proving no collected item lives outside those
+classes.  It closes the shape both earlier tiers refuse: a file whose every
+item is class-marked, which collects zero under the module's own ``-m`` and so
+returns the very rc=5 false RED this module exists to eliminate.
+
+It was added as a SIBLING of ``module_level_marker_names`` rather than an edit
+to it because that function's set is the strict module-only bound the other two
+tiers are each defined as a SUPERSET of; widening it in place would move the
+baseline every one of them is stated against.
+
 This module unit-tests the pure static detector (``orchestrator.pytest_markers``)
 against synthetic strings, then pins the wired ``derive_verify_plan`` behaviour —
 including the real-config incident golden — then the shared probe, the fallback
@@ -56,6 +71,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
     deselecting_expression_for_targets,
     expression_definitely_deselects,
+    guaranteed_marker_names,
     module_level_marker_names,
     per_item_marker_names,
     resolve_marker_expression,
@@ -561,6 +577,49 @@ class TestPerItemMarkerNames:
         source = f'@pytest.mark.slow\ndef test_a():\n    pass\n\n\n{assignment_line}\n'
         assert per_item_marker_names(source) is None
 
+    @pytest.mark.parametrize(
+        'binding',
+        [
+            'test_a1, test_a2 = _mk(), _mk()',
+            'test_first, *test_rest = _mk_all()',
+            'if True:\n    test_generated = _mk()',
+            'try:\n    test_generated = _mk()\nexcept Exception:\n    pass',
+            'for _ in range(1):\n    test_generated = _mk()',
+        ],
+    )
+    def test_refuses_on_an_unpacked_or_conditionally_bound_test_prefixed_name(self, binding):
+        """THE SAME dynamic-binding hole in its unpacking and nested spellings.
+
+        This tier shares its accounted-for guard with ``guaranteed_marker_names``
+        (``_assign_binds_test_prefixed_name`` and the module-SCOPE statement
+        walk), so both inherit the widened rule and cannot drift apart on which
+        bindings count.  A ``test*`` name is a module attribute whether it is
+        bound by a bare ``Name`` target, an unpacking, or one level down inside
+        a top-level compound statement.
+        """
+        source = f'@pytest.mark.slow\ndef test_a():\n    pass\n\n\n{binding}\n'
+        assert per_item_marker_names(source) is None
+
+    @pytest.mark.parametrize(
+        'hook_name',
+        ['pytest_collection_modifyitems', 'pytest_generate_tests'],
+    )
+    def test_refuses_on_a_pytest_hook_defined_below_a_top_level_if(self, hook_name):
+        """A conditionally-defined hook is still registered for this module."""
+        source = (
+            '@pytest.mark.slow\ndef test_a():\n    pass\n\n\n'
+            f'if True:\n    def {hook_name}(*args):\n        pass\n'
+        )
+        assert per_item_marker_names(source) is None
+
+    def test_a_pytest_prefixed_local_helper_does_not_refuse(self):
+        """THE SCOPE CONTROL: only a MODULE-scope ``pytest_*`` def is a hook."""
+        source = (
+            '@pytest.mark.slow\ndef test_a():\n    pass\n\n\n'
+            'def _outer():\n    def pytest_generate_tests(m):\n        pass\n'
+        )
+        assert per_item_marker_names(source) is not None
+
     def test_a_local_test_prefixed_assignment_inside_a_function_does_not_refuse(self):
         """Only a TOP-LEVEL binding is pytest-collectible; a local variable is not."""
         source = (
@@ -615,6 +674,644 @@ class TestPerItemMarkerNames:
             'def test_a():\n    pass\n'
         )
         assert per_item_marker_names(source) is not None
+
+
+# ---------------------------------------------------------------------------
+# guaranteed_marker_names (step-1: RED)
+# ---------------------------------------------------------------------------
+
+#: The real class-level shape at ``fused-memory/tests/test_mem0_client.py:1854``
+#: -- ``pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]``
+#: -- generalised to one class per accepted spelling: the class-BODY ``pytestmark``
+#: list (whose leading ``qdrant_skipif()`` is a non-marker ``Call`` on a bare
+#: ``Name``, which ``_marker_name`` must keep skipping WITHOUT suppressing its
+#: siblings) and the class DECORATOR.  No module-level ``pytestmark`` and no
+#: module-level test function, so the whole answer comes from the class tier.
+_ALL_CLASSES_MARKED_SOURCE = """\
+import pytest
+
+from helpers import qdrant_skipif
+
+
+class TestBodyPytestmark:
+
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.slow]
+
+    def test_one(self):
+        pass
+
+    def test_two(self):
+        pass
+
+
+@pytest.mark.slow
+class TestClassDecorator:
+
+    def test_three(self):
+        pass
+
+    def test_four(self):
+        pass
+"""
+
+#: The minimal acceptance shape: one marked class and nothing else.
+_ONE_CLASS_MARKED_SOURCE = """\
+import pytest
+
+
+@pytest.mark.slow
+class TestOnly:
+
+    def test_a(self):
+        pass
+
+    def test_b(self):
+        pass
+"""
+
+
+def _classes_marked_plus(extra: str) -> str:
+    """``_ALL_CLASSES_MARKED_SOURCE`` with *extra* appended at module scope."""
+    return f'{_ALL_CLASSES_MARKED_SOURCE}\n\n{extra}\n'
+
+
+def _classes_marked_importing(import_line: str) -> str:
+    """``_ALL_CLASSES_MARKED_SOURCE`` with *import_line* prepended at module scope."""
+    return f'{import_line}\n{_ALL_CLASSES_MARKED_SOURCE}'
+
+
+#: A module pytest collects NOTHING from: no ``Test*``-named class, no ``test*``
+#: function, only marked helper classes.  Both helpers carry ``slow``, so an
+#: intersection over "every top-level class" would read ``{'slow'}`` and prove
+#: any expression mentioning it -- THE VACUOUS-INTERSECTION HAZARD.
+_ONLY_HELPER_CLASSES_SOURCE = """\
+import pytest
+
+
+@pytest.mark.slow
+class _Helper:
+
+    def build(self):
+        pass
+
+
+@pytest.mark.slow
+class _Other:
+
+    def render(self):
+        pass
+"""
+
+
+class TestGuaranteedMarkerNames:
+    """``guaranteed_marker_names(source) -> frozenset[str]``.
+
+    THE THIRD, ADDITIVE PROOF TIER: a module-wide LOWER BOUND on EVERY item
+    collected from *source* -- ``module_level_marker_names(source)`` unioned
+    with the INTERSECTION of every collectable class's own markers, and only
+    when an all-items-accounted-for guard proves no collected item can live
+    outside those classes -- never a per-item enumeration, which is
+    ``per_item_marker_names``' job.  Every guard failure degrades to exactly
+    ``module_level_marker_names``' answer, never less.
+    """
+
+    def test_one_marked_class_is_the_minimal_acceptance_shape(self):
+        """The class-level marker is unioned into the module-wide bound."""
+        assert guaranteed_marker_names(_ONE_CLASS_MARKED_SOURCE) == frozenset({'slow'})
+
+    def test_both_class_marker_spellings_are_read_and_intersected(self):
+        """The real ``test_mem0_client.py`` body shape alongside the decorator spelling.
+
+        ``TestBodyPytestmark`` carries ``{timeout, slow}`` and
+        ``TestClassDecorator`` carries ``{slow}``; only the SHARED marker is a
+        module-wide bound, so the fold is an INTERSECTION and ``timeout`` is
+        correctly absent.  The leading ``qdrant_skipif()`` contributes nothing
+        and must not suppress its siblings.
+        """
+        assert guaranteed_marker_names(_ALL_CLASSES_MARKED_SOURCE) == frozenset({'slow'})
+
+    def test_module_level_and_class_level_markers_are_unioned(self):
+        """The two tiers compose rather than compete."""
+        source = (
+            'import pytest\n\n'
+            'pytestmark = pytest.mark.timeout(60)\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestA:\n'
+            '    def test_a(self):\n        pass\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestB:\n'
+            '    def test_b(self):\n        pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset({'timeout', 'slow'})
+
+    def test_reproduces_the_module_level_answer_on_the_real_pytestmark_shape(self):
+        """The primary tier is untouched and still decisive on its own.
+
+        ``_REAL_PYTESTMARK_SOURCE`` has no collectable class at all, so the
+        class tier refuses and the answer is exactly the module-level one --
+        the degradation contract, pinned non-vacuously (the shared answer is
+        a NON-empty set, so an accidental ``frozenset()`` would fail).
+        """
+        assert guaranteed_marker_names(_REAL_PYTESTMARK_SOURCE) == module_level_marker_names(
+            _REAL_PYTESTMARK_SOURCE,
+        )
+        assert guaranteed_marker_names(_REAL_PYTESTMARK_SOURCE) != frozenset()
+
+    def test_reproduces_the_module_level_answer_on_a_module_level_marked_module(self):
+        """``_MARKED_SOURCE`` -- a module-level ``pytestmark`` plus a module-level test.
+
+        The module-level test function means the accounted-for guard refuses
+        the class tier, and the module-level bound alone still proves
+        ``warm_lane_bash`` exactly as it does today.
+        """
+        assert guaranteed_marker_names(_MARKED_SOURCE) == module_level_marker_names(_MARKED_SOURCE)
+        assert guaranteed_marker_names(_MARKED_SOURCE) == frozenset({'warm_lane_bash'})
+
+    def test_unmarked_module_is_empty(self):
+        assert guaranteed_marker_names(_UNMARKED_SOURCE) == frozenset()
+
+    # -- refusals: shapes with a collectable item outside the marked classes --
+    #
+    # Every fixture below is `_ALL_CLASSES_MARKED_SOURCE` (which on its own
+    # yields `frozenset({'slow'})`, pinned above) plus exactly ONE offending
+    # construct, so a refusal can never pass vacuously: if the guard under
+    # test stopped firing, the assertion would fail with `frozenset({'slow'})`.
+    # The assertion form is `== module_level_marker_names(source)` rather than
+    # `== frozenset()` because that pins the exact DEGRADATION CONTRACT — a
+    # guard failure falls back to the primary tier's answer, never below it.
+
+    def test_refuses_on_a_module_level_test_function_beside_the_marked_classes(self):
+        """The mixed module the task names explicitly.
+
+        ``test_a`` is an undecorated, still-SELECTED item that no class
+        marker covers, so no class-level marker is a module-wide bound.
+        """
+        source = _classes_marked_plus('def test_a():\n    pass\n')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_refuses_when_a_test_function_is_nested_below_tree_body(self):
+        """THE UNSOUNDNESS THIS GUARD CLOSES.
+
+        An undecorated, still-SELECTED sibling hiding inside a top-level
+        ``if`` would otherwise be invisible to a class-body-only walk, and
+        the module would falsely widen.
+        """
+        source = _classes_marked_plus(
+            "if sys.platform == 'linux':\n    def test_b():\n        pass\n",
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_refuses_on_a_module_level_async_test_function(self):
+        """``async def`` counts as an item exactly as ``def`` does."""
+        source = _classes_marked_plus('async def test_c():\n    pass\n')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'hook_source',
+        [
+            'def pytest_collection_modifyitems(config, items):\n    pass\n',
+            'def pytest_generate_tests(metafunc):\n    pass\n',
+        ],
+    )
+    def test_refuses_on_a_top_level_pytest_hook(self, hook_source):
+        """A hook can add items outside the classes this walk sees."""
+        source = _classes_marked_plus(hook_source)
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_refuses_on_a_star_import(self):
+        """Bound names from ``from x import *`` are statically unknowable."""
+        source = _classes_marked_importing('from helpers import *')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'import_line',
+        [
+            'from helpers import TestBase',
+            'import helpers as TestAlias',
+            'from helpers import Base as TestBase',
+            'from helpers import test_shared_case',
+            'import helpers as test_alias',
+            'from helpers import shared_case as test_alias',
+        ],
+    )
+    def test_refuses_when_an_import_binds_a_name_starting_with_test(self, import_line):
+        """THE "test classes imported from another module" CASE, and its function twin.
+
+        Pytest collects an imported ``Test*`` CLASS in THIS module under the
+        default ``python_classes``, and an imported lowercase ``test_*``
+        FUNCTION under ``python_functions``; ``asname`` wins either way.
+        Neither is inside one of this module's marked classes.
+        """
+        source = _classes_marked_importing(import_line)
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_asname_that_does_not_start_with_test_does_not_refuse_on_that_ground_alone(self):
+        """THE REVERSE CONTROL: aliasing a ``Test*`` name AWAY is not a hole."""
+        source = _classes_marked_importing('from helpers import TestBase as _base')
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    @pytest.mark.parametrize(
+        'assignment_line',
+        [
+            'test_generated = _make_case()',
+            'test_generated: object = _make_case()',
+        ],
+    )
+    def test_refuses_on_a_top_level_assignment_that_binds_a_test_prefixed_name(
+        self, assignment_line,
+    ):
+        """THE "dynamically generated items" CASE.
+
+        The default ``python_functions = test*`` collects a module attribute
+        so named however it was bound, and this walk cannot tell statically
+        whether ``_make_case()`` returns a callable.
+        """
+        source = _classes_marked_plus(assignment_line)
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'target',
+        [
+            'test_a1, test_a2',
+            '(test_a1, test_a2)',
+            '[test_a1, test_a2]',
+            'test_first, *test_rest',
+            '_keep, test_a2',
+            'test_a1, (_inner, test_nested)',
+        ],
+    )
+    def test_refuses_on_a_tuple_or_list_unpacking_that_binds_a_test_prefixed_name(
+        self, target,
+    ):
+        """THE SAME dynamic-binding hole, spelled as an unpacking rather than a Name.
+
+        ``test_a1, test_a2 = _mk(), _mk()`` binds exactly the module attributes
+        the single-``Name`` rule above exists to refuse; reading only
+        ``ast.Name`` targets let the identical shape through.  Nested and
+        ``Starred`` targets are the same case one level down, and the
+        ``_keep, test_a2`` row pins that ONE test-prefixed name anywhere in the
+        target is enough.
+        """
+        source = _classes_marked_plus(f'{target} = _mk(), _mk()')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_an_unpacking_that_binds_no_test_prefixed_name_does_not_refuse(self):
+        """THE REVERSE CONTROL: the recursive target walk must not be over-broad."""
+        source = _classes_marked_plus('_first, (_second, _third) = _mk(), _mk()')
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    @pytest.mark.parametrize(
+        'wrapper',
+        [
+            'if True:',
+            'if os.environ.get("X"):',
+            'try:',
+            'for _ in range(1):',
+            'with _ctx():',
+            'while False:',
+        ],
+    )
+    def test_refuses_on_a_dynamic_binding_below_a_top_level_compound_statement(
+        self, wrapper,
+    ):
+        """A ``test*`` binding is a module attribute wherever it executes.
+
+        The rule keyed on DIRECT children of ``tree.body``, so the very shape
+        the guard's own docstring claims to cover — "a test hidden inside a
+        top-level ``if``" — escaped it whenever the item was bound by
+        assignment rather than ``def``.  What actually matters is lexical
+        SCOPE, not nesting depth: everything here still binds at module scope.
+        """
+        tail = 'except Exception:\n    pass\n' if wrapper == 'try:' else ''
+        source = _classes_marked_plus(f'{wrapper}\n    test_generated = _mk()\n{tail}')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'hook_name',
+        ['pytest_collection_modifyitems', 'pytest_generate_tests'],
+    )
+    def test_refuses_on_a_pytest_hook_defined_below_a_top_level_if(self, hook_name):
+        """The hook rule had the identical ``tree.body``-only hole.
+
+        A conditionally-defined hook is still registered for this module and
+        can still add items this walk never sees.
+        """
+        source = _classes_marked_plus(
+            f'if True:\n    def {hook_name}(*args):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    @pytest.mark.parametrize(
+        'nested_source',
+        [
+            'def _helper():\n    test_local = _mk()\n    return test_local\n',
+            'class _Cfg:\n    test_attr = _mk()\n',
+        ],
+    )
+    def test_a_test_prefixed_binding_inside_a_function_or_class_body_does_not_refuse(
+        self, nested_source,
+    ):
+        """THE SCOPE CONTROL that keeps the widened rule from swallowing the tier.
+
+        Dropping the "direct child of ``tree.body``" restriction must widen the
+        rule to module SCOPE, not to every node in the tree.  A binding inside
+        a ``def`` is a local pytest never sees; one inside a class body is a
+        class attribute, and if it is collected at all it is collected UNDER
+        that class's node and carries its marks — so neither is a hole, and
+        refusing on either would kill the tier on ordinary modules.
+        """
+        source = _classes_marked_plus(nested_source)
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    def test_an_ordinary_helper_import_does_not_refuse(self):
+        """THE CONTROL: the ``test``-prefix guard must not be over-broad."""
+        source = _classes_marked_importing(
+            'from systemd_unit_invariants import require_installed_unit',
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    # -- class shape and the INTERSECTION fold --------------------------------
+    #
+    # Same non-vacuity discipline as the sub-section above: every refusal
+    # fixture carries at least one fully-marked class, and the assertion form
+    # stays `== module_level_marker_names(source)` so the degradation contract
+    # is pinned rather than an emptiness that happens to coincide.
+
+    def test_an_unmarked_collectable_class_beside_a_marked_one_refuses(self):
+        """ALL, not ANY: EVERY collectable class must carry the marker.
+
+        ``TestOther``'s items are unmarked and still SELECTED, so no class
+        marker is a module-wide bound.  A union fold would answer
+        ``{'slow'}`` here and widen away a run that genuinely collects.
+        """
+        source = _classes_marked_plus(
+            'class TestOther:\n    def test_x(self):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_heterogeneously_marked_classes_intersect_to_nothing(self):
+        """THE KEY SOUNDNESS PIN: the fold is an INTERSECTION, never a union.
+
+        ``TestA`` guarantees ``slow`` only for its OWN items and ``TestB``
+        guarantees ``integration`` only for its own.  A union would claim
+        ``slow`` for ``TestB``'s items, and
+        ``expression_definitely_deselects('not slow', ...)`` would then read
+        True and widen away a run that genuinely collects ``TestB`` -- the
+        over-fire that reopens esc-3292-1 / task 1852.
+        """
+        source = (
+            'import pytest\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestA:\n'
+            '    def test_a(self):\n        pass\n\n\n'
+            '@pytest.mark.integration\n'
+            'class TestB:\n'
+            '    def test_b(self):\n        pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset()
+
+    def test_a_marker_carried_by_every_class_survives_the_intersection(self):
+        """The other half of the fold: a SHARED marker is a genuine bound."""
+        source = (
+            'import pytest\n\n\n'
+            '@pytest.mark.slow\n'
+            '@pytest.mark.timeout\n'
+            'class TestA:\n'
+            '    def test_a(self):\n        pass\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestB:\n'
+            '    def test_b(self):\n        pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    def test_refuses_on_a_class_nested_inside_another_class(self):
+        """Pins that the class scan uses ``ast.walk``, not just ``tree.body``.
+
+        ``TestInner`` defines no method of its own here, so nothing else in
+        the guard fires: only the non-top-level-class rule can catch it.
+        """
+        source = _classes_marked_plus(
+            '@pytest.mark.slow\n'
+            'class TestOuter:\n\n'
+            '    class TestInner:\n'
+            '        pass\n\n'
+            '    def test_a(self):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_refuses_on_a_class_nested_inside_a_top_level_if(self):
+        """A conditionally-defined test class is still collected when the branch runs."""
+        source = _classes_marked_plus(
+            'if True:\n    class TestNested:\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_zero_collectable_classes_refuses_rather_than_proving_everything(self):
+        """THE VACUOUS-INTERSECTION PIN.
+
+        ``frozenset.intersection()`` over an EMPTY family is conventionally
+        "every marker", so a module with no collectable class at all would
+        prove any expression false and widen everything.  Both helper classes
+        here carry ``slow``, so an unguarded fold over "every top-level class"
+        answers ``{'slow'}`` -- yet pytest collects nothing from this module.
+        """
+        assert guaranteed_marker_names(_ONLY_HELPER_CLASSES_SOURCE) == module_level_marker_names(
+            _ONLY_HELPER_CLASSES_SOURCE,
+        )
+        assert guaranteed_marker_names(_ONLY_HELPER_CLASSES_SOURCE) == frozenset()
+
+    def test_refuses_on_an_unmarked_non_test_named_class_that_defines_a_test_method(self):
+        """COLLECTABILITY IS NAME-PREFIX **OR** HAS-A-TEST-METHOD.
+
+        ``per_item_marker_names``' docstring already records that the default
+        ``python_classes = Test*`` is an UNCHECKED premise.  A repo that
+        overrides it to collect ``FooSuite`` would slip past a pure prefix
+        rule, so a non-``Test*``-named class that defines a ``test*`` method
+        must be marked or else refuse -- which makes the premise
+        self-checking in the safe direction.
+        """
+        source = _classes_marked_plus(
+            'class _Base:\n    def test_shared(self):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_a_plain_helper_class_does_not_force_a_refusal(self):
+        """THE BOUNDED-OVER-REFUSAL CONTROL.
+
+        ``_Config`` is neither ``Test*``-named nor defines a ``test*``
+        method, so pytest collects nothing from it and it is simply ignored.
+        Refusing on every unmarked helper class would kill this tier on most
+        real modules.
+        """
+        source = _classes_marked_plus(
+            'class _Config:\n    value = 1\n',
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    def test_pytestmark_inside_a_class_if_block_is_not_that_classs_marker(self):
+        """Mirrors ``module_level_marker_names``' ``tree.body``-only rule one level down."""
+        source = _classes_marked_plus(
+            'class TestConditional:\n\n'
+            '    if True:\n'
+            '        pytestmark = pytest.mark.slow\n\n'
+            '    def test_x(self):\n        pass\n',
+        )
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    # -- never raises ----------------------------------------------------------
+
+    def test_none_source_is_empty(self):
+        assert guaranteed_marker_names(None) == frozenset()
+
+    def test_syntax_error_is_empty_not_a_raise(self):
+        assert guaranteed_marker_names('def broken(:\n') == frozenset()
+
+    # -- the named refusal cases, their in-class acceptance twin, and the ----
+    # -- family invariant ----------------------------------------------------
+
+    @pytest.mark.parametrize(
+        'decorator_line',
+        [
+            "@pytest.mark.parametrize('x', [1, 2])",
+            "@pytest.mark.parametrize('x', [1, pytest.param(2, marks=pytest.mark.xfail)])",
+        ],
+    )
+    def test_refuses_on_a_module_level_parametrized_test_function(self, decorator_line):
+        """``parametrize`` / ``pytest.param(marks=...)`` where they ARE a genuine hole.
+
+        ``module_level_marker_names``' docstring names both as reasons a
+        per-item DECORATOR SWEEP is unsound.  At MODULE level they still are:
+        ``test_a``'s items live outside every marked class, so no class
+        marker bounds them — the accounted-for guard's module-level-test-
+        function rule is what refuses, and it would refuse here even without
+        the parametrize.
+        """
+        source = _classes_marked_plus(f'{decorator_line}\ndef test_a(x):\n    pass\n')
+        assert guaranteed_marker_names(source) == module_level_marker_names(source)
+
+    def test_parametrize_inside_a_fully_marked_class_does_not_block_widening(self):
+        """THE PAIRED ACCEPTANCE PIN, and why refusing here would buy no soundness.
+
+        Marks compose ADDITIVELY up the Module -> Class -> Function node
+        chain and nothing can REMOVE an ancestor mark, so ``parametrize``
+        multiplies items without breaking a bound that already holds for all
+        of them.  Refusing would still be SOUND, but ``parametrize`` is
+        near-ubiquitous inside test classes, so the guard would make this
+        tier fire on essentially nothing.
+
+        MEASURED, not assumed (scratch repo, re-verified in this task's
+        implementation session).  Under ``-m 'not slow'``, a class-level
+        ``pytestmark = [pytest.mark.slow]`` deselected ``test_plain``,
+        ``test_p[1]`` AND ``test_p[2]`` — the
+        ``pytest.param(2, marks=pytest.mark.xfail)`` one — for a total of
+        ``4 deselected, 0 selected`` and rc=5: precisely the false-RED shape
+        this widening exists to convert into a real run.
+        """
+        source = (
+            'import pytest\n\n\n'
+            'class TestBody:\n\n'
+            '    pytestmark = [pytest.mark.slow]\n\n'
+            '    def test_plain(self):\n        pass\n\n'
+            "    @pytest.mark.parametrize('x', [1, pytest.param(2, marks=pytest.mark.xfail)])\n"
+            '    def test_p(self, x):\n        pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    def test_a_marked_subclass_of_an_imported_base_is_not_a_hole(self):
+        """Inherited test methods are collected under the marked SUBCLASS's node.
+
+        Same measured basis as above: ``@pytest.mark.slow class TestSub(Base)``
+        with ``Base`` defined in ANOTHER module and no methods of its own
+        still yielded ``TestSub::test_inherited`` as a collected, DESELECTED
+        item.  ``from base_helper import Base`` binds no ``test``-prefixed
+        name, so the import guard correctly stays quiet; the separate
+        ``from helpers import TestBase`` shape remains refused (pinned above).
+        """
+        source = (
+            'import pytest\n\n'
+            'from base_helper import Base\n\n\n'
+            '@pytest.mark.slow\n'
+            'class TestSub(Base):\n'
+            '    pass\n'
+        )
+        assert guaranteed_marker_names(source) == frozenset({'slow'})
+
+    def test_the_real_class_organised_module_in_this_repo_is_handled_soundly(self):
+        """REAL-INPUT COVERAGE for the class tier — deliberately NOT a tripwire.
+
+        The two existing real-config goldens
+        (``TestWarmLaneBashRealConfigRegression``,
+        ``TestTestsScriptsAllIntegrationDecoratedRealConfigRegression``) guard
+        live premises.  This tier has none: ``fused-memory/tests/test_mem0_client.py``
+        is the repo's most class-organised marked suite and it marks only a
+        MINORITY of its top-level classes, so it correctly refuses, and the
+        synthetic goldens above are the honest way to pin the behaviour.  What is
+        worth running on the real file is the part that holds either way — the
+        SUPERSET contract, on input nobody wrote for this test.
+
+        WHY NOT ASSERT THE ABSENCE.  This test reads a file in ANOTHER PACKAGE
+        from inside the orchestrator suite.  An earlier form asserted that the
+        remaining classes are still unmarked, which meant a wholly unrelated task
+        adding a class marker in the fused-memory suite would turn THIS suite RED
+        and block that task's verify, with a failure naming a file its author
+        never touched — a cross-package coupling the synthetic goldens make
+        unnecessary.  The flip is still reported, as a SKIP carrying the
+        "promote it to a real-file golden" instruction, so the signal survives
+        without the blocking.
+        """
+        target = REPO_ROOT / 'fused-memory' / 'tests' / 'test_mem0_client.py'
+        if not target.exists():
+            pytest.skip(
+                f'{target} has been renamed or removed — this is real-input coverage '
+                'for the class tier, not a pin on that path; retarget it at another '
+                'class-organised suite or drop it. The fix is NOT in orchestrator.',
+            )
+        source = target.read_text()
+        top_level_classes = [
+            node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)
+        ]
+        if len(top_level_classes) <= 1:
+            pytest.skip(f'{target} is no longer class-organised; nothing real-input to assert')
+
+        # Holds on every input, so it can never be flipped by someone else's edit.
+        assert module_level_marker_names(source) <= guaranteed_marker_names(source), (
+            f'the STRICTLY ADDITIVE superset contract is broken on {target} — '
+            'guaranteed_marker_names returned LESS than module_level_marker_names, so '
+            'routing tier 1 through it can now refuse a target the old code accepted. '
+            'THIS one is an orchestrator defect: see pytest_markers.guaranteed_marker_names.'
+        )
+        if guaranteed_marker_names(source) != module_level_marker_names(source):
+            pytest.skip(
+                f'THE TRIPWIRE FLIPPED: every collectable class in {target} is now marked, '
+                'so the class tier has become live on REAL code and no longer has to be '
+                'pinned by synthetic goldens alone. Promote the shape to a real-file '
+                'golden beside TestWarmLaneBashRealConfigRegression. Nothing is broken and '
+                'THE FIX IS NOT IN ORCHESTRATOR — this is a healthy signal, not a failure.',
+            )
+
+    # -- cost bound: exactly one parse per call --------------------------------
+
+    def test_does_not_re_parse_source_to_derive_the_module_level_union(self, monkeypatch):
+        """One ``ast.parse`` per call, not two.
+
+        This function replaces a ``module_level_marker_names(source)`` call at
+        the composed entry point's tier-1 call site, so it must not cost more
+        than the call it replaces.  Reusing
+        ``_module_level_marker_names_from_tree`` off its OWN tree — rather
+        than calling ``module_level_marker_names(source)``, which would
+        re-parse — is what keeps the per-target parse count unchanged and the
+        existing cost pins green.
+        """
+        calls: list[None] = []
+        original_parse = ast.parse
+
+        def counting_parse(*args, **kwargs):
+            calls.append(None)
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(ast, 'parse', counting_parse)
+        assert guaranteed_marker_names(_ALL_CLASSES_MARKED_SOURCE) == frozenset({'slow'})
+        assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +1429,35 @@ _ROOT_PYPROJECT = _pyproject(f'"{_ROOT_ADDOPTS}"')
 #: this composed entry point, not just `per_item_marker_names` in isolation.
 _ALL_DECORATED_SOURCE_WITH_CLASS = _ALL_DECORATED_SOURCE + (
     '\n\nclass TestThing:\n    def test_method(self):\n        pass\n'
+)
+
+#: The CLASS-LEVEL twin of `_MARKED_SOURCE`: no module-level `pytestmark` and no
+#: module-level test function, so ONLY the class tier can prove this file fully
+#: deselected.  Both classes carry the incident's own `warm_lane_bash`, one per
+#: accepted spelling.
+_CLASS_MARKED_SOURCE = """\
+import pytest
+
+
+@pytest.mark.warm_lane_bash
+class TestOne:
+
+    def test_a(self):
+        pass
+
+
+class TestTwo:
+
+    pytestmark = [pytest.mark.warm_lane_bash]
+
+    def test_b(self):
+        pass
+"""
+
+#: `_CLASS_MARKED_SOURCE` plus ONE unmarked collectable class — ALL-not-ANY at
+#: class granularity, at this composed entry point rather than in isolation.
+_CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE = _CLASS_MARKED_SOURCE + (
+    '\n\nclass TestThree:\n    def test_c(self):\n        pass\n'
 )
 
 
@@ -877,6 +1603,94 @@ class TestDeselectingExpressionForTargets:
         ) == 'not smoke and not integration and not warm_lane_bash'
         assert read.paths == ['a/test_a.py', 'a/test_b.py']
 
+    # -- class-level markers, via the widened primary tier --------------------
+
+    def test_an_all_classes_marked_target_widens(self):
+        """THE ACCEPTANCE CASE for task 4561 — the shape that returns rc=5 today.
+
+        Neither tier can prove this file today: tier 1 sees only the
+        module-level set (empty) and tier 2 refuses on the ClassDef.  Yet
+        every item it collects carries ``warm_lane_bash`` and the module's own
+        addopts say ``-m 'not warm_lane_bash'``, so the file-scoped run
+        collects ZERO items and exits rc=5 — a false RED on a diff that
+        touched a real, passing test file.
+        """
+        read = _RecordingReader({'a/test_a.py': _CLASS_MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) == 'not warm_lane_bash'
+
+    def test_one_unmarked_class_among_marked_ones_is_refused(self):
+        """ALL, not ANY, at class granularity: ``TestThree``'s items still collect."""
+        read = _RecordingReader({'a/test_a.py': _CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) is None
+
+    def test_one_unmarked_target_beside_a_class_marked_one_is_refused(self):
+        """ALL, not ANY, ACROSS targets — the widened tier does not weaken that."""
+        read = _RecordingReader({
+            'a/test_a.py': _CLASS_MARKED_SOURCE,
+            'a/test_b.py': _UNMARKED_SOURCE,
+        })
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) is None
+
+    def test_a_class_marked_target_under_a_non_deselecting_expression_is_refused(self):
+        """THE EXPRESSION decides, not the mere presence of a class-level marker.
+
+        ``not smoke`` leaves ``smoke`` UNKNOWN on a ``warm_lane_bash``-marked
+        file, so nothing is proven and today's FILE_SCOPED behaviour stands.
+        """
+        read = _RecordingReader({'a/test_a.py': _CLASS_MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _pyproject('"-m \'not smoke\'"'), None, read,
+        ) is None
+
+    def test_a_cli_dash_m_that_reselects_the_bucket_refuses_a_class_marked_target(self):
+        """Last-wins survives the new tier: the lane's own ``-m`` SELECTS these items."""
+        read = _RecordingReader({'a/test_a.py': _CLASS_MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'],
+            _WARM_LANE_PYPROJECT,
+            'uv run pytest tests/ -m warm_lane_bash',
+            read,
+        ) is None
+
+    def test_the_existing_class_refusal_survives_because_both_tiers_still_refuse(self):
+        """UNCHANGED CONTROL, with its mechanism made explicit.
+
+        ``_ALL_DECORATED_SOURCE_WITH_CLASS`` carries module-level test
+        functions, so the widened tier 1's accounted-for guard refuses (those
+        items live OUTSIDE the class), and tier 2 still refuses on the
+        ClassDef.  Both arms decline, which is why
+        ``test_all_decorated_source_with_a_test_class_is_refused`` above stays
+        green — the widening is ADDITIVE, not a loosening.
+        """
+        assert guaranteed_marker_names(_ALL_DECORATED_SOURCE_WITH_CLASS) == frozenset()
+        assert per_item_marker_names(_ALL_DECORATED_SOURCE_WITH_CLASS) is None
+        read = _RecordingReader({'a/test_a.py': _ALL_DECORATED_SOURCE_WITH_CLASS})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _ROOT_PYPROJECT, None, read,
+        ) is None
+
+    def test_a_class_marked_target_still_costs_exactly_one_read(self):
+        """THE COST BOUND extended to the new tier: one read per target, not two.
+
+        ``guaranteed_marker_names`` replaces the ``module_level_marker_names``
+        call at tier 1 rather than joining it, so neither the read count nor
+        the per-target parse count moves.
+        """
+        read = _RecordingReader({
+            'a/test_a.py': _CLASS_MARKED_SOURCE,
+            'a/test_b.py': _CLASS_MARKED_SOURCE,
+        })
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _WARM_LANE_PYPROJECT, None, read,
+        ) == 'not warm_lane_bash'
+        assert read.paths == ['a/test_a.py', 'a/test_b.py']
+
 
 # ---------------------------------------------------------------------------
 # derive_verify_plan wiring (step-9: RED until step-10)
@@ -889,10 +1703,42 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _DESELECTING_PYPROJECT = _pyproject('"-n auto -m \'not slow\'"')
 _PLAIN_PYPROJECT = _pyproject('"-n auto -q"')
 
+#: A CLASS-marked module under ``mod``: every top-level class carries ``slow``,
+#: with no module-level ``pytestmark`` and no module-level test function — so
+#: only `guaranteed_marker_names` can prove it fully deselected (task 4561).
+_CLASS_MARKED_MODULE_SOURCE = """\
+import pytest
+
+
+@pytest.mark.slow
+class TestGamma:
+
+    def test_g(self):
+        pass
+
+
+class TestDelta:
+
+    pytestmark = [pytest.mark.slow]
+
+    def test_d(self):
+        pass
+"""
+
+#: THE NON-VACUITY CONTROL for the golden below: identical but for ONE unmarked
+#: collectable class.  Without it the golden could pass because the widening had
+#: become unconditional rather than because the classes are all marked.
+_CLASS_PARTLY_MARKED_MODULE_SOURCE = _CLASS_MARKED_MODULE_SOURCE + (
+    '\n\nclass TestEpsilon:\n    def test_e(self):\n        pass\n'
+)
+
+
 _SYNTHETIC_CONTENTS: dict[str, str] = {
     'mod/pyproject.toml': _DESELECTING_PYPROJECT,
     'mod/tests/test_a.py': 'import pytest\npytestmark = pytest.mark.slow\n',
     'mod/tests/test_b.py': 'import pytest\n\n\ndef test_b():\n    pass\n',
+    'mod/tests/test_c.py': _CLASS_MARKED_MODULE_SOURCE,
+    'mod/tests/test_d.py': _CLASS_PARTLY_MARKED_MODULE_SOURCE,
     # 'other' declares no -m at all — the control for "module without a marker
     # expression is never widened", even with an identically-marked target.
     'other/pyproject.toml': _PLAIN_PYPROJECT,
@@ -1006,6 +1852,46 @@ class TestDeriveModuleRunsWidensOnFullDeselection:
         assert run is not None
         assert run.scope_kind is ScopeKind.FILE_SCOPED
         assert run.scoped_targets == ('mod/tests/test_a.py', 'mod/tests/test_b.py')
+
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    def test_class_marked_target_widens_at_both_roles(self, role):
+        """END-TO-END: a class-marked diff reaches FULL_SUITE through the real planner.
+
+        Every unit below this point already passes; this is the pin that the
+        widening actually SURVIVES `derive_verify_plan` — that arm 4 consults
+        the probe, believes it, and emits a plan record an operator can read.
+        """
+        mc = _mc('mod')
+        plan = derive_verify_plan(
+            ['mod/tests/test_c.py'], [mc], None, _synthetic_reader, role=role,
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        # PlannedRun's invariant: scoped_targets is non-empty iff FILE_SCOPED.
+        assert run.scoped_targets == ()
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert 'not slow' in run.reason
+        assert 'mod/tests/test_c.py' in run.reason, 'the reason names the still-unrun file'
+        assert 'NOT executed' in run.reason
+
+    def test_one_unmarked_class_keeps_the_run_file_scoped(self):
+        """THE NON-VACUITY CONTROL, run alongside the golden above.
+
+        The same diff shape against a module whose classes are all marked BUT
+        ONE stays FILE_SCOPED.  Without this, the golden could pass because the
+        widening had become unconditional — which would be the over-fire that
+        reopens esc-3292-1 / task 1852, not a fix.
+        """
+        plan = derive_verify_plan(
+            ['mod/tests/test_d.py'], [_mc('mod')], None, _synthetic_reader, role='task',
+        )
+        run = _run_for(plan, 'mod', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.scoped_targets == ('mod/tests/test_d.py',)
+        assert run.reason == 'pytest: file-scoped to touched test file(s)'
 
     def test_module_without_a_marker_expression_is_never_widened(self):
         """CONTROL: an identically-marked target under a module declaring no ``-m``."""
@@ -1240,6 +2126,43 @@ class TestWarmLaneBashRealConfigRegression:
 _SLOW_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.slow\n\n\ndef test_x():\n    pass\n'
 _UNMARKED_PLAIN_SOURCE = 'import pytest\n\n\ndef test_y():\n    pass\n'
 
+#: The CLASS-LEVEL twin of `_SLOW_MARKED_SOURCE`: every top-level class carries
+#: `slow`, there is no module-level `pytestmark`, and there is no module-level
+#: test function — so ONLY `guaranteed_marker_names` can prove it deselected.
+_CLASS_MARKED_SLOW_SOURCE = """\
+import pytest
+
+
+@pytest.mark.slow
+class TestAlpha:
+
+    def test_a(self):
+        pass
+
+
+class TestBeta:
+
+    pytestmark = [pytest.mark.slow]
+
+    def test_b(self):
+        pass
+"""
+
+#: A class-marked override for every `.py` path the both-arms tests use, served
+#: through `_permissive_reader`'s existing `overrides` channel so no new I/O
+#: seam appears.  Non-vacuity is preserved: every `*pyproject.toml` still serves
+#: `_DESELECTING_PYPROJECT`, so a guard that stopped firing would WIDEN and the
+#: refusal assertions would fail rather than pass silently.
+_CLASS_MARKED_OVERRIDES: dict[str, str | None] = dict.fromkeys(
+    (
+        'mod/tests/test_a.py',
+        'sub/tests/test_a.py',
+        'tests/test_a.py',
+        'tests/test_b.py',
+    ),
+    _CLASS_MARKED_SLOW_SOURCE,
+)
+
 
 def _permissive_reader(
     reads: list[str],
@@ -1251,6 +2174,11 @@ def _permissive_reader(
     ``_SLOW_MARKED_SOURCE`` at every ``*.py`` path, recording each read into
     *reads*.  *overrides* wins where present (a ``None`` value models a file the
     reader cannot read — a directory, or a missing path).
+
+    *overrides* is also how a CLASS-marked source is served
+    (``_CLASS_MARKED_OVERRIDES``): the ``*pyproject.toml`` arm is untouched, so
+    every refusal test keeps its non-vacuity — a guard that stopped firing
+    would widen, not merely read a different file.
 
     Same injected seam as ``verify_plan``'s ``worktree_reader``
     (``Callable[[str], str | None]``); no new I/O is introduced.
@@ -1381,6 +2309,48 @@ class TestDeselectingExpressionForCommand:
             _permissive_reader(reads),
         ) is None
 
+    # -- ARM 1 inherits the class-level tier through this one probe -----------
+
+    def test_a_class_marked_target_returns_the_expression(self):
+        """The module arm's probe gained the class tier with no edit of its own.
+
+        ``_derive_module_runs`` arm 4 reaches
+        ``pytest_markers.deselecting_expression_for_targets`` only through this
+        function, so widening that one probe's primary tier is what gives this
+        arm the capability — no second call site exists to drift from.
+        """
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            'pytest mod/tests/test_a.py',
+            ['mod/tests/test_a.py'],
+            _permissive_reader(reads, _CLASS_MARKED_OVERRIDES),
+        ) == 'not slow'
+
+    def test_a_cd_command_with_a_class_marked_target_still_reads_its_own_rootdir(self):
+        """WHERE is decided before WHETHER: the new tier does not move the ini lookup."""
+        reads: list[str] = []
+        read = _permissive_reader(reads, _CLASS_MARKED_OVERRIDES)
+        assert deselecting_expression_for_command(
+            'cd sub && uv run pytest tests/test_a.py', ['sub/tests/test_a.py'], read,
+        ) == 'not slow'
+        assert 'sub/pyproject.toml' in reads
+        assert 'pyproject.toml' not in reads, "root config is not this command's rootdir"
+
+    @pytest.mark.parametrize(
+        'test_command',
+        ['npm test', './scripts/test.sh', 'cd sub && uv run pytest x && cd .. && pytest y'],
+    )
+    def test_a_class_marked_target_behind_a_command_guard_is_refused_before_any_read(
+        self, test_command,
+    ):
+        """The command-shape guards run FIRST, and the new tier does not soften them."""
+        reads: list[str] = []
+        assert deselecting_expression_for_command(
+            test_command, ['mod/tests/test_a.py'],
+            _permissive_reader(reads, _CLASS_MARKED_OVERRIDES),
+        ) is None
+        assert not any(p.endswith('pyproject.toml') for p in reads), 'refused before any read'
+
 
 def _fallback_mc(test_command: str | None) -> ModuleConfig:
     """The shape ``verify._build_fallback_config`` emits, with *test_command* substituted.
@@ -1474,6 +2444,27 @@ class TestWidenFallbackRefuses:
             'pytest mod/tests/test_a.py', {'pyproject.toml': _PLAIN_PYPROJECT},
         )
 
+    # -- ARM 2's guards are unmoved by the class-level tier --------------------
+
+    @pytest.mark.parametrize(
+        'test_command',
+        [
+            None,
+            'npm test',
+            'cd sub && uv run pytest tests/test_a.py && cd .. && pytest tests/test_b.py',
+            'pytest',
+        ],
+    )
+    def test_a_class_marked_target_behind_each_guard_still_refuses(self, test_command):
+        """One case per guard: no command, non-PYTEST, raw-retained chain, no targets.
+
+        Each returns the input ModuleConfig by IDENTITY.  Serving CLASS-marked
+        sources here is what makes these non-vacuous under the widened probe:
+        the pyproject arm still deselects, so a guard that stopped firing would
+        now WIDEN — which it could not have done before task 4561.
+        """
+        self._refuses(test_command, _CLASS_MARKED_OVERRIDES)
+
 
 class TestWidenFallbackWidensOnFullDeselection:
     """``widen_fallback_for_marker_deselection`` — the POSITIVE half.
@@ -1536,6 +2527,29 @@ class TestWidenFallbackWidensOnFullDeselection:
         assert 'tests/test_a.py' in reason
         assert 'tests/test_b.py' in reason
 
+    def test_a_class_marked_target_widens_the_fallback(self):
+        """ARM 2 inherits the class tier through the SAME probe — no second call site.
+
+        ``widen_fallback_for_marker_deselection`` reaches
+        ``pytest_markers.deselecting_expression_for_targets`` only through
+        ``deselecting_expression_for_command``, exactly as the module arm does,
+        so widening that one probe gave both arms the capability in ONE place.
+        """
+        reads: list[str] = []
+        fallback = _fallback_mc('pytest tests/test_a.py')
+        widened, reason = widen_fallback_for_marker_deselection(
+            fallback, _permissive_reader(reads, _CLASS_MARKED_OVERRIDES),
+        )
+        assert widened.test_command == 'pytest', 'targets dropped, command otherwise intact'
+        assert reason is not None
+        assert 'tests/test_a.py' in reason, 'the reason names the still-unrun file'
+        assert 'not slow' in reason
+        assert 'NOT executed' in reason
+        # Marker deselection is a pytest-only concern: nothing else may move.
+        assert widened.prefix == fallback.prefix
+        assert widened.lint_command == fallback.lint_command
+        assert widened.type_check_command == fallback.type_check_command
+
     def test_the_subproject_shape_widens_against_its_own_rootdir(self):
         """``cd sub && uv run pytest <file>`` — task 2344's rescoping, unscoped in place.
 
@@ -1574,6 +2588,67 @@ class TestWidenFallbackWidensOnFullDeselection:
         widened, reason = widen_fallback_for_marker_deselection(fallback, read)
         assert widened is fallback
         assert reason is None
+
+
+class TestBothArmsAgreeOnClassLevelMarkers:
+    """THE AGREEMENT PIN — one shared probe, so the two arms cannot disagree.
+
+    The task's wiring requirement is that both consumers route through
+    ``guaranteed_marker_names``.  They do, but not by two call sites: BOTH
+    reach ``pytest_markers.deselecting_expression_for_targets`` through
+    ``verify_plan.deselecting_expression_for_command``, so tier 1 was widened
+    in exactly ONE place.  A second call site would CREATE the divergence risk
+    this pin exists to exclude, so the inheritance is asserted rather than a
+    second edit manufactured.
+    """
+
+    def test_both_arms_answer_alike_for_the_same_class_marked_command(self):
+        """Same command, same target, same reader: same verdict AND same reads."""
+        command = 'pytest mod/tests/test_a.py'
+
+        module_arm_reads: list[str] = []
+        module_arm = deselecting_expression_for_command(
+            command,
+            ['mod/tests/test_a.py'],
+            _permissive_reader(module_arm_reads, _CLASS_MARKED_OVERRIDES),
+        )
+
+        fallback_arm_reads: list[str] = []
+        widened, reason = widen_fallback_for_marker_deselection(
+            _fallback_mc(command),
+            _permissive_reader(fallback_arm_reads, _CLASS_MARKED_OVERRIDES),
+        )
+
+        assert module_arm == 'not slow'
+        assert widened.test_command == 'pytest'
+        assert reason is not None and module_arm in reason
+        assert module_arm_reads == fallback_arm_reads, (
+            'the two arms must read the same files in the same order'
+        )
+
+    def test_both_arms_refuse_alike_for_a_partially_marked_target(self):
+        """The refusal direction agrees too, not only the widening direction."""
+        override = dict(_CLASS_MARKED_OVERRIDES)
+        override['mod/tests/test_a.py'] = _CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE.replace(
+            'warm_lane_bash', 'slow',
+        )
+        command = 'pytest mod/tests/test_a.py'
+
+        module_arm_reads: list[str] = []
+        module_arm = deselecting_expression_for_command(
+            command, ['mod/tests/test_a.py'], _permissive_reader(module_arm_reads, override),
+        )
+
+        fallback_arm_reads: list[str] = []
+        fallback = _fallback_mc(command)
+        widened, reason = widen_fallback_for_marker_deselection(
+            fallback, _permissive_reader(fallback_arm_reads, override),
+        )
+
+        assert module_arm is None
+        assert widened is fallback, 'a refusal returns the input config untouched'
+        assert reason is None
+        assert module_arm_reads == fallback_arm_reads
 
 
 @pytest.mark.usefixtures('code_default_config')
@@ -1889,3 +2964,81 @@ class TestTestsScriptsAllIntegrationDecoratedRealConfigRegression:
         assert mc.test_command is not None
         assert run.cmd == parse_config_command(mc.test_command)
         assert 'not smoke and not integration and not warm_lane_bash' in run.reason
+
+
+class TestGuaranteedMarkerNamesFamilyInvariant:
+    """THE FAMILY INVARIANT, swept over every marker-source fixture in this module.
+
+    WHY THIS CLASS SITS AT THE MODULE TAIL.  ``parametrize`` argument values are
+    evaluated at class-creation (import) time, and the fixtures below are defined
+    THROUGHOUT the file — from ``_REAL_PYTESTMARK_SOURCE`` near the top to
+    ``_SMOKE_MARKED_SOURCE`` in the last hundred lines.  Only a definition after
+    the final binding has every value in scope, so parametrizing over the values
+    themselves is possible here and nowhere earlier.  An earlier home is what
+    forced the previous shape (parametrize over NAMES, resolve via ``globals()``
+    at call time); moving the class removes the need for that indirection
+    entirely rather than working around it.
+
+    THE ACCEPTED RESIDUAL: a fixture added later that nobody adds to this list is
+    simply not swept.  That costs COVERAGE — never correctness — and can never
+    produce a false RED.  The guard this replaced tried to close it by asserting
+    the swept set against every module global matching ``startswith('_') and
+    'SOURCE' in name``, and did not actually close it: a fixture named
+    ``_CLASS_MARKED_FIXTURE`` or ``_REAL_CLASS_SHAPE`` is invisible to that rule
+    AND to the list, so the drift recurs silently and green.  What it did buy was
+    a tripwire on cosmetics — renaming a fixture, or adding an unrelated
+    ``_SOURCE_PATH`` helper string, turned the suite RED for a non-behavioural
+    reason.  So the fix is NOT to reintroduce a naming rule, tightened or
+    otherwise: a tighter regex only deepens the same hole while widening the
+    false-RED surface.  Add new fixtures to the list by hand.
+    """
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            _REAL_PYTESTMARK_SOURCE,
+            _ALL_DECORATED_SOURCE,
+            _MIXED_DECORATED_SOURCE,
+            _ALL_CLASSES_MARKED_SOURCE,
+            _ONE_CLASS_MARKED_SOURCE,
+            _ONLY_HELPER_CLASSES_SOURCE,
+            _MARKED_SOURCE,
+            _UNMARKED_SOURCE,
+            _ALL_DECORATED_SOURCE_WITH_CLASS,
+            _CLASS_MARKED_SOURCE,
+            _CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE,
+            _CLASS_MARKED_MODULE_SOURCE,
+            _CLASS_PARTLY_MARKED_MODULE_SOURCE,
+            _SLOW_MARKED_SOURCE,
+            _UNMARKED_PLAIN_SOURCE,
+            _CLASS_MARKED_SLOW_SOURCE,
+            _SMOKE_MARKED_SOURCE,
+        ],
+        ids=[
+            '_REAL_PYTESTMARK_SOURCE',
+            '_ALL_DECORATED_SOURCE',
+            '_MIXED_DECORATED_SOURCE',
+            '_ALL_CLASSES_MARKED_SOURCE',
+            '_ONE_CLASS_MARKED_SOURCE',
+            '_ONLY_HELPER_CLASSES_SOURCE',
+            '_MARKED_SOURCE',
+            '_UNMARKED_SOURCE',
+            '_ALL_DECORATED_SOURCE_WITH_CLASS',
+            '_CLASS_MARKED_SOURCE',
+            '_CLASS_MARKED_WITH_UNMARKED_CLASS_SOURCE',
+            '_CLASS_MARKED_MODULE_SOURCE',
+            '_CLASS_PARTLY_MARKED_MODULE_SOURCE',
+            '_SLOW_MARKED_SOURCE',
+            '_UNMARKED_PLAIN_SOURCE',
+            '_CLASS_MARKED_SLOW_SOURCE',
+            '_SMOKE_MARKED_SOURCE',
+        ],
+    )
+    def test_is_a_superset_of_the_module_level_tier_on_every_fixture(self, source):
+        """``guaranteed_marker_names`` is a provable SUPERSET of the module-level tier.
+
+        That is what makes routing the composed entry point's primary tier
+        through it STRICTLY ADDITIVE: it can never refuse a target the current
+        code accepts.
+        """
+        assert module_level_marker_names(source) <= guaranteed_marker_names(source)

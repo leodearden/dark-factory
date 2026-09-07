@@ -118,6 +118,73 @@ Useful variants: `lms_ctl active` / `stop-all`; `lms_fetch_weights --all`
 
 Logs are the journal: `journalctl --user -u lms-arm@qwen3.5-9b.service -f`.
 
+### The whole slate: `lms_slate_run.py`
+
+Steps 1-5 above are the per-arm primitives. To run the WHOLE slate, don't type
+them seven times — that is how the 2026-08-06 run was driven, and it is why no
+compliant invocation for it existed anywhere in the repo afterwards.
+
+```bash
+uv run --project shared python scripts/local-model-serving/lms_slate_run.py
+journalctl --user -u lms-slate-run -f      # follow it
+```
+
+That submits ONE transient `systemd --user` unit for the whole sweep (PRD
+hazard 11: long runs go in transient units, never bare background shells — a
+~30 minute slate through a background shell dies with your session, losing
+every arm measured so far). Inside the unit it drives exactly the steps above,
+**one arm at a time**: start / wait-ready / `--arm ... --output <part>` / stop.
+Each arm is stopped even when its probe fails, because `lms_ctl start` refuses
+rather than evicting — one arm left running would turn into six spurious
+refusals. For the same reason the sweep opens with `lms_ctl stop-all`: an arm
+left running by an *earlier* session would otherwise refuse all seven starts.
+That touches `lms-arm@` units only, so whisper-writer is unaffected — but if
+you have an arm up deliberately, the driver will stop it.
+
+It is **resumable**. Each arm's report lands in `--parts-dir` as
+`<arm_id>.json`, and a re-run skips any arm that already has a **passing**
+part, so a sweep that died at arm six re-measures one arm and not seven. A part
+whose row is a FAIL is *not* reused: the healthcheck writes its report before
+returning a non-zero exit, so a failed arm does leave a valid file behind, and
+reusing it would hand you a byte-identical artifact still carrying the stale
+FAIL row after you had fixed the arm. Fixing an arm and re-running therefore
+re-measures exactly the arms that failed. A part is also dropped when the
+manifest's `served_model_name` for that arm no longer matches the one in the
+part — but an `arms.yaml` edit that changes only `model_ref` or `quant` is
+invisible in a report row, so use `--force` after one. `--force` re-measures
+everything regardless. A re-measured arm's old part is **removed first**, so a
+re-measure that fails leaves no part at all and the merge refuses by name
+rather than quietly folding the previous run's row into this slate. Pass
+`--parts-dir` explicitly to resume into a directory
+from a previous run; the default lives under `$XDG_RUNTIME_DIR` and does not
+survive a reboot.
+
+`--dry-run` prints the compliant command and runs nothing — useful for reading
+the exact invocation without a card. It is a submit-layer flag: combined with
+`--in-unit` it is rejected rather than ignored, since `--in-unit` *is* the
+sweep. `--ready-timeout` forwards to `lms_ctl wait-ready` (default 900s).
+
+The artifact is written by `lms_healthcheck --merge`, never by the driver.
+What that merge refuses is a slate **missing rows**, which is narrower than
+"a failed sweep": an arm that never started or never came ready leaves no part,
+`merge_reports`' manifest-coverage check then writes nothing and names the
+uncovered arms, and the previously committed artifact is left intact. An arm
+that came up and *failed its probe* is a different case — it leaves a part
+carrying a FAIL row, so the slate is covered, the merge succeeds, and
+`verification/health-report.json` is **overwritten with a red but complete
+artifact**. That is the intended outcome (a red slate is a measurement), but do
+not read a red sweep as one that cannot have touched the committed file.
+
+**A manifest carrying TBD placeholder arms cannot be swept**, and the driver
+refuses up front rather than discovering it 30 minutes in. Neither half of the
+slate works for such an arm: `lms_ctl start` refuses a placeholder (exit 4),
+and `lms_healthcheck --arm` cannot cover it either — the report needs the VRAM
+baseline that only `lms_ctl start` writes, so it exits 8 having written
+nothing — while the merge requires a row for every manifest arm. A hand-run
+`lms_healthcheck --all` hits the same wall. Resolve the PRD open question that
+owns the arm, or drop it from `arms.yaml`, before running the slate. All seven
+arms are non-placeholder today.
+
 ### One arm at a time
 
 `lms_ctl start` is **exclusive by default** — it refuses while another arm's

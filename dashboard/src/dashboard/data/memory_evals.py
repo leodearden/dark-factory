@@ -201,9 +201,12 @@ _RUN_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 # outermost boundary in ``build_memory_evals`` and named as one.
 _ARTIFACT_ERRORS = (OSError, ValueError)
 
-# Issue kinds that mean the walk did not COMPLETE, as opposed to completing
-# over a degraded tree.  See :func:`root_scan_succeeded`, which is the only
-# reader: a payload carrying one of these is not pinned for the TTL window.
+# Issue kinds that CAN mean the walk did not COMPLETE, as opposed to completing
+# over a degraded tree.  This is the KIND gate only, not the whole rule:
+# ``internal_error`` is emitted at two scopes, so :func:`root_scan_succeeded` —
+# still the only reader — applies a further SCOPE test to it, and pins a payload
+# whose only ``internal_error`` is per-eval (``eval_id`` set).  Membership here
+# is therefore necessary but not sufficient for declining to cache.
 _UNCACHEABLE_ISSUE_KINDS = frozenset({'unreadable_root', 'internal_error'})
 
 # The limits artifact carries a great deal more than this — ``alarms``,
@@ -1294,9 +1297,10 @@ def root_scan_succeeded(payload: dict[str, Any]) -> bool:
       :func:`_build_payload` returned before enumerating.
     * an ``unreadable_root`` issue is present — the root exists but
       :meth:`Path.iterdir` raised, so again nothing was walked.
-    * an ``internal_error`` issue is present — a bug aborted the build, so the
-      payload is missing rows for a reason that has nothing to do with the
-      tree.
+    * an ``internal_error`` issue with NO ``eval_id`` is present — the
+      top-level guard in :func:`build_memory_evals` fired, so a bug aborted
+      the build and the payload is missing rows for a reason that has nothing
+      to do with the tree.
 
     The first two are O(1) to recompute — one ``stat``, or one
     immediately-raising ``iterdir`` — so re-deriving them on every poll costs
@@ -1305,19 +1309,35 @@ def root_scan_succeeded(payload: dict[str, Any]) -> bool:
     full TTL window past the moment the tree appears: a volume finishing its
     mount, a mode being fixed, the first eval run landing.
 
-    ``internal_error`` is not free to recompute, and declining it is still
-    right: unlike the ordinary-but-incomplete states
+    A TOP-LEVEL ``internal_error`` is not free to recompute, and declining it
+    is still right: unlike the ordinary-but-incomplete states
     :func:`~dashboard.data.escalation_analytics.archive_scan_succeeded`
     deliberately keeps cacheable, a bug is never a steady state — it is an
     emergency with no known trigger — so the walk it costs is bounded by how
     long the bug lives, and pinning a payload that is blank for reasons the
-    operator cannot see or fix is the worse trade.
+    operator cannot see or fix is the worse trade.  How much of the tree that
+    payload is missing is also unknown, which is what makes it unlike the case
+    below.
+
+    A PER-EVAL ``internal_error`` (``eval_id`` set to the eval dir basename,
+    emitted inside :func:`_build_payload`'s per-eval loop) is a degraded ROW,
+    and stays cacheable.  The walk COMPLETED; every other eval row is present
+    and correct, and exactly one was lost.  This half is load-bearing: a
+    deterministic bug in :func:`_build_eval` raises identically on the next
+    pass, so declining to cache would defeat the TTL forever — re-running the
+    full artifact walk on every ~3s poll, and firing ``logger.exception`` per
+    rebuild, to rediscover a bug that re-scanning cannot fix.
 
     A degraded ROW is deliberately still cacheable.  An unreadable metrics
     run, an unknown metric kind or an orphan verdict all mean the scan reached
     the tree and did its work; re-running it would rediscover the same
     degradation at the cost of the full walk this cache exists to prevent.
-    The predicate keys on named issue KINDS, never on ``issue_count``.
+    The predicate keys on named issue KINDS — plus, for ``internal_error``,
+    the issue's SCOPE — never on ``issue_count``.
+
+    The issue rides the payload either way, and ``issue_count`` still counts
+    it, so narrowing the CACHE predicate costs the operator no visibility: a
+    per-eval bug is named on every served response, cached or rebuilt.
 
     Reads every field through ``.get`` because it runs inside the cache write
     path: a partially-built payload must degrade to "don't cache" rather than
@@ -1325,10 +1345,28 @@ def root_scan_succeeded(payload: dict[str, Any]) -> bool:
     """
     if not payload.get('root_present'):
         return False
-    return not any(
-        issue.get('kind') in _UNCACHEABLE_ISSUE_KINDS
-        for issue in payload.get('issues') or ()
-    )
+    return not any(_is_uncacheable(issue) for issue in payload.get('issues') or ())
+
+
+def _is_uncacheable(issue: dict[str, Any]) -> bool:
+    """Does this one issue mean the walk did not complete?
+
+    The scope test is gated on ``internal_error`` SPECIFICALLY rather than
+    applied to every member of ``_UNCACHEABLE_ISSUE_KINDS``.  A blanket "any
+    scoped issue is cacheable" rule reads cleaner and is a no-op today, which
+    is exactly what makes it a trap: ``unreadable_root`` means
+    :meth:`Path.iterdir` raised and NOTHING was walked, which must stay
+    uncacheable whatever fields the issue later comes to carry.
+
+    ``is None``, not truthiness: :func:`_issue` declares
+    ``eval_id: str | None = None`` and writes that default through unchanged,
+    so ``None`` IS the "the emitter did not scope this" sentinel rather than a
+    proxy for it.  Reads through ``.get`` for the same reason the caller does.
+    """
+    kind = issue.get('kind')
+    if kind not in _UNCACHEABLE_ISSUE_KINDS:
+        return False
+    return kind != 'internal_error' or issue.get('eval_id') is None
 
 
 def _empty_payload(resolved_now: datetime, issues: list[dict[str, Any]]) -> dict[str, Any]:

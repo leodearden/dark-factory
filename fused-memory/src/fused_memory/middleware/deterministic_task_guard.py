@@ -30,6 +30,17 @@ dict) when any of these invariants is violated:
    ``always_escalates=True`` is forbidden (predicate escalation is
    conditional on the script's exit code, not unconditional).
    ``kind='deploy'`` (the default) behaviour is unaffected by this rule.
+7. ``metadata.recurrence``, when present, must be a well-formed chain link on
+   a well-formed CARRIER (task 4676; PRD
+   ``docs/prds/recurring-deterministic-tasks.md`` contract C-1, decision
+   R-D4). Two halves: the SHAPE is delegated to the shared ``Recurrence``
+   model (kebab-case ``key``, ``interval_secs > 0``, optional ``minted_from``
+   task id), and the CARRIER must be ``task_kind='deterministic'`` ∧
+   ``before_done.kind == 'predicate'`` ∧ ``metadata.milestone`` with
+   ``mode='dated'``. Recurrence on a deploy-kind deterministic task is
+   rejected as deliberately UNRULED, not merely unimplemented (PRD "Out of
+   scope"): a recurring chain of act-then-done deploys has no agreed
+   semantics for what re-running the action means.
 
 ``inject_task_kind`` normalises the metadata dict and sets
 ``metadata.task_kind`` so it is persisted alongside ``before_done`` /
@@ -45,7 +56,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from shared.task_metadata import Milestone, parse_metadata
+from shared.task_metadata import Milestone, Recurrence, parse_metadata
 
 __all__ = [
     'deterministic_task_error',
@@ -151,6 +162,134 @@ def _validate_milestone(milestone: Any) -> dict[str, Any] | None:
     return None
 
 
+def _validate_recurrence(
+    recurrence: Any,
+    *,
+    task_kind: str,
+    before_done: Any,
+    milestone: Any,
+) -> dict[str, Any] | None:
+    """Validate metadata.recurrence — shape + carrier contract (task 4676).
+
+    Contract C-1 of PRD ``docs/prds/recurring-deterministic-tasks.md``.
+    Submit-time only: the sole caller is :func:`deterministic_task_error`,
+    reached from ``submit_task`` (``tools.py::submit_task``), and nothing here
+    persists anything — a violation returns a structured error and the
+    submission never lands.
+
+    Returns a ValidationError dict on failure, or None when valid.
+
+    Responsibility is split with the shared model. The SHAPE lives in
+    :class:`shared.task_metadata.Recurrence` — delegated to here rather than
+    re-implemented, exactly as milestone delegates to ``Milestone``, so guard
+    and persistence-layer semantics can never drift; that registration also
+    enforces the shape at the ``update_task``/write boundary under
+    ``enforce=True``, which this guard never sees. The cross-field CARRIER
+    clauses are guard-only, because they read ``task_kind``, ``before_done``
+    and ``milestone`` TOGETHER — a relation ``Recurrence`` alone cannot see.
+
+    RESIDUAL GAP, named rather than left implicit: the CARRIER contract is
+    submit-time ONLY. Registration buys the shape at the write boundary
+    (``backends.sqlite_task_backend::SqliteTaskBackend._validate_metadata_on_write``,
+    and only while ``_task_metadata_enforce`` is on), but nothing re-checks
+    the cross-field relation there — and ``update_task`` never runs this
+    guard at all. So an update that flips ``before_done.kind`` to
+    ``'deploy'``, deletes ``metadata.milestone``, or attaches ``recurrence``
+    to an existing normal task lands exactly the state C-1 forbids, and no
+    error is raised. This is a THIRD symptom of the root cause task **3093**
+    already tracks ("update_task never runs deterministic_task_error"),
+    whose two recorded symptoms are the milestone spec and a task_kind
+    change — so closing it belongs there, as one hoist of these clauses into
+    a helper both boundaries call, not as a recurrence-shaped patch here.
+    Task 4676 rules the submit boundary only. Until 3093 lands, r2's mint
+    MUST re-verify
+    the carrier of the link it is about to renew instead of trusting that
+    submit-time validation still holds — ``docs/task-authoring.md`` §6.1
+    carries the same warning for authors.
+
+    ``TypeError`` is caught alongside ``ValidationError`` for the same reason
+    as milestone's: a bare string or list value cannot be splatted into the
+    model's keyword arguments.
+    """
+    try:
+        Recurrence(**recurrence)
+    except (ValidationError, TypeError) as exc:
+        return _validation_error(
+            f'metadata.recurrence is invalid: {exc}',
+            hint=(
+                "A recurrence must be {'key': '<kebab-case chain id>', "
+                "'interval_secs': <positive int>} (plus an optional "
+                "'minted_from' task id, absent on the seed link)."
+            ),
+        )
+
+    # Carrier clause 1: task_kind.
+    if task_kind != 'deterministic':
+        return _validation_error(
+            f"metadata.recurrence requires task_kind='deterministic' "
+            f'(got task_kind={task_kind!r}).',
+            hint=(
+                "A recurring job is a chain of deterministic PREDICATE tasks. "
+                "Either set task_kind='deterministic' with a "
+                "'before_done': {'kind': 'predicate', ...}, or remove "
+                "'recurrence' from metadata."
+            ),
+        )
+
+    # Carrier clause 2: before_done must be a PREDICATE action. The isinstance
+    # half is defence-in-depth (invariant 4 already guarantees a dict when
+    # before_done is not None) and simultaneously covers the pure-gate case
+    # where before_done is None.
+    if not isinstance(before_done, dict):
+        return _validation_error(
+            'metadata.recurrence requires a before_done action with '
+            "kind='predicate', but this task has no before_done (a pure "
+            'escalation gate is not a chain link — there is nothing to '
+            're-run on the next tick).',
+            hint=(
+                "Add 'before_done': {'kind': 'predicate', 'script': '<path>', "
+                "'timeout_secs': <n>}, or remove 'recurrence' from metadata."
+            ),
+        )
+    # The shared BeforeDone.kind default is 'deploy', so an OMITTED kind must
+    # be reported (and rejected) as the deploy it actually is — not slip
+    # through because the key is merely absent.
+    effective_kind = before_done.get('kind') or 'deploy'
+    if effective_kind != 'predicate':
+        return _validation_error(
+            f"metadata.recurrence requires before_done.kind='predicate' "
+            f'(got {effective_kind!r}).',
+            hint=(
+                'Recurrence on a deploy-kind deterministic task is not merely '
+                'unimplemented — it is deliberately UNRULED, and therefore '
+                'forbidden UNTIL it is separately ruled on (PRD '
+                'docs/prds/recurring-deterministic-tasks.md, "Out of scope"): '
+                'a recurring chain of act-then-done deploys has no agreed '
+                'semantics for what re-running the action means. Use '
+                "kind='predicate', or remove 'recurrence' from metadata."
+            ),
+        )
+
+    # Carrier clause 3: a DATED milestone. Milestone's own shape is already
+    # validated by deterministic_task_error before this runs, so this clause
+    # only has to discriminate the mode.
+    if not isinstance(milestone, dict) or milestone.get('mode') != 'dated':
+        return _validation_error(
+            "metadata.recurrence requires a metadata.milestone with "
+            "mode='dated' (the chain link's fire time).",
+            hint=(
+                'A chain link is withheld until its fire time by the existing '
+                'milestone scheduler gate, and only a dated milestone carries '
+                "the 'at' the mint advances by interval_secs — a delayed "
+                'anchor has no fire time to advance from. Add '
+                "'milestone': {'mode': 'dated', 'at': '<ISO-8601 datetime>'}, "
+                "or remove 'recurrence' from metadata."
+            ),
+        )
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public guard functions
 # ---------------------------------------------------------------------------
@@ -237,6 +376,25 @@ def deterministic_task_error(
     # Invariant 4: before_done structural + filesystem checks (only when present)
     if before_done is not None:
         err = _validate_before_done(before_done, project_root, always_escalates=always_escalates)
+        if err is not None:
+            return err
+
+    # Invariant 5 (PRD recurring-deterministic-tasks C-1, task 4676):
+    # metadata.recurrence carrier contract. Deliberately LAST — the carrier
+    # clauses read before_done.kind, and invariant 4 above is what guarantees
+    # before_done is a dict carrying a valid kind enum, so running earlier
+    # would either crash on a non-dict before_done or emit a confusing
+    # "must be predicate" complaint about a fundamentally malformed action.
+    # First-violation-wins ordering is preserved: a bad script path is still
+    # reported first.
+    recurrence = meta.get('recurrence')
+    if recurrence is not None:
+        err = _validate_recurrence(
+            recurrence,
+            task_kind=task_kind,
+            before_done=before_done,
+            milestone=milestone,
+        )
         if err is not None:
             return err
 

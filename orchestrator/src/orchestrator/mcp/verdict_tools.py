@@ -211,6 +211,20 @@ _MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     storm_consequence=(
         'further review gates strand on verdicts that never land.'
     ),
+    #: The HONEST answer for this boundary, which is not plan-tools' (task
+    #: 4744). verdict-tools is the identical per-agent stdio subprocess with an
+    #: identically ephemeral stderr, and it has no durable journal yet — so it
+    #: names the only route that genuinely exists here rather than inheriting
+    #: either the retired "grep the orchestrator logs" sentence or a journal
+    #: path this server never writes, which would send an operator to a missing
+    #: file. A follow-up is filed to give this boundary the same journal
+    #: plan-tools now has; landing it changes exactly this one string.
+    attribution_source=(
+        'this boundary has no durable per-event journal yet, so the leaking '
+        'caller must be mined out of data/orchestrator/agent-transcripts/ — '
+        'search the burst window for submit_review_verdict calls carrying '
+        'envelope markup'
+    ),
 )
 
 

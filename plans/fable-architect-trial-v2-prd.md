@@ -1,9 +1,34 @@
 # PRD: Fable architect trial v2 — effort-matched two-stage screen over an exhaustion-hard pool
 
-**Status:** active — authored 2026-08-04 (autonomous design session; design input
-is the verified brief `~/.claude/spawn-briefs/fable-trial-v2-prd-brief.md` and
-the resolution text on esc-2864-1, which carries Leo's ruled reopening
-condition; both honored here, not re-litigated).
+**Status:** **TERMINATED 2026-08-30** (was: active — authored 2026-08-04;
+autonomous design session; design input is the verified brief
+`~/.claude/spawn-briefs/fable-trial-v2-prd-brief.md` and the resolution text on
+esc-2864-1, which carries Leo's ruled reopening condition; both honored here,
+not re-litigated). See the termination note directly below before reading any
+section as live.
+
+> **Campaign terminated 2026-08-30 (ruling D9, Leo, via esc-3635-1 / esc-4761-1).**
+> *Appended 2026-08-30 by task 3636 (ζ). The prose below this note is left frozen as
+> authored; this block records what has since ceased to be true.*
+>
+> δ (task 3635) ran **53 of 66** tranche-1 cells and was **stopped cleanly** on
+> 2026-08-26. The **66-cell tranche-1 design is SUPERSEDED, not paused**, by a
+> redesigned eval set — the remaining 13 cells will never be run. The 53 completed
+> cells are **FORENSIC-ONLY decline-consistency evidence and are not usable as
+> capability data**: 47 of them are verified-correct protocol declines, so the band
+> was decline-shaped rather than incapability-shaped and could not test the stated
+> hypothesis.
+>
+> Two clauses below are consequently **inert**. §δ's remaining cost estimates
+> (`~48 cells ≈ $250–400+`) describe cells that will not be run. §ζ's *"On the pivot
+> branch"* clause never triggered — γ2 did **not** declare the historical seam
+> exhausted, so the pivot branch was never taken; ζ's actual re-scope came from the
+> decline-consistency finding instead. Any "run tranche 2 next" reading anywhere in
+> this PRD is likewise inert.
+>
+> **Delivered record:** `plans/fable-architect-trial-v2-decision-2026-08-30.md`.
+> Admission itself is untouched by that record and remains Leo-ratified at η (task
+> 3637).
 **Project:** dark_factory. **Approach:** bare **B** (G5 heuristic: instrument
 edits are small additive diffs inside one package whose seams the
 eval-framework-revival B+H contract already covers; the campaign itself is a

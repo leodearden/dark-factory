@@ -2693,24 +2693,6 @@ class TestStage2CycleSummaryHarnessBackstop:
     # caller swallows BaseException.
 
     @staticmethod
-    async def _poll_until(predicate, *, attempts=200, interval=0.01):
-        """Poll an async zero-arg *predicate* (bounded: up to `attempts`
-        tries, `interval` seconds apart — a 2s ceiling at the defaults)
-        instead of a fixed sleep. The common case resolves as soon as the
-        awaited signal is observed, and a loaded CI box gets real headroom
-        instead of a fixed sleep timing out and misreporting itself as the
-        very ordering regression these tests exist to catch. Returns the
-        last predicate result (truthy on success, falsy if every attempt
-        was exhausted)."""
-        result = await predicate()
-        for _ in range(attempts):
-            if result:
-                return result
-            await asyncio.sleep(interval)
-            result = await predicate()
-        return result
-
-    @staticmethod
     async def _drive_degraded_arm_cancelling_first_identity_read(
         harness, run, run_id, project_id, anchor, ledger_store,
     ) -> bool:
@@ -2784,7 +2766,7 @@ class TestStage2CycleSummaryHarnessBackstop:
             )
 
         # Give any shield-wrapped inner Task time to complete the write.
-        record = await self._poll_until(_read_degraded_row)
+        record = await _poll_until(_read_degraded_row)
         assert record is not None, (
             'the clobber-guard identity read must not run ahead of the '
             'shield — the shield exists precisely to guarantee this row '
@@ -2843,7 +2825,7 @@ class TestStage2CycleSummaryHarnessBackstop:
             # predicate — polling still buys an early exit if a regression
             # makes the closure call the writer, so that surfaces fast
             # instead of relying solely on the row-content check below.
-            await self._poll_until(_write_invoked, attempts=20, interval=0.01)
+            await _poll_until(_write_invoked, attempts=20, interval=0.01)
 
         assert injection_fired, (
             'the clobber-guard read never ran — this test no longer '
@@ -5345,6 +5327,379 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
         f"Expected status='failed' after double cancellation, got '{run.status}'. "
         'Review issue [async_cancellation_safety]: cleanup must be wrapped with '
         'asyncio.shield() so a second cancel cannot abort the DB write.'
+    )
+
+
+async def _poll_until(predicate, *, attempts=200, interval=0.01):
+    """Poll an async zero-arg *predicate* (bounded: up to `attempts` tries,
+    `interval` seconds apart — a 2s ceiling at the defaults) instead of a
+    fixed sleep. Shared by the module-level second-cancellation tests below
+    and by `TestStage2CycleSummaryHarnessBackstop` (task 4431 amendment —
+    each previously defined its own copy of this helper): a shield's
+    detached inner Task can finish its write AFTER `await outer_task`
+    returns, and fused-memory's pytest timeout_method="thread" hard-exits
+    the worker at 60s, so these tests must self-bound rather than guess a
+    fixed sleep. Returns the last predicate result (truthy on success,
+    falsy if every attempt was exhausted)."""
+    result = await predicate()
+    for _ in range(attempts):
+        if result:
+            return result
+        await asyncio.sleep(interval)
+        result = await predicate()
+    return result
+
+
+async def _drive_cancelling_first_stage_report_write(
+    harness, journal, stage_entered, make_task,
+):
+    """Drive `make_task()` under a second cancellation injected from inside
+    `journal.update_run_stage_reports`'s first call — the shared rig behind
+    the three task-4431 tests below, which differ only in which driver
+    `make_task` invokes (`run_full_cycle` vs `_run_remediation_pass`) and in
+    their post-hoc assertions. Mirrors
+    `TestStage2CycleSummaryHarnessBackstop._drive_degraded_arm_cancelling_first_identity_read`
+    for the finally-block persistence write instead of the clobber-guard
+    identity read.
+
+    `stage_entered` is the caller's `asyncio.Event`, set by whichever stage
+    the caller made slow — used to race against `outer_task` so the first
+    cancellation is guaranteed to land inside the driver's try block rather
+    than during pre-try setup.
+
+    Returns `(outer_task, injection_fired)` — the finished (cancelled)
+    outer task, and whether the self-cancelling stub actually ran. Callers
+    MUST assert `injection_fired` — otherwise no second cancellation was
+    ever delivered and the rest of the test silently exercises a path that
+    doesn't discriminate the fix.
+    """
+    outer_task_ref: list = [None]
+    original_update = journal.update_run_stage_reports
+    first_call = [True]
+
+    async def self_cancelling_update(run_id, stage_reports):
+        if first_call[0]:
+            first_call[0] = False
+            # Simulate a second external cancellation (e.g. server shutdown)
+            # arriving while the finally's persistence write is in flight.
+            outer_task_ref[0].cancel()
+            # Without asyncio.shield: this await runs in the outer task's own
+            # context, so the pending cancel fires here — CancelledError
+            # aborts the write before it ever reaches original_update.
+            # With asyncio.shield: this coroutine runs inside shield's own
+            # inner Task, unreached by the outer cancel, so sleep(0)
+            # completes and the write below proceeds.
+            await asyncio.sleep(0)
+        return await original_update(run_id, stage_reports)
+
+    journal.update_run_stage_reports = self_cancelling_update
+
+    outer_task = asyncio.create_task(make_task())
+    outer_task_ref[0] = outer_task
+
+    # Race the event against outer_task to avoid an infinite hang if the
+    # driver fails before the slowed stage is ever invoked.
+    done, _ = await asyncio.wait(
+        [asyncio.ensure_future(stage_entered.wait()), outer_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if outer_task in done and not stage_entered.is_set():
+        exc = 'task was cancelled' if outer_task.cancelled() else repr(outer_task.exception())
+        pytest.fail(f'outer_task completed before the slowed stage was invoked: {exc}')
+
+    # First cancellation: triggers CancelledError in the slowed stage, which
+    # propagates to the finally — whose update_run_stage_reports call
+    # delivers the SECOND cancellation via self_cancelling_update.
+    outer_task.cancel()
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await outer_task
+
+    journal.update_run_stage_reports = original_update
+
+    return outer_task, not first_call[0]
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 4431: `ReconciliationHarness.run_full_cycle`'s `finally` must
+    shield its `update_run_stage_reports` call against a second
+    cancellation.
+
+    Reviewer finding: `_flush_cycle_summaries` (called earlier in the same
+    `finally`) is careful — it never raises and shields its own writes —
+    but the very `update_run_stage_reports` call its markers exist to reach
+    was awaited UNSHIELDED one line later. On an already-being-cancelled
+    path, a second CancelledError arriving while that write is in flight
+    re-raises at this unshielded await, so the persisted stage_reports —
+    including the `_error` breadcrumb the `except asyncio.CancelledError`
+    handler stamps — never lands.
+
+    Mirrors test_cancellation_cleanup_shielded_from_second_cancel above,
+    but injects the second cancellation FROM WITHIN
+    `journal.update_run_stage_reports` itself rather than from
+    `journal.complete_run` (design decision 4): on the cancellation path,
+    the finally's call is the ONLY update_run_stage_reports invocation —
+    the success-path call inside the `try` is never reached, since stage 0
+    is cancelled long before it — so a one-shot injection targets it
+    unambiguously.
+
+    Without the shield on this call, the persisted stage_reports stays
+    empty: the self-cancelling stub runs in the outer task's own context,
+    so `await asyncio.sleep(0)` after the self-cancel raises CancelledError
+    before the real write ever runs. This test is the regression guard for
+    that.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    # task σ's resume_after_restart defaults on and would take the
+    # 'interrupted' branch (no _error stamp) instead of 'failed' — opt out,
+    # matching test_cancellation_cleanup_shielded_from_second_cancel above.
+    harness.config.resume_after_restart = False
+
+    # Event set by slow_stage_run when it starts — ensures the first cancel
+    # fires inside the try block, not during pre-try setup.
+    stage_entered = asyncio.Event()
+
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
+    ):
+        stage_entered.set()
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    _outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — this test no longer exercises '
+        "the finally's update_run_stage_reports call, so it would pass "
+        'vacuously regardless of whether the shield fix is present'
+    )
+
+    async def _stage_reports_persisted():
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        return recent[0] if recent and recent[0].stage_reports else None
+
+    persisted = await _poll_until(_stage_reports_persisted)
+    assert persisted is not None, (
+        'no run with non-empty stage_reports was persisted for test-project '
+        'within the poll window — the finally never completed its write'
+    )
+
+    assert persisted.stage_reports.get('_error', {}).get('error_type') == 'CancelledError', (
+        "the finally's update_run_stage_reports must be shielded so a second "
+        'cancellation cannot discard the _error breadcrumb the except '
+        'asyncio.CancelledError handler just stamped into run.stage_reports '
+        'before this finally ran'
+    )
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 4431: `ReconciliationHarness._run_remediation_pass`'s `finally`
+    must shield its `update_run_stage_reports` call against a second
+    cancellation — the undocumented structural mirror of run_full_cycle's
+    finally, already covered above by
+    test_run_full_cycle_finally_persists_stage_reports_despite_a_second_cancellation.
+
+    Unlike run_full_cycle, _run_remediation_pass has NO `except
+    asyncio.CancelledError:` handler — only `except AllAccountsCappedException`
+    and `except Exception`, neither of which catches CancelledError (not an
+    Exception subclass since Python 3.8). So a cancelled stage here
+    propagates straight to the finally with no `_error` breadcrumb stamped.
+    What must survive the second cancellation instead is whatever real
+    stage_reports entries were already recorded before the cancelled stage:
+    this test lets Stage 1 (memory_consolidator) complete normally, then
+    cancels Stage 2 (task_knowledge_sync) mid-flight, and checks Stage 1's
+    report is not lost from the persisted run.
+
+    Same injection rig as the run_full_cycle test above: the second
+    cancellation is delivered from inside a `journal.update_run_stage_reports`
+    stub, one-shot-guarded, cancelling the driving task and yielding once
+    before delegating to the real implementation.
+
+    Without the shield on this call, this mirror site loses Stage 1's
+    report the same way run_full_cycle's finally loses its `_error`
+    breadcrumb above — this test is the regression guard for that, and for
+    the comment on this finally's claim that update_run_stage_reports is
+    "placed strictly before ... so the persisted copy captures whatever
+    markers either arm stamped."
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    _mock_stage_run(harness.stages[0])
+
+    # Event set by slow_stage_run when it starts — ensures the first cancel
+    # fires inside the stage loop (Stage 2), after Stage 1 has recorded its
+    # real report into run.stage_reports.
+    stage_entered = asyncio.Event()
+
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[1],
+    ):
+        stage_entered.set()
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[1].run = slow_stage_run
+    _mock_stage_run(harness.stages[2])
+
+    _outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        ),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — this test no longer exercises '
+        "_run_remediation_pass's finally update_run_stage_reports call, so "
+        'it would pass vacuously regardless of whether the shield fix is present'
+    )
+
+    async def _stage_reports_persisted():
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        return recent[0] if recent and recent[0].stage_reports else None
+
+    persisted = await _poll_until(_stage_reports_persisted)
+    assert persisted is not None, (
+        'no remediation run with non-empty stage_reports was persisted for '
+        'test-project within the poll window — the finally never completed '
+        'its write'
+    )
+
+    assert persisted.run_type == 'remediation', (
+        'expected the persisted run to be the remediation pass, got '
+        f'run_type={persisted.run_type!r}'
+    )
+    assert 'memory_consolidator' in persisted.stage_reports, (
+        "_run_remediation_pass's finally must shield update_run_stage_reports "
+        'so a second cancellation cannot discard the Stage 1 report already '
+        'recorded in run.stage_reports before this finally ran — the '
+        'comment on this finally claims the call is "placed strictly before '
+        'update_run_stage_reports so the persisted copy captures whatever '
+        'markers either arm stamped", which is hollow while this write '
+        'stays unshielded'
+    )
+
+
+@pytest.mark.asyncio
+async def test_shielded_stage_report_persistence_still_propagates_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Guards against 'fixing' the finally's durability gap by wrapping the
+    shielded update_run_stage_reports call in `except BaseException`, which
+    would absorb the second cancellation and let run_full_cycle return a
+    value instead of propagating it — an uncancellable coroutine on the
+    success path (task 4431's plan, design decision 3). This is the
+    prospective half of the shield's contract: the write must survive a
+    second cancellation (see the two tests above), but the cancellation
+    ITSELF must still win.
+
+    Passes both BEFORE and AFTER the task-4431 shield fix by design, the
+    same shape as task 4128's
+    `TestStage2CycleSummaryHarnessBackstop.test_degraded_arm_still_skips_an_existing_row_under_a_second_cancellation`:
+    asyncio.shield alone never suppresses the outer task's own
+    cancellation, only an added `except BaseException` around it would —
+    so this test's job is to keep failing that hypothetical future change,
+    not to distinguish the fix in this task.
+
+    Also pins that the shield does not change the run's terminal
+    disposition: status must still read 'failed' (the branch
+    resume_after_restart=False takes), unaffected by whichever write path
+    lands stage_reports.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = False
+
+    stage_entered = asyncio.Event()
+
+    async def slow_stage_run(
+        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
+    ):
+        stage_entered.set()
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    harness.stages[0].run = slow_stage_run
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — this test no longer exercises '
+        "the finally's update_run_stage_reports call"
+    )
+
+    assert outer_task.cancelled(), (
+        "run_full_cycle's task must still end CANCELLED after a second "
+        'cancellation arrives while the shielded stage_reports write is in '
+        'flight — asyncio.shield protects the WRITE, not the outer '
+        'coroutine, so the cancellation must still propagate. If this '
+        'assertion fails, something (e.g. a stray except BaseException '
+        'wrapped around the shielded await) is swallowing the second '
+        'cancellation instead of letting it propagate, which would make '
+        "run_full_cycle uncancellable on its success path."
+    )
+
+    async def _run_persisted():
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        return recent[0] if recent else None
+
+    persisted = await _poll_until(_run_persisted)
+    assert persisted is not None, 'no run was persisted for test-project'
+    assert persisted.status == 'failed', (
+        f"expected status='failed' (resume_after_restart=False takes the "
+        f'failed-cleanup branch), got {persisted.status!r} — the shield '
+        'must not change the terminal disposition the cancel path records'
     )
 
 
@@ -18509,4 +18864,310 @@ async def test_maybe_remediate_deferral_leaves_the_findings_forward_feedable(
     forward_fed = await harness._get_prior_s3_findings('test-project')
     assert forward_fed == findings, (
         'Deferred findings must still be forward-fed into the next cycle'
+    )
+
+# ── INV-5: the storm counters delegate to shared.storm_counter (task 3259) ────
+
+
+def test_all_three_storm_counters_are_the_shared_storm_counter(
+    journal, event_buffer, mock_memory_service,
+):
+    """The INV-5 acceptance criterion, made executable — once, for all three.
+
+    Task 3088 extracted the append-prune-count-ratelimit body into one home
+    (since promoted to ``shared.storm_counter`` by task 3689) precisely so no
+    module outside it carries its own copy. Two of the three counters here
+    (``_record_placeholder_finding_drop``, ``_record_dead_owner_suppression``)
+    were among the copies that class was extracted FROM; the third,
+    ``_record_resume_failure``, was added by task σ/2717 AFTER task 3259 was
+    filed, with the identical body and a docstring saying so outright ("Same
+    rolling-window per-event counter + rate-limited single-fire shape as
+    _record_placeholder_finding_drop"). Leaving any of them behind re-opens
+    the gap this task closes, so all three are asserted together rather than
+    in three near-identical tests.
+
+    Structural rather than behavioural on purpose: a hand-rolled deque can
+    reproduce every behaviour below and still be a fourth copy, which is the
+    thing INV-5 forbids. The behavioural halves live in the half-open-window
+    tests that follow.
+
+    The dead-owner counter additionally asserts its MODE, via StormCounter's
+    public ``count_distinct`` property. That is not decoration: a default-mode
+    counter there would silently restore pre-2039 raw-event thresholding and
+    re-fire on the benign multi-project restart esc-recon-50da2482-1 was about
+    (the regression
+    ``test_record_dead_owner_suppression_single_dead_owner_multi_project_no_storm``
+    guards behaviourally).
+    """
+    from shared.storm_counter import StormCounter
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    for attr in ('_placeholder_drop_storm', '_resume_failure_storm', '_dead_owner_storm'):
+        assert isinstance(getattr(harness, attr), StormCounter), (
+            f'{attr} must BE a shared StormCounter, not a local deque '
+            'reproducing its body (INV-5)'
+        )
+
+    assert harness._dead_owner_storm.count_distinct is True, (
+        'the dead-owner counter must be in DISTINCT-KEY mode — default mode '
+        'would threshold on raw suppression events and re-fire on a benign '
+        'multi-project restart, the esc-recon-50da2482-1 regression task 2039 '
+        'fixed'
+    )
+
+
+def test_record_placeholder_finding_drop_window_is_half_open(
+    journal, event_buffer, mock_memory_service,
+):
+    """An event aged EXACTLY window_seconds is already out of the window.
+
+    The behavioural half of delegation, and the one the structural check
+    above cannot fake. The hand-rolled body prunes strictly
+    (``deque[0][0] < cutoff``), so it KEEPS an event aged exactly the window
+    and fires here; ``StormCounter._prune`` is half-open (``<= cutoff``),
+    already pinned by ``shared/tests/test_storm_counter.py::
+    test_window_is_half_open``. Consolidation adopts the shared semantics —
+    preserving the harness variant would mean forking the body again.
+
+    Production impact is nil (it takes an event landing at exactly
+    3600.000000s offset), which is why none of the seven pre-existing storm
+    tests touches this boundary: every phase-3 re-fire in them jumps a FULL
+    2× window, leaving prior events strictly outside under either rule.
+    """
+    from fused_memory.reconciliation.harness import (
+        _PLACEHOLDER_DROP_STORM_THRESHOLD,
+        _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert _PLACEHOLDER_DROP_STORM_THRESHOLD == 5
+    assert _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS == 3600.0
+
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    # THRESHOLD-1 drops all at `base`.
+    early = [
+        harness._record_placeholder_finding_drop('reify', now=base)
+        for _ in range(_PLACEHOLDER_DROP_STORM_THRESHOLD - 1)
+    ]
+    assert all(r is None for r in early), f'below threshold; got {early!r}'
+
+    # The threshold-th drop, one FULL window later. The four earlier drops are
+    # aged exactly window_seconds and must already be out, leaving a count of 1.
+    boundary = harness._record_placeholder_finding_drop(
+        'reify',
+        now=base + timedelta(seconds=_PLACEHOLDER_DROP_STORM_WINDOW_SECONDS),
+    )
+
+    assert boundary is None, (
+        'events aged EXACTLY window_seconds must have been pruned (half-open '
+        f'window), leaving a count of 1 below the threshold; got {boundary!r}'
+    )
+
+
+def test_record_resume_failure_window_is_half_open(
+    journal, event_buffer, mock_memory_service,
+):
+    """Same half-open boundary for the resume-failure counter."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    threshold = harness.config.resume_failure_storm_threshold
+    window = harness.config.resume_failure_storm_window_seconds
+    assert threshold == 6
+    assert window == 3600.0
+
+    base = datetime(2026, 7, 18, 0, 0, 0, tzinfo=UTC)
+
+    early = [
+        harness._record_resume_failure('reify', now=base)
+        for _ in range(threshold - 1)
+    ]
+    assert all(r is None for r in early), f'below threshold; got {early!r}'
+
+    boundary = harness._record_resume_failure(
+        'reify', now=base + timedelta(seconds=window),
+    )
+
+    assert boundary is None, (
+        'events aged EXACTLY window_seconds must have been pruned (half-open '
+        f'window), leaving a count of 1 below the threshold; got {boundary!r}'
+    )
+
+
+def test_migrated_per_event_counters_keep_the_three_key_return_shape(
+    journal, event_buffer, mock_memory_service,
+):
+    """The return dict stays EXACTLY {count, window_seconds, projects}.
+
+    ``StormCounter.record`` returns count/threshold/window_seconds/labels; the
+    harness contract is count/window_seconds/projects, as read at the three
+    sites that fold a summary into an escalation payload —
+    ``reconciliation/harness.py::_recover_stale_runs`` (dead-owner),
+    ``::_resume_interrupted_runs`` (resume-failure) and ``::_maybe_remediate``
+    (placeholder-drop). The adapter remaps rather than passing the shared shape
+    through, so a migrated counter cannot leak a renamed key (``labels`` for
+    ``projects``) or an extra one into an escalation payload.
+    """
+    from fused_memory.reconciliation.harness import _PLACEHOLDER_DROP_STORM_THRESHOLD
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
+
+    storm = None
+    for i in range(_PLACEHOLDER_DROP_STORM_THRESHOLD):
+        storm = harness._record_placeholder_finding_drop(
+            'reify' if i % 2 == 0 else 'autopilot_video',
+            now=base + timedelta(seconds=i),
+        )
+    assert storm is not None, 'the threshold-crossing drop must fire'
+    assert set(storm) == {'count', 'window_seconds', 'projects'}, (
+        f'exact 3-key harness shape expected, got {sorted(storm)}'
+    )
+    assert storm['projects'] == ['autopilot_video', 'reify']
+
+    resume_storm = None
+    for i in range(harness.config.resume_failure_storm_threshold):
+        resume_storm = harness._record_resume_failure(
+            'reify' if i % 2 == 0 else 'dark_factory',
+            now=base + timedelta(seconds=i),
+        )
+    assert resume_storm is not None, 'the threshold-crossing resume failure must fire'
+    assert set(resume_storm) == {'count', 'window_seconds', 'projects'}, (
+        f'exact 3-key harness shape expected, got {sorted(resume_storm)}'
+    )
+    assert resume_storm['projects'] == ['dark_factory', 'reify']
+
+
+def test_record_dead_owner_suppression_window_is_half_open(
+    journal, event_buffer, mock_memory_service,
+):
+    """An event aged EXACTLY window_seconds is already out of the window.
+
+    The behavioural half of delegation, as for the two per-event counters:
+    the hand-rolled body prunes strictly (``deque[0][0] < cutoff``) and so
+    KEEPS suppressions aged exactly the window, firing here; StormCounter's
+    half-open ``<= cutoff`` prunes them, leaving a distinct count of 1.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    threshold = harness.config.dead_owner_suppression_storm_threshold
+    window = harness.config.dead_owner_suppression_storm_window_seconds
+    assert threshold == 6
+    assert window == 3600.0
+
+    base = datetime(2026, 7, 3, 13, 42, 37, tzinfo=UTC)
+
+    # threshold-1 suppressions, each a genuinely DISTINCT dead owner, all at base.
+    early = [
+        harness._record_dead_owner_suppression('reify', f'iid-boundary-{i}', now=base)
+        for i in range(threshold - 1)
+    ]
+    assert all(r is None for r in early), f'below threshold; got {early!r}'
+
+    boundary = harness._record_dead_owner_suppression(
+        'reify', 'iid-boundary-last', now=base + timedelta(seconds=window),
+    )
+
+    assert boundary is None, (
+        'suppressions aged EXACTLY window_seconds must have been pruned '
+        '(half-open window), leaving a distinct count of 1 below the '
+        f'threshold; got {boundary!r}'
+    )
+
+
+def test_record_dead_owner_suppression_keeps_both_label_dimensions_after_migration(
+    journal, event_buffer, mock_memory_service,
+):
+    """count follows instance_id; projects follows project_id — independently.
+
+    The property that forced ``count_distinct`` + ``key`` to be TWO axes rather
+    than one. Here 6 distinct dead owners are spread across only 3 projects, so
+    the two numbers genuinely differ: a summary that reported 3 (the project
+    count) would understate the incident, and one that reported the raw event
+    count would overstate it the moment any restart touched several projects.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    threshold = harness.config.dead_owner_suppression_storm_threshold
+    assert threshold == 6
+
+    base = datetime(2026, 7, 3, 13, 42, 37, tzinfo=UTC)
+    projects = ['reify', 'dark_factory', 'autopilot_video']
+
+    results = [
+        harness._record_dead_owner_suppression(
+            projects[i % len(projects)], f'iid-two-dims-{i}', now=base + timedelta(seconds=i),
+        )
+        for i in range(threshold)
+    ]
+
+    assert all(r is None for r in results[:-1]), f'below threshold; got {results!r}'
+    storm = results[-1]
+    assert storm is not None, 'the threshold-th DISTINCT dead owner must fire'
+    assert set(storm) == {'count', 'window_seconds', 'projects'}, (
+        f'exact 3-key harness shape expected, got {sorted(storm)}'
+    )
+    assert storm['count'] == threshold, (
+        f'count follows the DISTINCT dead-owner-instance dimension, got '
+        f'{storm["count"]!r}'
+    )
+    assert storm['projects'] == sorted(projects), (
+        f'projects follows the project_id dimension independently, got '
+        f'{storm["projects"]!r}'
+    )
+    assert len(storm['projects']) < storm['count'], (
+        'this scenario is only meaningful if the two dimensions differ'
+    )
+
+
+def test_record_resume_failure_reads_its_threshold_live_off_config(
+    journal, event_buffer, mock_memory_service,
+):
+    """The harness-level analogue of ``TestLiveReadContract`` (task 3259).
+
+    The migrated docstrings make a load-bearing claim — threshold and window
+    are read LIVE off ``self.config`` on EVERY call rather than captured, so
+    promoting ``resume_failure_storm_*`` (or ``dead_owner_suppression_storm_*``)
+    into ``RELOADABLE_FIELDS`` would work with no further edits. Nothing at the
+    harness level pinned it: ``shared/tests/test_storm_counter.py::
+    TestLiveReadContract`` covers the CLASS, which takes the knobs per call and
+    cannot help but honour them, not the ADAPTER that supplies them. A refactor
+    that captured ``self.config.resume_failure_storm_threshold`` into
+    ``_storm_summary`` at construction — the exact mistake ``config/reload.py``'s
+    reload-safety rule warns about, and one that turns a green-tier leaf into a
+    restart-only one in disguise — would pass every other test in this section.
+
+    So: record below the ORIGINAL threshold, retune the config in place, and
+    assert the very next call decides against the NEW value.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness.config.resume_failure_storm_threshold == 6
+
+    base = datetime(2026, 7, 18, 0, 0, 0, tzinfo=UTC)
+
+    # Three failures — comfortably below the configured threshold of 6.
+    early = [
+        harness._record_resume_failure('reify', now=base + timedelta(seconds=i))
+        for i in range(3)
+    ]
+    assert all(r is None for r in early), f'below threshold 6; got {early!r}'
+
+    # An operator retunes the alarm downward. The counter's existing window is
+    # untouched: the same three events are now AT the new threshold.
+    harness.config.resume_failure_storm_threshold = 4
+
+    storm = harness._record_resume_failure('reify', now=base + timedelta(seconds=3))
+
+    assert storm is not None, (
+        'the 4th failure must fire against the RETUNED threshold of 4 — a '
+        'captured threshold of 6 would still be waiting for two more'
+    )
+    assert storm['count'] == 4
+
+    # The window leaf is read live on the same terms: narrowing it prunes on
+    # the NEXT call, not at some later construction.
+    harness.config.resume_failure_storm_window_seconds = 1.0
+    after = harness._record_resume_failure('reify', now=base + timedelta(seconds=600))
+
+    assert after is None, (
+        'the narrowed 1s window must have pruned every earlier failure on this '
+        'very call, leaving a count of 1'
     )

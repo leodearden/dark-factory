@@ -83,23 +83,45 @@ class TestShapeTaskCarriesClaimantFields:
         assert shaped['heartbeat_at'] is None
 
     def test_existing_shape_keys_are_unchanged(self):
-        shaped = _shape_task(_row(claimant_run_id='x', heartbeat_at=_iso(_NOW)))
+        """Every pre-existing key survives with its VALUE intact.
+
+        Membership alone (``key in shaped``) is not enough here: it passes
+        just as happily if every value were silently ``None``, which is the
+        precise regression this change risks — ``_shape_task`` now reads the
+        claimant columns via ``.get``, so a mis-keyed lookup yields ``None``
+        rather than raising, and the same slip on a neighbouring key would go
+        unnoticed.  Every field in the fixture is therefore distinct and
+        non-default, and the full key SET is compared too, so an accidentally
+        ADDED or dropped key is caught as well.
+        """
+        shaped = _shape_task(_row(
+            id='7',
+            title='a distinctive title',
+            description='a distinctive description',
+            details='some distinctive details',
+            status='blocked',
+            priority='high',
+            dependencies=['3', 4],
+            metadata={'files': ['a.py'], 'prd': 'plans/x.md'},
+            updatedAt=_iso(_NOW),
+            claimant_run_id='x',
+            heartbeat_at=_iso(_NOW),
+        ))
 
         assert shaped is not None
-        # The nine pre-existing keys must survive verbatim.
-        for key in (
-            'id',
-            'title',
-            'description',
-            'details',
-            'status',
-            'priority',
-            'dependencies',
-            'metadata',
-            'updated_at',
-        ):
-            assert key in shaped
-        assert shaped['id'] == 7
+        assert set(shaped) == {
+            'id', 'title', 'description', 'details', 'status', 'priority',
+            'dependencies', 'metadata', 'updated_at',
+            'claimant_run_id', 'heartbeat_at',
+        }
+        assert shaped['id'] == 7            # cast to int at the boundary
+        assert shaped['title'] == 'a distinctive title'
+        assert shaped['description'] == 'a distinctive description'
+        assert shaped['details'] == 'some distinctive details'
+        assert shaped['status'] == 'blocked'
+        assert shaped['priority'] == 'high'
+        assert shaped['dependencies'] == [3, 4]   # deps cast to int too
+        assert shaped['metadata'] == {'files': ['a.py'], 'prd': 'plans/x.md'}
         assert shaped['updated_at'] == _iso(_NOW)
 
 
@@ -109,9 +131,32 @@ class TestShapeTaskCarriesClaimantFields:
 
 
 class TestTaskIsStrandedTruthTable:
-    def test_ttl_is_a_timedelta(self):
+    def test_ttl_is_ten_minutes(self):
+        """Pin the TTL's exact value, not merely that it is a positive duration.
+
+        Deliberately an exact-value pin.  ``isinstance(..., timedelta)`` plus
+        ``> timedelta(0)`` is satisfied equally by 1 microsecond and by 100
+        years, so it cannot catch a units slip (``seconds=10`` for
+        ``minutes=10``) — the one error this constant is actually prone to.
+
+        The value is a contract, not a local tuning knob: ``task_is_stranded``
+        binds it for every dashboard surface that renders a strand — the
+        task-row badge and the burndown live/stranded split — so the surfaces
+        cannot disagree (INV-5, see ``dashboard.data.tasks.task_is_stranded``),
+        and it is the documented mirror of the orchestrator's
+        ``harness._RECONCILE_HEARTBEAT_TTL``.  Moving it should therefore
+        require a deliberate edit to this test rather than passing silently.
+
+        The ``isinstance`` assertion is retained rather than folded into the
+        equality: ``task_is_stranded`` passes the constant straight into
+        :func:`shared.task_claimant.is_stranded`, which does ``timedelta``
+        arithmetic on it, so a differently-typed duration object that happened
+        to compare equal would still be wrong at the call site.
+        """
         assert isinstance(STRANDED_HEARTBEAT_TTL, timedelta)
-        assert timedelta(0) < STRANDED_HEARTBEAT_TTL
+        # Operand order is ruff SIM300's, not a style choice: it reads the
+        # SCREAMING_CASE name as the constant, so it must sit on the right.
+        assert timedelta(minutes=10) == STRANDED_HEARTBEAT_TTL
 
     def test_in_progress_with_null_claimant_is_stranded(self):
         task = {'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None}
@@ -343,14 +388,57 @@ class TestBuildTaskRowStrandProjection:
         assert row['stranded'] is True
 
     def test_existing_row_keys_are_unchanged(self):
-        row = _build_task_row('p', _task(), 42, _rt(), 'p/T-42', now=_NOW)
+        """Every pre-existing row key survives with its VALUE intact.
 
-        for key in (
+        Same reasoning as ``test_existing_shape_keys_are_unchanged``: a
+        membership-only check passes even if every value were silently
+        ``None``, so the fixture gives each key a distinct, non-default value
+        and the assertions bind to those values.  The full key SET is compared
+        as well, catching an added or dropped key that per-key membership
+        cannot.
+        """
+        task = _task(
+            title='a distinctive title',
+            description='a distinctive description',
+            details='some distinctive details',
+            status='blocked',
+            metadata={
+                'files': ['a.py', 'b.py'],
+                'train': {'id': 'tr-1', 'order': 3},
+                'external_deps': ['other:9'],
+                'prd': 'plans/x.md',
+            },
+        )
+        rt = {
+            'agent': 'claude-task-42', 'loops': 5, 'attempts': 2, 'started': 11,
+            'lane': 'lane-3', 'phase': 'implement', 'lane_state': 'active',
+            'runtime_offline': True,
+        }
+
+        row = _build_task_row('proj-x', task, 42, rt, 'p/T-42', now=_NOW)
+
+        assert set(row) >= {
             'id', 'project', 'title', 'description', 'details', 'status',
             'agent', 'loops', 'attempts', 'lane', 'phase', 'lane_state',
             'runtime_offline', 'meta_files', 'train', 'external_deps', 'prd',
-        ):
-            assert key in row
+        }
+        assert row['id'] == 'p/T-42'   # the row's id IS the uid
+        assert row['project'] == 'proj-x'
+        assert row['title'] == 'a distinctive title'
+        assert row['description'] == 'a distinctive description'
+        assert row['details'] == 'some distinctive details'
+        assert row['status'] == 'blocked'
+        assert row['agent'] == 'claude-task-42'
+        assert row['loops'] == 5
+        assert row['attempts'] == 2
+        assert row['lane'] == 'lane-3'
+        assert row['phase'] == 'implement'
+        assert row['lane_state'] == 'active'
+        assert row['runtime_offline'] is True
+        assert row['meta_files'] == ['a.py', 'b.py']
+        assert row['train'] == {'id': 'tr-1', 'order': 3}
+        assert row['external_deps'] == [{'id': 'other:9', 'status': 'unknown'}]
+        assert row['prd'] == 'plans/x.md'
 
 
 class TestBuildTaskRowClockDiscipline:

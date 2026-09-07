@@ -14,6 +14,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -288,6 +289,116 @@ class TestCategoryCensusOccurrenceAxes:
         assert c.canonical_non_bool == 2
 
 
+class TestCategoryCensusCanonicalByTopic:
+    """The topic x canonical CROSS-TAB (task 4006).
+
+    ``topic_values`` and ``canonical_true`` are INDEPENDENT counters, so the
+    three numbers the coverage ask needs -- topics with exactly one canonical,
+    with zero, with more than one -- cannot be derived from either.  This
+    accumulator joins them at fold time, keyed by topic, mirroring 3198's
+    write-time probe ``count_memories_by_metadata(project_id,
+    {'topic': T, 'canonical': True})``
+    (fused-memory/src/fused_memory/services/memory_service.py::_check_canonical_uniqueness).
+    """
+
+    def test_canonical_true_keyed_by_its_topic(self):
+        c = _mod.CategoryCensus()
+        c.add({'topic': 'merge-lane', 'canonical': True})
+        c.add({'topic': 'merge-lane', 'canonical': True})
+        c.add({'topic': 'census', 'canonical': True})
+        assert c.canonical_true_by_topic['merge-lane'] == 2
+        assert c.canonical_true_by_topic['census'] == 1
+
+    def test_topic_without_canonical_true_is_not_in_the_cross_tab(self):
+        c = _mod.CategoryCensus()
+        c.add({'topic': 'merge-lane'})
+        c.add({'topic': 'merge-lane', 'canonical': False})
+        assert c.topic_values['merge-lane'] == 2
+        assert c.canonical_true_by_topic['merge-lane'] == 0
+        assert 'merge-lane' not in c.canonical_true_by_topic
+
+    def test_canonical_true_without_a_topic_is_named_not_dropped(self):
+        # Reachable today: the ``canonical_without_topic`` shape rule is
+        # warn-mode under the shipped ``memory_metadata.enforce=false``, so
+        # such records CAN land.  Counting them in a distinct scalar means
+        # canonical_true == sum(by_topic) + without_topic holds exactly, and
+        # no canonical vanishes silently in the join.
+        c = _mod.CategoryCensus()
+        c.add({'canonical': True})
+        c.add({'topic': None, 'canonical': True})
+        c.add({'topic': 'census', 'canonical': True})
+        assert c.canonical_true == 3
+        assert c.canonical_true_without_topic == 2
+        assert sum(c.canonical_true_by_topic.values()) == 1
+        assert c.canonical_true == sum(c.canonical_true_by_topic.values()) + \
+            c.canonical_true_without_topic
+
+    def test_non_bool_canonical_lands_in_neither_counter(self):
+        # Measured live: 1 such record in reify.  Matches the existing
+        # canonical_non_bool treatment -- a string 'true' is drift, not a
+        # canonical, and must not be scored as one.
+        c = _mod.CategoryCensus()
+        c.add({'topic': 'census', 'canonical': 'true'})
+        c.add({'topic': 'census', 'canonical': 1})
+        c.add({'canonical': 'true'})
+        assert c.canonical_non_bool == 3
+        assert sum(c.canonical_true_by_topic.values()) == 0
+        assert c.canonical_true_without_topic == 0
+
+    def test_merge_folds_both_the_counter_and_the_scalar(self):
+        a = _mod.CategoryCensus()
+        a.add({'topic': 'merge-lane', 'canonical': True})
+        a.add({'canonical': True})
+
+        b = _mod.CategoryCensus()
+        b.add({'topic': 'merge-lane', 'canonical': True})
+        b.add({'topic': 'census', 'canonical': True})
+        b.add({'canonical': True})
+
+        a.merge(b)
+        assert a.canonical_true_by_topic['merge-lane'] == 2
+        assert a.canonical_true_by_topic['census'] == 1
+        assert a.canonical_true_without_topic == 2
+        assert a.canonical_true == 5
+        # The rollup identity survives the merge.
+        assert a.canonical_true == sum(a.canonical_true_by_topic.values()) + \
+            a.canonical_true_without_topic
+
+    def test_merge_does_not_mutate_the_other_cross_tab(self):
+        a = _mod.CategoryCensus()
+        a.add({'topic': 't', 'canonical': True})
+        b = _mod.CategoryCensus()
+        b.add({'topic': 't', 'canonical': True})
+        b.add({'canonical': True})
+        a.merge(b)
+        assert b.canonical_true_by_topic['t'] == 1
+        assert b.canonical_true_without_topic == 1
+
+    def test_cross_tab_is_emitted_through_census_to_dict(self):
+        c = _mod.CategoryCensus()
+        c.add({'topic': 'merge-lane', 'canonical': True})
+        c.add({'topic': 'merge-lane', 'canonical': True})
+        c.add({'topic': 'census', 'canonical': True})
+        c.add({'canonical': True})
+        rendered = _mod._census_to_dict(c)
+        assert rendered['canonical_true_without_topic'] == 1
+        # Through _table(), so ordering is the deterministic count-desc /
+        # value-asc total order and the JSON table is never capped.
+        table = rendered['canonical_true_by_topic']
+        assert table['distinct_total'] == 2
+        assert [(e['value'], e['count']) for e in table['entries']] == [
+            ('merge-lane', 2),
+            ('census', 1),
+        ]
+
+    def test_add_does_not_mutate_a_canonical_topic_payload(self):
+        payload = {'topic': 'merge-lane', 'canonical': True}
+        before = dict(payload)
+        c = _mod.CategoryCensus()
+        c.add(payload)
+        assert payload == before
+
+
 class TestCategoryCensusSupersedes:
     """supersedes shape / member-shape / list-length census."""
 
@@ -380,7 +491,11 @@ PREF = MemoryCategory.preferences_and_norms.value
 DEC = MemoryCategory.decisions_and_rationale.value
 
 
-def _census(payloads: list[dict]) -> object:
+def _census(payloads: list[dict]) -> Any:
+    # `Any`, not `object`: `_mod` is loaded from a path at runtime, so
+    # `CategoryCensus` has no statically-known type to name here -- and
+    # callers legitimately read `.records` off the result, which `object`
+    # forbids.
     c = _mod.CategoryCensus()
     for p in payloads:
         c.add(p)
@@ -482,6 +597,1526 @@ class TestBuildReportRollups:
         assert dict(_entries(report['grand_total']['kind'])) == {'k': 2, 'other': 1}
 
 
+class TestTopicCoverageBlock:
+    """The per-project ``topic_coverage`` block (task 4006).
+
+    The existing report counts topic_present and canonical_true as raw
+    integers.  Coverage is a RATE plus the three-way canonical partition,
+    and neither is derivable from those counts.
+    """
+
+    def test_block_carries_the_rate_and_the_counts(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census(
+                    [{'topic': 'merge-lane'}, {'topic': 'census'}] + [{}] * 2,
+                ),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 4, {OBS: (4, 4)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['records'] == 4
+        assert block['topic_present'] == 2
+        assert block['topic_coverage_pct'] == 50.0
+        assert block['distinct_topics'] == 2
+
+    def test_empty_project_reports_a_null_rate_not_a_fabricated_zero(self):
+        # A 0.0 rate says "measured, and nothing is stamped"; null says
+        # "there was nothing to measure".  Conflating them is the same
+        # fabricated-baseline failure task 3291 hardened extract_done_count
+        # against -- and a ZeroDivisionError would lose the census entirely.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 0, {OBS: (0, 0)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['records'] == 0
+        assert block['topic_coverage_pct'] is None
+
+    def test_three_way_canonical_partition(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'exactly-one', 'canonical': True},
+                    {'topic': 'exactly-one'},
+                    {'topic': 'none-at-all'},
+                    {'topic': 'too-many', 'canonical': True},
+                    {'topic': 'too-many', 'canonical': True},
+                ]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 5, {OBS: (5, 5)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['topics_with_one_canonical'] == 1
+        assert block['topics_with_zero_canonical'] == 1
+        assert block['topics_with_multiple_canonical'] == 1
+
+    def test_partition_sums_to_distinct_topics(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'a', 'canonical': True},
+                    {'topic': 'b'},
+                    {'topic': 'c', 'canonical': True},
+                    {'topic': 'c', 'canonical': True},
+                    {'topic': 'd', 'canonical': False},
+                ]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 5, {OBS: (5, 5)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert (
+            block['topics_with_one_canonical']
+            + block['topics_with_zero_canonical']
+            + block['topics_with_multiple_canonical']
+        ) == block['distinct_topics'] == 4
+
+    def test_partition_is_computed_at_project_grain_across_all_categories(self):
+        # THE load-bearing assertion.  3198's write-time probe is
+        # count_memories_by_metadata(project_id, {'topic': T, 'canonical':
+        # True}) -- scope-wide, NOT category-filtered.  A topic whose peers
+        # sit in procedural_knowledge while its lone canonical sits in
+        # observations_and_summaries has EXACTLY ONE canonical.  Partitioning
+        # per-(project, category) would score it as one zero-canonical topic
+        # plus one separate exactly-one topic, manufacturing a false gap.
+        cells = {
+            'dark_factory': {
+                PROC: _census([{'topic': 'split-topic'}, {'topic': 'split-topic'}]),
+                OBS: _census([{'topic': 'split-topic', 'canonical': True}]),
+            },
+        }
+        cov = {
+            'dark_factory': _coverage(
+                'fused_dark_factory', 3, {PROC: (2, 2), OBS: (1, 1)},
+            ),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['distinct_topics'] == 1
+        assert block['topics_with_one_canonical'] == 1
+        assert block['topics_with_zero_canonical'] == 0
+
+    def test_a_canonical_split_across_categories_is_still_a_violation(self):
+        # The same grain in the other direction: two canonicals for one topic
+        # in DIFFERENT categories is exactly the duplicate 3198's probe would
+        # have caught, so the census must see it as one violation, not as two
+        # well-formed cells.
+        cells = {
+            'dark_factory': {
+                PROC: _census([{'topic': 'dup', 'canonical': True}]),
+                OBS: _census([{'topic': 'dup', 'canonical': True}]),
+            },
+        }
+        cov = {
+            'dark_factory': _coverage(
+                'fused_dark_factory', 2, {PROC: (1, 1), OBS: (1, 1)},
+            ),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['topics_with_multiple_canonical'] == 1
+        assert block['topics_with_one_canonical'] == 0
+
+    def test_projects_are_scored_independently(self):
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': 'shared', 'canonical': True}])},
+            'reify': {OBS: _census([{'topic': 'shared'}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        df = report['projects']['dark_factory']['topic_coverage']
+        rf = report['projects']['reify']['topic_coverage']
+        assert df['topics_with_one_canonical'] == 1
+        assert rf['topics_with_one_canonical'] == 0
+        assert rf['topics_with_zero_canonical'] == 1
+
+    def test_grand_total_block_is_emitted(self):
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])},
+            'reify': {OBS: _census([{'topic': 'b'}, {}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 2, {OBS: (2, 2)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['topic_coverage']
+        assert block['records'] == 3
+        assert block['topic_present'] == 2
+        assert block['distinct_topics'] == 2
+
+    def test_canonical_without_a_topic_is_disclosed_in_the_block(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([{'topic': 'a', 'canonical': True}, {'canonical': True}]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['canonical_true'] == 2
+        assert block['canonical_true_without_topic'] == 1
+        # The join drops it from every per-topic tally, so naming it is what
+        # keeps the block reconcilable against the canonical_true axis.
+        assert block['topics_with_one_canonical'] == 1
+
+    def test_schema_version_is_bumped_for_the_new_block(self):
+        cells = {'dark_factory': {OBS: _census([{}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert report['schema_version'] >= 4
+
+    def test_block_is_json_serialisable_and_deterministic(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'a', 'canonical': True},
+                    {'topic': 'b'},
+                ]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
+        first = _mod.build_report(cells, cov, top_n=50)
+        second = _mod.build_report(cells, cov, top_n=50)
+        assert json.dumps(first, sort_keys=False) == json.dumps(second, sort_keys=False)
+
+
+class TestUniquenessViolationsAreNamedAndReadable:
+    """>1 canonical per topic: NAMED, and readable against the live regime.
+
+    An operator cannot act on an integer, and a bare count is also
+    MISREADABLE: 3198 ships warn-mode-first behind ``memory_metadata.enforce``
+    (default False,
+    ``fused-memory/src/fused_memory/config/schema.py::MemoryMetadataConfig.enforce``),
+    so a duplicate can land by an ordinary write and a non-zero count is
+    partly backlog, not proof the guard broke.  The block therefore carries the violators, the live flag,
+    and -- per Leo's 2026-08-12 ruling (Option B on esc-4006-3) -- what still
+    stands between here and flipping that flag.
+    """
+
+    @staticmethod
+    def _violators_report(**kwargs):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'three-way', 'canonical': True},
+                    {'topic': 'three-way', 'canonical': True},
+                    {'topic': 'three-way', 'canonical': True},
+                    {'topic': 'a-pair', 'canonical': True},
+                    {'topic': 'a-pair', 'canonical': True},
+                    {'topic': 'b-pair', 'canonical': True},
+                    {'topic': 'b-pair', 'canonical': True},
+                    {'topic': 'fine', 'canonical': True},
+                ]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 8, {OBS: (8, 8)})}
+        return _mod.build_report(cells, cov, top_n=50, **kwargs)
+
+    def test_violators_are_named_not_merely_counted(self):
+        block = self._violators_report()['projects']['dark_factory']['topic_coverage']
+        assert block['topics_with_multiple_canonical'] == 3
+        rows = block['multiple_canonical_topics']
+        assert [(r['topic'], r['canonical_count']) for r in rows] == [
+            ('three-way', 3),
+            ('a-pair', 2),
+            ('b-pair', 2),
+        ]
+
+    def test_violator_rows_follow_the_house_total_order(self):
+        # count desc, then topic asc -- the same total order _table() uses,
+        # so the artifact stays byte-stable across re-runs.
+        rows = self._violators_report()['projects']['dark_factory'][
+            'topic_coverage'
+        ]['multiple_canonical_topics']
+        assert rows == sorted(rows, key=lambda r: (-r['canonical_count'], r['topic']))
+
+    def test_a_clean_corpus_reports_an_empty_violator_list(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'fine', 'canonical': True}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['multiple_canonical_topics'] == []
+
+    def test_enforce_state_is_disclosed_beside_the_count(self):
+        for state in (True, False):
+            block = self._violators_report(canonical_uniqueness_enforced=state)[
+                'projects'
+            ]['dark_factory']['topic_coverage']
+            assert block['canonical_uniqueness_enforced'] is state
+
+    def test_enforce_state_is_three_valued_never_defaulted_to_false(self):
+        # null means "could not read the config", which is a DIFFERENT claim
+        # from "the guard is off".  Fabricating False here would assert the
+        # wrong defect class confidently: it would tell a reader the
+        # violations are expected backlog when in fact nothing is known.
+        block = self._violators_report(canonical_uniqueness_enforced=None)[
+            'projects'
+        ]['dark_factory']['topic_coverage']
+        assert block['canonical_uniqueness_enforced'] is None
+
+    def test_enforce_reader_returns_a_bool_from_the_live_config(self):
+        assert _mod.read_canonical_uniqueness_enforced() in (True, False)
+
+    def test_enforce_reader_degrades_to_none_rather_than_raising(self, monkeypatch):
+        # The census must still produce its MEASUREMENT when config loading
+        # is broken -- losing the whole census to a config fault would be a
+        # strictly worse outcome than an undisclosed flag.
+        import fused_memory.config.schema as schema_mod
+
+        class _Exploding:
+            def __init__(self, *a, **kw):
+                raise RuntimeError('config is unloadable')
+
+        monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _Exploding)
+        assert _mod.read_canonical_uniqueness_enforced() is None
+
+    # ── the corpus-wide block is graded at (project, topic) grain ──────────
+    #
+    # Caught on the FIRST live regeneration (step-22): the report headlined
+    # "Topics carrying more than one live canonical: true: 1" directly above a
+    # named-violator table reading "(none)".  Both were right about their own
+    # scope and the report was still wrong, which is the worst shape a measured
+    # artifact can take -- a reader either distrusts the number or hunts for a
+    # violation that does not exist.
+    #
+    # Cause: the corpus-wide block was built from a census merged ACROSS
+    # projects, which merges the two topic NAMESPACES.  3198's invariant is
+    # per-(project, topic) -- its probe is
+    # count_memories_by_metadata(project_id, {'topic': T, 'canonical': True}),
+    # bound to one project -- so a topic correctly carrying one canonical in
+    # dark_factory and one in reify is two compliant cells, not one violation.
+    # Live instance: `merge-request-bare-task-id-branch-arg`, canonical in both.
+
+    def test_one_canonical_in_each_of_two_projects_is_not_a_violation(self):
+        """The exact live shape that produced the contradictory artifact."""
+        shared = 'merge-request-bare-task-id-branch-arg'
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': shared, 'canonical': True}])},
+            'reify': {OBS: _census([{'topic': shared, 'canonical': True}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+
+        for project_id in ('dark_factory', 'reify'):
+            block = report['projects'][project_id]['topic_coverage']
+            assert block['topics_with_multiple_canonical'] == 0, project_id
+            assert block['topics_with_one_canonical'] == 1, project_id
+
+        grand = report['topic_coverage']
+        assert grand['topics_with_multiple_canonical'] == 0
+        assert grand['multiple_canonical_topics'] == []
+        # Two compliant CELLS, not one merged topic: the partition is counted
+        # over (project, topic) pairs, the grain the invariant is stated at.
+        assert grand['topics_with_one_canonical'] == 2
+
+    def test_the_corpus_wide_count_and_its_named_list_can_never_disagree(self):
+        """The count IS the length of the named list, at every scope.
+
+        Pinned as an identity rather than as two numbers, because the artifact
+        that shipped had a count and a list sourced from different grains.
+        """
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    # A real per-project violation: two canonicals, one topic.
+                    {'topic': 'dupe', 'canonical': True},
+                    {'topic': 'dupe', 'canonical': True},
+                    {'topic': 'shared', 'canonical': True},
+                ]),
+            },
+            'reify': {OBS: _census([{'topic': 'shared', 'canonical': True}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 3, {OBS: (3, 3)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+
+        for block in (
+            report['projects']['dark_factory']['topic_coverage'],
+            report['projects']['reify']['topic_coverage'],
+            report['topic_coverage'],
+        ):
+            assert (block['topics_with_multiple_canonical']
+                    == len(block['multiple_canonical_topics']))
+
+        grand = report['topic_coverage']
+        # The genuine violation survives the regrade; the cross-project pair
+        # does not become one.
+        assert grand['topics_with_multiple_canonical'] == 1
+        assert [r['topic'] for r in grand['multiple_canonical_topics']] == ['dupe']
+        # A corpus-wide violator must name its project -- "dupe is duplicated"
+        # is not actionable without knowing where.
+        assert grand['multiple_canonical_topics'][0]['project_id'] == 'dark_factory'
+
+    def test_the_partition_still_sums_to_the_cell_population(self):
+        """one + zero + multiple == the number of (project, topic) cells.
+
+        The per-project blocks each partition their own topic_values, so the
+        corpus-wide sum must equal the sum of the per-project distinct counts
+        -- NOT the corpus-wide distinct-VALUE count, which de-duplicates a
+        topic shared by two projects.
+        """
+        cells = {
+            'dark_factory': {
+                OBS: _census([{'topic': 'shared', 'canonical': True}, {'topic': 'a'}]),
+            },
+            'reify': {OBS: _census([{'topic': 'shared'}, {'topic': 'b'}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)}),
+            'reify': _coverage('fused_reify', 2, {OBS: (2, 2)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        grand = report['topic_coverage']
+        cells_total = sum(
+            report['projects'][p]['topic_coverage']['distinct_topics']
+            for p in ('dark_factory', 'reify')
+        )
+        assert cells_total == 4
+        assert (grand['topics_with_one_canonical']
+                + grand['topics_with_zero_canonical']
+                + grand['topics_with_multiple_canonical']) == cells_total
+        # And the distinct-VALUE axis is untouched: gate 3626's item-3 history
+        # (98 -> 103) is a distinct-value series, so de-duplicating `shared`
+        # here is correct and must NOT be regraded to the cell count.
+        assert grand['distinct_topics'] == 3
+
+    def test_slug_conformance_stays_on_the_distinct_value_axis(self):
+        """The regrade touches the canonical partition ONLY.
+
+        Item 3 counts non-conforming distinct topic VALUES corpus-wide; a
+        legacy spelling present in both projects is one non-conforming topic,
+        not two, or the series this census continues would step on re-grain.
+        """
+        legacy = 'legacy_snake_case_topic'
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': legacy}])},
+            'reify': {OBS: _census([{'topic': legacy}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        grand = report['topic_coverage']
+        assert grand['slug_non_conforming'] == 1
+        assert [r['topic'] for r in grand['non_conforming_topics']] == [legacy]
+
+    def test_the_regrade_touches_exactly_the_fields_the_constant_names(self):
+        """`_UNIQUENESS_GRAIN_FIELDS` is authoritative, in BOTH directions.
+
+        The constant documents itself as "exactly those fields whose meaning
+        is fixed by 3198's per-(project, topic) invariant", and the regrade's
+        docstring says its scope is "only :data:`_UNIQUENESS_GRAIN_FIELDS`".
+        Neither claim was checked, and the implementation carried its own
+        duplicate literal of the scalar columns -- so the constant could grow
+        a field that nothing re-graded (the corpus-wide block would silently
+        headline a merged-across-projects number again, the exact defect the
+        regrade exists to fix), or the implementation could grow a re-grade
+        the constant does not name.
+
+        Asserted as a SET EQUALITY over the keys whose values actually change,
+        so it fails on either drift. The reverse half is load-bearing on its
+        own: `distinct_topics` and the slug axes are distinct-VALUE series
+        that gate 3626's recipe item 3 tracks across runs (98 -> 103), and
+        re-graining one of them to a cell count would step that series
+        discontinuously while every existing assertion stayed green.
+        """
+        # Sentinels on EVERY key, grain-fixed or not: a key that still holds
+        # its sentinel was left alone, one that does not was re-graded.
+        grand_block = {
+            'topics_with_one_canonical': -101,
+            'topics_with_zero_canonical': -102,
+            'topics_with_multiple_canonical': -103,
+            'multiple_canonical_topics': [{'topic': 'sentinel',
+                                           'canonical_count': -104}],
+            'distinct_topics': -105,
+            'slug_conforming': -106,
+            'slug_non_conforming': -107,
+            'non_conforming_topics': [{'topic': 'sentinel-slug'}],
+            'records': -108,
+            'topic_present': -109,
+            'topic_coverage_pct': -110.0,
+        }
+        projects = {
+            'dark_factory': {'topic_coverage': {
+                'topics_with_one_canonical': 2,
+                'topics_with_zero_canonical': 3,
+                'topics_with_multiple_canonical': 1,
+                'multiple_canonical_topics': [{'topic': 'dupe',
+                                               'canonical_count': 2}],
+            }},
+            'reify': {'topic_coverage': {
+                'topics_with_one_canonical': 5,
+                'topics_with_zero_canonical': 7,
+                'topics_with_multiple_canonical': 0,
+                'multiple_canonical_topics': [],
+            }},
+        }
+
+        regraded = _mod._regrade_uniqueness_at_project_grain(grand_block, projects)
+
+        changed = {k for k, v in regraded.items() if v != grand_block[k]}
+        assert changed == set(_mod._UNIQUENESS_GRAIN_FIELDS)
+        # And the re-grade is the per-project sum, not a passthrough that
+        # merely happens to differ from a sentinel.
+        assert regraded['topics_with_one_canonical'] == 7
+        assert regraded['topics_with_zero_canonical'] == 10
+        assert regraded['topics_with_multiple_canonical'] == 1
+        assert [r['topic'] for r in regraded['multiple_canonical_topics']] == ['dupe']
+        # PURE: the caller's dict is not mutated.
+        assert grand_block['topics_with_one_canonical'] == -101
+
+
+class TestEnforceFlipPreconditionCitations:
+    """The report says what stands between here and flipping ``enforce``.
+
+    Leo's 2026-08-12 ruling (Option B on esc-4006-3): emitting the flag tells
+    a reader its CURRENT state but not what remains.  This is a REPORTING
+    addition -- the report cites the preconditions; it does not chase them.
+    """
+
+    @staticmethod
+    def _block():
+        cells = {'dark_factory': {OBS: _census([{'topic': 't', 'canonical': True}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        return report['projects']['dark_factory']['topic_coverage']
+
+    def test_exactly_three_citations_each_fully_shaped(self):
+        entries = self._block()['enforce_flip_preconditions']
+        assert len(entries) == 3
+        for entry in entries:
+            assert set(entry) >= {'id', 'what', 'status', 'source'}
+            assert entry['what'] and entry['source']
+
+    def test_the_three_cited_ids(self):
+        ids = [e['id'] for e in self._block()['enforce_flip_preconditions']]
+        assert ids == ['legacy_topic_spelling_remains', '3202', '3626']
+
+    def test_legacy_spelling_bucket_is_not_cited_as_flatly_open(self):
+        # PRD §159's 2026-08-04 amendment records this half DISCHARGED, so
+        # citing it as flatly open would be as wrong as omitting it.  Asserted
+        # as "not open" rather than against the date literal: WHICH discharge
+        # date is recorded is editorial and will be superseded, but the
+        # distinction between a discharged half and an open one is the thing a
+        # reader acts on.
+        entry = self._block()['enforce_flip_preconditions'][0]
+        assert entry['status'] != 'open'
+        assert entry['source'], 'a citation with no source is not checkable'
+
+    def test_citations_are_single_homed_in_a_module_constant(self):
+        # One home for the three citations, so a future edit cannot leave the
+        # JSON and the markdown disagreeing about what blocks the flip.
+        ids = [e['id'] for e in _mod.ENFORCE_FLIP_PRECONDITIONS]
+        assert ids == [e['id'] for e in self._block()['enforce_flip_preconditions']]
+
+    def test_the_emitted_block_does_not_alias_the_constant(self):
+        # Rendering must not hand out the module constant itself: a consumer
+        # mutating the report would silently rewrite every later run's
+        # citations in the same process (the nightly wrapper censuses two
+        # projects in one invocation).
+        # Compared against the constant's own captured value rather than a
+        # date literal, so this stays a pure aliasing test and does not
+        # re-pin the editorial status text the review flagged.
+        original = _mod.ENFORCE_FLIP_PRECONDITIONS[0]['status']
+        block = self._block()
+        block['enforce_flip_preconditions'][0]['status'] = 'MUTATED'
+        assert _mod.ENFORCE_FLIP_PRECONDITIONS[0]['status'] == original
+
+    def test_citations_are_citation_only_carrying_no_live_task_probe(self):
+        # The ruling's scope note is explicit: cite the preconditions, do not
+        # chase them.  A live status probe here would silently expand this
+        # task into 3202/3626's territory and could go stale against the task
+        # store without any test noticing.
+        for entry in self._block()['enforce_flip_preconditions']:
+            assert 'task_status' not in entry
+            assert 'probed_at' not in entry
+
+    def test_citations_are_emitted_for_every_project_and_the_grand_total(self):
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': 'a'}])},
+            'reify': {OBS: _census([{'topic': 'b'}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        for block in (
+            report['projects']['dark_factory']['topic_coverage'],
+            report['projects']['reify']['topic_coverage'],
+            report['topic_coverage'],
+        ):
+            assert len(block['enforce_flip_preconditions']) == 3
+
+
+class TestTopicSlugConformance:
+    """Two conformance partitions, because the gate asks two questions.
+
+    Gate 3626's re-measurement recipe asks item 3 -- "the non-conforming
+    distinct-topic count" -- and item 4 -- "confirm every live canonical:true
+    record's topic passes the slug regex, in BOTH projects" -- as SEPARATE
+    checks, and PRD §159's discharge claim is stated over the canonical-scoped
+    predicate only.  A single merged column would report the exact state §159
+    records as of 2026-08-04 (legacy spellings present among ordinary records,
+    none among canonicals) as an undifferentiated failure.
+    """
+
+    # Live-measured pair: the corpus carries the snake_case spelling (8
+    # records) while the committed registry carries the hyphenated one.
+    LEGACY = 'architect_report_task_already_done_main_reachability'
+    CONFORMING = 'architect-report-task-already-done-main-reachability'
+
+    @staticmethod
+    def _block(payloads, project='dark_factory'):
+        cells = {project: {OBS: _census(payloads)}}
+        collection = 'fused_dark_factory' if project == 'dark_factory' else 'fused_reify'
+        cov = {
+            project: _coverage(
+                collection, len(payloads), {OBS: (len(payloads), len(payloads))}
+            )
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        return report['projects'][project]['topic_coverage']
+
+    def test_predicate_is_the_shared_one_pinned_by_identity(self):
+        # INV-5: pinned by ``is``, matching tests/test_topic_slug_namespace.py,
+        # so no second copy of the regex can drift from the rule that
+        # metadata.topic and ProceduralTopicCluster.topic_id are both
+        # validated against.
+        import fused_memory.topic_slug as ts
+
+        assert _mod.is_valid_topic_slug is ts.is_valid_topic_slug
+
+    def test_distinct_topics_are_partitioned_by_conformance(self):
+        block = self._block([
+            {'topic': self.LEGACY},
+            {'topic': self.LEGACY},
+            {'topic': self.CONFORMING},
+            {'topic': 'merge-lane'},
+        ])
+        assert block['distinct_topics'] == 3
+        assert block['slug_conforming'] == 2
+        assert block['slug_non_conforming'] == 1
+
+    def test_the_partition_counts_DISTINCT_topics_not_records(self):
+        # Recipe item 3 asks for the distinct-topic count (its 98 -> 103
+        # history is a distinct-value series), so a topic stamped on 8
+        # records is ONE non-conforming topic, not eight.
+        block = self._block([{'topic': self.LEGACY}] * 8)
+        assert block['slug_non_conforming'] == 1
+
+    def test_non_conforming_topics_are_named(self):
+        block = self._block([
+            {'topic': self.LEGACY},
+            {'topic': 'Also Bad'},
+            {'topic': 'merge-lane'},
+        ])
+        assert [r['topic'] for r in block['non_conforming_topics']] == [
+            'Also Bad', self.LEGACY,
+        ]
+        assert all('count' in r for r in block['non_conforming_topics'])
+
+    def test_the_legacy_and_conforming_spellings_coexist_as_two_topics(self):
+        block = self._block([{'topic': self.LEGACY}, {'topic': self.CONFORMING}])
+        assert block['distinct_topics'] == 2
+        assert block['slug_non_conforming'] == 1
+        assert [r['topic'] for r in block['non_conforming_topics']] == [self.LEGACY]
+
+    def test_conformance_partition_sums_to_distinct_topics(self):
+        block = self._block([
+            {'topic': self.LEGACY}, {'topic': 'ok-one'}, {'topic': 'ok-two'},
+        ])
+        assert block['slug_conforming'] + block['slug_non_conforming'] == \
+            block['distinct_topics'] == 3
+
+    def test_canonical_scoped_partition_is_separate_and_narrower(self):
+        block = self._block([
+            {'topic': self.LEGACY, 'canonical': True},
+            {'topic': 'merge-lane', 'canonical': True},
+            {'topic': 'census'},
+        ])
+        assert block['slug_non_conforming'] == 1
+        assert block['canonical_slug_conforming'] == 1
+        assert block['canonical_slug_non_conforming'] == 1
+        assert [r['topic'] for r in block['canonical_slug_non_conforming_topics']] == [
+            self.LEGACY,
+        ]
+
+    def test_the_2026_08_04_recorded_state_reports_as_two_DIFFERENT_numbers(self):
+        # THE discriminating case.  PRD §159 records legacy spellings present
+        # among ordinary records but NONE among canonicals -- item 3 non-zero,
+        # item 4 zero.  A single merged column would collapse this into one
+        # undifferentiated failure and mis-report the discharge.
+        block = self._block([
+            {'topic': self.LEGACY},
+            {'topic': self.LEGACY},
+            {'topic': self.CONFORMING, 'canonical': True},
+            {'topic': 'merge-lane', 'canonical': True},
+        ])
+        assert block['slug_non_conforming'] == 1
+        assert block['canonical_slug_non_conforming'] == 0
+        assert block['canonical_slug_non_conforming_topics'] == []
+        assert block['canonical_slug_conforming'] == 2
+
+    def test_canonical_scoped_partition_ignores_non_canonical_records(self):
+        block = self._block([{'topic': self.LEGACY}, {'topic': self.LEGACY}])
+        assert block['canonical_slug_conforming'] == 0
+        assert block['canonical_slug_non_conforming'] == 0
+
+    def test_both_partitions_are_at_project_grain(self):
+        cells = {
+            'dark_factory': {
+                PROC: _census([{'topic': self.LEGACY}]),
+                OBS: _census([{'topic': self.LEGACY, 'canonical': True}]),
+            },
+            'reify': {OBS: _census([{'topic': 'clean-slug', 'canonical': True}])},
+        }
+        cov = {
+            'dark_factory': _coverage(
+                'fused_dark_factory', 2, {PROC: (1, 1), OBS: (1, 1)},
+            ),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        df = report['projects']['dark_factory']['topic_coverage']
+        rf = report['projects']['reify']['topic_coverage']
+        # One distinct topic in dark_factory across two categories, not two.
+        assert df['slug_non_conforming'] == 1
+        assert df['canonical_slug_non_conforming'] == 1
+        assert rf['slug_non_conforming'] == 0
+        assert rf['canonical_slug_non_conforming'] == 0
+
+    def test_named_lists_follow_the_house_total_order(self):
+        block = self._block([
+            {'topic': 'Bad One'}, {'topic': 'Bad One'}, {'topic': 'Bad One'},
+            {'topic': 'Zed Bad'}, {'topic': 'Zed Bad'},
+            {'topic': 'Aaa Bad'}, {'topic': 'Aaa Bad'},
+        ])
+        rows = block['non_conforming_topics']
+        assert [(r['topic'], r['count']) for r in rows] == [
+            ('Bad One', 3), ('Aaa Bad', 2), ('Zed Bad', 2),
+        ]
+
+    def test_the_legacy_bucket_citation_carries_this_runs_re_measurement(self):
+        # A bucket recorded empty on 2026-08-04 can REGROW -- the leaf-alpha
+        # census's own 98 -> 103 history proves it does.  So the citation must
+        # carry a live number, not only a recorded status.
+        block = self._block([
+            {'topic': self.LEGACY},
+            {'topic': self.CONFORMING, 'canonical': True},
+        ])
+        entry = block['enforce_flip_preconditions'][0]
+        assert entry['id'] == 'legacy_topic_spelling_remains'
+        live = entry['live_re_measurement']
+        assert live['slug_non_conforming'] == 1
+        assert live['canonical_slug_non_conforming'] == 0
+
+    def test_the_other_two_citations_carry_no_re_measurement(self):
+        # 3202 and 3626 are cited, not measured -- the ruling's scope note.
+        block = self._block([{'topic': 'ok'}])
+        for entry in block['enforce_flip_preconditions'][1:]:
+            assert 'live_re_measurement' not in entry
+
+
+class _FakeEntry:
+    """Minimal stand-in for the probe's RegistryEntry (topic + project_id)."""
+
+    def __init__(self, topic: str, project_id: str):
+        self.topic = topic
+        self.project_id = project_id
+
+
+class _FakeRegistry:
+    def __init__(self, entries):
+        self.entries = entries
+
+
+class TestRegistryCoverageGauge:
+    """The TARGET: every committed registry topic carries exactly one canonical.
+
+    A corpus-wide stamping percentage over 49.6k records has no owner and no
+    bounded worklist.  The committed 32-entry registry is a bounded, named,
+    checkable set -- and it is precisely the set E1's retrieval-health run
+    scores 32/32 failing.
+
+    NOT a duplicate of E1's METRIC_TOPIC_CANONICAL_PRESENT (INV-5): that one
+    is computed from _tripwire_items(observations, TRIPWIRE_K) -- from SEARCH
+    observations -- so it cannot distinguish "the canonical does not exist"
+    from "it exists but ranks below K".  Only a deterministic metadata count
+    can establish the former, which is this task's central claim.
+    """
+
+    @staticmethod
+    def _report(cells, registry, **kwargs):
+        cov = {
+            pid: _coverage(
+                f'fused_{pid}',
+                sum(c.records for c in cats.values()),
+                {cat: (c.records, c.records) for cat, c in cats.items()},
+            )
+            for pid, cats in cells.items()
+        }
+        return _mod.build_report(cells, cov, top_n=50, registry=registry, **kwargs)
+
+    def test_loader_is_the_probes_pinned_by_identity(self):
+        # Imported through the same _load_probe_module importlib idiom
+        # fused-memory/scripts/retro_stamp_topics.py::_load_probe_module and
+        # ::load_topic_registry already established, so the schema
+        # check, the zero-entry rejection and the RegistryError type stay
+        # single-homed rather than re-parsed here.
+        import importlib.util as _ilu
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        assert _mod.__file__ is not None
+        probe_path = _Path(_mod.__file__).parent / 'memory_eval_retrieval_probe.py'
+        cached = _sys.modules.get('memory_eval_retrieval_probe')
+        if cached is None:
+            spec = _ilu.spec_from_file_location('memory_eval_retrieval_probe', probe_path)
+            assert spec is not None and spec.loader is not None
+            cached = _ilu.module_from_spec(spec)
+            _sys.modules['memory_eval_retrieval_probe'] = cached
+            spec.loader.exec_module(cached)
+        # Through the ACCESSOR, not a module attribute: the loader is bound
+        # lazily so an unloadable probe degrades to registry_error instead of
+        # killing the import (and with it the whole census). The reuse is
+        # still pinned by identity.
+        assert _mod.topic_registry_loader() is cached.load_topic_registry
+
+    # DELIBERATELY NOT TESTED HERE (review of 2026-08-16): that the probe is
+    # not loaded AT IMPORT TIME, via `inspect.getsource` +
+    # `'_load_probe_module()' in src` and an AST sweep for top-level call
+    # nodes.  That test made a RUNTIME claim its own body never observed at
+    # runtime: a correct lazy rewrite reaching the helper through an alias or
+    # attribute failed it, while an eager load reached via `getattr` passed
+    # it.  The property that actually matters -- an unloadable probe degrades
+    # to `registry_error` instead of killing the census import -- is asserted
+    # behaviourally by the test directly below, and the loader's lazy binding
+    # and reuse are pinned by identity in the test directly above.  Do not
+    # reinstate this as a tightened regex or AST pin.
+
+    def test_an_unloadable_probe_is_DISCLOSED_not_fatal(self, monkeypatch):
+        # The registry gauge is one optional block. A probe that cannot be
+        # loaded must take the same registry_error path every other registry
+        # failure takes -- not abort the measurement.
+        monkeypatch.setattr(_mod, '_TOPIC_REGISTRY_LOADER', None)
+
+        def _boom():
+            raise ImportError('memory_eval_retrieval_probe moved')
+
+        monkeypatch.setattr(_mod, '_load_probe_module', _boom)
+        registry, error = _mod.load_registry_or_error(_mod.DEFAULT_REGISTRY_PATH)
+        assert registry is None
+        assert error is not None
+        assert error.startswith('ImportError:')
+
+    def test_default_registry_path_is_the_committed_fixture(self):
+        assert _mod.DEFAULT_REGISTRY_PATH.endswith(
+            'tests/fixtures/memory_eval_topic_registry.json',
+        )
+        assert Path(_mod.DEFAULT_REGISTRY_PATH).is_file()
+
+    def test_per_topic_record_and_canonical_counts(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'alpha', 'canonical': True},
+                    {'topic': 'alpha'},
+                    {'topic': 'alpha'},
+                    {'topic': 'beta'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('beta', 'dark_factory'),
+            _FakeEntry('gamma', 'dark_factory'),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        rows = {r['topic']: r for r in block['topics']}
+        assert rows['alpha']['records'] == 3
+        assert rows['alpha']['canonical_count'] == 1
+        assert rows['beta']['records'] == 1
+        assert rows['beta']['canonical_count'] == 0
+        # Absent from the corpus entirely -- measured zero, not omitted.
+        assert rows['gamma']['records'] == 0
+        assert rows['gamma']['canonical_count'] == 0
+
+    def test_rollup_partitions_the_registry(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'one', 'canonical': True},
+                    {'topic': 'many', 'canonical': True},
+                    {'topic': 'many', 'canonical': True},
+                    {'topic': 'zero'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry(t, 'dark_factory') for t in ('one', 'many', 'zero', 'absent')
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        assert block['registry_topics_total'] == 4
+        assert block['registry_topics_with_exactly_one_canonical'] == 1
+        assert block['registry_topics_with_zero_canonical'] == 2
+        assert block['registry_topics_with_multiple_canonical'] == 1
+
+    def test_zero_canonical_topics_are_named_as_the_worklist(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([{'topic': 'has-one', 'canonical': True}, {'topic': 'bare'}]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry('has-one', 'dark_factory'),
+            _FakeEntry('bare', 'dark_factory'),
+            _FakeEntry('missing', 'dark_factory'),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        # The actionable list -- exactly what 3201's retro sweep would stamp.
+        assert [r['topic'] for r in block['zero_canonical_topics']] == [
+            'bare', 'missing',
+        ]
+
+    def test_registry_is_matched_within_its_own_project_not_globally(self):
+        # A canonical stamped in reify does NOT discharge a dark_factory
+        # registry entry: 3198's invariant is per-(project, topic), and a
+        # global match would report the target met while the dark_factory
+        # corpus stayed bare.
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': 'shared'}])},
+            'reify': {OBS: _census([{'topic': 'shared', 'canonical': True}])},
+        }
+        registry = _FakeRegistry([_FakeEntry('shared', 'dark_factory')])
+        block = self._report(cells, registry)['registry_coverage']
+        assert block['registry_topics_with_zero_canonical'] == 1
+        assert block['registry_topics_with_exactly_one_canonical'] == 0
+
+    def test_an_entry_for_an_uncensused_project_is_measured_as_zero(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
+        registry = _FakeRegistry([
+            _FakeEntry('a', 'dark_factory'), _FakeEntry('b', 'reify'),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        rows = {r['topic']: r for r in block['topics']}
+        assert rows['b']['records'] == 0
+        assert rows['b']['project_id'] == 'reify'
+        assert block['registry_topics_with_zero_canonical'] == 1
+
+    def test_rows_carry_their_project_and_are_deterministically_ordered(self):
+        cells = {'dark_factory': {OBS: _census([])}}
+        registry = _FakeRegistry([
+            _FakeEntry('zulu', 'reify'),
+            _FakeEntry('alpha', 'reify'),
+            _FakeEntry('mike', 'dark_factory'),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        assert [(r['project_id'], r['topic']) for r in block['topics']] == [
+            ('dark_factory', 'mike'), ('reify', 'alpha'), ('reify', 'zulu'),
+        ]
+
+    def test_a_missing_registry_is_disclosed_not_silently_all_zero(self):
+        # A silent all-zero gauge reads as "measured, and everything is
+        # fine" -- indistinguishable from a real clean result. The whole
+        # point of the gauge is that its zero is meaningful.
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a'}])}}
+        report = self._report(cells, None, registry_error='cannot read registry: nope')
+        assert report['registry_coverage'] is None
+        assert 'cannot read registry' in report['registry_error']
+
+    def test_a_zero_entry_registry_is_disclosed_as_an_error_not_a_perfect_score(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a'}])}}
+        report = self._report(cells, _FakeRegistry([]))
+        assert report['registry_coverage'] is None
+        assert report['registry_error']
+
+    def test_registry_error_is_absent_when_the_gauge_loaded(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
+        report = self._report(cells, _FakeRegistry([_FakeEntry('a', 'dark_factory')]))
+        assert report['registry_error'] is None
+        assert report['registry_coverage']['registry_topics_total'] == 1
+
+    def test_a_registry_of_the_wrong_SHAPE_is_disclosed_not_fatal(self):
+        """A loaded-but-misshapen registry degrades like every other failure.
+
+        The load path is already careful -- `topic_registry_loader` is lazily
+        memoized and `load_registry_or_error` catches everything -- precisely
+        so the optional gauge cannot take the measurement down with it. But
+        SCORING happens after the load, reaching `entry.project_id` /
+        `entry.topic` by attribute on objects owned by ANOTHER script's
+        dataclass. A `RegistryEntry` field rename (or a loader that starts
+        returning dicts) therefore raised straight out of `build_report`:
+        no report, no markdown, no trend row, from a block the design says
+        is optional.
+
+        This is not hypothetical reach: the registry, its loader and its
+        models all live in `memory_eval_retrieval_probe.py`, a file this task
+        does not own and does not test, and the census reuses them by import
+        exactly so they stay single-homed. Reuse across that seam is right;
+        inheriting an abort from it is not.
+        """
+        class _ShapelessEntry:
+            project_id = 'dark_factory'
+            # No `.topic` -- the shape a field rename in the probe produces.
+
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
+        report = self._report(cells, _FakeRegistry([_ShapelessEntry()]))
+
+        assert report['registry_coverage'] is None
+        assert 'AttributeError' in report['registry_error']
+        # The MEASUREMENT survived intact -- that is the whole claim.
+        assert report['projects']['dark_factory']['topic_coverage'][
+            'topics_with_one_canonical'] == 1
+
+    def test_a_registry_that_is_not_iterable_at_all_is_disclosed_not_fatal(self):
+        """The same guard, reached through a different failure shape."""
+        class _HostileRegistry:
+            @property
+            def entries(self):
+                raise RuntimeError('probe module changed under us')
+
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a'}])}}
+        report = self._report(cells, _HostileRegistry())
+
+        assert report['registry_coverage'] is None
+        assert 'RuntimeError' in report['registry_error']
+        assert report['projects']['dark_factory']['topic_coverage']['records'] == 1
+
+    def test_gauge_is_json_serialisable_and_deterministic(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
+        registry = _FakeRegistry([
+            _FakeEntry('a', 'dark_factory'), _FakeEntry('b', 'reify'),
+        ])
+        first = self._report(cells, registry)
+        second = self._report(cells, registry)
+        assert json.dumps(first) == json.dumps(second)
+
+    def test_the_committed_registry_still_holds_the_32_named_targets(self):
+        # The accountable set this task names as the TARGET. If the fixture
+        # grows or shrinks, the target moved and the docs must say so.
+        registry = _mod.topic_registry_loader()(_mod.DEFAULT_REGISTRY_PATH)
+        assert len(registry.entries) == 32
+
+
+def _history_report(registry=None, **kwargs) -> dict:
+    """A two-project report whose topic_coverage blocks carry known scalars.
+
+    dark_factory: 5 records, 3 topic-stamped, distinct {alpha, legacy_spelling},
+    alpha has exactly one canonical, legacy_spelling none, plus one canonical
+    carrying NO topic. reify: 3 records, all stamped 'beta', which holds TWO
+    canonicals (a uniqueness violation, reachable under the warn-mode default).
+    """
+    cells = {
+        'dark_factory': {
+            OBS: _census([
+                {'topic': 'alpha', 'canonical': True},
+                {'topic': 'alpha'},
+                {'topic': 'legacy_spelling'},
+                {'canonical': True},
+                {},
+            ]),
+        },
+        'reify': {
+            OBS: _census([
+                {'topic': 'beta'},
+                {'topic': 'beta', 'canonical': True},
+                {'topic': 'beta', 'canonical': True},
+            ]),
+        },
+    }
+    cov = {
+        pid: _coverage(
+            f'fused_{pid}',
+            sum(c.records for c in cats.values()),
+            {cat: (c.records, c.records) for cat, c in cats.items()},
+        )
+        for pid, cats in cells.items()
+    }
+    return _mod.build_report(cells, cov, top_n=50, registry=registry, **kwargs)
+
+
+def _walk(obj):
+    """Yield every nested value in a JSON-ish structure, including the root."""
+    yield obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk(v)
+
+
+class TestCoverageHistory:
+    """The TREND substrate: a committed, append-only history of headline scalars.
+
+    The ask names trending as the point -- a number measured once is not
+    owned.  Diffing consecutive runs needs durable prior state, and
+    ``docs/legibility/census-state.json`` is the in-repo precedent for a
+    committed one.
+
+    But this file is written by a NIGHTLY timer, so the row must stay
+    compact: persisting the per-topic tables (276 distinct topics in reify
+    alone) would grow the committed repo without bound on every run.  The
+    full tables stay in the regenerated report artifact, which is rewritten
+    rather than appended.
+
+    An absent history is an empty history; a MALFORMED one is an error.
+    Losing the trend must be loud -- restarting silently from empty is how
+    ``census_trigger.extract_done_count`` fabricated a ``0`` baseline twice
+    and armed a threshold with it (task 3291).
+    """
+
+    # ---- the compact row -------------------------------------------------
+
+    def test_appends_exactly_one_row_per_project(self):
+        report = _history_report()
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )
+        assert len(history['runs']) == 1
+        run = history['runs'][0]
+        assert set(run['projects']) == {'dark_factory', 'reify'}
+
+    def test_row_carries_the_headline_scalars(self):
+        report = _history_report()
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )
+        row = history['runs'][0]['projects']['dark_factory']
+        assert row['records'] == 5
+        assert row['topic_present'] == 3
+        assert row['topic_coverage_pct'] == 60.0
+        assert row['distinct_topics'] == 2
+        assert row['topics_with_one_canonical'] == 1
+        assert row['topics_with_zero_canonical'] == 1
+        assert row['topics_with_multiple_canonical'] == 0
+        assert row['canonical_true'] == 2
+        assert row['canonical_true_without_topic'] == 1
+        assert row['slug_conforming'] == 1
+        assert row['slug_non_conforming'] == 1
+        assert row['canonical_slug_conforming'] == 1
+        assert row['canonical_slug_non_conforming'] == 0
+
+        reify = history['runs'][0]['projects']['reify']
+        assert reify['topics_with_multiple_canonical'] == 1
+
+    def test_row_holds_scalars_only_never_the_per_topic_tables(self):
+        # The bound on the committed file's growth is STRUCTURAL, not a
+        # promise: nothing that scales with the corpus may enter a row.
+        report = _history_report()
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )
+        row = history['runs'][0]['projects']['dark_factory']
+        for value in row.values():
+            assert isinstance(value, (bool, int, float, str, type(None))), row
+        for key in (
+            'topic', 'keys', 'kind', 'canonical_true_by_topic',
+            'multiple_canonical_topics', 'non_conforming_topics',
+            'canonical_slug_non_conforming_topics', 'enforce_flip_preconditions',
+        ):
+            assert key not in row
+
+    def test_no_uncapped_value_table_survives_anywhere_in_a_run(self):
+        # _table()'s {'entries': [...], 'distinct_total': n} shape is the
+        # unbounded thing; assert none of it reached the persisted run.
+        report = _history_report()
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        for node in _walk(run):
+            if isinstance(node, dict):
+                assert 'distinct_total' not in node
+
+    def test_run_records_the_enforce_regime_the_counts_were_measured_under(self):
+        report = _history_report(canonical_uniqueness_enforced=False)
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        # A violation count trended across a flag flip is two different
+        # series; without the flag beside it the trend is unreadable.
+        assert run['canonical_uniqueness_enforced'] is False
+
+    # ---- the registry digest: bounded by the TARGET SET, not the corpus ---
+
+    def test_registry_scalars_land_per_project(self):
+        registry = _FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('legacy_spelling', 'dark_factory'),
+            _FakeEntry('beta', 'reify'),
+        ])
+        report = _history_report(registry=registry)
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        dark = run['projects']['dark_factory']
+        assert dark['registry_topics_total'] == 2
+        assert dark['registry_topics_with_exactly_one_canonical'] == 1
+        assert dark['registry_topics_with_zero_canonical'] == 1
+        assert dark['registry_topics_with_multiple_canonical'] == 0
+        assert run['projects']['reify']['registry_topics_with_multiple_canonical'] == 1
+
+    def test_registry_scalars_are_null_not_zero_when_the_gauge_did_not_run(self):
+        # Three-valued, like every other unread axis here: a 0 would read as
+        # "measured, and no registry topic is stamped" -- a different claim
+        # from "the gauge did not run", and the one that fabricates a trend.
+        report = _history_report()
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        assert run['projects']['dark_factory']['registry_topics_total'] is None
+        assert run['registry_error']
+
+    def test_registry_digest_is_bounded_by_the_registry_not_the_corpus(self):
+        # The ONE per-topic structure a run may carry, and only because the
+        # committed registry bounds it (32 entries). It is what makes
+        # "this registry topic LOST its canonical" nameable in the diff --
+        # the actionable regression -- without persisting 353 live topics.
+        registry = _FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('legacy_spelling', 'dark_factory'),
+            _FakeEntry('beta', 'reify'),
+        ])
+        report = _history_report(registry=registry)
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        digest = run['registry_topics']
+        assert len(digest) == 3
+        assert digest['dark_factory::alpha'] == {'records': 2, 'canonical': 1}
+        assert digest['dark_factory::legacy_spelling'] == {'records': 1, 'canonical': 0}
+        # Keyed by project too: 3198's invariant is per-(project, topic), so
+        # a canonical in reify must never discharge a dark_factory entry.
+        assert digest['reify::beta'] == {'records': 3, 'canonical': 2}
+        # No live topic outside the registry may appear -- that set is
+        # unbounded and is exactly what must stay in the report artifact.
+        assert not [k for k in digest if k.endswith('::gamma')]
+
+    def test_registry_digest_is_absent_when_the_gauge_did_not_run(self):
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), _history_report(),
+            stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        assert run['registry_topics'] == {}
+
+    # ---- append-only ordering, purity, retention -------------------------
+
+    def test_history_is_append_only_and_ordered_oldest_first(self):
+        report = _history_report()
+        history = _mod.empty_coverage_history()
+        for stamp in ('2026-08-14T05:00:00Z', '2026-08-15T05:00:00Z', '2026-08-16T05:00:00Z'):
+            history = _mod.append_coverage_run(history, report, stamp=stamp)
+        assert [r['stamp'] for r in history['runs']] == [
+            '2026-08-14T05:00:00Z', '2026-08-15T05:00:00Z', '2026-08-16T05:00:00Z',
+        ]
+
+    def test_append_does_not_mutate_the_history_it_was_given(self):
+        history = _mod.empty_coverage_history()
+        before = json.dumps(history)
+        _mod.append_coverage_run(history, _history_report(), stamp='2026-08-16T05:00:00Z')
+        assert json.dumps(history) == before
+
+    def test_stamp_is_injected_never_read_from_the_clock(self):
+        # Injected so the row is deterministic and testable; a datetime.now()
+        # inside would make the artifact unreproducible and the test racy.
+        with pytest.raises(TypeError):
+            _mod.append_coverage_run(_mod.empty_coverage_history(), _history_report())
+
+    def test_retention_drops_the_oldest_and_DISCLOSES_the_drop(self):
+        report = _history_report()
+        history = _mod.empty_coverage_history()
+        for day in range(1, 6):
+            history = _mod.append_coverage_run(
+                history, report, stamp=f'2026-08-{day:02d}T05:00:00Z', max_runs=3,
+            )
+        assert [r['stamp'] for r in history['runs']] == [
+            '2026-08-03T05:00:00Z', '2026-08-04T05:00:00Z', '2026-08-05T05:00:00Z',
+        ]
+        # Silently truncated history would look like a corpus that only ever
+        # had three runs -- the same no-silent-truncation rule the JSON
+        # tables already follow.
+        assert history['retention']['max_runs'] == 3
+        assert history['retention']['dropped_runs'] == 2
+
+    # ---- load / save -----------------------------------------------------
+
+    def test_absent_history_file_loads_as_an_empty_history(self, tmp_path):
+        history = _mod.load_coverage_history(str(tmp_path / 'nope.json'))
+        assert history['runs'] == []
+        assert history['schema_version'] == _mod.COVERAGE_HISTORY_SCHEMA_VERSION
+
+    def test_malformed_history_raises_rather_than_restarting_from_empty(self, tmp_path):
+        path = tmp_path / 'history.json'
+        path.write_text('{not json', encoding='utf-8')
+        with pytest.raises(_mod.CoverageHistoryError) as exc:
+            _mod.load_coverage_history(str(path))
+        assert 'history.json' in str(exc.value)
+
+    def test_a_history_without_a_runs_list_raises(self, tmp_path):
+        path = tmp_path / 'history.json'
+        path.write_text(json.dumps({'schema_version': 1, 'runs': {}}), encoding='utf-8')
+        with pytest.raises(_mod.CoverageHistoryError):
+            _mod.load_coverage_history(str(path))
+
+    def test_an_unknown_schema_version_raises_rather_than_being_misread(self, tmp_path):
+        path = tmp_path / 'history.json'
+        path.write_text(json.dumps({'schema_version': 99, 'runs': []}), encoding='utf-8')
+        with pytest.raises(_mod.CoverageHistoryError) as exc:
+            _mod.load_coverage_history(str(path))
+        assert '99' in str(exc.value)
+
+    def test_round_trip_write_then_load_is_stable(self, tmp_path):
+        path = str(tmp_path / 'history.json')
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(),
+            _history_report(registry=_FakeRegistry([_FakeEntry('alpha', 'dark_factory')])),
+            stamp='2026-08-16T05:00:00Z',
+        )
+        _mod.save_coverage_history(history, path)
+        assert _mod.load_coverage_history(path) == history
+
+    def test_save_creates_missing_parent_directories(self, tmp_path):
+        path = str(tmp_path / 'nested' / 'dir' / 'history.json')
+        _mod.save_coverage_history(_mod.empty_coverage_history(), path)
+        assert Path(path).is_file()
+
+    def test_default_history_path_is_committed_beside_the_report(self):
+        assert _mod.DEFAULT_HISTORY_OUT.endswith(
+            'plans/memory-metadata-coverage-history.json',
+        )
+
+
+def _topic_report(payloads_by_project: dict, registry=None, **kwargs) -> dict:
+    """A report over ``{project_id: [payload, ...]}``, all in one category."""
+    cells = {pid: {OBS: _census(p)} for pid, p in payloads_by_project.items()}
+    cov = {
+        pid: _coverage(
+            f'fused_{pid}',
+            sum(c.records for c in cats.values()),
+            {cat: (c.records, c.records) for cat, c in cats.items()},
+        )
+        for pid, cats in cells.items()
+    }
+    return _mod.build_report(cells, cov, top_n=50, registry=registry, **kwargs)
+
+
+class TestCoverageDiff:
+    """Trending: what MOVED since the most recent prior run.
+
+    The first-ever run is the load-bearing case. It reports ``baseline:
+    null`` with a stated reason and emits NO deltas at all -- a table of
+    zeros would read as "coverage is flat" when the truth is "there is
+    nothing to compare against". That fabricated-zero-baseline failure is
+    exactly what task 3291 hardened ``census_trigger.extract_done_count``
+    against, where a fabricated 0 was persisted twice and armed a threshold.
+    """
+
+    # A pair of runs that exercises all three regrowth classes at once:
+    # alpha grows 2 -> 3 records while LOSING its canonical, and beta is a
+    # newly registered target that arrives already stamped.
+    _PRIOR = {'dark_factory': [{'topic': 'alpha', 'canonical': True}, {'topic': 'alpha'}]}
+    _NOW = {
+        'dark_factory': [
+            {'topic': 'alpha'}, {'topic': 'alpha'}, {'topic': 'alpha'},
+            {'topic': 'beta', 'canonical': True},
+        ],
+    }
+
+    @classmethod
+    def _history_with_prior(cls) -> dict:
+        prior = _topic_report(
+            cls._PRIOR, registry=_FakeRegistry([_FakeEntry('alpha', 'dark_factory')]),
+        )
+        return _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+
+    @classmethod
+    def _current(cls) -> dict:
+        return _topic_report(
+            cls._NOW,
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('beta', 'dark_factory'),
+            ]),
+        )
+
+    # ---- the no-baseline case -------------------------------------------
+
+    def test_first_ever_run_reports_a_null_baseline_with_a_reason(self):
+        diff = _mod.build_coverage_diff(_topic_report(self._NOW), _mod.empty_coverage_history())
+        assert diff['baseline'] is None
+        assert diff['baseline_reason']
+        assert diff['projects'] == {}
+
+    def test_first_run_emits_no_fabricated_zero_anywhere(self):
+        diff = _mod.build_coverage_diff(_topic_report(self._NOW), _mod.empty_coverage_history())
+        zeros = [
+            n for n in _walk(diff)
+            if isinstance(n, (int, float)) and not isinstance(n, bool) and n == 0
+        ]
+        assert zeros == []
+
+    def test_an_absent_history_argument_is_disclosed_distinctly(self):
+        # "no history was supplied" is a different claim from "the history
+        # is empty", and both are different from "coverage is flat".
+        diff = _mod.build_coverage_diff(_topic_report(self._NOW), None)
+        assert diff['baseline'] is None
+        assert diff['baseline_reason'] != _mod.build_coverage_diff(
+            _topic_report(self._NOW), _mod.empty_coverage_history(),
+        )['baseline_reason']
+
+    # ---- per-project deltas ---------------------------------------------
+
+    def test_baseline_is_the_most_recent_prior_run(self):
+        history = self._history_with_prior()
+        history = _mod.append_coverage_run(
+            history, _topic_report(self._PRIOR), stamp='2026-08-16T05:00:00Z',
+        )
+        diff = _mod.build_coverage_diff(self._current(), history)
+        assert diff['baseline'] == '2026-08-16T05:00:00Z'
+
+    def test_every_headline_column_is_trended(self):
+        diff = _mod.build_coverage_diff(self._current(), self._history_with_prior())
+        columns = set(diff['projects']['dark_factory']['columns'])
+        assert columns == set(
+            _mod._HISTORY_COVERAGE_COLUMNS + _mod._HISTORY_REGISTRY_COLUMNS,
+        )
+
+    def test_each_column_carries_before_after_and_delta(self):
+        diff = _mod.build_coverage_diff(self._current(), self._history_with_prior())
+        cols = diff['projects']['dark_factory']['columns']
+        assert cols['records'] == {'before': 2, 'after': 4, 'delta': 2}
+        assert cols['distinct_topics'] == {'before': 1, 'after': 2, 'delta': 1}
+        assert cols['topics_with_zero_canonical'] == {'before': 0, 'after': 1, 'delta': 1}
+        # Unchanged columns keep a real 0 -- there IS a baseline here, so 0
+        # is a measurement, not a fabrication.
+        assert cols['canonical_true']['delta'] == 0
+
+    def test_an_unmeasured_axis_diffs_to_null_not_zero(self):
+        # The registry gauge ran now but not before: "we cannot compare" is
+        # not "nothing changed".
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), _topic_report(self._PRIOR),
+            stamp='2026-08-15T05:00:00Z',
+        )
+        diff = _mod.build_coverage_diff(self._current(), history)
+        column = diff['projects']['dark_factory']['columns']['registry_topics_total']
+        assert column['before'] is None
+        assert column['delta'] is None
+        assert column['after'] == 2
+
+    def test_a_project_absent_from_the_prior_run_is_new_not_a_delta_from_zero(self):
+        current = _topic_report({**self._NOW, 'reify': [{'topic': 'gamma'}]})
+        diff = _mod.build_coverage_diff(current, self._history_with_prior())
+        assert diff['projects']['reify']['status'] == 'new_project'
+        assert 'columns' not in diff['projects']['reify']
+
+    def test_a_project_absent_from_this_run_is_disclosed_not_dropped(self):
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(),
+            _topic_report({**self._PRIOR, 'reify': [{'topic': 'gamma'}]}),
+            stamp='2026-08-15T05:00:00Z',
+        )
+        diff = _mod.build_coverage_diff(_topic_report(self._NOW), history)
+        assert diff['projects']['reify']['status'] == 'absent_from_this_run'
+
+    # ---- per-topic regrowth ---------------------------------------------
+
+    def test_regrowth_names_newly_registered_topics(self):
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['new_topics'] == [
+            {'project_id': 'dark_factory', 'topic': 'beta', 'records': 1, 'canonical': 1},
+        ]
+
+    def test_regrowth_names_topics_whose_member_count_grew(self):
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['grown_topics'] == [
+            {
+                'project_id': 'dark_factory', 'topic': 'alpha',
+                'records_before': 2, 'records_after': 3,
+            },
+        ]
+
+    def test_regrowth_names_topics_that_LOST_their_canonical(self):
+        # The actionable regression: a target that WAS met and no longer is.
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['lost_canonical_topics'] == [
+            {
+                'project_id': 'dark_factory', 'topic': 'alpha',
+                'canonical_before': 1, 'canonical_after': 0,
+            },
+        ]
+
+    def test_regrowth_scope_is_disclosed_as_registry_bounded(self):
+        # The signal is scoped to the committed registry because that is
+        # what the history may bound-safely carry. Disclosed, never silently
+        # narrowed -- a reader must not take it for a corpus-wide sweep.
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['available'] is True
+        assert regrowth['scope'] == 'registry'
+        assert 'registry' in regrowth['scope_note']
+
+    def test_regrowth_is_unavailable_rather_than_all_new_when_the_baseline_lacks_a_digest(self):
+        # Without this, every registry topic would be reported as "newly
+        # appearing" the first time the gauge runs -- a fabricated signal
+        # indistinguishable from a genuine 32-topic regression.
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), _topic_report(self._PRIOR),
+            stamp='2026-08-15T05:00:00Z',
+        )
+        regrowth = _mod.build_coverage_diff(self._current(), history)['topic_regrowth']
+        assert regrowth['available'] is False
+        assert regrowth['reason']
+        assert regrowth['new_topics'] == []
+
+    # ---- wiring + determinism -------------------------------------------
+
+    def test_report_carries_the_trend_under_coverage_trend(self):
+        report = _topic_report(
+            self._NOW,
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('beta', 'dark_factory'),
+            ]),
+            history=self._history_with_prior(),
+        )
+        assert report['coverage_trend']['baseline'] == '2026-08-15T05:00:00Z'
+        assert report['coverage_trend']['projects']['dark_factory']['status'] == 'compared'
+
+    def test_a_report_built_without_history_still_carries_a_disclosed_trend(self):
+        report = _topic_report(self._NOW)
+        assert report['coverage_trend']['baseline'] is None
+        assert report['coverage_trend']['baseline_reason']
+
+    def test_diff_is_pure_and_deterministic(self):
+        history = self._history_with_prior()
+        before = json.dumps(history)
+        first = json.dumps(_mod.build_coverage_diff(self._current(), history))
+        second = json.dumps(_mod.build_coverage_diff(self._current(), history))
+        assert first == second
+        assert json.dumps(history) == before
+
+
 class TestBuildReportDeterminism:
     """A re-run must produce a byte-identical artifact."""
 
@@ -568,7 +2203,7 @@ class TestBuildReportNeverTruncatesTheJson:
 
 
 class TestBuildReportCoverage:
-    """INV-2 no-silent-fail: every enumeration shortfall is named, never swallowed."""
+    """INV-11 no-silent-fail-soft: every enumeration shortfall is named, never swallowed."""
 
     def test_complete_when_every_cell_agrees_and_nothing_uncovered(self):
         cells = {'dark_factory': {OBS: _census([{}, {}]), PROC: _census([{}])}}
@@ -969,8 +2604,11 @@ class TestRenderMarkdownDisclosure:
 
     def test_incomplete_coverage_renders_a_warning_naming_the_deltas(self):
         md = _mod.render_markdown(_rich_report(complete=False))
-        lowered = md.lower()
-        assert 'incomplete' in lowered or 'warning' in lowered
+        # The banner itself, not 'incomplete' OR 'warning' anywhere: the
+        # disjunction could be satisfied by either word appearing in unrelated
+        # prose, and the complete-coverage twin below already pins its
+        # absence by this exact spelling.
+        assert '**WARNING — COVERAGE INCOMPLETE.**' in md
         # The named delta itself, not just a flag.
         assert 'category_shortfall' in md or '-3' in md
         assert OBS in md
@@ -985,8 +2623,13 @@ class TestRenderMarkdownDisclosure:
         cov = {'reify': _coverage('fused_reify', 100, {OBS: (20, 20)})}
         md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50))
         assert 'uncovered' in md.lower()
-        assert '80' in md
-        assert 'carry a category outside the censused set' in md
+        # Anchored to the line that REPORTS the residue: a bare `'80' in md`
+        # matches any of the hundreds of numbers in a ~200 KiB document.
+        residue = next(
+            line for line in md.split('\n')
+            if 'carry a category outside the censused set' in line
+        )
+        assert '80' in residue, residue
 
 
 def _both_default_projects_report(*, top_n: int = 50, page_size: int = 1000) -> dict:
@@ -1004,6 +2647,19 @@ def _both_default_projects_report(*, top_n: int = 50, page_size: int = 1000) -> 
     return _mod.build_report(cells, cov, top_n=top_n, page_size=page_size)
 
 
+#: The bare regen command every artifact header starts from: repo-root
+#: relative, `--frozen`, and identical to what the nightly wrapper runs and
+#: what OPERATIONS.md §12 documents. Single-homed here so the flag-
+#: reconstruction tests below assert what they are about -- which FLAGS are
+#: emitted -- while the spelling itself is pinned exactly once, by
+#: TestRegenCommandCoversTheNewFlags::
+#: test_the_command_is_the_invocation_the_nightly_wrapper_makes.
+_BARE_REGEN = (
+    'uv run --frozen --project fused-memory python '
+    'fused-memory/scripts/census_memory_metadata.py'
+)
+
+
 class TestRegenCommand:
     """The header's regen command must always reproduce the artifact it is
     embedded in (task 3507): a bare-default invocation silently truncated
@@ -1014,20 +2670,19 @@ class TestRegenCommand:
     def test_all_default_params_render_the_bare_command(self):
         md = _mod.render_markdown(_both_default_projects_report())
         assert (
-            'Regenerate with `uv run python scripts/census_memory_metadata.py`.'
+            f'Regenerate with `{_BARE_REGEN}`.'
             in md
         )
 
     def test_non_default_top_n_is_named_in_the_regen_command(self):
         md = _mod.render_markdown(_both_default_projects_report(top_n=400))
         assert (
-            'Regenerate with `uv run python scripts/census_memory_metadata.py '
-            '--top-n 400`.' in md
+            f'Regenerate with `{_BARE_REGEN} --top-n 400`.' in md
         )
         # And the bare command -- which would silently under-render -- must
         # NOT be what's documented.
         assert (
-            'Regenerate with `uv run python scripts/census_memory_metadata.py`.'
+            f'Regenerate with `{_BARE_REGEN}`.'
             not in md
         )
 
@@ -1071,13 +2726,16 @@ class TestRegenCommand:
         cells = {'dark_factory': {OBS: _census([])}}
         cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
         md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50))
-        assert '**WARNING — COVERAGE INCOMPLETE**' not in md
+        assert '**WARNING — COVERAGE INCOMPLETE.**' not in md
         assert 'Named shortfalls' not in md
         assert 'carry a category outside the censused set' not in md
         # ...but the movement is still visible, with both intervals named.
         assert '### Corpus churn during the scan' in md
-        assert 'collection total' in md.lower()
-        assert '100' in md and '101' in md
+        churn = _md_section(md, '### Corpus churn during the scan')
+        assert 'collection total' in churn.lower()
+        # Both interval endpoints inside the CHURN section -- unanchored,
+        # '100'/'101' matched the record counts rendered elsewhere.
+        assert '100' in churn and '101' in churn, churn
 
     def test_churn_render_tolerates_a_collection_level_entry(self):
         # A 'collection_total_moved' entry has no 'category'/'expected'/
@@ -1096,6 +2754,355 @@ class TestRegenCommand:
         cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
         report = _mod.build_report(cells, cov, top_n=50)
         assert _mod.render_markdown(report) == _mod.render_markdown(report)
+
+
+def _md_section(md: str, heading: str, stop: str = '#') -> str:
+    """The body of *heading*, up to the next line starting with *stop*.
+
+    Section-scoped assertions cannot be satisfied by a match somewhere else
+    in a ~200KB document -- which is how three trend assertions came to pass
+    against lists that were empty ('lost' matched its own heading;
+    '`alpha`' and 'registry' matched unrelated sections). Asserts the
+    heading is unique, so a slice can never silently address the wrong one.
+    """
+    assert md.count(heading) == 1, f'{heading!r} occurs {md.count(heading)} times'
+    start = md.index(heading) + len(heading)
+    body: list[str] = []
+    for line in md[start:].split('\n'):
+        if line.startswith(stop):
+            break
+        body.append(line)
+    return '\n'.join(body)
+
+
+def _coverage_md_report(top_n: int = 50, *, history=..., registry=True, **kwargs) -> dict:
+    """A report exercising every new coverage/trend section of the markdown.
+
+    dark_factory carries two legacy-spelled topics, a topic with exactly one
+    canonical, and a DUPLICATE-canonical topic; reify carries a second
+    duplicate. Two rows in every named list, so a ``--top-n 1`` render has
+    something to cut.
+
+    Defaults to an EMPTY history rather than none, modelling the real first
+    nightly run: the timer always loads the history file, which on day one
+    simply has no runs in it.
+    """
+    if history is ...:
+        history = _mod.empty_coverage_history()
+    payloads = {
+        'dark_factory': [
+            {'topic': 'alpha', 'canonical': True},
+            {'topic': 'alpha'},
+            {'topic': 'legacy_spelling'},
+            {'topic': 'another_legacy'},
+            {'topic': 'dup', 'canonical': True},
+            {'topic': 'dup', 'canonical': True},
+            {},
+        ],
+        'reify': [
+            {'topic': 'beta', 'canonical': True},
+            {'topic': 'beta', 'canonical': True},
+        ],
+    }
+    cells = {pid: {OBS: _census(p)} for pid, p in payloads.items()}
+    cov = {
+        pid: _coverage(
+            f'fused_{pid}',
+            sum(c.records for c in cats.values()),
+            {cat: (c.records, c.records) for cat, c in cats.items()},
+        )
+        for pid, cats in cells.items()
+    }
+    return _mod.build_report(
+        cells, cov, top_n=top_n, page_size=1000,
+        registry=_FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('gamma', 'dark_factory'),
+            _FakeEntry('delta', 'dark_factory'),
+            _FakeEntry('beta', 'reify'),
+        ]) if registry else None,
+        history=history,
+        **kwargs,
+    )
+
+
+class TestRenderMarkdownTopicCoverage:
+    """The `## Topic & canonical coverage` section.
+
+    The markdown is the twin a human actually reads. A coverage number that
+    lands only in the JSON is a number nobody is accountable to -- which is
+    the failure mode the ask names outright.
+    """
+
+    def test_section_renders_the_rate_and_the_three_way_partition(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '## Topic & canonical coverage' in md
+        # The RATE is the thing the raw counts cannot express.
+        assert '| `dark_factory` | 7 | 6 | 85.7143% | 4 | 1 | 2 | 1 |' in md
+        assert '| `reify` | 2 | 2 | 100.0% | 1 | 0 | 0 | 1 |' in md
+
+    def test_partition_is_rendered_for_the_grand_total_too(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '| **(all)** | 9 | 8 |' in md
+
+    def test_uniqueness_violators_are_NAMED_with_their_project(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '| `dark_factory` | `dup` | 2 |' in md
+        assert '| `reify` | `beta` | 2 |' in md
+
+    def test_enforce_state_is_rendered_inline_as_the_caveat(self):
+        md = _mod.render_markdown(_coverage_md_report(canonical_uniqueness_enforced=False))
+        # Without the regime beside the count a reader cannot tell "the
+        # guard is warn-only, so this is backlog" from "the guard broke".
+        assert '`memory_metadata.enforce`' in md
+        assert 'warn' in md.lower()
+
+    def test_an_unreadable_enforce_flag_renders_as_unknown_not_false(self):
+        md = _mod.render_markdown(_coverage_md_report(canonical_uniqueness_enforced=None))
+        assert 'unknown' in md.lower()
+        assert '**false**' not in md.lower()
+
+    def test_both_slug_conformance_partitions_render_distinctly_labelled(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        # Two columns, two questions -- gate 3626's recipe items 3 and 4.
+        # A reader must not mistake one for the other.
+        assert 'item 3' in md
+        assert 'item 4' in md
+        assert '`canonical: true`' in md
+        assert '| `legacy_spelling` | 1 |' in md
+        assert '| `another_legacy` | 1 |' in md
+
+    def test_registry_gauge_renders_with_its_actionable_worklist(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        registry = _md_section(
+            md, '### Registry coverage — the accountable target', stop='### ',
+        )
+        # registry_topics_total, inside the registry section. Unanchored,
+        # '**4**' matched any bolded 4 anywhere in the document.
+        assert '**4**' in registry, registry
+        # The worklist: the exact set 3201's retro sweep would stamp.
+        assert '| `dark_factory` | `gamma` |' in md
+        assert '| `dark_factory` | `delta` |' in md
+
+    def test_a_registry_that_did_not_load_is_disclosed_not_omitted(self):
+        md = _mod.render_markdown(_coverage_md_report(registry=False))
+        assert 'no topic registry supplied' in md
+
+
+class TestRenderMarkdownEnforcePreconditions:
+    """The flip-precondition citations, rendered as prose beneath the count.
+
+    Leo's 2026-08-12 ruling (Option B on esc-4006-3): a reader must learn
+    the number, the regime that produced it, AND what remains -- in one
+    place, without reconstructing the last part from the PRD.
+    """
+
+    def test_all_three_citations_render(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        # Default stop='#': the citation block ONLY, cut at the very next
+        # heading of any level -- the tightest slice available. Unanchored,
+        # a task id matched anywhere in a ~200 KiB document, so the ruling's
+        # requirement was not guarded where it applies.
+        block = _md_section(
+            md, '#### What still blocks flipping `memory_metadata.enforce`',
+        )
+        # Driven off the SINGLE-HOMED constant rather than three literals, so
+        # what this catches is the RENDERER dropping an entry the report still
+        # claims to cite -- the regression Leo's 2026-08-12 ruling is actually
+        # exposed to. WHICH three ids are cited is pinned on the JSON side by
+        # test_the_three_cited_ids and is deliberately not restated here.
+        cited = [entry['id'] for entry in _mod.ENFORCE_FLIP_PRECONDITIONS]
+        assert len(cited) == 3, cited
+        for precondition_id in cited:
+            # The rendered ROW, not the bare id: the block's own intro prose
+            # reads "task 3626 decides", so `'3626' in block` survived the
+            # renderer dropping 3626's entry entirely. Verified by mutation.
+            assert f'- **`{precondition_id}`**' in block, (precondition_id, block)
+
+    # DELIBERATELY NOT TESTED HERE (review of 2026-08-16): the rendered
+    # WORDING, the citation ORDER relative to the count/flag, and the
+    # 'discharged_2026_08_04' date literal.  Three tests pinning those were
+    # removed: `'re-measur' in md.lower()`, a positional
+    # `md.index(...) < md.index(...)` ordering assertion, and `'task 3626' in
+    # md`.  None could catch a defect in what the census MEASURES, and each
+    # turned a cosmetic re-wording -- or the ordinary event of 3202 landing
+    # and a status flipping -- into a suite failure.  What the ruling actually
+    # requires is that the citations REACH the reader and are never truncated;
+    # that is what the two surviving tests assert, keyed on stable IDs rather
+    # than prose.  The live re-measurement is asserted as COMPUTED COUNTS in
+    # `test_the_legacy_bucket_citation_carries_this_runs_re_measurement`,
+    # which is a measurement rather than a substring.
+
+    def test_citations_are_NEVER_subject_to_the_top_n_cut(self):
+        # A truncated precondition list silently under-reports what blocks
+        # the flip -- the one list where a cut changes the conclusion.
+        md = _mod.render_markdown(_coverage_md_report(top_n=1))
+        for cited in ('legacy_topic_spelling_remains', '3202', '3626'):
+            assert cited in md
+
+
+class TestRenderMarkdownCoverageTrend:
+    """The `## Coverage trend` section -- and its no-baseline case."""
+
+    @staticmethod
+    def _history():
+        prior = _topic_report(
+            {'dark_factory': [{'topic': 'alpha', 'canonical': True}, {'topic': 'alpha'}]},
+            registry=_FakeRegistry([_FakeEntry('alpha', 'dark_factory')]),
+        )
+        return _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+
+    def test_first_run_prints_an_explicit_no_baseline_line(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '## Coverage trend' in md
+        assert 'No baseline' in md
+        assert 'first recorded run' in md
+
+    def test_first_run_renders_no_delta_table_of_zeros(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '| before | after | delta |' not in md
+
+    def test_baseline_stamp_and_deltas_render(self):
+        md = _mod.render_markdown(_coverage_md_report(history=self._history()))
+        assert '2026-08-15T05:00:00Z' in md
+        assert '| `dark_factory` | `records` | 2 | 7 | +5 |' in md
+
+    def test_an_uncomparable_column_renders_as_not_measured_not_zero(self):
+        md = _mod.render_markdown(_coverage_md_report(history=self._history()))
+        # reify is new_project this run: no deltas, disclosed as such.
+        assert '`reify`' in md
+        assert 'new_project' in md
+
+    @staticmethod
+    def _history_with_movement():
+        """A prior run the current fixture actually MOVES against.
+
+        ``_history()`` above happens to be static in every regrowth class --
+        alpha sits at 2 records / 1 canonical on both sides -- so a test
+        driven off it renders `_(none)_` under every heading and can only be
+        satisfied by matching the headings themselves. Here alpha GREW
+        (1 -> 2 records) and gamma LOST its canonical (1 -> 0), so both
+        actionable classes produce a real row to pin.
+        """
+        prior = _topic_report(
+            {'dark_factory': [
+                {'topic': 'alpha', 'canonical': True},
+                {'topic': 'gamma', 'canonical': True},
+            ]},
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'),
+                _FakeEntry('gamma', 'dark_factory'),
+            ]),
+        )
+        return _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+
+    def test_regrowth_classes_render_named(self):
+        # Pinned as whole ROWS under their own headings. `'lost' in
+        # md.lower()` matched the heading itself and `'`alpha`' in md`
+        # matched any of ~200KB of unrelated document, so both passed
+        # against a fixture in which every regrowth list was empty -- the
+        # green-by-construction class this suite's own
+        # test_the_forbidden_git_patterns_can_actually_fire exists to catch.
+        md = _mod.render_markdown(
+            _coverage_md_report(history=self._history_with_movement()),
+        )
+        lost = _md_section(md, '#### Lost their `canonical: true`')
+        assert '| `dark_factory` | `gamma` | 1 | 0 |' in lost
+        grew = _md_section(md, '#### Grew in member records')
+        assert '| `dark_factory` | `alpha` | 1 | 2 |' in grew
+
+    def test_a_class_with_nothing_to_report_says_so_rather_than_vanishing(self):
+        # The mirror image, and why the row assertions above are keyed to
+        # their own section: an empty class must render an explicit "(none)"
+        # under its heading, not disappear and leave the heading to carry a
+        # substring match for a class that was never measured.
+        md = _mod.render_markdown(_coverage_md_report(history=self._history()))
+        assert _md_section(md, '#### Lost their `canonical: true`').strip() == '_(none)_'
+        assert _md_section(md, '#### Grew in member records').strip() == '_(none)_'
+
+    def test_regrowth_scope_is_disclosed_in_the_markdown_too(self):
+        # `'registry' in md.lower()` could not fail: the document always
+        # carries a '### Registry coverage' section. The claim is that the
+        # NARROWING is disclosed where the signal is rendered, so assert the
+        # scope note itself, inside the regrowth section, verbatim from the
+        # single-homed constant.
+        md = _mod.render_markdown(_coverage_md_report(history=self._history()))
+        regrowth = _md_section(md, '### Registry topic regrowth', stop='#### ')
+        assert _mod._REGROWTH_SCOPE_NOTE in regrowth
+        assert 'Scoped to the committed topic registry' in regrowth
+
+
+class TestRenderMarkdownCoverageCutsDiscloseThemselves:
+    """The new named lists obey the same cut-and-disclose rule as the old."""
+
+    def test_named_lists_are_cut_with_a_disclosure(self):
+        md = _mod.render_markdown(_coverage_md_report(top_n=1))
+        # The cut lands on the NEW lists too: one violator row shown, the
+        # second cut -- and the cut says so and says where the rest is.
+        #
+        # WHICH row survives is severity-major, not project-major: the list is
+        # ordered by canonical count desc, then (topic, project) asc, matching
+        # _table's total order. Under a project-major order a `--top-n 1` cut
+        # would keep dark_factory's 2-canonical topic and drop a hypothetical
+        # 9-canonical one in reify -- a cut that changes the conclusion. Both
+        # fixture rows tie at 2, so the tiebreak is the topic: `beta` < `dup`.
+        assert '| `reify` | `beta` | 2 |' in md
+        assert '| `dark_factory` | `dup` | 2 |' not in md
+        assert '**truncated**' in md
+        assert 'JSON artifact carries the full population' in md
+
+    def test_the_violator_cut_keeps_the_worst_offender(self):
+        """Severity-major ordering, stated over rows that do NOT tie.
+
+        The tie in the fixture above makes the assertion above readable but
+        not load-bearing; this one fails if the order ever reverts to
+        project-major, which would silently cut the worse violation.
+        """
+        payloads = {
+            'dark_factory': [
+                {'topic': 'mild', 'canonical': True},
+                {'topic': 'mild', 'canonical': True},
+            ],
+            'reify': [
+                {'topic': 'severe', 'canonical': True},
+                {'topic': 'severe', 'canonical': True},
+                {'topic': 'severe', 'canonical': True},
+            ],
+        }
+        cells = {pid: {OBS: _census(p)} for pid, p in payloads.items()}
+        cov = {
+            pid: _coverage(
+                f'fused_{pid}',
+                sum(c.records for c in cats.values()),
+                {cat: (c.records, c.records) for cat, c in cats.items()},
+            )
+            for pid, cats in cells.items()
+        }
+        report = _mod.build_report(cells, cov, top_n=1, page_size=1000)
+        md = _mod.render_markdown(report)
+        assert '| `reify` | `severe` | 3 |' in md
+        assert '| `dark_factory` | `mild` | 2 |' not in md
+
+    def test_markdown_cut_never_drops_a_value_from_the_json(self):
+        report = _coverage_md_report(top_n=1)
+        md = _mod.render_markdown(report)
+        cov = report['projects']['dark_factory']['topic_coverage']
+        # The JSON keeps every row whatever the markdown shows.
+        assert len(cov['non_conforming_topics']) == 2
+        assert len(report['registry_coverage']['zero_canonical_topics']) == 2
+        # ...and the cut view points at the copy that is not cut.
+        assert md.count('JSON artifact carries the full population') >= 1
+
+    def test_a_wide_top_n_renders_every_named_row(self):
+        md = _mod.render_markdown(_coverage_md_report(top_n=500))
+        assert '| `dark_factory` | `dup` | 2 |' in md
+        assert '| `reify` | `beta` | 2 |' in md
+        assert '| `legacy_spelling` | 1 |' in md
+        assert '| `another_legacy` | 1 |' in md
 
 
 class TestRenderMarkdownDeterminism:
@@ -1462,6 +3469,9 @@ def _args(tmp_path, **overrides):
         'json_out': str(tmp_path / 'census.json'),
         'md_out': str(tmp_path / 'census.md'),
         'config': None,
+        'registry': _mod.DEFAULT_REGISTRY_PATH,
+        'history_out': str(tmp_path / 'coverage-history.json'),
+        'no_history': False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -1662,3 +3672,349 @@ class TestCliParser:
         assert args.json_out == '/tmp/j.json'
         assert args.md_out == '/tmp/m.md'
         assert args.config == '/tmp/c.yaml'
+
+
+class TestCliHistoryFlags:
+    """`--history-out` / `--no-history` / `--registry` (task 4006).
+
+    The trend file is committed and written by a nightly timer, so an
+    operator's ad-hoc run must be able to MEASURE without polluting it --
+    otherwise the only safe way to look at coverage is not to look.
+    """
+
+    def test_parser_defaults_for_the_new_flags(self):
+        args = _mod._build_parser().parse_args([])
+        assert args.history_out == _mod.DEFAULT_HISTORY_OUT
+        assert args.no_history is False
+        assert args.registry == _mod.DEFAULT_REGISTRY_PATH
+
+    def test_new_flags_parse(self):
+        args = _mod._build_parser().parse_args([
+            '--history-out', '/tmp/h.json', '--no-history', '--registry', '/tmp/r.json',
+        ])
+        assert args.history_out == '/tmp/h.json'
+        assert args.no_history is True
+        assert args.registry == '/tmp/r.json'
+
+    @pytest.mark.asyncio
+    async def test_run_appends_a_run_to_the_history(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = str(tmp_path / 'history.json')
+        rc = await _mod._run(_args(tmp_path, history_out=history_out))
+        assert rc == 0
+        history = _mod.load_coverage_history(history_out)
+        assert len(history['runs']) == 1
+        assert history['runs'][0]['stamp']
+        assert 'dark_factory' in history['runs'][0]['projects']
+
+    @pytest.mark.asyncio
+    async def test_consecutive_runs_append_rather_than_overwrite(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = str(tmp_path / 'history.json')
+        await _mod._run(_args(tmp_path, history_out=history_out))
+        await _mod._run(_args(tmp_path, history_out=history_out))
+        assert len(_mod.load_coverage_history(history_out)['runs']) == 2
+
+    @pytest.mark.asyncio
+    async def test_no_history_leaves_the_file_byte_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = tmp_path / 'history.json'
+        await _mod._run(_args(tmp_path, history_out=str(history_out)))
+        before = history_out.read_bytes()
+        rc = await _mod._run(_args(tmp_path, history_out=str(history_out), no_history=True))
+        assert rc == 0
+        assert history_out.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_no_history_still_REPORTS_the_trend_it_did_not_append(
+        self, tmp_path, monkeypatch,
+    ):
+        # Measure without polluting: the ad-hoc run still reads the history
+        # and renders the diff, it just does not extend it.
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = str(tmp_path / 'history.json')
+        await _mod._run(_args(tmp_path, history_out=history_out))
+        await _mod._run(_args(tmp_path, history_out=history_out, no_history=True))
+        written = json.loads((tmp_path / 'census.json').read_text())
+
+        # The baseline must be the PRIOR RUN's stamp, not merely non-None:
+        # the behaviour under test is that the ad-hoc run trends against the
+        # recorded series it declined to extend. `is not None` also passes on
+        # a wrong stamp or an empty-ish placeholder, which is the one way
+        # this could plausibly break.
+        recorded = _mod.load_coverage_history(history_out)['runs']
+        assert len(recorded) == 1, 'the --no-history run must not have appended'
+        assert written['coverage_trend']['baseline'] == recorded[-1]['stamp']
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_history_fails_the_run_loudly(self, tmp_path, monkeypatch):
+        # Losing the trend must be loud: a run that silently restarted the
+        # history from empty would report "first recorded run" forever.
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = tmp_path / 'history.json'
+        history_out.write_text('{not json', encoding='utf-8')
+        rc = await _mod._run(_args(tmp_path, history_out=str(history_out)))
+        assert rc == 1
+        assert history_out.read_text(encoding='utf-8') == '{not json'
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_history_fails_BEFORE_the_scroll(self, tmp_path, monkeypatch):
+        # The fault costs milliseconds to detect and the scroll costs minutes
+        # over ~54k live payloads. Validating after it would discard a
+        # completed measurement over an unrelated file -- and the nightly job
+        # would then emit nothing at all, every night, until someone noticed.
+        scrolled: list[str] = []
+
+        async def _stub(backend, project_id, categories=None, page_size=1000, max_pages=200):
+            scrolled.append(project_id)
+            return {OBS: _census([{'kind': 'cycle_summary'}])}, _coverage(
+                'fused_x', 1, {OBS: (1, 1)},
+            )
+
+        monkeypatch.setattr(_mod, 'census_project', _stub)
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = tmp_path / 'history.json'
+        history_out.write_text('{not json', encoding='utf-8')
+        rc = await _mod._run(_args(tmp_path, history_out=str(history_out)))
+        assert rc == 1
+        assert scrolled == []
+        # And the artifacts do not half-land: nothing was measured, so
+        # nothing claims to have been.
+        assert not (tmp_path / 'census.json').exists()
+        assert not (tmp_path / 'census.md').exists()
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_census_still_lands_its_artifacts_and_exits_1(
+        self, tmp_path, monkeypatch,
+    ):
+        # The pre-existing exit-code contract survives the new wiring.
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub(complete=False))
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        rc = await _mod._run(_args(tmp_path, history_out=str(tmp_path / 'h.json')))
+        assert rc == 1
+        assert (tmp_path / 'census.json').exists()
+
+
+class TestRegenCommandCoversTheNewFlags:
+    """Task 3507's drift, re-armed for 4006's flags: a documented regen
+    command that no longer reproduces the artifact is worse than none."""
+
+    def test_default_new_flags_keep_the_bare_command(self):
+        md = _mod.render_markdown(_both_default_projects_report())
+        assert (
+            f'Regenerate with `{_BARE_REGEN}`.'
+            in md
+        )
+
+    def test_every_path_in_the_command_resolves_from_ONE_working_directory(self):
+        """The script path and the flag paths must share a cwd.
+
+        The emitted prefix named the script relative to ``fused-memory/``,
+        while ``--registry`` / ``--history-out`` carry the values recorded by
+        ``_repo_relative`` -- relative to the REPO ROOT. A run that used
+        either non-default path therefore printed a command whose script and
+        whose flags could not both resolve from any single directory, which
+        is precisely the drift ``_repo_relative``'s own docstring cites task
+        3507 for: "a documented regen command that no longer reproduces the
+        artifact is worse than none".
+
+        Asserted by RESOLVING every path in the command against one base,
+        not by pinning its spelling -- so it stays true through a rename and
+        fails the moment the two bases diverge again.
+        """
+        # Two real, non-default, repo-root-relative paths, so both flags are
+        # emitted and both can be resolved.
+        params = {
+            'projects': ['dark_factory', 'reify'],
+            'registry': 'fused-memory/tests/fixtures/census-grandfather-oracle.json',
+            'history_out': 'plans/memory-metadata-census-report.json',
+        }
+        command = _mod._regen_command(params)
+        tokens = command.split()
+        repo_root = Path(_mod._REPO_ROOT)
+
+        script = next(t for t in tokens if t.endswith('census_memory_metadata.py'))
+        paths = {'script': script}
+        for flag in ('--registry', '--history-out'):
+            assert flag in tokens, command
+            paths[flag] = tokens[tokens.index(flag) + 1]
+
+        unresolvable = {
+            name: value for name, value in paths.items()
+            if not (repo_root / value).is_file()
+        }
+        assert not unresolvable, (
+            f'{command!r} mixes path bases; these do not resolve from the '
+            f'repo root: {unresolvable}'
+        )
+
+    def test_the_command_is_the_invocation_the_nightly_wrapper_makes(self):
+        """One spelling, shared by the wrapper, OPERATIONS.md and this header.
+
+        The wrapper runs `uv run --frozen --project "$FM" python
+        "$FM/scripts/census_memory_metadata.py"`; OPERATIONS.md §12 documents
+        that same form and claims it is "what the report's own regen line
+        reproduces". That claim was false while this function emitted a
+        different, cwd-incompatible spelling -- so a reader following the
+        artifact header and a reader following the runbook ran two different
+        commands.
+        """
+        command = _mod._regen_command({'projects': ['dark_factory', 'reify']})
+        assert command == (
+            'uv run --frozen --project fused-memory python '
+            'fused-memory/scripts/census_memory_metadata.py'
+        )
+        # --frozen matters on its own: an unpinned resolve could regenerate a
+        # committed artifact under a different dependency set than the run
+        # that produced it.
+        assert '--frozen' in command
+
+    def test_non_default_registry_is_named(self):
+        params = {'projects': ['dark_factory', 'reify'], 'registry': '/tmp/r.json'}
+        assert '--registry /tmp/r.json' in _mod._regen_command(params)
+
+    def test_non_default_history_out_is_named(self):
+        params = {'projects': ['dark_factory', 'reify'], 'history_out': '/tmp/h.json'}
+        assert '--history-out /tmp/h.json' in _mod._regen_command(params)
+
+    def test_no_history_is_named(self):
+        params = {'projects': ['dark_factory', 'reify'], 'no_history': True}
+        assert '--no-history' in _mod._regen_command(params)
+
+    def test_the_defaults_are_never_restated_in_the_command(self):
+        params = {
+            'projects': ['dark_factory', 'reify'],
+            'registry': _mod.DEFAULT_REGISTRY_PATH,
+            'history_out': _mod.DEFAULT_HISTORY_OUT,
+            'no_history': False,
+        }
+        assert _mod._regen_command(params) == _BARE_REGEN
+
+    @pytest.mark.asyncio
+    async def test_run_records_the_new_flags_in_params(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        await _mod._run(_args(
+            tmp_path, history_out='/tmp/h.json', no_history=True, registry='/tmp/r.json',
+        ))
+        written = json.loads((tmp_path / 'census.json').read_text())
+        # Out-of-tree paths stay absolute: they are already
+        # checkout-independent, and shortening them is not _repo_relative's job.
+        assert written['params']['history_out'] == '/tmp/h.json'
+        assert written['params']['no_history'] is True
+        assert written['params']['registry'] == '/tmp/r.json'
+
+
+class TestCommittedParamsAreCheckoutIndependent:
+    """The artifact is COMMITTED, so a param that names the checkout which
+    happened to generate it churns the diff, points a reader at a worktree
+    that will be reclaimed, and makes _regen_command print a path that does
+    not exist where the artifact is read (task 3507, re-armed)."""
+
+    def test_an_in_repo_path_is_recorded_relative_to_the_repo_root(self):
+        assert _mod._repo_relative(_mod.DEFAULT_REGISTRY_PATH) == (
+            'fused-memory/tests/fixtures/memory_eval_topic_registry.json'
+        )
+        assert _mod._repo_relative(_mod.DEFAULT_HISTORY_OUT) == (
+            'plans/memory-metadata-coverage-history.json'
+        )
+
+    def test_an_out_of_tree_path_stays_absolute(self):
+        assert _mod._repo_relative('/tmp/elsewhere/r.json') == '/tmp/elsewhere/r.json'
+
+    def test_a_recorded_relative_value_is_re_anchored_at_the_repo_root_not_the_cwd(self):
+        # The reader's CWD is not the repo root (this suite runs from
+        # fused-memory/, the wrapper from the repo root). Anchoring a
+        # recorded value at the CWD would make an artifact compare unequal to
+        # its own default depending on where it was read from.
+        assert _mod._resolved_repo_path(
+            'plans/memory-metadata-coverage-history.json',
+        ) == _mod._resolved_repo_path(_mod.DEFAULT_HISTORY_OUT)
+        assert _mod._resolved_repo_path('plans/x.json').startswith(str(_mod._REPO_ROOT))
+
+    @pytest.mark.asyncio
+    async def test_run_records_the_default_paths_repo_relative(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        await _mod._run(_args(
+            tmp_path, registry=_mod.DEFAULT_REGISTRY_PATH,
+            history_out=_mod.DEFAULT_HISTORY_OUT, no_history=True,
+        ))
+        params = json.loads((tmp_path / 'census.json').read_text())['params']
+        assert params['registry'] == (
+            'fused-memory/tests/fixtures/memory_eval_topic_registry.json'
+        )
+        assert params['history_out'] == 'plans/memory-metadata-coverage-history.json'
+        # The load-bearing half: no absolute prefix, so no worktree lane can
+        # be baked into a committed artifact.
+        assert not params['registry'].startswith('/')
+        assert '.worktrees' not in params['history_out']
+
+    def test_a_relative_default_still_reproduces_the_bare_regen_command(self):
+        # An artifact generated in one checkout and read in another must not
+        # emit a --registry flag naming a path that no longer exists.
+        params = {
+            'projects': ['dark_factory', 'reify'],
+            'registry': 'fused-memory/tests/fixtures/memory_eval_topic_registry.json',
+            'history_out': 'plans/memory-metadata-coverage-history.json',
+            'no_history': False,
+        }
+        assert _mod._regen_command(params) == _BARE_REGEN
+
+    def test_a_pre_4006_absolute_default_is_normalised_too(self):
+        # Artifacts already committed carry the absolute spelling; reading
+        # them must not manufacture a spurious flag either.
+        params = {
+            'projects': ['dark_factory', 'reify'],
+            'registry': _mod.DEFAULT_REGISTRY_PATH,
+            'history_out': _mod.DEFAULT_HISTORY_OUT,
+        }
+        assert _mod._regen_command(params) == _BARE_REGEN
+
+
+class TestTheDisclosedRegimeIsTheOneTheRunUsed:
+    @pytest.mark.asyncio
+    async def test_the_enforce_flag_is_read_from_the_censuss_own_config(
+        self, tmp_path, monkeypatch,
+    ):
+        # Two independently-constructed FusedMemoryConfig()s can resolve
+        # different CONFIG_PATHs, so the report could disclose an `enforce`
+        # regime belonging to a config the census never operated under.
+        seen: dict[str, object] = {}
+
+        def _backend_of(cfg):
+            seen['backend'] = cfg
+            return AsyncMock()
+
+        def _enforce_of(config=None):
+            seen['enforce'] = config
+            return True
+
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', _backend_of)
+        monkeypatch.setattr(_mod, 'read_canonical_uniqueness_enforced', _enforce_of)
+        await _mod._run(_args(tmp_path))
+        assert seen['enforce'] is seen['backend']
+        assert seen['enforce'] is not None
+
+    def test_an_injected_config_is_read_without_constructing_a_second(self):
+        class _Cfg:
+            memory_metadata = types.SimpleNamespace(enforce=True)
+
+        assert _mod.read_canonical_uniqueness_enforced(_Cfg()) is True
+
+    def test_an_unreadable_injected_config_still_degrades_to_null(self):
+        class _Broken:
+            @property
+            def memory_metadata(self):
+                raise RuntimeError('config is a wreck')
+
+        # Never raises: the measurement does not depend on the config, and
+        # losing the whole census to a config fault is strictly worse than an
+        # undisclosed flag.
+        assert _mod.read_canonical_uniqueness_enforced(_Broken()) is None

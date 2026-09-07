@@ -7,13 +7,13 @@ chains, and the three §5.6 health counters — and renders them as text.
 
 BINDING CONTRACT — READ ONLY.  Nothing in this module opens debt, files a task,
 resolves anything, or escalates.  All ledger DATA comes from α's public READ API
-(``list_open_debt`` / ``read_occurrences`` / ``read_debt``); the only SQL of its own is
-:func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly less than
-those readers do (no DDL, no journal-mode pragma).  One consequence is not obvious and
-is enforced by :func:`build_report`'s guards: α's readers PROVISION on read (``_open``
-does ``parent.mkdir`` → ``connect`` → ``executescript(_SCHEMA)``), so calling one
-against a project that has no ledger would create ``data/orchestrator/runs.db`` plus its
-WAL sidecars as a side effect of PRINTING a report — and calling one against a
+(``list_open_debt`` / ``read_occurrences`` / ``read_debt_many``); the only SQL of its
+own is :func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly
+less than those readers do (no DDL, no journal-mode pragma).  One consequence is not
+obvious and is enforced by :func:`build_report`'s guards: α's readers PROVISION on read
+(``_open`` does ``parent.mkdir`` → ``connect`` → ``executescript(_SCHEMA)``), so calling
+one against a project that has no ledger would create ``data/orchestrator/runs.db`` plus
+its WAL sidecars as a side effect of PRINTING a report — and calling one against a
 ``runs.db`` that has no flake tables yet would CREATE those tables in it.  Absence and
 unreadability are therefore both established BEFORE any read, and reported honestly
 rather than papered over by a freshly-provisioned empty result.
@@ -54,7 +54,7 @@ from orchestrator.flake_ledger import (
     FlakeOccurrenceRow,
     FlakeVerdict,
     list_open_debt,
-    read_debt,
+    read_debt_many,
     read_occurrences,
 )
 
@@ -490,6 +490,30 @@ class ChainRow:
     last_observed_at: str | None
 
 
+def _chain_universe(
+    occurrences: Sequence[FlakeOccurrenceRow],
+    open_debt_rows: Sequence[DebtRow],
+) -> set[str]:
+    """The set of test_ids a chain is built for — the ONE spelling of that union.
+
+    :func:`build_chains` iterates it and :func:`build_report` pre-fetches debt for it,
+    and those two sets must not merely happen to agree.  INV-5 (no-lockstep-duplication)
+    is the failure this module's docstrings already name twice, and :func:`_is_over_age`
+    was extracted here for exactly this reason after a count and a per-row marker
+    "agreed only by coincidence".  Spelled twice, a later change to the universe — say,
+    including tests named only by a RESOLVED debt row — would desynchronise the
+    pre-fetched set from the looked-up set, and the symptom would be a silently blank
+    ``debt:`` line on a chain rather than an error.
+
+    ``UNKNOWN_TEST_ID`` is excluded: a sentinel names no test, so it can own no chain —
+    ``open_debt`` itself refuses it for the same reason.  It still counts toward the
+    gate-blind rate, where it is the entire point.
+    """
+    universe: set[str] = {row.test_id for row in open_debt_rows}
+    universe |= {row.test_id for row in occurrences if row.test_id != UNKNOWN_TEST_ID}
+    return universe
+
+
 def build_chains(
     occurrences: Sequence[FlakeOccurrenceRow],
     open_debt_rows: Sequence[DebtRow],
@@ -501,7 +525,8 @@ def build_chains(
     filters on ``resolved_at IS NULL``, so a chain built from it alone goes blank
     exactly when a test is BETWEEN cycles — hiding the PRD's motivating case
     (``test_spawn_claude.py``, 7 de-flake tasks in 7 weeks) at the very moment each fix
-    appears to have worked.  ``debt_lookup`` therefore reaches ``read_debt``, which
+    appears to have worked.  ``debt_lookup`` therefore reaches α's debt reader (today,
+    :func:`build_report` backs it with a batched ``read_debt_many`` pre-fetch), which
     returns RESOLVED rows too (§5.2 retains them deliberately, because the recurrence
     trigger reads them).
 
@@ -531,11 +556,8 @@ def build_chains(
     for row in occurrences:
         by_test.setdefault(row.test_id, []).append(row)
 
-    universe: set[str] = {row.test_id for row in open_debt_rows}
-    universe |= {test_id for test_id in by_test if test_id != UNKNOWN_TEST_ID}
-
     chains: list[ChainRow] = []
-    for test_id in universe:
+    for test_id in _chain_universe(occurrences, open_debt_rows):
         mine = by_test.get(test_id, ())
         counts: dict[str, int] = {}
         for row in mine:
@@ -662,7 +684,7 @@ def build_report(
     """Read the ledger at *db_path* and aggregate it into a :class:`FlakeLedgerReport`.
 
     All ledger DATA comes from α's public read API — ``list_open_debt`` /
-    ``read_occurrences`` / ``read_debt``; the only SQL of this module's own is
+    ``read_occurrences`` / ``read_debt_many``; the only SQL of this module's own is
     :func:`probe_ledger`'s ``sqlite_master`` SELECT, which decides whether those readers
     are safe to call at all.  *now* defaults to the wall clock and is injectable so the
     whole report is deterministic under test.
@@ -730,21 +752,29 @@ def build_report(
     occurrences = read_occurrences(db_path, since=since, limit=occurrence_limit)
     truncated = len(occurrences) >= occurrence_limit
 
-    # Every OPEN debt row is already in hand from the single `list_open_debt` scan above,
-    # so the chain build must not re-read it per test: each `read_debt` goes through α's
-    # `_open`, which opens a fresh connection, applies the durability pragmas (including
-    # a `journal_mode=WAL` switch) and runs `executescript(_SCHEMA)` against the LIVE
-    # runs.db the merge lane is also using.  N+1 of those turns a nominally read-only
-    # report into N schema executions contending on that database.  What remains is only
-    # the BETWEEN-CYCLES remainder — a test with occurrences whose debt is currently
-    # RESOLVED, and so absent from `list_open_debt` — which is the case the chain exists
-    # to show and which α exposes no batched reader for (a `read_debt_many` belongs in α,
-    # not here; ι writes no SQL of its own).
+    # The chain build reads debt for every test in the universe, and it must cost a
+    # CONSTANT number of ledger connections rather than one per test: each `read_debt`
+    # would go through α's `_open`, which opens a fresh connection, applies the
+    # durability pragmas (including a `journal_mode=WAL` switch) and runs
+    # `executescript(_SCHEMA)` against the LIVE runs.db the merge lane is also using —
+    # so an N+1 turns a nominally read-only report into N schema executions contending
+    # on that database.  Two reads cover the whole universe here.  Every OPEN row is
+    # already in hand from the single `list_open_debt` scan above; the remainder is the
+    # BETWEEN-CYCLES case — a test with occurrences whose debt is currently RESOLVED,
+    # and so absent from that scan — which the chain exists to show, and which α now
+    # exposes `read_debt_many` for.  ι still writes no SQL of its own.
     open_by_test = {row.test_id: row for row in open_rows}
+    # `_chain_universe` rather than a second spelling of the union: this pre-fetched set
+    # and the set `build_chains` iterates must not merely happen to agree (INV-5).
+    resolved_by_test = read_debt_many(
+        db_path, _chain_universe(occurrences, open_rows) - open_by_test.keys()
+    )
 
     def _debt_lookup(test_id: str) -> DebtRow | None:
+        # `is not None` rather than `or`, so a falsy-but-present row can never be
+        # misread as a miss and silently fall through to the second lookup.
         hit = open_by_test.get(test_id)
-        return hit if hit is not None else read_debt(db_path, test_id)
+        return hit if hit is not None else resolved_by_test.get(test_id)
 
     # `list_open_debt`'s `opened_at, test_id` ordering is contractual (its docstring
     # names ι as the reason), so it is relied on directly and never re-sorted here.

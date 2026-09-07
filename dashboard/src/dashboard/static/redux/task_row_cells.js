@@ -50,6 +50,16 @@
 // claimant vanished or its heartbeat went stale.
 const STRAND_TITLE = 'stranded: in-progress with no live claimant / stale heartbeat';
 
+// ── The one true mute colour ──
+// The dim tertiary custom property a PLACEHOLDER renders in, exported for
+// exactly the reason STRAND_TITLE above is. Before task 4408 this literal was
+// hand-written in tab_tasks.jsx's JSX, and unifying the two agent-cell sites by
+// hand-copying it into tabs.jsx as well would have recreated, in miniature, the
+// same drift hazard this module exists to remove. Exported once, so the two
+// sites cannot come to disagree about how dim a placeholder is — and so the
+// colour is assertable in the node suite, which a JSX literal never is.
+const MUTED_COLOR = 'var(--fg-3)';
+
 // ── Should the stranded badge render, and how? ──
 // Returns a render descriptor `{cls, label, title[, marginLeft]}`, or null for
 // "render nothing" — null rather than a disabled/negated descriptor so the
@@ -94,12 +104,41 @@ function strandBadgeState(task, opts) {
   };
 }
 
-// ── What does the `agent` cell say, and is it muted? ──
-// Returns `{text, muted}`. `muted` means "this is a placeholder, not a real
-// agent name", which is what the call sites render in the dim tertiary colour.
+// ── What does the `agent` cell say, and how is it coloured? ──
+// Returns `{text, color}`. `color` is MUTED_COLOR when the text is a
+// PLACEHOLDER rather than a real agent name, and null when it is a real name
+// and no colour override applies. Both call sites render it identically.
 //
-// The placeholder is a parameter because the two sites disagree: TaskDetail
-// spells it 'unassigned', OrchTab renders an em-dash. Both are preserved.
+// The placeholder STRING is a parameter, because the two sites genuinely
+// disagree: TaskDetail spells it 'unassigned', OrchTab renders an em-dash.
+// Both are preserved. The placeholder STYLING is NOT a parameter — how dim a
+// placeholder renders is one decision for the whole surface, and it is made
+// here.
+//
+// WHY A COLOUR AND NOT A BOOLEAN (task 4408). This returned `{text, muted}`
+// until that task, and `muted` was honoured at ONE of its two call sites:
+// TaskDetail wrapped its placeholder in the dim tertiary colour, while OrchTab
+// took only `.text` and discarded the mute — so its em-dash rendered at exactly
+// the colour a real agent name would. A placeholder that reads as a value is
+// worst precisely THERE, because the OrchTab agent cell abuts the stranded
+// badge, which is the one place an operator scans for "is anything actually
+// claiming this task". Returning the colour fixes both halves at once: the mute
+// is honoured at both sites, and the field carrying the placeholder-ness is now
+// the field a site must read in order to render at all, so a site that drops it
+// is visibly dropping the descriptor's only other key. `muted` was REMOVED
+// rather than kept alongside `color` — one bit living in two discardable fields
+// would re-create this very defect one layer down.
+//
+// `color` is present-and-null for a real agent, never omitted — deliberately
+// the opposite of how compact omits marginLeft above. The two resolutions have
+// DIFFERENT reasons, and neither is about spreading: no call site spreads
+// either descriptor, they all read explicit fields. compact omits marginLeft
+// because that site renders no `style` attribute at all (see the badge note
+// above), so there is nothing for the key to feed; these two agent-cell sites
+// BRANCH on `color`, so it must always be there to branch on. A key that is
+// always present makes `ac.color ? … : ac.text` a total function over a stable
+// shape, and keeps "no colour override" an affirmative decision rather than an
+// absent key.
 //
 // An empty-string agent is treated as absent — a blank cell would be
 // indistinguishable from a failed load, and the placeholder is the
@@ -112,16 +151,20 @@ function strandBadgeState(task, opts) {
 // also why the module is named for the ROW rather than for the badge — see the
 // header.
 //
-// The two call sites consume this differently ON PURPOSE: TaskDetail honours
-// `muted` by wrapping the placeholder in the dim tertiary colour, OrchTab takes
-// only `.text` and renders its em-dash undimmed. Both are what those sites drew
-// before the extraction, and unifying them is a visual change belonging to a
-// different task — the same reason marginLeft above stayed a parameter.
+// Note the contrast with the badge above, which is NOT a leftover: the agent
+// cell's mute styling is unified across both sites as of task 4408, while
+// strandBadgeState's marginLeft (TaskDetail 6, OrchTab 4) deliberately is not.
+// That is a separate open visual question about a different field on a
+// different descriptor, and unifying it here would have smuggled a second
+// unrequested pixel change into this one.
 function agentCellState(task, opts) {
   const t = task || {};
   const o = opts || {};
-  if (t.agent) return { text: t.agent, muted: false };
-  return { text: o.placeholder !== undefined ? o.placeholder : 'unassigned', muted: true };
+  if (t.agent) return { text: t.agent, color: null };
+  return {
+    text: o.placeholder !== undefined ? o.placeholder : 'unassigned',
+    color: MUTED_COLOR,
+  };
 }
 
 // Module-unique export const, never a bare `API` — see the
@@ -129,7 +172,7 @@ function agentCellState(task, opts) {
 // runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision
 // here would leave window.DF_TASK_ROW_CELLS undefined and break the
 // top-level destructures in tab_tasks.jsx and tabs.jsx.
-const TASK_ROW_CELLS_API = { strandBadgeState, agentCellState, STRAND_TITLE };
+const TASK_ROW_CELLS_API = { strandBadgeState, agentCellState, STRAND_TITLE, MUTED_COLOR };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = TASK_ROW_CELLS_API;

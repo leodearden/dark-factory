@@ -97,11 +97,20 @@ shape check, so it costs nothing to run BEFORE the irreversible delete.
 The printed report ALWAYS survives, because for a ``content_lost_in_flight``
 record it is the only remaining copy of the original text. Each record is added
 to the report BEFORE any store mutation is attempted and its repair runs under
-its own ``try``, so one record's transport error is recorded as ``record_error``
-on that record (non-zero exit; whether its delete landed is unknown) and the
-sweep continues instead of unwinding. Should anything escape anyway, ``main``
-owns the progress container and prints the PARTIAL report -- same shape, plus
-``"aborted": true`` -- before exiting 2.
+its own ``try``, so one record's transport error is recorded on that record
+(non-zero exit) and the sweep continues instead of unwinding. Should anything
+escape anyway, ``main`` owns the progress container and prints the PARTIAL
+report -- same shape, plus ``"aborted": true`` -- before exiting 2.
+
+A failed repair is ADJUDICATED, not assumed unknown. A raised ``delete_memory``
+does not mean the delete failed: mem0 removes the Qdrant point BEFORE writing
+its SQLite history, so the measured 7d073281 failure raised with the content
+already gone. The sweep therefore performs the read-only id check the runbook
+used to hand to a human (:func:`probe_delete_landed`) and records the verdict
+as ``delete_landed`` on the record. A landed delete becomes
+``content_lost_in_flight`` like any other; ``record_error`` now means the
+delete demonstrably did NOT land, or the probe could not answer -- the residual
+genuine unknown, which is precisely the state a human has to adjudicate.
 
 Scope
 -----
@@ -430,6 +439,81 @@ def readd_persisted(response: Any) -> tuple[bool, str]:
     return True, ''
 
 
+async def probe_delete_landed(
+    memory_service: Any, project_id: str, memory_id: Any
+) -> tuple[bool | None, str]:
+    """Did the delete of *memory_id* actually land? Answered by READING the store.
+
+    Returns ``(True|False|None, note)``:
+
+      * ``True``  -- the point is GONE, so the delete landed;
+      * ``False`` -- the point SURVIVED, so it did not;
+      * ``None``  -- the probe could not answer. Genuinely unknown.
+
+    READ-ONLY. It delegates to ``MemoryService.get_memory_by_id``, a raw Qdrant
+    point read, and mutates nothing -- which matters because it runs at the
+    worst possible moment, immediately after a delete has already raised.
+
+    WHY THIS EXISTS -- the measured 7d073281 incident
+    (``docs/toolcall-xml-leak-sweep-2026-08-05/investigation.md`` §4). The
+    traceback landed INSIDE ``delete_memory``
+    (``_journaled_backend_call`` -> ``sqlite3.OperationalError`` on mem0's
+    SQLite history write), and mem0 removes the Qdrant point BEFORE that
+    history write. A read-only check measured the point ABSENT afterwards and
+    the collection down from 21,089 to 21,088: the delete HAD landed and the
+    content was gone -- the substance of ``content_lost_in_flight`` -- while
+    the report said ``record_error``/UNKNOWN. The runbook already prescribes
+    this exact remedy to a HUMAN ("the id check in that cell is not optional --
+    it is what established the delete had landed, and it must be a read-only
+    lookup"); this automates the step the operator was told to perform.
+
+    It MEASURES rather than infers. Sniffing the exception for
+    ``sqlite3.OperationalError`` / "readonly database" would encode mem0's
+    internal delete-then-write-history ORDERING as a string match in a repair
+    script, and would mis-attribute silently the day mem0 reorders those two
+    halves or another transport raises the same class.
+
+    ``get_memory_by_id`` is the right primitive precisely because its ``None``
+    means a GENUINE not-found and never a swallowed timeout -- it PROPAGATES a
+    read timeout rather than collapsing it into ``None`` -- so "absent" and
+    "could not tell" stay distinguishable, which is what makes a three-valued
+    verdict possible at all.
+
+    The three-valued return is deliberate: collapsing an unanswerable probe
+    into either verdict re-creates the very defect this fixes, pointing the
+    other way. Claiming a landed delete on no evidence sends an operator to
+    hand-restore a record that is still live (producing a duplicate); claiming
+    it did not land hides a real loss. ``record_error`` has always meant "a
+    human must go and check this id", which is the honest label for an unknown.
+
+    It swallows its OWN exceptions and never raises. An escaping probe would
+    replace the caller's ORIGINAL delete error with its own, destroying the one
+    fact a human most needs.
+    """
+    getter = getattr(memory_service, 'get_memory_by_id', None)
+    if getter is None:
+        return None, (
+            'delete-landed probe UNAVAILABLE: this memory service exposes no '
+            'get_memory_by_id, so whether the point survived could not be read'
+        )
+    try:
+        found = await getter(project_id=project_id, memory_id=memory_id)
+    except Exception as exc:  # noqa: BLE001 - the probe must never mask the delete error
+        return None, (
+            f'delete-landed probe FAILED ({type(exc).__name__}: {exc}); whether the '
+            'point survived is unknown. The original delete error is preserved.'
+        )
+    if found is None:
+        return True, (
+            'delete-landed probe: read-only get_memory_by_id reports the point ABSENT, '
+            'so the delete landed and the stored copy is gone'
+        )
+    return False, (
+        'delete-landed probe: read-only get_memory_by_id reports the point still '
+        'PRESENT, so the delete did not land and nothing was destroyed'
+    )
+
+
 def routes_to_mem0(payload: dict) -> tuple[bool, str]:
     """Return (True, '') only when this payload's category writes to mem0.
 
@@ -643,13 +727,23 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
       * Each record is appended to ``progress['records']`` BEFORE any mutation
         of the store is attempted, and its per-record body runs under its own
         ``try``. One record's transport error (a ``delete_memory`` timeout, a
-        Qdrant outage) is recorded on THAT record as ``record_error`` and the
-        sweep continues, instead of unwinding the whole run and taking every
-        earlier record's report entry -- including any already-lost original
-        text -- with it.
+        Qdrant outage) is recorded on THAT record and the sweep continues,
+        instead of unwinding the whole run and taking every earlier record's
+        report entry -- including any already-lost original text -- with it.
       * *progress* is caller-owned. Should anything escape anyway, the caller
         still holds every record accumulated so far and can print the partial
         report (see :func:`main`).
+
+    That per-record catch-all ATTRIBUTES rather than assumes. It reads the
+    ``delete_landed`` evidence :func:`_repair_record` has already settled: True
+    means the point is gone, so the escape is a ``content_lost_in_flight``
+    exactly like a raising or non-persisting re-add. That covers the one window
+    ``_repair_record`` cannot -- between ``add_memory`` returning and
+    :func:`readd_persisted` rendering its verdict -- since a response the sweep
+    could not even evaluate cannot be vouched for. False, None, or ABSENT (a
+    pre-flight failure, so no delete was ever attempted) stay ``record_error``.
+    Reading one field, rather than repeating the classification, is what keeps
+    the two sites from drifting apart.
     """
     progress = new_progress() if progress is None else progress
     records: list[dict] = progress['records']
@@ -696,7 +790,32 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
         limit=args.limit,
     )
     matches = scan.get('matches', [])
-    progress['collection'] = scan.get('collection', '')
+    # READ from the scan result, never re-derived here. The alternative --
+    # spelling ``Scope(project_id=...).mem0_collection_name(prefix)`` a second
+    # time inside this script -- would be a second copy of the
+    # scope-to-collection rule, the same duplication the ``_CONTENT_KEYS`` /
+    # ``_MEM0_OWNED_KEYS`` bindings above exist to avoid, and it would go
+    # silently wrong the day that mapping changes. The value the scan actually
+    # swept is the only value worth printing.
+    collection = scan.get('collection') or ''
+    if not collection:
+        # Loud rather than silently degraded: the ``.get(..., '')`` default is
+        # exactly how a whole authoritative 21,089-point live --apply run
+        # emitted a blank field unnoticed, and two committed artifacts under
+        # docs/toolcall-xml-leak-sweep-2026-08-05/ still carry it. A WARNING,
+        # not a raise, because the report must ALWAYS survive -- for a
+        # content_lost_in_flight record it is the only remaining copy of the
+        # original text, so a cosmetic provenance gap must never abort a run.
+        logger.warning(
+            'sweep_toolcall_xml_leak: the scan reported no "collection" -- this '
+            'run report will not say which Qdrant collection it swept, so it '
+            'cannot serve as an auditable measurement of that collection. The '
+            'sweep continues and the field degrades to "". Expected '
+            'MemoryService.scan_memory_content to return a "collection" key '
+            '(Mem0Backend.scan_payload_text supplies it); got keys %s.',
+            sorted(scan),
+        )
+    progress['collection'] = collection
     progress['scanned'] = scan.get('scanned', len(matches))
     progress['truncated'] = bool(scan.get('truncated'))
 
@@ -732,8 +851,29 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
                     match.get('id'),
                 )
         except Exception as exc:  # noqa: BLE001 - one bad record must not void the run
-            record[RECORD_ERROR] = True
-            record['error'] = str(exc)
+            # ONE rule, consulted rather than re-derived: _repair_record has
+            # already settled whether this record's delete landed, so the
+            # catch-all reads that field instead of writing record_error
+            # unconditionally. True covers the window between add_memory
+            # RETURNING and readd_persisted's verdict -- an escape there leaves
+            # a landed delete with no vouched-for replacement, and a response
+            # the sweep could not even evaluate certainly cannot be vouched
+            # for. False/None/ABSENT (a pre-flight failure, so no delete was
+            # ever attempted) correctly stay record_error.
+            #
+            # `not repaired` is the OTHER half of "no vouched-for replacement":
+            # a clean repair also carries delete_landed=True, so without it any
+            # future statement added after _repair_record that raised would
+            # emit repaired AND content_lost_in_flight together, sending an
+            # operator to hand-restore text that is live in the store --
+            # producing exactly the duplicate the probe's three-valued verdict
+            # exists to prevent. Unreachable today (nothing follows the call);
+            # kept because the cost is one token and the failure is silent.
+            if record.get('delete_landed') is True and not record.get('repaired'):
+                _report_content_lost(record, match.get('id'), str(exc))
+            else:
+                record[RECORD_ERROR] = True
+                record['error'] = str(exc)
             logger.exception(
                 'sweep_toolcall_xml_leak: memory_id=%s failed mid-repair (%s). '
                 'Recorded on this record and the sweep continues -- aborting here '
@@ -775,6 +915,27 @@ async def _repair_record(
 
     Both flags force a non-zero exit (:func:`resolve_exit_code`) so a skipped
     record is never mistaken for a repaired one.
+
+    POST-DELETE ADJUDICATION. The delete runs under its own ``try``, because a
+    delete that RAISED has not necessarily failed: mem0 removes the Qdrant
+    point BEFORE writing its SQLite history, so the measured 7d073281 failure
+    raised with the content already gone (see :func:`probe_delete_landed`).
+    Every path therefore settles ``record['delete_landed']``:
+
+      * the delete RETURNED -- ``True``, no probe: a returned call is direct
+        evidence;
+      * the delete RAISED and the read-only probe finds the point ABSENT --
+        ``True``, and the record is routed to :func:`_report_content_lost`,
+        the same flag and the same loudness as any other landed-delete loss;
+      * the delete RAISED and the point SURVIVED (``False``) or the probe
+        could not answer (``None``) -- ``record_error``, which has always
+        meant "a human must go and check this id". The ORIGINAL delete error
+        stays in ``record['error']``; the probe's account lives beside it in
+        ``delete_landed_note`` and never displaces it.
+
+    ``delete_landed`` is EVIDENCE, not an outcome: it is deliberately not in
+    :data:`HUMAN_ADJUDICATION_FLAGS`, since every successful repair legitimately
+    carries ``delete_landed: True`` and adding it would fail every clean run.
 
     POSTCONDITION, after the re-add: :func:`readd_persisted` must vouch for the
     response. ``repaired=True`` is set ONLY then. A non-raising ``add_memory``
@@ -829,11 +990,41 @@ async def _repair_record(
         )
         return
 
-    await memory_service.delete_memory(
-        memory_id=memory_id,
-        store='mem0',
-        project_id=args.project_id,
-    )
+    try:
+        await memory_service.delete_memory(
+            memory_id=memory_id,
+            store='mem0',
+            project_id=args.project_id,
+        )
+    except Exception as delete_exc:  # noqa: BLE001 - adjudicated, then reported
+        # A raised delete does NOT mean the point survived. mem0 removes the
+        # Qdrant point BEFORE writing its SQLite history, so the measured
+        # 7d073281 failure raised with the content already gone. Ask the store
+        # (read-only) instead of guessing from the exception.
+        landed, probe_note = await probe_delete_landed(
+            memory_service, args.project_id, memory_id
+        )
+        record['delete_landed'] = landed
+        record['delete_landed_note'] = probe_note
+        if landed is True:
+            _report_content_lost(record, memory_id, f'{delete_exc} -- {probe_note}')
+            return
+        # False (the point survived) or None (unanswerable). record_error has
+        # always meant "a human must go and check this id", which is the honest
+        # label for both. The ORIGINAL delete error is what a human needs, so
+        # the probe's note lives in its own field and never displaces it.
+        record[RECORD_ERROR] = True
+        record['error'] = str(delete_exc)
+        logger.exception(
+            'sweep_toolcall_xml_leak: delete FAILED for memory_id=%s (%s). %s',
+            memory_id, delete_exc, probe_note,
+        )
+        return
+    # A delete that RETURNED is direct evidence that it landed -- no probe
+    # needed. Recorded so run()'s catch-all can attribute anything escaping the
+    # post-delete window below (see run()'s docstring).
+    record['delete_landed'] = True
+
     try:
         response = await memory_service.add_memory(
             content=repaired,
@@ -897,9 +1088,11 @@ def resolve_exit_code(report: dict) -> int:
     ``skipped_metadata_would_be_rejected`` (a repairable record whose carried
     metadata would fail ``add_memory``'s own validation, so the pre-flight
     refused to delete it), and ``record_error`` (the record's repair aborted on
-    an unexpected error -- the sweep carried on, but whether that record's
-    delete landed is UNKNOWN, which is precisely the state a human has to
-    adjudicate).
+    an unexpected error -- the sweep carried on, and the record's
+    ``delete_landed`` says what that cost: ``False`` the delete demonstrably
+    did NOT land, ``None`` the read-only probe could not tell, ABSENT no delete
+    was ever attempted. All three need a human; only the first and third are
+    known-harmless).
     """
     if report['dry_run']:
         return 0
