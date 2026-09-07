@@ -242,6 +242,28 @@ def _timeout_marker_sites(source: str) -> tuple[_Site, ...]:
     return tuple(sites)
 
 
+def _inverts(seconds: float | None) -> bool:
+    """True iff a marker at *seconds* TIGHTENS verify while reading as a loosening.
+
+    The band is ``(PYPROJECT_DEFAULT_TIMEOUT, VERIFY_CLI_PER_TEST_TIMEOUT)``,
+    open at both ends.  Named against the constants rather than their numbers,
+    which live -- with the full rationale -- in _orch_helpers.py; the three
+    regimes those two edges carve out are:
+
+    * at or below the ini default -- tightens under BOTH budgets, so a
+      deliberate tight bound.  NOT an offence;
+    * strictly between them -- INVERTS.  Written to loosen against the default
+      the author was reading, it silently becomes a tightening under verify's
+      CLI budget.  The sign of the marker's effect flips with context, which is
+      the defect;
+    * at or above the CLI budget -- loosens under both.  Safe.
+
+    None is not a number and cannot invert: unresolvable means "no opinion",
+    never "too small".
+    """
+    return seconds is not None and PYPROJECT_DEFAULT_TIMEOUT < seconds < VERIFY_CLI_PER_TEST_TIMEOUT
+
+
 class TestVerifyCliBudgetConstant:
     """``VERIFY_CLI_PER_TEST_TIMEOUT`` -- the budget the whole guard is built on.
 
