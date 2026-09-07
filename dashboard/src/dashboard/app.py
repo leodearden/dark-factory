@@ -114,7 +114,12 @@ from dashboard.data.reconciliation import (
 )
 from dashboard.data.redux_api import _project_label
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
+from dashboard.data.tasks import (
+    DEFAULT_WHOLE_OPERATION_BUDGET,
+    _fetch_tasks_cache,
+    _fetch_tasks_cache_key,
+    fetch_tasks,
+)
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import (
     get_memory_timeseries,
@@ -647,6 +652,29 @@ _DB_PROBE_TIMEOUT = 0.9
 # (measured before this budget existed: 503 delivered at 50.6s).
 _HEALTHZ_TOTAL_BUDGET = 3.0
 
+# Per-request budget for the DATA-PLANE (MCP fan-out) probe. Invariant
+# (machine-checked by test_healthz_data_plane_budget_is_structurally_deliverable):
+#   _DB_PROBE_TIMEOUT * len(_healthz_db_targets(...)) + _MCP_PROBE_TIMEOUT
+#     <= _HEALTHZ_TOTAL_BUDGET
+#   0.9 * 3 + 0.2 = 2.9 <= 3.0, leaving 0.1s of slack.
+#
+# NOTHING WAS WIDENED to make room: _DB_PROBE_TIMEOUT and _HEALTHZ_TOTAL_BUDGET
+# are untouched. 0.2s is sufficient precisely BECAUSE the probe never needs to
+# see a healthy fetch FINISH -- it either finds warmth or grace for free, or it
+# leaves a background task running for the NEXT /healthz to observe. See
+# _probe_mcp_fanout.
+_MCP_PROBE_TIMEOUT = 0.2
+
+# How long a single observed fan-out COMPLETION answers for.
+#
+# Must be at least one ``tasks._FETCH_TASKS_TTL_SECONDS`` (20.0) wide: the warm
+# signal below goes stale every TTL by construction, so a grace narrower than
+# the TTL would let an ordinary expiry between two 3s browser polls read as a
+# wedge. 30.0 gives 1.5 TTLs, which also absorbs the journal's routine ~2.0s
+# ReadTimeout/recovered cycles against localhost:8002 without flipping the
+# verdict.
+_MCP_FANOUT_OK_GRACE_SECONDS = 30.0
+
 
 def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
     """The (name, path) pairs /healthz probes.
@@ -757,6 +785,134 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
         return 'error'
 
 
+# --- Data-plane probe state (task 4884 / #4790) ------------------------------
+#
+# The single-flight probe task, and the loop time of the last observed fan-out
+# completion. Module state rather than app.state because /healthz is the only
+# reader and a test hook resets both; _mcp_probe_state_clear mirrors
+# _task_cards_cache_clear.
+_mcp_probe_task: asyncio.Task | None = None
+_mcp_fanout_last_ok: float | None = None
+
+# Strong references to live probe tasks. The event loop holds only a WEAK
+# reference to a Task, so an unreferenced one can be garbage-collected
+# mid-flight -- the same hazard _ABANDONED_PROBES exists for, and track_task's
+# done-callback removes the entry when it ends.
+_MCP_PROBES: set[asyncio.Task] = set()
+
+
+def _mcp_probe_state_clear() -> None:
+    """Test hook: forget the grace stamp and abandon any live probe task.
+
+    Deliberately DOES cancel, unlike budget expiry (see _probe_mcp_fanout): a
+    test hook's job is to leave no cross-test state behind, whereas expiry's
+    whole point is that the task keeps running for the next call to observe.
+    """
+    global _mcp_probe_task, _mcp_fanout_last_ok
+    task = _mcp_probe_task
+    _mcp_probe_task = None
+    _mcp_fanout_last_ok = None
+    if task is not None and not task.done():
+        # Fire-and-forget: track_task already holds the strong reference and
+        # consumes the exception, so do NOT await the unwinding here.
+        task.cancel()
+
+
+async def _probe_mcp_fanout(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    budget: float,
+) -> str:
+    """Probe whether a caller can traverse the MCP fan-out, inside *budget*.
+
+    Returns 'ok' | 'timeout' | 'error', mirroring :func:`_probe_db`'s
+    verdict-string contract. Never raises for a data-plane failure.
+
+    THE LOAD-BEARING RULE, in the same voice as _probe_db's: ``'timeout'``
+    means the FAN-OUT PATH could not be traversed inside the budget. It is NOT
+    a claim about fused-memory's reachability, and it is NOT a claim that a
+    fetch failed.
+
+    Both of the obvious probes are wrong, and the 2026-08-27 incident is what
+    proves it. fused-memory was REACHABLE for all 19.8 hours of that wedge --
+    /api/v2/dashboard/{memory,scheduler} served fine from the same MCP server
+    over the same shared httpx client -- so a probe keyed on reachability would
+    have reported healthy throughout, which is exactly the blind spot this
+    closes. Conversely a probe keyed on the fetch SUCCEEDING false-alarms: the
+    journal's routine ReadTimeout/recovered cycles return the
+    ``{'offline': True, ...}`` marker after ~2.0s, longer than any budget that
+    fits inside _HEALTHZ_TOTAL_BUDGET. Only "could a caller get THROUGH the
+    cache in front of the substrate, inside a bound" separates the two, and
+    that is the property the incident actually violated. So a COMPLETED
+    fan-out is 'ok' whatever it returned, the offline marker included.
+
+    Three signals, cheapest first:
+
+    1. WARM -- a fresh entry in ``tasks._fetch_tasks_cache`` for the routes'
+       own key. Free, and conclusive: a stored value proves a refresh COMPLETED
+       inside the TTL. ``get_or_refresh``'s own docstring records that during
+       the incident "nothing was ever stored for the wedged key", which is why
+       this is the right signal rather than a proxy for one. With the browser
+       polling every 3s this is the steady state, so /healthz normally costs
+       ZERO MCP calls.
+    2. GRACE -- a fan-out completion observed within
+       _MCP_FANOUT_OK_GRACE_SECONDS. This is what keeps an occasional 2.0s
+       ReadTimeout, or one expired cache entry between polls, from flipping the
+       verdict.
+    3. PROBE -- start, or JOIN if one is already live, a single-flight
+       background ``fetch_tasks`` and wait at most *budget* using
+       ``asyncio.wait({task}, timeout=...)`` (NOT ``wait_for``, which awaits
+       the cancelled operation's unwinding -- the same reason _probe_db uses
+       this idiom).
+
+    The task is NOT cancelled on expiry and NOT relaunched while live. That is
+    what makes the two cases distinguishable at all: a healthy-but-COLD system
+    reports 'timeout' only until its background fetch lands (~6s worst case),
+    after which warmth carries it forever; a WEDGED key never lands, so
+    'timeout' persists -- which is precisely the 19.8h fact nothing reported.
+    Cancelling on expiry would instead relaunch a doomed task per watchdog
+    tick, and single-flight is what stops three /healthz calls costing three.
+    """
+    global _mcp_probe_task, _mcp_fanout_last_ok
+    loop = asyncio.get_running_loop()
+
+    key = _fetch_tasks_cache_key(str(config.project_root), None, None, 0, False)
+    if _fetch_tasks_cache.get_fresh(key) is not None:
+        return 'ok'
+
+    last_ok = _mcp_fanout_last_ok
+    if last_ok is not None and (loop.time() - last_ok) < _MCP_FANOUT_OK_GRACE_SECONDS:
+        return 'ok'
+
+    task = _mcp_probe_task
+    if task is None:
+        task = asyncio.create_task(fetch_tasks(client, config, config.project_root))
+        _mcp_probe_task = task
+        track_task(task, _MCP_PROBES)
+
+    done, _pending = await asyncio.wait({task}, timeout=budget)
+    if task not in done:
+        # STILL RUNNING -- leave it alone, deliberately (see above).
+        return 'timeout'
+
+    # It completed, now or between calls. Consume it exactly once.
+    _mcp_probe_task = None
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        # Only _mcp_probe_state_clear or loop shutdown cancels a probe; report
+        # it rather than laundering it into a verdict about the data plane.
+        return 'error'
+    except Exception:
+        # The payload can only carry a status string, so the exception itself
+        # would be unrecoverable if it were not logged here (INV-2
+        # structured-facts-at-failure) -- _probe_db's rationale, verbatim.
+        logger.warning('/healthz MCP fan-out probe raised', exc_info=True)
+        return 'error'
+    _mcp_fanout_last_ok = loop.time()
+    return 'ok'
+
+
 @app.get('/healthz')
 async def healthz(request: Request) -> JSONResponse:
     """Deep health check — detects thread leaks and unresponsive DB connections.
@@ -810,6 +966,59 @@ async def healthz(request: Request) -> JSONResponse:
         # that raised as 'error', which flips healthy above but must not
         # claim the handler blew its budget — folding 'error' back into
         # 'timeout' here would silently re-break this flag.
+        if status == 'timeout':
+            deadline_exceeded = True
+
+    # DATA-PLANE CHECK (task 4884 / #4790), inside the SAME deadline as the DB
+    # probes above.
+    #
+    # THE RESTART DECISION, stated here so it cannot be silently reversed: a
+    # data-plane failure surfaces as this 503 with a named check and
+    # deliberately does NOT trip the watchdog's restart path. Three reasons,
+    # each with its evidence:
+    #
+    #  1. scripts/dashboard-watchdog.py::PROBE_URL already defaults to the
+    #     SHALLOW /api/health handler, not /healthz. The task text's premise
+    #     ("FAIL_STREAK consecutive /healthz failures") does not describe the
+    #     shipped watchdog.
+    #  2. Probing /healthz WAS the 2026-07-30 defect -- 192 restarts in 3
+    #     hours, ~27% downtime, from a service that was serving requests
+    #     throughout -- and moving off it was the fix. This handler's own
+    #     docstring records /healthz as deliberately wired to nothing that
+    #     kills (plans/dashboard-availability-prd.md task epsilon,
+    #     Resolved-decision 1).
+    #  3. Task 4789 has since bounded the refresh latch
+    #     (mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0, plus a tracked
+    #     self-healing bypass), so the specific unbounded wedge a restart once
+    #     cleared can no longer persist. The residual is a slow or hung MCP
+    #     SUBSTRATE, which is not in this process -- restarting the dashboard
+    #     does not fix it, and MAX_RESTARTS/RATE_WINDOW_SECS would merely
+    #     rate-limit the flapping.
+    #
+    # THE COUNTER-ARGUMENT, named so a future reader can re-open this on
+    # evidence rather than rediscover it: a restart DID clear the 2026-08-27
+    # wedge. It no longer applies, for reason 3 -- what a restart cleared then
+    # was the never-released latch, which cannot recur. If a wedge is ever
+    # observed that a restart clears AND that 4789's bypass does not, that is
+    # new evidence and this decision should be re-opened, not worked around.
+    #
+    # Pinned by test_watchdog_probes_the_shallow_endpoint_not_healthz.
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        checks['mcp_fanout'] = 'deadline_exceeded'
+        healthy = False
+        deadline_exceeded = True
+    else:
+        http_client: httpx.AsyncClient = request.app.state.http_client
+        status = await _probe_mcp_fanout(
+            http_client, config, min(remaining, _MCP_PROBE_TIMEOUT),
+        )
+        checks['mcp_fanout'] = status
+        if status != 'ok':
+            healthy = False
+        # Load-bearing, exactly as in the DB loop: keyed on 'timeout' ALONE.
+        # An 'error' verdict flips healthy but must not claim the handler blew
+        # its budget.
         if status == 'timeout':
             deadline_exceeded = True
 
@@ -2061,6 +2270,7 @@ __all__: Sequence[str] = (
     '_performance_resources',
     '_burndown_dbs',
     '_task_cards_cache_clear',
+    '_mcp_probe_state_clear',
     '_load_task_cards',
     '_analytics_cache_clear',
     '_memory_evals_cache_clear',

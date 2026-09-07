@@ -229,9 +229,38 @@ def _make_healthz_request(
         db=pool,
         config=config,
         start_time=start_time if start_time is not None else time.monotonic(),
+        # Read by the data-plane check (task 4884). Every test in this module
+        # runs under `stub_mcp_fanout_probe` below, which never touches it.
+        http_client=None,
     )
     app = SimpleNamespace(state=state)
     return cast(Request, SimpleNamespace(app=app))
+
+
+@pytest.fixture(autouse=True)
+def stub_mcp_fanout_probe(monkeypatch):
+    """Hold /healthz's MCP fan-out check at 'ok' for this whole module.
+
+    This module is about the DB-probe deadline; the data-plane probe task 4884
+    added has its own acceptance module (``test_healthz_data_plane.py``). Two
+    reasons this stub is required rather than merely tidy:
+
+    * HERMETICITY — the real probe issues ``fetch_tasks`` against
+      ``config.fused_memory_urls``, which defaults to ``http://localhost:8002``.
+      On a developer machine that server is frequently RUNNING, so without this
+      the module's assertions would depend on live infrastructure.
+    * SEMANTICS — a cold probe against a tmp_path project root cannot complete
+      inside ``_MCP_PROBE_TIMEOUT``, so it would report 'timeout' and flip every
+      one of this module's 200-expecting cases to 503 for a reason that has
+      nothing to do with what they test.
+    """
+    async def _ok(_client, _config, _budget):
+        return 'ok'
+
+    monkeypatch.setattr(app_module, '_probe_mcp_fanout', _ok)
+    app_module._mcp_probe_state_clear()
+    yield
+    app_module._mcp_probe_state_clear()
 
 
 async def _call_healthz(request: Request, *, hard_cap: float) -> tuple[JSONResponse, float]:
