@@ -5187,6 +5187,83 @@ def test_main_write_decision_already_canonical_project_logs_nothing(
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
+def test_main_write_decision_warns_on_a_declined_alias_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Passing a DECLINED alias target warns, and changes nothing else.
+
+    This is the load-bearing pair of assertions for task 3813: the record is
+    still filed under EXACTLY what the caller passed (we warn, we do not
+    silently move another project's rows -- rewriting here would be the very
+    cross-project behaviour change the task declined), and the return code
+    is unaffected (advisory, never a refusal -- contrast the two hard
+    refusals in _run_write_decision, which return without filing).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-declined',
+                '--project',
+                'my_solar_challenge',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    # NOT rewritten: filed under exactly the token the caller passed.
+    assert sr.list_decisions(root=tmp_path)[0].project == 'my_solar_challenge'
+    assert any(
+        r.levelno >= logging.WARNING
+        and 'my_solar_challenge' in r.getMessage()
+        and 'solar_challenge' in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_main_write_decision_recommended_solar_token_warns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The token the skills recommend must stay silent.
+
+    Same strict no-noise assertion as
+    test_main_write_decision_already_canonical_project_logs_nothing: a
+    watcher following the documented ``--project solar_challenge`` guidance
+    must not be warned on every park, or the new hint is noise rather than
+    signal.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-solar-ok',
+                '--project',
+                'solar_challenge',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].project == 'solar_challenge'
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 def test_main_write_decision_stamps_severity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
