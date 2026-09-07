@@ -76,6 +76,7 @@ from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.tasks import (
     fetch_external_statuses,
     fetch_statuses,
+    fetch_task_page,
     fetch_tasks,
     task_is_stranded,
 )
@@ -544,7 +545,8 @@ async def _shape_one_project(
     2. ``fetch_statuses(...)`` — the compact map, ~95% smaller, supplying both
        *done_count* and the terminal population that positions (3).  Issued
        concurrently with (1);
-    3. ``fetch_tasks(statuses=sorted(_TERMINAL_STATUSES), page_size=..., offset=...)``
+    3. ``fetch_task_page(statuses=sorted(_TERMINAL_STATUSES), page_size=...,
+       offset=...)``
        — a bounded window of terminal rows, issued ONLY when a terminal cap is
        actually requested.  ``collect_active_tasks``'s scheduler path passes
        both caps as 0 and therefore transfers no terminal row at all.
@@ -684,9 +686,12 @@ async def _shape_one_project(
                 'filed can be missing from the Tasks tab',
                 project, n_terminal, window, window,
             )
+        # fetch_task_page, not fetch_tasks: this read wants a PARTIAL answer
+        # (the WARNING above says so), and after task 5018 that contract is in
+        # the function name rather than in an argument combination.
         # page_size/offset slice a list ordered by ASCENDING id, so reaching
         # the high-id end requires a computed offset rather than a LIMIT.
-        terminal = await fetch_tasks(
+        terminal = await fetch_task_page(
             client, config, project_root,
             statuses=sorted(_TERMINAL_STATUSES),
             page_size=window,
@@ -700,8 +705,8 @@ async def _shape_one_project(
             # tab uses as a map key and as its selection identity — so the
             # task renders twice, as pending AND as done.
             #
-            # This is not a narrow race. fetch_tasks caches per (root,
-            # narrowing) for the TTL, and the terminal key embeds an offset
+            # This is not a narrow race. Both reads cache per (root,
+            # narrowing, mode) for the TTL, and the terminal key embeds an offset
             # that changes on EVERY completion — so a completion mints a fresh
             # terminal key (cold, sees 'done') while the active key is still
             # served from an entry up to a full TTL old (still 'pending').

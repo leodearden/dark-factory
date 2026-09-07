@@ -153,7 +153,7 @@ def _fake_load(by_root_map):
     """
     canonical = {_root_key(k): v for k, v in by_root_map.items()}
 
-    # **_kwargs absorbs the collector's opt-in `page_size=` (task 4360); these
+    # **_kwargs absorbs the collector's opt-in `chunk_size=` (task 5018); these
     # fakes stand in for the whole fetch_tasks seam, so paging is already done
     # by the time they answer.
     async def _fake(client, config, project_root, **_kwargs):
@@ -1635,7 +1635,11 @@ class TestCollectSnapshotTaskSourceAndCap:
 
         async def fake_tasks(client, cfg, project_root, **kwargs):
             calls.append(kwargs)
-            if 'page_size' not in kwargs:
+            # `chunk_size`, not `page_size`: the collector's fallback now asks
+            # for a CHUNKED complete read. Keying this fake off the old spelling
+            # would make the probe and the fallback indistinguishable and the
+            # fallback would never appear to succeed.
+            if 'chunk_size' not in kwargs:
                 return {'offline': True, 'error': 'response too large'}
             return [_ztask(status='pending', id=1)]
 

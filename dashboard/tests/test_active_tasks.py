@@ -166,28 +166,46 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
     ``fetch_statuses`` unpatched would reach for the network.
 
     So the wrapper emulates exactly what the substrate does — a ``statuses``
-    row filter, then a ``page_size``/``offset`` slice over an ASCENDING-id
-    list — and derives the compact map from the same canned tree.  Tests here
-    are about SHAPING; the wire contract itself is asserted against a canned
-    ``mcp_tool_call`` in ``TestShapeOneProjectNarrowing``.
+    row filter, then (for a page read) a ``page_size``/``offset`` slice over an
+    ASCENDING-id list — and derives the compact map from the same canned tree.
+    Tests here are about SHAPING; the wire contract itself is asserted against
+    a canned ``mcp_tool_call`` in ``TestShapeOneProjectNarrowing``.
+
+    TWO fakes, not one permissive fake, because the module now reads through
+    two functions with DIFFERENT contracts: ``fetch_tasks`` returns the
+    COMPLETE set and takes no window at all, ``fetch_task_page`` returns ONE
+    page and REQUIRES both ``page_size`` and ``offset``.  A fake laxer than the
+    real signature is how a call-site regression passes its tests — so each
+    fake here accepts exactly what its real counterpart accepts.
 
     *fetch* keeps its original ``(client, config, project_root)`` signature and
     may still return an offline marker dict, which is propagated unchanged.
     """
 
-    async def _narrowed(
-        client, config, project_root, *,
-        statuses=None, page_size=None, offset=0, timeout=None,
-    ):
+    async def _rows(client, config, project_root, statuses):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
             return rows
         if statuses is not None:
             rows = [r for r in rows if r.get('status') in statuses]
-        rows = sorted(rows, key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
-        if page_size is not None:
-            rows = rows[offset:offset + page_size]
-        return rows
+        return sorted(rows, key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
+
+    async def _narrowed(
+        client, config, project_root, *,
+        statuses=None, chunk_size=None, timeout=None,
+    ):
+        # The COMPLETE set: chunk_size selects transport, so the fake ignores
+        # it exactly as the real one's ANSWER does.
+        return await _rows(client, config, project_root, statuses)
+
+    async def _page(
+        client, config, project_root, *,
+        page_size, offset, statuses=None, timeout=None,
+    ):
+        rows = await _rows(client, config, project_root, statuses)
+        if not isinstance(rows, list):
+            return rows
+        return rows[offset:offset + page_size]
 
     async def _statuses(client, config, project_root):
         rows = await fetch(client, config, project_root)
@@ -198,6 +216,7 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
         }
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _narrowed)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_page', _page)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _statuses)
 
 
@@ -2411,8 +2430,8 @@ class TestShapeOneProjectNarrowing:
         monkeypatch.setattr(at_mod, 'fetch_statuses', _fake_statuses)
 
         await _shape_one_project(
-            dummy_client, config, str(config.project_root),
-            done_cap=10, cancelled_cap=10,
+            dummy_client, config, config.project_root,
+            max_done_per_project=10, max_cancelled_per_project=10,
         )
 
         assert len(paged) == 1, f'exactly one windowed read, got {paged}'
