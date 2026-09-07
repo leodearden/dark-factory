@@ -1929,7 +1929,7 @@ class TestSessionResumeReasons:
         empty_cfg = tmp_path / 'claude-config-both'
         (empty_cfg / 'projects').mkdir(parents=True)
 
-        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+        reasons = harness._session_resume_reasons(session, str(empty_cfg), archive_available=False)
 
         assert reasons == frozenset({'stale', 'no_transcript'})
 
@@ -1946,7 +1946,7 @@ class TestSessionResumeReasons:
         }
         cfg_dir = _make_transcript(tmp_path, 'uuid-ok')
 
-        reasons = harness._session_resume_reasons(session, str(cfg_dir))
+        reasons = harness._session_resume_reasons(session, str(cfg_dir), archive_available=False)
 
         assert reasons == frozenset()
         assert not reasons  # the eligibility predicate itself
@@ -1963,7 +1963,7 @@ class TestSessionResumeReasons:
         gone = tmp_path / 'gone-three' / 'claude-config-x'
         assert not gone.exists()  # provably ENOENT → the 'reseeded' arm
 
-        reasons = harness._session_resume_reasons(session, str(gone))
+        reasons = harness._session_resume_reasons(session, str(gone), archive_available=False)
 
         assert reasons == frozenset({'stale', 'capped', 'reseeded'})
 
@@ -1986,7 +1986,7 @@ class TestSessionResumeReasons:
         empty_cfg = tmp_path / 'claude-config-dis'
         (empty_cfg / 'projects').mkdir(parents=True)
 
-        reasons = harness._session_resume_reasons(session, str(empty_cfg))
+        reasons = harness._session_resume_reasons(session, str(empty_cfg), archive_available=False)
 
         assert reasons == frozenset({'disabled'})
 
@@ -2004,7 +2004,8 @@ class TestSessionResumeReasons:
             {'session_id': 'uuid-bad', 'role': 'r',
              'started_at': 'not-a-date', 'resume_count': 0},
             str(cfg1),
-        )
+        archive_available=False,
+    )
         assert 'stale' in r1
         assert 'no_transcript' not in r1
 
@@ -2012,7 +2013,8 @@ class TestSessionResumeReasons:
         r2 = harness._session_resume_reasons(
             {'session_id': 'uuid-bad2', 'role': 'r', 'resume_count': 0},  # no started_at
             str(cfg2),
-        )
+        archive_available=False,
+    )
         assert 'stale' in r2
         assert 'no_transcript' not in r2
 
@@ -2028,13 +2030,15 @@ class TestSessionResumeReasons:
             {'session_id': 'uuid-nocfg', 'role': 'r',
              'started_at': fresh, 'resume_count': 0},
             None,
-        )
+        archive_available=False,
+    )
         assert 'no_transcript' in no_dir
 
         no_sid = harness._session_resume_reasons(
             {'session_id': None, 'role': 'r', 'started_at': fresh, 'resume_count': 0},
             '/some/where',
-        )
+        archive_available=False,
+    )
         assert 'no_transcript' in no_sid
 
     def test_unreadable_config_dir_stays_no_transcript_and_never_raises(
@@ -2065,7 +2069,8 @@ class TestSessionResumeReasons:
             {'session_id': 'uuid-eacces', 'role': 'r',
              'started_at': datetime.now(UTC).isoformat(), 'resume_count': 0},
             str(blocked),
-        )
+        archive_available=False,
+    )
 
         assert 'no_transcript' in reasons
         assert 'reseeded' not in reasons
@@ -2103,7 +2108,9 @@ class TestSessionResumeReasons:
 
         harness.config.session_resume = SessionResumeConfig()
 
-        reasons = harness._session_resume_reasons(bad_session, str(tmp_path))
+        reasons = harness._session_resume_reasons(
+            bad_session, str(tmp_path), archive_available=False
+        )
 
         assert isinstance(reasons, frozenset)
         assert all(isinstance(r, str) for r in reasons)
@@ -2129,9 +2136,136 @@ class TestSessionResumeReasons:
         """
         harness.config.session_resume = SessionResumeConfig(enabled=False)
 
-        reasons = harness._session_resume_reasons(['a'], str(tmp_path))
+        reasons = harness._session_resume_reasons(
+            ['a'], str(tmp_path), archive_available=False
+        )
 
         assert reasons == frozenset({'disabled'})
+
+    # ── δ (task 3730 / D2): the durable archive as a SECOND source of
+    #    reachability, and freshness demoted to the no-archive case ─────────
+
+    def test_aged_but_archived_and_config_dir_less_is_eligible(
+        self, harness: Harness
+    ):
+        """(a) B8 HEADLINE — the real crash-recovery shape is now ELIGIBLE.
+
+        An aged sidecar, NO live config dir at all, but the session is still
+        in the durable transcript archive: the empty set. Neither 'stale' nor
+        'no_transcript'.
+
+        This is the shape production actually reaches, which is the whole
+        point. ``run()``'s finally executes an unconditional
+        ``cleanup_config_dir`` teardown while ``session_preserved`` keeps the
+        sidecar, so on every crash-recovery path the config dir is GONE and
+        ``_adopt_recovered_session``'s glob hands the guard ``config_dir=None``.
+        Before δ that combination was uncorroborable by construction, which is
+        why ~91% of post-3578 fallbacks (92 of 101, measured 2026-09-04) had a
+        recoverable archive the predicate never consulted.
+
+        Reachability outranks freshness: an archived transcript does not decay
+        with wall-clock, so "how old is it" is the wrong question for a
+        session that is still reachable. The absolute backstop (D3) is what
+        keeps that from meaning "no age limit at all".
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = {
+            'session_id': 'uuid-archived',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+        assert 2 * cfg.freshness_window_secs < cfg.absolute_resume_age_secs, (
+            'this row must sit BETWEEN the two thresholds, or it is testing '
+            'the backstop instead of the freshness demotion'
+        )
+
+        reasons = harness._session_resume_reasons(
+            session, None, archive_available=True
+        )
+
+        assert reasons == frozenset()
+        assert not reasons  # the eligibility predicate itself
+
+    def test_the_archive_is_the_only_thing_that_changed_the_answer(
+        self, harness: Harness
+    ):
+        """(b) THE CONTROL for (a) — same session, archive_available=False,
+        and the answer is exactly today's {'stale', 'no_transcript'}.
+
+        Run against byte-identical inputs so the archive is demonstrably the
+        only variable. Without this, (a) would be consistent with δ having
+        loosened something else.
+        """
+        cfg = SessionResumeConfig()
+        harness.config.session_resume = cfg
+        session = {
+            'session_id': 'uuid-archived',
+            'role': 'implementer',
+            'started_at': (
+                datetime.now(UTC) - timedelta(seconds=2 * cfg.freshness_window_secs)
+            ).isoformat(),
+            'resume_count': 0,
+        }
+
+        reasons = harness._session_resume_reasons(
+            session, None, archive_available=False
+        )
+
+        assert reasons == frozenset({'stale', 'no_transcript'})
+
+    def test_fresh_and_archived_without_a_live_transcript_is_eligible(
+        self, harness: Harness
+    ):
+        """(c) Reachability ALONE suffices — the age was never the objection.
+
+        A FRESH sidecar with no live transcript is ineligible today purely on
+        corroboration. With an archive it is reachable, so it is eligible;
+        this separates the corroboration change from the freshness change,
+        which (a) exercises together.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {
+            'session_id': 'uuid-fresh-arch',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+
+        reasons = harness._session_resume_reasons(
+            session, None, archive_available=True
+        )
+
+        assert reasons == frozenset()
+
+    def test_a_live_transcript_still_corroborates_on_its_own(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """(d) The archive is an ADDITIONAL source of reachability, not a
+        replacement: a live transcript still corroborates with no archive.
+
+        Pins that δ WIDENED the corroboration leg rather than moving it onto
+        the archive — a rewrite that made the archive the only accepted source
+        would leave every warm-lane resume (the population γ shipped for)
+        newly ineligible, and nothing else in this class would notice.
+        """
+        harness.config.session_resume = SessionResumeConfig()
+        session = {
+            'session_id': 'uuid-live-only',
+            'role': 'implementer',
+            'started_at': datetime.now(UTC).isoformat(),
+            'resume_count': 0,
+        }
+        cfg_dir = _make_transcript(tmp_path, 'uuid-live-only')
+
+        reasons = harness._session_resume_reasons(
+            session, str(cfg_dir), archive_available=False
+        )
+
+        assert reasons == frozenset()
 
 
 @pytest.mark.asyncio
