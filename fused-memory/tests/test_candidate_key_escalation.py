@@ -2,9 +2,10 @@
 
 This is the injectable escalation seam invoked by the sqlite backend's
 v3->v4 self-gating migration when residual non-cancelled duplicate
-candidate_key groups are found at connection-open. Mirrors the defensive
-HAS_ESCALATION / EscalationQueue never-raise pattern established by
-``middleware.scope_violation_escalator``.
+candidate_key groups are found at connection-open. The defensive
+HAS_ESCALATION / EscalationQueue never-raise pattern it relies on lives in
+``middleware._folded_escalation`` (task 4854), which is why the seams below
+patch THAT module rather than this filer.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ def test_emit_residual_candidate_key_escalation_never_raises_and_returns_id_or_n
         project_root=str(tmp_path),
         residual_groups=residual_groups,
     )
-    if cke_mod.HAS_ESCALATION:
+    if _folded_escalation.HAS_ESCALATION:
         assert isinstance(result, str)
         queue_dir = tmp_path / 'data' / 'escalations'
         files = list(queue_dir.glob('esc-*.json'))
@@ -58,7 +59,7 @@ def test_emit_residual_candidate_key_escalation_dedupes_against_existing_pending
         project_root=str(tmp_path), residual_groups=residual_groups,
     )
 
-    if not cke_mod.HAS_ESCALATION:
+    if not _folded_escalation.HAS_ESCALATION:
         assert first_id is None
         assert second_id is None
         return
@@ -114,7 +115,7 @@ def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp
         project_root=str(tmp_path),
         residual_groups=residual_groups,
     )
-    if not cke_mod.HAS_ESCALATION:
+    if not _folded_escalation.HAS_ESCALATION:
         assert result is None
         return
 
