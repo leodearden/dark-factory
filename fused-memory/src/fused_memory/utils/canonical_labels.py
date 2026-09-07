@@ -147,7 +147,7 @@ _TASK_NODE_NAME_PATTERN = re.compile(
 # not re.ASCII: re.ASCII would re-scope '\d', '\s' and '\w' at once, three
 # separately-reasoned axes for the price of one.
 _QUALIFIED_NODE_NAME_PATTERN = re.compile(
-    r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)\s*$'
+    r'^[ \t]*([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)[ \t]*\Z'
 )
 
 # Task-vocabulary words are never project ids. Matched with fullmatch() against
