@@ -16,6 +16,7 @@ checkout, plus a LIVE guard that re-derives against the real runs.db and SKIPS
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator import resume_age_bound as rab
+from orchestrator.config import SessionResumeConfig
 
 # Mirrors the `events` table of orchestrator/src/orchestrator/event_store.py —
 # copied rather than imported so a schema drift shows up as a red test here
@@ -288,3 +290,146 @@ def test_default_runs_db_path_is_env_overridable(tmp_path, monkeypatch):
 
     monkeypatch.setenv(rab.RUNS_DB_ENV_VAR, str(tmp_path / 'elsewhere.db'))
     assert rab.default_runs_db_path() == tmp_path / 'elsewhere.db'
+
+
+# ---------------------------------------------------------------------------
+# step-3 (task 3730): required_absolute_resume_age_secs(...) — the NON-VACUITY
+# proof, mirroring test_gc_agent_transcripts.py's
+# test_required_max_task_dirs_is_falsifiable_against_a_known_peak.
+#
+# The live derived-bound guard below is inert in a fresh checkout by design:
+# with no runs.db to measure it skips. So the guarantee that the bound is a
+# REAL check — and not arithmetic on literals that can never fail — has to be
+# made HERE, host-independently: over a corpus whose two terms are known by
+# CONSTRUCTION, the exact comparison the live guard makes is shown to fail for
+# a too-small bound and clear for an adequate one.
+# ---------------------------------------------------------------------------
+
+# The 2026-09-07 measurement recorded in resume_age_bound.RESUME_AGE_SAFETY_FACTOR's
+# provenance block, in seconds. Named here only as the reference point the
+# anti-inflation clamp doubles; re-derive from the block, never from these.
+_MEASURED_INFLIGHT_SECS = 32_052.087   # 8.90 h
+_MEASURED_DOWNTIME_SECS = 205_149.466  # 56.99 h
+
+
+def _known_corpus(tmp_path: Path, anchor: datetime, *, inflight: timedelta,
+                  downtime: timedelta) -> rab.ResumeAgeSample:
+    """Sample a corpus built so both terms are known BY CONSTRUCTION."""
+    step = timedelta(minutes=5)
+    rows = _filler(rab.MIN_SAMPLE_TASKS, start=anchor, step=step)
+    last = anchor + step * (rab.MIN_SAMPLE_TASKS - 1)
+    rows.append(_completed(last + timedelta(minutes=5),
+                           int(inflight.total_seconds() * 1000), 'done'))
+    rows.append(_completed(last + timedelta(minutes=5) + downtime, 1000, 'done'))
+    sample = rab.observed_resume_age_inputs(_make_db(tmp_path / 'known.db', rows))
+    assert sample is not None
+    # Known by construction — asserted before anything is derived from them.
+    assert sample.inflight_max_secs == inflight.total_seconds()
+    assert sample.downtime_max_secs == downtime.total_seconds()
+    return sample
+
+
+def test_required_bound_is_the_two_terms_times_the_factor(tmp_path, anchor):
+    """(a) The requirement is ceil((in-flight + downtime) x safety).
+
+    Nothing entering this arithmetic is a literal the test controls on both
+    sides: both terms are read back off a SAMPLE of a corpus the test built,
+    and the factor is the shipped constant.
+    """
+    sample = _known_corpus(
+        tmp_path, anchor, inflight=timedelta(hours=6), downtime=timedelta(hours=10)
+    )
+
+    required = rab.required_absolute_resume_age_secs(
+        sample.inflight_max_secs,
+        sample.downtime_max_secs,
+        rab.RESUME_AGE_SAFETY_FACTOR,
+    )
+    assert required == math.ceil(
+        (sample.inflight_max_secs + sample.downtime_max_secs)
+        * rab.RESUME_AGE_SAFETY_FACTOR
+    )
+
+
+def test_required_bound_comparison_can_fail(tmp_path, anchor):
+    """(b) FALSIFIABILITY: the live guard's own comparison evaluates both ways.
+
+    ``required <= candidate`` is the exact expression
+    test_absolute_resume_age_is_derived_from_live_runs_db asserts. Shown here
+    failing for a bound one second short and clearing for the shipped one.
+    """
+    sample = _known_corpus(
+        tmp_path, anchor, inflight=timedelta(hours=6), downtime=timedelta(hours=10)
+    )
+    required = rab.required_absolute_resume_age_secs(
+        sample.inflight_max_secs,
+        sample.downtime_max_secs,
+        rab.RESUME_AGE_SAFETY_FACTOR,
+    )
+
+    too_small = required - 1
+    assert not (required <= too_small), (
+        'the derived-bound comparison must be able to FAIL — a guard that '
+        'cannot go red is measuring nothing'
+    )
+    # ...and it CLEARS for the bound we actually ship, against a corpus whose
+    # terms are far below the live fleet's.
+    assert required <= SessionResumeConfig().absolute_resume_age_secs
+
+
+def test_required_bound_is_strictly_increasing_in_every_input():
+    """(c) Neither term can be dropped, and the factor cannot be ignored.
+
+    A derivation that ignored an input would still satisfy (a) on a corpus
+    where that input happened not to matter. Varying each of the three
+    separately is what makes "two terms" a checked claim rather than a
+    docstring.
+    """
+    base = rab.required_absolute_resume_age_secs(1000.0, 2000.0, 1.5)
+    assert rab.required_absolute_resume_age_secs(5000.0, 2000.0, 1.5) > base
+    assert rab.required_absolute_resume_age_secs(1000.0, 9000.0, 1.5) > base
+    assert rab.required_absolute_resume_age_secs(1000.0, 2000.0, 3.0) > base
+
+
+def test_required_bound_rounds_up():
+    """(d) A fractional requirement must never round DOWN into headroom that
+    the measured worst case does not actually leave."""
+    required = rab.required_absolute_resume_age_secs(1.0, 0.0, 1.5)
+    assert required == 2  # ceil(1.5), not 1
+    assert isinstance(required, int)
+
+
+def test_shipped_safety_factor_is_at_least_one():
+    """(e) Below 1 the bound would sit UNDER the worst case it is derived from
+    and would reject sessions that are still legitimately in flight."""
+    assert rab.RESUME_AGE_SAFETY_FACTOR >= 1
+
+
+def test_shipped_default_is_reachable_by_a_plausible_fleet():
+    """(f) THE ANTI-INFLATION CLAMP — the live guard's subject can still trip.
+
+    (b) shows the COMPARISON can go either way; this shows its actual SUBJECT
+    can. A fleet twice as slow to finish and twice as long to be down really
+    does exceed the bound we ship. Without this, raising
+    absolute_resume_age_secs to a week or a month would leave every test in
+    this file green while the live guard became permanently vacuous — the
+    exact failure mode this section exists to rule out, and the one D3 names:
+    "archive outranks age" must not quietly become "no age limit".
+    """
+    shipped = SessionResumeConfig().absolute_resume_age_secs
+    required_at_doubled = rab.required_absolute_resume_age_secs(
+        2 * _MEASURED_INFLIGHT_SECS,
+        2 * _MEASURED_DOWNTIME_SECS,
+        rab.RESUME_AGE_SAFETY_FACTOR,
+    )
+    assert required_at_doubled > shipped, (
+        f'a fleet with a {2 * _MEASURED_INFLIGHT_SECS / 3600:.1f} h max '
+        f'in-flight duration and {2 * _MEASURED_DOWNTIME_SECS / 3600:.1f} h '
+        f'max downtime requires {required_at_doubled} s but '
+        f'absolute_resume_age_secs is {shipped} s — the shipped bound is now '
+        'so large that no realistic fleet can trip the live derived-bound '
+        'guard, which makes that guard vacuous. Either the bound was raised '
+        'far beyond its derivation, or these reference terms need re-deriving '
+        'from a fresh measurement (see the RESUME_AGE_SAFETY_FACTOR '
+        'provenance block in orchestrator/src/orchestrator/resume_age_bound.py).'
+    )
