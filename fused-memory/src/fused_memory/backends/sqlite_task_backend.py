@@ -3317,6 +3317,22 @@ class SqliteTaskBackend:
             # this method unconditionally raises before reaching this point.
 
             # details: explicit param wins over prompt. Both honor ``append``.
+            #
+            # ``append`` IS NOT SCOPED TO METADATA (task 4216). The same flag
+            # that selects the additive metadata merge also drives the
+            # ``details`` and ``prompt`` TEXT columns here: when the row
+            # already has a non-empty body, the write becomes
+            # ``existing + '\n\n' + new`` rather than a replacement.
+            #
+            # So a SINGLE update_task carrying BOTH a details rewrite and a
+            # metadata attach under ``append=True`` splits in two: the
+            # metadata half unions exactly as advertised while the details
+            # half is silently DUPLICATED, and the response still reads as a
+            # clean success. Callers wanting a details rewrite alongside a
+            # hints attach must SPLIT the call — a metadata-only write with
+            # ``append=True``, then a details-only write with ``append``
+            # OMITTED. Pinned by
+            # tests/test_sqlite_task_backend.py::test_update_task_details_and_metadata_append_true_concatenates_details.
             existing_details = row['details'] or ''
             new_details: str | None = None
             if details is not None:

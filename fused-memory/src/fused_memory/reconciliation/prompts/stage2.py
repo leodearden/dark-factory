@@ -514,6 +514,20 @@ MAY also contain pre-existing entries that were preserved through the union merg
 the returned hints are missing any newly-attached entry, skip the \
 `tasks_hints_updated` increment and flag the discrepancy in your structured report.
 
+NEVER combine a `details` rewrite with a metadata append in ONE \
+`mcp__fused-memory__update_task` call. `append` is NOT scoped to metadata: the same \
+flag also drives the `details` (and `prompt`) TEXT column, so with `append=True` the \
+backend writes `existing_details + "\\n\\n" + your_details` instead of replacing the \
+body. The metadata half still succeeds exactly as advertised, so the response reads as \
+a clean success while `details` has been silently DUPLICATED. Use one of the two \
+sanctioned shapes instead: (1) SPLIT the work into two calls — a metadata-only call \
+with `append=True` for the hints attach, then a separate details-only call with \
+`append` OMITTED for the details rewrite; or (2) when you deliberately want to APPEND \
+a new section to `details`, pass ONLY the new section text with `append=True` and let \
+the backend do the concatenation — never re-send the existing body. Either way, verify \
+by reading the response's `details` field or a follow-up \
+`mcp__fused-memory__get_task`, and flag a duplicated body in your structured report.
+
 The additive union above is ONLY for the ATTACH case (adding new hints \
 to a task). For the distinct RESHAPE case — converting a task's LEGACY list-format \
 `memory_hints` (`[{{entity, query}}, ...]`) to the canonical `{{entities, queries}}` \
