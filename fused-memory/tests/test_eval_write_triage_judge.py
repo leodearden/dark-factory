@@ -784,6 +784,67 @@ class TestRunJudgeEval:
         _run(tmp_path)
         assert (tmp_path / 'report.md').exists()
 
+    # --- the markdown sibling's composition (gate item 4) --------------------
+    #
+    # `run_judge_eval` writes the JSON and then a markdown sibling. Deriving
+    # that sibling with `Path.with_suffix('.md')` REPLACES the last suffix, so
+    # `--report-path foo.md` composes back to `foo.md` and the markdown
+    # silently overwrites the JSON that was just written — with no error, on a
+    # script whose output is a committed artifact. `guard_committed_report`
+    # does not cover it: that guard addresses dry-run/`--limit` publishing and
+    # returns early for any non-committed path.
+
+    @staticmethod
+    def _sibling_run(tmp_path: Path, name: str):
+        return _mod().run_judge_eval(
+            records=_corpus(),
+            judge_fn=_fake_judge(),
+            report_path=tmp_path / name,
+            provenance=dict(_PROVENANCE),
+            distractors=2,
+        )
+
+    def test_a_json_report_path_gets_a_dot_md_sibling(self, tmp_path: Path) -> None:
+        """The anchor case: `.json` in, `.md` beside it, JSON still parseable."""
+        report = self._sibling_run(tmp_path, 'r.json')
+        assert json.loads((tmp_path / 'r.json').read_text()) == report
+        assert (tmp_path / 'r.md').exists()
+        assert (tmp_path / 'r.md').read_text().startswith('# ')
+
+    def test_a_multi_suffix_path_keeps_its_json_and_gains_a_sibling(
+        self, tmp_path: Path,
+    ) -> None:
+        """`foo.tar.gz` — the sibling is composed from the STEM, not a suffix swap."""
+        report = self._sibling_run(tmp_path, 'foo.tar.gz')
+        assert json.loads((tmp_path / 'foo.tar.gz').read_text()) == report
+        assert (tmp_path / 'foo.tar.md').exists()
+
+    def test_a_suffixless_path_gains_a_dot_md_sibling(self, tmp_path: Path) -> None:
+        """`--report-path /tmp/smoke` is a reasonable ad-hoc spelling."""
+        report = self._sibling_run(tmp_path, 'smoke')
+        assert json.loads((tmp_path / 'smoke').read_text()) == report
+        assert (tmp_path / 'smoke.md').exists()
+
+    def test_a_dot_md_report_path_raises_instead_of_eating_the_json(
+        self, tmp_path: Path,
+    ) -> None:
+        """The destructive case, and the reason this is gate item 4.
+
+        `with_suffix('.md')` composes `foo.md` back to `foo.md`: the report is
+        written and then overwritten by its own markdown, losing every number
+        the run paid for, silently. Raising BEFORE either write makes the
+        mistake cost nothing — a warning on a script whose output is a
+        committed artifact would be read after the loss.
+        """
+        target = tmp_path / 'foo.md'
+        with pytest.raises(ValueError) as excinfo:
+            self._sibling_run(tmp_path, 'foo.md')
+        message = str(excinfo.value)
+        assert str(target) in message, message
+        assert not target.exists() or json.loads(target.read_text()), (
+            f'{target} was left holding markdown where the JSON should be'
+        )
+
     def test_creates_the_report_directory(self, tmp_path: Path) -> None:
         nested = tmp_path / 'calibration' / 'nested'
         _mod().run_judge_eval(
