@@ -6433,6 +6433,112 @@ def test_main_reap_decisions_leaves_pending_escalation_open(
     assert listed['dec-cli-pending'] == sr.DecisionState.OPEN
 
 
+def test_main_reap_decisions_warns_on_a_declined_alias_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The operationally important half of task 3813's hint.
+
+    Filing under the wrong token is recoverable -- the record still exists
+    and is still visible. REAPING under it is the silent zero-row no-op that
+    started this whole thread: it looks exactly like "nothing to reap", and
+    the only way to discover otherwise today is the hand-run Counter
+    one-liner both SKILL.md files tell humans to paste.
+
+    A decision is seeded under ``solar_challenge`` so there IS a populated
+    bucket to miss, exactly as the live population has it.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-solar.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-solar',
+            project='solar_challenge',
+            escalation_id='esc-solar',
+            escalations_dir=str(escalations_dir),
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'reap-decisions',
+                '--project',
+                'my_solar_challenge',
+                '--escalations-dir',
+                str(escalations_dir),
+            ]
+        )
+
+    assert rc == 0
+    assert any(
+        r.levelno >= logging.WARNING
+        and 'my_solar_challenge' in r.getMessage()
+        and 'solar_challenge' in r.getMessage()
+        for r in caplog.records
+    )
+    # The warning changes NO reaping behaviour: the seeded decision would
+    # have been closed under the right token, and is still OPEN under this
+    # one. All the hint does is make the zero-match visible.
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-solar'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_recommended_solar_token_warns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same fixture with the DOCUMENTED token: reaps, and stays silent.
+
+    A watcher reaping with the token both SKILL.md files recommend runs this
+    every Main Loop cycle, so a warning here would accumulate indefinitely
+    and drown the one case the hint exists to surface.
+
+    The ANSWERED assertion below also keeps its sibling honest: it proves
+    this fixture's decision really is reapable, so the sibling's "still
+    OPEN under my_solar_challenge" is a genuine contrast rather than a
+    vacuous pass for some unrelated reason.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-solar.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-solar',
+            project='solar_challenge',
+            escalation_id='esc-solar',
+            escalations_dir=str(escalations_dir),
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'reap-decisions',
+                '--project',
+                'solar_challenge',
+                '--escalations-dir',
+                str(escalations_dir),
+            ]
+        )
+
+    assert rc == 0
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-solar'] == sr.DecisionState.ANSWERED
+
+
 def test_main_reap_decisions_scopes_to_project(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
