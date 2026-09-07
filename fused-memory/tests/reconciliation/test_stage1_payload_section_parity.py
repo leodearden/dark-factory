@@ -82,7 +82,10 @@ import pytest
 from _ast_guard import calls_named, parse_python_module
 
 import fused_memory.reconciliation.stages.memory_consolidator as consolidator_module
-from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from fused_memory.reconciliation.stages.memory_consolidator import (
+    MemoryConsolidator,
+    RequiredSection,
+)
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 from reconciliation.test_stage1 import _make_consolidator
 
@@ -295,10 +298,17 @@ class TestRequiredSectionsRegistry:
 class TestRenderRequiredSections:
     """``_render_required_sections`` is the one aggregator all builders consume.
 
-    Driven with a real live-workflow fixture (the detector monkeypatched at its
-    home namespace in ``task_knowledge_sync``, the established spelling) so
-    these assertions run against real renderer output rather than the empty
-    strings every renderer returns when its guard fails.
+    Two complementary drives, because the aggregator has two separable
+    contracts:
+
+    * WHAT IT DISPATCHES TO — driven with a real live-workflow fixture (the
+      detector monkeypatched at its home namespace in ``task_knowledge_sync``,
+      the established spelling) so the assertion runs against real renderer
+      output rather than the empty strings every renderer returns when its
+      guard fails.
+    * HOW IT ASSEMBLES — driven with a two-member STAND-IN registry of stub
+      renderers, because order and the absence of a separator are not
+      falsifiable against a real registry holding one member.
     """
 
     def _make_tree(self, tasks: list[dict]) -> FilteredTaskTree:
@@ -356,19 +366,46 @@ class TestRenderRequiredSections:
             )
 
     def test_output_is_the_concatenation_of_the_registry_renderers_in_order(self, monkeypatch):
-        stage = self._make_live_stage(monkeypatch)
+        """Registry order, no separator, no post-processing — pinned as literal text.
+
+        Driven through a TWO-member STAND-IN registry of stub renderers rather
+        than the real one. Against the real single-member registry "in order" is
+        vacuous and "no separator" only incidentally covered, and the natural
+        expected value — ``''.join(getattr(stage, s.renderer)() for s in
+        REQUIRED_SECTIONS)`` — is the production line copied verbatim, so it
+        would agree with any implementation written the same way and check
+        nothing. Two distinguishable sentinels make the contract falsifiable:
+        a separator, a reorder, a strip or any other post-processing each
+        produces a string different from the one asserted below.
+
+        The stand-in is deliberately NOT the real registry: this test owns the
+        aggregator's ASSEMBLY contract. That the real registry's members render
+        their real headers is pinned by
+        :meth:`test_renders_every_registry_header_when_all_sections_apply`.
+        """
+        stage = _make_consolidator(project_root='/project')
+        # Instance attributes, so getattr(self, section.renderer)() dispatches to
+        # them exactly as it does to real bound methods.
+        monkeypatch.setattr(stage, '_stub_alpha', lambda: '\n### Alpha\nfirst\n', raising=False)
+        monkeypatch.setattr(stage, '_stub_beta', lambda: '\n### Beta\nsecond\n', raising=False)
+        monkeypatch.setattr(
+            MemoryConsolidator,
+            'REQUIRED_SECTIONS',
+            (
+                RequiredSection('### Alpha', '_stub_alpha'),
+                RequiredSection('### Beta', '_stub_beta'),
+            ),
+        )
 
         rendered = stage._render_required_sections()
 
-        expected = ''.join(
-            getattr(stage, section.renderer)()
-            for section in MemoryConsolidator.REQUIRED_SECTIONS
-        )
+        expected = '\n### Alpha\nfirst\n\n### Beta\nsecond\n'
         assert rendered == expected, (
-            'The aggregator must be exactly the concatenation of its registry '
-            "renderers' output, in registry order — it may not add a separator, "
-            'reorder, or post-process. Each renderer already owns its own leading '
-            f'newline.\n  got:      {rendered!r}\n  expected: {expected!r}'
+            "The aggregator must be exactly its registry renderers' output "
+            'concatenated in REGISTRY ORDER — it may not add a separator, '
+            'reorder, or post-process. Each renderer already owns its own '
+            f'leading newline.\n  got:      {rendered!r}\n'
+            f'  expected: {expected!r}'
         )
 
     def test_returns_empty_string_when_no_section_applies(self):
