@@ -166,7 +166,8 @@ That divergence from fused-memory's reject-and-lose behaviour is the pre-γ stat
 
 This bears on the 2026-08-20 esc-3886-1 row above, whose own conclusion is "consistent with §2.5's transient-for-that-call-pair reading rather than a payload property" — flagged here as a tension between rows rather than resolved; esc-3886-1's own recorded conclusion is left as-is. B4/§2.1's "already last, nothing dropped" observation is consistent with this reading, but it is a single retrospective row and is not the load-bearing evidence; Specimens 2 and 3 above are.
 
-Still correlational and small (n=2 in one turn; n=1 reject plus n=1 clean retry): the retry-luck confound is real — this PRD records several immediate-retry-landed-clean cases — so Specimen 3 alone does not distinguish position from retry-luck. The controlled experiment that would: compare FIRST-attempt leak rates across parameter positions, holding prose constant. Noted here as a candidate follow-up investigation, not a conclusion; no code or test changes accompany this note, and the controlled experiment itself is out of this documentation-only task's file scope — tracked separately as task 4558 ("Controlled experiment: does MCP tool-call parameter order affect envelope-markup leak rate?", filed 2026-08-20, priority low, pending as of this writing).
+Still correlational and small (n=2 in one turn; n=1 reject plus n=1 clean retry): the retry-luck confound is real — this PRD records several immediate-retry-landed-clean cases — so Specimen 3 alone does not distinguish position from retry-luck. The controlled experiment that would: compare FIRST-attempt leak rates across parameter positions, holding prose constant. Noted here as a candidate follow-up investigation, not a conclusion; no code or test changes accompany this note, and the controlled experiment itself is out of this documentation-only task's file scope — tracked separately as task 4558 ("Controlled experiment: does MCP tool-call parameter order affect envelope-markup leak rate?", filed 2026-08-20, priority low) — which is now `deferred`, coalesced into task **4896**
+along with the findings that produced the block below; the experiment itself remains undone.
 
 **Recurrence log continued (2026-08-20 → 2026-08-26) — three storm records, ONE class, callers identified.** Same
 reading note as above: this block is appended at the end of the log and its Observed dates overlap the tables before it.
@@ -313,6 +314,54 @@ same L2 rotation's READ+RECOVER pass and none of them resolved by it:
 `esc-mcp-markup-residue-1.payload.md`, `esc-plan-tools-markup-residue-5.payload.md` and
 `esc-verdict-tools-markup-residue-1.payload.md`, alongside `markup_guard_residue-loglines-2026-08-27.log`. They are
 machine-local only; anything in them that matters must be folded into this document to survive.
+
+**Recurrence log continued (2026-08-21 → 2026-08-22) — FOUR bursts at the γ2 plan-tools boundary, in the
+`reify` project.** Same reading note as above: this block is appended at the end of the log and its Observed dates
+overlap the tables before it; it covers the 2026-08-21T21:07Z → 2026-08-22T22:50Z range only. Sourced from eight
+archived escalation records — `esc-plan-tools-markup-storm-1` … `-8` (alternating L1 burst alarm / L2 promotion, two
+per burst) plus `esc-plan-tools-markup-residue-1` — under
+`/home/leo/src/reify/data/escalations/archive/2026-08-22/`. It is recorded here for the same reason as the block
+above: the escalation store lives under `data/`, which is gitignored, so this material otherwise survives only in
+machine-local files, and this document is version-controlled. Ownership is **γ2 / task 4457** (§9) — the leaf that
+registered this guard.
+
+**⚠️ ID COLLISION — escalation ids are per-project and these two are different records.** The table in §2.5 above
+already carries a **dark-factory** `esc-plan-tools-markup-storm-2`, fired 2026-08-21T16:53:02Z (the task-3127
+architect retry loop). The `esc-plan-tools-markup-storm-2` below is a **reify** record fired 2026-08-21T21:08:07Z.
+Neither is renumbered and they are not merged; every row below is labelled with its project.
+
+| Burst | L1 fired (`reify`) | L2 promotion | Gap since previous burst | Residue |
+|---|---|---|---|---|
+| **1** | `esc-plan-tools-markup-storm-1`, 2026-08-21T21:07:17Z | `-storm-2`, 21:08:07Z | — (first ever, see below) | **ONE** — `esc-plan-tools-markup-residue-1`, 21:17:56Z: `add_design_decision.decision` absorbed the entire serialization of the following `rationale` parameter, boundary not determinable, so the guard refused outright and preserved the raw payload (reify task 5711). **Later recovered** — the caller re-emitted cleanly with `rationale` present, verified against the lane's `plan.json`; nothing corrupt ever reached disk. |
+| **2** | `-storm-3`, 2026-08-22T20:11:07Z | `-storm-4`, 20:12:47Z | 23h | none — all repairable |
+| **3** | `-storm-5`, 2026-08-22T21:23:05Z | `-storm-6`, 21:23:46Z | 70min | none — all repairable |
+| **4** | `-storm-7`, 2026-08-22T22:49:35Z | `-storm-8`, 22:50:32Z | 86min | none — all repairable |
+
+Every one of the four L1 records carries the **identical** measurement block: `count=3`, `threshold=3`,
+`window_seconds=3600.0`, `outcome='rejected'`, `project=None`. The cadence — **23h, then 70min, then 86min**, as
+computed in `-storm-8`'s own resolution — is the genuinely new datum: `-storm-8` reads it as having "settled into a
+roughly HOURLY sustained condition rather than a series of discrete incidents".
+
+Three qualifiers from the source resolutions, all load-bearing; dropping any of them overstates the data.
+
+**(i) These are the plan-tools guard's FIRST-EVER firings.** `-storm-1`/`-storm-2`'s shared resolution records the
+2026-08-21 rejections as the boundary guard's first since it went live 2026-08-20 — corroborated independently here:
+`git log -S "mcp.add_middleware" -- orchestrator/src/orchestrator/mcp/plan_tools.py` returns exactly one commit,
+`37eed69c97` (2026-08-20, *"feat(4457): register MarkupGuardMiddleware on the plan-tools server"*). So this is not a
+newly-worsening leak; it is a previously-invisible one becoming visible the moment γ2 landed, which is the §2.5 thesis
+restated at a fourth boundary.
+
+**(ii) The counts are FLOORS, not rates.** A *repairable* rejection leaves **no queue artifact** — only unrepairable
+ones are guaranteed to leave a residue record — so the true rejection count is strictly higher than anything countable
+from this corpus. Each burst is known to be ≥3 because 3 is the alarm threshold, not because 3 is the measurement. Do
+not read a rate off this table.
+
+**(iii) Containment WORKED; this series is evidence the guard functions, not that it fails.** Across all four bursts
+exactly **one** payload was ever unrepairable, and even that one was recovered. Every other rejected call was retried
+clean. `-storm-8`'s resolution states the consequence plainly: *"CONTAINMENT MUST STAY ARMED … disabling the guard is
+what would let specimens land permanently in fleet `plan.json` files."* The mechanism is the one §2.1 describes —
+model/harness-side over-consumption past a mis-closed tag, where parameter N's value swallows parameter N+1's entire
+serialization and N+1 is silently dropped — and is not fixable at the fleet layer.
 
 ### 2.6 The corruption is deterministically repairable
 
