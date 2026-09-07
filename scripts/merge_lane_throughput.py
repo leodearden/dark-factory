@@ -1361,7 +1361,7 @@ def collect_projects(
 def void_rate_by_project(
     bundles: Sequence[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """The chain-dead void rate PER project, keyed by project root.
+    """Every cross-project speculation headline rate, keyed by project root.
 
     The cross-project view the ``--speculation`` section exists for: the rates
     are placed beside each other, never pooled into one numerator over one
@@ -1369,9 +1369,23 @@ def void_rate_by_project(
     a different one, and it erases the between-project spread that motivates
     the PRD's decomposition.
 
+    The headline a diagnosis quotes is now fully reproducible from THIS one
+    section: alongside the void rate it carries both speculative-ahead
+    measures (loose and strict — see :func:`compute_speculation` for why both
+    exist) and the void anatomy's ``pre_verify``/``verify_burned`` split.  A
+    reader who had to reopen each project's own speculation section to
+    assemble the comparison was doing by hand what this section is for, and
+    the void rate on its own is the rate most likely to be misread: it says
+    how OFTEN speculation was thrown away and nothing at all about what the
+    throwing-away cost.
+
+    Every field is read straight off the bundle's already-computed
+    ``speculation`` section — no second query path and no re-derivation.
+
     A bundle that errored is ABSENT from the result rather than present with a
     rate of 0.0: a project whose store could not be read has no measured void
-    rate at all.
+    rate at all, and — now that the anatomy rides along — a zero-filled entry
+    would positively read as "nothing was wasted here".
     """
     out: dict[str, dict[str, Any]] = {}
     for bundle in bundles:
@@ -1382,6 +1396,9 @@ def void_rate_by_project(
             'n_speculative': speculation['n_speculative'],
             'n_voided_chain_dead': speculation['n_voided_chain_dead'],
             'void_rate': speculation['void_rate'],
+            'speculative_ahead': speculation['speculative_ahead'],
+            'speculative_ahead_adopted': speculation['speculative_ahead_adopted'],
+            'void_anatomy': speculation['void_anatomy'],
         }
     return out
 
