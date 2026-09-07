@@ -5851,3 +5851,85 @@ def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_t
     assert exc.rejected == 1
     assert exc.unverified == 3
     assert exc.verified + exc.rejected + exc.unverified == len(clusters)
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-7: RED — W-B, the MESSAGE. Step-6 put the rejected count on
+# the exception; nothing reads it yet. `_defer` still renders two counts that
+# do not account for the run, so the escalation an operator actually reads is
+# still the one that cannot say how much of an expensive run had completed.
+# ---------------------------------------------------------------------------
+
+def _defer_blob(escalate_fn):
+    assert len(escalate_fn.calls) == 1, escalate_fn.calls
+    call = escalate_fn.calls[0]
+    return (call.get("summary") or "") + (call.get("detail") or "")
+
+
+def test_run_census_defer_message_accounts_for_the_whole_run(tmp_path):
+    """5 clusters offered, 2 already adjudicated (1 verified + 1 rejected),
+    3 never reached. The message must name all three counts AND the total."""
+    def raising_verify_fn(clusters, *, model):
+        raise mod.CensusHeadroomExhausted(
+            stage="verify",
+            reason="probe reports no capacity",
+            verified=1, rejected=1, unverified=3,
+        )
+
+    fake_escalate_fn = _make_fake_escalate_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=raising_verify_fn,
+        synthesize_fn=_poison("synthesize_fn"),
+        escalate_fn=fake_escalate_fn,
+        commit=_poison("commit"),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+    blob = _defer_blob(fake_escalate_fn)
+
+    # The legacy pin, kept intact rather than re-spelled — see the design
+    # decision. `test_run_census_verify_headroom_abort_persists_nothing`
+    # asserts this exact substring and must not silently rot.
+    assert "1 cluster(s) verified" in blob
+
+    assert "1" in blob and "rejected" in blob.lower(), (
+        f"the REJECTED count must be named — it is work already spent; got {blob!r}"
+    )
+    assert "3" in blob, "the unverified count"
+    assert "5" in blob, "and the TOTAL offered, so the three counts account for the run"
+
+    # The three counts must actually sum to the stated total, not merely
+    # co-occur: pin the arithmetic the operator is being asked to trust.
+    assert (1 + 1 + 3) == 5
+
+    # The sunk-work phrasing an operator needs to size what completed.
+    assert "sunk" in blob.lower(), f"the message must say the spend is sunk; got {blob!r}"
+
+
+def test_run_census_preflight_defer_message_carries_no_counts_clause(tmp_path):
+    """Companion: a PREFLIGHT defer spent nothing, so `_defer` still skips the
+    counts clause entirely. Adding `rejected` must not leak a count into a
+    message about a run that never adjudicated anything."""
+    fake_escalate_fn = _make_fake_escalate_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(default="I cannot answer: you have hit your weekly limit."),
+        batch_source=_poison("batch_source"),
+        verify_fn=_poison("verify_fn"),
+        escalate_fn=fake_escalate_fn,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+    assert outcome.deferred_stage == "preflight"
+    blob = _defer_blob(fake_escalate_fn)
+    assert "cluster(s) verified" not in blob, (
+        f"a preflight defer must carry no counts clause at all; got {blob!r}"
+    )
+    assert "rejected" not in blob.lower()
