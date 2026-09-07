@@ -897,6 +897,58 @@ _XDIST_MAX_WORKERS_REACHED_OUTPUT = (
 )
 
 
+# task 5082, facet 1 — the esc-4292-3 shape, VERBATIM in structure: a worker
+# died mid-test, xdist's `handle_crashitem` (dsession.py) FABRICATED a
+# ``outcome="failed"`` / ``when="???"`` report for the test that worker had in
+# flight, and pytest's terminal reporter dutifully printed a ``FAILED`` short
+# summary line for it and counted it in the tally. esc-4292-3's measurement:
+# "the single test reported on a FAILED summary line was THE SAME test the
+# crashed worker was running, and that test passes in isolation."
+#
+# The FAILED line here deliberately carries NO `` - worker 'gwN' crashed while
+# running ...`` suffix, pinning the HARD case rather than the easy one. pytest
+# renders that suffix through `_pytest/terminal.py::_format_trimmed`, which
+# ellipsizes it to the remaining terminal width and returns None when even the
+# ellipsis will not fit — so it survives only under `running_on_ci()` or
+# ``-vv``. A detector that parsed the suffix would pass in CI and silently
+# fail locally, which is why detection correlates the node-id against the
+# UNTRIMMED crash notice in the FAILURES body instead.
+#
+# Note the node-id: it is the SAME one _XDIST_WORKER_CRASH_OUTPUT's crash
+# notice names, which is the whole point. _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT
+# above pins a FAILED line on a DIFFERENT test, so that fixture's False verdict
+# is preserved by construction under the widened predicate.
+_XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + 'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar\n'
+    + '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
+    + '1 failed, 728 passed, 1 skipped in 209.67s\n'
+)
+
+# task 5082, facet 1 STRICTNESS guard: the crash-attributed FAILED line PLUS a
+# genuine, independently-failing test. Widening the acceptance predicate must
+# never become a licence to discount every FAILED line just because a worker
+# died — the "never mask a real failure" norm that motivates every veto in
+# _is_bare_xdist_worker_crash, and that task 4066 billed a concrete incident
+# for (8 genuine failures silently reclassified as infra).
+_XDIST_CRASH_ATTRIBUTED_PLUS_GENUINE_OUTPUT = (
+    _XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+    + 'E   AssertionError: expected 3, got 4\n'
+    + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+)
+
+# task 5082, facet 1: the crash-attributed FAILED line PLUS an INTERNALERROR.
+# The task-4066 veto must keep dominating the NEW acceptance clause exactly as
+# it dominates the _KNOWN_LOAD_FLAKE_NODEID_RES clause beside it — an
+# INTERNALERROR produces no FAILED line of its own, so the per-FAILED-line
+# check would never see it.
+_XDIST_CRASH_ATTRIBUTED_PLUS_INTERNALERROR_OUTPUT = (
+    _XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR> KeyError: <WorkerController gw35>\n'
+)
+
+
 class TestBareXdistWorkerCrashDetector:
     """task 2365 step-1: verify._is_bare_xdist_worker_crash(output) pure helper.
 
@@ -1167,6 +1219,72 @@ class TestBareXdistWorkerCrashDetector:
         assert verify._PYTEST_FAILED_LINE_RE.findall(output) == []
         assert verify._PYTEST_TRACEBACK_E_RE.findall(output) == []
         assert verify._PYTEST_FAILURE_SUMMARY_RE.search(output) is None
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+
+    def test_crash_attributed_failed_line_is_true(self):
+        """task 5082: a FAILED line naming the CRASHED WORKER'S OWN in-flight
+        test is an xdist artefact, not a verdict -> True.
+
+        The esc-4292-3 shape. `xdist/dsession.py::handle_crashitem` synthesizes
+        the report itself with ``outcome="failed"``, ``when="???"`` and a
+        longrepr that is the crash message rather than a traceback; pytest then
+        prints an ordinary-looking FAILED line for it. Before this widening
+        that fabricated line defeated the discriminator and routed the run to
+        the DEBUGGER to chase a test that never actually failed (and passes in
+        isolation), instead of to the bounded infra retry.
+
+        The marker profile is pinned first so the verdict is attributable: the
+        crash signature is present, there is EXACTLY ONE FAILED line, and none
+        of the INTERNALERROR / ERROR vetoes fire. Without that, a later fixture
+        or regex edit could silently decay this into a tautology.
+        """
+        output = _XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+        assert verify._XDIST_WORKER_CRASH_RE.search(output) is not None
+        assert len(verify._PYTEST_FAILED_LINE_RE.findall(output)) == 1
+        assert verify._PYTEST_INTERNALERROR_RE.search(output) is None
+        assert verify._ERROR_LINE_NODEID_RE.search(output) is None
+        assert verify._ERROR_LINE_FILE_RE.search(output) is None
+        # The FAILED line names exactly the node-id the crash notice blames.
+        assert verify._crash_attributed_nodeids(output) == {
+            'orchestrator/tests/test_config.py::TestFoo::test_bar'
+        }
+
+        assert verify._is_bare_xdist_worker_crash(output) is True
+
+    def test_crash_attributed_failed_plus_unrelated_failed_is_false(self):
+        """Crash-attributed FAILED line PLUS a genuine independent failure -> False.
+
+        Strictness guard, the same one _XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT
+        enforces for the allow-list clause: a real in-scope failure must still
+        route to the debugger. Widening the acceptance predicate is never a
+        licence to discount every FAILED line just because a worker died —
+        task 4066 bills a concrete incident for that direction of error.
+        """
+        output = _XDIST_CRASH_ATTRIBUTED_PLUS_GENUINE_OUTPUT
+        # Pin that BOTH failed lines are present, so a False verdict here can
+        # only come from the second (non-crash-attributed) one.
+        assert len(verify._PYTEST_FAILED_LINE_RE.findall(output)) == 2
+        assert 'orchestrator/tests/test_x.py::test_real' not in (
+            verify._crash_attributed_nodeids(output)
+        )
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_crash_attributed_failed_plus_internalerror_is_false(self):
+        """Crash-attributed FAILED line PLUS an INTERNALERROR -> False.
+
+        The task-4066 veto must keep DOMINATING the new acceptance clause. An
+        INTERNALERROR produces no FAILED line of its own, so the per-FAILED-line
+        check would never see it — which is exactly why the veto sits above the
+        per-line loop and must stay there untouched.
+        """
+        output = _XDIST_CRASH_ATTRIBUTED_PLUS_INTERNALERROR_OUTPUT
+        # Isolate: every FAILED line here IS crash-attributed, so without the
+        # veto the widened predicate alone would green this.
+        assert len(verify._PYTEST_FAILED_LINE_RE.findall(output)) == 1
+        assert len(verify._PYTEST_INTERNALERROR_RE.findall(output)) > 0
 
         assert verify._is_bare_xdist_worker_crash(output) is False
 
