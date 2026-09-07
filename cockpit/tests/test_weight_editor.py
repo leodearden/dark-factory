@@ -104,7 +104,9 @@ class TestKnownProjects:
 
         result = known_projects(records, decisions, existing)
 
-        assert result == ['df', 'other', 'zeta']
+        # 'df' is offered under its canonical spelling (task 3812) -- the
+        # union/sort/dedupe behaviour under test is unchanged.
+        assert result == ['dark_factory', 'other', 'zeta']
 
     def test_dedupes_across_records_decisions_and_existing(self):
         from cockpit.panes.weight_editor import known_projects
@@ -115,14 +117,18 @@ class TestKnownProjects:
 
         result = known_projects(records, decisions, existing)
 
-        assert result == ['df']
+        # One entry from all three channels, under the canonical spelling
+        # (task 3812). See TestKnownProjectsOffersCanonicalNamesOnly for the
+        # stronger case: three DIFFERENT spellings collapsing to one name.
+        assert result == ['dark_factory']
 
     def test_empty_records_and_decisions_returns_existing_alone(self):
         from cockpit.panes.weight_editor import known_projects
 
         result = known_projects([], [], {'df': 1.0})
 
-        assert result == ['df']
+        # Canonical spelling (task 3812); the existing-alone path is unchanged.
+        assert result == ['dark_factory']
 
     def test_defaults_existing_to_empty(self):
         from cockpit.panes.weight_editor import known_projects

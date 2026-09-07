@@ -19,7 +19,11 @@ import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 
-from orchestrator.session_registry import DecisionRecord, SessionRecord
+from orchestrator.session_registry import (
+    DecisionRecord,
+    SessionRecord,
+    normalize_project_token,
+)
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -87,7 +91,7 @@ def known_projects(
     decisions: Sequence[DecisionRecord],
     existing: Iterable[str] = (),
 ) -> list[str]:
-    """Sorted distinct project-name candidates for the weight editor's project fields.
+    """Sorted distinct CANONICAL project-name candidates for the weight editor.
 
     Unions each SessionRecord's/DecisionRecord's own .project with
     *existing* (typically the current Priorities.project_weights' own
@@ -96,11 +100,36 @@ def known_projects(
     stable, deterministic picker order -- mirrors known_project_roots.
     Fail-soft (PRD §2): an empty/falsy project name is simply excluded,
     never raises.
+
+    Every candidate is folded through ``normalize_project_token`` FIRST, so
+    the picker offers CANONICAL names only -- one name per project, never a
+    project listed twice under two spellings (task 3812). Folding before the
+    falsy filter is deliberate: a whitespace-only name is truthy as a raw
+    string but folds to the ``''`` unset sentinel, and belongs in the
+    exclusion above rather than as a nameless picker row.
+
+    This closes the gap task 3807's design decision named when it stopped at
+    the decision-registry write path: the name offered here becomes a
+    ``project_weights`` KEY, and ``priority.score()`` looks that key up with
+    an already-canonical ``item.project``, so offering a raw spelling would
+    let an operator set a weight that silently never applies -- a NEW silent
+    failure, worse than the split it came from.
+
+    The fold is deliberately REDUNDANT with the ones in
+    ``registry_reader``/``load_priorities``, and that redundancy is the
+    point rather than an oversight. ``normalize_project_token`` is
+    idempotent, so it costs nothing when the inputs already folded upstream;
+    what it buys is that the canonical-names guarantee is LOCAL to the
+    picker instead of contingent on three remote callers. CockpitApp's
+    scanner is a DI seam (SessionScannerProtocol), so a fake or a future
+    scanner can hand this function raw records -- without the local fold
+    that silently refragments the picker, which is precisely the
+    disagreement this task exists to make impossible.
     """
-    projects = {record.project for record in records if record.project}
-    projects.update(decision.project for decision in decisions if decision.project)
-    projects.update(name for name in existing if name)
-    return sorted(projects)
+    projects = {normalize_project_token(record.project) for record in records}
+    projects.update(normalize_project_token(decision.project) for decision in decisions)
+    projects.update(normalize_project_token(name) for name in existing)
+    return sorted(name for name in projects if name)
 
 
 class WeightEditorScreen(ModalScreen[None]):
