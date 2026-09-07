@@ -418,28 +418,42 @@ class TestWrappedCandidates:
         }
 
 
-def _dangling_citations(src_dirs: Sequence[Path], test_dirs: Sequence[Path]) -> dict[str, str]:
-    """``{cited name: '<file>:<line>'}`` for every citation that does NOT resolve.
+class _Citations(NamedTuple):
+    """One src-corpus extraction pass: the citations, and the census proving it swept."""
 
-    Four passes. (1) Sweep every ``*.py`` under *src_dirs* and extract its
-    citations, keeping the first location seen for each name; a file that
-    cannot be read or tokenized raises rather than being skipped. (2) LIVENESS:
-    a sweep that found no citations at all is broken, not clean, and says so —
-    returning ``{}`` there would let this guard pass forever while checking
-    nothing. (3) Resolve the whole cited set in one pass. (4) For the remainder
-    only, generate line-wrap join candidates and resolve ALL of them in ONE
-    further pass; a name with a candidate that resolves is not dangling.
+    locations: dict[str, str]
+    sources: list[str]
+    files: int
+    members: set[str]
 
-    Batching pass (4) is what keeps the fallback a fixed one-pass cost instead
-    of one full re-sweep per unresolved name. Reported locations are relative
-    to the repo root when the file is inside it (a synthetic tree is not), and
-    a surviving name carries the joined candidates that were tried, so a
-    failure message can show why a wrapped citation was still rejected.
+
+def _extract_citations(src_dirs: Sequence[Path]) -> _Citations:
+    """THE src sweep: read and tokenize every ``*.py`` under *src_dirs* exactly ONCE.
+
+    Everything downstream is derived from this single pass — both the dangling
+    map and the anti-vacuity census. A second pass would re-read and re-tokenize
+    the whole src corpus to recompute numbers this one already has mid-flight,
+    and, worse, whichever copy ran first would raise a bare
+    ``UnicodeDecodeError``/``TokenError`` naming no file, leaving the
+    remediation message below unreachable for the exact failure it is for.
+
+    A file that cannot be read or tokenized RAISES, naming itself; it is never
+    skipped, because a silently skipped file is a file this guard is vacuous
+    for. Locations are repo-relative when the file is inside the repo (a
+    synthetic tree is not).
+
+    FIRST citing site wins, in ``sorted`` walk order. That is a stated rule
+    rather than an accident of ``setdefault`` — pinned by
+    ``TestDanglingCitations`` — and its honest consequence is that one
+    dangling name cited from several modules is reported one site at a time.
     """
-    citations: dict[str, str] = {}
+    locations: dict[str, str] = {}
     sources: list[str] = []
+    members: set[str] = set()
+    files = 0
     for src_dir in src_dirs:
         for path in sorted(src_dir.rglob('*.py')):
+            files += 1
             try:
                 source = path.read_text()
                 names = _cited_names(source)
@@ -450,13 +464,34 @@ def _dangling_citations(src_dirs: Sequence[Path], test_dirs: Sequence[Path]) -> 
                     f'file would make this guard vacuous for it.'
                 ) from exc
             sources.append(source)
+            if names:
+                members.add(src_dir.parent.name)
             shown = path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path
             for name, line in names.items():
-                citations.setdefault(name, f'{shown}:{line}')
+                locations.setdefault(name, f'{shown}:{line}')
+    return _Citations(locations=locations, sources=sources, files=files, members=members)
+
+
+def _resolve_dangling(cited: _Citations, test_dirs: Sequence[Path]) -> dict[str, str]:
+    """``{cited name: '<file>:<line>'}`` for every citation in *cited* that does NOT resolve.
+
+    Three passes over the already-extracted corpus. (1) LIVENESS: a sweep that
+    found no citations at all is broken, not clean, and says so — returning
+    ``{}`` here would let this guard pass forever while checking nothing.
+    (2) Resolve the whole cited set in ONE pass. (3) For the remainder only,
+    generate line-wrap join candidates and resolve ALL of them in ONE further
+    pass; a name with a candidate that resolves is not dangling.
+
+    Batching pass (3) is what keeps the fallback a fixed one-pass cost instead
+    of one full re-sweep per unresolved name. A surviving name carries the
+    joined candidates that were tried, so a failure message can show why a
+    wrapped citation was still rejected.
+    """
+    citations, sources = cited.locations, cited.sources
     if not citations:
         raise AssertionError(
-            f'swept {[str(d) for d in src_dirs]} and found no cited test class '
-            f'names at all. The sweep is broken, not the tree clean.'
+            f'the src sweep read {cited.files} file(s) and found no cited test '
+            f'class names at all. The sweep is broken, not the tree clean.'
         )
     unresolved = set(citations) - _defined_test_classes(test_dirs, set(citations))
     tried: dict[str, set[str]] = {name: set() for name in unresolved}
@@ -470,6 +505,13 @@ def _dangling_citations(src_dirs: Sequence[Path], test_dirs: Sequence[Path]) -> 
         for name in sorted(unresolved)
         if not tried[name] & joined
     }
+
+
+def _dangling_citations(src_dirs: Sequence[Path], test_dirs: Sequence[Path]) -> dict[str, str]:
+    """Extract, then resolve — the whole guard, for callers that do not also
+    need the census. ``_real_tree_sweep`` calls the two halves separately so
+    that the real tree is swept exactly once."""
+    return _resolve_dangling(_extract_citations(src_dirs), test_dirs)
 
 
 class TestDanglingCitations:
@@ -590,6 +632,46 @@ class TestDanglingCitations:
         assert _dangling_citations(*terse) == {}
         assert _dangling_citations(*verbose) == {}
 
+    def test_a_name_cited_from_several_files_reports_the_first_in_walk_order(self, tmp_path):
+        """FIRST citing site wins, in ``sorted`` walk order — pinned here so it
+        is a stated rule rather than an accident of ``setdefault``. The honest
+        consequence, which this test exists to make visible: one dangling name
+        cited from several modules is reported one site at a time, so clearing
+        it costs one red run per citing site."""
+        cited = '"""Pinned by ``TestNoSuchClassAnywhere``."""\n'
+        src_dirs, test_dirs = self._corpus(
+            tmp_path, {'a_mod.py': cited, 'z_mod.py': cited}, self._UNRELATED
+        )
+        assert _dangling_citations(src_dirs, test_dirs) == {
+            'TestNoSuchClassAnywhere': f'{src_dirs[0] / "a_mod.py"}:1'
+        }
+
+    def test_an_untokenizable_src_file_raises_naming_it(self, tmp_path):
+        """The src-sweep half of the loud-failure pair whose resolution-side
+        half is ``TestDefinedTestClasses.test_an_unparseable_file_matching_the_prefilter_raises_naming_it``.
+
+        ``TestCitedNames`` already pins that the pure extractor RAISES; what is
+        pinned here is the wrapper's message, which must name the file — that
+        remediation text is only reachable through this arm.
+        """
+        src_dirs, test_dirs = self._corpus(
+            tmp_path, {'broken.py': '"""Unterminated docstring\n'}, self._UNRELATED
+        )
+        with pytest.raises(AssertionError, match='broken.py'):
+            _dangling_citations(src_dirs, test_dirs)
+
+    def test_an_unreadable_src_file_raises_naming_it(self, tmp_path):
+        """A dangling symlink under a src root raises ``OSError`` on read and is
+        translated, naming the file — the src-sweep counterpart of
+        ``TestDefinedTestClasses.test_an_unreadable_file_raises_naming_it``.
+        Never swallowed, never silently skipped."""
+        src_dirs, test_dirs = self._corpus(
+            tmp_path, {'mod.py': '"""Pinned by ``TestSomethingElseEntirely``."""\n'}, self._UNRELATED
+        )
+        (src_dirs[0] / 'dangling.py').symlink_to(src_dirs[0] / 'missing.py')
+        with pytest.raises(AssertionError, match='dangling.py'):
+            _dangling_citations(src_dirs, test_dirs)
+
     def test_a_src_tree_with_no_citations_at_all_raises(self, tmp_path):
         """LIVENESS. A sweep that finds nothing is broken, not clean — the one
         outcome that would let this guard pass forever while checking nothing.
@@ -601,32 +683,54 @@ class TestDanglingCitations:
             _dangling_citations(src_dirs, test_dirs)
 
 
+def _workspace_members() -> list[str]:
+    """The workspace member roster, read from the root ``pyproject.toml``'s
+    ``[tool.uv.workspace].members`` at runtime rather than hard-coded, so adding
+    or renaming a member cannot silently shrink either corpus."""
+    config = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
+    return config['tool']['uv']['workspace']['members']
+
+
 def _src_dirs() -> list[Path]:
     """Every ``<member>/src`` the workspace actually has, derived at runtime.
 
-    Read from the root ``pyproject.toml``'s ``[tool.uv.workspace].members``
-    rather than hard-coded, so adding or renaming a workspace member cannot
-    silently shrink this guard's reach. A member without a ``src`` directory is
-    skipped rather than assumed.
+    A member without a ``src`` directory is skipped rather than assumed.
     """
-    config = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text())
-    members = config['tool']['uv']['workspace']['members']
-    return sorted(d for d in (REPO_ROOT / m / 'src' for m in members) if d.is_dir())
+    return sorted(d for d in (REPO_ROOT / m / 'src' for m in _workspace_members()) if d.is_dir())
+
+
+#: The first-party test roots that belong to no workspace member, and so cannot
+#: be derived from the roster: ``scripts/`` is not a member, and the repo-root
+#: ``tests/`` sits under no ``<member>/`` at all. Each is skipped when absent.
+_EXTRA_TEST_ROOTS = ('scripts/tests', 'tests')
 
 
 def _test_dirs() -> list[Path]:
     """Every test root a cited class may legitimately be defined under.
 
-    ``*/tests`` is deliberately SHALLOW rather than an rglob: in the main
-    checkout a recursive search would descend into ``.worktrees/<id>/...`` and
-    multiply the corpus by every live task lane, while the shallow form still
-    picks up ``scripts/tests`` alongside the member test dirs without naming
-    any of them. The repo-root ``tests/`` is added explicitly because it is not
-    itself a ``*/tests`` match.
+    Derived from the SAME member roster as ``_src_dirs`` — one
+    ``<member>/tests`` each — plus ``_EXTRA_TEST_ROOTS``.
+
+    Deliberately NOT ``REPO_ROOT.glob('*/tests')``, which was the shape this
+    module shipped with. That shallow glob also matches top-level trees
+    belonging to no member: in the main checkout it picks up the vendored
+    upstream SUBMODULES' own test suites, which a task worktree never checks
+    out. Two consequences, both removed by deriving the roster instead. An
+    unrelated upstream ``class TestFooBar`` could RESOLVE a genuine dangle —
+    the permissive direction this module refuses everywhere else — and, because
+    the extra trees exist in only one of the two places, the guard would reach
+    a different verdict for an operator in the main checkout than verify
+    reaches in a worktree. Vendored code can also red-wall the guard through
+    ``_defined_test_classes``, which raises on any prefilter-matching file it
+    cannot parse: a vendor bump is not something this repo controls.
+
+    A recursive ``rglob`` is wrong for the same family of reasons plus one of
+    its own: it would descend into ``.worktrees/<id>/...`` and multiply the
+    corpus by every live task lane.
     """
-    dirs = sorted(d for d in REPO_ROOT.glob('*/tests') if d.is_dir())
-    root_tests = REPO_ROOT / 'tests'
-    return [*dirs, root_tests] if root_tests.is_dir() else dirs
+    roots = {REPO_ROOT / m / 'tests' for m in _workspace_members()}
+    roots |= {REPO_ROOT / extra for extra in _EXTRA_TEST_ROOTS}
+    return sorted(d for d in roots if d.is_dir())
 
 
 #: FLOORS, deliberately set well below the live values so ordinary tree growth
@@ -655,28 +759,22 @@ class _Sweep(NamedTuple):
 def _real_tree_sweep() -> _Sweep:
     """The single real-tree sweep, shared by both tests that need it.
 
-    The census is gathered by its own extraction pass rather than read off the
-    guard's result, because on a green tree that result is ``{}`` and carries
-    no information whatever about how much was actually swept — which is
-    exactly the vacuity the census exists to rule out.
+    The census cannot be read off the guard's RESULT: on a green tree that is
+    ``{}`` and says nothing about how much was actually swept, which is exactly
+    the vacuity the census exists to rule out. It is read off the SWEEP
+    instead — ``_extract_citations`` already holds every number mid-flight — so
+    the src corpus is still read and tokenized exactly once, and an unreadable
+    src file fails with that helper's path-naming ``AssertionError`` no matter
+    which consumer trips over it first.
     """
     src_dirs, test_dirs = _src_dirs(), _test_dirs()
-    citations: set[str] = set()
-    citing_members: set[str] = set()
-    src_files = 0
-    for src_dir in src_dirs:
-        for path in sorted(src_dir.rglob('*.py')):
-            src_files += 1
-            names = _cited_names(path.read_text())
-            if names:
-                citations.update(names)
-                citing_members.add(src_dir.parent.name)
+    cited = _extract_citations(src_dirs)
     return _Sweep(
-        dangling=_dangling_citations(src_dirs, test_dirs),
-        src_files=src_files,
+        dangling=_resolve_dangling(cited, test_dirs),
+        src_files=cited.files,
         test_files=sum(1 for d in test_dirs for _ in d.rglob('*.py')),
-        citations=citations,
-        citing_members=citing_members,
+        citations=set(cited.locations),
+        citing_members=cited.members,
     )
 
 
@@ -744,3 +842,14 @@ class TestCitedTestClassDrift:
         assert REPO_ROOT / 'tests' in test_dirs
         member_tests = {REPO_ROOT / m / 'tests' for m in members if (REPO_ROOT / m / 'tests').is_dir()}
         assert member_tests <= test_dirs
+        # And nothing else: no top-level tree belonging to no workspace member
+        # may enter the resolution corpus. A bare `*/tests` glob also matches
+        # the vendored upstream submodules, which are checked out in the main
+        # checkout and not in a task worktree — so citations would resolve
+        # against third-party code, and the verdict would depend on where the
+        # suite was run. Derived from the roster here, so this cannot rot.
+        allowed = member_tests | {REPO_ROOT / extra for extra in _EXTRA_TEST_ROOTS}
+        assert test_dirs <= allowed, (
+            f'test roots outside the workspace roster reached the corpus: '
+            f'{sorted(str(d) for d in test_dirs - allowed)}'
+        )
