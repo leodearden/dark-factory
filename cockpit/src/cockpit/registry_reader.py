@@ -90,6 +90,46 @@ def _read_record_soft(
     return record
 
 
+def scan_decisions(root: Path | str | None = None) -> list[session_registry.DecisionRecord]:
+    """Return every readable DecisionRecord, ``.project`` canonicalized.
+
+    The decision-side twin of scan_sessions (task 3812): the cockpit's two
+    record kinds share one ``project_weights`` key and one weight picker, so
+    both must enter through the same fold or an operator's weight reaches
+    only one of them.
+
+    The whole READ -- and therefore the whole fail-soft policy: absent
+    decisions/ dir -> [], a single corrupt or foreign ``*.json`` logged and
+    skipped rather than aborting the rest -- is delegated to
+    ``session_registry.list_decisions``. This is a fold over that reader,
+    never a second implementation of it, so its contract cannot drift away
+    from the frozen one (pinned by
+    test_returns_the_same_ids_in_the_same_order_as_list_decisions). The
+    returned records are freshly parsed and exclusively owned here, so the
+    fold is applied in place, guarded by the same inequality check
+    ``_read_record_soft`` uses.
+
+    The fold is IDEMPOTENT and therefore a NO-OP for every decision written
+    since task 3807 -- the ``write-decision`` verb already stamps the
+    canonical token at the write path. What it exists for is the LEGACY rows
+    still sitting on disk that ``migrate_decision_project_tokens`` has not
+    been run over (measured 2026-09-07: 19 OPEN ``df`` + 2 OPEN
+    ``dark-factory``), and, more durably, so the cockpit's guarantee rests on
+    a rule it applies itself rather than on a migration having been run
+    somewhere else.
+
+    Read-only, like everything in this module: the canonicalized records are
+    in-memory only and are never written back (the cockpit never calls
+    write_decision).
+    """
+    decisions = session_registry.list_decisions(root)
+    for record in decisions:
+        canonical = normalize_project_token(record.project)
+        if canonical != record.project:
+            record.project = canonical
+    return decisions
+
+
 def scan_sessions(root: Path | str | None = None) -> list[session_registry.SessionRecord]:
     """Return every readable SessionRecord under ``sessions_dir(root)``.
 
