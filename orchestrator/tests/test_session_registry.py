@@ -400,6 +400,36 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     return sr.DecisionRecord(**fields)
 
 
+def _names_the_destination_token(message: str) -> bool:
+    """True when *message* names ``solar_challenge`` as a token in its OWN
+    right -- not merely as the tail of ``my_solar_challenge``.
+
+    Exists because the obvious spelling of that assertion is VACUOUS:
+    ``'solar_challenge' in msg`` is implied by ``'my_solar_challenge' in
+    msg``, so a regression that dropped the destination token entirely --
+    leaving the operator exactly where the silent zero-row no-op did --
+    passes it. The word-boundary lookaround is what makes the check
+    discriminating; a bare substring test is not.
+
+    Deliberately boundary-based rather than quote-based (``"'solar_challenge'"``
+    would also work today) so it survives a message that renders the token
+    without ``!r`` quoting -- it pins the CLAIM, not the formatting.
+    """
+    return re.search(r'(?<!\w)solar_challenge(?!\w)', message) is not None
+
+
+def _claims_zero_matches(message: str) -> bool:
+    """True when *message* asserts the passed token matched nothing.
+
+    The one wording pin in this area, and a deliberate one: that claim is
+    TRUE for ``reap-decisions`` (which matches) and FALSE for
+    ``write-decision`` (which creates, and files a row under exactly that
+    token one line later). Pinning it in both directions is what keeps the
+    hint's verb-awareness from silently regressing to a single message.
+    """
+    return re.search(r'matches (no|zero)\b', message, re.IGNORECASE) is not None
+
+
 def test_make_decision_defaults_to_the_unset_queue_sentinel() -> None:
     """The fixture must not hand escalations_dir a non-'' default.
 
@@ -5221,12 +5251,14 @@ def test_main_write_decision_warns_on_a_declined_alias_target(
     assert rc == 0
     # NOT rewritten: filed under exactly the token the caller passed.
     assert sr.list_decisions(root=tmp_path)[0].project == 'my_solar_challenge'
-    assert any(
-        r.levelno >= logging.WARNING
-        and 'my_solar_challenge' in r.getMessage()
-        and 'solar_challenge' in r.getMessage()
-        for r in caplog.records
-    )
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # Non-vacuous on BOTH tokens: see _names_the_destination_token.
+    assert any('my_solar_challenge' in m and _names_the_destination_token(m) for m in warnings)
+    # ...and the message must be TRUE on this path. write-decision CREATES;
+    # it matches nothing by definition, and one line after this warning it
+    # files a row under this very token. A "matches no decisions" line here
+    # would be false the moment it is acted on.
+    assert not any(_claims_zero_matches(m) for m in warnings)
 
 
 def test_main_write_decision_recommended_solar_token_warns_nothing(
@@ -6195,15 +6227,69 @@ def test_declined_project_token_hint_names_both_tokens() -> None:
 
     assert hint is not None
     assert isinstance(hint, str)
-    # Token PRESENCE, deliberately not sentence wording.
+    # Token PRESENCE, deliberately not sentence wording. The destination
+    # token goes through _names_the_destination_token because the bare
+    # `'solar_challenge' in hint` spelling is VACUOUS -- it is implied by the
+    # line above it, so a message that named only the typed token would pass.
     assert 'my_solar_challenge' in hint
-    assert 'solar_challenge' in hint
+    assert _names_the_destination_token(hint)
 
     # The fold runs FIRST, so a spelling variant still hits. This is the case
     # that matters: an operator copying the config-declared value with
     # different case/separators must still be warned.
     assert sr.declined_project_token_hint('My-Solar-Challenge') is not None
     assert sr.declined_project_token_hint('  MY_SOLAR_CHALLENGE  ') is not None
+
+
+def test_declined_project_token_hint_consequence_is_verb_aware() -> None:
+    """One message cannot be true for both callers, so *action* picks one.
+
+    ``reap-decisions`` MATCHES, so its consequence is a zero-row no-op.
+    ``write-decision`` CREATES: it matches nothing by definition, and one
+    line after the warning it files a row under exactly the token passed --
+    so the reap wording would be false the moment it is acted on. Its real
+    consequence is also the worse of the two (the row lands where no
+    documented reap scopes, and can never auto-close), which the shared
+    wording left unstated entirely.
+
+    Asserts on the CLAIM each message makes, not its sentences: the
+    zero-match claim must be present on the reap path and absent on the
+    write path, and every variant must still name both tokens.
+    """
+    reap = sr.declined_project_token_hint('my_solar_challenge', action='reap')
+    file_ = sr.declined_project_token_hint('my_solar_challenge', action='file')
+
+    assert reap is not None and file_ is not None
+    assert reap != file_
+    for message in (reap, file_):
+        assert 'my_solar_challenge' in message
+        assert _names_the_destination_token(message)
+
+    assert _claims_zero_matches(reap)
+    assert not _claims_zero_matches(file_)
+
+
+@pytest.mark.parametrize('action', ['', 'bogus-verb'])
+def test_declined_project_token_hint_unknown_action_stays_verb_neutral(action: str) -> None:
+    """An omitted or unrecognised *action* is not an error, and is not guessed.
+
+    Fail-soft in the direction that matters for a message a human acts on: a
+    future caller that forgets the argument gets the verb-neutral core --
+    less specific, but TRUE on any path -- rather than a confident
+    description of the wrong verb. Pinning this is what stops the default
+    from quietly being set to one of the two real verbs later.
+    """
+    hint = sr.declined_project_token_hint('my_solar_challenge', action=action)
+
+    assert hint is not None
+    assert 'my_solar_challenge' in hint
+    assert _names_the_destination_token(hint)
+    # No verb-specific claim, in either direction.
+    assert not _claims_zero_matches(hint)
+    assert hint != sr.declined_project_token_hint('my_solar_challenge', action='reap')
+    assert hint != sr.declined_project_token_hint('my_solar_challenge', action='file')
+    # The default really is the neutral variant, not one of the two verbs.
+    assert sr.declined_project_token_hint('my_solar_challenge') == hint
 
 
 @pytest.mark.parametrize(
@@ -6488,12 +6574,12 @@ def test_main_reap_decisions_warns_on_a_declined_alias_target(
         )
 
     assert rc == 0
-    assert any(
-        r.levelno >= logging.WARNING
-        and 'my_solar_challenge' in r.getMessage()
-        and 'solar_challenge' in r.getMessage()
-        for r in caplog.records
-    )
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # Non-vacuous on BOTH tokens: see _names_the_destination_token.
+    assert any('my_solar_challenge' in m and _names_the_destination_token(m) for m in warnings)
+    # On THIS path the zero-match claim is the true one -- the reap really is
+    # matching, and really does match none of the seeded rows.
+    assert any(_claims_zero_matches(m) for m in warnings)
     # The warning changes NO reaping behaviour: the seeded decision would
     # have been closed under the right token, and is still OPEN under this
     # one. All the hint does is make the zero-match visible.

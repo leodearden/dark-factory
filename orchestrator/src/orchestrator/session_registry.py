@@ -1686,7 +1686,7 @@ def normalize_project_token(value: object) -> str:
     return PROJECT_TOKEN_ALIASES.get(folded, folded)
 
 
-def declined_project_token_hint(value: object) -> str | None:
+def declined_project_token_hint(value: object, action: str = '') -> str | None:
     """One-line operator warning when *value* names a DECLINED alias target
     (task 3813). Returns None -- the overwhelmingly common case -- otherwise.
 
@@ -1716,6 +1716,26 @@ def declined_project_token_hint(value: object) -> str | None:
     which cannot distinguish a token nothing uses from a healthy project
     with nothing open.
 
+    WHY IT IS VERB-AWARE. The two callers hit this table for OPPOSITE
+    reasons, and one message cannot be true for both. ``reap-decisions`` is
+    MATCHING, so its consequence is a zero-row no-op. ``write-decision`` is
+    CREATING, so it matches nothing by definition and a "matches no
+    decisions" line would be false the moment it is acted on -- one line
+    later the verb files a row under exactly that token. Its real
+    consequence is also the WORSE of the two and would otherwise go
+    unstated: the row lands in a bucket no documented reap scopes to (the
+    skills tell watchers to reap ``solar_challenge``), so it can never
+    auto-close, whereas a missed reap is merely repeatable. *action* selects
+    that consequence clause: ``'reap'`` and ``'file'`` are the two known
+    verbs.
+
+    An OMITTED or unrecognised *action* is not an error and is not guessed
+    at: it yields the verb-neutral core alone, which states only what the
+    decline is and where the rows live. That is fail-soft in the direction
+    that matters here -- a future caller that forgets the argument gets a
+    message that is less specific but still TRUE, never one that confidently
+    describes the wrong verb.
+
     Folds *value* through ``normalize_project_token`` first, so case and
     separator variants of the config-declared token (``My-Solar-Challenge``)
     all hit, and a non-str or ``None`` *value* coerces fail-soft to a
@@ -1727,14 +1747,32 @@ def declined_project_token_hint(value: object) -> str | None:
     if not folded:
         return None
     for alias, (declined_canonical, _reason) in PROJECT_TOKEN_ALIASES_DECLINED.items():
-        if folded == declined_canonical:
-            return (
-                f'--project {folded!r} matches no decisions: the alias '
-                f'{alias!r} -> {declined_canonical!r} was considered and DECLINED '
-                f'(task 3813), so that project\'s rows stay under {alias!r}. '
-                f'Pass a token that folds to {alias!r} instead; see '
-                f'PROJECT_TOKEN_ALIASES_DECLINED for the evidence.'
-            )
+        if folded != declined_canonical:
+            continue
+        # Verb-neutral, and therefore true on EVERY caller's path: it states
+        # only what was declined and where the rows live, never what this
+        # caller is about to do with them.
+        core = (
+            f'--project {folded!r}: the alias {alias!r} -> {declined_canonical!r} '
+            f'was considered and DECLINED (task 3813), so that project\'s '
+            f'decisions live under {alias!r}, not {declined_canonical!r}.'
+        )
+        # Built only on a hit (rare by construction), so the cost of holding
+        # both strings here is never paid on the common None path.
+        consequence = {
+            'reap': (
+                f' This reap therefore matches ZERO of them, and its silent '
+                f'no-op reads as "nothing to reap"; re-run scoped to a token '
+                f'that folds to {alias!r}.'
+            ),
+            'file': (
+                f' This record is being FILED under {declined_canonical!r}, '
+                f'which no documented reap scopes to, so it can never '
+                f'auto-close; re-file it under a token that folds to '
+                f'{alias!r}.'
+            ),
+        }.get(action, '')
+        return f'{core}{consequence} See PROJECT_TOKEN_ALIASES_DECLINED for the evidence.'
     return None
 
 
@@ -4087,7 +4125,12 @@ def _run_write_decision(
     # reflects the token that will actually be STORED, and BEFORE the record
     # is built so it fires even if a later step fails. It must not alter
     # canonical_project, gate the filing, or change the return code.
-    declined_hint = declined_project_token_hint(canonical_project)
+    # action='file' because this path CREATES rather than matches: the reap
+    # wording ("matches no decisions") would be false one line below, where
+    # a row is filed under exactly this token. The filing consequence is the
+    # worse of the two -- that row lands in a bucket no documented reap
+    # scopes to and can never auto-close -- so it is the one worth naming.
+    declined_hint = declined_project_token_hint(canonical_project, action='file')
     if declined_hint is not None:
         logger.warning('write-decision: %s', declined_hint)
 
@@ -4308,7 +4351,9 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     # runs this every Main Loop cycle and a per-record line would flood its
     # log. It must not touch reaper_project, neither scoping axis, nor what
     # gets closed: both guards below stay fail-OPEN exactly as documented.
-    declined_hint = declined_project_token_hint(reaper_project)
+    # action='reap': this path really is MATCHING, so the zero-row-no-op
+    # consequence is the true one here (contrast _run_write_decision).
+    declined_hint = declined_project_token_hint(reaper_project, action='reap')
     if declined_hint is not None:
         logger.warning('reap-decisions: %s', declined_hint)
 
