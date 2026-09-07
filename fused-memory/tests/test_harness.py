@@ -19955,13 +19955,16 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
     reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at a
     spread of guards that divert or suppress real work: the external-dep,
     cross-repo and substrate-flip block-and-escalate paths and the orphan-L0
-    reaper's DISMISS branch in `orchestrator/harness.py`, plus
-    `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`. That
-    population is enumerated authoritatively, in `path::symbol` form, in the
-    `FINDING_TASK_ESCALATION_LEVEL` comment block of
-    `fused_memory/reconciliation/finding_task_escalation.py` — read it there
-    rather than restating it, and do not reintroduce bare line pins (CLAUDE.md:
-    cite as `path/to/module.py::symbol`, never `module.py:1234`).
+    reaper's DISMISS branch in `orchestrator/harness.py`, plus TWO sites in
+    `orchestrator/workflow.py`. That population is enumerated authoritatively,
+    in `path::symbol` form, in the `FINDING_TASK_ESCALATION_LEVEL` comment block
+    of `fused_memory/reconciliation/finding_task_escalation.py` — read it there
+    rather than restating it here, and do not reintroduce bare line pins
+    (CLAUDE.md: cite as `path/to/module.py::symbol`, never `module.py:1234`).
+    Deliberately a POINTER and not a summary-with-names: an earlier revision
+    named one of the two workflow.py sites and read as if that were the whole
+    set, which is how the block's own list came to be missing one (see the
+    correction note in it).
 
     A recon-authored L1 would answer YES to every one of them, turning a
     PASSIVE observation into a gate on dispatch. The two assertions below are
