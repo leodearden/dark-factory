@@ -3532,11 +3532,15 @@ def test_report_includes_merge_idle_and_would_defer_columns(
     commit_epoch = 1_800_000_000
     now = 2_000_000_000.0
     # unit->(merge_idle, ts_epoch) heartbeat fixture, or None for "no file".
+    # SYNTHETIC names (task 4890): these four feed a local _write_heartbeat
+    # closure, so they name FILES. synthetic_unit(...) still matches the real
+    # `orchestrator-*.service` glob the script enumerates with, so the fake
+    # list-units stdout below stays faithful.
     units = [
-        "orchestrator-alpha.service",  # idle: fresh + merge_idle=True
-        "orchestrator-bravo.service",  # busy: fresh + merge_idle=False
-        "orchestrator-charlie.service",  # stale: ts_epoch far outside the fresh window
-        "orchestrator-delta.service",  # absent: no heartbeat file at all
+        synthetic_unit("alpha"),  # idle: fresh + merge_idle=True
+        synthetic_unit("bravo"),  # busy: fresh + merge_idle=False
+        synthetic_unit("charlie"),  # stale: ts_epoch far outside the fresh window
+        synthetic_unit("delta"),  # absent: no heartbeat file at all
     ]
     start_epochs = {u: commit_epoch + 100 for u in units}  # all fresh vs. commit
 
@@ -3703,7 +3707,7 @@ def test_report_extended_columns_stay_read_only(
 
     commit_epoch = 1_800_000_000
     now = 2_000_000_000.0
-    unit = "orchestrator-echo.service"
+    unit = synthetic_unit("echo")  # SYNTHETIC: a heartbeat FILE is written for it
     start_epoch = commit_epoch + 100  # fresh
 
     recorded_calls: list[list[str]] = []
@@ -4126,7 +4130,22 @@ def _boundary_make_fake_systemctl(base_dir, *, running_units, units=None):
 
 
 def _boundary_write_heartbeat(fleet_dir, unit, **overrides):
-    """Write a heartbeat JSON matching fleet_heartbeat.py's on-disk contract."""
+    """Write a heartbeat JSON matching fleet_heartbeat.py's on-disk contract.
+
+    Every unit name handed in must be SYNTHETIC (task 3799, extended to this
+    helper by task 4890). This is the heartbeat-WRITING seam -- the point where
+    a name starts naming a FILE in whatever directory ORCH_FLEET_DIR currently
+    resolves to -- so checking it here covers every caller, including the ones
+    nobody has written yet, and cannot touch the in-process contract pins
+    elsewhere in this file. Without it the live-fleet leak guard, which is keyed
+    on the `orchestrator-fake` prefix, would report all-clear on a
+    production-shaped heartbeat written into the live dir. See
+    test_boundary_write_heartbeat_rejects_a_real_unit_name for the hazard.
+    """
+    assert_synthetic_units(
+        [unit],
+        where="tests/scripts/test_orchestrator_watchdog.py::_boundary_write_heartbeat",
+    )
     fleet_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "unit": unit,
@@ -4856,8 +4875,9 @@ def test_boundary9_report_mixed_fleet_seven_columns(
 
     commit_epoch = 1_800_000_000
     now = 2_000_000_000.0
-    unit_stale = "orchestrator-stale.service"  # started before the commit, busy heartbeat
-    unit_fresh = "orchestrator-fresh.service"  # started after the commit, idle heartbeat
+    # SYNTHETIC (task 4890): heartbeat FILES are written for both below.
+    unit_stale = synthetic_unit("stale")  # started before the commit, busy heartbeat
+    unit_fresh = synthetic_unit("fresh")  # started after the commit, idle heartbeat
     units = [unit_stale, unit_fresh]
     start_epochs = {unit_stale: commit_epoch - 100, unit_fresh: commit_epoch + 100}
 
