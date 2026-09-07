@@ -22,7 +22,10 @@ import functools
 import importlib.util
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -367,6 +370,171 @@ class TestHoldLease:
         assert len(both) == 2
         assert after_inner_released == outer
         assert self._names(lease_dir) == []
+
+
+def _wait_for_marker(marker_path: Path, timeout: float = 5.0) -> bool:
+    """Poll for *marker_path* to appear; return False on timeout.
+
+    Test-side synchronisation only, and bounded, so a child that fails to
+    start cannot hang the suite forever.  Mirrors
+    ``shared/tests/test_verify_admission.py::_wait_for_marker``.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if marker_path.exists():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+#: Inline stdlib child: takes a real lease in another process, signals
+#: readiness with a marker file, then blocks so the parent can observe it —
+#: and, in the SIGKILL case, can kill it without any chance of cleanup
+#: running.  The construction mirrors
+#: ``shared/tests/test_verify_admission.py::_SELF_HEAL_CHILD_SRC``, which
+#: already demonstrates the kernel-release mechanism passing on this
+#: toolchain.
+_LIVE_HOLDER_CHILD_SRC = (
+    'import fcntl, json, os, sys, time\n'
+    'fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o644)\n'
+    'fcntl.flock(fd, fcntl.LOCK_EX)\n'
+    "os.write(fd, json.dumps({'owner': sys.argv[3], 'pid': os.getpid()}).encode())\n"
+    "open(sys.argv[2], 'w').write('ready')\n"
+    'time.sleep(60)\n'
+)
+
+
+class TestLiveLeasesSeesOnlyLivingHolders:
+    """Liveness is the flock, never the file and never a clock.
+
+    This class is where the no-TTL premise is paid for.  If a lease that
+    outlived its holder still read as live, the 6-hourly cron would be
+    wedged by the first bake-off that ever crashed, and the design would
+    need the expiry it deliberately does not have.
+    """
+
+    def test_it_reports_a_lease_held_in_this_process(self, lease_dir):
+        mod = _mod()
+
+        with mod.hold_lease(owner='e2-bake-off gw2'):
+            live = mod.live_leases()
+
+        assert len(live) == 1
+        assert live[0]['owner'] == 'e2-bake-off gw2'
+        assert live[0]['pid'] == os.getpid()
+
+    def test_it_reports_nothing_once_that_holder_has_exited(self, lease_dir):
+        mod = _mod()
+
+        with mod.hold_lease(owner='e2-bake-off'):
+            pass
+
+        assert mod.live_leases() == []
+
+    def test_it_reports_a_lease_held_by_another_live_process(self, lease_dir):
+        """The case that actually matters: the cron is a DIFFERENT process
+        from the run it must not reap, so an in-process-only probe would
+        pass every test here and protect nothing in production."""
+        mod = _mod()
+        lease_dir.mkdir(parents=True)
+        marker = lease_dir.parent / 'ready.marker'
+        lease_path = lease_dir / 'other-process.lease'
+        proc = subprocess.Popen([
+            sys.executable, '-c', _LIVE_HOLDER_CHILD_SRC,
+            str(lease_path), str(marker), 'bake-off-in-another-shell',
+        ])
+        try:
+            assert _wait_for_marker(marker), 'child never signalled readiness'
+
+            live = mod.live_leases()
+
+            assert [record['owner'] for record in live] == [
+                'bake-off-in-another-shell',
+            ]
+            assert live[0]['pid'] == proc.pid
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_a_sigkilled_holder_stops_being_reported_with_no_cleanup(
+        self, lease_dir,
+    ):
+        """The single most load-bearing assertion in this file.
+
+        A SIGKILLed holder runs no `finally`, no atexit and no signal
+        handler — its lease file is still on disk afterwards, and this
+        asserts so, because that is exactly the residue a file-existence
+        guard would mistake for a live run and be wedged by forever.  The
+        kernel drops the flock on process death, so the probe sees the truth
+        with no TTL, no clock and no pid check.
+        """
+        mod = _mod()
+        lease_dir.mkdir(parents=True)
+        marker = lease_dir.parent / 'ready.marker'
+        lease_path = lease_dir / 'doomed.lease'
+        proc = subprocess.Popen([
+            sys.executable, '-c', _LIVE_HOLDER_CHILD_SRC,
+            str(lease_path), str(marker), 'a-run-that-is-about-to-die',
+        ])
+        try:
+            assert _wait_for_marker(marker), 'child never signalled readiness'
+            assert len(mod.live_leases()) == 1
+
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+            proc = None
+
+            assert lease_path.exists(), 'a SIGKILLed holder cleans nothing up'
+            assert mod.live_leases() == []
+        finally:
+            if proc is not None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_it_returns_empty_and_does_not_raise_when_the_directory_is_absent(
+        self, lease_dir,
+    ):
+        """The state of a machine that has never run an integration test.
+        This is called from an unattended cron job whose contract is
+        "always exits 0"."""
+        mod = _mod()
+        assert not lease_dir.exists()
+
+        assert mod.live_leases() == []
+
+    @pytest.mark.parametrize('body', [b'', b'not json at all', b'{"owner":'])
+    def test_a_corrupt_body_degrades_the_diagnostic_not_the_guard(
+        self, lease_dir, body,
+    ):
+        """A holder killed between creating its file and writing its record
+        is still HOLDING the flock.  Reading its body must not be able to
+        decide whether it exists — the filename stands in for the owner and
+        the lease is still reported."""
+        mod = _mod()
+        lease_dir.mkdir(parents=True)
+        marker = lease_dir.parent / 'ready.marker'
+        lease_path = lease_dir / 'half-written.lease'
+        lease_path.write_bytes(body)
+        child = (
+            'import fcntl, os, sys, time\n'
+            'fd = os.open(sys.argv[1], os.O_RDWR)\n'
+            'fcntl.flock(fd, fcntl.LOCK_EX)\n'
+            "open(sys.argv[2], 'w').write('ready')\n"
+            'time.sleep(60)\n'
+        )
+        proc = subprocess.Popen(
+            [sys.executable, '-c', child, str(lease_path), str(marker)],
+        )
+        try:
+            assert _wait_for_marker(marker), 'child never signalled readiness'
+
+            live = mod.live_leases()
+
+            assert len(live) == 1
+            assert live[0]['owner'] == 'half-written.lease'
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 class TestSweep:
