@@ -224,3 +224,102 @@ def test_date_skew_makes_the_documented_candidate_query_pick_the_wrong_merge(
         'contained-before rc=1 means the branch was not in main before X, so X IS the '
         'merge that brought it in -- the stampable arm'
     )
+
+
+def test_a_merge_created_from_the_branch_side_puts_the_task_tip_at_caret_1(
+    tmp_path: Path,
+) -> None:
+    """``$c^1`` is main-just-before-the-merge only when the merge was made ON main.
+
+    Build the merge from the TASK side: ``git checkout -b integ task/T``
+    then ``git merge --no-ff main``, and fast-forward main onto it.  The
+    merge lands on main and ``task/T``'s own ref never advances -- exactly
+    the state the rc=0 arm inspects -- but its first parent is the task
+    tip, not main.  The runbook's ``contained-before`` check then exits 0
+    trivially and the arm reads "unrelated later merge, do not stamp",
+    losing a merge sha it was holding.
+
+    ``orchestrator/src/orchestrator/git_ops.py::GitOps.merge_to_main``
+    always merges FROM main, so a dark-factory landing is safe; a target
+    project reached through ``skills/orchestrate/SKILL.md``'s call site
+    merges by its own convention, which is what makes this reachable.
+    """
+    root = tmp_path / 'repo'
+    _new_repo(root)
+
+    _commit(root, 'base', 'base.txt')
+    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    _commit(root, 'work', 'work.txt')
+    task_tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
+
+    # main advances, so the landing genuinely needs a merge commit.
+    _git(root, 'checkout', 'main')
+    mainadv = _commit(root, 'mainadv', 'main.txt')
+
+    # The merge is created ON THE TASK SIDE, then fast-forwarded onto main.
+    _git(root, 'checkout', '-b', 'integ', f'task/{TASK_ID}')
+    _git(root, 'merge', '--no-ff', 'main', '-m', 'Merge main into integ')
+    merge = _git(root, 'rev-parse', 'HEAD')
+    _git(root, 'checkout', 'main')
+    _git(root, 'merge', '--ff-only', 'integ')
+
+    assert _git(root, 'rev-parse', 'main') == merge
+    assert _git(root, 'rev-parse', f'task/{TASK_ID}') == task_tip, (
+        "the task ref must still sit at its pre-merge tip -- that is the state the rc=0 "
+        'arm inspects, and it is what makes the ^1 mix-up reachable'
+    )
+
+    # (1) The first parent is the TASK side, not main.
+    assert _git(root, 'rev-parse', f'{merge}^1') == task_tip
+    assert _git(root, 'rev-parse', f'{merge}^2') == mainadv
+
+    candidate = _candidate_topo(root, TASK_ID)
+    assert candidate == merge, 'the ladder must select this merge as the candidate'
+
+    # (2) The runbook's check on ^1 gives the FALSE "do not stamp" verdict...
+    assert _contained_before(root, TASK_ID, f'{candidate}^1') == 0, (
+        'with the task tip at ^1 the containment check exits 0 trivially, which the '
+        'rc=0 arm reads as "unrelated later merge, do not stamp" -- a false skip of a '
+        'merge sha the agent was already holding'
+    )
+
+    # (3) ...while the main-side parent gives the correct one.
+    assert _contained_before(root, TASK_ID, f'{candidate}^2') == 1, (
+        'against the MAIN-side parent the branch is correctly not-yet-contained: this '
+        'IS the merge that brought it in'
+    )
+
+
+def test_a_merge_created_on_main_puts_main_at_caret_1(tmp_path: Path) -> None:
+    """The control for the pin above: merge direction is what decides ``^1``.
+
+    Same history, merged the dark-factory way (``git merge --no-ff
+    task/T`` from main).  Here ``^1`` IS main-just-before-the-merge and the
+    containment check renders the correct verdict, so the previous test
+    pins a direction-dependent hazard rather than a universal one.
+    """
+    root = tmp_path / 'repo'
+    _new_repo(root)
+
+    _commit(root, 'base', 'base.txt')
+    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    _commit(root, 'work', 'work.txt')
+    task_tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
+
+    _git(root, 'checkout', 'main')
+    mainadv = _commit(root, 'mainadv', 'main.txt')
+    _git(root, 'merge', '--no-ff', f'task/{TASK_ID}', '-m', f'Merge task/{TASK_ID} into main')
+    merge = _git(root, 'rev-parse', 'HEAD')
+
+    assert _git(root, 'rev-parse', f'{merge}^1') == mainadv, (
+        'a merge created on main has main-just-before-the-merge as its first parent'
+    )
+    assert _git(root, 'rev-parse', f'{merge}^2') == task_tip
+
+    candidate = _candidate_topo(root, TASK_ID)
+    assert candidate == merge
+    assert _contained_before(root, TASK_ID, f'{candidate}^1') == 1, (
+        'merged from main, the documented ^1 check renders the correct "this IS the '
+        'merge that brought it in" verdict -- so the hazard above is about merge '
+        'DIRECTION, not about the check itself'
+    )
