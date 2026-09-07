@@ -254,16 +254,29 @@ class TestTheEventCarriesNoEnvelopeMarkup:
 
     def test_no_value_of_the_event_carries_markup(self):
         record = make_fact()
+        # THE TWO SPECIMENS NEED TWO PREDICATES, because ``pattern`` and
+        # ``misclose`` are different things (the middleware keeps them apart on
+        # purpose, PRD 2.2). ``pattern`` is the ENUMERATED envelope literal
+        # ``detect`` matched. ``misclose`` is the tag that actually drifted,
+        # verbatim — a raw sentinel by this module's own import-time predicate,
+        # but not one of ``ENVELOPE_LITERALS``, so ``detect`` does not see it.
+        # Asserting ``detect`` on both would make the control silently vacuous
+        # on the mis-close half.
         assert detect(record['pattern']) is not None, (
             'the specimen must actually be markup, or this control proves '
             'nothing'
         )
-        assert detect(record['misclose']) is not None
+        assert any(seq in record['misclose'] for seq in _FORBIDDEN_SEQUENCES), (
+            'the mis-close specimen must actually be a raw sentinel'
+        )
 
         event = plan_markup_stamp.build_event(record, now=_Clock())
 
         for name, value in event.items():
             assert detect(value) is None, f'{name} carries envelope markup'
+            assert not any(seq in str(value) for seq in _FORBIDDEN_SEQUENCES), (
+                f'{name} carries a raw envelope sentinel'
+            )
 
     def test_the_encoded_event_carries_markup_nowhere(self):
         """Asserted on the WHOLE encoding, not merely field by field.
