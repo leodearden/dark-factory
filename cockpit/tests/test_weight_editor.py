@@ -138,3 +138,79 @@ class TestKnownProjects:
         result = known_projects(records, decisions, {'': 1.0})
 
         assert result == []
+
+
+class TestKnownProjectsOffersCanonicalNamesOnly:
+    """The picker offers ONE name per project (task 3812).
+
+    known_projects is the operator-facing half of the same invariant
+    registry_reader and load_priorities enforce on the scorer's side: the
+    name offered here becomes a project_weights KEY, and priority.score()
+    looks that key up with an already-canonical item.project. Offering a raw
+    spelling would therefore let an operator set a weight that silently never
+    applies -- the exact new silent failure task 3807's design decision named
+    as the reason it stopped short of this work.
+
+    The fold is applied to all three input channels locally and is
+    deliberately redundant with the upstream folds: normalize_project_token
+    is idempotent, so it costs nothing, and it makes the guarantee LOCAL to
+    the picker rather than contingent on three remote callers (CockpitApp's
+    scanner is a DI seam -- a fake or future scanner can hand this function
+    raw records).
+    """
+
+    def test_one_name_from_three_spellings_across_all_three_channels(self):
+        from cockpit.panes.weight_editor import known_projects
+
+        result = known_projects(
+            [_make_session(project='dark-factory')],
+            [_make_decision(project='df')],
+            {'DARK_FACTORY': 1.0},
+        )
+
+        assert result == ['dark_factory']
+
+    def test_distinct_tokens_stay_distinct(self):
+        """Collapse guard: the fold merges SPELLINGS, never distinct
+        projects. A cwd-basename token and a synthetic one each stay their
+        own offered entry."""
+        from cockpit.panes.weight_editor import known_projects
+
+        records = [
+            _make_session(session_slug='s-1', project='orchestrator'),
+            _make_session(session_slug='s-2', project='fm-neutral-classifier-cwd-_3yp2s4h'),
+            _make_session(session_slug='s-3', project='dark-factory'),
+        ]
+
+        result = known_projects(records, [], {})
+
+        assert result == [
+            'dark_factory',
+            'fm_neutral_classifier_cwd_3yp2s4h',
+            'orchestrator',
+        ]
+
+    def test_result_stays_sorted_and_deduped_after_folding(self):
+        from cockpit.panes.weight_editor import known_projects
+
+        records = [
+            _make_session(session_slug='s-1', project='ZETA'),
+            _make_session(session_slug='s-2', project='zeta'),
+            _make_session(session_slug='s-3', project='alpha-one'),
+        ]
+
+        result = known_projects(records, [_make_decision(project='alpha_one')], {'zeta': 1.0})
+
+        assert result == ['alpha_one', 'zeta']
+
+    def test_whitespace_only_name_folds_to_empty_and_is_excluded(self):
+        """Fold FIRST, then drop empties: a whitespace-only name is truthy as
+        a raw string but folds to the '' unset sentinel, and must be excluded
+        rather than offered as a nameless picker row."""
+        from cockpit.panes.weight_editor import known_projects
+
+        result = known_projects(
+            [_make_session(project='   ')], [_make_decision(project='')], {'  ': 1.0}
+        )
+
+        assert result == []
