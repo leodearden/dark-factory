@@ -39,6 +39,7 @@ if str(REPO_ROOT.resolve()) not in sys.path:
 from df_pytest_isolation import (  # noqa: E402
     PIPE_CLOSING_LEAKER_SRC,
     assert_synthetic_units,
+    load_scaled_grace,
     read_leaked_pid,
     run_in_new_session,
     synthetic_unit,
@@ -4138,11 +4139,56 @@ def _boundary_write_heartbeat(fleet_dir, unit, **overrides):
     (fleet_dir / f"{unit}.json").write_text(json.dumps(payload))
 
 
+# _BOUNDARY_DRAIN_RUN_BASE_SECS: UNCHANGED from the literal 20 this default
+# has always carried. Deliberately not raised -- the fix for task 4207 is to
+# scale under contention, not to widen the idle path, and load_scaled_grace
+# floors at its base so an unloaded run is byte-identical to before.
+_BOUNDARY_DRAIN_RUN_BASE_SECS = 20
+
+# _BOUNDARY_DRAIN_RUN_CAP_SECS: derived, not tuned -- same value and same
+# reasoning as `tests/scripts/test_spawn_claude.py::_SPAWN_RUN_CAP_SECS`.
+# This budget bounds ONE subprocess and does not feed wait_proof_grace_secs
+# (the callers relying on the default set no force-fire grace), so the only
+# ceiling above it is pytest-timeout's --timeout=300 per-test axe that both
+# test roots' test_command carries. 120 leaves >2x margin inside it.
+#
+# A subprocess wall-clock bound can afford a larger cap than a readiness
+# wait: it is paid only when the child genuinely HANGS, since the happy path
+# returns the instant the child exits. Against the 11.66s the flaking caller
+# measured in isolation, 120 is ~10x.
+_BOUNDARY_DRAIN_RUN_CAP_SECS = 120
+
+
+def _boundary_drain_run_budget(base_secs: int = _BOUNDARY_DRAIN_RUN_BASE_SECS) -> int:
+    """Load-scale the drain-script spawn's must-not-hang bound.
+
+    Delegates entirely to `df_pytest_isolation::load_scaled_grace`, which
+    floors at *base_secs*: an idle host returns 20 exactly, so this can only
+    LENGTHEN the budget under contention and never shortens or slows an
+    unloaded run. Pinned by
+    `test_boundary_drain_run_budget_is_load_scaled_off_the_unchanged_base`.
+    """
+    return load_scaled_grace(base_secs, cap_secs=_BOUNDARY_DRAIN_RUN_CAP_SECS)
+
+
 def _boundary_run_drain_script(
-    bin_dir, state_path, fleet_dir, clock_file, *, env=None, timeout=20
+    bin_dir, state_path, fleet_dir, clock_file, *, env=None, timeout=None
 ):
     """Run the REAL restart-all-orchestrators.sh --drain with the fake
     systemctl prepended onto PATH.
+
+    ``timeout=None`` (the default) resolves to `_boundary_drain_run_budget`:
+    load-scaled and FLOORED at 20, so an unloaded run is unchanged. An
+    explicit ``timeout=`` still wins and is NOT scaled -- callers that pin a
+    number are pinning a behaviour (a deliberate timeout test, or a value
+    coupled to a wait-proving grace), and double-scaling it would break the
+    invariant they encode. This is the same never-double-scale rule
+    `tests/scripts/test_spawn_claude.py::_run_spawn` documents.
+
+    The sentinel is ``None`` rather than a scaled DEFAULT EXPRESSION on
+    purpose: a default argument is evaluated once at IMPORT, which would
+    freeze whatever loadavg happened to hold at collection time instead of
+    sampling it at each spawn.
 
     The spawn is SESSION-ISOLATED via run_in_new_session (task 3798), not a
     plain subprocess.run: subprocess.run's timeout kill()s the direct child
@@ -4160,6 +4206,7 @@ def _boundary_run_drain_script(
     For the spawn path specifically, the "which of the two copies did I fix"
     hazard can no longer recur -- there is only one copy.
     """
+    timeout = _boundary_drain_run_budget() if timeout is None else timeout
     full_env = dict(os.environ)
     full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
