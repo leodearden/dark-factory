@@ -395,7 +395,7 @@ def _make_consumer_fixture(
       - A wired _FakeMergeWorker (optionally pre-halted)
       - A real EscalationQueue (so _escalate_train_halt end-to-end registers owner)
     """
-    from _orch_helpers import pydantic_spec
+    from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
     from orchestrator.config import OrchestratorConfig
 
@@ -413,7 +413,7 @@ def _make_consumer_fixture(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
     config.max_consecutive_infra_resumes = 3
     config.max_consecutive_merge_thrash = 3
     config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
@@ -670,7 +670,7 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
     which wires merge_queue but NOT merge_worker.  merge_worker is None → probe
     is False → plain _mark_blocked(escalate_to_human=True) fall-through.
     """
-    from _orch_helpers import pydantic_spec
+    from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
     from orchestrator.config import OrchestratorConfig
 
@@ -697,7 +697,7 @@ async def test_consumer_no_merge_worker_preserves_existing_path(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
     config.max_consecutive_infra_resumes = 3
     config.max_consecutive_merge_thrash = 3
     config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse

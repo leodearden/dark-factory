@@ -1327,6 +1327,76 @@ def assert_update_wire_mode(
     return arguments
 
 
+# task 4389: THE canonical name for the inert `project_root` placeholders in the
+# TaskWorkflow mock-config factories.  Spelled distinctly — and project-prefixed
+# — following the `_REVIEW_PROJECT_ROOT` precedent in test_out_of_band_routing.py
+# so a future grep-driven cleanup can tell a deliberate placeholder from an
+# accident, and so it cannot collide with an unrelated project's fixture the way
+# the generic `/tmp/non-existent-for-test` it replaces could.
+MOCK_WORKFLOW_PROJECT_ROOT = Path('/tmp/dark-factory-mock-workflow-project-root')
+"""Inert stand-in ``project_root`` for the ``TaskWorkflow`` mock-config factories.
+
+THE CLASSIFICATION RECORD for the 16 sites task 3551's sweep flagged and task
+4389 adjudicated.  Every one sits inside a module-level ``_make*()`` factory
+building a ``MagicMock(spec_set=pydantic_spec(OrchestratorConfig))`` for a
+``TaskWorkflow``, across 15 modules.  All 16 now point here, which also collapses
+an accidental divergence: ``test_workflow_train_halt_owner.py`` spelled the same
+sentinel two ways (``/tmp/non-existent-for-test`` at one factory,
+``/tmp/non-existent`` at the other).
+
+VERDICT: deliberate-but-inert, and deliberately NOT sandboxed under ``tmp_path``.
+Recorded here rather than in prose because the lineage's demonstrated failure
+mode is prose being re-litigated from scratch by each successor task.
+
+WHY NOT ``tmp_path``.  Structural, not preference: those factories are plain
+module-level FUNCTIONS, not fixtures, so they cannot request ``tmp_path`` at all.
+Sandboxing them means threading a ``project_root`` argument through 16 factories
+and ~327 call sites across 15 files — a large mechanical diff and real
+merge-conflict surface — for no measured benefit, per the three measurements
+below.
+
+THE THREE MEASUREMENTS (task 4389, on this branch):
+
+1. THE VALUE IS INERT.  Flipping all 16 literals to an EXISTING directory
+   (``/tmp``) and running the 15 affected modules gave 327 passed; flipping them
+   to a pytest-SHAPED path gave 327 passed again.  So nothing branches on the
+   path's non-existence, and the ``ReviewCheckpoint`` ``/tmp/pytest`` trap that
+   task 3551 hit does not reach these modules.
+2. NOTHING HAS EVER WRITTEN THROUGH THEM.  ``/tmp/non-existent-for-test``,
+   ``/tmp/non-existent`` and ``/tmp/pr`` were all ABSENT from the machine's
+   ``/tmp`` despite a long history of suite runs.  Four ``config.project_root``
+   reads can ``mkdir(parents=True)``:
+   ``workflow.py::TaskWorkflow._archive_then_cleanup_config_dir`` and
+   ``workflow.py::TaskWorkflow._invoke`` (transcript archive),
+   ``workflow.py::TaskWorkflow._run_scoped_verification_with_infra_retry``
+   (verify archive), and ``workflow.py::TaskWorkflow._maybe_file_chronic_flakes``
+   (chronic-flake ledger).  Their absence on disk is direct evidence those paths
+   are never reached under these mocks.  There is no file leak to fix — and that
+   claim is not left to age, it is TRIPWIRED by
+   ``TestMockWorkflowProjectRootContract`` in test_steward_scaffolding_guards.py,
+   which asserts this path does not exist.
+3. ``ReviewCheckpoint`` IS NOT ON THIS PATH.  Its ``/tmp/pytest`` guard is the
+   first statement of ``review_checkpoint.py::ReviewCheckpoint._run_review``
+   only, and the comment on ``workflow.py::_ESCALATION_CAPABLE_ROLES`` states
+   explicitly that ``ReviewCheckpoint`` runs in its own dispatcher rather than
+   through ``TaskWorkflow._invoke`` — which is why measurement 1's pytest-shaped
+   path was harmless.
+
+FOR A NEW FACTORY, PREFER THE SANDBOXED SHAPE.  This constant is the adjudicated
+resting place for the EXISTING population, not the pattern to copy.
+``test_workflow_already_done.py::_make`` is the in-tree shape to follow: a
+``_make(*, project_root: Path, ...)`` keyword parameter with each call site
+passing ``tmp_path / 'proj'``.  A new factory that takes that argument keeps its
+writes inside pytest's retention sweep by construction and needs no adjudication
+at all.
+
+The full sanctioned population of absolute-``/tmp`` ``project_root`` literals —
+this constant and the five review-family sites — is censused by
+``TestAbsoluteTmpProjectRootLiteralsAreCensused`` in
+test_steward_scaffolding_guards.py, each with its recorded reason.
+"""
+
+
 def assert_sandboxed_project_root(project_root, tmp_path: Path) -> None:
     """Assert *project_root* is a created directory strictly below *tmp_path*.
 
@@ -1376,12 +1446,25 @@ def assert_sandboxed_project_root(project_root, tmp_path: Path) -> None:
     either ``.resolve()`` would leave that case silently accepted, so clause 4's
     message reports the resolved target alongside the value as given.
 
-    ONE sanctioned exception, recorded here so a reader who greps the invariant
-    finds it instead of "fixing" the site: ``test_out_of_band_routing.py``'s
-    ``_REVIEW_PROJECT_ROOT`` must NOT be sandboxed, because
-    ``ReviewCheckpoint._run_review`` raises ``ValueError`` on any
-    ``project_root`` containing ``/tmp/pytest`` — moving it under a pytest path
-    fails 5 tests in that module (measured, task 3551).
+    SANCTIONED EXCEPTIONS are not listed here, and deliberately so.  This
+    paragraph used to name ``test_out_of_band_routing.py``'s
+    ``_REVIEW_PROJECT_ROOT`` as the ONE exception; task 4389 adjudicated 17 more
+    absolute-``/tmp`` ``project_root`` literals, at which point a hand-maintained
+    list in this docstring would have become exactly the fourth drifting address
+    the lineage above warns about — authoritative-looking, unasserted, and wrong
+    the moment the population changes.
+
+    The record instead lives at ONE address that is CHECKED:
+    ``_ADJUDICATED_TMP_PROJECT_ROOT_LITERALS`` in
+    test_steward_scaffolding_guards.py, whose census fails if a module grows an
+    un-adjudicated literal, and equally if an allowlisted one disappears.  A
+    reader who greps this invariant and lands on a root outside ``tmp_path``
+    should look there for its reason before "fixing" the site.  The shape of
+    those exceptions, for orientation only: ``ReviewCheckpoint._run_review``
+    raises ``ValueError`` on any ``project_root`` containing ``/tmp/pytest``
+    (moving ``_REVIEW_PROJECT_ROOT`` under a pytest path fails 5 tests —
+    measured, task 3551), and ``MOCK_WORKFLOW_PROJECT_ROOT`` above is an inert
+    placeholder for factories that structurally cannot request ``tmp_path``.
 
     Raises:
         AssertionError: naming both the offending value and the sandbox root it

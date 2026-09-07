@@ -32,7 +32,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import VerifyResult
@@ -73,7 +73,7 @@ def _make(
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
 
     if update_task_raises:
         update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
