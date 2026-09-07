@@ -12229,6 +12229,24 @@ class GitOps:
         (normal case).  When *base_sha* is provided the worktree is created
         at that exact commit, supporting speculative merges where N+1 is
         merged against N's merge commit.
+
+        The ``git worktree add --detach`` is retried up to
+        :data:`_WORKTREE_ADD_MAX_ATTEMPTS` times with ``0.5 * attempt``
+        seconds of linear backoff on a TRANSIENT failure, and fails
+        IMMEDIATELY on a non-retryable one (ENOSPC), via the same
+        git_ops.py::GitOps._worktree_add_with_retry driver
+        git_ops.py::GitOps.ephemeral_worktree uses — one loop and one
+        predicate for both worktree-minting sites.
+
+        The retry is grounded, not defensive: five archived occurrences
+        under ``data/verify-logs`` (tasks 3692, 3420, 3869, 4215, 4545;
+        2026-08-10 -> 2026-09-06) blocked a merge outright on a single
+        non-zero rc here, and the transient shapes among them —
+        4215's ``fatal: Invalid path '.../.git/worktrees/_merge-9a6caddb'``
+        on git's ADMINISTRATIVE registration path, and 4545's bare
+        ``Preparing worktree (detached HEAD ae6e7e9)`` — are exactly what a
+        bounded retry absorbs. 3692's ``No space left on device`` is the
+        counter-case the predicate fast-fails.
         """
         import uuid
         merge_id = uuid.uuid4().hex[:8]
@@ -12252,9 +12270,8 @@ class GitOps:
             checkout_ref = base_sha.strip()
 
         # Detached worktree avoids "branch already checked out" error
-        rc, _, err = await _run(
-            ['git', 'worktree', 'add', '--detach', str(merge_wt), checkout_ref],
-            cwd=self.project_root,
+        rc, out, err, attempts = await self._worktree_add_with_retry(
+            merge_wt, checkout_ref, label='_create_merge_worktree',
         )
         if rc != 0:
             raise RuntimeError(f'Failed to create merge worktree: {err}')
