@@ -8,16 +8,18 @@ enforcement; this script is the same question asked *before* you try, so a
 curator can see the offending ids without burning a refused transition.
 
 It is deliberately a THIN wrapper, not a second opinion. The CLI and the
-seam are single-sourced on THREE things (INV-5): the PREDICATE
+seam are single-sourced on FOUR things (INV-5): the PREDICATE
 (``consolidation_gate.py::evaluate_closure``), the SCROLL CAP (imported
 from ``TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT`` rather than restated),
 and — since task 4808 — the UNSTAMPED DERIVATION
-(``consolidation_gate.py::resolve_unstamped_live_ids``). Those three
-imports are what make "the same mechanical check" literally true: a CLI
-with its own predicate, merely its own cap, or its own idea of which
-observed members are strays could report ``closed`` on a view the seam
-would reject, which is exactly the false reassurance this whole gate
-exists to prevent.
+(``consolidation_gate.py::resolve_unstamped_live_ids``) together with the
+EXISTENCE PROBE it awaits (``consolidation_gate.py::closure_exists_probe``,
+which owns the ``project_id``-first argument adaptation both callers would
+otherwise each re-spell). Those four imports are what make "the same
+mechanical check" literally true: a CLI with its own predicate, merely its
+own cap, its own idea of which observed members are strays, or its own
+probe scoping could report ``closed`` on a view the seam would reject,
+which is exactly the false reassurance this whole gate exists to prevent.
 
 This replaces the old prose "re-search before merging" guard with something
 a curator can actually execute.
@@ -104,6 +106,7 @@ from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     EXIT_CLOSED,
     EXIT_NOT_CLOSED,
     GATE_METADATA_KEY,
+    closure_exists_probe,
     evaluate_closure,
     resolve_unstamped_live_ids,
 )
@@ -222,30 +225,8 @@ def load_task_metadata(project_root: str, task_id: str, tag: str) -> Any:
     return row[0]
 
 
-def _exists_probe(memory: Any):
-    """An ``async (memory_id, *, project_id) -> bool`` over the real store.
-
-    ``MemoryService.get_memory_by_id(project_id, memory_id)`` returns
-    ``{'id', 'content', 'metadata'}`` or ``None`` on a genuine miss, and
-    PROPAGATES a read ``TimeoutError`` rather than collapsing it into
-    ``None`` — which is exactly what lets ``run()``'s store-failure wrapper
-    report "could not check" instead of silently reading a timed-out probe
-    as "no strays".
-
-    A named function rather than a lambda so a test can assert its scoping:
-    *project_id* is that method's FIRST positional argument, and an
-    argument-order slip here would probe the wrong scope and report every
-    candidate as absent.
-    """
-
-    async def exists(memory_id: str, *, project_id: str) -> bool:
-        return (await memory.get_memory_by_id(project_id, memory_id)) is not None
-
-    return exists
-
-
 async def scroll_cluster(
-    memory: Any, project_id: str, topic: str, block: Any = None
+    memory: Any, project_id: str, topic: str, *, block: Any
 ) -> dict:
     """Bind the real fused-memory scroll for one topic.
 
@@ -255,12 +236,21 @@ async def scroll_cluster(
 
     Also derives ``unstamped`` (task 4808) from *block*'s inert provenance,
     through the SHARED ``consolidation_gate.py::resolve_unstamped_live_ids``
-    — never a second copy of that subtraction, so the CLI and the seam
-    cannot disagree about which observed members are strays. It stays INSIDE
-    this function on purpose: ``run()``'s existing
+    (over the SHARED ``consolidation_gate.py::closure_exists_probe``) — never
+    a second copy of that subtraction nor of that argument adaptation, so the
+    CLI and the seam cannot disagree about which observed members are strays.
+    It stays INSIDE this function on purpose: ``run()``'s existing
     ``except Exception -> available: False -> EXIT_USAGE`` wrapper then
     covers a probe failure with no new branch, matching the store-outage
     asymmetry with the seam this module's docstring already argues for.
+
+    *block* is REQUIRED and KEYWORD-ONLY, matching the convention
+    ``consolidation_gate.py::evaluate_closure`` sets for its own
+    completeness arguments. A defaulted *block* would let a caller silently
+    fall back to pre-4808 behaviour — ``resolve_unstamped_live_ids`` treats a
+    non-Mapping gate block as "no candidates" by design — and reintroduce
+    exactly the SILENT DORMANCY this task exists to remove, with no error and
+    no log line to notice it by.
     """
     filters = {"topic": topic}
     total = await memory.count_memories_by_metadata(project_id, filters)
@@ -274,7 +264,7 @@ async def scroll_cluster(
     unstamped = await resolve_unstamped_live_ids(
         block,
         members=members,
-        exists=_exists_probe(memory),
+        exists=closure_exists_probe(memory),
         project_id=project_id,
     )
     return {
@@ -375,7 +365,9 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
 
     store_error: str | None = None
     try:
-        scrolled = await scroll_cluster(memory, args.project_id, topic, block)
+        scrolled = await scroll_cluster(
+            memory, args.project_id, topic, block=block
+        )
     except Exception as exc:  # noqa: BLE001 — any store failure is "could not check"
         store_error = f"{type(exc).__name__}: {exc}"
         scrolled = {

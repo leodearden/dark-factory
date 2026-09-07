@@ -1035,6 +1035,192 @@ class TestResolveUnstampedLiveIds:
     def test_it_is_exported(self):
         assert 'resolve_unstamped_live_ids' in consolidation_gate.__all__
 
+
+class TestUnstampedProbeBudget:
+    """The probe loop is CAPPED, and the cap is disclosed rather than silent.
+
+    This loop runs on the `done` transition itself, inside
+    `TaskInterceptor._consolidation_closure_error`, while
+    `provenance.observed_members` is written verbatim with no cap of its own —
+    so an uncapped loop is unbounded work on the write path.  The cap mirrors
+    the scroll's, which is the sibling collaborator reading the same store for
+    the same cluster.
+    """
+
+    @staticmethod
+    def _strays(n):
+        return [_uuid(1000 + i) for i in range(n)]
+
+    def test_the_cap_matches_the_scroll_cap(self):
+        """A cap on one store collaborator and none (or a different one) on
+        the other is an asymmetry with no justification."""
+        from fused_memory.middleware.task_interceptor import TaskInterceptor
+
+        assert (
+            consolidation_gate._UNSTAMPED_PROBE_LIMIT
+            == TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT
+        )
+
+    @pytest.mark.asyncio
+    async def test_at_the_cap_every_candidate_is_still_probed(self):
+        limit = consolidation_gate._UNSTAMPED_PROBE_LIMIT
+        strays = self._strays(limit)
+        probe = _RecordingProbe(live=[])
+        await consolidation_gate.resolve_unstamped_live_ids(
+            _prov(strays),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        )
+        assert len(probe.calls) == limit
+
+    @pytest.mark.asyncio
+    async def test_past_the_cap_the_loop_stops_at_the_limit(self):
+        """Bounded work on the write path — not `len(observed_members)`."""
+        limit = consolidation_gate._UNSTAMPED_PROBE_LIMIT
+        strays = self._strays(limit + 5)
+        probe = _RecordingProbe(live=strays)
+        live = await consolidation_gate.resolve_unstamped_live_ids(
+            _prov(strays),
+            members=_well_formed_cluster(2),
+            exists=probe,
+            project_id='dark_factory',
+        )
+        assert len(probe.calls) == limit
+        assert [c[0] for c in probe.calls] == strays[:limit]
+        assert live == tuple(strays[:limit])
+
+    @pytest.mark.asyncio
+    async def test_overflow_is_DISCLOSED_not_silent(self, caplog):
+        """A partial probe that said nothing would read as \'no strays\'.  The
+        WARNING is the disclosure, and it is emitted HERE — in the one shared
+        derivation — so the CLI and the seam cannot disclose differently."""
+        import logging  # noqa: PLC0415
+
+        limit = consolidation_gate._UNSTAMPED_PROBE_LIMIT
+        strays = self._strays(limit + 1)
+        with caplog.at_level(logging.WARNING, logger=consolidation_gate.__name__):
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov(strays),
+                members=_well_formed_cluster(2),
+                exists=_RecordingProbe(live=[]),
+                project_id='dark_factory',
+            )
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'probe budget' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert str(limit + 1) in message and str(limit) in message
+        # The first id it did NOT look at, so the log names what is unchecked.
+        assert strays[limit] in message
+
+    @pytest.mark.asyncio
+    async def test_under_the_cap_says_nothing(self, caplog):
+        """The measured corpus is 2-6 observed members: the common path must
+        not emit an operational warning."""
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger=consolidation_gate.__name__):
+            await consolidation_gate.resolve_unstamped_live_ids(
+                _prov(self._strays(3)),
+                members=_well_formed_cluster(2),
+                exists=_RecordingProbe(live=[]),
+                project_id='dark_factory',
+            )
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+class _StubMemoryService:
+    """Just ``get_memory_by_id`` — no store, no config, no MemoryService.
+
+    Duck-typed on purpose: :func:`closure_exists_probe` must not need a real
+    ``MemoryService``, which is what keeps this module a stdlib-only import
+    leaf and lets both callers bind it without importing the service layer.
+    """
+
+    def __init__(self, *, result=None, raises=None):
+        self.result = result
+        self.raises = raises
+        self.calls = []
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        self.calls.append((project_id, memory_id))
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+class TestClosureExistsProbe:
+    """The ONE home of the probe binding, for both production callers.
+
+    ``server/main.py::_wire_closure_collaborators`` and
+    ``scripts/check_consolidation_closure.py::scroll_cluster`` each used to
+    close over their own copy of this adaptation, with a private test apiece.
+    Both copies spelled the same ``project_id``-first argument order, which is
+    precisely the slip that would probe the wrong scope and report every
+    candidate absent — so it is tested ONCE, here, against the shared factory.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_payload_dict_reads_as_live(self):
+        stub = _StubMemoryService(
+            result={'id': _uuid(42), 'content': 'x', 'metadata': {}}
+        )
+        probe = consolidation_gate.closure_exists_probe(stub)
+        assert await probe(_uuid(42), project_id='dark_factory') is True
+
+    @pytest.mark.asyncio
+    async def test_none_reads_as_absent(self):
+        """The two outcomes that distinguish live-but-unstamped from
+        absorbed-and-deleted."""
+        probe = consolidation_gate.closure_exists_probe(
+            _StubMemoryService(result=None)
+        )
+        assert await probe(_uuid(42), project_id='dark_factory') is False
+
+    @pytest.mark.asyncio
+    async def test_project_id_is_the_first_positional_argument(self):
+        """``MemoryService.get_memory_by_id(self, project_id, memory_id)``.
+        An argument-order slip here would probe the wrong scope and silently
+        report every candidate as absent."""
+        stub = _StubMemoryService(result=None)
+        await consolidation_gate.closure_exists_probe(stub)(
+            _uuid(42), project_id='dark_factory'
+        )
+        assert stub.calls == [('dark_factory', _uuid(42))]
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_propagates_rather_than_collapsing_to_false(self):
+        """``get_memory_by_id``\'s docstring makes this contract explicit: the
+        timeout is PROPAGATED, not collapsed into None, precisely so a caller
+        can tell "genuinely absent" from "backend timed out".  Collapsing it
+        here would let an unreadable store read as "no strays"."""
+        probe = consolidation_gate.closure_exists_probe(
+            _StubMemoryService(raises=TimeoutError('qdrant point read'))
+        )
+        with pytest.raises(TimeoutError):
+            await probe(_uuid(42), project_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_it_plugs_straight_into_the_derivation(self):
+        """The factory and its one consumer agree on the collaborator shape —
+        the property two separately-maintained copies could not guarantee."""
+        stray = _uuid(42)
+        stub = _StubMemoryService(result={'id': stray, 'content': 'x'})
+        assert await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([stray]),
+            members=_well_formed_cluster(2),
+            exists=consolidation_gate.closure_exists_probe(stub),
+            project_id='dark_factory',
+        ) == (stray,)
+        assert stub.calls == [('dark_factory', stray)]
+
+    def test_it_is_exported(self):
+        assert 'closure_exists_probe' in consolidation_gate.__all__
+
+
 class TestHandrolledMemberEnumeration:
     """The SECOND gap: a gate filed with no `x_recon_consolidation_gate` block
     at all, for which the seam is fully dormant and `set_task_status(done)`

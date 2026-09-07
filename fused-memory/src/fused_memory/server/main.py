@@ -24,6 +24,9 @@ from functools import partial  # noqa: E402
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
+    closure_exists_probe,
+)
 from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
@@ -2135,36 +2138,6 @@ def _acquire_singleton_lock() -> None:
         raise SystemExit(1) from None
 
 
-def _closure_exists_for(memory_service: Any):
-    """Task 4808: the consolidation-gate existence probe, bound to the store.
-
-    Returns an async ``(memory_id, *, project_id) -> bool`` over
-    ``MemoryService.get_memory_by_id(project_id, memory_id)``, which returns
-    ``{'id', 'content', 'metadata'}`` or ``None`` on a genuine miss — the two
-    outcomes that distinguish a live-but-unstamped cluster member from one
-    that was absorbed and deleted.
-
-    A read ``TimeoutError`` is deliberately NOT caught here. That method
-    propagates it rather than collapsing it into ``None`` precisely so a
-    caller can tell "genuinely absent" from "backend timed out", and
-    ``TaskInterceptor._consolidation_closure_error`` already converts it into
-    the same fail-closed refusal an unreadable scroll produces. Swallowing it
-    here would let an unreadable store read as "no strays".
-
-    MODULE-LEVEL rather than nested inside :func:`run_server` so
-    ``tests/test_consolidation_closure_seam.py::TestProductionProbeWiring``
-    can import and exercise it without a store. Kept as its own factory —
-    rather than inlined into :func:`_wire_closure_collaborators`, which is
-    its only production caller — precisely so those four behavioural tests
-    keep a seam to reach.
-    """
-
-    async def _closure_exists(memory_id: str, *, project_id: str) -> bool:
-        return (await memory_service.get_memory_by_id(project_id, memory_id)) is not None
-
-    return _closure_exists
-
-
 def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> None:
     """Hand the interceptor all three consolidation-gate closure collaborators.
 
@@ -2179,8 +2152,11 @@ def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> N
 
     All three are ``project_id``-adapting wrappers: the ``MemoryService``
     methods take that scope FIRST positionally, while the interceptor passes
-    it by keyword because it resolves scope per task. *exists* is built by
-    the module-level ``server/main.py::_closure_exists_for``, whose docstring
+    it by keyword because it resolves scope per task. *exists* is NOT built
+    here — it comes from the shared
+    ``consolidation_gate.py::closure_exists_probe``, the same factory
+    ``scripts/check_consolidation_closure.py`` binds, so the CLI and the seam
+    cannot disagree about that argument adaptation (INV-5). Its docstring
     carries the fail-closed ``TimeoutError`` contract.
 
     ONE wiring block, called from both ``TaskInterceptor`` construction sites
@@ -2219,7 +2195,7 @@ def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> N
     task_interceptor.set_consolidation_scroll(
         _closure_scroll,
         count=_closure_count,
-        exists=_closure_exists_for(memory_service),
+        exists=closure_exists_probe(memory_service),
     )
 
 

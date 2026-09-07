@@ -61,7 +61,8 @@ leaf module with a regression test.  Nothing here may import
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import logging
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -72,6 +73,8 @@ from fused_memory.memory_metadata import (
 )
 from fused_memory.utils.validation import is_full_uuid
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     'EXIT_CLOSED',
     'EXIT_NOT_CLOSED',
@@ -81,6 +84,7 @@ __all__ = [
     'ClosureVerdict',
     'ConsolidationGateSpec',
     'build_consolidation_gate_task',
+    'closure_exists_probe',
     'evaluate_closure',
     'handrolled_member_enumeration',
     'render_consolidation_gate_section',
@@ -250,6 +254,13 @@ def _payload_id(payload: Any) -> str:
     return str(value) if value is not None else ''
 
 
+#: The most existence probes ``resolve_unstamped_live_ids`` will issue for one
+#: gate.  200 MIRRORS ``TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT``: the two
+#: collaborators read the same store for the same cluster, so a cap on one and
+#: none on the other is an asymmetry with no justification.  See that function
+#: for why exceeding it WARNS and proceeds rather than refusing.
+_UNSTAMPED_PROBE_LIMIT = 200
+
 #: Hand-rolled member-enumeration keys observed on real BLOCK-LESS gates.
 #: Measured from the live tasks.db on 2026-08-28 — see
 #: :func:`handrolled_member_enumeration` for the census and the decision.
@@ -267,7 +278,7 @@ def handrolled_member_enumeration(metadata: Any) -> tuple[str, list[Any]] | None
     THE DECISION THIS ENCODES: FLAG, DO NOT REFUSE.
 
     (i) ``operational_mode == 'gate'`` is a GENERIC human-gate marker, not a
-    consolidation marker — ``scripts/curator_gate_resolution_sweep.py::
+    consolidation marker — ``curator_gate_resolution_sweep.py::
     extract_open_gate_task_ids`` selects on exactly that value across the
     whole population.  So a blanket seam refusal for a block-less gate is not
     available: it would brick every unrelated gate.
@@ -394,6 +405,48 @@ def unstamped_candidates(
     return tuple(candidates)
 
 
+def closure_exists_probe(memory_service: Any) -> Callable[..., Awaitable[bool]]:
+    """The consolidation-gate existence probe, bound to a real store.
+
+    Returns the ``async (memory_id: str, *, project_id: str) -> bool``
+    collaborator :func:`resolve_unstamped_live_ids` awaits, over
+    ``MemoryService.get_memory_by_id(project_id, memory_id)`` — which returns
+    ``{'id', 'content', 'metadata'}`` or ``None`` on a genuine miss.  Those
+    two outcomes are what distinguish a live-but-unstamped cluster member
+    from one that was absorbed and deleted.
+
+    ONE HOME, TWO CALLERS (INV-5).  ``server/main.py::
+    _wire_closure_collaborators`` and ``scripts/check_consolidation_closure
+    .py::scroll_cluster`` both call this rather than each closing over their
+    own copy.  The thing being single-sourced is the ARGUMENT ORDER:
+    *project_id* is that method's FIRST POSITIONAL argument while the gate
+    passes scope by KEYWORD, and a slip in that adaptation would probe the
+    wrong scope and silently report every candidate as absent — a green
+    "no strays" manufactured out of a mis-wired call.  Two copies of that
+    adaptation is two places for the slip to happen and two test suites that
+    each only cover their own.  This is the FOURTH collaborator the CLI and
+    the seam share, alongside the predicate, the scroll cap and the unstamped
+    derivation.
+
+    *memory_service* is DUCK-TYPED, not imported: only ``get_memory_by_id``
+    is touched, so this module stays the stdlib-only import leaf its module
+    docstring requires and neither caller has to hand over a real
+    ``MemoryService`` in tests.
+
+    A read ``TimeoutError`` is deliberately NOT caught.  ``get_memory_by_id``
+    propagates it rather than collapsing it into ``None`` precisely so a
+    caller can tell "genuinely absent" from "backend timed out", and both
+    production callers already convert it into their own fail-closed outcome
+    (the seam refuses the transition; the CLI exits "could not check").
+    Swallowing it here would let an unreadable store read as "no strays".
+    """
+
+    async def exists(memory_id: str, *, project_id: str) -> bool:
+        return (await memory_service.get_memory_by_id(project_id, memory_id)) is not None
+
+    return exists
+
+
 async def resolve_unstamped_live_ids(
     gate_block: Any,
     *,
@@ -425,6 +478,28 @@ async def resolve_unstamped_live_ids(
     four live consolidated topics) and small otherwise, so concurrency would
     buy nothing and would obscure which probe raised.
 
+    CAPPED AT :data:`_UNSTAMPED_PROBE_LIMIT`, and the cap is DISCLOSED rather
+    than silently applied: this loop runs inside
+    ``TaskInterceptor._consolidation_closure_error``, i.e. on the ``done``
+    transition itself, while ``provenance.observed_members`` is written
+    verbatim by ``consolidation_gate.py::build_consolidation_gate_task`` with
+    no cap of its own.  Without a cap a gate filed over a pathological cluster
+    would serialise unbounded point reads there.  Overflow WARNS and probes
+    the first N rather than refusing, for two reasons.  (i) Proportionality:
+    the measured corpus is 2-6 observed members against a cap of 200, so the
+    branch is unreachable today and a refusal would be a brand-new brick risk
+    bought for nothing — the same FLAG-DON\'T-REFUSE call
+    :func:`handrolled_member_enumeration` records.  (ii) A large candidate set
+    is USUALLY A TRUNCATION ARTEFACT, not a real anomaly: on a truncated
+    scroll every observed member past the cap fails the ``live_ids``
+    subtraction, so refusing on overflow would manufacture an
+    ``scroll_unavailable`` out of a view ``evaluate_closure`` already refuses
+    (and describes more precisely) as ``scroll_incomplete``.  The verdict
+    itself carries no incompleteness marker for a capped probe — that would
+    need a new reason code in ``evaluate_closure``, which this task's plan
+    scopes out; the WARNING is the disclosure, and it is emitted HERE so the
+    CLI and the seam cannot disclose differently.
+
     Any exception PROPAGATES.  Both production callers already convert a
     failed store read into their own fail-closed outcome — the seam refuses
     the transition, the CLI exits "could not check" — so swallowing here would
@@ -439,8 +514,21 @@ async def resolve_unstamped_live_ids(
     """
     if exists is None:
         return ()
+    candidates = unstamped_candidates(gate_block, members=members)
+    if len(candidates) > _UNSTAMPED_PROBE_LIMIT:
+        logger.warning(
+            'consolidation closure probe budget exceeded: %d unstamped '
+            'candidates > cap %d; probing the first %d only, so this '
+            'derivation may UNDER-report strays for this gate. First '
+            'unprobed id: %s',
+            len(candidates),
+            _UNSTAMPED_PROBE_LIMIT,
+            _UNSTAMPED_PROBE_LIMIT,
+            candidates[_UNSTAMPED_PROBE_LIMIT],
+        )
+        candidates = candidates[:_UNSTAMPED_PROBE_LIMIT]
     live: list[str] = []
-    for candidate in unstamped_candidates(gate_block, members=members):
+    for candidate in candidates:
         if await exists(candidate, project_id=project_id):
             live.append(candidate)
     return tuple(live)

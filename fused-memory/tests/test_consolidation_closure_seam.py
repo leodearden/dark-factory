@@ -552,13 +552,22 @@ class TestSeamUnstampedEdgePolicies:
             'status': 'pending',
             'metadata': _prov_gate([stray]),
         }
-        interceptor.set_consolidation_scroll(
-            _scroll(_WELL_FORMED, total=500, live_ids=[stray])
-        )
+        scroll = _scroll(_WELL_FORMED, total=500, live_ids=[stray])
+        interceptor.set_consolidation_scroll(scroll)
         result = await _set_done(interceptor)
         codes = [r['code'] for r in result['reasons']]
         assert 'scroll_incomplete' in codes
         assert 'unstamped_cluster_member' not in codes
+        # The derivation still RUNS on a truncated view — the suppression lives
+        # in `evaluate_closure`, and the caller deliberately does not
+        # re-implement it (a second home for the truncation rule is the INV-5
+        # drift this module is single-sourced against). That means the probe is
+        # spent on a result `evaluate_closure` will discard, which is a real
+        # cost and is pinned here rather than left as an unasserted accident:
+        # a future short-circuit must flip this assertion CONSCIOUSLY, because
+        # skipping the derivation also narrows `_apply_waivers`' `live_universe`
+        # and could turn an applied waiver into `stale_waiver`.
+        assert scroll.probes == [(stray, resolve_project_id(_PROJECT_ROOT))]
 
     @pytest.mark.asyncio
     async def test_a_waiver_reaches_the_derived_id(self, interceptor, taskmaster):
@@ -594,65 +603,15 @@ class TestSeamUnstampedEdgePolicies:
 # --------------------------------------------------------------------------- #
 
 
-class _StubMemoryService:
-    """Just ``get_memory_by_id`` — no store, no config, no MemoryService."""
-
-    def __init__(self, *, result=None, raises=None):
-        self.result = result
-        self.raises = raises
-        self.calls = []
-
-    async def get_memory_by_id(self, project_id, memory_id):
-        self.calls.append((project_id, memory_id))
-        if self.raises is not None:
-            raise self.raises
-        return self.result
-
-
-class TestProductionProbeWiring:
-    @pytest.mark.asyncio
-    async def test_a_payload_dict_reads_as_live(self):
-        from fused_memory.server.main import _closure_exists_for
-
-        stub = _StubMemoryService(
-            result={'id': _uuid(42), 'content': 'x', 'metadata': {}}
-        )
-        probe = _closure_exists_for(stub)
-        assert await probe(_uuid(42), project_id='dark_factory') is True
-
-    @pytest.mark.asyncio
-    async def test_none_reads_as_absent(self):
-        """The two outcomes that distinguish live-but-unstamped from absorbed."""
-        from fused_memory.server.main import _closure_exists_for
-
-        probe = _closure_exists_for(_StubMemoryService(result=None))
-        assert await probe(_uuid(42), project_id='dark_factory') is False
-
-    @pytest.mark.asyncio
-    async def test_project_id_is_the_first_positional_argument(self):
-        """``MemoryService.get_memory_by_id(self, project_id, memory_id)``.
-        An argument-order slip here would probe the wrong scope and silently
-        report every candidate as absent."""
-        from fused_memory.server.main import _closure_exists_for
-
-        stub = _StubMemoryService(result=None)
-        probe = _closure_exists_for(stub)
-        await probe(_uuid(42), project_id='dark_factory')
-        assert stub.calls == [('dark_factory', _uuid(42))]
-
-    @pytest.mark.asyncio
-    async def test_a_timeout_propagates_rather_than_collapsing_to_false(self):
-        """``get_memory_by_id``\'s docstring makes this contract explicit: the
-        timeout is PROPAGATED, not collapsed into None, precisely so a caller
-        can tell "genuinely absent" from "backend timed out". Collapsing it
-        here would let an unreadable store read as "no strays"."""
-        from fused_memory.server.main import _closure_exists_for
-
-        probe = _closure_exists_for(
-            _StubMemoryService(raises=TimeoutError('qdrant point read'))
-        )
-        with pytest.raises(TimeoutError):
-            await probe(_uuid(42), project_id='dark_factory')
+# NOTE: the probe FACTORY's own unit tests (payload -> live, None -> absent,
+# project_id-first ordering, TimeoutError propagates) moved to
+# ``tests/test_consolidation_gate.py::TestClosureExistsProbe`` when
+# ``server/main.py::_closure_exists_for`` was replaced by the shared
+# ``consolidation_gate.py::closure_exists_probe`` the CLI binds too. What
+# belongs HERE is the property that is specific to this file: that
+# ``server/main.py`` actually WIRES that factory's product into the
+# interceptor, which ``TestClosureCollaboratorWiring`` below proves by
+# awaiting the captured collaborator.
 
 
 class _RecordingInterceptor:
