@@ -34,6 +34,13 @@ from fused_memory.utils.canonical_labels import (
 ARABIC_INDIC_THREE = '\u0663'  # ARABIC-INDIC DIGIT THREE
 FULLWIDTH_THREE = '\uff13'  # FULLWIDTH DIGIT THREE — the same hazard, a second block
 
+# Unicode letters that case-fold onto ASCII 's' and 'k' under re.IGNORECASE —
+# same escape-spelling rationale as above: U+212A KELVIN SIGN renders as an
+# ordinary 'K' in most terminals, so a literal-character fixture would be
+# unreviewable and would look like a duplicate of the ASCII case.
+LATIN_SMALL_LETTER_LONG_S = '\u017f'  # folds onto ASCII 's' under re.IGNORECASE
+KELVIN_SIGN = '\u212a'  # folds onto ASCII 'k' under re.IGNORECASE
+
 
 class TestReferentNodeName:
     """``Referent.node_name`` renders the graph node name the referent denotes.
@@ -544,6 +551,73 @@ class TestUnicodeDigitsAreNotTaskNumbers:
         scan = scan_content('see reify:12' + ARABIC_INDIC_THREE, group_id='dark_factory')
         assert scan.refs == ()
         assert scan.ambiguous == ()
+
+
+class TestTaskWordIsAsciiOnly:
+    """The literal word 'task(s)' is ASCII, meant to be matched
+    case-insensitively only across the ASCII 'a'-'z'/'A'-'Z' range. Python's
+    ``re`` performs FULL Unicode case folding under ``re.IGNORECASE`` on str
+    patterns, so a Unicode letter that case-folds onto an ASCII letter —
+    U+017F LATIN SMALL LETTER LONG S onto 's', U+212A KELVIN SIGN onto 'k' —
+    is accepted as if it were the ASCII letter itself, minting a referent
+    from a word that was never actually 'task'.
+
+    This is a false POSITIVE against :func:`scan_content`'s own
+    PRECISION-OVER-RECALL contract, the same direction as
+    :class:`TestUnicodeDigitsAreNotTaskNumbers` above but a DIFFERENT axis —
+    that class narrows the DIGITS, this one narrows the WORD.
+
+    It is WORSE than the digit case even though both are low likelihood: the
+    referent minted here carries a REAL ASCII number, so a lookalike
+    spelling of 'Task 5' names a task that EXISTS — a consumer doing
+    destructive edge surgery misattributes facts onto a LIVE node rather
+    than an obviously-junk one. And task 4174's digit narrowing does not
+    cover this: the number here was already ASCII: only the WORD was
+    spelled with a lookalike.
+
+    The standing ASCII regression guards are deliberately NOT copied into
+    this class, following the convention TestUnicodeDigitsAreNotTaskNumbers
+    documents for the same reason: TestParseNodeNameMatchesLocalForms and
+    TestScanContentFindsOwnProjectReferents already pin every ASCII spelling
+    ('task', 'tasks', 'Task', 'TASK', 'Tasks', 'TaSkS', 'task#5', 'task #5',
+    'Task: 5', ' tasks 9 ') and run on every commit; those ARE the proof
+    this narrowing disturbed nothing. A second copy here would be the very
+    lockstep duplication INV-5 exists to prevent.
+    """
+
+    def test_a_long_s_lookalike_mention_yields_no_referent(self):
+        content = 'ta' + LATIN_SMALL_LETTER_LONG_S + 'k 5'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+
+    def test_a_kelvin_sign_lookalike_mention_yields_no_referent(self):
+        content = 'tas' + KELVIN_SIGN + ' 5'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+
+    def test_a_lookalike_mention_in_prose_yields_no_referent(self):
+        content = 'blocked on ta' + LATIN_SMALL_LETTER_LONG_S + 'k 5 now'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+
+    def test_a_lookalike_on_the_optional_trailing_s_yields_no_referent(self):
+        """The lookalike lands on the OPTIONAL trailing 's' of 'tasks?' here,
+        a distinct code path from the stem substitutions above — verified to
+        match today."""
+        content = 'task' + LATIN_SMALL_LETTER_LONG_S + ' 5'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+
+    def test_a_long_s_lookalike_node_name_is_not_a_task_label(self):
+        assert parse_node_name('Ta' + LATIN_SMALL_LETTER_LONG_S + 'k 5') is None
+
+    def test_a_kelvin_sign_lookalike_node_name_is_not_a_task_label(self):
+        assert parse_node_name('Tas' + KELVIN_SIGN + ' 5') is None
+
+    def test_a_mixed_lookalike_substitution_is_not_a_task_label(self):
+        """Both lookalikes at once, replacing 's' and 'k' in the same word."""
+        name = 'ta' + LATIN_SMALL_LETTER_LONG_S + KELVIN_SIGN + ' 5'
+        assert parse_node_name(name) is None
 
 
 class TestQualifiedRefNeverSpansALineBreak:
