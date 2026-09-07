@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 
+from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware import candidate_key_escalation as cke_mod
 from fused_memory.middleware.candidate_key_escalation import (
     emit_residual_candidate_key_escalation,
@@ -125,3 +126,87 @@ def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp
     assert 'mixed_status' in detail, detail
     assert 'title_divergent' in detail, detail
     assert 'auto-heal' in detail.lower(), detail
+
+
+class TestDelegatesToTheSharedHelper:
+    """The filer BODY now lives in `middleware/_folded_escalation`."""
+
+    def test_forwards_this_modules_own_anchor_role_and_category(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: dict = {}
+
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-candidate-key-migration-1'
+
+        monkeypatch.setattr(cke_mod, 'file_folded_escalation', _spy)
+
+        result = emit_residual_candidate_key_escalation(
+            str(tmp_path),
+            [{'tag': 't', 'candidate_key': 'k', 'task_ids': ['1', '2'],
+              'count': 2, 'reason': 'mixed_status'}],
+        )
+
+        assert result == 'esc-candidate-key-migration-1'
+        assert seen['anchor_task_id'] == 'candidate-key-migration'
+        assert seen['agent_role'] == 'fused-memory/candidate-key-migration'
+        assert seen['category'] == 'candidate_key_residual_duplicates'
+        assert seen['severity'] == 'blocking'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_the_anchor_is_still_a_module_attribute_of_THIS_module(self):
+        """Cross-imported by tests/server/test_write_triage.py, and read from
+        its own home by the pairwise anchor-collision regression."""
+        assert cke_mod._ANCHOR_TASK_ID == 'candidate-key-migration'
+        assert cke_mod._AGENT_ROLE == 'fused-memory/candidate-key-migration'
+        assert cke_mod._CATEGORY == 'candidate_key_residual_duplicates'
+
+    def test_the_group_detail_construction_stays_in_THIS_module(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-candidate-key-migration-1'
+
+        monkeypatch.setattr(cke_mod, 'file_folded_escalation', _spy)
+
+        emit_residual_candidate_key_escalation(
+            str(tmp_path),
+            [{'tag': 'bug', 'candidate_key': 'ck-9', 'task_ids': ['7'],
+              'count': 1, 'reason': 'title_divergent'}],
+        )
+
+        assert "reason='title_divergent'" in seen['detail']
+        assert 'ux_tasks_candidate_key' in seen['detail']
+        assert 'residual duplicate candidate_key' in seen['summary']
+
+
+def test_a_queue_construction_failure_returns_none(tmp_path, monkeypatch):
+    """BEHAVIOUR CHANGE, pinned deliberately (task 4854).
+
+    Six of the seven copies of this filer skeleton guarded the queue
+    constructor; this one did NOT — even though its own docstring promises it
+    "NEVER raises: this is called from connection-open migration code, and a
+    raise here would defeat the self-gating step's own fail-safe guarantee".
+    Constructing an `EscalationQueue` creates its directory, so a read-only or
+    missing `project_root` turned a connection-open migration into a crash:
+    the exact outcome that docstring rules out.
+
+    Consolidating to one home forces a single answer, and the correct answer is
+    the one six siblings already implement and the seventh already documents.
+    """
+    def _explode(*_a, **_kw):
+        raise OSError('cannot create queue dir')
+
+    monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _explode)
+
+    assert emit_residual_candidate_key_escalation(
+        str(tmp_path),
+        [{'tag': 't', 'candidate_key': 'k', 'task_ids': ['1'], 'count': 1,
+          'reason': 'mixed_status'}],
+    ) is None
