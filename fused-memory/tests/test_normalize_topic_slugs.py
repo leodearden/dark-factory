@@ -1297,3 +1297,433 @@ class TestVerifyOldSlugsDrained:
     def test_a_stranded_slug_fails_the_run(self):
         assert 'legacy_slug_residue' in _mod.ERROR_OUTCOMES
         assert 'legacy_slug_residue' in _mod.SKIP_BUCKETS
+
+
+# ===========================================================================
+# pair_gate_blocks + the gate writer — the two-store lockstep
+# ===========================================================================
+#
+# ``metadata.x_recon_consolidation_gate`` is a Tier-C block on TASK metadata,
+# not Mem0 metadata: a genuinely different store, reached through the MCP
+# server rather than through a backend call.  Renaming the memories without
+# moving that block leaves the gate's closure scroll pointed at a slug no
+# record carries any more — the uncloseable-gate trap re-created at a NEW
+# address, which is strictly worse than leaving the snake_case slug alone.
+#
+# So the halves are planned as a pair and refused as a pair.  Every test below
+# exists to pin one edge of that atomicity.
+
+def _gate_task(
+    task_id: str,
+    topic: str,
+    *,
+    project_id: str = 'dark_factory',
+    project_root: str = '/repo',
+    **block_extras,
+) -> dict:
+    """One gate task as the MCP ``get_task`` read hands it over.
+
+    ``block_extras`` seed the SIBLING keys inside the block (``provenance``,
+    ``considered_and_kept``, ...) — the ones the patch must leave untouched.
+    """
+    block = {'topic': topic}
+    block.update(block_extras)
+    return {
+        'id': task_id,
+        'project_id': project_id,
+        'project_root': project_root,
+        'metadata': {
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            _mod.GATE_METADATA_KEY: block,
+        },
+    }
+
+
+def _stateful_service(records: dict[str, dict]) -> MagicMock:
+    """A ``MemoryService`` double that REMEMBERS what was written to it.
+
+    The gate lockstep's most important property — that a refused gate patch
+    leaves the memory half at its ORIGINAL value — is a statement about the
+    store's end state, not about a call list.  A stateless double can only
+    show the calls; it cannot show that the corpus came back to where it
+    started, which is the whole claim.
+    """
+    service = MagicMock()
+
+    async def _get(*, project_id, memory_id):
+        record = records.get(memory_id)
+        return None if record is None else {
+            'id': memory_id, 'metadata': dict(record['metadata']),
+        }
+
+    async def _update(*, memory_id, project_id, metadata_patch, **kwargs):
+        record = records.get(memory_id)
+        if record is None:
+            return {'error_type': 'not_found', 'error': memory_id}
+        record['metadata'].update(metadata_patch)
+        return {'status': 'updated', 'id': memory_id, 'metadata_patched': True}
+
+    service.get_memory_by_id = AsyncMock(side_effect=_get)
+    service.update_memory = AsyncMock(side_effect=_update)
+    return service
+
+
+def _store(*topics: tuple[str, str]) -> dict[str, dict]:
+    return {mid: {'metadata': {'topic': topic}} for mid, topic in topics}
+
+
+def _client(*, result: object = None, error: Exception | None = None) -> MagicMock:
+    """A ``FusedMemoryClient`` double.  Injected so no test opens a socket."""
+    client = MagicMock()
+    if error is not None:
+        client.call_tool = AsyncMock(side_effect=error)
+    else:
+        client.call_tool = AsyncMock(
+            return_value=result if result is not None
+            else {'id': '4220', 'updated': True, 'message': 'ok'}
+        )
+    return client
+
+
+class TestPairGateBlocks:
+    """``pair_gate_blocks(renames, gate_tasks) -> (groups, skips)``.
+
+    Pure.  It decides WHICH renames travel with WHICH gate task, before
+    anything is written, so the pairing is reproducible from the plan alone.
+    """
+
+    def test_a_gate_on_a_renamed_slug_is_paired_with_it(self):
+        renames = [_mod.Rename('dark_factory', 'm1', 'mem0_tombstone_coverage',
+                               'mem0-tombstone-coverage')]
+        gates = [_gate_task('4220', 'mem0_tombstone_coverage')]
+
+        groups, skips = _mod.pair_gate_blocks(renames, gates)
+
+        assert len(groups) == 1
+        assert groups[0].old_topic == 'mem0_tombstone_coverage'
+        assert groups[0].new_topic == 'mem0-tombstone-coverage'
+        assert groups[0].gate_task_id == '4220'
+        assert skips == []
+
+    def test_the_patch_moves_the_topic_and_touches_no_sibling_key(self):
+        provenance = {'report_run': 'r1', 'observed_members': ['a'],
+                      'detector': 'd', 'authoritative': False}
+        kept = [{'id': 'x', 'why': 'peer'}]
+        gates = [_gate_task('4220', 'gate_topic', provenance=provenance,
+                            considered_and_kept=kept)]
+        renames = [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
+
+        groups, _skips = _mod.pair_gate_blocks(renames, gates)
+
+        assert groups[0].gate_block == {
+            'topic': 'gate-topic',
+            'provenance': provenance,
+            'considered_and_kept': kept,
+        }
+
+    def test_the_patch_does_not_mutate_the_source_task(self):
+        gates = [_gate_task('4220', 'gate_topic', provenance={'a': 1})]
+        renames = [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')]
+
+        _mod.pair_gate_blocks(renames, gates)
+
+        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_topic'
+
+    def test_every_rename_on_the_slug_joins_the_group(self):
+        renames = [
+            _mod.Rename('dark_factory', f'm{i}', 'gate_topic', 'gate-topic')
+            for i in range(4)
+        ]
+        groups, _skips = _mod.pair_gate_blocks(
+            renames, [_gate_task('4220', 'gate_topic')])
+
+        assert len(groups) == 1
+        assert [r.memory_id for r in groups[0].renames] == ['m0', 'm1', 'm2', 'm3']
+
+    def test_a_rename_with_no_gate_still_forms_a_group(self):
+        """Most topics are not gates; those renames must proceed normally."""
+        renames = [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')]
+
+        groups, skips = _mod.pair_gate_blocks(renames, [])
+
+        assert len(groups) == 1
+        assert groups[0].gate_task_id is None
+        assert groups[0].gate_block is None
+        assert skips == []
+
+    def test_a_gate_is_matched_within_its_own_project(self):
+        renames = [_mod.Rename('reify', 'm1', 'gate_topic', 'gate-topic')]
+        gates = [_gate_task('4220', 'gate_topic', project_id='dark_factory')]
+
+        groups, skips = _mod.pair_gate_blocks(renames, gates)
+
+        assert groups[0].gate_task_id is None
+        assert _by_reason(skips, 'orphan_gate_topic')
+
+    def test_a_gate_whose_slug_matches_no_record_is_an_orphan_not_a_silence(self):
+        gates = [_gate_task('4774', 'ghost_topic')]
+
+        groups, skips = _mod.pair_gate_blocks([], gates)
+
+        assert groups == []
+        orphans = _by_reason(skips, 'orphan_gate_topic')
+        assert len(orphans) == 1
+        assert orphans[0]['gate_task_id'] == '4774'
+        assert orphans[0]['gate_topic'] == 'ghost_topic'
+        assert orphans[0]['project_id'] == 'dark_factory'
+
+    def test_a_gate_already_on_a_conforming_slug_is_not_an_orphan(self):
+        """Nothing to migrate is not the same fact as a dangling gate."""
+        groups, skips = _mod.pair_gate_blocks([], [_gate_task('4220', 'good-topic')])
+
+        assert groups == []
+        assert skips == []
+
+    def test_a_gate_task_without_a_block_is_ignored(self):
+        task = {'id': '9', 'project_id': 'dark_factory', 'metadata': {}}
+
+        groups, skips = _mod.pair_gate_blocks([], [task])
+
+        assert (groups, skips) == ([], [])
+
+    def test_groups_are_sorted_for_a_clean_diff(self):
+        renames = [
+            _mod.Rename('reify', 'm9', 'z_topic', 'z-topic'),
+            _mod.Rename('dark_factory', 'm2', 'b_topic', 'b-topic'),
+            _mod.Rename('dark_factory', 'm1', 'a_topic', 'a-topic'),
+        ]
+        groups, _skips = _mod.pair_gate_blocks(renames, [])
+
+        assert [(g.project_id, g.new_topic) for g in groups] == [
+            ('dark_factory', 'a-topic'),
+            ('dark_factory', 'b-topic'),
+            ('reify', 'z-topic'),
+        ]
+
+    def test_the_group_is_frozen(self):
+        groups, _skips = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'a_topic', 'a-topic')], [])
+        assert dataclasses.is_dataclass(groups[0])
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            groups[0].new_topic = 'other'  # type: ignore[misc]
+
+
+class TestGateLockstepWriter:
+    """``rename_group(memory_service, group, *, apply, client)``.
+
+    The pair is ALL-OR-NOTHING.  Memory renames land first; the gate patch
+    follows only once they ALL succeeded; and if either half fails the group
+    ends at its original state, so no gate is ever left scrolling a slug no
+    record carries.
+    """
+
+    @pytest.mark.asyncio
+    async def test_memory_renames_land_first_then_the_gate_patch(self):
+        records = _store(('m1', 'gate_topic'))
+        service = _stateful_service(records)
+        client = _client()
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [_gate_task('4220', 'gate_topic')])
+
+        results, gate_row = await _mod.rename_group(
+            service, group, apply=True, client=client)
+
+        assert [r['outcome'] for r in results] == ['renamed']
+        assert records['m1']['metadata']['topic'] == 'gate-topic'
+        assert gate_row['outcome'] == 'gate_patched'
+        # The write is a NARROW merge of the one block, never a whole-blob
+        # replace: `update_task` refuses any replace carrying `done_provenance`.
+        (tool, payload), _ = client.call_tool.call_args
+        assert tool == 'update_task'
+        assert payload['id'] == '4220'
+        assert payload['metadata_mode'] == 'merge'
+        assert payload['metadata'] == {
+            _mod.GATE_METADATA_KEY: {'topic': 'gate-topic'},
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_writes_neither_half(self):
+        records = _store(('m1', 'gate_topic'))
+        service = _stateful_service(records)
+        client = _client()
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [_gate_task('4220', 'gate_topic')])
+
+        results, gate_row = await _mod.rename_group(
+            service, group, apply=False, client=client)
+
+        assert [r['outcome'] for r in results] == ['would_rename']
+        assert gate_row['outcome'] == 'would_patch_gate'
+        assert records['m1']['metadata']['topic'] == 'gate_topic'
+        service.update_memory.assert_not_awaited()
+        client.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_memory_failure_withholds_the_gate_patch(self):
+        """The other direction of the pair: a failed half holds the whole group."""
+        records = _store(('m1', 'gate_topic'))  # m2 is absent -> memory_not_found
+        service = _stateful_service(records)
+        client = _client()
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
+             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
+            [_gate_task('4220', 'gate_topic')])
+
+        results, gate_row = await _mod.rename_group(
+            service, group, apply=True, client=client)
+
+        assert {r['outcome'] for r in results} >= {'memory_not_found'}
+        client.call_tool.assert_not_awaited()
+        assert gate_row['outcome'] == 'gate_lockstep_failed'
+        assert gate_row['half'] == 'memory'
+
+    @pytest.mark.asyncio
+    async def test_a_refused_gate_patch_undoes_the_memory_half(self):
+        """The dangerous direction, and the reason the group exists at all.
+
+        ``update_task`` reports some rejections by RETURNING an error envelope
+        inside a successful JSON-RPC frame, so a caller guarding only against
+        exceptions would score a refused gate move as a completed one — and
+        leave the gate scrolling a slug the records no longer carry.
+        """
+        records = _store(('m1', 'gate_topic'), ('m2', 'gate_topic'))
+        service = _stateful_service(records)
+        client = _client(result={'success': False, 'error': 'done_provenance_via_update_task'})
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
+             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
+            [_gate_task('4220', 'gate_topic')])
+
+        results, gate_row = await _mod.rename_group(
+            service, group, apply=True, client=client)
+
+        assert gate_row['outcome'] == 'gate_lockstep_failed'
+        assert gate_row['half'] == 'gate'
+        assert 'done_provenance_via_update_task' in str(gate_row['error'])
+        # Net effect: the slug is exactly where it started in BOTH stores.
+        assert records['m1']['metadata']['topic'] == 'gate_topic'
+        assert records['m2']['metadata']['topic'] == 'gate_topic'
+        assert [r['outcome'] for r in results] == [
+            'gate_lockstep_failed', 'gate_lockstep_failed']
+
+    @pytest.mark.asyncio
+    async def test_a_raising_gate_patch_undoes_the_memory_half_too(self):
+        records = _store(('m1', 'gate_topic'))
+        service = _stateful_service(records)
+        client = _client(error=RuntimeError('mcp down'))
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [_gate_task('4220', 'gate_topic')])
+
+        _results, gate_row = await _mod.rename_group(
+            service, group, apply=True, client=client)
+
+        assert gate_row['outcome'] == 'gate_lockstep_failed'
+        assert 'mcp down' in str(gate_row['error'])
+        assert records['m1']['metadata']['topic'] == 'gate_topic'
+
+    @pytest.mark.asyncio
+    async def test_a_failed_undo_is_named_on_the_row_not_swallowed(self):
+        records = _store(('m1', 'gate_topic'))
+        service = _stateful_service(records)
+        client = _client(error=RuntimeError('mcp down'))
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [_gate_task('4220', 'gate_topic')])
+
+        calls = {'n': 0}
+        forward = service.update_memory.side_effect
+
+        async def _fail_the_undo(**kwargs):
+            calls['n'] += 1
+            if calls['n'] > 1:
+                raise RuntimeError('undo failed')
+            return await forward(**kwargs)
+
+        service.update_memory = AsyncMock(side_effect=_fail_the_undo)
+
+        _results, gate_row = await _mod.rename_group(
+            service, group, apply=True, client=client)
+
+        assert gate_row['outcome'] == 'gate_lockstep_failed'
+        assert gate_row['undo_failures']
+        assert 'undo failed' in str(gate_row['undo_failures'])
+
+    @pytest.mark.asyncio
+    async def test_an_ungated_group_never_reaches_the_client(self):
+        records = _store(('m1', 'plain_topic'))
+        service = _stateful_service(records)
+        client = _client()
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')], [])
+
+        results, gate_row = await _mod.rename_group(
+            service, group, apply=True, client=client)
+
+        assert [r['outcome'] for r in results] == ['renamed']
+        assert gate_row is None
+        client.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_ungated_group_runs_without_a_client_at_all(self):
+        """A run that reaches no gate must not require an MCP handshake."""
+        records = _store(('m1', 'plain_topic'))
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic')], [])
+
+        results, gate_row = await _mod.rename_group(
+            _stateful_service(records), group, apply=True, client=None)
+
+        assert [r['outcome'] for r in results] == ['renamed']
+        assert gate_row is None
+
+    @pytest.mark.asyncio
+    async def test_a_gated_group_with_no_client_is_a_lockstep_failure(self):
+        """Unable to move the gate is the same verdict as refused to move it."""
+        records = _store(('m1', 'gate_topic'))
+        service = _stateful_service(records)
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic')],
+            [_gate_task('4220', 'gate_topic')])
+
+        _results, gate_row = await _mod.rename_group(
+            service, group, apply=True, client=None)
+
+        assert gate_row['outcome'] == 'gate_lockstep_failed'
+        assert records['m1']['metadata']['topic'] == 'gate_topic'
+
+    @pytest.mark.asyncio
+    async def test_an_already_normalized_record_is_not_undone(self):
+        """Undo reverses THIS run's writes; it does not rewrite what it found."""
+        records = _store(('m1', 'gate-topic'), ('m2', 'gate_topic'))
+        service = _stateful_service(records)
+        client = _client(error=RuntimeError('mcp down'))
+        group, = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'gate_topic', 'gate-topic'),
+             _mod.Rename('dark_factory', 'm2', 'gate_topic', 'gate-topic')],
+            [_gate_task('4220', 'gate_topic')])
+
+        _results, gate_row = await _mod.rename_group(
+            service, group, apply=True, client=client)
+
+        assert gate_row['outcome'] == 'gate_lockstep_failed'
+        assert records['m1']['metadata']['topic'] == 'gate-topic'
+        assert records['m2']['metadata']['topic'] == 'gate_topic'
+
+
+class TestGateLockstepOutcomesAreGraded:
+    """A held pair must fail the run — it is unfinished work, not a no-op."""
+
+    def test_gate_lockstep_failed_is_an_error_outcome(self):
+        assert 'gate_lockstep_failed' in _mod.ERROR_OUTCOMES
+
+    def test_both_gate_outcomes_are_pre_seeded_buckets(self):
+        for bucket in ('gate_lockstep_failed', 'orphan_gate_topic'):
+            assert bucket in _mod.SKIP_BUCKETS, bucket
+
+    def test_an_orphan_gate_does_not_by_itself_fail_the_run(self):
+        """A dangling gate predates this sweep; reporting it is the deliverable."""
+        assert 'orphan_gate_topic' not in _mod.ERROR_OUTCOMES
