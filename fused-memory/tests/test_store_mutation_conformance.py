@@ -496,11 +496,6 @@ class TestReadOnlyModuleIsNotACandidate:
 
 SCRIPTS_ROOT = pathlib.Path(__file__).parents[1] / 'scripts'
 
-#: Union of every token a qualifying ast.Call's callee name could possibly
-#: be. Used only as a raw-text prefilter, never as the classification
-#: itself -- see _discover_candidate_scripts.
-_PREFILTER_TOKENS = MUTATING_CALL_NAMES | GENERIC_MUTATING_VERBS
-
 #: Measured at plan time (task 4848) by running this same two-tier detector
 #: over the repo's 43 scripts. A FLOOR, not a pin: discovery is free to find
 #: MORE as new mutating scripts are added (and does -- the live count already
@@ -511,21 +506,33 @@ CANDIDATE_FLOOR = 14
 
 
 def _discover_candidate_scripts() -> list[pathlib.Path]:
-    """Every script under SCRIPTS_ROOT whose AST contains a Tier A/B mutating call.
+    """Every script under SCRIPTS_ROOT, recursively, whose AST contains a
+    Tier A/B mutating call.
 
-    A raw ``read_text()`` prefilter runs first: a file whose text contains
-    NONE of the Tier A names nor any Tier B verb cannot possibly contain a
-    qualifying ``ast.Call`` -- the identifier has to appear literally in the
-    source for the call to exist -- so the prefilter is a strict superset of
-    the AST criterion and cannot hide a real candidate. It exists purely so
-    the majority of scripts that plainly never mutate are not parsed and
-    memoised (via parse_python_module's session cache) for the rest of the
-    run.
+    ``rglob``, not ``glob`` (amendment, task 4848): ``fused-memory/scripts/``
+    has at least one subdirectory (``local_memory_models_eval/``) holding a
+    real script, and a non-recursive walk would silently place anything
+    mutating under it outside both the GUARDED and the KNOWN UNGUARDED
+    column -- undetected, not exempt, with nothing signalling the gap.
+    ``__pycache__`` is excluded explicitly even though a ``*.py`` glob would
+    not match its ``.pyc`` contents today, so a future cache-layout change
+    cannot silently start parsing compiled-artifact directories.
+
+    No raw-text prefilter. An earlier version skipped ``ast.parse`` for a
+    file containing none of the Tier A/B tokens, reasoning that it would
+    avoid parsing "the majority of scripts that plainly never mutate" --
+    measured, that did not hold: the tokens ('add', 'update', 'delete',
+    'save', plus the Tier A names) are common enough in ordinary prose and
+    identifiers ('updated_at', 'address', 'padding') that the prefilter
+    skipped exactly 1 of the tree's ~43 files. That is not enough benefit to
+    justify the extra constant and the correctness argument a reader had to
+    verify, especially since ``parse_python_module`` is already
+    session-memoised (see ``_ast_guard.py``) -- so every file is parsed
+    directly.
     """
     found: list[pathlib.Path] = []
-    for path in sorted(SCRIPTS_ROOT.glob('*.py')):
-        text = path.read_text()
-        if not any(token in text for token in _PREFILTER_TOKENS):
+    for path in sorted(SCRIPTS_ROOT.rglob('*.py')):
+        if '__pycache__' in path.parts:
             continue
         if mutating_calls(parse_python_module(path)):
             found.append(path)
