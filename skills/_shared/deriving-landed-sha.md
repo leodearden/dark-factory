@@ -198,7 +198,19 @@ merge is skipped — the procedure degrades to the citation gate below and stamp
 where an actual merge sha was available. Do not "tidy" it away.
 (`orchestrator/tests/test_group_merge_candidate_ordering.py` reproduces this against real git.)
 
-The containment check on `$c`'s first parent (main just before that merge) decides:
+The containment check on `$c`'s **first parent** decides — but read the caveat below first:
+
+**`$c^1` is main-just-before-the-merge only when `$c` was created ON main.**
+`orchestrator/src/orchestrator/git_ops.py::GitOps.merge_to_main` merges with `git merge --no-ff`
+*from* main, so that holds for every dark-factory landing. It is **not** guaranteed for a target
+project reached via [`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s call site, where the
+project's own merge convention decides parent order: a merge built on the branch side (e.g. an
+integration branch cut from the task branch, then fast-forwarded onto main) has the **task tip**
+at `$c^1`, the containment check exits 0 trivially, and this arm falsely concludes "unrelated
+later merge, do not stamp" — discarding a merge sha you were already holding. On a project whose
+merge direction you do not know, confirm the parent order before trusting the rc:
+`git rev-list --parents -n 1 "$c"` (or `git log --format=%P -n 1 "$c"`) — the first parent listed
+must itself be on main *before* `$c`; if it is the branch side, read `$c^2` instead.
 
 - **contained-before rc=1** → the branch was not in main before `$c`, so `$c` **is** the merge
   that brought it in. Stamp `{"kind": "<merged|found_on_main>", "commit": "$c", "note": "absorbed
