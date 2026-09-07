@@ -541,14 +541,30 @@ def _discover_candidate_scripts() -> list[pathlib.Path]:
 
 CANDIDATE_SCRIPTS = _discover_candidate_scripts()
 
+#: The two currently-known candidates whose ONLY mutating hits are Tier B --
+#: `qdrant_client.delete` and `memory.mem0.update`, the exact two spellings
+#: the production module's docstring calls "a mutation no pattern search
+#: finds". CANDIDATE_FLOOR alone gives Tier B ZERO live-tree protection:
+#: measured, 14 of the current 16 real candidates are Tier A, so a
+#: regression that wiped out Tier B entirely (an emptied
+#: SUBSTRATE_RECEIVER_HINTS, a GENERIC_MUTATING_VERBS that stopped matching)
+#: would still clear the floor on Tier A hits alone -- see
+#: TestCandidateDiscoveryIsNotVacuous.test_tier_b_only_candidates_are_still_discovered.
+TIER_B_ONLY_CANDIDATES = frozenset({
+    'clear_malformed_empty_memory.py',
+    'tag_cgl_eta_rehome_scope.py',
+})
+
 
 class TestCandidateDiscoveryIsNotVacuous:
-    """Discovery must keep finding at least the measured candidate count.
+    """Discovery must keep finding at least the measured candidate count,
+    and must not silently lose Tier B specifically.
 
-    Without this floor, a detector whose criteria silently stopped matching
-    (a rename of the Tier A/B tokens, a broken prefilter) would parametrize
-    the conformance test below over an empty set and report green having
-    checked nothing.
+    Without the floor, a detector whose criteria silently stopped matching
+    (a rename of the Tier A/B tokens) would parametrize the conformance test
+    below over an empty set and report green having checked nothing. The
+    floor alone does not protect Tier B, though: see
+    TIER_B_ONLY_CANDIDATES and the second test below.
     """
 
     def test_candidate_discovery_is_not_vacuous(self):
@@ -557,6 +573,27 @@ class TestCandidateDiscoveryIsNotVacuous:
             f'{len(CANDIDATE_SCRIPTS)} mutation candidate(s), below the measured '
             f'floor of {CANDIDATE_FLOOR}. Fix the criteria; do NOT lower the '
             f'floor, or this guard silently checks nothing.'
+        )
+
+    def test_tier_b_only_candidates_are_still_discovered(self):
+        """Pin the two known Tier-B-only candidates by name.
+
+        CANDIDATE_FLOOR is satisfiable by Tier A hits alone (measured: 14 of
+        the 16 live candidates are Tier A), so it gives the tier the module
+        docstring calls load-bearing zero live-tree protection on its own.
+        These two files' only mutating hit is Tier B; if either drops out of
+        CANDIDATE_SCRIPTS, Tier B has silently stopped matching the real
+        tree, even though the floor above may still be satisfied by Tier A
+        hits alone.
+        """
+        discovered = {p.name for p in CANDIDATE_SCRIPTS}
+        missing = TIER_B_ONLY_CANDIDATES - discovered
+        assert missing == set(), (
+            f'{sorted(missing)} dropped out of candidate discovery. Both are '
+            f'Tier-B-only candidates (no Tier A callee name present) -- fix '
+            f'SUBSTRATE_RECEIVER_HINTS / GENERIC_MUTATING_VERBS; do not lower '
+            f'CANDIDATE_FLOOR to compensate, it would not even notice this '
+            f'regression.'
         )
 
 
