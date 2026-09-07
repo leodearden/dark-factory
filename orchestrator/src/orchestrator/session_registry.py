@@ -1686,6 +1686,58 @@ def normalize_project_token(value: object) -> str:
     return PROJECT_TOKEN_ALIASES.get(folded, folded)
 
 
+def declined_project_token_hint(value: object) -> str | None:
+    """One-line operator warning when *value* names a DECLINED alias target
+    (task 3813). Returns None -- the overwhelmingly common case -- otherwise.
+
+    WHY THIS EXISTS. Declining the solar-challenge alias makes that project's
+    naming mismatch PERMANENT: an operator who trusts its config-declared
+    ``memory.project_id`` gets a silent zero-row no-op forever, which reads
+    exactly like "nothing to reap". Under this project's
+    loud-over-silent-degradation norm, a decision that manufactures a
+    standing silent trap is only defensible if the trap ANNOUNCES ITSELF. So
+    the recorded decline gets a live caller instead of staying documentation.
+
+    WHY IT WARNS RATHER THAN REWRITES. Rewriting the passed token to the
+    bucket that actually holds the rows would BE the cross-project behaviour
+    change task 3813 declined, smuggled in through the CLI boundary instead
+    of the alias table. Callers file under, and scope to, EXACTLY the token
+    they were given; only a log line is added. Non-blocking by construction,
+    so a watcher's filing path can never break on it -- matching the
+    fail-soft contract every helper this module hands a watch loop honours.
+
+    WHY IT KEYS ON THE DECLINED VALUE, NOT THE KEY. The trap is typing the
+    config-declared id (``my_solar_challenge``), so that is where the warning
+    must land. ``solar_challenge`` -- the token both SKILL.md files recommend
+    -- must stay SILENT, or a watcher accrues a warning every Main Loop
+    cycle and the signal degrades into noise. Because the check is gated on
+    a one-entry table it has zero false positives; it is deliberately
+    narrower than a generic "your --project matched zero records" warning,
+    which cannot distinguish a token nothing uses from a healthy project
+    with nothing open.
+
+    Folds *value* through ``normalize_project_token`` first, so case and
+    separator variants of the config-declared token (``My-Solar-Challenge``)
+    all hit, and a non-str or ``None`` *value* coerces fail-soft to a
+    matchless token or ``''`` rather than raising. Returning None costs one
+    scan of a one-entry dict. Stdlib-only, no intra-orchestrator imports
+    (see module docstring).
+    """
+    folded = normalize_project_token(value)
+    if not folded:
+        return None
+    for alias, (declined_canonical, _reason) in PROJECT_TOKEN_ALIASES_DECLINED.items():
+        if folded == declined_canonical:
+            return (
+                f'--project {folded!r} matches no decisions: the alias '
+                f'{alias!r} -> {declined_canonical!r} was considered and DECLINED '
+                f'(task 3813), so that project\'s rows stay under {alias!r}. '
+                f'Pass a token that folds to {alias!r} instead; see '
+                f'PROJECT_TOKEN_ALIASES_DECLINED for the evidence.'
+            )
+    return None
+
+
 def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
     """Best-effort read of *escalation_id*'s ``status`` field (Fleet Cockpit C8 reaper).
 
