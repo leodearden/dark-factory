@@ -695,7 +695,7 @@ def deploy_clock_change_report(
     session_token: str | None,
     root: str | os.PathLike[str] | None = None,
 ) -> tuple[str, str] | None:
-    """Attribute the FIRST changed protected clock, or ``None`` if none changed.
+    """Attribute the changed protected clocks, or ``None`` if none changed.
 
     Returns ``(verdict, message)``, where *verdict* is:
 
@@ -733,12 +733,41 @@ def deploy_clock_change_report(
     run must not become the arbiter of another run's bug on the strength of a
     token it cannot verify.
 
+    PRECEDENCE: ``'falsified'`` anywhere outranks ``'external_redeploy'``
+    anywhere, so EVERY protected relpath is inspected before a benign verdict is
+    returned.  Among changes of the SAME verdict the first in
+    :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS` order is reported.
+
+    That is not a tie-break detail, it is the whole contract: the benign reading
+    is an exemption for the RUN's innocence, and one clock being provably
+    external is no evidence at all about a DIFFERENT file.  The two protected
+    clocks have different writers — ``scripts/restart-all-orchestrators.sh``
+    stamps the fleet one, ``scripts/orchestrator-watchdog.py`` the fused-memory
+    one — so they can genuinely disagree within a single run.  Concretely, the
+    masking this replaced: a real fleet redeploy stamps
+    ``data/orchestrator/last_redeploy_orchestrator.json`` while a test falsifies
+    ``data/fused-memory/last_redeploy_fused_memory.json``, and because the
+    benign clock comes FIRST in protected order the earlier version returned on
+    it and never inspected the second — disarming task 3797's defence for
+    exactly the redeploy-in-flight window this task's downgrade exists to serve.
+    Do not re-introduce an early ``return`` believing first-changed-wins was
+    intentional; it was not, and
+    ``TestAFalsificationIsNeverMaskedByABenignChange`` pins every direction of
+    it.
+
+    A benign change IS deliberately swallowed for a root that also carries a
+    falsification.  ``pytest.fail`` is the louder and the only actionable
+    signal, and :func:`_falsified_message` already carries the full attribution,
+    so adding a warning about an unrelated file alongside it would dilute the
+    one message a reader must act on.
+
     *root* is optional and cosmetic-but-load-bearing in BOTH verdicts: pass the
     checkout the snapshots were taken against and the message names the ABSOLUTE
     file.  A run guards more than one checkout (see
     :func:`deploy_clock_guard_roots`), so a bare relpath leaves the reader unable
     to tell which one moved.
     """
+    benign: tuple[str, str] | None = None
     for relpath in PROTECTED_DEPLOY_CLOCK_RELPATHS:
         before_entry, after_entry = before.get(relpath), after.get(relpath)
         kind = _clock_change_kind(before_entry, after_entry)
@@ -753,19 +782,25 @@ def deploy_clock_change_report(
         if provenance is not None and session_token and not provenance[
             CLOCK_PROVENANCE_SESSION_KEY
         ]:
-            return (
-                'external_redeploy',
-                _external_redeploy_message(
-                    where, kind, observed, provenance[CLOCK_PROVENANCE_SOURCE_KEY],
-                ),
-            )
+            # Hold it, keep scanning: a later clock may still be falsified, and
+            # that outranks this.  Only the FIRST benign change is kept, so the
+            # reported one stays first in protected order.
+            if benign is None:
+                benign = (
+                    'external_redeploy',
+                    _external_redeploy_message(
+                        where, kind, observed,
+                        provenance[CLOCK_PROVENANCE_SOURCE_KEY],
+                    ),
+                )
+            continue
         return (
             'falsified',
             _falsified_message(
                 relpath, where, kind, observed, provenance, session_token,
             ),
         )
-    return None
+    return benign
 
 
 def _clock_attribution_line(
