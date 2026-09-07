@@ -346,21 +346,115 @@ def _fleet_type_check_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["type_check_command"]
 
 
-def _non_cd_clauses(cmd: str) -> list[list[str]]:
+def _non_cd_clauses(cmd: str, label: str) -> list[list[str]]:
     """Every clause of *cmd* that is not a bare ``cd``, tokenised.
 
-    Used only for the runner-SHAPE assertions below. Splits on the same
-    top-level ``&&`` the shared walker uses, so the two views of the chain
-    cannot disagree about where a clause begins.
+    Splits on the same top-level ``&&`` the shared walker uses, so the two views
+    of the chain cannot disagree about where a clause begins.
+
+    A clause ``shlex`` cannot tokenise raises an ``AssertionError`` naming
+    *label*, the mirror marker and the offending clause — never a bare
+    ``ValueError: No closing quotation``. One caller passes a command read out
+    of HUMAN-EDITED PROSE, so a stray apostrophe in CONTRIBUTING.md is ordinary
+    input and not a programming error, and this module promises twice over that
+    every failure says which artifact to go fix. MEASURED before this guard
+    existed: appending ``# don't forget npm ci`` to the fenced command walks
+    cleanly past the extractor AND past assertion (b) — the cwds are unchanged —
+    and then raised a raw ``ValueError`` here, naming neither CONTRIBUTING.md nor
+    the marker nor a remedy. Same contract, and the same reason, as
+    ``verify_command_invariants.anchor_split``. Note the deliberate contrast with
+    ``verify_command_invariants.pyright_clause_cwds``, which degrades SILENTLY on
+    the same input: that one must keep tracking cwd through junk it cannot parse,
+    while this one has already committed to every clause being part of the chain.
     """
     clauses = []
     for raw in verify_cmd.split_top_level_and(cmd):
-        tokens = shlex.split(raw)
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            raise AssertionError(
+                f"cannot tokenise a clause of {label}: {exc}; clause: {raw!r} "
+                f"(task 4108). If that is the documented command, the chain "
+                f"inside the {MIRROR_BEGIN!r} marker in CONTRIBUTING.md must be "
+                f"a shell-parseable `cd <dir> && uv run pyright && ...` chain "
+                f"with balanced quotes and no trailing `#` comment — `#` is not "
+                f"a comment to shlex.split, which is how the retired `# also: "
+                f"orchestrator, dashboard` form left four members unnamed."
+            ) from exc
         if tokens and tokens[0] == "cd":
             continue
         if tokens:
             clauses.append(tokens)
     return clauses
+
+
+def _pyright_runner_clauses(cmd: str, label: str) -> list[list[str]]:
+    """Those clauses of *cmd* that actually invoke pyright, tokenised.
+
+    The input to the runner-SHAPE assertions below, which ask WHICH RUNNER
+    invokes pyright — not "may anything else appear in this chain". A non-``cd``
+    SETUP clause is therefore skipped rather than failing the shape pin: the
+    gate's ``npx`` lane needs an ``npm ci`` to resolve its pinned pyright at all,
+    so a chain that grows one is CORRECT, and
+    ``test_verify_command_invariants.py::test_pyright_clause_cwds_ignores_a_clause_that_is_neither_cd_nor_pyright``
+    names ``npm ci`` as exactly the clause this repo's Node lane would plausibly
+    grow. Pinning every non-``cd`` clause would turn that correct config into a
+    red merge gate.
+
+    Whole-token membership, never a substring of the raw clause: ``npx
+    pyright-langserver`` invokes a different program. The shared walker's looser
+    ``PYRIGHT in clause`` test is not a disagreement — it must stay tolerant of
+    text it cannot tokenise, which is the one thing this helper refuses to do.
+    """
+    return [tokens for tokens in _non_cd_clauses(cmd, label) if vci.PYRIGHT in tokens]
+
+
+def test_non_cd_clauses_reports_an_untokenisable_clause_with_its_label() -> None:
+    """An unbalanced quote is an AssertionError naming the doc, not a ValueError.
+
+    MEASURED against the live doc: appending ``  # don't forget npm ci`` to the
+    fenced command leaves the chain walker's answer UNCHANGED, so the extractor
+    and assertion (b) both pass cleanly, and the run then died on a raw
+    ``ValueError: No closing quotation`` from ``shlex`` that named neither
+    CONTRIBUTING.md, nor the marker, nor the remedy. The merge gate still went
+    red, so this was a diagnosis-quality gap rather than a false green — but this
+    module's docstring and ``pyright_clause_cwds``'s both promise that a command
+    read out of human-edited prose fails LOUDLY and says which artifact to fix,
+    and this was the one parser here that did not keep that promise.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        _non_cd_clauses("cd alpha && uv run pyright   # don't forget npm ci", _DOC_LABEL)
+
+    message = str(excinfo.value)
+    assert "CONTRIBUTING.md" in message
+    assert MIRROR_BEGIN in message
+    assert "don't forget" in message
+
+
+def test_pyright_runner_clauses_skips_a_setup_clause() -> None:
+    """A non-``cd`` SETUP clause is not a runner and must not fail the shape pin.
+
+    The gate's ``npx`` lane needs an ``npm ci`` to resolve its pinned pyright at
+    all, so a chain that grows one is CORRECT — and assertion (c) below pins
+    which runner invokes the checker, not that nothing else may appear in the
+    chain. Asserting over every non-``cd`` clause would take a correct config red
+    on the exact clause
+    ``test_verify_command_invariants.py::test_pyright_clause_cwds_ignores_a_clause_that_is_neither_cd_nor_pyright``
+    names as the one this repo's Node lane would plausibly grow.
+    """
+    assert _pyright_runner_clauses(
+        "cd alpha && npm ci && npx pyright && cd ../beta && npx pyright", _LIVE_LABEL
+    ) == [["npx", "pyright"], ["npx", "pyright"]]
+
+
+def test_pyright_runner_clauses_matches_a_whole_token_not_a_substring() -> None:
+    """``pyright-langserver`` is a different program and is not a pyright runner.
+
+    Whole-token membership rather than a substring of the raw clause, so the
+    shape assertions cannot be silently satisfied — or silently failed — by a
+    clause that merely mentions pyright.
+    """
+    assert _pyright_runner_clauses("cd alpha && npx pyright-langserver", _LIVE_LABEL) == []
 
 
 def test_documented_type_check_bullet_mirrors_the_live_type_check_command() -> None:
@@ -382,11 +476,19 @@ def test_documented_type_check_bullet_mirrors_the_live_type_check_command() -> N
     live_cmd = _fleet_type_check_command()
     documented = _documented_type_check_command(CONTRIBUTING_PATH.read_text(encoding="utf-8"))
 
-    # The gate's own guards read this chain with skip_uv_project=True, so the
-    # live side is read exactly as they read it. The DOC side asks the other
-    # question — which directories does this command type-check? — for which a
-    # `uv run --project X pyright` spelling is a real answer.
-    live_cwds = vci.pyright_clause_cwds(live_cmd)
+    # BOTH sides walk with skip_uv_project=False, because assertion (b) asks ONE
+    # question of both — "which directories does this command type-check?" — and
+    # for that question a `uv run --project X pyright` spelling is a real answer.
+    # Reading the LIVE side with the default True would ask it the OTHER question
+    # ("which clauses resolve their interpreter from that directory's
+    # [tool.pyright] block?"): were the yaml chain ever rewritten into `--project`
+    # form, the live walk would silently shrink and (b) would fire reporting the
+    # DOC as carrying EXTRA members — a red with a backwards diagnosis, which is
+    # precisely what test_verify_command_invariants.py::
+    # test_pyright_clause_cwds_includes_a_uv_project_clause_when_asked says the
+    # flag exists to prevent. The interpreter-pin question keeps the default True
+    # where it belongs: test_fallback_verify_config.py::_pyright_clause_cwds.
+    live_cwds = vci.pyright_clause_cwds(live_cmd, skip_uv_project=False)
     doc_cwds = vci.pyright_clause_cwds(documented, skip_uv_project=False)
 
     # (a) NON-VACUITY, both sides. Neither an empty live walk nor an empty
@@ -432,7 +534,12 @@ def test_documented_type_check_bullet_mirrors_the_live_type_check_command() -> N
     # telling contributors to run the lane the doc itself explains needs `npm ci`
     # first. `test_pyright_version_pin.py` (task 4538) is what holds the two
     # lanes to the same pyright version.
-    for tokens in _non_cd_clauses(documented):
+    #
+    # Scoped to the clauses that actually INVOKE pyright. This assertion is about
+    # which runner runs the checker, not about what else the chain may contain —
+    # see `_pyright_runner_clauses`, which carries the reasoning and the `npm ci`
+    # case that made the unscoped form fail a correct config.
+    for tokens in _pyright_runner_clauses(documented, _DOC_LABEL):
         assert tokens == ["uv", "run", "pyright"], (
             f"{_DOC_LABEL} invokes {tokens!r} (task 4108) — every non-`cd` clause "
             f"of the DOCUMENTED chain must be exactly `uv run pyright`, the wheel "
@@ -441,7 +548,7 @@ def test_documented_type_check_bullet_mirrors_the_live_type_check_command() -> N
             f"contributor to run; both resolve the same pinned version, which "
             f"tests/scripts/test_pyright_version_pin.py enforces."
         )
-    for tokens in _non_cd_clauses(live_cmd):
+    for tokens in _pyright_runner_clauses(live_cmd, _LIVE_LABEL):
         assert tokens == ["npx", "pyright"], (
             f"{_LIVE_LABEL} invokes {tokens!r} (task 4108) — every non-`cd` clause "
             f"of the LIVE chain is expected to be exactly `npx pyright`. If the "
