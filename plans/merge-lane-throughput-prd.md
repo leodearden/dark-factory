@@ -516,3 +516,29 @@ the cross-project arbitration half that the RED-TIER rulings in
 `plans/cpu-load-robust-verify-prd.md` § 6 and
 `plans/integration-test-lane-prd.md` § 11 forbid. This correction records the
 question; it does not decide it and does not file it.
+
+---
+
+## Corrections (2026-09-07 — after G's speculation diagnosis)
+
+Append-only pointer, same discipline as the dated sections above: the
+§ Background table is left untouched as provenance of what was believed on
+2026-09-03.
+
+1. **§ Background's speculative-ahead row does not reproduce.** The cells
+   "Landings that were speculative-ahead (matched, 30d) | 165 / 416 (40%) |
+   10 / 277 (3.6%)" do **not** reproduce under
+   `scripts/merge_lane_throughput.py` (task A/5050) at the *same* dated
+   30-day window `2026-08-04T16:10:00+00:00..2026-09-03T16:10:00+00:00`,
+   which reproduces every other 30d cell in that table exactly — including
+   the speculative-merge/void row (424; 126 and 264; 154). The script reads
+   351/507 (0.692) for dark_factory and 191/323 (0.591) for reify. The
+   divergence is **definitional, not drift**: both the numerators and the
+   denominators differ, and no single definition has been found that
+   reproduces the original pair. The current home for these rates is
+   **`plans/merge-lane-throughput-prd.speculation-diagnosis.md`** (task
+   G/5058), which reports the loose measure above alongside a stricter
+   `speculative_ahead_adopted` (255/507 and 84/323) and says what remains
+   unexplained. Tasks E (5056) and H (5059) compare their before/after
+   reports against this row: read the diagnosis, not this cell, or a false
+   before/after delta follows.
