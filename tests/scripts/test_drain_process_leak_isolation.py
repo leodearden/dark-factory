@@ -52,6 +52,7 @@ from df_pytest_isolation import (  # noqa: E402
     LEAK_TOKEN_ENV,
     WAIT_PROOF_GRACE_FLOOR_SECS,
     WAIT_PROOF_GRACE_MULTIPLIER,
+    WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
     fixture_marker,
     leaked_drain_process_reason,
     leaked_drain_processes,
@@ -408,6 +409,46 @@ class TestWaitProofGraceSecs:
                 'ceiling — a leak from this call site would outlive its fake '
                 'systemctl and reach the real one.'
             )
+
+    def test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits(self) -> None:
+        """``WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS`` is DERIVED, not chosen.
+
+        A wait-proving spawn timeout that is itself load-scaled needs an upper
+        bound, because the grace derived FROM it must still land inside the
+        self-termination ceiling. That bound is not free to be picked: it is
+        the largest spawn timeout whose derived grace still fits.
+
+        Both halves are asserted, and the MAXIMALITY half is the point. Legal
+        alone would pass for any smaller value too, which is exactly how the
+        constant could later be raised by hand until it silently stopped
+        fitting — freehand grace selection is what let 86 orphan pollers
+        accumulate on 2026-08-06. With maximality pinned, the constant cannot
+        be raised without either failing here or deliberately moving
+        ``LEAK_SELF_TERMINATION_CEILING_SECS`` / the multiplier, which is a
+        visible decision rather than a quiet edit.
+
+        Asserted against the imported constants and the FUNCTION, never
+        against the literals 22/88/90: this tracks the formula, so a change to
+        the multiplier or the ceiling re-derives the answer here instead of
+        leaving a restatement of today's arithmetic behind.
+        """
+        legal = wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+        assert legal <= LEAK_SELF_TERMINATION_CEILING_SECS, (
+            f'the cap {WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s derives a grace of '
+            f'{legal}s, past the {LEAK_SELF_TERMINATION_CEILING_SECS}s '
+            'self-termination ceiling — a leak from a call site scaled to the '
+            'cap would outlive its fake systemctl and reach the real one.'
+        )
+
+        over = wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS + 1)
+        assert over > LEAK_SELF_TERMINATION_CEILING_SECS, (
+            f'the cap {WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s is not MAXIMAL: '
+            f'{WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS + 1}s still derives '
+            f'{over}s, inside the {LEAK_SELF_TERMINATION_CEILING_SECS}s '
+            'ceiling. Either the cap is being left below what the ceiling '
+            'permits, or the ceiling/multiplier moved and the cap was not '
+            're-derived.'
+        )
 
     def test_a_floor_applies_to_very_short_timeouts(self) -> None:
         """A tiny timeout must not derive a grace that expires mid-test.
