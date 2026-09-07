@@ -22,6 +22,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -517,3 +518,330 @@ class TestCollisionOutcomesFailTheRun:
         """
         assert 'slug_collision' in _mod.SKIP_BUCKETS
         assert 'canonical_collision' in _mod.SKIP_BUCKETS
+
+
+# ===========================================================================
+# enumerate_topic_bearing — the corpus boundary
+# ===========================================================================
+
+def _backend(
+    records_by_category: dict[str, list[dict]],
+    *,
+    counts_by_category: dict[str, int] | None = None,
+    recounts_by_category: dict[str, int] | None = None,
+    call_log: list | None = None,
+    scroll_calls: list | None = None,
+    scroll_raises: dict[str, BaseException] | None = None,
+) -> AsyncMock:
+    """``Mem0Backend`` stand-in — the ``test_census_memory_metadata._backend`` shape.
+
+    ``scroll_all_by_metadata`` is a REAL async generator dispatching on the
+    ``category`` filter, not an AsyncMock returning a list: the thing under
+    test consumes it with ``async for``, and a mock that returned a list would
+    let a non-streaming implementation pass.
+
+    *recounts_by_category* lets a test make the post-scroll count differ from
+    the pre-scroll one, which is the only way to exercise the churn-versus-
+    truncation distinction the bracket exists to draw.
+    """
+    log = call_log if call_log is not None else []
+    scrolls = scroll_calls if scroll_calls is not None else []
+    counts = counts_by_category or {
+        c: len(r) for c, r in records_by_category.items()
+    }
+    recounts = recounts_by_category or {}
+    raises = scroll_raises or {}
+    seen_counts: dict[str, int] = {}
+
+    async def _scroll_all_by_metadata(scope, filters, **kwargs):
+        category = filters['category']
+        log.append(('scroll', category))
+        scrolls.append((scope, dict(filters), dict(kwargs)))
+        for record in records_by_category.get(category, []):
+            yield dict(record)
+        if category in raises:
+            raise raises[category]
+
+    async def _count_by_metadata(scope, filters):
+        category = filters['category']
+        log.append(('count', category))
+        seen = seen_counts.get(category, 0)
+        seen_counts[category] = seen + 1
+        if seen and category in recounts:
+            return recounts[category]
+        return counts.get(category, 0)
+
+    backend = AsyncMock()
+    backend.config = MagicMock()
+    backend.config.mem0.collection_prefix = 'fused'
+    backend.scroll_all_by_metadata = _scroll_all_by_metadata
+    backend.count_by_metadata = _count_by_metadata
+    backend.count.return_value = sum(counts.values())
+    return backend
+
+
+def _service_with(backend: AsyncMock) -> AsyncMock:
+    """A ``MemoryService`` double exposing the backend as ``.mem0``.
+
+    Reaching the backend through the service (the
+    ``consolidate_namespace_families.py`` pattern) rather than constructing one
+    separately is what lets a single injected object serve both the reads and
+    the writes — so an end-to-end test cannot accidentally scroll one store and
+    write to another.
+    """
+    service = AsyncMock()
+    service.mem0 = backend
+    return service
+
+
+class TestEnumerateTopicBearing:
+    """``enumerate_topic_bearing(service, project_id, *, categories, page_size, max_pages)``.
+
+    The corpus boundary.  Three measured constraints force its shape:
+
+    1. ``scroll_all_by_metadata`` and ``scroll_by_metadata`` both raise
+       ``ValueError`` on an EMPTY filter dict, explicitly "to avoid silently
+       enumerating every memory in the collection" — so there is no direct
+       all-records scroll at this seam, and the category partition is how
+       ``census_memory_metadata.py`` already covers the whole collection with
+       non-empty filters.
+    2. A single capped ``get_memories_by_metadata`` silently drops most of a
+       ~49k-entry collection, which is why ``scroll_all_by_metadata`` (real
+       offset/next_offset pagination) exists at all.
+    3. ``CategoryCensus`` deliberately never retains payloads, so the census
+       cannot hand over the record ids a migration needs — but retaining only
+       the NON-conforming residue keeps peak memory bounded by the residue
+       rather than by the corpus.
+    """
+
+    @pytest.mark.asyncio
+    async def test_walks_every_census_category(self):
+        """No cell may be silently uncovered.
+
+        The partition comes from the census's own category set, so the two
+        scripts provably cover the same corpus rather than keeping two lists
+        that drift.
+        """
+        scrolls: list = []
+        backend = _backend({}, scroll_calls=scrolls)
+        await _mod.enumerate_topic_bearing(_service_with(backend), 'dark_factory')
+        scrolled = [filters['category'] for _scope, filters, _kw in scrolls]
+        assert scrolled == list(_mod.census_categories())
+        assert len(scrolled) == len(set(scrolled)), 'one scroll per category'
+        assert len(scrolled) >= 6, 'all six categories, Mem0- and Graphiti-primary'
+
+    @pytest.mark.asyncio
+    async def test_uses_the_paginating_scroll_not_the_capped_list_read(self):
+        """``get_memories_by_metadata`` would cover a prefix and call it whole.
+
+        It returns a bare list with no ``total``, so a capped read is
+        indistinguishable from a complete one at this seam — exactly the
+        silent truncation this script must not build its coverage claim on.
+        """
+        backend = _backend({})
+        service = _service_with(backend)
+        await _mod.enumerate_topic_bearing(service, 'dark_factory')
+        service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_forwards_page_size_and_max_pages(self):
+        scrolls: list = []
+        backend = _backend({}, scroll_calls=scrolls)
+        await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', page_size=250, max_pages=7,
+        )
+        _scope, _filters, kwargs = scrolls[0]
+        assert kwargs['page_size'] == 250
+        assert kwargs['max_pages'] == 7
+
+    @pytest.mark.asyncio
+    async def test_retains_only_the_non_conforming_residue(self):
+        """Peak memory is bounded by the RESIDUE, not by the corpus.
+
+        10k conforming records in and nothing comes out.  This is the property
+        that makes a corpus-wide sweep affordable at all, and the reason this
+        script cannot simply reuse ``CategoryCensus`` (which retains nothing
+        and so cannot supply the ids) nor accumulate everything (which would
+        hold the whole ~49.4k-record corpus).
+        """
+        category = _mod.census_categories()[0]
+        records = [_rec(f'm{i}', 'conforming-topic') for i in range(10_000)]
+        backend = _backend({category: records})
+        result = await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=[category],
+        )
+        assert result['records'] == []
+
+    @pytest.mark.asyncio
+    async def test_retains_the_triple_for_a_non_conforming_record(self):
+        """``(id, topic, canonical)`` — everything the planner needs, nothing more."""
+        category = _mod.census_categories()[0]
+        backend = _backend({category: [
+            _rec('m1', 'legacy_topic', canonical=True),
+            _rec('m2', 'conforming-topic'),
+            _rec('m3'),
+        ]})
+        result = await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=[category],
+        )
+        assert [r['id'] for r in result['records']] == ['m1']
+        assert result['records'][0]['metadata'] == {
+            'topic': 'legacy_topic', 'canonical': True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_each_cell_is_bracketed_by_a_count_before_and_after(self):
+        """Two independent reads, or a shortfall is undetectable.
+
+        Counting BEFORE is what makes an under-enumerated scroll detectable at
+        all; counting AFTER brackets the scan against a LIVE corpus, so a
+        scroll that matches the recount saw churn rather than truncation.
+        One read cannot tell those apart.
+        """
+        category = _mod.census_categories()[0]
+        log: list = []
+        backend = _backend({category: [_rec('m1', 'a_b')]}, call_log=log)
+        await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=[category],
+        )
+        assert log == [('count', category), ('scroll', category), ('count', category)]
+
+    @pytest.mark.asyncio
+    async def test_a_matching_bracket_is_complete(self):
+        category = _mod.census_categories()[0]
+        backend = _backend({category: [_rec('m1', 'a_b')]})
+        result = await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=[category],
+        )
+        cell = result['coverage'][category]
+        assert cell == {
+            'expected': 1, 'scrolled': 1, 'recount': 1, 'delta': 0, 'complete': True,
+        }
+        assert result['complete'] is True
+
+    @pytest.mark.asyncio
+    async def test_a_scroll_matching_neither_count_is_under_enumerated(self):
+        """A shortfall is REPORTED, never treated as complete.
+
+        Scrolled 1 where both counts said 5: the sweep saw a fifth of that
+        cell.  Calling that complete would let the migration report a clean
+        run over a corpus it barely looked at.
+        """
+        category = _mod.census_categories()[0]
+        backend = _backend(
+            {category: [_rec('m1', 'a_b')]}, counts_by_category={category: 5},
+        )
+        result = await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=[category],
+        )
+        cell = result['coverage'][category]
+        assert cell['expected'] == 5
+        assert cell['scrolled'] == 1
+        assert cell['complete'] is False
+        assert result['complete'] is False
+        assert len(_by_reason(result['skips'], 'under_enumerated')) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_scroll_agreeing_with_the_recount_is_churn_not_truncation(self):
+        """Count moved 2 -> 1 while scrolling and the scroll saw 1: complete.
+
+        The corpus is live; orchestrators write while this runs.  Grading only
+        against the PRE-scroll count would report ordinary churn as a coverage
+        hole, and an operator who learns to ignore that bucket stops reading
+        the real ones.
+        """
+        category = _mod.census_categories()[0]
+        backend = _backend(
+            {category: [_rec('m1', 'a_b')]},
+            counts_by_category={category: 2},
+            recounts_by_category={category: 1},
+        )
+        result = await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=[category],
+        )
+        cell = result['coverage'][category]
+        assert (cell['expected'], cell['scrolled'], cell['recount']) == (2, 1, 1)
+        assert cell['complete'] is True
+        assert result['complete'] is True
+        assert _by_reason(result['skips'], 'under_enumerated') == []
+
+    @pytest.mark.asyncio
+    async def test_page_budget_exhausted_is_an_explicit_incomplete_outcome(self):
+        """NEVER swallowed into a clean empty result.
+
+        ``ScrollPageBudgetExhausted`` means the backend gave up paging. A
+        migration that caught it and moved on would report a completed sweep
+        over a corpus it had only partly enumerated — and then the residue
+        probe would find the legacy slug still populated and blame the writes.
+        """
+        categories = list(_mod.census_categories()[:2])
+        first, second = categories
+        backend = _backend(
+            {first: [_rec('m1', 'a_b')], second: [_rec('m2', 'c_d')]},
+            scroll_raises={first: _mod.ScrollPageBudgetExhausted('budget')},
+        )
+        result = await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=categories,
+        )
+        assert result['complete'] is False
+        entries = _by_reason(result['skips'], 'scroll_budget_exhausted')
+        assert len(entries) == 1
+        assert entries[0]['category'] == first
+        assert entries[0]['project_id'] == 'dark_factory'
+        assert 'budget' in entries[0]['error']
+        assert result['coverage'][first]['complete'] is False
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_cell_does_not_abort_the_other_cells(self):
+        """One dead cell must not cost the coverage of the other five.
+
+        The report is more useful naming which cell failed than crashing
+        before any of it is written.
+        """
+        categories = list(_mod.census_categories()[:2])
+        first, second = categories
+        backend = _backend(
+            {first: [_rec('m1', 'a_b')], second: [_rec('m2', 'c_d')]},
+            scroll_raises={first: _mod.ScrollPageBudgetExhausted('budget')},
+        )
+        result = await _mod.enumerate_topic_bearing(
+            _service_with(backend), 'dark_factory', categories=categories,
+        )
+        assert {r['id'] for r in result['records']} == {'m1', 'm2'}
+        assert result['coverage'][second]['complete'] is True
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_enumeration_is_an_error_outcome(self):
+        """A partial sweep must not exit 0 and read as a finished migration."""
+        assert 'under_enumerated' in _mod.ERROR_OUTCOMES
+        assert 'scroll_budget_exhausted' in _mod.ERROR_OUTCOMES
+        assert 'under_enumerated' in _mod.SKIP_BUCKETS
+        assert 'scroll_budget_exhausted' in _mod.SKIP_BUCKETS
+
+    @pytest.mark.asyncio
+    async def test_the_scope_carries_the_project(self):
+        """Each scroll is scoped to the project being enumerated."""
+        scrolls: list = []
+        backend = _backend({}, scroll_calls=scrolls)
+        await _mod.enumerate_topic_bearing(_service_with(backend), 'reify')
+        scope, _filters, _kw = scrolls[0]
+        assert scope.project_id == 'reify'
+
+
+class TestCensusCategoriesAreImportedNotRestated:
+    """The partition has ONE home: ``census_memory_metadata.CENSUS_CATEGORIES``.
+
+    Two lists kept in sync by prose is exactly the drift INV-5 forbids, and
+    here the consequence is a silently unenumerated slice of the corpus — the
+    failure mode hardest to notice, because the report would look clean.
+    """
+
+    def test_categories_match_the_census_module(self):
+        census = _mod.load_census_module()
+        assert list(_mod.census_categories()) == [
+            c.value for c in census.CENSUS_CATEGORIES
+        ]
+
+    def test_the_census_module_is_loaded_once(self):
+        """``sys.modules``-first, memoized — re-executing hands back new classes."""
+        assert _mod.load_census_module() is _mod.load_census_module()
