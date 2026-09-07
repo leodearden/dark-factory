@@ -422,14 +422,36 @@ class TestSingleResetsParserOwnership:
         `shared.usage_gate.__all__` lists no underscore names, so the star
         import cannot reintroduce these — only an explicit re-export tuple
         could, which is how they used to survive there.
-        """
-        import orchestrator.usage_gate as orch_usage_gate
 
-        leaked = [
-            name
-            for name in ('_parse_resets_at', '_extract_cap_message')
-            if hasattr(orch_usage_gate, name)
-        ]
+        An AST scan of the FILE rather than `import orchestrator.usage_gate`
+        + `hasattr`, for two independent reasons. (1) Layering: `shared/`
+        must not import `orchestrator/` (program decision #4 — the same note
+        appears in `test_server_error.py` and
+        `test_invocation_outcome_boundary.py`). (2) That import is not even
+        available here: verify runs `cd shared && uv run pytest` FIRST in its
+        chain, which syncs the workspace venv down to `shared`'s own
+        dependencies, so `orchestrator` is not installed and the import
+        raises `ModuleNotFoundError` — the guard would go red for a reason
+        with nothing to do with what it guards, and go green again only if
+        some earlier command happened to leave an `--all-packages` venv
+        behind. Reading the source keeps the assertion true of the file,
+        which is what "does not re-export" actually means.
+        """
+        path = _REPO_ROOT / 'orchestrator/src/orchestrator/usage_gate.py'
+        assert path.is_file(), f'orchestrator usage_gate shim missing: {path}'
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        bound: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import | ast.ImportFrom):
+                # A `from ... import *` alias is literally named '*' and binds
+                # nothing statically — it cannot reintroduce these two, since
+                # shared.usage_gate.__all__ lists no underscore names.
+                bound.update(alias.asname or alias.name for alias in node.names)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                bound.add(node.name)
+            elif isinstance(node, ast.Assign):
+                bound.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        leaked = sorted(bound & {'_parse_resets_at', '_extract_cap_message'})
         assert leaked == [], (
             f'orchestrator/src/orchestrator/usage_gate.py re-exports {leaked}. '
             f'Both live ONLY in {_STRICT_PARSE_OWNER}; re-exporting them from a '
