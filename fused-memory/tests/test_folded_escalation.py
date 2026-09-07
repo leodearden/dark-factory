@@ -652,3 +652,40 @@ class TestNoTwoFilersShareAnAnchor:
             f'the sweep shrank to {len(anchors)} entries; a filer was dropped '
             'rather than renamed'
         )
+
+
+@_needs_escalation
+class TestTheFiledAnchorAndTheLookupAreTheSame:
+    """Filing under one anchor while deduping against another is the bug.
+
+    It would produce a record nobody dedupes against (unbounded duplicates)
+    or a lookup nobody files under (permanent suppression). Pinned by
+    capturing the anchor the dedup read is called with and comparing it to
+    the `task_id` that actually landed.
+
+    MOVED HERE by task 4854 from `tests/server/test_write_triage.py`, where it
+    could only ever prove the property for one caller. Both uses are now
+    threaded from the SINGLE `anchor_task_id` parameter of
+    `file_folded_escalation`, so this is where the property lives — and one
+    test now covers every filer that calls it.
+    """
+
+    def test_the_dedup_lookup_uses_the_anchor_that_is_filed(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: list = []
+        real_get_by_task = _folded_escalation.EscalationQueue.get_by_task
+
+        def _spy(self, task_id, status=None):
+            seen.append(task_id)
+            return real_get_by_task(self, task_id, status=status)
+
+        monkeypatch.setattr(_folded_escalation.EscalationQueue, 'get_by_task', _spy)
+        _emit(tmp_path, anchor_task_id='a-distinctive-anchor')
+
+        filed = _filed(tmp_path)
+        assert len(filed) == 1
+        assert seen == [filed[0]['task_id']], (
+            f'deduped against {seen!r} but filed under {filed[0]["task_id"]!r}'
+        )
+        assert seen == ['a-distinctive-anchor']

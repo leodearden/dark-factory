@@ -109,6 +109,20 @@ logger = logging.getLogger(__name__)
 
 _QUEUE_DIRNAME: str = 'data/escalations'
 
+# NOT A MEMBER of ``middleware/_folded_escalation``'s family, deliberately
+# (task 4854). That helper is the one home for the PENDING-ANCHOR-FOLD filer
+# skeleton — ``queue.get_by_task(anchor, status='pending')`` plus a never-raise
+# submit — which seven filers carried verbatim. This module does not carry it:
+# it dedupes on ``compute_content_fingerprint`` + ``DedupeConfig`` through
+# ``escalation.dedupe.submit_or_dedupe`` over a CACHED per-project queue.
+# Migrating it would replace content-fingerprint dedupe with pending-anchor
+# dedupe, which is a behaviour regression rather than a refactor. Do not
+# "finish the job" by folding this in.
+#
+# The anchor below is still swept by
+# ``tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor``: this module
+# writes to the SAME queue, so it can squat an anchor even though it is not a
+# member.
 # Anchor task_id used by ``EscalationQueue.make_id`` so the resulting
 # escalation IDs (e.g. ``esc-task-path-guard-37``) are easily greppable.
 _ANCHOR_TASK_ID: str = 'task-path-guard'

@@ -1799,90 +1799,12 @@ class TestEmitTriageFailOpenStormEscalation:
         assert payload['task_id'] == write_triage._ANCHOR_TASK_ID
         assert payload['level'] == 1
 
-    def test_the_anchor_is_this_leafs_own_and_shared_with_nobody(self) -> None:
-        """A SQUATTED anchor is suppressed indefinitely, and reads as calm.
-
-        Measured incident: the L1 escalation watcher files its own cluster
-        records under the `markup-tripwire` anchor and SQUATS it — the tripwire
-        filed nothing 2026-08-16..2026-08-19 while 41 rejections occurred, all
-        17 records sitting at dedupe_count 0. A filer that dedupes against an
-        anchor somebody else keeps open never files again, and the resulting
-        silence is indistinguishable from health.
-
-        That incident is why `emit_markup_storm_escalation` grew its
-        `anchor_task_id` parameter (see its docstring), and it is why this leaf
-        must never share an anchor with any other filer. Asserted against the
-        siblings' constants IMPORTED FROM THEIR OWN HOMES, so a future rename
-        that collides is caught here rather than in production silence.
-        """
-        from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
-            _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
-        )
-        from fused_memory.middleware.mem0_update_storm_escalator import (  # noqa: PLC0415
-            _ANCHOR_TASK_ID as MEM0_UPDATE_ANCHOR,
-        )
-        from fused_memory.middleware.scope_violation_escalator import (  # noqa: PLC0415
-            _ANCHOR_TASK_ID as SCOPE_VIOLATION_ANCHOR,
-        )
-        from fused_memory.server.markup_guard import (  # noqa: PLC0415
-            _RESIDUE_ANCHOR_TASK_ID as GUARD_RESIDUE_ANCHOR,
-        )
-        from fused_memory.server.markup_guard import (
-            _STORM_ANCHOR_TASK_ID as GUARD_STORM_ANCHOR,
-        )
-        from fused_memory.server.markup_tripwire import (  # noqa: PLC0415
-            _ANCHOR_TASK_ID as TRIPWIRE_ANCHOR,
-        )
-        from fused_memory.server.markup_tripwire import (
-            _RESIDUE_ANCHOR_TASK_ID as RESIDUE_ANCHOR,
-        )
-
-        ours = write_triage._ANCHOR_TASK_ID
-        assert ours == 'write-triage-fail-open'
-        for label, theirs in [
-            ('markup_tripwire (the SQUATTED one)', TRIPWIRE_ANCHOR),
-            ('markup_tripwire residue', RESIDUE_ANCHOR),
-            ('markup_guard storm', GUARD_STORM_ANCHOR),
-            ('markup_guard residue', GUARD_RESIDUE_ANCHOR),
-            ('candidate_key_escalation', CANDIDATE_KEY_ANCHOR),
-            ('mem0_update_storm_escalator', MEM0_UPDATE_ANCHOR),
-            ('scope_violation_escalator', SCOPE_VIOLATION_ANCHOR),
-        ]:
-            assert ours != theirs, (
-                f'write-triage must not share the {label} anchor {theirs!r}: a '
-                'filer deduping against an anchor another party keeps open is '
-                'suppressed indefinitely, and that silence reads as calm'
-            )
-
-    def test_the_filed_anchor_and_the_dedup_lookup_are_the_same(
-        self, tmp_path, monkeypatch,
-    ) -> None:
-        """Filing under one anchor while deduping against another is the bug.
-
-        It would produce a record nobody dedupes against (unbounded duplicates)
-        or a lookup nobody files under (permanent suppression). Pinned by
-        capturing the anchor the dedup read is called with and comparing it to
-        the `task_id` that actually landed.
-        """
-        if not _folded_escalation.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
-
-        seen: list = []
-        real_get_by_task = _folded_escalation.EscalationQueue.get_by_task
-
-        def _spy(self, task_id, status=None):
-            seen.append(task_id)
-            return real_get_by_task(self, task_id, status=status)
-
-        monkeypatch.setattr(_folded_escalation.EscalationQueue, 'get_by_task', _spy)
-        emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
-
-        payload = json.loads(
-            next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text()
-        )
-        assert seen == [payload['task_id']], (
-            f'deduped against {seen!r} but filed under {payload["task_id"]!r}'
-        )
+    # test_the_anchor_is_this_leafs_own_and_shared_with_nobody and
+    # test_the_filed_anchor_and_the_dedup_lookup_are_the_same moved in task
+    # 4854 to tests/test_folded_escalation.py — the first generalised into
+    # TestNoTwoFilersShareAnAnchor (pairwise over ALL filers, not this leaf
+    # against its siblings), the second onto the shared helper, where the
+    # filed-anchor-equals-looked-up-anchor property now actually lives.
 
 
 class TestAttachWriteLanded:
