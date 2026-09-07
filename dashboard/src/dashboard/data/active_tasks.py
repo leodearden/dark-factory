@@ -306,6 +306,71 @@ def _all_project_roots(config: DashboardConfig) -> list[Path]:
     return roots
 
 
+# Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
+# one slot per render. Module state, like the `_*_cache` objects elsewhere in
+# this package, with a matching `_reset_root_rotation()` test hook.
+_root_rotation_offset: int = 0
+
+
+def _reset_root_rotation() -> None:
+    """Reset the admission-order rotation. Test hook.
+
+    Same shape as the ``_*_cache_clear`` hooks in ``tasks.py``: rotation is
+    module state, so a test that asserts an ORDER has to be able to start from
+    a known offset rather than inherit whatever the previous test left.
+    """
+    global _root_rotation_offset
+    _root_rotation_offset = 0
+
+
+def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
+    """``_all_project_roots`` rotated left by one more slot on each call.
+
+    WHAT THIS CLOSES. `collect_tasks_with_counts` cannot always serve every
+    root inside `_TASKS_TOTAL_BUDGET`, and with a FIXED walk order the roots
+    that lose are always the same ones — the last ones. The journal of the
+    2026-08-27 incident shows exactly that: `project solar-challenge-platform:
+    skipped — the 20.0s Tasks budget was already spent before this project was
+    reached` and `project pump-web-ui: skipped ...`, the same trailing pair,
+    render after render. Those two projects were effectively invisible on the
+    Tasks tab for the duration.
+
+    ROTATION MAKES STARVATION FAIR, NOT ABSENT. This is the load-bearing
+    claim, and it is deliberately weaker than it looks: with 9 roots and a
+    20.0 s budget some render will still fail to serve some roots. What
+    rotation guarantees is that the starved SET rotates, so no root is
+    permanently invisible. What reports the starvation is unchanged — the
+    honest `TASKS_DEGRADED_PROJECTS` / `TASKS_OFFLINE_PROJECTS` markers task
+    3857 built. Do not read this helper as a fix for degraded rows; read it as
+    the reason a degraded row is transient rather than permanent.
+
+    DETERMINISTIC ROUND-ROBIN, NOT RANDOMISATION. A shuffle would also spread
+    the starvation, and was rejected: an operator comparing two consecutive
+    renders can predict which roots were served under a round-robin and cannot
+    under a shuffle, and a test can assert the former (see
+    ``TestCollectTasksWithCountsFairness``) but only sample the latter.
+    Reproducibility in an incident is worth more here than any property a
+    random order would buy.
+
+    SEPARATE HELPER, deliberately. ``_all_project_roots`` stays byte-identical
+    and primary-first: ``app.py``, ``scheduler.py``, ``collect_done_counts``
+    and ``test_app.py``'s patch point all depend on that ordering, so rotating
+    in place would silently repoint every one of them at a different project.
+    Only ``collect_tasks_with_counts``' admission loop calls this.
+
+    Rotation changes ADMISSION order only. Output is re-assembled in canonical
+    ``_all_project_roots`` order by the caller, so the rendered table does not
+    reshuffle on every 3 s poll.
+    """
+    global _root_rotation_offset
+    roots = _all_project_roots(config)
+    if not roots:
+        return roots
+    offset = _root_rotation_offset % len(roots)
+    _root_rotation_offset = (_root_rotation_offset + 1) % len(roots)
+    return roots[offset:] + roots[:offset]
+
+
 def _task_uid(project: str, task_id: int) -> str:
     """Project-scoped unique id used by the React tasks tab as a map key."""
     return f'{project}/T-{task_id}'
@@ -1047,7 +1112,12 @@ async def collect_tasks_with_counts(
     # invisible-failure class this task exists to close.
     count_unknown_projects: list[str] = []
 
+    # ROTATED for admission, canonical for output. The rotation is what stops
+    # the same trailing roots being starved on every render; see
+    # _rotated_project_roots. `roots` below is the canonical order the results
+    # are re-assembled in.
     roots = _all_project_roots(config)
+    admission_order = _rotated_project_roots(config)
     # Admission control, not a work queue: the coroutines are all created up
     # front and the semaphore decides how many are inside _shape_one_project
     # at once. See _TASKS_ROOT_CONCURRENCY for why the width is bounded.
@@ -1144,11 +1214,13 @@ async def collect_tasks_with_counts(
     # there is no exception for it to swallow, and a real escape (a bug in this
     # assembly code, a CancelledError) must still propagate rather than be
     # silently converted into a result object.
-    results = await asyncio.gather(*(_one(root) for root in roots))
+    results = await asyncio.gather(*(_one(root) for root in admission_order))
+    by_label = {result['label']: result for result in results}
 
-    # ROOT order, not completion order. This is the only place the shared
-    # accumulators are written.
-    for result in results:
+    # CANONICAL ROOT order — neither completion order nor admission order.
+    # This is the only place the shared accumulators are written.
+    for root in roots:
+        result = by_label[_project_label(root)]
         label = result['label']
         if result.get('degraded'):
             degraded_projects.append(label)

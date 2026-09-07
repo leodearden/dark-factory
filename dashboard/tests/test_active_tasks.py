@@ -25,6 +25,25 @@ from dashboard.data.active_tasks import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _reset_root_rotation_between_tests():
+    """Start every test from rotation offset 0.
+
+    REQUIRED, not tidy. ``active_tasks._root_rotation_offset`` is module state
+    that ``collect_tasks_with_counts`` advances on every call (task 4884), so
+    without this any test that asserts WHICH roots were served — or in what
+    order they were admitted — silently depends on how many times an EARLIER
+    test in the session happened to call the collector. That is a test that
+    passes or fails by file order, which is worse than one that fails.
+    """
+    import dashboard.data.active_tasks as at_mod
+
+    at_mod._reset_root_rotation()
+    yield
+    at_mod._reset_root_rotation()
+
+
+
 def test_minutes_since_handles_z_suffix_and_naive_iso():
     one_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace('+00:00', 'Z')
     minutes = _minutes_since(one_hour_ago)
