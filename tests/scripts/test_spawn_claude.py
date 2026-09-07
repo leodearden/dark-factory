@@ -7,7 +7,6 @@ branches by name (the script dispatches on the first word of $CLAUDE_TERMINAL_CM
 
 from __future__ import annotations
 
-import math
 import os
 import pathlib
 import re
@@ -38,6 +37,24 @@ SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
 _ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
+
+# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
+# subproject directories (orchestrator/, shared/, ...) resolve as namespace
+# packages shadowing their own src/<pkg>/ -- the failure the root conftest.py
+# docstring exists to prevent. Mirrors the same block in
+# tests/scripts/test_orchestrator_watchdog.py and
+# tests/scripts/test_fleet_dir_isolation.py. Needed here because
+# --import-mode=importlib does not put a test module's own tree on sys.path.
+if str(REPO_ROOT.resolve()) not in sys.path:
+    sys.path.append(str(REPO_ROOT.resolve()))
+
+# `_load_scaled_grace` lives in df_pytest_isolation (task 4890 promoted it out
+# of this file so scripts/tests/ could reach it); aliased back to the local
+# name every call site below already uses. See the task-2733 section comment
+# further down for the history and the reason it is load-scaled at all.
+from df_pytest_isolation import (  # noqa: E402
+    load_scaled_grace as _load_scaled_grace,
+)
 
 # noqa must sit on the STATEMENT's first line: E402 is reported at the start of
 # the import, so the per-name noqas ruff's I001 fix left on lines below suppress
@@ -1471,30 +1488,15 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
 # target as host load climbs; _load_scaled_grace instead scales the grace by
 # load-per-core -- floored at base_secs (an idle host is byte-identical to
 # today) and capped at cap_secs (a pathological host stays bounded).
-
-
-def _load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
-    """Scale a started-grace budget by host load-per-core, floored and capped.
-
-    A fixed started-grace chases a moving target as host load climbs (this
-    is the SECOND recurrence of a started-grace flake in this file -- task
-    2367 already bumped a fixed 1s/2s -> 3s/8s six days ago). Load-per-core
-    headroom tracks the actual contention that delays the fake claude
-    startup chain, instead of chasing that moving target with another
-    one-off bump.
-
-    Floored at base_secs: an idle host (loadavg_1min <= cpu_count) returns
-    base_secs unchanged, so this is byte-identical to the pre-existing fixed
-    grace there -- no regression. Capped at cap_secs so a pathologically
-    loaded host stays bounded. Fails safe to base_secs if getloadavg is
-    unavailable on this platform.
-    """
-    try:
-        load1 = os.getloadavg()[0]
-    except (OSError, AttributeError):
-        return base_secs
-    factor = max(1.0, load1 / (os.cpu_count() or 1))
-    return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
+#
+# Task 4890 PROMOTED the definition to `df_pytest_isolation::load_scaled_grace`
+# so `scripts/tests/` could reach it too -- the two test roots cannot import
+# each other's test modules. It is imported at the top of this file and bound
+# back under the SAME module-local name `_load_scaled_grace`, so every call
+# site and every `test_load_scaled_grace_*` case below keeps working
+# unchanged; those tests then double as regression coverage on the shared
+# definition. The behaviour is identical -- the promoted body is this one,
+# character for character.
 
 
 # _NOT_FLAGGED_GRACE_BASE_SECS: raised from 2 to 8 (task 3451). Derived, not
