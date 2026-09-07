@@ -2071,6 +2071,81 @@ class TestGetRetriesRelocationBetweenLocateAndRead:
         assert queue.get('esc-1-999') is None
 
 
+class TestGetByTaskRecoversRecordRelocatedMidScan:
+    """Task 5118, workstream B (follow-up to task 5111's amendment 8):
+    ``get_by_task`` must recover — not silently drop — a record relocated
+    root -> archive inside the scan window, for an archive-including scan.
+
+    ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
+    record moved out of the root during that loop is in neither the
+    archive-tier snapshot (taken too early) nor the root copy (gone by read
+    time).  Before this fix that produced a silently SHORT listing; the fix
+    re-locates the id and retries the read once.
+    """
+
+    def test_get_by_task_recovers_relocated_record_into_a_complete_listing(
+        self, tmp_path: Path, caplog,
+    ):
+        """RED on main: the relocated record is silently missing from
+        ``results`` instead of being recovered via re-glob.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        # (a) The listing is complete — the relocated record is recovered,
+        # not silently dropped.
+        assert {e.id for e in results} == {'esc-4176-1', 'esc-4176-2'}, (
+            f'Expected both records via re-glob recovery, got '
+            f'{[e.id for e in results]}'
+        )
+
+        # (b) The recovery is named at DEBUG for auditability.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any('esc-4176-2' in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG mentioning the recovered esc-4176-2; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+    def test_get_by_task_pending_scan_does_not_recover_a_relocated_record(
+        self, tmp_path: Path,
+    ):
+        """A ``status='pending'`` scan does not attempt recovery: the archive
+        is skipped there by design, and a record relocated out of the root
+        is by definition no longer pending — it would be filtered out on
+        status even if recovered, so recovering it would only add archive
+        I/O to the fast path for no behavioural difference.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            results = queue.get_by_task('4176', status='pending')
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving pending record, got '
+            f'{[e.id for e in results]}'
+        )
+
+
 class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
