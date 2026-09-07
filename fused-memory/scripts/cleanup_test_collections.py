@@ -21,6 +21,29 @@ script that seeds under one imports its constant from HERE.  A name coined
 in one file and reaped by a constant in another is one rename away from
 orphaning collections forever.
 
+WHY THIS SWEEP CAN HOLD OFF (task 4775)
+---------------------------------------
+A live ``-m integration`` run, or the E2 storage-shape bake-off, seeds its
+corpus under :data:`E2_BAKEOFF_PREFIX` — a prefix listed right below as
+reapable.  Unguarded, a sweep landing between that run's seed and measure
+phases deletes the corpus out from under it, and leaves nothing behind
+pointing back here: the run simply measures a world that quietly emptied.
+
+So a holder publishes a lease (:func:`hold_lease`) for as long as it has
+collections in flight, and this sweep skips ENTIRELY while any lease is live
+(:func:`live_leases`).  Blanket rather than per-name, because a run grows its
+own collection set mid-setup and a future driver would add names no lease
+format here knows about — an incomplete list would let this delete exactly
+the collection the guard exists to protect, while reading as if it were
+guarded.  A deferred sweep costs nothing: it runs again in six hours, over
+debris nothing depends on.
+
+The task-4293 premises below are untouched by that guard.  It constructs no
+``MemoryService``, takes no input that can widen :data:`PREFIXES`, and only
+NARROWS the circumstances under which the existing deletes may run.  Its one
+new mutation, :func:`reap_dead_leases`, unlinks files inside the lease
+directory and can never reach a Qdrant collection.
+
 WHY THERE IS NO STORE-MUTATION PREFLIGHT HERE (an observation, task 4293)
 ------------------------------------------------------------------------
 ``fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed``
@@ -315,7 +338,31 @@ def live_leases(*, directory: Path | None = None) -> list[dict]:
     return held
 
 
+def _report_hold_off(holders: list[dict]) -> None:
+    """Name every live holder on stderr, then say why nothing was swept."""
+    for holder in holders:
+        print(
+            f'In-use lease held by {holder["owner"]} '
+            f'(pid {holder["pid"]}, {holder["path"]})',
+            file=sys.stderr,
+        )
+    print(
+        f'{len(holders)} ephemeral-collection lease(s) live; skipping the '
+        f'sweep so a running experiment keeps its collections',
+        file=sys.stderr,
+    )
+
+
 def main() -> None:
+    # FIRST of two lease checks.  This one sits before the client is
+    # constructed, so a held-off sweep costs zero network — and, because no
+    # client exists yet on this path, returning from here cannot leak a
+    # connection past the `finally` further down.
+    holders = live_leases()
+    if holders:
+        _report_hold_off(holders)
+        return
+
     try:
         from qdrant_client import QdrantClient
     except ImportError:
