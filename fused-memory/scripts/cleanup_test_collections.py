@@ -338,6 +338,42 @@ def live_leases(*, directory: Path | None = None) -> list[dict]:
     return held
 
 
+def reap_dead_leases(*, directory: Path | None = None) -> int:
+    """Unlink lease files no living process holds; return how many.
+
+    Litter collection, not a guard.  These files hold nothing off —
+    :func:`live_leases` already ignores an unlocked file — so this exists
+    only to stop the lease directory growing without bound after every run
+    that is SIGKILLed, OOM-killed or otherwise denied its ``finally``.
+
+    Unlinking a LIVE holder's file is impossible rather than merely avoided:
+    only a file whose flock is acquired outright is removed, and unique
+    filenames (see :func:`_lease_filename`) mean no new holder can ever be
+    handed a dead holder's path.  A file that cannot be probed at all is
+    skipped rather than removed — unprobeable is not the same as dead.
+
+    Never raises, for the same reason as :func:`live_leases`: two sweeps can
+    overlap (an operator running this by hand while cron fires), and the
+    loser of that race must return a count rather than a traceback.
+    """
+    target = lease_dir() if directory is None else Path(directory)
+    try:
+        entries = sorted(target.iterdir())
+    except OSError:
+        return 0
+
+    reaped = 0
+    for path in entries:
+        if _is_held(path) is not False:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
+        reaped += 1
+    return reaped
+
+
 def _report_hold_off(holders: list[dict]) -> None:
     """Name every live holder on stderr, then say why nothing was swept."""
     for holder in holders:
@@ -362,6 +398,15 @@ def main() -> None:
     if holders:
         _report_hold_off(holders)
         return
+
+    # Only on a sweep that will actually proceed: there is nothing to
+    # reclaim while a run is live, and the held-off path above must stay
+    # zero-cost.  Reported on stderr and never stdout — stdout is reserved
+    # for the deletion report below, because a cron job that prints on every
+    # no-op trains its reader to ignore it.
+    dead = reap_dead_leases()
+    if dead:
+        print(f'Removed {dead} lease file(s) left by dead holders', file=sys.stderr)
 
     try:
         from qdrant_client import QdrantClient
