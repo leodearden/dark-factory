@@ -3090,7 +3090,11 @@ class TestPrioritiesPathResolution:
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
 
         assert app._priorities_path == resolve_fleet_root(tmp_path) / 'priorities.yaml'
-        assert app._priorities.project_weights == {'df': 7.0}
+        # The seeded marker key is read back CANONICAL: load_priorities
+        # folds project_weights keys (task 3812). Which file was read --
+        # the point of this test -- is unaffected: the 7.0 value is the
+        # marker, and the global default file has no such entry at all.
+        assert app._priorities.project_weights == {'dark_factory': 7.0}
 
 
 class TestWeightEditor:
