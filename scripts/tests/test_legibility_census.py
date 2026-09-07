@@ -5619,3 +5619,117 @@ def test_mine_to_saturation_emits_one_aggregated_warning_per_failing_batch(caplo
     assert not [r for r in census_warnings if "batch 0" in r.getMessage()], (
         "a batch with zero failures must emit no aggregate line at all"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-3: RED — W-A, the BOUND. The aggregate above is the census's
+# own signal; it does not by itself reduce the flood, it adds to it. The
+# per-digest `legibility.coder` lines must ALSO be capped for the duration of
+# census's own `code_digests` call — capped, not silenced: a small non-zero
+# exemplar allowance keeps the raw line shape visible for the common
+# one-or-two-failure batch and makes the suppression obviously partial, and
+# the aggregate says how many lines were dropped so the drop is loud rather
+# than silent. The bound must be CALLER-SCOPED: `nightly.run_nightly`'s
+# trickle is the one sink some failures ever reach, so a filter must never
+# outlive census's own call — including when the loop unwinds abnormally.
+# ---------------------------------------------------------------------------
+
+def _coder_warnings(caplog):
+    return [
+        r for r in caplog.records
+        if r.name == "legibility.coder" and r.levelno == logging.WARNING
+    ]
+
+
+def test_mine_to_saturation_bounds_the_coder_per_digest_flood_without_silencing_other_callers(
+    caplog,
+):
+    live_codebook = _minimal_v2_codebook()
+    source, fake_invoke, saturation, fail_a, fail_b = (
+        _two_batch_source_with_a_failing_second_batch()
+    )
+    limit = mod._MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
+
+    with caplog.at_level(logging.WARNING):
+        result = mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=fake_invoke,
+        )
+
+    assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
+
+    # (a) the flood really is bounded
+    coder_lines = _coder_warnings(caplog)
+    assert len(coder_lines) <= limit, (
+        f"at most {limit} per-digest lines may survive the batch; got {len(coder_lines)}"
+    )
+    assert len(coder_lines) < 6, "strictly fewer lines than the 6 failures — a real bound"
+    assert coder_lines, "the allowance is non-zero: exemplar lines must still get through"
+
+    # (b) the drop is LOUD — the aggregate names how many lines were suppressed
+    batch1_lines = [
+        r for r in _census_warnings(caplog) if "batch 1" in r.getMessage()
+    ]
+    assert len(batch1_lines) == 1
+    message = batch1_lines[0].getMessage()
+    suppressed = 6 - len(coder_lines)
+    assert "suppress" in message.lower(), (
+        f"the aggregate must state that lines were bounded; got {message!r}"
+    )
+    assert str(suppressed) in message, (
+        f"and how many ({suppressed}); got {message!r}"
+    )
+
+    # (c) caller-scoped, not global: nothing survives the call
+    assert logging.getLogger("legibility.coder").filters == [], (
+        "the bound must be removed when mine_to_saturation returns"
+    )
+
+
+def test_mine_to_saturation_bound_leaves_a_later_direct_code_digests_call_untouched(caplog):
+    """(d) The nightly trickle's per-digest visibility is the whole reason the
+    bound is caller-scoped: a `coder.code_digests` call made outside census
+    must still emit ONE WARNING per failed digest."""
+    live_codebook = _minimal_v2_codebook()
+    source, fake_invoke, saturation, fail_a, fail_b = (
+        _two_batch_source_with_a_failing_second_batch()
+    )
+
+    with caplog.at_level(logging.WARNING):
+        mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=fake_invoke,
+        )
+        caplog.clear()
+        # The same failing fixture, called directly — as nightly.run_nightly does.
+        direct = coder.code_digests(
+            _batch_digests(10, "f1"), live_codebook,
+            project="dark_factory", model="sonnet", invoke=fake_invoke,
+        )
+
+    assert direct.failed == 6, "fixture sanity"
+    assert len(_coder_warnings(caplog)) == 6, (
+        "a direct caller must still get one WARNING per failed digest"
+    )
+
+
+def test_mine_to_saturation_bound_is_removed_when_the_batch_loop_unwinds(caplog):
+    """(e) An exception mid-iteration must not leave the filter attached — a
+    leaked filter would silently bound another caller's logging forever."""
+    live_codebook = _minimal_v2_codebook()
+    _, fake_invoke, saturation, _, _ = _two_batch_source_with_a_failing_second_batch()
+
+    class _RaisingBatchSource:
+        def __iter__(self):
+            yield _batch_digests(10, "f1")   # a batch that fails 6/10
+            raise RuntimeError("batch source blew up mid-iteration")
+
+    with pytest.raises(RuntimeError, match="blew up mid-iteration"):
+        mod.mine_to_saturation(
+            _RaisingBatchSource(), live_codebook, project="dark_factory",
+            model="sonnet", config=saturation, invoke=fake_invoke,
+        )
+
+    assert logging.getLogger("legibility.coder").filters == [], (
+        "the bound must be removed even when the loop unwinds abnormally"
+    )
