@@ -3589,3 +3589,125 @@ class TestTheLiveExtendNeverWritesBelowProductionK:
         )
 
         assert replayed
+
+
+# ---------------------------------------------------------------------------
+# The live driver's in-use lease (task 4775)
+# ---------------------------------------------------------------------------
+#
+# `fetch_production_rankings` seeds under exactly the prefix the 6-hourly
+# reaper deletes — `config.mem0.collection_prefix = bake.ephemeral_collection_prefix()`
+# — and has its own `__main__` CLI, so it carries the identical exposure to
+# `run_bake_off` and needs its own lease.  The doubles below are the minimum
+# that lets the live driver reach its teardown; they are deliberately local
+# and are not a general harness for this file.
+
+
+def _fake_config():
+    """A config shaped like the two attributes paths the driver walks."""
+    config = types.SimpleNamespace(
+        mem0=types.SimpleNamespace(
+            collection_prefix='fused',  # the DEFAULT — nothing under it is reapable
+            qdrant_url='http://localhost:6333',
+        ),
+        embedder=types.SimpleNamespace(
+            model='text-embedding-3-small',
+            providers=types.SimpleNamespace(
+                openai=types.SimpleNamespace(api_key='sk-fake-must-be-cleared'),
+            ),
+        ),
+        queue=types.SimpleNamespace(data_dir='./data/queue'),
+    )
+    config.model_copy = lambda deep=False: _fake_config()
+    return config
+
+
+class _FakeMemoryService:
+    """Enough service for the driver to initialise, seed and tear down."""
+
+    initialize_raises = False
+
+    def __init__(self, config):
+        self.config = config
+        self.mem0 = object()
+        self.closed = False
+
+    async def initialize(self):
+        if type(self).initialize_raises:
+            raise RuntimeError('qdrant unreachable')
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+class TestFetchProductionRankingsHoldsALease:
+    """The second live-seeding driver, and it needs its own lease.
+
+    `run_bake_off` is not the only site that seeds under a reaped prefix:
+    this one repoints `collection_prefix` at
+    `bake.ephemeral_collection_prefix()` and runs the same
+    drop -> seed -> measure -> finally-drop shape, with its own `__main__`
+    CLI where no pytest conftest exists to cover it.
+    """
+
+    @staticmethod
+    def _install_doubles(monkeypatch, *, initialize_raises=False):
+        """Patch the driver's seams at their source; return the observations.
+
+        `drop_collections` is the first statement in the driver's `try`, so
+        it fires before any collection exists — the instant the lease has to
+        already be live.
+        """
+        import fused_memory.config.schema as schema_mod  # noqa: PLC0415
+        import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+        bake = _bake_off()
+        reaper = bake.load_cleanup_script()
+        at_drop: list[list[dict]] = []
+
+        def _drop_and_look(*args, **kwargs):
+            at_drop.append(reaper.live_leases())
+
+        async def _seed(*args, **kwargs):
+            return None
+
+        async def _fetch(*args, **kwargs):
+            return {'queries': {}}
+
+        _FakeMemoryService.initialize_raises = initialize_raises
+        monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _fake_config)
+        monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
+        monkeypatch.setattr(bake, 'drop_collections', _drop_and_look)
+        monkeypatch.setattr(bake, 'seed_arm', _seed)
+        monkeypatch.setattr(bake, 'fetch_arm', _fetch)
+        return reaper, at_drop
+
+    async def test_a_lease_is_live_when_the_pre_run_sweep_fires(self, monkeypatch):
+        mod = _mod()
+        reaper, at_drop = self._install_doubles(monkeypatch)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert at_drop, 'the observation seam never fired'
+        assert len(at_drop[0]) == 1, at_drop[0]
+        assert mod.__name__ in at_drop[0][0]['owner'], at_drop[0][0]['owner']
+
+    async def test_the_lease_is_released_once_the_call_returns(self, monkeypatch):
+        mod = _mod()
+        reaper, _ = self._install_doubles(monkeypatch)
+
+        await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert reaper.live_leases() == []
+
+    async def test_the_lease_is_released_when_the_service_raises(self, monkeypatch):
+        """A failed pass must not hold the cron off any more than a failed
+        bake-off does."""
+        mod = _mod()
+        reaper, _ = self._install_doubles(monkeypatch, initialize_raises=True)
+
+        with pytest.raises(RuntimeError, match='qdrant unreachable'):
+            await mod.fetch_production_rankings([], project_suffix='utest')
+
+        assert reaper.live_leases() == []
