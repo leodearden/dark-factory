@@ -593,7 +593,10 @@ _COVERAGE_CAVEAT = (
     "not the whole corpus - SEEN is the eligible population and COMPARED the "
     "matched pairs, and the rows between them account for the difference: a "
     "capability with no same-named task-record entry, a manifest binding a "
-    "task_id with no tasks.db row, an unvalidatable task entry, an "
+    "task_id with no tasks.db row, a block whose producer lives in ANOTHER "
+    "project's registry (external_task_id - absent from this store by "
+    "construction, and remediable by neither re-stamping nor retiring), an "
+    "unvalidatable task entry, an "
     "unconvertible sidecar descriptor and an unparseable sidecar are all "
     "counted here and are NONE of them drift; the missing-entry class is owned "
     "by audit_combine_gate_marker_loss.py and is never remediated from this "
@@ -657,6 +660,11 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
             ("task entries with no capability:",
              coverage.task_entries_with_no_sidecar_capability),
             ("manifest tasks with no db row:", coverage.manifest_tasks_without_db_row),
+            # ADJACENT to the row above on purpose: the two are both absences
+            # from this project's tasks.db, and they are the two an operator is
+            # most likely to conflate. Printing them together is what says
+            # which of the two a given block is in. See AuditCoverage.
+            ("external-registry task blocks:", coverage.external_registry_task_blocks),
             ("unvalidatable task entries:", coverage.malformed_task_entries),
             ("unconvertible sidecar descriptors:",
              coverage.unconvertible_sidecar_descriptors),
