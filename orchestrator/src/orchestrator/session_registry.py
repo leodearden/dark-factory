@@ -4083,6 +4083,14 @@ def _run_write_decision(
             'write-decision: normalized --project %r -> %r', project, canonical_project
         )
 
+    # Advisory only (task 3813). Placed AFTER canonicalization so the hint
+    # reflects the token that will actually be STORED, and BEFORE the record
+    # is built so it fires even if a later step fails. It must not alter
+    # canonical_project, gate the filing, or change the return code.
+    declined_hint = declined_project_token_hint(canonical_project)
+    if declined_hint is not None:
+        logger.warning('write-decision: %s', declined_hint)
+
     incoming = DecisionRecord(
         id=decision_id,
         project=canonical_project,
