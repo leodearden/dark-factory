@@ -63,7 +63,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     TaskKnowledgeSync,
     _format_flagged,
     _git_show_name_only,
-    _needs_hint_conversion,
+    _needs_hint_attention,
     _queue_briefing_refresh_tasks,
     _render_done_provenance_section,
     _run_briefing_known_gaps_script,
@@ -2785,13 +2785,16 @@ class TestProactiveSampling:
         assert _select_proactive_sample(iter([]), 0) == []
 
 
-class TestNeedsHintConversion:
-    """Tests for _needs_hint_conversion helper.
+class TestNeedsHintAttention:
+    """Tests for _needs_hint_attention helper.
 
     Verifies the three-branch classification from the task 1275 pseudo-code:
-      1. list memory_hints  -> True  (legacy list-of-dict format, conversion target)
+      1. list memory_hints  -> True  (legacy list-of-dict format, attach target)
       2. falsy memory_hints -> True  (missing key or empty dict, existing falsy path)
       3. truthy non-list   -> False (assumed already-structured dict, skip)
+
+    Both True branches are served by the SAME plain additive attach (task
+    4216) — hence "attention", not "conversion".
     """
 
     # ------------------------------------------------------------------ helpers
@@ -2809,31 +2812,31 @@ class TestNeedsHintConversion:
     def test_list_memory_hints_classified_as_conversion_target(self):
         """Non-empty list-of-dict memory_hints returns True (NEW branch — legacy format)."""
         task = self._make_task([{'entity': 'Foo', 'query': 'what is Foo'}])
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
     def test_empty_list_memory_hints_classified_as_conversion_target(self):
         """Empty list memory_hints returns True via the list branch (not the falsy branch)."""
         task = self._make_task([])
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
     # ------------------------------------------------------------------ branch 2: falsy
 
     def test_missing_memory_hints_classified_as_conversion_target(self):
         """Task with metadata dict that has no memory_hints key returns True."""
         task = self._make_task_no_hints()
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
     def test_empty_dict_memory_hints_classified_as_conversion_target(self):
         """Empty dict memory_hints returns True (existing falsy path)."""
         task = self._make_task({})
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
     # ------------------------------------------------------------------ branch 3: already-valid dict
 
     def test_structured_dict_memory_hints_not_flagged(self):
         """Task with {entities: [...], queries: [...]} dict returns False (already valid)."""
         task = self._make_task({'entities': ['Foo'], 'queries': ['what is Foo']})
-        assert _needs_hint_conversion(task) is False
+        assert _needs_hint_attention(task) is False
 
     def test_truthy_non_dict_non_list_memory_hints_not_flagged(self):
         """Truthy non-list, non-dict values (string, int) return False — pins branch-3 contract.
@@ -2843,25 +2846,25 @@ class TestNeedsHintConversion:
         to flag malformed scalars is a separable robustness concern deferred to a follow-up task.
         This test documents the current contract so future narrowing is a deliberate, visible change.
         """
-        assert _needs_hint_conversion(self._make_task('oops')) is False
-        assert _needs_hint_conversion(self._make_task(42)) is False
+        assert _needs_hint_attention(self._make_task('oops')) is False
+        assert _needs_hint_attention(self._make_task(42)) is False
 
     # ------------------------------------------------------------------ defensive edge cases
 
     def test_task_without_metadata_key_classified_as_conversion_target(self):
         """Task dict with no 'metadata' key at all returns True (treated as no hints attached)."""
         task = {'id': 1, 'title': 'T', 'status': 'pending'}
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
     def test_task_with_none_metadata_classified_as_conversion_target(self):
         """Task with metadata=None returns True (malformed metadata can't carry valid hints)."""
         task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': None}
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
     def test_task_with_non_dict_metadata_string_classified_as_conversion_target(self):
         """Task with metadata as a string returns True (defensive: non-dict metadata treated as no hints)."""
         task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': 'not-a-dict'}
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
 
 class TestRunIdValidation(BaseStageValidationTest):
@@ -12576,12 +12579,12 @@ class TestPropagateEscalationQueueHelper:
             )
 
 
-class TestStage2HintConversionDetection:
+class TestStage2HintAttentionDetection:
     """assemble_payload() surfaces Tasks Needing Memory Hint Attention section.
 
     Tests that the new conditional ``### Tasks Needing Memory Hint Attention``
     section is produced by ``assemble_payload()`` exactly when active tasks fail
-    ``_needs_hint_conversion()``.  Uses the harness-injection pattern
+    ``_needs_hint_attention()``.  Uses the harness-injection pattern
     (``stage.filtered_task_tree``) from ``TestTaskKnowledgeSyncFilteredTaskTree``
     to control the task pool without calling taskmaster.
     """
@@ -12614,7 +12617,7 @@ class TestStage2HintConversionDetection:
     def _make_task_no_hints(self, tid: int, status: str) -> dict:
         """Build a task dict whose ``metadata`` dict has no ``memory_hints`` key.
 
-        Covers the ``not task_hints`` (falsy) branch of ``_needs_hint_conversion``.
+        Covers the ``not task_hints`` (falsy) branch of ``_needs_hint_attention``.
         For the complementary case where ``metadata`` is absent entirely, use
         ``_make_task_no_metadata``.
         """
@@ -12624,9 +12627,9 @@ class TestStage2HintConversionDetection:
         """Build a task dict with no ``metadata`` key at all.
 
         Exercises the ``isinstance(metadata, dict) else None`` guard in
-        ``_needs_hint_conversion``: ``task.get('metadata')`` returns ``None``,
+        ``_needs_hint_attention``: ``task.get('metadata')`` returns ``None``,
         which is not a dict, so ``task_hints`` is forced to ``None`` (falsy →
-        ``_needs_hint_conversion`` returns ``True``).
+        ``_needs_hint_attention`` returns ``True``).
         """
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
 
@@ -12753,9 +12756,9 @@ class TestStage2HintConversionDetection:
         """Active task with no 'metadata' key at all must appear in the section.
 
         Exercises the ``isinstance(metadata, dict) else None`` guard in
-        ``_needs_hint_conversion``: ``task.get('metadata')`` returns ``None``
+        ``_needs_hint_attention``: ``task.get('metadata')`` returns ``None``
         (not a dict), so ``task_hints`` is forced to ``None`` → falsy →
-        ``_needs_hint_conversion`` returns ``True``.
+        ``_needs_hint_attention`` returns ``True``.
         """
         task = self._make_task_no_metadata(60, 'pending')
         stage = make_configured_task_knowledge_sync_stage(
@@ -12845,7 +12848,7 @@ class TestStage2HintConversionDetection:
         """
         import re as _re
 
-        # Positions 1..40: dict-format hints (non-qualifying via _needs_hint_conversion)
+        # Positions 1..40: dict-format hints (non-qualifying via _needs_hint_attention)
         tasks = [
             self._make_task_with_hints(
                 i, 'pending', {'entities': [f'E{i}'], 'queries': ['q']}
