@@ -493,3 +493,74 @@ def test_wrapper_fails_loud_when_uv_bin_is_set_but_not_executable(tmp_path):
         f"PATH would run a different uv than the one pinned. "
         f"calls={_recorded_calls(state_path)!r}"
     )
+
+
+def test_wrapper_resolves_uv_after_sourcing_dotenv_so_env_can_supply_uv_bin(tmp_path):
+    """Task 4591 amendment (review suggestion 4). BEHAVIOURAL pin on the
+    ordering of the uv resolution relative to `set -a; source "$REPO/.env"`.
+
+    The resolution must run AFTER the source, so a UV_BIN (or PATH) set in
+    .env is visible to it. That is not a stylistic preference: it is exactly
+    the remedy an operator reaches for after a minimal-boot-PATH 127, and the
+    sibling fused-memory/scripts/cgl_eta_auto_apply.sh originally resolved
+    BEFORE its source -- so the same .env fix would have worked here and
+    failed there.
+
+    Driven end-to-end rather than by grepping the script text: UV_BIN is
+    supplied ONLY by the .env file (absent from the process env), under a PATH
+    scrubbed to an empty dir and a HOME with no .local/bin/uv. If the
+    resolution ran first, UV_BIN would still be unset at that moment, nothing
+    else would resolve, and the wrapper would exit 127 with its ERROR: line.
+    Reaching the fake uv at all is the proof.
+
+    MUTATION-VERIFIED by hoisting the whole resolve + CHECK_CMD block above
+    the `set -a` -- this test then fails with exactly the 127 + ERROR: line
+    described above. Note what does NOT move the needle, since it is the
+    non-obvious part: relocating the resolve_uv_bin DEFINITION alone changes
+    nothing, because the call site lives inside the FLAG_MARKER_SWEEP_CMD
+    else-branch further down. The invocation point is the invariant, not the
+    definition point.
+
+    (The cgl wrapper hardcodes REPO and so cannot be pointed at a fake .env;
+    its copy of this invariant is pinned structurally instead, in
+    fused-memory/tests/test_cgl_eta_auto_apply_wrapper.py.)
+    """
+    if os.path.exists("/usr/local/bin/uv"):
+        pytest.skip(
+            "/usr/local/bin/uv exists on this host, so the ladder resolves "
+            "without .env's UV_BIN and the ordering cannot be discriminated"
+        )
+
+    uv_bin_dir, state_path = _fake_uv(tmp_path)
+
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir(exist_ok=True)
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+    (fake_repo / ".env").write_text(f"UV_BIN={uv_bin_dir / 'uv'}\n")
+
+    env = dict(os.environ)
+    env["PATH"] = _empty_path_dir(tmp_path)
+    env["HOME"] = str(fake_home)
+    env["FAKE_CHECK_STATE"] = str(state_path)
+    env["REPO"] = str(fake_repo)
+    env.pop("UV_BIN", None)          # supplied by .env alone -- that is the point
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"Expected UV_BIN set in $REPO/.env to be visible to the uv "
+        f"resolution. A non-zero exit here means the resolution ran BEFORE "
+        f"`source $REPO/.env`, making the .env remedy for a boot-PATH 127 "
+        f"silently ineffective; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert _recorded_calls(state_path), (
+        f"Expected the uv named by .env to actually be invoked; "
+        f"stderr={result.stderr!r}"
+    )
