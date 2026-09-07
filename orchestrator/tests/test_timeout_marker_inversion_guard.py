@@ -663,3 +663,187 @@ def test_the_aiosqlite_leak_isolation_regression_is_fixed() -> None:
         "this suite's measured ~4.8x load inflation it reaches ~73s, which a "
         'marker inside the band clamps below. Use VERIFY_CLI_PER_TEST_TIMEOUT.'
     )
+
+
+# ---------------------------------------------------------------------------
+# The tree-wide RATCHET.
+# ---------------------------------------------------------------------------
+
+#: Anti-vacuity FLOORS, not equalities -- 563 files and 148 marker sites
+#: MEASURED at authorship time -- so the guard survives the tree growing while
+#: still failing loudly if the sweep itself ever breaks (a wrong _TESTS_DIR, a
+#: read that silently yields nothing, an extractor rotted to always-empty).
+#: Without them a broken sweep reports zero offenders and passes, which is
+#: indistinguishable from a clean tree.  The house pattern for exactly this
+#: risk: test_whole_tree_scan_timeout_guard.py::_MIN_EXPECTED_TEST_FILES,
+#: test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES,
+#: test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
+_MIN_EXPECTED_TEST_FILES = 400
+_MIN_EXPECTED_MARKER_SITES = 100
+
+#: Pre-existing in-band sites, seeded in the next step.  EMPTY here so the
+#: sweep must prove itself against the real tree before anything is exempted
+#: from it -- an allowlist landed in the same commit as the sweep would make
+#: the two indistinguishable from a sweep that finds nothing.
+_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset()
+
+
+def _all_timeout_sites() -> tuple[list[tuple[str, _Site]], int, list[str]]:
+    """Every timeout marker site under this directory, with sweep-health counters.
+
+    Returns ``(sites, files_examined, unreadable)`` where each site is paired
+    with its module filename -- the first half of the ``(module, qualname)``
+    key the allowlist is written in.
+
+    Fail-soft on the READ for the same reason :func:`_timeout_marker_sites`
+    fails soft on the PARSE: a non-UTF-8 source, a deliberately-malformed
+    encoding fixture or a broken symlink under this directory would otherwise
+    raise straight out of a TIMEOUT-COVERAGE check and turn it red for a reason
+    unrelated to timeout coverage.  Skipped files are NOT counted as examined
+    (they were not) and are surfaced to the caller, so a sweep that silently
+    stops reading anything cannot hide here.
+    """
+    sites: list[tuple[str, _Site]] = []
+    unreadable: list[str] = []
+    examined = 0
+
+    for py_file in sorted(_TESTS_DIR.rglob('*.py')):
+        try:
+            source = py_file.read_text(encoding='utf-8')
+        except (UnicodeDecodeError, OSError):
+            unreadable.append(py_file.name)
+            continue
+        examined += 1
+        sites.extend((py_file.name, site) for site in _timeout_marker_sites(source))
+
+    return sites, examined, unreadable
+
+
+def _in_band_sites() -> tuple[list[tuple[str, _Site]], int, list[str]]:
+    """:func:`_all_timeout_sites`, narrowed to the sites that actually invert."""
+    sites, examined, unreadable = _all_timeout_sites()
+    return [pair for pair in sites if _inverts(pair[1].seconds)], examined, unreadable
+
+
+def test_no_new_inverting_timeout_marker() -> None:
+    """No marker in the inversion band, except the grandfathered census.
+
+    THE RATCHET.  A marker at ``PYPROJECT_DEFAULT_TIMEOUT < N <
+    VERIFY_CLI_PER_TEST_TIMEOUT`` reads as a loosening against the ini default
+    its author was looking at and silently becomes a TIGHTENING under verify's
+    CLI budget.  Under ``timeout_method = "thread"`` a breach is not a red
+    test: pytest-timeout ``os._exit()``s the xdist worker,
+    ``--max-worker-restart=0`` declines to replace it, and the session is
+    truncated with the blame landing on whatever innocent test shared the dead
+    worker.  Three tasks (4176, 4384, 4405) were failed that way by ONE such
+    marker.
+
+    A RATCHET AND NOT A SWEEP, deliberately.  The 61 surviving in-band sites
+    span ~20 modules, most of them the hottest files in the repo
+    (test_merge_queue.py, test_merge_queue_deep_landing.py,
+    test_merge_queue_build_chain.py, test_crash_recovery.py).  Rewriting them
+    here would take a concurrency lock on nearly every file in-flight fleet
+    tasks are editing, and would risk destabilising the very verify path this
+    guard exists to de-flake.  Blocking NEW instances at commit time is what
+    actually stops a fourth task being blamed; migrating the existing ones is
+    ordinary follow-up work, and the stale-entry twin below is what forces the
+    list to shrink as that happens.
+
+    The SITES are grandfathered, not the FILES.  A per-file count would net to
+    zero when one marker is added and another removed in the same file,
+    leaving a hole in a guard whose entire purpose is catching accidental
+    additions.  Verbosity is cheap; a hole in the ratchet is not.
+    """
+    offenders, examined, unreadable = _in_band_sites()
+
+    assert examined >= _MIN_EXPECTED_TEST_FILES, (
+        f'only {examined} .py files examined under {_TESTS_DIR} (expected at '
+        f'least {_MIN_EXPECTED_TEST_FILES}; {len(unreadable)} skipped as '
+        f'unreadable: {sorted(unreadable)}) -- the sweep itself is broken, so '
+        'this guard would pass vacuously rather than because the tree is clean.'
+    )
+
+    new_offenders = [
+        (module, site) for module, site in offenders if (module, site.qualname) not in _GRANDFATHERED
+    ]
+    if new_offenders:
+        offender_list = '\n  '.join(
+            f'{module}::{site.qualname} ({site.kind}, line {site.lineno}) pins '
+            f'{site.seconds:g}s'
+            for module, site in sorted(new_offenders, key=lambda pair: (pair[0], pair[1].qualname))
+        )
+        raise AssertionError(
+            f'{len(new_offenders)} NEW timeout marker(s) in the inversion band '
+            f'({PYPROJECT_DEFAULT_TIMEOUT} < N < {VERIFY_CLI_PER_TEST_TIMEOUT}).\n\n'
+            'A marker there is a TWO-WAY override, not a floor: it raises the '
+            f'budget under a bare local `pytest` (ini default '
+            f'{PYPROJECT_DEFAULT_TIMEOUT}s) and LOWERS it under verify, which '
+            f'passes --timeout={VERIFY_CLI_PER_TEST_TIMEOUT}. So a number '
+            'picked to loosen against the default in front of you silently '
+            'tightens the run that actually gates your merge. Exceeding it '
+            "does NOT fail the test: pytest-timeout's thread method os._exit()s "
+            'the xdist worker, --max-worker-restart=0 declines to replace it, '
+            'and the truncated session blames an innocent test that merely '
+            'shared it.\n\n'
+            'Write one of:\n\n'
+            '    from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT\n'
+            '    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)   # slow test\n\n'
+            f'    @pytest.mark.timeout(N)  # N <= {PYPROJECT_DEFAULT_TIMEOUT}, a '
+            'DELIBERATE tight bound\n\n'
+            'The second is for a test that asserts something happens FAST (see '
+            "test_verify_clock_stop.py's 15s watchdog marks); it tightens under "
+            'both budgets, which is why it is allowed. Anything in between '
+            'inverts. Full rationale: the VERIFY_CLI_PER_TEST_TIMEOUT comment '
+            'block in _orch_helpers.py.\n\n'
+            '_GRANDFATHERED is a shrinking census of pre-existing sites and may '
+            'only ever have entries REMOVED -- do not add yours to it.'
+            f'\n\nOffending sites:\n  {offender_list}'
+        )
+
+
+def test_grandfather_allowlist_has_no_stale_entries() -> None:
+    """Every ``_GRANDFATHERED`` entry must still name a real in-band site.
+
+    The ratchet self-tightens: as the follow-up migration raises these markers,
+    their entries stop matching and must be deleted, so the list can never rot
+    into a permanent blanket exemption that silently re-admits a site someone
+    later re-adds under the same name.  Same shape, and same reason, as
+    test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
+    """
+    offenders, examined, unreadable = _in_band_sites()
+
+    assert examined >= _MIN_EXPECTED_TEST_FILES, (
+        f'only {examined} .py files examined under {_TESTS_DIR} (expected at '
+        f'least {_MIN_EXPECTED_TEST_FILES}; {len(unreadable)} skipped as '
+        f'unreadable: {sorted(unreadable)}) -- the sweep is broken, so EVERY '
+        'allowlist entry would read as stale.'
+    )
+
+    live = {(module, site.qualname) for module, site in offenders}
+    stale = sorted(_GRANDFATHERED - live)
+
+    assert not stale, (
+        f'{len(stale)} _GRANDFATHERED entr(y/ies) no longer correspond to an '
+        'in-band timeout marker -- delete them, the ratchet is supposed to '
+        'shrink. (The marker was raised, removed, or its test renamed; in the '
+        'rename case re-add nothing, the new name must stand on its own.)\n  '
+        + '\n  '.join(f'{module}::{qualname}' for module, qualname in stale)
+    )
+
+
+def test_the_marker_census_is_not_vacuous() -> None:
+    """The sweep must find a substantial population of markers, in-band or not.
+
+    Distinct from the file floor above and load-bearing in a way it is not: a
+    correct ``_TESTS_DIR`` with an EXTRACTOR rotted to always-empty would
+    examine 563 files, find zero sites, report zero offenders and pass. This is
+    the floor that catches that. 148 sites measured at authorship time.
+    """
+    sites, examined, _ = _all_timeout_sites()
+
+    assert len(sites) >= _MIN_EXPECTED_MARKER_SITES, (
+        f'only {len(sites)} timeout marker site(s) found across {examined} '
+        f'files (expected at least {_MIN_EXPECTED_MARKER_SITES}) -- '
+        '_timeout_marker_sites has probably stopped matching, so the ratchet '
+        'would pass vacuously. Check it against the inline fixtures above.'
+    )
