@@ -1492,6 +1492,36 @@ def fleet_dir_redirect_violation_reason(
     return None
 
 
+def fleet_dir_redirect_target(
+    existing_value: str | None,
+    basetemp: str | os.PathLike[str],
+) -> Path | None:
+    """The already-sound ``ORCH_FLEET_DIR`` to ADOPT, or ``None`` to create one.
+
+    Defined ON TOP of :func:`fleet_dir_redirect_violation_reason`: adopt
+    *existing_value* exactly when that rule finds no violation in it. One rule,
+    not two -- a second copy of the soundness test would drift, and adoption is
+    the one place where accepting a value the tests reject would silently undo
+    the whole defence.
+
+    WHY ADOPTION EXISTS (task 4398): :func:`_df_fleet_dir_redirect` is
+    session-scoped AND autouse, and each test root's conftest binds its own
+    copy. A session collecting two roots runs BOTH instances; without adoption
+    each unconditionally ``mktemp``s and overwrites the env var, so the root
+    whose fixture ran first yields a path that no longer matches
+    ``ORCH_FLEET_DIR`` and its per-root identity assertion fails. One basetemp
+    per session, so "inside this run's basetemp" is well-defined for the check.
+
+    A value from a PREVIOUS session is not adopted: it lands outside this run's
+    basetemp, which the rule already refuses.
+    """
+    if not existing_value:
+        return None
+    if fleet_dir_redirect_violation_reason(existing_value, basetemp) is not None:
+        return None
+    return Path(existing_value)
+
+
 @pytest.fixture(scope='session', autouse=True)
 def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     """Point ``ORCH_FLEET_DIR`` at a tmp dir for this whole session (task 3799).
@@ -1530,8 +1560,35 @@ def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     absent rather than setting an empty string — an empty ``ORCH_FLEET_DIR`` is
     not "unset" to a ``${VAR:-…}`` default, so leaking one would fall straight
     through to the production path, i.e. be its own bug.
+
+    IDEMPOTENT ACROSS TEST ROOTS (task 4398).  Each root's conftest binds its own
+    copy of this session-scoped fixture, so a session collecting two roots runs
+    both.  When :func:`fleet_dir_redirect_target` says the value already set is
+    sound for this run, this instance ADOPTS it and touches neither ``mktemp``
+    nor ``os.environ`` — otherwise the second instance to run would overwrite the
+    env var out from under the first, leaving the first yielding a path the var
+    no longer holds (which is exactly the failure 4398 reported), and its
+    teardown would then pop a value the owning instance still needs.
+
+    Adoption is NOT the weakening the paragraph above warns against, and the
+    distinction is precise: it is gated on the value already satisfying the very
+    rule every one of these tests asserts, so it can never accept something
+    :func:`fleet_dir_redirect_violation_reason` would reject.  All three
+    properties survive it — hermeticity (the adopted value is inside this run's
+    basetemp and is not the live dir), the per-root PROOF (each root's test still
+    takes this fixture BY NAME, so deleting a conftest binding still fails
+    collection), and per-call ``env=`` overrides still winning.
     """
     saved = os.environ.get(_FLEET_DIR_ENV)
+    adopted = fleet_dir_redirect_target(saved, tmp_path_factory.getbasetemp())
+    if adopted is not None:
+        # Another root's instance already established a sound redirect for this
+        # session. Yield IT and touch nothing: creating a second dir here would
+        # overwrite the env var out from under the instance that owns it, and
+        # popping it on teardown would strip a value that instance still needs.
+        yield adopted
+        return
+
     fleet_dir = tmp_path_factory.mktemp('fleet-dir')
     os.environ[_FLEET_DIR_ENV] = str(fleet_dir)
     try:
