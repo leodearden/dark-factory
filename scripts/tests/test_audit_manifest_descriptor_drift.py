@@ -848,6 +848,13 @@ def test_report_coverage_rows_render_with_their_column_alignment(
     assert "    capabilities with no task entry:    1" in lines
     assert "    task entries with no capability:    1" in lines
     assert "    manifest tasks with no db row:      0" in lines
+    # The two absence classes render ADJACENTLY and on the same gutter, so an
+    # operator reading a nonzero no-db-row count sees, in the next line, the
+    # class it is NOT. The 30-char label is under _COVERAGE_LABEL_WIDTH (36),
+    # so its value lands at column 40 like every sibling row.
+    assert "    external-registry task blocks:      0" in lines
+    assert lines.index("    external-registry task blocks:      0") == (
+        lines.index("    manifest tasks with no db row:      0") + 1)
     assert "    unvalidatable task entries:         0" in lines
     assert "    unconvertible sidecar descriptors:  0" in lines
     assert "    manifests that failed to parse:     0" in lines
@@ -908,6 +915,10 @@ def test_format_json_emits_an_object_with_projects_coverage_and_findings(
     assert project["project_root"].endswith("proj")
     assert project["manifest_root"] == project["project_root"]
     assert project["coverage"]["mechanical_capabilities_compared"] == 1
+    # Every coverage class travels, including the ones that are zero on this
+    # sweep: a machine consumer that only ever sees a key when it is nonzero
+    # cannot tell "none of these" from "this build does not report them".
+    assert project["coverage"]["external_registry_task_blocks"] == 0
     assert project["coverage"]["git_discovery_failed"] is False
     (finding,) = project["findings"]
     assert finding["manifest"] == "plans/a-prd.capability-manifest.yaml"
@@ -1012,6 +1023,7 @@ def test_main_json_payload_shape(tmp_path, make_tasks_db):
     payload = json.loads(result.stdout)
     (project,) = payload["projects"]
     assert project["coverage"]["mechanical_capabilities_compared"] == 1
+    assert project["coverage"]["external_registry_task_blocks"] == 0
     assert [f["capability"] for f in project["findings"]] == ["gate"]
 
 
