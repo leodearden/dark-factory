@@ -2019,3 +2019,87 @@ class TestTheRefusalIsCountedOnThePlan:
         )
 
         assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY not in rig.harness.plan()
+
+
+class TestARefusalBeforeThePlanExistsIsAdoptedByIt:
+    """The one gap the eager stamp cannot close alone.
+
+    A refused ``create_plan`` has no document to stamp — the middleware's own
+    docs name the case — and ``test_no_plan_is_written`` pins that no plan file
+    appears, which the counter must not violate. Without a buffer, the loudest
+    leak shape on this server (an architect bounced repeatedly before its plan
+    even exists) would be the one case the counter could never describe.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_refused_create_plan_still_writes_no_plan_at_all(
+        self, harness: Harness
+    ):
+        """The standing invariant survives the eager stamp.
+
+        Stamping here would MANUFACTURE a plan out of a refusal — no task_id,
+        no title, no analysis — which every later reader would inherit as the
+        architect's own work.
+        """
+        with pytest.raises(ToolError):
+            await harness.call(
+                'create_plan',
+                {'task_id': 'test-1', 'title': ABSORBED_ANALYSIS, 'files': ['a.py']},
+            )
+
+        assert not harness.plan_path.exists()
+        assert plan_markup_stamp.pending_block()['count'] == 1, (
+            'buffered rather than lost'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_next_successful_create_plan_adopts_the_refusal(
+        self, harness: Harness
+    ):
+        with pytest.raises(ToolError):
+            await harness.call(
+                'create_plan',
+                {'task_id': 'test-1', 'title': ABSORBED_ANALYSIS, 'files': ['a.py']},
+            )
+
+        await harness.seed_plan()
+
+        plan = harness.plan()
+        block = plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 1
+        assert block['by_tool'] == {'create_plan': 1}
+        assert plan['title'] == 'A clean plan', (
+            'every authored field is exactly what the successful call supplied'
+        )
+        assert plan['analysis'] == 'Clean analysis prose describing the approach.'
+        assert plan_markup_stamp.pending_block() is None, 'the buffer was drained'
+
+    @pytest.mark.asyncio
+    async def test_a_second_create_plan_carries_the_block_forward(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """``_create_plan`` overwrites ``plan.json`` WHOLESALE.
+
+        Without the carry-forward, a re-plan would erase a counter earned
+        earlier in the same session — losing exactly the record it exists to
+        keep, at the moment a reader most wants it.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+        assert rig.harness.plan()[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]['count'] == 1
+
+        await rig.harness.seed_plan()
+
+        block = rig.harness.plan()[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 1, 'the earlier refusal survived the overwrite'
+        assert block['by_tool'] == {'add_design_decision': 1}
+
+    @pytest.mark.asyncio
+    async def test_a_session_with_no_refusal_produces_no_key_at_all(
+        self, harness: Harness
+    ):
+        """The clean path stays byte-identical to what it is today."""
+        await harness.seed_plan()
+
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY not in harness.plan()
