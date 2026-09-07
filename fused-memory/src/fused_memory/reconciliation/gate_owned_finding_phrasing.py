@@ -56,6 +56,120 @@ Pure throughout: no I/O, no side effects, no task writes.
 
 from __future__ import annotations
 
+from fused_memory.reconciliation.curator_gate_resolution_sweep import (
+    GATE_RESOLUTION_FLAG_TYPE,
+)
+
+#: The ONE sentence both halves of task 4814 quote (INV-5).
+#:
+#: The Stage-1 prompt norm tells the stage to write a gate-owned finding's
+#: ``suggested_action`` in these terms; :func:`normalize_gate_owned_suggested_actions`
+#: PREPENDS this exact text when the stage did not.  Because both halves read
+#: this one constant, the correction an operator sees can never be wording the
+#: stage was never given.
+#:
+#: CONTAINS NO BRACE, in any form, and this is load-bearing rather than
+#: stylistic: the constant is interpolated into ``STAGE1_SYSTEM_PROMPT``, which
+#: is an f-string — a bare brace fails at import — while
+#: ``tests/test_stage1_consolidation_guidance.py`` separately asserts that
+#: ``{{``/``}}`` never survive into the rendered text, so escaping is not an
+#: escape hatch either.  Carrying no brace at all satisfies both.
+CANONICAL_HUMAN_GATE_ACTION = (
+    'HUMAN DECISION GATE: the cited task is a human decision gate '
+    "(metadata.operational_mode = 'gate' and/or metadata.always_escalates = "
+    'true), so it is awaiting human-operator sign-off only. No reconciliation '
+    'stage may decide this question, and no stage may record a decision on the '
+    'task (update_task / set_task_status) that a human has not made. '
+    'Everything that follows is evidence assembled FOR the human operator, not '
+    'an instruction to a stage.'
+)
+
+#: The prompt section's title and heading, exported so a rename moves the
+#: prompt and the wiring pins in
+#: ``tests/test_recon_gate_owned_action_phrasing_guidance.py`` together.
+#: Follows the ``prompts/stage1.py::EXECUTING_A_CLUSTER_FOLD_HEADING``
+#: precedent: tests locate the section by this constant rather than by pinning
+#: its prose, so a pure rename with a byte-identical body cannot turn them red
+#: for no behavioural reason.
+GATE_OWNED_ACTION_NORM_TITLE = 'Gate-Owned Finding Phrasing'
+GATE_OWNED_ACTION_NORM_HEADING = f'## {GATE_OWNED_ACTION_NORM_TITLE}'
+
+
+def render_gate_owned_action_norm() -> str:
+    """Render the Stage-1 gate-owned ``suggested_action`` phrasing norm.
+
+    Half A of task 4814 — the probabilistic half.  It embeds
+    :data:`CANONICAL_HUMAN_GATE_ACTION` VERBATIM exactly once (never a
+    reworded second copy) and states the Stage-1-facing rule: when a finding's
+    cited task is gate-owned, phrase ``suggested_action`` as awaiting
+    human-operator sign-off only, and never in a form that reads as
+    authorizing a later stage to decide.
+
+    It names the ONE carve-out by the imported
+    :data:`~fused_memory.reconciliation.curator_gate_resolution_sweep.GATE_RESOLUTION_FLAG_TYPE`
+    rather than re-spelling it, and it tells the stage that the same rule is
+    enforced deterministically in code after the stage runs — the
+    prompt-directive-plus-authoritative-code-gate shape the Flag Suppression
+    Check and ``filter_stale_count_snapshot_corrections`` already use.
+
+    Stage 1 ONLY.  It is deliberately not given to Stage 2 or Stage 3: Stage 2
+    is the stage that legitimately holds ``set_task_status``/``submit_task``,
+    and a section telling IT that gate-owned findings are awaiting human
+    sign-off only sits one reword away from contradicting both
+    ``build_gate_resolution_flag``'s instruction to transcribe a recorded
+    ruling and ``render_source_completion_section``'s instruction to FILE the
+    gate.  ``tests/test_recon_gate_owned_action_phrasing_guidance.py`` pins
+    that absence.
+
+    HARD CONSTRAINTS on this text, each enforced by a live suite (see that
+    module, and ``TestCanonicalHumanGateAction`` in
+    ``tests/reconciliation/test_gate_owned_finding_phrasing.py``): no
+    ``escalate_blocker``; no brace in any form; no ``source_finding_id`` or
+    ``related_memory_ids`` (they would break the derived-count invariant in
+    ``test_finding_provenance_prompt_guidance.py``); no
+    ``as_submit_task_kwargs``; no ``write_entity_standing_decision``; and NO
+    recon-report tool-call example at all, since
+    ``test_recon_report_guidance_drift.py``'s balanced-paren scan requires
+    ``run_id`` inside every ``add_finding``-shaped example and a phrasing rule
+    needs no call example.
+
+    Pure: no I/O, no side effects.
+    """
+    return (
+        GATE_OWNED_ACTION_NORM_HEADING + '\n'
+        'Before you write a finding, check whether the task it cites is a human '
+        'decision gate — the structured markers are '
+        "metadata.operational_mode = 'gate' and metadata.always_escalates = "
+        'true, and EITHER one is sufficient. When it is, the finding is '
+        'evidence for a human, not work for a stage.\n\n'
+        'PHRASE suggested_action ACCORDINGLY. Write it as awaiting '
+        'human-operator sign-off only. Do NOT write it in any form that reads '
+        'as authorizing a later stage to settle the question — the observed '
+        'offenders are "Stage 2 or operator should decide", "enumerate" and '
+        '"extend". Stage 2 holds update_task and set_task_status, so a '
+        'suggested_action phrased as a decision to be made is an invitation to '
+        'close a human decision that has not been made. Assemble the evidence, '
+        'name what the human would need in order to rule, and stop there.\n\n'
+        'THE SENTENCE TO WRITE, verbatim, as the opening of such a '
+        'suggested_action:\n' + CANONICAL_HUMAN_GATE_ACTION + '\n\n'
+        'ONE CARVE-OUT. A finding whose flag_type is '
+        + GATE_RESOLUTION_FLAG_TYPE + ' is exempt. That flag is emitted by the '
+        'deterministic curator-gate-resolution sweep, and its evidence is a '
+        'ruling a human curator ALREADY recorded in Mem0 — so it legitimately '
+        'asks Stage 2 to TRANSCRIBE a human decision rather than to make one, '
+        'and it carries its own dismiss branch for the case where the memories '
+        'merely curate the gate without ruling on it. Leave that flag\'s '
+        'suggested_action alone.\n\n'
+        'THIS RULE IS ALSO ENFORCED IN CODE. After this stage returns, a pure '
+        'post-processor reads the same two metadata markers off the live task '
+        'tree and prepends the sentence above to any finding citing a '
+        'gate-owned task that does not already carry it, preserving your text '
+        'after it. So the phrasing is corrected whether or not you comply, and '
+        'the correction keys on the structured task fact rather than on your '
+        'wording — you cannot evade it by rephrasing, and you gain nothing by '
+        'hedging. Write the finding\'s evidence plainly.'
+    )
+
 
 def extract_human_gated_task_ids(tasks):
     """Return sorted, deduped str ids of human-gate-owned tasks.
