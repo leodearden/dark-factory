@@ -6088,22 +6088,33 @@ def test_normalize_project_token_maps_none_to_the_unset_sentinel() -> None:
     assert sr.normalize_project_token(None) != 'none'
 
 
-def test_normalize_project_token_solar_challenge_gap_is_known_not_resolved() -> None:
-    """RESIDUAL GAP, pinned so it stays a known state rather than a surprise.
+def test_solar_challenge_alias_was_decided_and_declined() -> None:
+    """The naming mismatch is a DECIDED, standing state -- not a pending gap.
 
-    Folding DOES merge solar-challenge's two filed spellings into one bucket
-    -- an improvement, since a reap scoped to either previously missed the
-    other (live 2026-08-07: 3 OPEN under ``solar-challenge``, 2 under
-    ``solar_challenge``). But that bucket is ``solar_challenge``, while
+    Folding merges solar-challenge's two filed spellings into one bucket --
+    an improvement, since a reap scoped to either previously missed the
+    other (re-measured 2026-09-07 over 748 records: 3 OPEN under
+    ``solar-challenge``, 2 under ``solar_challenge``, ZERO under
+    ``my_solar_challenge``; unchanged from 2026-08-07). But that bucket is
+    ``solar_challenge``, while
     ``/home/leo/src/solar-challenge/dark-factory-orchestrator.yaml`` declares
     ``my_solar_challenge``, and no alias bridges them. So a reaper passing
     the config-declared token matches ZERO of those 5 rows.
 
-    This test exists so nobody reads the folding rows above as "solved" and
-    so the day an alias IS added (its own filed decision task, 3813) this
-    test fails loudly and must be updated deliberately -- rather than the
-    gap silently changing shape. The skills' ``--project`` guidance carries
-    the same caveat for the humans and watchers that read it.
+    Task 3813 was the decision task for that bridge, and it DECLINED it --
+    chiefly because the fold left no split to heal (an alias would rename a
+    populated bucket onto an empty one) and because the identity question is
+    an open human gate in that project, marked "Do NOT auto-act". See
+    ``sr.PROJECT_TOKEN_ALIASES_DECLINED`` for the full evidence.
+
+    So this is no longer "pending"; the assertions below pin a settled
+    outcome. They keep their fail-loudly-on-promotion property -- adding the
+    alias breaks the last two -- which
+    test_project_token_alias_declines_registry_shape now also enforces from
+    the other side, via the disjointness of the two tables. The skills'
+    ``--project`` guidance carries the same, now-permanent caveat for the
+    humans and watchers that read it, and both CLI verbs warn if you pass
+    the config-declared token.
     """
     assert sr.normalize_project_token('solar-challenge') == 'solar_challenge'
     assert sr.normalize_project_token('solar-challenge') == sr.normalize_project_token(
