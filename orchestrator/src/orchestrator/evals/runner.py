@@ -1866,100 +1866,118 @@ async def run_eval_matrix(
     """
     configs = configs or EVAL_CONFIGS
 
-    combos = [
-        (task_path, config, t)
-        for task_path in task_paths
-        for config in configs
-        for t in range(1, trials + 1)
-    ]
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the WHOLE matrix (task 4427): every cell below shares
+        # this object, so cell N+1 inherits the cap knowledge cell N paid for
+        # instead of re-leasing an account already proved capped — the
+        # wall-clock win φ's failover was added for, which a per-cell gate
+        # forfeits. Sharing one gate across concurrent cells is the production
+        # shape, not a new one: :class:`orchestrator.harness.Harness` owns
+        # exactly one UsageGate for the whole process and shares it across every
+        # concurrent workflow.
+        #
+        # The `async with` spans the monitor loop AND its sibling-cancellation
+        # drain, so the gate outlives the cells it serves and campaign_usage_
+        # gate's `finally` tears it down on the way out — including on the
+        # CancelledError re-raise, where a leaked probe loop would otherwise
+        # survive the aborted campaign. `gate` may be None (deliberately
+        # ungated) and is threaded to cells AS SUCH.
 
-    if max_parallel is None:
-        max_parallel = len(combos)
-    sem = asyncio.Semaphore(max_parallel)
+        combos = [
+            (task_path, config, t)
+            for task_path in task_paths
+            for config in configs
+            for t in range(1, trials + 1)
+        ]
 
-    async def _run_one(
-        task_path: Path, config: EvalConfig, trial: int,
-    ) -> EvalResult | None:
-        task = load_task(task_path)
-        if not force and _result_exists(task['id'], config.name):
-            logger.info(f'Skipping existing: {task["id"]} × {config.name}')
-            return None
-        async with sem:
-            return await run_eval(
-                task_path, config, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
+        if max_parallel is None:
+            max_parallel = len(combos)
+        sem = asyncio.Semaphore(max_parallel)
 
-    # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
-    # asyncio.gather(return_exceptions=True).
-    #
-    # asyncio.gather(return_exceptions=True) blocks until ALL tasks complete before
-    # the post-gather loop can detect CancelledError and re-raise it.  For a large
-    # matrix where one eval is cancelled early, N-1 siblings continue running their
-    # full duration — wasting CPU proportional to matrix size × timeout_minutes.
-    #
-    # asyncio.wait(FIRST_COMPLETED) lets us react to each task completion
-    # individually: on CancelledError we immediately cancel all remaining tasks and
-    # re-raise, typically within milliseconds.  Non-cancel exceptions are still
-    # logged and the loop continues — identical happy-path/error-path semantics to
-    # the previous gather loop, with strictly better cancellation behaviour.
-    #
-    # This is the same pattern used in harness.py (lines 305, 317) for managing
-    # concurrent workflow tasks.  Cleanup follows the established pattern from
-    # steward.py (lines 101-104): cancel tasks explicitly then await them with
-    # return_exceptions=True to ensure clean teardown before re-raising.
-    active: set[asyncio.Task] = {
-        asyncio.create_task(_run_one(tp, cfg, t))
-        for tp, cfg, t in combos
-    }
-    results: list[EvalResult] = []
-    # Distinguish two cancellation scenarios:
-    #   Inner-task cancellation — an individual _run_one coroutine was cancelled
-    #     or raised CancelledError.  asyncio.wait surfaces this via
-    #     task.cancelled() or task.exception() inside the monitor loop below;
-    #     we log it, cancel siblings, and re-raise to propagate.
-    #   Outer-task cancellation — run_eval_matrix itself was cancelled (e.g.
-    #     SIGINT / asyncio.wait_for timeout).  The CancelledError interrupts
-    #     the *await asyncio.wait(...)* call directly and is caught by the
-    #     outer except clause, which performs the same sibling cleanup.
-    try:
-        while active:
-            done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-            # Task 586: scan the full done batch for ALL CancelledErrors before
-            # processing any results.  Multiple tasks can complete in the same
-            # event-loop iteration and land in the same done set (e.g. when a
-            # shutdown signal fires while two evals are parked at the same
-            # await point).  The old code raised on the first cancel it saw,
-            # silently discarding subsequent cancels in the batch.
-            cancel_errors = _collect_cancel_errors(done)
-            if cancel_errors:
-                for ce in cancel_errors:
-                    logger.error('Eval cancelled', exc_info=ce)
-                for t in active:
-                    t.cancel()
-                await asyncio.gather(*active, return_exceptions=True)
-                active.clear()
-                raise cancel_errors[0]
-            # No cancellations in this batch — handle results and non-cancel
-            # exceptions.  task.cancelled() is False for all remaining tasks so
-            # task.exception() / task.result() are safe to call.
-            for task in done:
-                exc = task.exception()
-                if exc is not None:
-                    logger.error('Eval failed', exc_info=exc)
-                else:
-                    r = task.result()
-                    if r is not None:
-                        results.append(r)
-    except asyncio.CancelledError:
-        # External cancellation (e.g. SIGINT / asyncio.wait_for timeout).
-        # Cancel all remaining sibling tasks and await their cleanup before
-        # re-raising so we don't leave orphaned tasks behind.
-        for t in active:
-            t.cancel()
-        await asyncio.gather(*active, return_exceptions=True)
-        raise
-    return results
+        async def _run_one(
+            task_path: Path, config: EvalConfig, trial: int,
+        ) -> EvalResult | None:
+            task = load_task(task_path)
+            if not force and _result_exists(task['id'], config.name):
+                logger.info(f'Skipping existing: {task["id"]} × {config.name}')
+                return None
+            async with sem:
+                return await run_eval(
+                    task_path, config, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
+                )
+
+        # Design decision: use asyncio.wait(FIRST_COMPLETED) monitor loop instead of
+        # asyncio.gather(return_exceptions=True).
+        #
+        # asyncio.gather(return_exceptions=True) blocks until ALL tasks complete before
+        # the post-gather loop can detect CancelledError and re-raise it.  For a large
+        # matrix where one eval is cancelled early, N-1 siblings continue running their
+        # full duration — wasting CPU proportional to matrix size × timeout_minutes.
+        #
+        # asyncio.wait(FIRST_COMPLETED) lets us react to each task completion
+        # individually: on CancelledError we immediately cancel all remaining tasks and
+        # re-raise, typically within milliseconds.  Non-cancel exceptions are still
+        # logged and the loop continues — identical happy-path/error-path semantics to
+        # the previous gather loop, with strictly better cancellation behaviour.
+        #
+        # This is the same pattern used in harness.py (lines 305, 317) for managing
+        # concurrent workflow tasks.  Cleanup follows the established pattern from
+        # steward.py (lines 101-104): cancel tasks explicitly then await them with
+        # return_exceptions=True to ensure clean teardown before re-raising.
+        active: set[asyncio.Task] = {
+            asyncio.create_task(_run_one(tp, cfg, t))
+            for tp, cfg, t in combos
+        }
+        results: list[EvalResult] = []
+        # Distinguish two cancellation scenarios:
+        #   Inner-task cancellation — an individual _run_one coroutine was cancelled
+        #     or raised CancelledError.  asyncio.wait surfaces this via
+        #     task.cancelled() or task.exception() inside the monitor loop below;
+        #     we log it, cancel siblings, and re-raise to propagate.
+        #   Outer-task cancellation — run_eval_matrix itself was cancelled (e.g.
+        #     SIGINT / asyncio.wait_for timeout).  The CancelledError interrupts
+        #     the *await asyncio.wait(...)* call directly and is caught by the
+        #     outer except clause, which performs the same sibling cleanup.
+        try:
+            while active:
+                done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                # Task 586: scan the full done batch for ALL CancelledErrors before
+                # processing any results.  Multiple tasks can complete in the same
+                # event-loop iteration and land in the same done set (e.g. when a
+                # shutdown signal fires while two evals are parked at the same
+                # await point).  The old code raised on the first cancel it saw,
+                # silently discarding subsequent cancels in the batch.
+                cancel_errors = _collect_cancel_errors(done)
+                if cancel_errors:
+                    for ce in cancel_errors:
+                        logger.error('Eval cancelled', exc_info=ce)
+                    for t in active:
+                        t.cancel()
+                    await asyncio.gather(*active, return_exceptions=True)
+                    active.clear()
+                    raise cancel_errors[0]
+                # No cancellations in this batch — handle results and non-cancel
+                # exceptions.  task.cancelled() is False for all remaining tasks so
+                # task.exception() / task.result() are safe to call.
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        logger.error('Eval failed', exc_info=exc)
+                    else:
+                        r = task.result()
+                        if r is not None:
+                            results.append(r)
+        except asyncio.CancelledError:
+            # External cancellation (e.g. SIGINT / asyncio.wait_for timeout).
+            # Cancel all remaining sibling tasks and await their cleanup before
+            # re-raising so we don't leave orphaned tasks behind.
+            for t in active:
+                t.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
+            raise
+        return results
 
 
 async def _bounded_fanout(
@@ -2038,39 +2056,51 @@ async def run_ofat_stage(
     list across every ``(candidate, fixture, trial)`` cell; a failed cell is
     logged and skipped via :func:`_bounded_fanout`.
     """
-    def _thunk(
-        task_path: Path, candidate: EvalConfig, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            if candidate.role == 'architect':
-                return await run_architect_eval(
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the WHOLE stage (task 4427): every cell below shares this
+        # object, so cell N+1 inherits the cap knowledge cell N paid for instead
+        # of re-leasing an account already proved capped — the wall-clock win
+        # φ's failover was added for, which a per-cell gate forfeits. Sharing one
+        # gate across concurrent cells is the production shape, not a new one:
+        # :class:`orchestrator.harness.Harness` owns exactly one UsageGate for
+        # the whole process and shares it across every concurrent workflow.
+        # ``gate`` may be None (deliberately ungated) and is threaded to cells
+        # AS SUCH — see campaign_usage_gate for why dropping it would be wrong.
+        def _thunk(
+            task_path: Path, candidate: EvalConfig, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                if candidate.role == 'architect':
+                    return await run_architect_eval(
+                        task_path, candidate, base_config,
+                        trial=trial, timeout_override=timeout_override,
+                        usage_gate=gate,
+                    )
+                if candidate.role == 'judge':
+                    # ο: vary ONLY the judge — pin the implementer to the fixed cloud
+                    # incumbent (config=JUDGE_OFAT_IMPLEMENTER_PIN) and ride the judge
+                    # candidate on judge_config, so run_eval derives the ζ completion
+                    # judge's model/effort while implementer/architect/reviewer stay
+                    # fixed (true OFAT). run_eval relabels + stamps role_under_test.
+                    return await run_eval(
+                        task_path, JUDGE_OFAT_IMPLEMENTER_PIN, base_config,
+                        trial=trial, timeout_override=timeout_override,
+                        judge_config=candidate, usage_gate=gate,
+                    )
+                return await run_eval(
                     task_path, candidate, base_config,
                     trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
                 )
-            if candidate.role == 'judge':
-                # ο: vary ONLY the judge — pin the implementer to the fixed cloud
-                # incumbent (config=JUDGE_OFAT_IMPLEMENTER_PIN) and ride the judge
-                # candidate on judge_config, so run_eval derives the ζ completion
-                # judge's model/effort while implementer/architect/reviewer stay
-                # fixed (true OFAT). run_eval relabels + stamps role_under_test.
-                return await run_eval(
-                    task_path, JUDGE_OFAT_IMPLEMENTER_PIN, base_config,
-                    trial=trial, timeout_override=timeout_override,
-                    judge_config=candidate,
-                )
-            return await run_eval(
-                task_path, candidate, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+            return _run
 
-    thunks = [
-        _thunk(tp, candidate, trial)
-        for tp in task_paths
-        for candidate in candidates
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        thunks = [
+            _thunk(tp, candidate, trial)
+            for tp in task_paths
+            for candidate in candidates
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 async def run_matrix_stage(
@@ -2093,24 +2123,35 @@ async def run_matrix_stage(
     semantics to :func:`run_ofat_stage`). Both roles run LIVE. Returns the
     flattened ``EvalResult`` list; a failed cell is logged and skipped.
     """
-    def _thunk(
-        task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            return await run_end_to_end(
-                task_path, arch, impl, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the WHOLE stage (task 4427): every cell below shares this
+        # object, so cell N+1 inherits the cap knowledge cell N paid for instead
+        # of re-leasing an account already proved capped — the wall-clock win
+        # φ's failover was added for, which a per-cell gate forfeits. Sharing one
+        # gate across concurrent cells is the production shape, not a new one:
+        # :class:`orchestrator.harness.Harness` owns exactly one UsageGate for
+        # the whole process and shares it across every concurrent workflow.
+        # ``gate`` may be None (deliberately ungated) and is threaded to cells
+        # AS SUCH — see campaign_usage_gate for why dropping it would be wrong.
+        def _thunk(
+            task_path: Path, arch: EvalConfig, impl: EvalConfig, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                return await run_end_to_end(
+                    task_path, arch, impl, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
+                )
+            return _run
 
-    pairs = matrix_pairs(arch_survivors, impl_survivors)
-    thunks = [
-        _thunk(tp, arch, impl, trial)
-        for tp in task_paths
-        for arch, impl in pairs
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        pairs = matrix_pairs(arch_survivors, impl_survivors)
+        thunks = [
+            _thunk(tp, arch, impl, trial)
+            for tp in task_paths
+            for arch, impl in pairs
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 async def run_confirm_stage(
@@ -2134,22 +2175,33 @@ async def run_confirm_stage(
     :func:`run_matrix_stage`. Both roles run LIVE. Returns the flattened
     ``EvalResult`` list for the confirmation batch.
     """
-    def _thunk(
-        task_path: Path, trial: int,
-    ) -> Callable[[], Awaitable[EvalResult | None]]:
-        async def _run() -> EvalResult | None:
-            return await run_end_to_end(
-                task_path, arch_winner, impl_winner, base_config,
-                trial=trial, timeout_override=timeout_override,
-            )
-        return _run
+    async with campaign_usage_gate(base_config) as gate:
+        # ONE gate for the WHOLE stage (task 4427): every cell below shares this
+        # object, so cell N+1 inherits the cap knowledge cell N paid for instead
+        # of re-leasing an account already proved capped — the wall-clock win
+        # φ's failover was added for, which a per-cell gate forfeits. Sharing one
+        # gate across concurrent cells is the production shape, not a new one:
+        # :class:`orchestrator.harness.Harness` owns exactly one UsageGate for
+        # the whole process and shares it across every concurrent workflow.
+        # ``gate`` may be None (deliberately ungated) and is threaded to cells
+        # AS SUCH — see campaign_usage_gate for why dropping it would be wrong.
+        def _thunk(
+            task_path: Path, trial: int,
+        ) -> Callable[[], Awaitable[EvalResult | None]]:
+            async def _run() -> EvalResult | None:
+                return await run_end_to_end(
+                    task_path, arch_winner, impl_winner, base_config,
+                    trial=trial, timeout_override=timeout_override,
+                    usage_gate=gate,
+                )
+            return _run
 
-    thunks = [
-        _thunk(tp, trial)
-        for tp in task_paths
-        for trial in range(1, trials + 1)
-    ]
-    return await _bounded_fanout(thunks, max_parallel)
+        thunks = [
+            _thunk(tp, trial)
+            for tp in task_paths
+            for trial in range(1, trials + 1)
+        ]
+        return await _bounded_fanout(thunks, max_parallel)
 
 
 def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:
