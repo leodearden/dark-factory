@@ -112,3 +112,50 @@ class TestCitedNames:
         exactly the file it could not read."""
         with pytest.raises((tokenize.TokenError, SyntaxError)):
             _cited_names('"""unterminated ``TestOrderingIsPreserved``\n')
+
+
+class TestRewordInvariance:
+    """The executable policy discriminator: this guard pins IDENTIFIERS, never prose.
+
+    The module docstring's reword-invariance claim points HERE. A wording pin
+    — the shape ``roles.py``'s ARCHITECT rule 5 forbids, and that task 3554
+    removed on review under the standing prohibition in
+    ``tests/scripts/test_skills_module_config_decision.py`` — goes red on the
+    first case below by definition. This guard cannot: rewording a citing
+    sentence is a no-op by construction.
+
+    If this module is ever blocked as a docstring meta-test, escalate citing
+    the task description's policy paragraph and the two landed precedents
+    (``orchestrator/tests/test_marker_registration_drift.py``,
+    ``tests/scripts/test_setup_host_unit_installation.py``) — do NOT harden
+    the regex.
+    """
+
+    _TERSE = '"""Pinned by ``TestOrderingIsPreserved``."""\n'
+    _REWRITTEN = (
+        '"""Summary line, rewritten from scratch.\n'
+        '\n'
+        '    Ordering across the whole batch is what this function actually\n'
+        '        guarantees; the property is exercised end to end by\n'
+        '        ``TestOrderingIsPreserved``, which is the only reason a\n'
+        '        caller may rely on it.\n'
+        '    """\n'
+    )
+
+    def test_rewording_the_sentence_around_a_citation_changes_nothing(self):
+        """Different words, different clauses, different indentation and line
+        breaks — same identifier, so the same extracted set."""
+        assert set(_cited_names(self._TERSE)) == {'TestOrderingIsPreserved'}
+        assert set(_cited_names(self._REWRITTEN)) == {'TestOrderingIsPreserved'}
+
+    def test_moving_a_citation_from_a_docstring_into_a_comment_changes_nothing(self):
+        comment = '# Ordering is pinned by TestOrderingIsPreserved.\n'
+        assert set(_cited_names(comment)) == set(_cited_names(self._TERSE))
+
+    def test_renaming_the_identifier_does_change_the_extracted_set(self):
+        """The converse. Without it the invariance above would be vacuous."""
+        renamed = self._REWRITTEN.replace('TestOrderingIsPreserved', 'TestOrderingIsStable')
+        assert set(_cited_names(renamed)) == {'TestOrderingIsStable'}
+
+    def test_prose_citing_no_test_class_extracts_nothing_however_long(self):
+        assert _cited_names('"""' + 'Prose naming no identifier at all. ' * 40 + '"""\n') == {}
