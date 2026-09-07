@@ -397,9 +397,18 @@ def _pyright_runner_clauses(cmd: str, label: str) -> list[list[str]]:
     red merge gate.
 
     Whole-token membership, never a substring of the raw clause: ``npx
-    pyright-langserver`` invokes a different program. The shared walker's looser
-    ``PYRIGHT in clause`` test is not a disagreement — it must stay tolerant of
-    text it cannot tokenise, which is the one thing this helper refuses to do.
+    pyright-langserver`` invokes a different program and is not a pyright runner.
+
+    This IS a stricter predicate than the shared walker's ``PYRIGHT in clause``
+    substring test, deliberately and with a known consequence: a clause that
+    merely MENTIONS pyright would be counted as a type-checked directory by
+    assertion (b) and skipped by (c). That asymmetry is the right way round.
+    ``pyright_clause_cwds`` must keep tracking cwd through text it cannot
+    tokenise — it reads human-edited prose and has no licence to raise — so it
+    can only afford a substring test; this helper has already refused
+    untokenisable input one call earlier, so it can afford the exact one. A
+    substring test here would let ``npx pyright-langserver`` satisfy a runner
+    pin it does not satisfy, which is the direction that fails silently.
     """
     return [tokens for tokens in _non_cd_clauses(cmd, label) if vci.PYRIGHT in tokens]
 
