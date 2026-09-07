@@ -330,3 +330,64 @@ class TestDefinedTestClasses:
         (tmp_path / 'test_dangling.py').symlink_to(tmp_path / 'missing.py')
         with pytest.raises(AssertionError, match='test_dangling.py'):
             _defined_test_classes([tmp_path], {'TestFooBarBaz'})
+
+
+class TestWrappedCandidates:
+    """Unit tests for the line-wrap JOIN generator ``_wrapped_candidates``.
+
+    Both wrap shapes below are drawn from citations that exist for real in the
+    tree, so the fallback is fitted to the population it must recover, not to
+    an invented one.
+    """
+
+    def test_hyphen_wrap_joins(self):
+        """The shape in ``orchestrator.verify``."""
+        source = (
+            '                # double-add. Pinned by TestRunScopedVerificationReverse-\n'
+            '                # DependencyGuards (test_verify_reverse_dep.py, task 2607\n'
+        )
+        assert _wrapped_candidates(source, 'TestRunScopedVerificationReverse') == {
+            'TestRunScopedVerificationReverseDependencyGuards'
+        }
+
+    def test_no_hyphen_wrap_joins(self):
+        """The shape in ``orchestrator.workflow`` — wrapped with no hyphen at
+        all, which is why the join cannot simply key on a trailing dash."""
+        source = (
+            '                    # the REAL _mark_blocked (TestAlreadyLandedLadderWith\n'
+            '                    # RealMarkBlocked) rather than a stub:\n'
+        )
+        assert _wrapped_candidates(source, 'TestAlreadyLandedLadderWith') == {
+            'TestAlreadyLandedLadderWithRealMarkBlocked'
+        }
+
+    def test_wrap_inside_a_docstring_without_a_comment_prefix_joins(self):
+        source = '"""Pinned by TestAlreadyLandedLadderWith\n    RealMarkBlocked.\n    """\n'
+        assert _wrapped_candidates(source, 'TestAlreadyLandedLadderWith') == {
+            'TestAlreadyLandedLadderWithRealMarkBlocked'
+        }
+
+    def test_a_name_not_at_end_of_line_yields_nothing(self):
+        assert _wrapped_candidates('# Pinned by TestFooBarBaz today.\n', 'TestFooBarBaz') == set()
+
+    def test_a_lowercase_continuation_yields_nothing(self):
+        source = '# Pinned by TestFooBarBaz\n# and by nothing else.\n'
+        assert _wrapped_candidates(source, 'TestFooBarBaz') == set()
+
+    def test_the_false_positive_that_decided_the_design(self):
+        """THE reason this helper is a candidate GENERATOR and not an
+        extraction rule. In ``shared.locking`` a comment line ends with
+        ``...::TestFileExtensionsDriftGuard`` and the NEXT line begins ``# Drift
+        guard (...)``, so this pure helper invents a name that exists nowhere.
+        Asserted plainly rather than papered over: the helper alone is UNSOUND,
+        and its safety comes entirely from the caller in ``_dangling_citations``
+        invoking it ONLY for names that already failed to resolve, and honouring
+        a candidate ONLY when the joined name is itself an AST-confirmed class.
+        """
+        source = (
+            '# Drift guard (this shared copy): shared/tests/test_locking.py::TestFileExtensionsDriftGuard\n'
+            '# Drift guard (the other copy): fused-memory/tests/test_lock_charter_guard.py\n'
+        )
+        assert _wrapped_candidates(source, 'TestFileExtensionsDriftGuard') == {
+            'TestFileExtensionsDriftGuardDrift'
+        }
