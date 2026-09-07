@@ -47,12 +47,33 @@ Nothing is written without ``--apply``.  See the operator runbook below.
 """
 from __future__ import annotations
 
+import functools
+import logging
+import sys
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+from fused_memory.backends.mem0_client import (
+    DEFAULT_SCROLL_MAX_PAGES,
+    ScrollPageBudgetExhausted,
+)
 from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
+)
+
+# This script reports through ``print``; stdout carries its machine-read
+# markdown/JSON artifact, so the diagnoses that must not land there -- the
+# fail-closed store-mutation refusal, and the coverage warnings -- go through
+# this logger instead.  Named for the script basename, matching every other
+# guarded script (and what the tests filter ``caplog`` on).
+logger = logging.getLogger('normalize_topic_slugs')
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CENSUS_SCRIPT_PATH = (
+    _REPO_ROOT / 'fused-memory' / 'scripts' / 'census_memory_metadata.py'
 )
 
 # Convention inherited from ``retro_stamp_topics.py``: this list carries every
@@ -60,13 +81,20 @@ from fused_memory.utils.store_mutation_preflight import (
 # defined locally.  This script is loaded by path via ``importlib`` and cannot
 # be imported from, so its ``__all__`` grants the shared rule no second home.
 __all__ = [
+    'DEFAULT_MAX_PAGES',
+    'DEFAULT_PAGE_SIZE',
+    'DEFAULT_SCROLL_MAX_PAGES',
     'ERROR_OUTCOMES',
     'Rename',
     'SKIP_BUCKETS',
+    'ScrollPageBudgetExhausted',
     'StoreMutationUnavailable',
     'assert_store_mutation_allowed',
+    'census_categories',
     'derive_topic_slug',
+    'enumerate_topic_bearing',
     'is_valid_topic_slug',
+    'load_census_module',
     'plan_renames',
 ]
 
@@ -77,6 +105,8 @@ __all__ = [
 ERROR_OUTCOMES: frozenset[str] = frozenset({
     'slug_collision',
     'canonical_collision',
+    'under_enumerated',
+    'scroll_budget_exhausted',
 })
 
 #: Every bucket the report carries, PRE-SEEDED TO EMPTY.  Seeding is the
@@ -84,12 +114,239 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
 #: different claim from "we looked and found nothing".  A hole in coverage
 #: that never reaches the artifact is a hole nobody closes.
 SKIP_BUCKETS: tuple[str, ...] = (
+    # from enumerate_topic_bearing
+    'under_enumerated',
+    'scroll_budget_exhausted',
     # from plan_renames
     'topic_unfoldable',
     'record_without_id',
     'slug_collision',
     'canonical_collision',
 )
+
+#: Page size and page budget for each cell's scroll.  ALIASED from the
+#: backend, never restated: the budget travels with the paging loop it bounds
+#: (``Mem0Backend.scroll_collection_pages``), and ``census_memory_metadata.py``
+#: aliases the same object for the same INV-5 reason.  This script must cover
+#: the corpus the way the census does or its coverage claim is not comparable
+#: to the census baseline it reports against.
+DEFAULT_PAGE_SIZE = 1000
+DEFAULT_MAX_PAGES = DEFAULT_SCROLL_MAX_PAGES
+
+
+# ---------------------------------------------------------------------------
+# The corpus partition — borrowed, never restated
+# ---------------------------------------------------------------------------
+
+@functools.cache
+def load_census_module() -> Any:
+    """Load ``census_memory_metadata`` by path.
+
+    ``scripts/`` is not a package, so a plain import cannot reach it.  Same
+    importlib idiom — including the ``sys.modules``-first lookup — that
+    ``census_memory_metadata.py::_load_probe_module`` and
+    ``retro_stamp_topics.py::_load_probe_module`` already established for
+    exactly this cross-script reuse: that slot may already hold a module
+    another by-path loader executed, and re-executing would hand back
+    DIFFERENT class objects, silently breaking identity across the seam.
+
+    Memoized because the load is not free and because the identity above is
+    only stable if it happens once.
+    """
+    import importlib.util  # noqa: PLC0415
+
+    mod_name = 'census_memory_metadata'
+    cached = sys.modules.get(mod_name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(mod_name, _CENSUS_SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {_CENSUS_SCRIPT_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+def census_categories() -> tuple[str, ...]:
+    """The category partition this sweep covers — the census's, by import.
+
+    An empty filter dict is REJECTED by both ``scroll_by_metadata`` and
+    ``scroll_all_by_metadata`` ("to avoid silently enumerating every memory in
+    the collection"), so there is no direct all-records scroll at this seam.
+    Partitioning on ``{'category': c}`` is how ``census_memory_metadata.py``
+    already covers the whole collection with non-empty filters, and this
+    script reuses that partition rather than keeping a second list.
+
+    Two reasons it is imported rather than restated.  INV-5: a corpus
+    partition kept in two places drifts, and the failure mode here is a
+    SILENTLY unenumerated slice — the hardest kind to notice, because the
+    report still looks clean.  And this script's coverage claim is only
+    comparable to the census baseline it diffs against (item 4) if the two
+    provably walk the same cells.
+    """
+    return tuple(c.value for c in load_census_module().CENSUS_CATEGORIES)
+
+
+# ---------------------------------------------------------------------------
+# The corpus boundary
+# ---------------------------------------------------------------------------
+
+async def enumerate_topic_bearing(
+    memory_service: Any,
+    project_id: str,
+    *,
+    categories: list[str] | None = None,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    max_pages: int = DEFAULT_MAX_PAGES,
+) -> dict:
+    """Walk one project's whole collection, retaining only the residue.
+
+    Per category: ``count_by_metadata`` -> page-scroll every record ->
+    ``count_by_metadata`` again.  The bracket is copied from
+    ``census_memory_metadata.census_project`` for the reason it has one:
+    counting BEFORE is what makes an under-enumerated scroll detectable at
+    all, and counting AFTER brackets the scan against a LIVE corpus, so a
+    scroll that agrees with the recount saw churn rather than truncation.
+    One read cannot tell those apart, and reporting ordinary churn as a
+    coverage hole teaches an operator to ignore the bucket that matters.
+
+    **Only NON-conforming records are retained.**  That is what makes a
+    corpus-wide sweep affordable: peak memory is bounded by the residue
+    (~141 records at the ad707e72 baseline), never by the ~49.4k-record
+    corpus.  It is also why ``CategoryCensus`` cannot be reused here — it
+    deliberately retains no payloads at all, so it knows WHICH slugs are
+    non-conforming but not WHICH RECORDS carry them, and a migration needs
+    the ids.
+
+    The backend is reached as ``memory_service.mem0`` (the
+    ``consolidate_namespace_families.py`` pattern) so one injected service
+    serves both these reads and the later writes — an end-to-end run cannot
+    scroll one store and write to another.
+
+    ``ScrollPageBudgetExhausted`` is caught PER CELL and surfaced as an
+    explicit incomplete outcome.  Never swallowed: a migration that caught it
+    and moved on would report a completed sweep over a corpus it had only
+    partly enumerated, and the residue probe would then find the legacy slug
+    still populated and blame the writes.  Caught per cell rather than
+    per run because one dead cell must not cost the coverage of the other
+    five — the artifact is more useful naming which cell failed.
+
+    Returns:
+        ``{'project_id', 'records', 'coverage', 'skips', 'complete'}`` —
+        *records* are the retained scroll-shaped residue dicts,
+        *coverage* maps category -> the expected/scrolled/recount/delta/
+        complete cell, and *complete* is the conjunction over all cells.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    backend = memory_service.mem0
+    category_values = (
+        list(categories) if categories is not None else list(census_categories())
+    )
+    scope = Scope(project_id=project_id)
+
+    records: list[dict] = []
+    coverage: dict[str, dict] = {}
+    skips: list[dict] = []
+
+    for category in category_values:
+        filters = {'category': category}
+        expected = await backend.count_by_metadata(scope, filters)
+
+        scrolled = 0
+        exhausted: str | None = None
+        try:
+            async for record in backend.scroll_all_by_metadata(
+                scope, filters, page_size=page_size, max_pages=max_pages,
+            ):
+                scrolled += 1
+                metadata = record.get('metadata') or {}
+                topic = metadata.get('topic')
+                if topic is None or is_valid_topic_slug(topic):
+                    continue
+                # The residue triple: the id to write to, the topic to fold,
+                # and whether this record claims canonical (which decides
+                # whether a collision is severe).  Nothing else is kept.
+                records.append({
+                    'id': record.get('id'),
+                    'created_at': record.get('created_at'),
+                    'metadata': {
+                        'topic': topic,
+                        **(
+                            {'canonical': True}
+                            if metadata.get('canonical') is True else {}
+                        ),
+                    },
+                })
+        except ScrollPageBudgetExhausted as exc:
+            exhausted = str(exc) or exc.__class__.__name__
+            logger.warning(
+                'SCROLL BUDGET EXHAUSTED project=%s category=%s after %d records: %s',
+                project_id, category, scrolled, exhausted,
+            )
+            skips.append({
+                'reason': 'scroll_budget_exhausted',
+                'project_id': project_id,
+                'category': category,
+                'scrolled': scrolled,
+                'error': exhausted,
+                'note': (
+                    'the backend gave up paging this cell, so its enumeration '
+                    'is a LOWER BOUND — do not read a clean residue probe as '
+                    'proof the legacy slugs drained'
+                ),
+            })
+
+        recount = await backend.count_by_metadata(scope, filters)
+        delta = scrolled - expected
+        complete = exhausted is None and (delta == 0 or scrolled == recount)
+        coverage[category] = {
+            'expected': expected,
+            'scrolled': scrolled,
+            'recount': recount,
+            'delta': delta,
+            'complete': complete,
+        }
+        if exhausted is None and not complete:
+            logger.warning(
+                'UNDER-ENUMERATED project=%s category=%s: scrolled %d, count said %d '
+                'before and %d after (delta %+d) — this sweep is a LOWER BOUND '
+                'for that cell.',
+                project_id, category, scrolled, expected, recount, delta,
+            )
+            skips.append({
+                'reason': 'under_enumerated',
+                'project_id': project_id,
+                'category': category,
+                'expected': expected,
+                'scrolled': scrolled,
+                'recount': recount,
+                'delta': delta,
+                'note': (
+                    'the scroll agreed with neither count, so records in this '
+                    'cell may carry a non-conforming topic this run never saw'
+                ),
+            })
+        elif delta != 0 and complete:
+            logger.info(
+                'CORPUS CHURN project=%s category=%s: count moved %d → %d while '
+                'scrolling; the scroll agrees with the re-count, so the scan is '
+                'complete.',
+                project_id, category, expected, recount,
+            )
+
+    return {
+        'project_id': project_id,
+        'records': records,
+        'coverage': coverage,
+        'skips': skips,
+        'complete': all(cell['complete'] for cell in coverage.values()),
+    }
 
 
 # ---------------------------------------------------------------------------
