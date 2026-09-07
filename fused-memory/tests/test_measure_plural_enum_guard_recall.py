@@ -2372,3 +2372,126 @@ def test_scan_corpus_of_empty_corpus_is_all_zeroes():
     assert result.guard_rejected == 0
     assert result.selected == 0
     assert result.rejections == []
+
+
+# ---------------------------------------------------------------------------
+# An INCOMPLETE run must not destroy a COMPLETE committed measurement
+# ---------------------------------------------------------------------------
+#
+# The artifacts are the deliverable — the whole reason this is a committed
+# script and not a transcript is that 'zero matches today' is only as good as
+# its re-checkability. `exit_code` already encodes the fail-closed instinct
+# for the STATUS: the evidence lands, and the exit code refuses to call an
+# under-enumerated measurement a success. It was never applied to the FILE.
+#
+# So a single benign raced run — one edge written by an unrelated cycle while
+# 43 graphs paged — overwrote a good committed measurement with a truncated
+# one, and the recovery was `git checkout`, if anyone noticed. The growth
+# tolerance above makes that race far rarer; it does not make the clobber
+# safe, and the two fixes are independent.
+
+
+async def _report_with(complete: bool):
+    """A real report, complete or not, built through ``run`` rather than by hand.
+
+    Hand-built dataclasses would let this test pass against a `_write_artifacts`
+    that reads a field the real renderer never emits.
+    """
+    corpora = {'alpha': (_ALPHA_FACTS, complete)}
+    return await run(_args(project_id=['alpha'], measured_at=_FIXED_TIMESTAMP),
+                     edge_source=_FakeEdgeSource(corpora))
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_run_does_not_overwrite_a_complete_artifact(
+    tmp_path, caplog,
+):
+    """A raced run must not be able to destroy a good committed measurement."""
+    json_out = tmp_path / 'recall.json'
+    md_out = tmp_path / 'recall.md'
+
+    good = await _report_with(complete=True)
+    _mod._write_artifacts(good, str(json_out), str(md_out))
+    good_json = json_out.read_text()
+    good_md = md_out.read_text()
+
+    bad = await _report_with(complete=False)
+    with caplog.at_level('WARNING'):
+        _mod._write_artifacts(bad, str(json_out), str(md_out))
+
+    assert json_out.read_text() == good_json, 'the committed measurement was clobbered'
+    assert md_out.read_text() == good_md, 'the committed measurement was clobbered'
+
+    # The evidence is still recorded — refusing to write it at all would be
+    # the opposite failure.
+    sidecar_json = tmp_path / 'recall.json.incomplete'
+    sidecar_md = tmp_path / 'recall.md.incomplete'
+    assert json.loads(sidecar_json.read_text())['complete'] is False
+    assert sidecar_md.read_text()
+
+    # ...and the operator is TOLD, because a run that silently wrote somewhere
+    # else is worse than one that clobbered: the reader of the committed file
+    # would have no way to know a newer, worse measurement exists.
+    warnings = '\n'.join(r.getMessage() for r in caplog.records)
+    assert str(sidecar_json) in warnings
+    assert str(sidecar_md) in warnings
+    assert str(json_out) in warnings
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_run_writes_in_place_when_there_is_nothing_to_protect(
+    tmp_path,
+):
+    """The guard protects a KNOWN-GOOD artifact; it does not refuse evidence.
+
+    Diverting to a sidecar when the primary path holds nothing worth keeping
+    would leave the deliverable permanently empty and make every subsequent
+    run's sidecar the real report — the reverse of the intent.
+    """
+    # (a) nothing there at all
+    first_json = tmp_path / 'a.json'
+    first_md = tmp_path / 'a.md'
+    bad = await _report_with(complete=False)
+    _mod._write_artifacts(bad, str(first_json), str(first_md))
+    assert json.loads(first_json.read_text())['complete'] is False
+    assert not (tmp_path / 'a.json.incomplete').exists()
+
+    # (b) what IS there is already incomplete — nothing to protect
+    _mod._write_artifacts(bad, str(first_json), str(first_md))
+    assert json.loads(first_json.read_text())['complete'] is False
+    assert not (tmp_path / 'a.json.incomplete').exists()
+
+    # (c) unreadable/malformed JSON is 'nothing to protect', not a crash and
+    #     not an excuse to divert: a file that cannot be parsed cannot be
+    #     shown to be a good measurement.
+    broken_json = tmp_path / 'b.json'
+    broken_md = tmp_path / 'b.md'
+    broken_json.write_text('{not json at all')
+    broken_md.write_text('stale')
+    _mod._write_artifacts(bad, str(broken_json), str(broken_md))
+    assert json.loads(broken_json.read_text())['complete'] is False
+    assert not (tmp_path / 'b.json.incomplete').exists()
+
+
+@pytest.mark.asyncio
+async def test_a_complete_run_always_writes_in_place(tmp_path):
+    """The regression guard: the protection must not degenerate to 'never write'.
+
+    A complete measurement is exactly what the committed artifact is FOR, so
+    it overwrites whatever is there — including a previous complete one.
+    """
+    json_out = tmp_path / 'c.json'
+    md_out = tmp_path / 'c.md'
+
+    bad = await _report_with(complete=False)
+    _mod._write_artifacts(bad, str(json_out), str(md_out))
+    assert json.loads(json_out.read_text())['complete'] is False
+
+    good = await _report_with(complete=True)
+    _mod._write_artifacts(good, str(json_out), str(md_out))
+    assert json.loads(json_out.read_text())['complete'] is True
+
+    again = await _report_with(complete=True)
+    _mod._write_artifacts(again, str(json_out), str(md_out))
+    assert json.loads(json_out.read_text())['complete'] is True
+    assert not (tmp_path / 'c.json.incomplete').exists()
