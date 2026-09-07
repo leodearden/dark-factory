@@ -17,6 +17,7 @@ no Graphiti and no I/O.
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import pytest
 
@@ -27,6 +28,7 @@ from fused_memory.middleware.dependency_direction_check import (
     DependencyAssertion,
     DependencyIndex,
     build_dependency_index,
+    check_dependency_direction,
     classify_dependency_assertion,
     extract_dependency_assertions,
 )
@@ -325,3 +327,118 @@ class TestClassifyDependencyAssertion:
             'sibling_sequential',
             'unsupported',
         )
+
+
+# ── THE LEAF SIGNAL ───────────────────────────────────────────────────────
+#
+# The three VERBATIM facts below were extracted into Graphiti episode
+# f3d18584-4041-4397-9faa-d4a14c01f71d. Every task number in them is real and
+# adjacent; only the DIRECTION is wrong. Against the frozen ground truth all
+# three must be flagged and none of the three genuinely-correct facts from the
+# same neighbourhood may be.
+
+BAD_FACTS = {
+    'edge-bad-1': 'Task 3727 waits behind task 3619',
+    'edge-bad-2': 'Task 3730 needs task 3733',
+    'edge-bad-3': 'Task 3618 waits behind task 3578',
+}
+
+CORRECT_FACTS = {
+    # A direct edge: 3619 IS in direct[3578].
+    'edge-ok-1': 'Task 3578 waits behind task 3619',
+    # A direct edge whose pair ALSO shares the dependency 3727 — the
+    # sibling-arm false-positive trap.
+    'edge-ok-2': 'Task 3730 needs task 3728',
+    # True only TRANSITIVELY (3730 -> 3578 -> 3619 -> 3618) — the
+    # direct-edge-only false-positive trap.
+    'edge-ok-3': 'Task 3730 waits behind task 3618',
+}
+
+
+class _DictEdge(dict):
+    """A dict-shaped edge, to prove the pure core needs no graphiti_core."""
+
+
+class _AttrEdge:
+    def __init__(self, uuid: str, fact: str) -> None:
+        self.uuid = uuid
+        self.fact = fact
+
+
+class TestKnownBadEpisodeFacts:
+    """Fails before the change, passes after: the three real bad facts are
+    flagged with the right classifications and the three correct ones are not.
+    """
+
+    @pytest.fixture
+    def index(self):
+        return build_dependency_index(LIVE_SHAPE_EDGES)
+
+    @pytest.fixture
+    def edges(self):
+        return [
+            _AttrEdge(uuid, fact)
+            for uuid, fact in {**BAD_FACTS, **CORRECT_FACTS}.items()
+        ]
+
+    def test_three_known_bad_facts_flagged_and_correct_facts_are_not(
+        self, edges, index
+    ):
+        findings = check_dependency_direction(edges, index)
+
+        assert len(findings) == 3
+        assert {f.edge_uuid: f.classification for f in findings} == {
+            'edge-bad-1': SIBLING_SEQUENTIAL,
+            'edge-bad-2': SIBLING_SEQUENTIAL,
+            'edge-bad-3': REVERSED,
+        }
+        # The no-false-positive companion assertion.
+        flagged = {f.edge_uuid for f in findings}
+        assert flagged.isdisjoint(CORRECT_FACTS)
+
+    def test_findings_carry_verbatim_evidence(self, edges, index):
+        findings = {f.edge_uuid: f for f in check_dependency_direction(edges, index)}
+
+        inverted = findings['edge-bad-3']
+        # The extraction's OWN wording, never a corrected one.
+        assert inverted.fact == BAD_FACTS['edge-bad-3']
+        assert (inverted.dependent, inverted.dependency) == (3618, 3578)
+        assert inverted.classification == REVERSED
+        assert inverted.ground_truth
+
+    def test_to_dict_round_trips_and_is_json_serialisable(self, edges, index):
+        findings = check_dependency_direction(edges, index)
+        for finding in findings:
+            record = finding.to_dict()
+            assert record['edge_uuid'] == finding.edge_uuid
+            assert record['fact'] == finding.fact
+            assert record['dependent'] == finding.dependent
+            assert record['dependency'] == finding.dependency
+            assert record['classification'] == finding.classification
+            # Sets rendered as sorted lists so this cannot raise.
+            json.dumps(record)
+
+    def test_dict_shaped_edges_are_accepted_too(self, index):
+        edges = [
+            _DictEdge(uuid=uuid, fact=fact) for uuid, fact in BAD_FACTS.items()
+        ]
+        findings = check_dependency_direction(edges, index)
+        assert {f.edge_uuid for f in findings} == set(BAD_FACTS)
+
+    @pytest.mark.parametrize(
+        'edge',
+        [
+            _AttrEdge('', 'Task 3727 waits behind task 3619'),   # no uuid
+            _AttrEdge('edge-x', ''),                             # no fact
+            _AttrEdge('edge-x', 'Tasks were filed today'),       # unparseable
+            _DictEdge(),                                         # neither
+            None,
+        ],
+    )
+    def test_unusable_edges_are_skipped_never_raised_on(self, edge, index):
+        assert check_dependency_direction([edge], index) == []
+
+    def test_finding_is_frozen(self, edges, index):
+        finding = check_dependency_direction(edges, index)[0]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            finding.classification = REVERSED  # type: ignore[misc]
