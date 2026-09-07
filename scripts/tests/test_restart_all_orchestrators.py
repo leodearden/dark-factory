@@ -1217,18 +1217,41 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
         of the UNRESET deadline (start~0 + FORCE_FIRE(10) = ~10). The outer
         loop force-fires the first time elapsed reaches 10 -- around
         t~10-11 -- and never reads the heartbeat again, so the t=15 trap is
-        unreachable: `fired` stays ["stale", "busy"].
+        unreachable BY THE SCRIPT: it prints the force line and no resume
+        line. (The trap's timer may still FIRE in this process afterwards
+        if the run is slow -- see below; that says nothing about the
+        anchor.)
       - Anchor RESET (the regression): start_secs restarts at t~8-9, so the
         new deadline is ~8-9 + FORCE_FIRE(10) = ~18-19 -- AFTER the trap.
         The loop keeps polling past t=15, its own (unguarded-by-FORCE_FIRE)
         idle check reads the trap's heartbeat, and it prints "resuming
         restart of <unit>: drained" with NO force line (the reset deadline
         would not have been reached until t~18-19).
-    The two counterfactuals differ in OUTPUT, not merely in duration, so the
-    assertions below are text-level: exactly two defer lines (the initial
-    one plus the re-defer after the stale interlude -- itself independent
-    corroboration that the oscillation happened), a force line present, a
-    resume line absent, and "idle-trap" absent from `fired`.
+    The two counterfactuals differ in OUTPUT, not merely in duration, so
+    every assertion below is text-level, read off the subprocess's STDOUT:
+    exactly two defer lines (the initial one plus the re-defer after the
+    stale interlude -- itself independent corroboration that the
+    oscillation happened), a force line PRESENT, and a resume line ABSENT.
+    That pair discriminates both counterfactuals completely, and stdout is
+    a record of what the script actually reached, which no amount of host
+    load can perturb.
+
+    The trap is therefore observed through stdout and NEVER through this
+    process's timer. A negative `assert "idle-trap" not in fired` used to
+    stand here and was deleted (task 4890): `fired` is appended by a
+    `threading.Timer` armed in the TEST process and cancelled only when
+    `_run_script` returns, so it reports "the script's total wall clock
+    exceeded 15s" -- a quantity measured varying 11.3s-39.7s across five
+    runs at loadavg 90 on 32 cores, i.e. a property of the host, not of
+    the anchor. It failed 2/10 isolated reruns while the code was correct.
+    `test_fired_records_elapsed_wall_clock_not_script_reachability` (above)
+    pins that premise directly.
+
+    DO NOT, on a recurrence here: widen the trap delay, raise FORCE_FIRE,
+    or re-add a negative `fired` assertion in any form. The trap ENTRY at
+    t=15 stays -- it is load-bearing, being what makes the reset path print
+    a resume line instead of merely force-firing later -- but its only
+    legitimate observation is the stdout pair above.
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is a must-never-elapse bound here (the
     # unit resumes busy on its own at t=8, well inside it). Capped at 22
@@ -1241,7 +1264,7 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     # through to /usr/bin/systemctl and restarts REAL units.
     spawn_timeout = 22
 
-    result, state, fired = _busy_unit_drain_run(
+    result, state, _ = _busy_unit_drain_run(
         tmp_path,
         [
             ("stale", _FIRST_TRANSITION_DELAY_SECS, _HB_STALE),
@@ -1270,10 +1293,6 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     assert f"resuming restart of {UNIT_R}: drained" not in result.stdout, (
         f"expected NO resume line -- one here means start_secs was reset "
         f"on the busy-resumption arm; got stdout={result.stdout!r}"
-    )
-    assert "idle-trap" not in fired, (
-        f"the idle-trap transition fired, meaning the script was still "
-        f"running at t=15 -- the anchor must have been reset: fired={fired!r}"
     )
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
