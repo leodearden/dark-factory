@@ -185,25 +185,56 @@ def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
     uniquely-named file, so concurrent holders (xdist workers, a bake-off
     beside an integration test) never contend and one release never
     un-guards another.
+
+    FAILS OPEN — do not "tighten" this into a raise.  An unusable lease
+    directory (unwritable, full, a regular file in the way) yields ``False``
+    and reports one line on stderr instead of raising.  The callers are
+    integration tests and two seeding scripts: raising would abort a live
+    bake-off for a reason with nothing to do with what it measures, and fail
+    an integration test on infrastructure noise.  What this guard improves
+    on is "no guard at all", so degrading back to it is not a regression —
+    degrading back to it SILENTLY would be, which is what the stderr line is
+    for.  Same yielded-``held`` contract as
+    ``shared/verify_admission.py::acquire_task_slot`` (clause C-fail-open).
     """
     target = lease_dir() if directory is None else Path(directory)
-    target.mkdir(parents=True, exist_ok=True)
     path = target / _lease_filename(owner)
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    fd = None
+    # `held` is set only after the WHOLE acquisition succeeds, and is never
+    # inferred from `fd`: a file opened but not flocked is not a lease, and
+    # reporting one as held would be the silent no-guard this fails open to
+    # avoid — the caller would believe it was covered while `live_leases`
+    # correctly saw nothing.
+    held = False
     try:
+        target.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         os.set_inheritable(fd, False)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.write(fd, _lease_body(owner))
-        yield True
+        held = True
+    except OSError as exc:
+        # Both facts on one line: the directory says WHERE to look, the
+        # error says what to fix.
+        print(
+            f'Could not take an ephemeral-collection lease in {target} '
+            f'({exc}); the cleanup sweep is NOT held off for {owner}',
+            file=sys.stderr,
+        )
+
+    try:
+        yield held
     finally:
         # Closing the fd is what releases the flock; the unlink is only
         # tidiness, and a holder that dies before reaching it leaves a file
         # that `reap_dead_leases` collects rather than a lease that holds
-        # anything off.
-        with contextlib.suppress(OSError):
-            os.close(fd)
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        # anything off.  Both run even for a PARTIAL acquisition — a file
+        # created but not flocked is still this holder's litter.
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
 
 
 def _is_held(path: Path) -> bool | None:
