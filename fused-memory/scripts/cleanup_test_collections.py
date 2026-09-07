@@ -54,8 +54,14 @@ die and the guard becomes required.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import json
 import os
 import sys
+import uuid
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 PREFIX = '_test_mem0_qdrant_integration_'
@@ -121,6 +127,82 @@ def lease_dir() -> Path:
     """
     override = os.environ.get(LEASE_DIR_ENV)
     return Path(override) if override else DEFAULT_LEASE_DIR
+
+
+def _lease_filename(owner: str) -> str:
+    """A filename no other holder can collide with, readable in a listing.
+
+    Uniqueness is what lets the acquisition use ``O_CREAT | O_EXCL`` with no
+    retry loop: holders never contend for a path, so an ``EEXIST`` would be a
+    real defect rather than ordinary contention.  It also means no new holder
+    can ever reuse a DEAD holder's path, which is what makes reaping dead
+    lease files safe (see :func:`reap_dead_leases`).
+
+    The owner is slugified rather than dropped because these names are read
+    by a human in cron mail; the pid and a uuid4 carry the uniqueness.
+    """
+    slug = ''.join(c if (c.isalnum() or c in '._-') else '-' for c in owner)
+    slug = slug.strip('-')[:60] or 'holder'
+    return f'{slug}.{os.getpid()}.{uuid.uuid4().hex}.lease'
+
+
+def _lease_body(owner: str) -> bytes:
+    """The diagnostics a prober reads out of a held lease file.
+
+    Nothing branches on this — liveness is the flock, never the body — so a
+    corrupt or empty body may degrade the diagnostic and must never degrade
+    the guard.  Deliberately no expiry or TTL field: the kernel releases the
+    flock when the holder dies, SIGKILL included, so there is no stale-lease
+    case for a timeout to bound.
+    """
+    record = {
+        'owner': owner,
+        'pid': os.getpid(),
+        'started_at': datetime.now(UTC).isoformat(),
+    }
+    return json.dumps(record).encode()
+
+
+@contextlib.contextmanager
+def hold_lease(owner: str, *, directory: Path | None = None) -> Iterator[bool]:
+    """Publish a lease that holds :func:`main`'s sweep off while it is open.
+
+    Yields whether the lease is HELD.  Take one around anything that seeds
+    collections under :data:`PREFIXES` — the 6-hourly cron is otherwise free
+    to delete a live run's corpus between its seed and measure phases.
+
+    The exclusion is an ``fcntl.flock``, not the file's existence.  That is
+    the whole reason there is no TTL, no expiry field and no pid-liveness
+    probe: the kernel frees a flock when the holder dies, SIGKILL included,
+    with no daemon, canary or ``atexit`` involved.  A TTL would force a trade
+    with no good value — long enough for the longest live run, short enough
+    that a crashed run does not wedge the cron — and a pid probe re-opens the
+    PID-reuse hazard that makes a dead owner look alive.
+
+    The flock is taken BEFORE the body is written, so a prober can never read
+    a half-written record out of an unlocked file.  Each holder gets its own
+    uniquely-named file, so concurrent holders (xdist workers, a bake-off
+    beside an integration test) never contend and one release never
+    un-guards another.
+    """
+    target = lease_dir() if directory is None else Path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / _lease_filename(owner)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        os.set_inheritable(fd, False)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(fd, _lease_body(owner))
+        yield True
+    finally:
+        # Closing the fd is what releases the flock; the unlink is only
+        # tidiness, and a holder that dies before reaching it leaves a file
+        # that `reap_dead_leases` collects rather than a lease that holds
+        # anything off.
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
 
 
 def main() -> None:
