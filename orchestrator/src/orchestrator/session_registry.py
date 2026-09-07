@@ -1541,18 +1541,32 @@ def normalize_project_token(value: object) -> str:
     let one project's reaper close the other's decisions -- strictly worse
     than the bug being fixed. A named collapse-guard test pins that.
 
-    SCOPE: this canonicalizes ``DecisionRecord.project`` ONLY.
-    ``SessionRecord.project`` is the other half of the same fleet-global
-    project axis and is deliberately NOT normalized here -- the cockpit
-    unions the two (``known_projects`` over records + decisions, and one
-    ``project_weights`` lookup keyed on ``item.project`` for both row kinds),
-    so until the session side folds too, the picker can list one project
-    under two names and an operator-set weight keyed on the session spelling
-    will not apply to decision rows. That is a KNOWN, filed gap (task 3812),
-    not an oversight: the session population is ~39k records written on the
-    spawn path, and folding it is a strictly larger change than task 3807's
-    decision-registry fix. Do not read "canonical" here as "canonical
-    fleet-wide".
+    SCOPE: at the WRITE path, this canonicalizes ``DecisionRecord.project``
+    ONLY. ``SessionRecord.project`` is deliberately still written raw --
+    ``identity.project`` feeds ``build_session_slug`` (the record's on-disk
+    directory identity) and the stored value is parsed from
+    ``record.title``, the literal terminal title, so folding it at the spawn
+    path would churn the slug namespace and desynchronize a documented
+    mirror.
+
+    The cockpit -- the one consumer that unions the two record kinds onto a
+    single ``project_weights`` key and a single weight picker -- therefore
+    folds BOTH kinds at its READ boundary instead (task 3812):
+    ``cockpit/src/cockpit/registry_reader.py::_read_record_soft`` for
+    sessions and ``::scan_decisions`` for decisions, plus its
+    ``priorities.yaml`` ``project_weights`` KEYS at load
+    (``cockpit/src/cockpit/priority.py::_canonical_project_weights``) and
+    its picker candidates
+    (``cockpit/src/cockpit/panes/weight_editor.py::known_projects``). The
+    picker and the scorer key can no longer disagree, and the fix is
+    retroactive over every already-written record with no migration run.
+
+    Do not read "canonical" here as "canonical fleet-wide": the on-disk
+    session records themselves are still unnormalized (they are TTL-reaped
+    by ``reap_stale_records`` rather than migrated, which is why they need
+    no ``migrate_session_project_tokens`` twin), so any OTHER consumer
+    comparing a raw ``SessionRecord.project`` must run it through this
+    function itself.
 
     Stdlib-only and fail-soft: never raises, and coerces a non-str *value*
     via ``str()`` rather than rejecting it -- ``42`` becomes ``'42'``, which
