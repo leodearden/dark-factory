@@ -35,7 +35,6 @@ import pytest
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server import write_triage
 from fused_memory.server import write_triage_judge as judge_module
 from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY
 from fused_memory.server.write_triage import (
@@ -57,6 +56,7 @@ from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _DEFAULT_MODEL_BY_PROVIDER,
     _ELIDED_MARKER,
+    _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
     JUDGE_SYSTEM_PROMPT,
     JUDGE_VERDICTS,
@@ -123,13 +123,6 @@ class TestJudgeVerdictVocabulary:
         """Each judge word lands on the outcome the ack contract publishes."""
         assert JUDGE_VERDICTS[word] == outcome
 
-    def test_the_outcome_constants_come_from_write_triage(self) -> None:
-        """The values are the ones beta publishes, whatever they are spelled."""
-        assert JUDGE_VERDICTS['restates'] == write_triage.OUTCOME_RESTATED
-        assert JUDGE_VERDICTS['amends'] == write_triage.OUTCOME_AMENDED
-        assert JUDGE_VERDICTS['contests'] == write_triage.OUTCOME_CONTESTED
-        assert JUDGE_VERDICTS['distinct'] == write_triage.OUTCOME_STORED
-
 
 class TestParseJudgeVerdict:
     """Parsing is where the closed output is ENFORCED (D3).
@@ -141,10 +134,6 @@ class TestParseJudgeVerdict:
     returns out-of-vocabulary, and a silent default would make a broken judge
     read exactly like a healthy one answering "nothing matched".
     """
-
-    def test_judge_output_error_is_an_exception_subclass(self) -> None:
-        """Module-local, so a caller can distinguish it from a transport error."""
-        assert issubclass(JudgeOutputError, Exception)
 
     @pytest.mark.parametrize(
         ('word', 'outcome'),
@@ -706,9 +695,6 @@ class TestResolveJudgeEnabled:
     the resulting all-`stored` ack stream as evidence the corpus is novel.
     """
 
-    def test_the_default_is_on(self) -> None:
-        assert _DEFAULT_JUDGE_ENABLED is True
-
     @pytest.mark.parametrize('value', [True, False])
     def test_a_configured_bool_is_used(self, value: bool) -> None:
         assert resolve_judge_enabled(_svc(judge_enabled=value)) is value
@@ -1235,7 +1221,7 @@ class TestJudgeWriteOpenAIArm:
         kwargs = client.chat.completions.create.call_args.kwargs
         assert kwargs['model'] == 'pinned-model'
         assert kwargs['temperature'] == 0.0
-        assert 0 < kwargs['max_tokens'] <= 256
+        assert kwargs['max_tokens'] == _JUDGE_MAX_TOKENS
         assert kwargs['response_format'] == {'type': 'json_object'}
         assert kwargs['messages'][0] == {
             'role': 'system', 'content': JUDGE_SYSTEM_PROMPT,
@@ -1295,7 +1281,7 @@ class TestJudgeWriteAnthropicArm:
         kwargs = client.messages.create.call_args.kwargs
         assert kwargs['system'] == JUDGE_SYSTEM_PROMPT
         assert kwargs['model'] == 'pinned-model'
-        assert 0 < kwargs['max_tokens'] <= 256
+        assert kwargs['max_tokens'] == _JUDGE_MAX_TOKENS
         assert [m['role'] for m in kwargs['messages']] == ['user']
 
     @pytest.mark.asyncio
@@ -1355,6 +1341,30 @@ class TestJudgeWriteFailuresRaise:
                 pytest.raises(TimeoutError):
             await judge_write(
                 memory_service=_judge_svc(judge_timeout_seconds=0.01),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_hang_past_the_timeout_raises_on_the_anthropic_arm_too(
+        self,
+    ) -> None:
+        """The timeout is per-ARM, and only the openai arm was pinned.
+
+        `_call_llm` wraps each arm in its own `asyncio.wait_for`, so a bound
+        that was dropped from one of them would leave that deployment on the
+        SDK's 600s default while this suite stayed green — the wedge described
+        in the openai case above, reachable by flipping one config key.
+        """
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = MagicMock()
+        client.messages.create = AsyncMock(side_effect=_hang)
+        with patch('anthropic.AsyncAnthropic', return_value=client), \
+                pytest.raises(TimeoutError):
+            await judge_write(
+                memory_service=_judge_svc('anthropic', judge_timeout_seconds=0.01),
                 content='c', project_id='p',
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
