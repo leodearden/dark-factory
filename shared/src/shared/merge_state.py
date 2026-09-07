@@ -57,6 +57,9 @@ __all__ = [
     'EPISTEMIC_STATES',
     'POLL_STOP_STATES',
     'CANCEL_STATES',
+    'MergeSubmitStatus',
+    'SUBMIT_NON_TERMINAL',
+    'SUBMIT_TERMINAL',
 ]
 
 
@@ -156,3 +159,75 @@ POLL_STOP_STATES = TERMINAL_STATES | {MergeState.unknown}
 #: them into one constant — that would make the beta change silently mutate an
 #: unrelated pinned prose span.
 CANCEL_STATES = TERMINAL_STATES | {MergeState.unknown}
+
+
+class MergeSubmitStatus(enum.StrEnum):
+    """Closed SUBMIT vocabulary — ``merge_request``'s ``status`` field.
+
+    A SEPARATE vocabulary from ``MergeState``, not a superset of it.  Five
+    spellings appear in both (``queued``, ``done``, ``conflict``, ``blocked``,
+    ``superseded``), but they are distinct members of distinct enums that
+    happen to share a wire spelling.  Nine values are submit-only and eight are
+    poll-only; ``shared/tests/test_merge_state.py::TestVocabulariesAreDistinct``
+    pins the split.
+
+    WHY 14 MEMBERS AND NOT THE PRD CONTRACT BLOCK'S ILLUSTRATIVE 6.
+    ``escalation/src/escalation/server.py`` returns ``'status': outcome.status``
+    VERBATIM, so the wire vocabulary IS
+    ``orchestrator/src/orchestrator/merge_types.py::MergeOutcome.status`` — a
+    12-member ``Literal`` — plus the two non-terminal response shapes.  The
+    PRD's 6-member block names only the values its surrounding prose was
+    discussing; PRD Open Question 3 explicitly delegates full membership to
+    this task ("Decide in alpha").  Shipping the 6-member sketch would make the
+    drift guard fire falsely against ``skills/merge-queue/SKILL.md``'s submit
+    list, which already names ``done``, ``conflict`` and ``blocked``.
+
+    THE MAPPING TO ``MergeState``, stated as a POINTER not as data.  When a
+    submit status is later served through the poll wire,
+    ``escalation/src/escalation/server.py::_map_terminal_state`` collapses it:
+    ``already_merged`` and ``done_wip_recovery`` -> ``MergeState.done``;
+    ``wip_halted``, ``wip_recovery_no_advance``, ``unmerged_state``,
+    ``stash_failed``, ``unknown_branch`` and ``error`` -> ``MergeState.blocked``.
+    That mapping is deliberately NOT encoded here — it belongs to the server,
+    and a copy of it would be exactly the second home this module exists to
+    remove.
+
+    Two values the runbooks have historically invented are NOT members, and
+    both absences are asserted in the test file: ``'failed'`` (which appears
+    nowhere in ``server.py`` — the real value is ``error``) and
+    ``'needs_rebase'`` (which exists only in
+    ``orchestrator/src/orchestrator/suffix_graph.py`` as an internal structured
+    bounce log line, never as a response status).
+    """
+
+    # ── non-terminal response shapes ──
+    #: wait_secs=0 dispatched, or a wait_secs>0 bounded wait that timed out.
+    queued = 'queued'
+    #: coalesced onto an already in-flight request.
+    attached = 'attached'
+
+    # ── terminal: MergeOutcome.status's 12-member Literal, verbatim ──
+    done = 'done'
+    conflict = 'conflict'
+    blocked = 'blocked'
+    already_merged = 'already_merged'
+    wip_halted = 'wip_halted'
+    done_wip_recovery = 'done_wip_recovery'
+    wip_recovery_no_advance = 'wip_recovery_no_advance'
+    unmerged_state = 'unmerged_state'
+    stash_failed = 'stash_failed'
+    unknown_branch = 'unknown_branch'
+    superseded = 'superseded'
+    error = 'error'
+
+
+#: The two shapes that mean "not settled yet" — the caller must keep polling
+#: ``merge_status``.  Enumerated (it is the small, stable half).
+SUBMIT_NON_TERMINAL = frozenset({MergeSubmitStatus.queued, MergeSubmitStatus.attached})
+
+#: Every settled ``merge_request`` status == MergeOutcome.status's Literal.
+#: DERIVED by complement, deliberately: a member added to MergeSubmitStatus
+#: lands in the terminal partition by DEFAULT, which reddens the prose spans
+#: pinned to SUBMIT_TERMINAL rather than letting the new value slip in
+#: undocumented.
+SUBMIT_TERMINAL = frozenset(MergeSubmitStatus) - SUBMIT_NON_TERMINAL
