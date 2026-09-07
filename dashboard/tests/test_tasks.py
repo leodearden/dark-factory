@@ -2329,6 +2329,336 @@ class TestFetchTasksPagination:
         )
 
 
+async def _returned_or_raised(awaitable):
+    """Await *awaitable*, returning either its value or the ValueError it raised.
+
+    Lets a test assert on the DIFFERENCE between the two — `pytest.raises`
+    discards the returned value, which is the very thing an all-or-nothing
+    rule needs to show in its failure message.
+    """
+    try:
+        return await awaitable
+    except ValueError as exc:
+        return exc
+
+
+class TestPagePrimitive:
+    """`_fetch_page` — one MCP call against ONE url, envelope PRESERVED.
+
+    RED source (step-4): `_fetch_page` does not exist as a named unit; it is
+    currently the anonymous `_request`/`_shape_all` closure pair inside
+    `fetch_tasks`, which DISCARDS `result['pagination']`. The walk needs
+    `returned`/`total`, so returning the pair is the whole point of naming it.
+    """
+
+    @staticmethod
+    def _read(statuses=None):
+        return tasks_mod._TasksRead(
+            '/proj/page', statuses, tasks_mod._CompleteRead(None)
+        )
+
+    async def test_returns_shaped_rows_and_the_raw_envelope(
+        self, dummy_client, monkeypatch
+    ):
+        """The `pagination` envelope is RETURNED, not dropped on the floor."""
+        envelope = {'returned': 2, 'total': 7}
+
+        async def _fake(_client, _url, tool, args, **_kwargs):
+            assert tool == 'get_tasks'
+            assert args == {
+                'project_root': '/proj/page', 'page_size': 2, 'offset': 4,
+            }
+            return {
+                'tasks': [_paged_task_raw(1), _paged_task_raw(2)],
+                'pagination': envelope,
+            }
+
+        monkeypatch.setattr(tasks_mod, 'mcp_tool_call', _fake)
+        rows, pagination = await tasks_mod._fetch_page(
+            dummy_client, 'http://x', self._read(), tasks_mod._OnePage(2, 4), 5.0,
+        )
+
+        assert pagination == envelope
+        assert [r['id'] for r in rows] == ['1', '2']
+        # _shape_task-shaped, not raw MCP rows: 'updatedAt' becomes 'updated_at'.
+        assert 'updated_at' in rows[0] and 'updatedAt' not in rows[0]
+
+    async def test_pagination_is_none_when_the_server_omits_the_envelope(
+        self, dummy_client, monkeypatch
+    ):
+        """An older fused-memory answers with a bare list and no envelope.
+
+        `None` rather than `{}` so the walk can tell "no envelope" from "an
+        envelope with nothing usable in it" — those take different branches.
+        """
+        async def _fake(_client, _url, _tool, _args, **_kwargs):
+            return {'tasks': [_paged_task_raw(1)]}
+
+        monkeypatch.setattr(tasks_mod, 'mcp_tool_call', _fake)
+        rows, pagination = await tasks_mod._fetch_page(
+            dummy_client, 'http://x', self._read(), None, 5.0,
+        )
+        assert pagination is None
+        assert len(rows) == 1
+
+    async def test_a_structured_mcp_error_raises_value_error(
+        self, dummy_client, monkeypatch
+    ):
+        """ValueError is `first_success`'s documented soft-failure signal.
+
+        It must be raised for `'error' in result and 'tasks' not in result`
+        specifically, so the fan-out falls through to the next URL rather than
+        treating an error payload as an empty tree.
+        """
+        async def _fake(_client, _url, _tool, _args, **_kwargs):
+            return {'error': 'boom'}
+
+        monkeypatch.setattr(tasks_mod, 'mcp_tool_call', _fake)
+        with pytest.raises(ValueError, match='boom'):
+            await tasks_mod._fetch_page(
+                dummy_client, 'http://x', self._read(), None, 5.0,
+            )
+
+    async def test_an_error_alongside_tasks_is_not_a_failure(
+        self, dummy_client, monkeypatch
+    ):
+        """`error` WITH `tasks` is a partial-warning payload, not a failure.
+
+        Pinned because the guard is `'error' in result and 'tasks' not in
+        result`; loosening it to `'error' in result` would turn a served tree
+        into a fan-out failure.
+        """
+        async def _fake(_client, _url, _tool, _args, **_kwargs):
+            return {'error': 'partial', 'tasks': [_paged_task_raw(1)]}
+
+        monkeypatch.setattr(tasks_mod, 'mcp_tool_call', _fake)
+        rows, _ = await tasks_mod._fetch_page(
+            dummy_client, 'http://x', self._read(), None, 5.0,
+        )
+        assert len(rows) == 1
+
+    async def test_the_window_and_statuses_come_from_wire_arguments(
+        self, dummy_client, monkeypatch
+    ):
+        """One encoder builds the request — `_fetch_page` does not roll its own."""
+        seen: list[dict] = []
+
+        async def _fake(_client, _url, _tool, args, **_kwargs):
+            seen.append(dict(args))
+            return {'tasks': [], 'pagination': {'returned': 0, 'total': 0}}
+
+        monkeypatch.setattr(tasks_mod, 'mcp_tool_call', _fake)
+        read = self._read(frozenset({'done', 'blocked'}))
+        await tasks_mod._fetch_page(
+            dummy_client, 'http://x', read, tasks_mod._OnePage(10, 20), 5.0,
+        )
+        assert seen == [read.wire_arguments(tasks_mod._OnePage(10, 20))]
+        assert seen[0]['statuses'] == ['blocked', 'done']
+
+
+class TestWalkPages:
+    """`_walk_pages(page_fn, read, chunk_size)` — assembly over an INJECTED page fn.
+
+    RED source (step-4): `_walk_pages` does not exist as a named unit.
+
+    Taking the page function as a PARAMETER is what makes the five
+    completeness failures drivable by a fake, replacing task 4360's
+    `monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', ...)`
+    string-path seam with a real one.
+    """
+
+    @staticmethod
+    def _read(statuses=None, root='/proj/walk'):
+        return tasks_mod._TasksRead(root, statuses, tasks_mod._CompleteRead(3))
+
+    @staticmethod
+    def _pager(pages, calls=None):
+        """Build a page fn serving *pages* in order, recording its windows."""
+        served = iter(pages)
+
+        async def _page_fn(window):
+            if calls is not None:
+                calls.append(window)
+            return next(served)
+
+        return _page_fn
+
+    # ---- (e) the PINNED-URL constraint, asserted structurally -------------
+
+    def test_walk_pages_cannot_fan_out(self):
+        """`_walk_pages` accepts no url/urls/config parameter.
+
+        Load-bearing, not style: `first_success` tries urls IN ORDER, so a walk
+        that could fan out mid-walk would assemble pages from DIFFERENT servers
+        and silently invalidate the grown-`total` coherence check — the pages
+        would be from different states of two different worlds while every
+        counter still looked self-consistent. A structural pin is what stops a
+        later edit reintroducing that quietly; a behavioural test cannot, since
+        the bug only shows up with two disagreeing servers.
+        """
+        params = set(inspect.signature(tasks_mod._walk_pages).parameters)
+        assert not (params & {'url', 'urls', 'config', 'client'}), (
+            'the walk must be bound to ONE already-pinned url by its caller'
+        )
+
+    # ---- (c) the two COMPLETE cases: a true zero, not a truncation --------
+
+    async def test_an_empty_tree_returns_empty_rather_than_raising(self):
+        """`total <= 0` is a complete read of an empty tree.
+
+        Get this wrong and every empty project becomes a permanent burndown
+        hole instead of its legitimate all-zero row.
+        """
+        page_fn = self._pager([([], {'returned': 0, 'total': 0})])
+        assert await tasks_mod._walk_pages(page_fn, self._read(), 3) == []
+
+    async def test_an_exhausted_tree_returns_its_rows(self):
+        """`offset >= total` with an empty page is exhaustion, not truncation."""
+        rows = [_shape_task(_paged_task_raw(i)) for i in (1, 2)]
+        page_fn = self._pager([
+            ([r for r in rows if r], {'returned': 2, 'total': 2}),
+        ])
+        out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
+        assert [r['id'] for r in out] == ['1', '2']
+
+    # ---- (d) a server that ignores paging ---------------------------------
+
+    async def test_a_server_that_ignores_paging_stops_after_one_page(self):
+        """No envelope means this response IS the answer — take it and stop.
+
+        Looping blind would either spin or re-request the same rows forever.
+        """
+        calls: list = []
+        rows = [r for r in (_shape_task(_paged_task_raw(i)) for i in range(1, 8)) if r]
+        page_fn = self._pager([(rows, None)], calls)
+
+        out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
+        assert len(out) == 7
+        assert len(calls) == 1, 'a bare-list server must be asked exactly once'
+
+    # ---- (f) how the walk advances, and what reaches every page -----------
+
+    async def test_offsets_advance_by_rows_delivered_not_by_chunk_size(self):
+        """`walk_offset += len(page)`, not `+= chunk_size`.
+
+        A server free to return a SHORT page (fewer rows than asked for) while
+        still owing rows must be re-asked from where it actually stopped.
+        Advancing by the requested chunk would skip the gap silently.
+        """
+        calls: list = []
+        p1 = [r for r in (_shape_task(_paged_task_raw(i)) for i in (1, 2)) if r]
+        p2 = [r for r in (_shape_task(_paged_task_raw(i)) for i in (3, 4)) if r]
+        page_fn = self._pager(
+            [(p1, {'returned': 2, 'total': 4}), (p2, {'returned': 2, 'total': 4})],
+            calls,
+        )
+
+        out = await tasks_mod._walk_pages(page_fn, self._read(), 3)
+        assert [r['id'] for r in out] == ['1', '2', '3', '4']
+        # Asked for 3, given 2 -> the next window starts at 2, NOT at 3.
+        assert [(w.page_size, w.offset) for w in calls] == [(3, 0), (3, 2)]
+
+    async def test_statuses_reach_every_page(self):
+        """The tool filters BEFORE its in-memory slice.
+
+        So `total` is the FILTERED count; an unfiltered page would both
+        over-read and desynchronise the walk's terminator.
+        """
+        calls: list = []
+        read = self._read(frozenset({'done'}))
+        p1 = [r for r in (_shape_task(_paged_task_raw(i)) for i in (1, 2, 3)) if r]
+        p2 = [r for r in (_shape_task(_paged_task_raw(4)),) if r]
+        page_fn = self._pager(
+            [(p1, {'returned': 3, 'total': 4}), (p2, {'returned': 1, 'total': 4})],
+            calls,
+        )
+
+        await tasks_mod._walk_pages(page_fn, read, 3)
+        assert len(calls) == 2
+        for window in calls:
+            assert read.wire_arguments(window)['statuses'] == ['done']
+
+    # ---- (b) the five completeness failures, all-or-nothing ---------------
+
+    @pytest.mark.parametrize(
+        ('label', 'pages'),
+        [
+            (
+                'non-int envelope counters',
+                [([{'id': '1'}], {'returned': '1', 'total': 'many'})],
+            ),
+            (
+                'empty page with rows still owed',
+                [([], {'returned': 0, 'total': 99})],
+            ),
+            (
+                'returned disagrees with the page actually sent',
+                [([{'id': '1'}], {'returned': 10, 'total': 99})],
+            ),
+            (
+                'total grew mid-walk',
+                [
+                    ([{'id': '1'}, {'id': '2'}, {'id': '3'}],
+                     {'returned': 3, 'total': 9}),
+                    ([{'id': '4'}, {'id': '5'}, {'id': '6'}],
+                     {'returned': 3, 'total': 99}),
+                ],
+            ),
+            (
+                'page budget exceeded',
+                # total=9, chunk=3 -> budget ceil(9/3)+2 = 5 pages. A server
+                # that keeps answering 1 row while claiming 9 amplifies the
+                # walk; it is caught here rather than paid for.
+                [([{'id': str(i)}], {'returned': 1, 'total': 9}) for i in range(1, 9)],
+            ),
+        ],
+    )
+    async def test_each_completeness_failure_raises_and_discards(self, label, pages):
+        """ALL-OR-NOTHING: a truncated read must never come back as a list.
+
+        `fetch_tasks`' contract distinguishes only `list` (a complete success)
+        from the offline marker, so a truncated list is indistinguishable from
+        a complete one at EVERY call site — `collect_snapshot` would write a
+        confident undercount into the APPEND-ONLY snapshots table, and a
+        plausible dip in an append-only chart is unfalsifiable after the fact
+        while a gap is visible. `ValueError` is `first_success`'s soft-failure
+        signal, so the fan-out tries the next URL and, on exhaustion, yields
+        the marker `collect_snapshot` already skips on.
+
+        The assertion that MATTERS is the second one: raising while handing
+        back partial rows would defeat the entire point.
+        """
+        page_fn = self._pager(pages)
+
+        # Deliberately NOT `pytest.raises`: the property under test is that
+        # nothing is RETURNED, so the returned value has to be captured and
+        # shown in the failure message. In the last two cases rows really were
+        # accumulated before the raise, and handing those back is exactly the
+        # silent truncation this rule exists to prevent.
+        outcome = await _returned_or_raised(
+            tasks_mod._walk_pages(page_fn, self._read(), 3)
+        )
+        assert isinstance(outcome, ValueError), (
+            f'{label}: returned {outcome!r} instead of raising — '
+            'partial rows must be DISCARDED, never handed back'
+        )
+        assert '/proj/walk' in str(outcome), (
+            'the message must name the root, or an operator cannot act on it'
+        )
+
+    async def test_a_raising_page_fn_propagates(self):
+        """`_fetch_page`'s own ValueError rides the same fall-through path.
+
+        The walk adds completeness failures; it does not swallow transport
+        ones.
+        """
+        async def _page_fn(_window):
+            raise ValueError('transport said no')
+
+        with pytest.raises(ValueError, match='transport said no'):
+            await tasks_mod._walk_pages(_page_fn, self._read(), 3)
+
+
 class TestFetchStatusesCache:
     """Per-project_root TTL cache inside fetch_statuses (task 3857 amendment).
 
