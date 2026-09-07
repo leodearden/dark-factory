@@ -35,6 +35,7 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.falkor_indices import (
+    IndexCatalogUnsettledError,
     IndexHeaderShapeError,
     IndexProvisionResult,
     IndexRecordShapeError,
@@ -43,6 +44,7 @@ from fused_memory.backends.falkor_indices import (
     normalize_index_records,
     plan_index_statements,
     resolve_header_positions,
+    unsettled_index_statuses,
     vector_drop_statement,
     vector_index_properties,
 )
@@ -5066,6 +5068,94 @@ class GraphitiBackend:
         """
         graph = self._graph_for(group_id)
         await graph.query(vector_drop_statement(label, field, entity_type=entity_type))
+
+    async def _await_index_catalog_settled(
+        self,
+        group_id: str,
+        *,
+        timeout_s: float = 30.0,
+        interval: float = 0.05,
+    ) -> list[dict]:
+        """Block until every index in *group_id*'s catalog is OPERATIONAL, then
+        return the records that settled certified.
+
+        PRIVATE and UNDECORATED on purpose: the caller
+        (:meth:`drop_vector_indices`) is decorated with
+        ``@_canonicalize_group_args``, so *group_id* arrives already canonical —
+        exactly the :meth:`_ensure_indices_locked` shape.  Keeping it private
+        also keeps ``tests/test_graphiti_group_arg_canonicalization.py``'s
+        hand-listed sweep — which asserts ``len(cases) == 40`` and claims to
+        cover EVERY public group-arg method — true with no edit there.  No
+        external caller needs it: ``reindex.py`` wants a drop, not a barrier, and
+        a public barrier would invite exactly the ``ensure_indices`` misuse INV-6
+        warns against.
+
+        It RETURNS the certified records so the caller consumes the very read the
+        barrier validated, rather than re-reading.  Settling and then issuing a
+        fresh :meth:`list_indices` would leave a read-after-settle gap in which
+        another process's drop could open a NEW window — narrowly reintroducing
+        the class of bug this exists to fix — and would cost a second round-trip.
+
+        The poll LOOP is hand-rolled here; the HEADER WALK is not.  The read goes
+        through :meth:`list_indices` -> ``falkor_indices.resolve_header_positions``,
+        so this adds ZERO new ``CALL db.indexes()`` readers — task 4777's named
+        constraint, since ``list_indices``, ``resolve_header_positions`` and
+        ``tests/_fm_helpers.await_index_operational`` are already three copies of
+        that walk and a fourth must not be hand-rolled.  A few lines of
+        monotonic-clock check-before-sleep is a different thing from a header
+        walk, and does not warrant importing a test-only helper into production.
+
+        No ``try``/``except`` anywhere, deliberately: a driver error, an absent
+        graph (measured: ``Invalid graph operation on empty key``), or α's
+        fail-closed shape errors must propagate untouched rather than be
+        converted into a full-budget block and a misleading timeout.
+
+        Args:
+            group_id: The graph to settle.  Already canonical.
+            timeout_s: The settle budget.  DERIVED, not guessed: the same
+                measurement that produced ``_BULK_BARRIER_S`` in
+                ``tests/test_drop_vector_indices_integration.py`` records that
+                under 16-way FalkorDB contention the initial HNSW build measured
+                2.87-24.45s and the post-drop rebuild 0.00-22.86s — so 20 sits
+                BELOW both maxima while 30 clears them with ~20% headroom.
+                Generous headroom is free here: check-before-sleep means a
+                settled graph pays exactly ONE ``CALL db.indexes()`` round-trip
+                (~0.2 ms), and this is an operator-run maintenance path.
+            interval: Seconds between polls.  Matches
+                ``await_index_operational``'s poll interval; what matters is
+                detecting the window's CLOSURE within 50 ms, not catching a ~4 ms
+                opening, so a tighter interval buys nothing.
+
+        Returns:
+            The settled ``list_indices()`` records — every one ``OPERATIONAL``.
+            Empty when the graph carries no indices, which counts as SETTLED (see
+            ``falkor_indices.unsettled_index_statuses`` for why that diverges
+            from the test-side helper).
+
+        Raises:
+            IndexCatalogUnsettledError: The catalog still had non-OPERATIONAL
+                records when *timeout_s* expired.  Fail closed — dropping against
+                an index state that was never determined is the silent-fail-soft
+                class ``ensure_indices`` refuses for provisioning (INV-4).
+            IndexRecordShapeError: A record carried no ``status`` key, i.e.
+                ``list_indices`` stopped resolving that column.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            records = await self.list_indices(group_id=group_id)
+            unsettled = unsettled_index_statuses(records)
+            if not unsettled:
+                return records
+            # Check BEFORE sleeping, so a settled catalog costs one round-trip
+            # and no wait at all.
+            if time.monotonic() >= deadline:
+                raise IndexCatalogUnsettledError(
+                    f'FalkorDB index catalog for graph {group_id!r} did not '
+                    f'settle within {timeout_s}s; still not OPERATIONAL: '
+                    f'{unsettled!r}. Refusing to act on an index state that was '
+                    'never determined.'
+                )
+            await asyncio.sleep(interval)
 
     @_canonicalize_group_args
     async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
