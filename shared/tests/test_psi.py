@@ -208,6 +208,13 @@ def _healthy_sample(**overrides):
     return PsiSample(**fields)
 
 
+def vars_of(sample):
+    """The sample's fields as a plain dict, for building a variant of it."""
+    import dataclasses
+
+    return {f.name: getattr(sample, f.name) for f in dataclasses.fields(sample)}
+
+
 class TestPsiSampleSaturated:
     def test_frozen(self):
         import dataclasses
@@ -387,6 +394,99 @@ class TestSaturatedV2Arms:
             io_some_avg10=40.0,
         )
         assert _healthy_sample(mem_full10=3.0).saturated(v1_cfg) is True
+
+
+class TestTrippingMetric:
+    """PRD D10 rank + the settled suffixed vocabulary.
+
+    tripping_metric() returns CONFIG FIELD NAMES — the domain the shipped
+    dispatch_deferred payload already uses — so the gate, the event consumers
+    and the operator vocabulary stay one set.
+    """
+
+    D10_RANK = (
+        'mem_full_avg10',
+        'runqueue_ratio',
+        'own_cpu_some_avg10',
+        'mem_some_avg10',
+        'io_some_avg10',
+        'cpu_some_avg10',
+    )
+
+    def _all_arms_cfg(self):
+        return _configured_cfg(
+            cpu_some_avg10=85.0,
+            runqueue_ratio=4.0,
+            own_cpu_some_avg10=50.0,
+        )
+
+    def _all_arms_over(self):
+        return _healthy_sample(
+            cpu_some10=99.0,
+            mem_some10=99.0,
+            mem_full10=99.0,
+            io_some10=99.0,
+            runqueue_ratio=9.0,
+            own_cpu_some10=99.0,
+        )
+
+    def test_runqueue_outranks_mem_some(self):
+        """§7 row 5 — runqueue_ratio=4.3 over cfg 4.0, mem_some also over."""
+        sample = _healthy_sample(runqueue_ratio=4.3, mem_some10=20.0)
+        cfg = _configured_cfg(runqueue_ratio=4.0)
+        assert sample.saturated(cfg) is True
+        assert sample.tripping_metric(cfg) == 'runqueue_ratio'
+
+    def test_mem_full_outranks_runqueue(self):
+        """§7 row 5 continued — add mem_full over too."""
+        sample = _healthy_sample(runqueue_ratio=4.3, mem_some10=20.0, mem_full10=5.0)
+        cfg = _configured_cfg(runqueue_ratio=4.0)
+        assert sample.tripping_metric(cfg) == 'mem_full_avg10'
+
+    @pytest.mark.parametrize('dropped', range(len(D10_RANK)))
+    def test_walks_the_whole_rank_from_the_top(self, dropped):
+        """Every arm over its threshold, then removed one at a time from the
+        top: the reported metric walks the exact D10 sequence."""
+        removals = {
+            'mem_full_avg10': {'mem_full10': 0.0},
+            'runqueue_ratio': {'runqueue_ratio': 0.0},
+            'own_cpu_some_avg10': {'own_cpu_some10': 0.0},
+            'mem_some_avg10': {'mem_some10': 0.0},
+            'io_some_avg10': {'io_some10': 0.0},
+        }
+        overrides = {}
+        for name in self.D10_RANK[:dropped]:
+            overrides.update(removals[name])
+        sample = _healthy_sample(**{**vars_of(self._all_arms_over()), **overrides})
+        cfg = self._all_arms_cfg()
+        assert sample.tripping_metric(cfg) == self.D10_RANK[dropped]
+
+    def test_none_threshold_arm_is_skipped_in_the_ranking(self):
+        """mem_full is the highest-value arm but its threshold is None."""
+        sample = _healthy_sample(mem_full10=99.0, runqueue_ratio=4.3)
+        cfg = _configured_cfg(mem_full_avg10=None, runqueue_ratio=4.0)
+        assert sample.tripping_metric(cfg) == 'runqueue_ratio'
+
+    def test_failed_component_arm_is_skipped_in_the_ranking(self):
+        """The own arm's value is highest but its component read failed."""
+        sample = _healthy_sample(
+            own_cpu_some10=99.0,
+            own_read_ok=False,
+            mem_some10=20.0,
+        )
+        cfg = _configured_cfg(own_cpu_some_avg10=50.0)
+        assert sample.tripping_metric(cfg) == 'mem_some_avg10'
+
+    def test_raises_on_non_saturated_sample(self):
+        """Precondition violation is a programming error, not a fail-open case."""
+        sample = _healthy_sample()
+        with pytest.raises(ValueError, match='saturated'):
+            sample.tripping_metric(self._all_arms_cfg())
+
+    def test_raises_when_host_read_failed_even_with_everything_over(self):
+        sample = _healthy_sample(**{**vars_of(self._all_arms_over()), 'read_ok': False})
+        with pytest.raises(ValueError, match='saturated'):
+            sample.tripping_metric(self._all_arms_cfg())
 
 
 class TestReadPsiSampleHappyPath:
