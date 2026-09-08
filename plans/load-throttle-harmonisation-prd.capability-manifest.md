@@ -7,12 +7,25 @@ asserts is bound to evidence. A binding resolving to a FAIL value
 (`declared-only` / `test-only` / `producer-absent` / `producer-downstream` /
 `producer-extent-short` / `bound≤floor` / `rejection-absent`) blocks the batch.
 
-**All bindings PASS.** Four premises in the PRD prose were found stale, absent
-or loosely sourced during this walk and are corrected below (§Corrections);
-each correction is carried into the filed task's own text, so no leaf is
-dispatched against a fiction. **One G7 waiver** was recorded (β,
-`storm-escape-required`); every other invariant hit resolved by redesign
-inside the owning leaf's declared scope.
+**All bindings PASS.** Five premises in the PRD prose were found stale, absent,
+loosely sourced or incomplete during this walk and are corrected below
+(§Corrections); each correction is carried into the filed task's own text, so no
+leaf is dispatched against a fiction. **One G7 waiver** was recorded (β,
+`storm-escape-required`); every other invariant hit resolved by redesign inside
+the owning leaf's declared scope.
+
+Corrections (1), (2) and (5) were rewritten or added after an adversarial
+re-walk of the *filed* batch, before release. That pass also found and fixed
+four `delivered_check`s that were unfalsifiable or self-defeating — most
+sharply ε2's, whose `own_cpu_some_avg10` absent-check would have been broken
+forever by γ's own required comment line, leaving ε2 unmarkable-done. Every
+`grep` check in the sidecar was then executed against both repos: each
+`expect: present` check currently fails and each `expect: absent` check on a
+not-yet-delivered capability currently fails, so none is a false green. The
+four that legitimately match today are must-survive guards (green-tier
+registration, the sampler unit's `WorkingDirectory`, reify's
+`PartOf=orchestrator-reify.service`, and the `fleet_load_detector` block that
+must NOT be deleted).
 
 Substrate verified live on dark-factory `main` `b6282847f9` and reify `main`
 `840f87779c` (both 2026-09-08), by symbol. Every anchor below is
@@ -47,7 +60,7 @@ Substrate verified live on dark-factory `main` `b6282847f9` and reify `main`
 | `Milestone` (`mode` iff `at` / `after_secs`) | `shared/src/shared/task_metadata.py::Milestone`; `docs/task-authoring.md` §6 |
 | deterministic deploy/gate presets | `docs/task-authoring.md` §5; worked examples tasks 5203 / 5204 / 5208 |
 | `execution_class='operational'` DELETES `before_done` at submit | `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._inject_deterministic_pure_gate` — "DELETES any `before_done` key". δ′/ε1/ε2/ρ3 therefore carry `task_kind='deterministic'` only |
-| loud stubs committed at the exact `before_done.script` paths | `scripts/install-load-sampler.sh`, `scripts/load-threshold-calibration.py` — mode `100755`, exit 64, commit `b6282847f9` |
+| loud stubs committed at the exact `before_done.script` paths | `scripts/install-load-sampler.sh`, `scripts/load-threshold-calibration.py` — mode `100755`, exit 64, commit `b6282847f9`. The dark-factory pre-commit is cheap for a script-only change (`pyright skipped (no Python changes)`), so both landed in seconds; reify's is not, which is why its stub was backed out instead |
 | host premise for α's signal (live probe 2026-09-08) | orchestrator unit cgroup `…/app.slice/orchestrator-dark-factory.service`, its `cpu.pressure` readable (`some avg10=35.03`); `procs_running 101`, `len(os.sched_getaffinity(0))=32` ⇒ ratio 3.16 |
 
 ## reify substrate
@@ -59,7 +72,7 @@ Substrate verified live on dark-factory `main` `b6282847f9` and reify `main`
 | balancer PSI knob + hold/release thresholds + reservoir | `scripts/jobserver-balancer.py` — `PSI_PROC_PATH` from `REIFY_JOBSERVER_PSI_PROC_PATH` (default `/proc/pressure/cpu`); `::read_pressure`; `::pressure_decide` (hold 50.0 / release 40.0, `release < hold` validated at import); `held_back` published via `::write_held_back` to `REIFY_JOBSERVER_HELD_BACK_FILE` (default `/tmp/reify-jobserver-held-back`) |
 | the `reify-jobserver.service` heredoc, its `PartOf=`, and the canary | `scripts/setup-dev.sh::install_build_services` — heredoc carries `PartOf=orchestrator-reify.service`; `reify-jobserver-canary.{service,timer}` already exist and are enabled |
 | `render_jobserver_unit` | **absent repo-wide** — ρ2 extracts it |
-| `scripts/redeploy-jobserver-unit.sh` | **absent** — ρ2 writes it; the loud stub lands first |
+| `scripts/redeploy-jobserver-unit.sh` | **absent** — ρ2 writes it (declared file). A loud stub was committed at decompose so ρ3's `before_done` could validate at submit, then **backed out**: reify's pre-commit runs `verify.sh --include-infra`, which held `.git/index.lock` in the machine-operated checkout for 65 min on a saturated host, contending with the merge worker, for a 9-line stub. ρ3 depends on ρ2, so the script exists before ρ3 can dispatch |
 | reify's current `psi_admission` block (what ρ1 replaces) | `dark-factory-orchestrator.yaml` — `cpu_some_avg10: 70.0`, `min_inflight_floor: 3` |
 | reify `fused_memory.project_id` | `dark-factory-orchestrator.yaml` — `project_id: "reify"` |
 | the detector and its census entry stay untouched | `scripts/fleet-load-detector.sh` (ratio arm only; the PSI arm was dropped by reify 5985), `tests/infra/test_fleet_load_detector.sh`, `cpu_governance.fleet_load_detector` block (`enabled: true`, `ratio_threshold: 4.0`) |
@@ -97,22 +110,34 @@ declared file set and step list were short. `scripts/verify.sh` and
 `tests/infra/test_verify_admission_knob_parity.sh` are added to ρ2's declared
 files, and the three-part step is carried into ρ2's task text.
 
-**(2) `cpu-load-admission-control.md` states no single-tenant premise — there is
-no sentence to amend (G6 branch 3).**
+**(2) The single-tenant premise IS stated in `cpu-load-admission-control.md` —
+just never in those words, so it must be amended in four named places (G6
+branch 3).**
 PRD D7 and the §8 ρ1 row instruct ρ1 to amend "the single-tenant premise of
-`cpu-load-admission-control.md` §2/§6". Measured 2026-09-08: the strings
-`single-tenant`, `single-host`, `multi-tenant` and `multi-host` do not occur
-anywhere in that 419-line document, and §2's actual framing is already
-many-source/one-host (up to 24 concurrent agents each launching ad-hoc `cargo
-test` on one 32-core box). §6's G3 table verifies substrate, not tenancy.
+`cpu-load-admission-control.md` §2/§6". A literal search is misleading:
+`single-tenant`, `single-host`, `multi-tenant` and `multi-host` occur nowhere in
+that 419-line document, and §6 is a G3 substrate table rather than a tenancy
+claim. This manifest's first draft concluded from that that there was nothing to
+amend, and told ρ1 not to edit prose. **That was wrong**, and the adversarial
+re-walk caught it: the premise is carried implicitly, and four assertions are
+false on this host —
 
-D7's substance is untouched — C-A1's *source* is what changes, and its contract
+1. the title, "…over **ALL load sources**";
+2. §1's goal, to put "every significant CPU source on the build host … under a
+   single work-conserving governance regime";
+3. §2's source enumeration, which is closed and reify-only and attributes the
+   whole measured host load (42–89 on 32 cores) to reify's own agents;
+4. §3's "A lone source must reach all 32 cores."
+
+The document's own repo already refutes them — reify's
+`dark-factory-orchestrator.yaml` says "seven orchestrator services run here" and
+`scripts/verify.sh` calls it a "busy multi-tenant box". So ρ1 **amends those
+four**, rather than appending a block beside them and leaving four false
+statements standing.
+
+D7's substance is untouched: C-A1's *source* is what changes, and its contract
 text ("host-portable %, no `nproc`-derived constant", work-conserving, never
-requeue on timeout) survives verbatim. The correction is to the amendment's
-*shape*: ρ1 **adds** a dated amendment block stating the multi-tenant framing
-(two heavy projects share this host; host PSI is not this project's stall) and
-re-sourcing C-A1 from `/proc/pressure/cpu` to `@own-slice`. It must not hunt
-for a single-tenant sentence to edit. Carried into ρ1's task text.
+requeue on timeout) survives verbatim. Carried into ρ1's task text.
 
 **(3) "matching reify's detector" is not corroboration for `runqueue_ratio: 4.0`
 — the two ratios are different quantities (G6 branch 1).**
@@ -145,6 +170,38 @@ produces. The clause therefore **does not fire** and the entry stays. Separately
 already delivered by reify 5985, which dropped that arm; and item 4 ("decide
 what happens to `cpu_some_avg10`") is settled by D1 — default `None`, still
 configurable. All three are stated in the amendment appended to 3590.
+
+**(5) ρ2 collides with three further reify guards, one of which reads green
+while the config is unloadable (G3, blocking).**
+Correction (1) named the admission-knob parity guard. The adversarial re-walk
+found three more, all verified directly:
+
+- **`tests/infra/test_host_global_unit_pinning.sh`.** It extracts
+  `install_build_services()` with column-0 `sed` anchors, asserts the extracted
+  snippet carries `^ExecStart=.*jobserver-balancer[.]py` (assert **B0c**), then
+  `source`s only that snippet and calls the function. Moving the heredoc into
+  `render_jobserver_unit` — the INV-5 move ρ2 exists to make — fails B0c
+  immediately and the B1b/B2a run-time asserts after it. The guard's own comment
+  anticipates this ("a future refactor of setup-dev.sh must fail this suite
+  loudly"), so it is a tripwire to co-change, not a prohibition. The manifest's
+  first draft bound `render_jobserver_unit` as "absent repo-wide … PASS" and
+  missed the guard entirely.
+- **`tests/infra/test_run_all_ambient_isolation.sh`.** It enforces **set
+  equality** in both directions between the live `verify_env` keys and
+  `tests/infra/run-all-ambient-vars.manifest` (task 5152: "equality, not mere
+  subset"). Two new `verify_env` keys with no ledger rows are two failed
+  asserts. So Correction (1)'s remedy is **four** parts, not three: the fourth
+  is a ledger row per knob.
+- **YAML quoting.** `@` is a reserved YAML indicator: `k: @own-slice` raises a
+  `ScannerError`, so reify's orchestrator would fail to load its config
+  entirely. The parity guard's own pure-awk parser accepts the unquoted form, so
+  that guard reads **green while the config is unloadable** — the worst shape a
+  check can have. ρ2 must write `"@own-slice"`, quoted, in `verify_env`.
+
+ρ2's declared file set was widened accordingly (from 9 to 16), which crosses the
+overlay's >15-file review trigger. That is recorded deliberately rather than
+split: eleven of the sixteen are the guards and fixtures that must move with the
+one behavioural change, and splitting them from it would land a red main.
 
 ---
 

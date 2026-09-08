@@ -3,11 +3,16 @@
 # shared/src/shared/capability_manifest.py::CapabilityManifestDoc.
 #
 # task_id is null until commit_planning stamps it. Labels rho1/rho2/rho3 are
-# filed in the `reify` project against this dark_factory-hosted PRD; their
-# delivered_check paths are therefore reify-repo-relative, evaluated by reify's
-# own dispatch gate. Greek labels are ASCII-transliterated for the primed and
-# numbered ones (delta_prime, epsilon1, epsilon2) so a label is never ambiguous
-# in a log line.
+# filed in the `reify` project against this dark_factory-hosted PRD, and their
+# delivered_check paths are reify-repo-relative.
+#
+# BUT: commit_planning's stamper derives the sidecar as Path(project_root) /
+# re.sub(r'[.]md$','',prd_path) + '.capability-manifest.yaml' and refuses a path
+# resolving outside project_root. The rho tasks carry an ABSOLUTE dark_factory
+# prd_path, so reify's commit_planning cannot reach this file: rho1/rho2/rho3 are
+# HAND-STAMPED and carry NO metadata.delivered_checks. Their checks are
+# authoring-time evidence for a human reader, not a live dispatch gate. Only the
+# seven dark_factory labels are machine-stamped and gate-enforced.
 prd: plans/load-throttle-harmonisation-prd.md
 schema_version: 1
 tasks:
@@ -113,18 +118,16 @@ tasks:
         binding: "capability→producer (wired) — 3 sites in orchestrator/tests/test_config_psi_admission_reload.py assert or construct 85.0; β moves them when cpu_some_avg10 becomes None"
         verdict: PASS
         delivered_check:
-          kind: grep
-          pattern: 'cpu_some_avg10 == 85\.0'
-          paths: ["orchestrator/tests/"]
-          expect: absent
+          kind: manual
+          reason: "what must move is the DEFAULT assertion; the CPU-arm tests deliberately KEEP an explicit cpu_some_avg10=85.0 after the leak fix, so a bare literal grep cannot separate the pin from the fixture"
+
       - name: "live-yaml-leak-closed-without-touching-conftest"
         binding: "capability→producer (wired) — census: 19 OrchestratorConfig( across the three scheduler test files, 3 already explicit, 16 bare. Leak re-reproduced on current main 2026-09-08 (9 failed / 9 passed with the block present; 18 passed without)"
         verdict: PASS
         delivered_check:
-          kind: grep
-          pattern: 'psi_admission=PsiAdmissionConfig\(\)'
-          paths: ["orchestrator/tests/test_scheduler_hermetic_psi.py"]
-          expect: present
+          kind: manual
+          reason: "beta may close the leak EITHER with explicit psi_admission= kwargs OR with the empty-ORCH_CONFIG_PATH pattern; a grep for one literal would forbid the other remedy its own text sanctions. The real check is behavioural and already stated mechanically in beta: with a non-default psi_admission block in the project yaml, the three scheduler test files pass."
+
       - name: "dispatch-deferred-carries-the-whole-sample"
         binding: "capability→producer (wired) — orchestrator/src/orchestrator/scheduler.py::Scheduler._note_heavy_deferral already emits a data dict {metric, value, in_flight, floor}; β widens it"
         verdict: PASS
@@ -184,10 +187,9 @@ tasks:
         binding: "INV-9 — §6.2 is the home. Per §Corrections (3) the comment must NOT cite reify's fleet-load-detector as corroboration: that detector's ratio is load1/nproc, a different quantity from procs_running/nproc"
         verdict: PASS
         delivered_check:
-          kind: grep
-          pattern: 'fleet.load.detector'
-          paths: ["dark-factory-orchestrator.yaml"]
-          expect: absent
+          kind: manual
+          reason: "an absent-grep over comment prose pins wording rather than behaviour (INV-10). The substantive rule -- do not cite reify's load1/nproc detector as corroboration for a procs_running threshold -- lives in gamma's task text and Corrections (3)"
+
 
   - label: "δ"
     task_id: null
@@ -202,6 +204,14 @@ tasks:
           pattern: 'runqueue_ratio'
           paths: ["sampler/src/sampler/"]
           expect: present
+      - name: "runqueue-read-ok-is-recorded-too"
+        binding: "producer:δ — the G7 waiver on β rests on δ giving the fail-open rate a counter. After D1, runqueue_ratio is the ONLY live CPU arm (both yamls omit cpu_some_avg10), so an unreadable /proc/stat silently disables the sole CPU throttle. own_read_ok alone does not cover it: runqueue_read_ok must be recorded as its own 0/1 metric"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'runqueue_read_ok'
+          paths: ["sampler/src/sampler/"]
+          expect: present
       - name: "long-format-store-needs-no-migration"
         binding: "capability→producer (wired) — sampler/src/sampler/store.py CREATE TABLE IF NOT EXISTS samples (ts, metric, value, window_mean, window_max): a new metric is a new stem, not a new column"
         verdict: PASS
@@ -213,7 +223,7 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: '2592000'
+          pattern: '(2592000|retain_days|30[[:space:]]*[*][[:space:]]*24)'
           paths: ["sampler/src/sampler/"]
           expect: present
       - name: "install-script-replaces-the-loud-stub"
@@ -342,7 +352,7 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: 'own_cpu_some_avg10'
+          pattern: '^[[:space:]]*own_cpu_some_avg10[[:space:]]*:'
           paths: ["dark-factory-orchestrator.yaml"]
           expect: absent
 
@@ -381,14 +391,14 @@ tasks:
           pattern: 'own-slice'
           paths: ["docs/prds/cpu-load-admission-control.md"]
           expect: present
-      - name: "the-amendment-adds-rather-than-edits-a-premise"
-        binding: "capability→producer (wired) — §Corrections (2): the strings single-tenant / single-host / multi-tenant / multi-host do not occur anywhere in that 419-line document, and §2's framing is already many-source/one-host. ρ1 appends a dated amendment block; it must not hunt for a sentence to edit"
+      - name: "the-four-single-tenant-assertions-are-corrected"
+        binding: "capability→producer (wired) — §Corrections (2), REVISED at review: the LITERAL strings single-tenant / multi-tenant are absent, but the premise is asserted in four places (the title's 'over ALL load sources'; §1's 'every significant CPU source on the build host'; §2's closed reify-only source enumeration attributing the whole 42-89 host load to reify; §3's 'A lone source must reach all 32 cores'). ρ1 must amend those four, not merely append"
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: 'single-tenant'
+          pattern: 'multi-tenant'
           paths: ["docs/prds/cpu-load-admission-control.md"]
-          expect: absent
+          expect: present
       - name: "the-detector-block-and-its-census-entry-are-untouched"
         binding: "capability→producer (wired) — PRD §2 item 6 and §Corrections (4): the runqueue arm reads /proc/stat directly and consumes nothing reify produces, so 3590's 'delete the self-refuting census entry' clause does not fire"
         verdict: PASS
@@ -427,6 +437,30 @@ tasks:
           pattern: 'REIFY_PSI_GATE_PROC_PATH'
           paths: ["tests/infra/test_verify_admission_knob_parity.sh"]
           expect: present
+      - name: "the-unit-pinning-guard-is-co-changed-not-broken"
+        binding: "rejection-mechanism — §Corrections (5): tests/infra/test_host_global_unit_pinning.sh extracts install_build_services() by column-0 sed anchors and asserts the extracted snippet carries ^ExecStart=.*jobserver-balancer[.]py (assert B0c), then sources only that snippet. Moving the heredoc into render_jobserver_unit fails B0c and the B1b/B2a run-time asserts. The guard's own comment says a refactor of setup-dev.sh must fail it loudly — it is a tripwire, so ρ2 co-changes the harness"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'render_jobserver_unit'
+          paths: ["tests/infra/test_host_global_unit_pinning.sh"]
+          expect: present
+      - name: "the-ambient-var-ledger-gains-a-row-per-knob"
+        binding: "rejection-mechanism — §Corrections (5): tests/infra/test_run_all_ambient_isolation.sh enforces SET EQUALITY between the live verify_env keys and tests/infra/run-all-ambient-vars.manifest in both directions (task 5152: equality, not subset). Two new verify_env keys without ledger rows are two failed asserts"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'REIFY_(PSI|COMPILE)_GATE_PROC_PATH'
+          paths: ["tests/infra/run-all-ambient-vars.manifest"]
+          expect: present
+      - name: "the-sentinel-is-yaml-quoted"
+        binding: "rejection-mechanism — §Corrections (5): '@' is a reserved YAML indicator, so an unquoted `@own-slice` value is a ScannerError and reify's orchestrator would fail to load its config. The parity guard's awk parser accepts the unquoted form, so it reads GREEN while the config is unloadable — the sentinel must be written \"@own-slice\""
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: '"@own-slice"'
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
       - name: "the-slice-name-to-place-the-unit-under"
         binding: "DAG-direction — producer:dark_factory:3394 upstream via a qualified external dep; the name is df-<project_id>.slice with project_id from fused_memory.project_id = reify, never verify.py::_scope_tag_for"
         verdict: PASS
@@ -449,27 +483,27 @@ tasks:
           pattern: 'PartOf=orchestrator-reify\.service'
           paths: ["scripts/setup-dev.sh"]
           expect: present
-      - name: "redeploy-script-replaces-the-loud-stub"
-        binding: "producer:ρ2 — scripts/redeploy-jobserver-unit.sh is a committed loud stub so ρ3 can name it at submit; ρ2 writes the real one, sourcing render_jobserver_unit"
+      - name: "redeploy-script-is-created-sourcing-the-one-renderer"
+        binding: "producer:ρ2 — scripts/redeploy-jobserver-unit.sh does not exist. A loud stub was committed at decompose so ρ3's before_done could validate at submit, then BACKED OUT: reify's pre-commit runs verify.sh --include-infra, which held .git/index.lock in the machine-operated checkout for 65 min on a saturated host — an unacceptable cost for a 9-line stub the merge worker contends with. ρ3 depends on ρ2, so the script exists before ρ3 can dispatch"
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: 'not implemented until task'
+          pattern: 'render_jobserver_unit'
           paths: ["scripts/redeploy-jobserver-unit.sh"]
-          expect: absent
+          expect: present
 
   - label: "ρ3"
     task_id: null
     title: "Balancer unit re-deploy (deterministic, before_done = scripts/redeploy-jobserver-unit.sh)"
     capabilities:
-      - name: "before-done-script-exists-and-is-executable-at-submit"
-        binding: "capability→producer (wired) — the loud stub is committed at mode 755 ahead of filing, matching reify's executable-script convention (77 of 85 scripts/*.sh are executable; the 8 that are not are sourced-only lib_*.sh helpers)"
+      - name: "before-done-script-is-produced-upstream-before-dispatch"
+        binding: "DAG-direction — producer:ρ2 upstream (edge ρ3→ρ2) declares scripts/redeploy-jobserver-unit.sh and creates it at mode 755, matching reify's convention (77 of 85 scripts/*.sh are executable; the 8 that are not are sourced-only lib_*.sh helpers). submit_task's before_done validation was satisfied at filing by a temporary committed stub, since backed out — see ρ2's redeploy-script capability for why"
         verdict: PASS
         delivered_check:
           kind: manual
-          reason: "validated by submit_task itself"
-      - name: "the-stub-can-never-run-for-real"
-        binding: "DAG-direction — producer:ρ2 is upstream (edge ρ3→ρ2) and the stub exits 64 naming its owning task (INV-SF-5: placeholders owned and loud)"
+          reason: "a dependency-graph property; the runner would fail loudly if ρ2 had not produced the script"
+      - name: "the-script-cannot-run-before-its-producer-lands"
+        binding: "DAG-direction — producer:ρ2 is upstream (edge ρ3→ρ2). With the stub backed out the path simply does not exist until ρ2 lands, which the DeterministicRunner would report loudly rather than silently succeeding (INV-SF-5's concern is satisfied by absence rather than by a loud placeholder)"
         verdict: PASS
         delivered_check:
           kind: manual

@@ -305,6 +305,10 @@ psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (
 
 - Name: `df-<project_id>.slice`, `<project_id>` = `fused_memory.project_id`. Owner 3394; both repos
   cite it, neither restates it.
+- **In yaml the sentinel must be quoted — `"@own-slice"`.** `@` is a reserved YAML indicator, so a
+  bare `KEY: @own-slice` is a `ScannerError` and the whole config fails to load. reify's
+  admission-knob parity guard parses `verify_env` with awk and accepts the unquoted form, so it
+  would read green while the config is unloadable (decompose walk, 2026-09-08).
 - `@own-slice` (reify shell + python, and `shared.psi.resolve_own_cgroup` on the dark-factory side):
   resolve `/proc/self/cgroup` → nearest `df-*.slice` ancestor → `/sys/fs/cgroup<path>/cpu.pressure`.
   No ancestor ⇒ fall back to `/proc/pressure/cpu` and emit **one** WARNING per process naming the
@@ -355,16 +359,30 @@ mappings**, not text (INV-10).
 
 > **Decompose walk, 2026-09-08** — the capability manifest is
 > `plans/load-throttle-harmonisation-prd.capability-manifest.md` (+ its YAML
-> sidecar). All bindings PASS. Four premises in the prose above were corrected
-> during the walk and are carried into the filed tasks' own text; the manifest's
-> §Corrections is their home: (1) ρ2 must also move `verify.sh`'s two PSI-path
-> defaults and add `KNOB_TABLE` rows, or reify's admission-knob parity guard
-> goes red; (2) `cpu-load-admission-control.md` states no single-tenant premise,
-> so ρ1's amendment **adds** the multi-tenant framing rather than editing a
-> sentence (D7's substance is unchanged); (3) "matching reify's detector" is not
-> corroboration for `runqueue_ratio: 4.0` — that detector's ratio is
-> `load1/nproc`, a different quantity; (4) 3590's "remove the self-refuting
-> census entry" clause does not fire, per §2 item 6.
+> sidecar). All bindings PASS. **Five** premises in the prose above were
+> corrected during the walk (two of them at a second, adversarial pass over the
+> already-filed batch) and are carried into the filed tasks' own text; the
+> manifest's §Corrections is their home: (1) ρ2 must also move `verify.sh`'s two
+> PSI-path defaults, add `KNOB_TABLE` rows **and** a ledger row per knob, or two
+> reify guards go red; (2) `cpu-load-admission-control.md` never uses the words
+> *single-tenant*, but it **does** assert the premise in four named places, so
+> ρ1 amends those rather than appending beside them (D7's substance unchanged);
+> (3) "matching reify's detector" is not corroboration for `runqueue_ratio: 4.0`
+> — that detector's ratio is `load1/nproc`, a different quantity; (4) 3590's
+> "remove the self-refuting census entry" clause does not fire, per §2 item 6;
+> (5) three further reify guards collide with ρ2, one of which reads **green
+> while the config is unloadable** (`@` is a reserved YAML indicator, so the
+> sentinel must be written `"@own-slice"`).
+>
+> Three G7 waivers are recorded, each on its own task's `metadata.g7_waivers`
+> and in its row below: β `storm-escape-required`, γ `one-fact-one-home`,
+> ρ2 `storm-escape-required`.
+>
+> **`tripping_metric()` returns the suffixed config field names** —
+> `mem_full_avg10` > `runqueue_ratio` > `own_cpu_some_avg10` > `mem_some_avg10`
+> > `io_some_avg10` > `cpu_some_avg10`. §0 item 2, D10 and §7 rows 5/7 spell the
+> domain three different ways; this is the settled spelling (it is already the
+> `dispatch_deferred` payload's domain). The **rank** is unchanged.
 
 - **α — `PsiSample` v2 and readers** (shared). Defaulted fields, `read_runqueue_ratio`,
   `resolve_own_cgroup`, `read_own_cgroup_pressure`, `None`-tolerant `saturated`, `tripping_metric`
@@ -397,6 +415,13 @@ mappings**, not text (INV-10).
   throwaway worktree before committing. *Signal:* row 9 for dark-factory; the next
   `config_reload`/restart shows every leaf `applied`. *Files:* `dark-factory-orchestrator.yaml`.
   *Deps:* β.
+  *G7 waiver: `one-fact-one-home` — §6.2 writes three values identical to the current code
+  defaults (`mem_some_avg10` 15.0, `mem_full_avg10` 3.0, `io_some_avg10` 40.0) into both heavy
+  projects' yamls, so one fact gains three homes and a later code-default change silently reaches
+  neither. Waived rather than trimmed because §6.2's whole point is two byte-identical, diffable
+  blocks; the reconciler is δ's calibration script, which compares the two blocks as parsed
+  mappings and also reports any leaf merely restating the code default, on ε1/ε2's 14-day clock.
+  Accepted staleness is one calibration cycle, not unbounded.*
 - **δ — sampler metrics, retention, install script, calibration script** (**re-scopes 3592**,
   dashboard half dropped). Metrics per §6.4 via α's readers (no second parser); `retain_seconds`
   default 30 d; `scripts/install-load-sampler.sh` (copies the two committed units into
@@ -439,9 +464,22 @@ Reify batch (project `reify`; cross-project deps as `dark_factory:<id>`):
   `install_build_services` calls, and it gains `Slice=df-reify.slice` and
   `Environment=REIFY_JOBSERVER_PSI_PROC_PATH=@own-slice`; parity fixtures per §6.3's table in
   `tests/infra/test_cpu_admit.sh` and `tests/infra/test_jobserver_balancer.sh`.
-  *Signal:* rows 13–14. *Files:* `scripts/cpu-admit.sh`, `scripts/jobserver-balancer.py`,
-  `scripts/setup-dev.sh`, `dark-factory-orchestrator.yaml`, the two infra tests. *Deps:*
-  `dark_factory:3394`. ~300–600 LOC.
+  *Signal:* rows 13–14. *Files:* widened at decompose from 6 to **16** — the four above plus
+  `scripts/verify.sh`, `scripts/redeploy-jobserver-unit.sh`, `scripts/test_psi_gate.sh`,
+  `docs/notes/verify-pipeline-knobs.md` and six `tests/infra/` guards/ledgers
+  (`test_cpu_admit.sh`, `test_jobserver_balancer.sh`, `test_verify_admission_knob_parity.sh`,
+  `test_host_global_unit_pinning.sh`, `test_run_all_ambient_isolation.sh`,
+  `run-all-ambient-vars.manifest`, `test_verify_compile_gate.sh`,
+  `test_verify_semaphore_e2e.sh`). Crossing the overlay's >15 review trigger is deliberate:
+  eleven of the sixteen are guards that must move in lockstep with the one behavioural change.
+  *Deps:* `dark_factory:3394`, **ρ1** (added at decompose — both edit reify's
+  `dark-factory-orchestrator.yaml`). ~300–600 LOC.
+  *G7 waiver: `storm-escape-required` — the `@own-slice` fallback's only signal is one WARNING
+  per process, with no counter. Waived because the fallback is value-preserving (it returns a real
+  host reading, i.e. today's shipped behaviour), and the once-per-process bound is itself the
+  escape at the cadence that matters. The residual INV-11 gap is closed inside ρ2 rather than
+  waived: the balancer publishes the RESOLVED path alongside `held_back`, so a degraded resolve is
+  distinguishable by value.*
 - **ρ3 — balancer unit re-deploy** (reify `task_kind='deterministic'`, `before_done` = a committed
   `scripts/redeploy-jobserver-unit.sh` that sources `setup-dev.sh`'s `render_jobserver_unit` (one
   rendering site, INV-5), `daemon-reload`s and restarts `reify-jobserver.service`, then asserts the
