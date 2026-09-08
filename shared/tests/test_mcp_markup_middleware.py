@@ -67,7 +67,12 @@ import toolcall_markup_corpus_extract as extract
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    _ATTRIBUTION_AXIS_MAXLEN,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+    _bounded_axis,
+)
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect
 
 # ---------------------------------------------------------------------------
@@ -3145,6 +3150,71 @@ class TestTheStormNamesItsCrossingCaller:
         assert storm['crossing_subject_task_id'] == '4805'
         assert storm['crossing_subject_agent_role'] == 'implementer-4805'
         assert storm['crossing_agent_id'] is None
+
+    # -- (e) the axes are argument values, so they are BOUNDED --------------
+
+    def test_the_bound_leaves_a_real_identifier_alone(self):
+        """The bound must be invisible on every value this fleet actually mints.
+
+        The longest ids here are ~30 characters, so a bound that altered one
+        would be trading a rare pathological record for a wrong ordinary one.
+        ``None`` passes through as ``None``: absent is not empty, and the
+        record's present-and-null contract rests on that.
+        """
+        assert _bounded_axis('claude-task-4805-implementer') == (
+            'claude-task-4805-implementer'
+        )
+        assert _bounded_axis(None) is None
+        assert _bounded_axis('') == ''
+        # Exactly at the bound is NOT truncated — an off-by-one here would
+        # silently mark untruncated values as prefixes.
+        edge = 'x' * _ATTRIBUTION_AXIS_MAXLEN
+        assert _bounded_axis(edge) == edge
+
+    def test_the_bound_marks_what_it_shortened(self):
+        """Silent truncation is worse than none.
+
+        A shortened id is otherwise indistinguishable from a real one, so a
+        triager could compare it against the true id, find they differ, and
+        conclude the record names a caller that does not exist. The marker is
+        ASCII because this value is ``json.dumps``-ed into the caller-facing
+        payload, which escapes non-ASCII — a ``…`` would arrive as a
+        ``\u2026`` that reads as corruption rather than as truncation.
+        """
+        bounded = _bounded_axis('y' * (_ATTRIBUTION_AXIS_MAXLEN + 500))
+
+        assert bounded.startswith('y' * _ATTRIBUTION_AXIS_MAXLEN)
+        assert bounded.endswith('...')
+        assert len(bounded) == _ATTRIBUTION_AXIS_MAXLEN + 3
+        assert bounded.isascii()
+
+    async def test_a_blob_in_an_axis_does_not_ride_into_the_record(self):
+        """The pathological case is not hypothetical, and that is the point.
+
+        These axes are argument VALUES — the exact things this guard fires on
+        — so the axis a serialization leak lands in can itself BE the leaked
+        blob. Unbounded, it would ride whole into an operator-facing escalation
+        body, into every bounce payload for the rest of the window, and into
+        the ``StormCounter``'s retained event list once per event.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+        blob = 'B' * 4000
+
+        for _ in range(3):
+            await self._typed_repair(h, task_id=blob, agent_role='implementer-4805')
+            clock.advance(60)
+
+        storm = self._storms(h)[0]
+        crossing = storm['crossing_subject_task_id']
+        assert crossing is not None
+        assert len(crossing) == _ATTRIBUTION_AXIS_MAXLEN + 3, len(crossing)
+        assert blob not in crossing
+        # The window-wide axis is bounded by the same helper, so neither name
+        # for the caller can be the one that carries the blob.
+        assert storm['callers'] and all(blob not in c for c in storm['callers'])
+        # The unbounded value reaches NOTHING on the record.
+        assert blob not in repr(storm)
 
 
 # ---------------------------------------------------------------------------
