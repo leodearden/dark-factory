@@ -112,7 +112,7 @@ _FIND_SCRIPT_POSITION_CASES = [
         'missing-tag-returns-none',
     ],
 )
-def testfind_script_position_returns_document_order(
+def test_find_script_position_returns_document_order(
     body: str, src_prefix: str, expected_position: int | None
 ) -> None:
     """find_script_position returns the 0-indexed document position of the
