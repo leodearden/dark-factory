@@ -430,14 +430,34 @@ class TestSelectJudgeCandidates:
         result set at all. The parent is what the attach targets, so when the
         hoisted id is absent the CHILD that carried the evidence must stay —
         dropping both would leave the judge with no view of the match at all.
+
+        The child is scored BELOW every peer on purpose. Scored above them it
+        is plain top-1, an unconditional `sorted(...)[:n]` returns the same
+        slate, and the branch this test names is never the reason it passes —
+        which is why deleting the `PARENT_ID_KEY` fallback outright used to
+        leave the whole suite green. At 0.55 against six records at
+        0.90..0.85 the rescue arm is the ONLY thing that can put it in.
+
+        The eviction victim is asserted too. The sibling
+        `test_the_bands_winner_is_always_present` checks membership and
+        `len <= n`, so a rescue that dropped the STRONGEST candidate instead
+        of the weakest would satisfy both it and a bare `in` check here.
         """
         child = _result(
-            'child-1', 0.97,
+            'child-1', 0.55,
             extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
         )
-        results = [child, *[_result(f'm{i}', 0.90 - i / 100) for i in range(6)]]
-        selected = select_judge_candidates(results, 3, canonical_id='parent-1')
-        assert 'child-1' in [r.id for r in selected]
+        peers = [_result(f'm{i}', 0.90 - i / 100) for i in range(6)]
+        selected = select_judge_candidates(
+            [child, *peers], 3, canonical_id='parent-1',
+        )
+        ids = [r.id for r in selected]
+        assert 'child-1' in ids
+        # The rescue EVICTS rather than widens: still exactly n.
+        assert len(selected) == 3
+        # And it evicts the WEAKEST of the window (m2 at 0.88), not an
+        # arbitrary one — m0 and m1 are the two strongest and both survive.
+        assert ids == ['m0', 'm1', 'child-1']
 
     def test_an_empty_input_returns_empty_without_raising(self) -> None:
         """Nothing to compare is a decision, not a failure."""
