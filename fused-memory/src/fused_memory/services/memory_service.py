@@ -4038,12 +4038,40 @@ class MemoryService:
                 # SUBTRACTS this axis from the membership rate, which needs the
                 # denominator to still be there. See REFERENT_FINDING_AXES.
                 self._referent_finding_counts['corroborated'] += 1
-            # WARNING, not DEBUG. The task calls out today's `logger.debug`-only
-            # ReconcileStats shape as unacceptable here, and a misattached edge
-            # is a correctness defect an operator should see. This line is the
-            # OPERATOR surface ONLY — it carries the structured payload for
-            # legibility, but nothing parses it.
-            logger.warning(
+            # WARNING, not DEBUG — but NOT WARNING for every finding.
+            #
+            # WARNING is right for the shape this pass exists to catch. The task
+            # calls out today's `logger.debug`-only ReconcileStats shape as
+            # unacceptable here, and a misattached edge is a correctness defect
+            # an operator should see.
+            #
+            # INFO is right for a CORROBORATED finding, and that is the other
+            # half of the same rule. A fact that names the very node its edge
+            # landed on is evidence the attachment is CORRECT:
+            # `_candidate_pool`'s veto has already emptied its pool, so there is
+            # nothing to act on, and the dominant legitimate write shape
+            # produces it routinely (`resolve_referents` derives
+            # `source='metadata'` from an agent's ambient task_id — "an agent
+            # working on task 3668 legitimately writes memories about Task
+            # 2500"). Warning about it is exactly the alert fatigue the pairing
+            # arm's `cited_declared` narrowing already refused to create; this
+            # is the membership arm keeping the same discipline the only way
+            # open to it, since the PRD requires the finding be RECORDED.
+            #
+            # DEMOTED, NOT DROPPED. Discarding the line would be a fail-soft
+            # path with nothing to hear it (INV-4); one level down, the evidence
+            # is still there for anyone who goes looking.
+            #
+            # PER FINDING, never per episode: one episode routinely carries both
+            # shapes, and an episode-level rule would swallow the defect.
+            #
+            # This line is the OPERATOR surface ONLY — it carries the structured
+            # payload for legibility, but nothing parses it. The machine
+            # surfaces are the counters above and `stats.findings`, and NEITHER
+            # is affected by this level: a corroborated finding is counted and
+            # returned in full regardless.
+            logger.log(
+                logging.INFO if finding.corroborated else logging.WARNING,
                 'Referent verification finding: %s', finding.to_dict(),
             )
 
