@@ -645,12 +645,19 @@ async def _call_llm(
     """One single-turn call to *provider*, returning the raw response text.
 
     Mirrors ``reconciliation/judge.py::_call_llm``'s two-arm fan-out at
-    write-path scale: ``temperature=0`` (this is a classification, not a
-    generation), a small :data:`_JUDGE_MAX_TOKENS`, and — on the openai arm —
-    ``response_format={'type': 'json_object'}`` so the happy path is the
-    parser's happy path. The anthropic arm passes the system prompt via
-    ``system=`` because Anthropic has no system ROLE; a system message would
-    arrive as an ordinary user turn.
+    write-path scale. Determinism (``temperature=0.0``) and the token cap
+    (:data:`_JUDGE_MAX_TOKENS`) are pinned IDENTICALLY on both arms: the
+    judge is a classifier answering one word from a closed vocabulary, so
+    sampling buys nothing and costs parse failures — and a parse failure
+    here is a counted fail-open, not merely a worse answer. Omitting
+    ``temperature`` on an arm does not mean "unset": Anthropic's default is
+    1.0.
+
+    ``response_format={'type': 'json_object'}`` is the ONLY openai-specific
+    request parameter — Anthropic has no equivalent — and it makes that arm's
+    happy path the parser's happy path. The anthropic arm passes the system
+    prompt via ``system=`` because Anthropic has no system ROLE; a system
+    message would arrive as an ordinary user turn.
 
     The client is constructed PER CALL and deliberately not cached on a module
     global. ``add_memory`` is served by one long-lived server process, and a
@@ -717,6 +724,7 @@ async def _call_llm(
             response = await asyncio.wait_for(
                 client.messages.create(
                     model=model,
+                    temperature=0.0,
                     max_tokens=_JUDGE_MAX_TOKENS,
                     system=JUDGE_SYSTEM_PROMPT,
                     messages=[{'role': 'user', 'content': prompt}],
