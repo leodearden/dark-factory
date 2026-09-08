@@ -250,14 +250,23 @@ def test_the_superset_corpus_actually_exercises_both_sides():
     Its body is a conditional, so a corpus in which NOTHING matched the full
     regex would leave every case green while checking nothing. Both sides
     have to be populated for the identity to have been tested at all.
+
+    NON-VACUITY IS THE WHOLE CLAIM, so no magnitude is pinned. Earlier this
+    asserted 61 / 48 / 61 exactly, which contradicted the design the docstring
+    above states and the artifact repeats — that appending a shape to
+    reconciliation/plural_enum_shapes.py re-validates both candidates
+    automatically. A single appended shape failed this test with a
+    magic-number mismatch that said nothing about the property under test and
+    sent its reader to the wrong file. The three assertions below carry the
+    entire guarantee the docstring claims and need no re-tuning as the shared
+    corpus grows.
     """
-    assert len(_ALL_PINNED_FACTS) == 61
     matched = [f for f in _ALL_PINNED_FACTS if _mod.PLURAL_ENUM_SNAPSHOT_RE.search(f)]
     precondition = [
         f for f in _ALL_PINNED_FACTS if _mod._LEXICAL_PRECONDITION_RE.search(f)
     ]
-    assert len(matched) == 48, 'the full-regex side emptied or drifted'
-    assert len(precondition) == 61, 'the precondition side emptied or drifted'
+    assert matched, 'the full-regex side emptied or drifted'
+    assert precondition, 'the precondition side emptied or drifted'
     assert len(matched) < len(precondition), (
         'a corpus where the two counts coincide cannot show near_miss is not '
         'just a second name for lexical_precondition'
@@ -2368,6 +2377,66 @@ async def test_every_incomplete_project_names_why_in_the_artifact():
             assert line.count('`') > 2, (
                 f'an incomplete row must name its kind, not just fail: {line}'
             )
+
+
+# The four ways a verdict can disagree with its own explanation, one per
+# `raise ValueError` path across the two dataclasses. Each case names the
+# field whose check must be the one that fires, so a validator deleted or
+# inverted in a refactor fails HERE rather than shipping an artifact nobody
+# can read. Both dataclasses word their message as `... but <field>=<repr>`,
+# which is what makes one `match` expression serve both.
+_DISAGREEING_VERDICTS = [
+    # An incomplete verdict that cannot say why — the defect these types
+    # exist to make unrepresentable.
+    ({'complete': False}, 'reason'),
+    # Explained, but with no branchable discriminator beside the prose: a
+    # consumer would have to parse an interface that is deliberately not one.
+    ({'complete': False, 'reason': 'came back short'}, 'kind'),
+    # The reverse direction, which is just as corrosive: an explanation
+    # stapled to a healthy row makes every explanation in the artifact
+    # suspect.
+    ({'complete': True, 'reason': 'came back short', 'kind': 'short_read'}, 'reason'),
+    ({'complete': True, 'kind': 'short_read'}, 'kind'),
+]
+
+
+@pytest.mark.parametrize('kwargs, offending', _DISAGREEING_VERDICTS)
+def test_an_enumeration_outcome_cannot_disagree_with_itself(kwargs, offending):
+    """The biconditional is ENFORCED, not merely satisfied by today's callers.
+
+    ``test_every_incomplete_project_names_why_in_the_artifact`` asserts the
+    invariant HOLDS over a mixed report — and it passes identically whether
+    these validators exist or were deleted, because every report it builds is
+    well-formed by construction. The mechanism doing the work had no direct
+    coverage at all, which is the wrong thing to leave untested in a change
+    whose stated purpose is to make an unexplained `complete: false`
+    unrepresentable.
+    """
+    with pytest.raises(ValueError, match=rf'but {offending}='):
+        EnumerationOutcome(**kwargs)
+
+
+@pytest.mark.parametrize('kwargs, offending', [
+    (kwargs, offending.replace('reason', 'error').replace('kind', 'error_kind'))
+    for kwargs, offending in _DISAGREEING_VERDICTS
+])
+def test_a_project_report_cannot_disagree_with_itself(kwargs, offending):
+    """The same guarantee at the layer that gets COMMITTED.
+
+    ``ProjectReport`` re-asserts the invariant it inherits from
+    ``EnumerationOutcome`` rather than trusting it, because ``run``'s
+    exception handler builds one WITHOUT an outcome — the graph that never
+    enumerated. That path is exactly where an unexplained row would come
+    from, so the check has to live here too and has to be tested here too.
+    """
+    kwargs = {
+        k.replace('reason', 'error').replace('kind', 'error_kind'): v
+        for k, v in kwargs.items()
+    }
+    with pytest.raises(ValueError, match=rf'but {offending}='):
+        _mod.ProjectReport(
+            project_id='alpha', valid_edges=0, scan=_mod.ScanResult(), **kwargs,
+        )
 
 
 @pytest.mark.asyncio
