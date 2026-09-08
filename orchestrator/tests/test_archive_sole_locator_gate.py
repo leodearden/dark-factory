@@ -88,16 +88,13 @@ _GLOB_METHODS = frozenset({'glob', 'rglob'})
 # The ONE production site permitted to glob the archive by session id.
 _ARCHIVE_LOCATOR = ('shared/src/shared/transcript_archive.py', 'durable_archive_path')
 
-# Where the invariant is stated in PROSE, for humans. This gate enforces it;
-# that docstring is what explains it, and is where a deliberate change of
-# policy belongs. Cited as `path::symbol` per CLAUDE.md rather than a line pin.
+# Interpolated into the failure message to point a future author at where the
+# invariant is stated in prose, and so at where a deliberate change of policy
+# belongs. A message POINTER only: nothing here asserts on that docstring's
+# wording, which would pin prose rather than behaviour and would go red on a
+# rewrite that left the invariant perfectly intact. Cited as `path::symbol` per
+# CLAUDE.md rather than a line pin.
 _PROSE_HOME = 'shared/src/shared/transcript_archive.py (module docstring)'
-
-# The sentence in that docstring this gate is the mechanical form of. Pinned so
-# the two cannot drift into disagreeing about what the rule IS — a gate whose
-# prose home has quietly said something else for six months is worse than no
-# prose home, because a reader trusts the words over the assertion.
-_PROSE_CLAIM = 'is the single session-id-keyed locator into it'
 
 # Sites that interpolate a session id into a glob against the LIVE CLI CONFIG
 # TREE rather than the archive. Each carries its reason inline so a future
@@ -507,28 +504,3 @@ def test_failure_message_names_the_invariant_and_the_remedy() -> None:
     # Keeps the legitimate escape hatch visible, so a genuine live-config-tree
     # lookup is not blocked by a message that only says "never".
     assert '_LIVE_CONFIG_TREE_ALLOWLIST' in msg
-
-
-def test_prose_home_still_states_the_invariant() -> None:
-    """The gate and its prose statement must not drift apart.
-
-    This gate is the mechanical form of a sentence in
-    ``shared/transcript_archive.py``'s module docstring, and its failure
-    message sends readers there. If that sentence is edited away — or the rule
-    is deliberately relaxed there without anyone touching this file — the gate
-    would keep enforcing a policy its own stated source no longer claims, and
-    the failure message would cite a paragraph that says something else.
-    Cheaper to notice here than in an argument six months from now.
-    """
-    docstring = ast.get_docstring(
-        ast.parse((REPO_ROOT / _ARCHIVE_LOCATOR[0]).read_text(encoding='utf-8'))
-    )
-    assert docstring is not None, f'{_ARCHIVE_LOCATOR[0]} lost its module docstring'
-    normalised = ' '.join(docstring.split())
-    assert _PROSE_CLAIM in normalised, (
-        f'{_PROSE_HOME} no longer states the I-E invariant this gate enforces '
-        f'(looked for: {_PROSE_CLAIM!r}). If the rule genuinely changed, change '
-        'it THERE and here together; if the wording merely moved, re-point '
-        '_PROSE_CLAIM at the new sentence.'
-    )
-    assert 'durable_archive_path' in normalised
