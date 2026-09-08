@@ -314,28 +314,52 @@ Reply with a bare JSON object and nothing else:
 """
 
 
-def _is_attach_target(candidate: MemoryResult, attach_target_id: str | None) -> bool:
-    """Is *candidate* the record the band's verdict will be filed against?
+def _attach_target_of(
+    candidates: list[MemoryResult], attach_target_id: str | None,
+) -> MemoryResult | None:
+    """WHICH record the band's verdict will be filed against — at most one.
 
-    The SAME two-clause predicate :func:`select_judge_candidates`' rescue arm
-    uses, so the marker and the rescue can never disagree about which record
-    carries the evidence. The second clause is not defensive padding:
+    The SAME ordered ``next(...) or next(...)`` expression
+    :func:`select_judge_candidates`' rescue arm uses, so the marker and the
+    rescue resolve the winner IDENTICALLY rather than merely sharing two
+    clauses. Precedence is exact-id-first; the ``PARENT_ID_KEY`` arm is the
+    FALLBACK for a hoisted parent that is absent from the slate, not a
+    co-equal alternative. That fallback is not defensive padding:
     ``_canonical_id_of`` HOISTS a child winner to its parent id, so
     ``decision.canonical_id`` routinely names a record that is not in the
     slate at all, and a bare ``candidate.id == attach_target_id`` marker marks
     NOTHING there — the silent version of the defect rather than a fix for it.
 
-    ``None`` marks nothing, and neither does an id naming no candidate: the
+    Resolving ONE target for the whole slate is what makes the mark
+    determinate, and this deliberately replaces an earlier per-candidate
+    predicate that asked the two clauses UNORDERED, once per candidate. On a
+    slate holding a canonical parent AND one of its ``PARENT_ID_KEY``
+    children — the ordinary consolidated-topic case, since ``_canonical_id_of``
+    hoists and ``retrieve_candidates`` returns children un-filtered — both
+    clauses were true somewhere and EVERY such record got marked; several
+    children of one parent multiplied it further. That defeats the very
+    determinacy the mark exists to establish: the prompt's constant sentence
+    says the marked candidate is the one the verdict will be filed against,
+    and with two marks that sentence is simply false.
+
+    ``None`` resolves to nothing, and so does an id naming no candidate: the
     mark MATCHES against the slate rather than interpolating what it was
     handed. That is what
     ``scripts/check_write_triage_attach_target.py::_echoes_argument``
     separates a real marker from a free-text parameter by.
     """
     if attach_target_id is None:
-        return False
-    return (
-        candidate.id == attach_target_id
-        or (candidate.metadata or {}).get(PARENT_ID_KEY) == attach_target_id
+        return None
+    return next(
+        (c for c in candidates if c.id == attach_target_id),
+        None,
+    ) or next(
+        (
+            c
+            for c in candidates
+            if (c.metadata or {}).get(PARENT_ID_KEY) == attach_target_id
+        ),
+        None,
     )
 
 
@@ -357,10 +381,15 @@ def build_judge_prompt(
     uuids, not context.
 
     *attach_target_id* is the band's winner (``decision.canonical_id``). The
-    candidate satisfying :func:`_is_attach_target` gains an ``attach_target``
-    line naming its own id, wherever it sits in the slate; every other
-    candidate, and an id matching none of them, renders exactly as it would
-    with no target at all. Position is NOT a sound encoding of the target:
+    single candidate :func:`_attach_target_of` resolves gains an
+    ``attach_target`` line naming its own id, wherever it sits in the slate;
+    every other candidate, and an id matching none of them, renders exactly as
+    it would with no target at all. AT MOST ONE candidate is ever marked —
+    the target is resolved once for the whole slate, not re-decided per
+    candidate — which is what makes the constant "the candidate marked
+    ``attach_target`` is the one this verdict will be filed against" sentence
+    below true rather than merely intended. Position is NOT a sound encoding
+    of the target:
     :func:`select_judge_candidates` rescues a hoisted parent's evidence child
     by APPENDING it, so the target is LAST on that slate and first on a flat
     one (measured in
@@ -385,9 +414,10 @@ def build_judge_prompt(
         '',
         'EXISTING CANDIDATES:',
     ]
+    target = _attach_target_of(candidates, attach_target_id)
     for candidate in candidates:
         lines.append(f'- id: {candidate.id}')
-        if _is_attach_target(candidate, attach_target_id):
+        if target is not None and candidate is target:
             # Names the CANDIDATE's id, not the argument. A bare
             # `attach_target: true` flag would leave no differing line
             # mentioning any candidate id, which is precisely what the gate's
