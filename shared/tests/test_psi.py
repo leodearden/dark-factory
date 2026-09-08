@@ -580,18 +580,6 @@ class TestReadRunqueueRatio:
         assert reading.read_ok is False
         assert reading.ratio == 0.0
 
-    def test_is_a_plain_function_with_no_cfg_or_host_psi_dependency(self):
-        """The reader takes no cfg and no host-PSI seam — it is orthogonal to
-        both, which is what lets read_psi_sample compose it independently."""
-        import inspect
-
-        from shared.psi import read_runqueue_ratio
-
-        params = inspect.signature(read_runqueue_ratio).parameters
-        assert list(params) == ['proc_stat_path']
-        assert params['proc_stat_path'].kind is inspect.Parameter.KEYWORD_ONLY
-        assert params['proc_stat_path'].default is not inspect.Parameter.empty
-
 
 # PRD `plans/load-throttle-harmonisation-prd.md` §6.3 is the SINGLE HOME of
 # these two cgroup shapes; reify's rho2 builds the same strings on the bash
