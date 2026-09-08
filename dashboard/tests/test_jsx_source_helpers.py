@@ -31,6 +31,7 @@ import pytest
 from _dashboard_helpers import (
     ScriptTagCollector,
     assert_script_loads_before,
+    extract_df_data_block,
     extract_function_body,
     find_script_position,
     strip_js_comments,
@@ -430,6 +431,100 @@ def _resolved_client_scope(request) -> str | None:
         if marker is not None:
             return getattr(marker, 'scope', None)
     return None
+
+
+class TestExtractDfDataBlock:
+    """The `window.DF_DATA` seed-block extractor's contract.
+
+    Deliberately pins the CURRENT behaviour of the three private copies this
+    replaces (test_tab_escalations, test_tab_memory_evals,
+    test_tab_escalation_analytics), whose code was byte-identical.  Two of
+    those behaviours differ from its sibling `extract_function_body` and are
+    kept as-is rather than "improved" in the same change that moves them: the
+    silent `''` on a miss, and the string-literal blind spot.  Unifying and
+    changing semantics at once is exactly what makes a consolidation unsafe.
+    """
+
+    def test_returns_the_block_with_both_braces(self) -> None:
+        src = "window.DF_DATA = { ESCALATIONS: { open: 3 }, OTHER: 1 };"
+
+        block = extract_df_data_block(src, 'ESCALATIONS')
+
+        assert block == '{ open: 3 }'
+        assert block.startswith('{') and block.endswith('}')
+
+    def test_the_walk_is_brace_depth_aware(self) -> None:
+        """A NESTED object does not terminate the block early.
+
+        This is the whole reason a `[^}]*` regex was rejected: it would stop at
+        the first nested `}` and silently truncate.
+        """
+        src = (
+            "ESCALATIONS: { summary: { open: 3, closed: 1 }, rows: [] }, "
+            "MEMORY_EVALS: { n: 9 }"
+        )
+
+        block = extract_df_data_block(src, 'ESCALATIONS')
+
+        assert block == '{ summary: { open: 3, closed: 1 }, rows: [] }'
+        assert 'MEMORY_EVALS' not in block, 'a later sibling key must be excluded'
+        assert block.count('{') == block.count('}')
+
+    def test_the_key_is_regex_escaped(self) -> None:
+        """A key carrying regex metacharacters is matched literally."""
+        src = "a.b: { x: 1 }, aXb: { x: 2 }"
+
+        assert extract_df_data_block(src, 'a.b') == '{ x: 1 }'
+        assert extract_df_data_block(src, 'a[b') == ''
+
+    def test_arbitrary_whitespace_is_allowed_around_the_colon(self) -> None:
+        src = "ESCALATIONS   :\n    {\n  open: 3\n}"
+
+        block = extract_df_data_block(src, 'ESCALATIONS')
+
+        assert block.startswith('{') and 'open: 3' in block
+
+    def test_returns_empty_string_when_the_key_is_absent(self) -> None:
+        """A miss is SILENT — the opposite policy to `extract_function_body`.
+
+        Kept deliberately: all four call sites already assert on the returned
+        value themselves, so raising here would merely relocate their failures.
+        """
+        assert extract_df_data_block('OTHER: { x: 1 }', 'ESCALATIONS') == ''
+
+    def test_returns_empty_string_when_the_brace_is_never_closed(self) -> None:
+        assert extract_df_data_block('ESCALATIONS: { open: 3', 'ESCALATIONS') == ''
+
+    def test_is_re_entrant_over_its_own_output(self) -> None:
+        """Feeding the result back in extracts a nested key.
+
+        test_tab_escalations.py relies on exactly this: it pulls the
+        ESCALATIONS seed block, then pulls `summary` back out of it.
+        """
+        src = "ESCALATIONS: { summary: { open: 3 }, rows: [] }, OTHER: 1"
+
+        seed_block = extract_df_data_block(src, 'ESCALATIONS')
+        summary_block = extract_df_data_block(seed_block, 'summary')
+
+        assert summary_block == '{ open: 3 }'
+
+    def test_brace_inside_a_string_literal_miscounts(self) -> None:
+        """KNOWN LIMITATION, pinned as current behaviour, not endorsed.
+
+        Unlike `extract_function_body`, this walk is NOT quote-aware: a `{` or
+        `}` inside a quoted string is counted, so the block ends early.  Pinned
+        so that making it quote-aware later is a deliberate, visible contract
+        edit rather than silent drift.
+        """
+        src = 'ESCALATIONS: { label: "a } b", open: 3 }'
+
+        block = extract_df_data_block(src, 'ESCALATIONS')
+
+        assert block == '{ label: "a }', (
+            'if this now returns the full block the walk became quote-aware — '
+            'a real improvement, but update this pin deliberately'
+        )
+        assert 'open: 3' not in block
 
 
 class TestScriptOrderHelpers:
