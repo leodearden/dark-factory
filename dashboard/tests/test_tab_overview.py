@@ -67,7 +67,7 @@ class TestHostLoadCardStaleness:
 def tab_overview_jsx_code(tab_overview_jsx_body):
     """`tab_overview.jsx` with every comment stripped.
 
-    Copied from `test_tab_memory_evals.py`'s `tab_memory_evals_jsx_code`
+    Same shape as `test_tab_memory_evals.py`'s `tab_memory_evals_jsx_code`
     fixture, for the same reason it was created there: a substring assertion
     over the raw body is satisfied by a MENTION in a comment just as well as by
     a render site.  That false-pass mode is not hypothetical — the memory-evals

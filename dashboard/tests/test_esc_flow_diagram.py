@@ -27,17 +27,16 @@ module-scoped fixture in conftest.py and `extract_function_body` is imported
 from `_dashboard_helpers`; test_jsx_source_helpers.py owns their contract and
 guards against the copies returning.
 
-That retirement stopped at the two JSX-slicing helpers, DELIBERATELY, and the
-remaining copies are tracked rather than forgotten — read the paragraph above
-as scoped to those two, not as a claim that this file holds no copies.  The
-script-order helpers below (ScriptTagCollector, find_script_position,
-assert_script_loads_before) are still local copies from
-test_tab_escalation_analytics.py, and are copied again in test_index_html.py,
-test_tab_escalations.py and test_tab_memory_evals.py; `_extract_df_data_block`
-stands in three modules; test_charts_axis_labels.py's `_extract_signature`
-re-derives the paren-depth walk `extract_function_body` now owns.  Moving them
-needs test_index_html.py, which task 3549 held no lock on, so it filed
-ticket tkt_0RSN5VVGAVK7BQ8K9GX4PM2YBZ for the rest.
+Task 4881 finished the job that retirement started, so the paragraph above is
+now the whole story rather than a claim scoped to two helpers.  The
+script-order trio this file uses (`ScriptTagCollector`,
+`find_script_position`, `assert_script_loads_before`) is imported from
+`_dashboard_helpers` rather than copied here and into four other modules;
+`extract_df_data_block` likewise replaced three copies; and
+test_charts_axis_labels.py's `_extract_signature` is now a projection over the
+same `find_function_params` paren walk `extract_function_body` is built on,
+instead of re-deriving it.  test_jsx_source_helpers.py owns every one of those
+contracts.
 """
 
 from __future__ import annotations

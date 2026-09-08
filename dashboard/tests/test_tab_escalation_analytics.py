@@ -22,7 +22,7 @@ from _dashboard_helpers import (
 
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware).
-# Copied from test_tab_escalations.py — scopes token-presence checks to a
+# Imported from `_dashboard_helpers` — scopes token-presence checks to a
 # specific function body rather than searching the entire file (which would
 # give false confidence when a token appears in an unrelated context).
 # ---------------------------------------------------------------------------
