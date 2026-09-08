@@ -1326,7 +1326,7 @@ class TestRunJudgeEval:
                 **_PROVENANCE, 'judge_candidate_count': 2,
             })
         warnings = [
-            record.getMessage() % record.args if record.args else record.getMessage()
+            record.getMessage()
             for record in caplog.records if record.levelno >= logging.WARNING
         ]
         assert any('measured' in message for message in warnings), warnings

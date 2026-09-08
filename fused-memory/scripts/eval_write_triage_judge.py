@@ -176,6 +176,38 @@ EVAL_CLASSES: tuple[str, ...] = (
 #: Measured 2026-08-27 — the committed pair disagreed on exactly this.
 EVAL_OUTCOMES: tuple[str, ...] = tuple(sorted(TRIAGE_OUTCOMES))
 
+#: Every provenance field the report is expected to carry, in report order —
+#: the same "one list, two consumers" shape as ``EVAL_CLASSES`` above, and for
+#: a sharper version of the same reason. :func:`build_report` backfills from
+#: THIS tuple and ``_run`` supplies its own subset of it, so a field added in
+#: one place cannot go missing from reports assembled through the other. Two
+#: hand-typed lists is exactly how ``candidate_count_min`` and
+#: ``distractor_count_requested`` — the pair that discloses a NARROWED slate —
+#: came to be absent from every report ``build_report`` backfilled.
+#:
+#: An ABSENT key cannot be told apart from an artifact predating the field, so
+#: an unmeasured one reads ``None`` rather than vanishing.
+PROVENANCE_KEYS: tuple[str, ...] = (
+    # Supplied by the caller — what was run, against what.
+    'fixture_path',
+    'judge_provider',
+    'judge_model',
+    'limit',
+    # Measured by `run_judge_eval` — the population and the slate it BUILT.
+    'record_count',
+    'case_count',
+    'candidate_count',
+    'candidate_count_min',
+    'distractor_count',
+    'distractor_count_requested',
+    # Resolved from config — what the model could actually SEE, and whether
+    # it was asked at all. `judge_write` re-trims the slate to
+    # `judge_candidate_count`, and returns `stored` on its first line when
+    # `judge_enabled` is false.
+    'judge_candidate_count',
+    'judge_enabled',
+)
+
 #: Curator label -> the verdicts that count as correct for it. See the module
 #: docstring for the rationale behind each entry; every one traces to a human
 #: adjudication rather than to an opinion formed here.
@@ -488,13 +520,20 @@ def build_report(
     from already-scored cases still produces an artifact whose provenance
     block has every key, with ``None`` where nothing was measured. An ABSENT
     key cannot be told apart from an artifact predating the field.
+
+    The backfill iterates :data:`PROVENANCE_KEYS` rather than a literal, so
+    that promise covers the WHOLE vocabulary. It used to name three of its
+    members by hand, which left ``candidate_count_min`` and
+    ``distractor_count_requested`` — the two fields that disclose a narrowed
+    slate — absent from every report assembled here, so a report built from
+    already-scored cases read exactly like a full-width run.
     """
     per_class = dict(scored['per_class'])
     run_provenance = dict(provenance)
     run_provenance.setdefault(
         'case_count', sum(entry['n'] for entry in per_class.values()),
     )
-    for key in ('record_count', 'candidate_count', 'distractor_count'):
+    for key in PROVENANCE_KEYS:
         run_provenance.setdefault(key, None)
 
     return {
@@ -628,6 +667,19 @@ def run_judge_eval(
             'slate widths ran %d..%d against a requested %d — the report '
             'records what was measured, not what was asked for',
             min(widths), max(widths), distractors + 1,
+        )
+    # The OTHER direction, and a different mechanism: `judge_write` re-trims
+    # the slate to `judge_candidate_count` before the prompt is built, so a
+    # slate built wider than that cap is measured narrower than it is
+    # published. Silent today because the shipped cap (5) and the default
+    # `--distractors 4` happen to agree.
+    effective_cap = run_provenance.get('judge_candidate_count')
+    if widths and isinstance(effective_cap, int) and max(widths) > effective_cap:
+        logger.warning(
+            'slate widths ran %d..%d but judge_candidate_count caps the '
+            'prompt at %d — the report records what the model was measured '
+            'on, not the wider slate that was built',
+            min(widths), max(widths), effective_cap,
         )
     report = build_report(scored=scored, provenance=run_provenance)
 
@@ -827,6 +879,8 @@ def _run(args: Any) -> int:
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_candidate_count,
+        resolve_judge_enabled,
         resolve_judge_model,
         resolve_judge_provider,
     )
@@ -846,6 +900,16 @@ def _run(args: Any) -> int:
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
     model = resolve_judge_model(service)
+    # Resolved from the SAME config the shipped judge reads, and recorded even
+    # on a --dry-run: the two facts the numbers cannot be read without.
+    # `judge_candidate_count` is the width `judge_write` trims the slate to,
+    # so it — not the width this script builds — is what the model saw.
+    # `judge_enabled` false makes `judge_write` return `stored` on its first
+    # line for every case, which scores the `distractor` control 1.0 and
+    # `duplicate` 0.0 while spending nothing and writing a report that is
+    # otherwise indistinguishable from a measurement.
+    judge_candidate_count = resolve_judge_candidate_count(service)
+    judge_enabled = resolve_judge_enabled(service)
 
     records = load_fixture(args.fixture)
     logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
@@ -927,6 +991,8 @@ def _run(args: Any) -> int:
             # smoke rather than the corpus-wide measurement the task-3169
             # flip gate reads it as.
             'limit': args.limit,
+            'judge_candidate_count': judge_candidate_count,
+            'judge_enabled': judge_enabled,
         },
         distractors=args.distractors,
     )
