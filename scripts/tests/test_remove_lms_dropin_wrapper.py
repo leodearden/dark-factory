@@ -237,6 +237,51 @@ def _unique_template() -> str:
     return f"{_SELFTEST_PREFIX}{os.getpid()}-{uuid4().hex[:8]}@"
 
 
+def test_default_template_constant_matches_the_shell_default() -> None:
+    """_DEFAULT_TEMPLATE must equal the .sh's actual fallback literal.
+
+    This is a VALUE contract between two files -- the functional default the
+    prune's bare-default arm must match -- NOT an assertion on prose,
+    comments or docstrings.  Same-shaped precedent:
+    tests/scripts/test_dashboard_service_template.py::
+    _assert_known_project_roots_comma_separated, which parses a systemd unit
+    file's Environment= line the same way: read the file, ``re.search`` an
+    ANCHORED ``^...$`` pattern under ``re.MULTILINE``, assert the match
+    exists, then assert on the extracted group.
+
+    Anchored rather than a substring/``in`` check on purpose -- MEASURED: the
+    literal ``lms-dropin-selftest@`` also appears in the .sh's own header
+    comment ("(lms-dropin-selftest@) plus a drop-in") and
+    ``LMS_SELFTEST_TEMPLATE=`` appears again in the Usage comment.  A naive
+    ``"lms-dropin-selftest@" in sh_text`` check stays True even after the
+    default on the ``TEMPLATE=`` line itself is changed to something else
+    entirely, so it would silently pass through the exact drift this test
+    exists to catch.
+
+    The variable-name half of the pattern is built from ``_TEMPLATE_ENV_VAR``
+    (``re.escape``d) rather than re-typed, so the two bind.  The forward
+    reference to ``_TEMPLATE_ENV_VAR`` (defined below, near the .sh-driving
+    helpers) is safe: globals resolve at CALL time, the same pattern this
+    module already documents for the forward reference to ``_SELFTEST_PREFIX``
+    in ``_systemd_user_manager_skip_reason``.
+    """
+    sh_text = SELFTEST_SH.read_text(encoding="utf-8")
+    pattern = r'^TEMPLATE="\$\{' + re.escape(_TEMPLATE_ENV_VAR) + r':-([^"}]+)\}"$'
+    match = re.search(pattern, sh_text, re.MULTILINE)
+    assert match is not None, (
+        f"{SELFTEST_SH} no longer has a line of the shape "
+        f'TEMPLATE="${{{_TEMPLATE_ENV_VAR}:-<default>}}" -- this test cannot '
+        "pin the .sh's default template without it."
+    )
+    assert match.group(1) == _DEFAULT_TEMPLATE, (
+        f"the .sh's default template ({match.group(1)!r}) has drifted from "
+        f"_DEFAULT_TEMPLATE ({_DEFAULT_TEMPLATE!r}).  The prune's bare-default "
+        "arm keys on _DEFAULT_TEMPLATE, so this drift makes a killed hand-run's "
+        "residue permanently unreapable again -- while every other assertion "
+        "in this module stays green."
+    )
+
+
 # How long a selftest unit must go untouched before it counts as abandoned.
 # Comfortably longer than a run's MEASURED cost (~5.2s solo on the operator
 # host, and bounded above by _SELFTEST_TIMEOUT_S + _LOCK_WAIT_S even when the
