@@ -33,6 +33,7 @@ from _dashboard_helpers import (
     assert_script_loads_before,
     extract_df_data_block,
     extract_function_body,
+    find_function_params,
     find_script_position,
     strip_js_comments,
 )
@@ -431,6 +432,141 @@ def _resolved_client_scope(request) -> str | None:
         if marker is not None:
             return getattr(marker, 'scope', None)
     return None
+
+
+class TestFindFunctionParams:
+    """The paren-depth-walk primitive shared by the two signature consumers.
+
+    `extract_function_body` and test_charts_axis_labels.py's
+    `_extract_signature` both had to locate `function NAME(` and walk to the
+    matching `)`.  They return DISJOINT, adjacent slices of that declaration —
+    the params between the parens, and the body from the brace — so neither
+    could be built on the other, but the walk itself was duplicated.  This
+    primitive is that walk, and it returns the two indices plus the masked
+    source so each caller can take the slice it actually needs.
+    """
+
+    def test_returns_the_parameter_list_slice_parens_excluded(self) -> None:
+        """`source[params_start:params_end]` is exactly the parameter text."""
+        src = 'function Foo(a, b = 2) { const x = 1; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == 'a, b = 2'
+        assert src[params_start - 1] == '(', 'params_start is just past the open paren'
+        assert src[params_end] == ')', 'params_end is the index OF the matching paren'
+
+    def test_the_body_brace_is_found_past_params_end(self) -> None:
+        """`masked.find('{', params_end + 1)` is the body's opening brace."""
+        src = 'function Foo(a) { const x = 1; }'
+
+        masked, _params_start, params_end = find_function_params(src, 'Foo')
+        start = masked.find('{', params_end + 1)
+
+        assert src[start:] == '{ const x = 1; }'
+
+    def test_a_destructured_parameter_does_not_capture_the_body(self) -> None:
+        """`function Foo({ a, b }) {` must yield the BODY, never `{ a, b }`.
+
+        The destructuring pattern carries its own `{`/`}` pair INSIDE the
+        parameter list, so taking the first `{` after the opening paren returns
+        the pattern instead of the body — a truncated slice every downstream
+        absence assertion then passes vacuously over.
+        """
+        src = 'function Foo({ a, b }) { const x = 1; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == '{ a, b }'
+        start = masked.find('{', params_end + 1)
+        assert src[start:] == '{ const x = 1; }'
+
+    def test_a_paren_inside_a_string_literal_is_not_counted(self) -> None:
+        """The walk runs over the mask, so a `)` in a string cannot close it."""
+        src = 'function Foo(a = ")") { const x = 1; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == 'a = ")"'
+        start = masked.find('{', params_end + 1)
+        assert src[start:] == '{ const x = 1; }'
+
+    def test_the_function_keyword_inside_a_comment_is_not_matched(self) -> None:
+        """A commented-out declaration must not shadow the real one."""
+        src = '/* function Foo(decoy) {} */\nfunction Foo(real) { const x = 1; }'
+
+        _masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == 'real'
+
+    def test_the_mask_is_index_aligned_with_the_source(self) -> None:
+        """`len(masked) == len(source)`, so the indices slice the REAL text."""
+        src = 'function Foo(a /* note */, b) { const s = "x"; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert len(masked) == len(src)
+        assert src[params_start:params_end] == 'a /* note */, b', (
+            'the slice is taken from the original source, comments intact'
+        )
+
+    def test_finds_a_declaration_nested_inside_another_function(self) -> None:
+        """The regex is deliberately NOT line-anchored.
+
+        The real instance is `function statusMatches(s) {` indented inside
+        `TasksTab` in tab_tasks.jsx.
+        """
+        src = (
+            'function Outer(a) {\n'
+            '    function Inner(b) { return b; }\n'
+            '    return Inner(a);\n'
+            '}'
+        )
+
+        _masked, params_start, params_end = find_function_params(src, 'Inner')
+
+        assert src[params_start:params_end] == 'b'
+
+    def test_a_prefix_sibling_does_not_shadow_the_target(self) -> None:
+        """The trailing `\\s*\\(` stops `TaskGraphEdges(` matching `TaskGraph`.
+
+        `function TaskGraphEdges(` at tab_tasks.jsx:33 precedes
+        `function TaskGraph(` at :151, so without the anchor the earlier
+        declaration wins and the wrong slice is returned.
+        """
+        src = 'function TaskGraphEdges(edges) { }\nfunction TaskGraph(nodes) { }'
+
+        _masked, params_start, params_end = find_function_params(src, 'TaskGraph')
+
+        assert src[params_start:params_end] == 'nodes'
+
+    def test_raises_when_there_is_no_such_declaration(self) -> None:
+        """A miss RAISES — never a sentinel, so no caller can go vacuously GREEN."""
+        src = 'const Foo = (a) => a;'
+
+        with pytest.raises(AssertionError):
+            find_function_params(src, 'Foo')
+
+    def test_raises_when_the_parameter_list_is_never_closed(self) -> None:
+        src = 'function Foo(a, b'
+
+        with pytest.raises(AssertionError):
+            find_function_params(src, 'Foo')
+
+    def test_the_miss_reason_is_available_to_the_caller(self) -> None:
+        """Callers can supply their own exception factory.
+
+        `extract_function_body` needs its four-way `_miss` wording preserved
+        exactly, and test_charts_axis_labels.py keeps a file-specific message;
+        neither can be served by one fixed string.
+        """
+        src = 'const Foo = (a) => a;'
+        sentinel = 'CALLER SPECIFIC MESSAGE'
+
+        with pytest.raises(AssertionError, match=sentinel):
+            find_function_params(
+                src, 'Foo', miss=lambda what: AssertionError(f'{sentinel}: {what}'),
+            )
 
 
 class TestExtractDfDataBlock:
