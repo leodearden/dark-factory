@@ -39,6 +39,7 @@ from _dashboard_helpers import (
     find_function_params,
     find_script_position,
     strip_js_comments,
+    walk_balanced,
 )
 
 
@@ -689,6 +690,64 @@ class TestDfChartsDestructure:
         nested = "window.DF_CHARTS = { StackedAreaChart, opts: { a: 1 } };"
 
         assert DF_CHARTS_EXPORT_RE.search(nested) is None
+
+
+class TestWalkBalanced:
+    """The balanced-delimiter walk shared by the two anchor-specific extractors.
+
+    `extract_df_data_block` (anchored on data.js's `key: {` seed form) and
+    test_tab_memory_evals.py's `_extract_const_object` (anchored on a
+    module-scope `const NAME = {`/`[`) need the identical depth loop over
+    DIFFERENT anchors — the same shape that made `find_function_params` worth
+    factoring out of `extract_function_body`.  With the loop written twice,
+    the string-literal blind spot pinned below was documented in two places
+    and would have had to be fixed in two places.
+    """
+
+    def test_returns_the_span_including_both_delimiters(self) -> None:
+        src = 'const A = { open: 3 }; const B = 1;'
+        start = src.index('{')
+
+        assert walk_balanced(src, start) == '{ open: 3 }'
+
+    def test_a_nested_pair_does_not_terminate_the_walk_early(self) -> None:
+        """The depth count is the whole point: `[^}]*` would truncate here."""
+        src = '{ summary: { open: 3 }, rows: [] } TRAILING'
+        span = walk_balanced(src, 0)
+
+        assert span == '{ summary: { open: 3 }, rows: [] }'
+        assert 'TRAILING' not in span
+        assert span.count('{') == span.count('}')
+
+    def test_the_delimiter_pair_is_selectable(self) -> None:
+        """`_extract_const_object` walks `[`/`]` for PARITY_PLAIN's array."""
+        src = "const PARITY_PLAIN = ['a', ['b'], 'c']; const AFTER = 1;"
+        start = src.index('[')
+
+        assert walk_balanced(src, start, '[', ']') == "['a', ['b'], 'c']"
+
+    def test_returns_empty_string_when_the_delimiter_is_never_closed(self) -> None:
+        """Silent `''`, not a raise and not a truncated slice.
+
+        The deliberate policy of this family: every call site already asserts
+        on the returned value, so raising would only relocate its failure.
+        """
+        assert walk_balanced('{ open: 3', 0) == ''
+
+    def test_a_delimiter_inside_a_string_literal_miscounts(self) -> None:
+        """KNOWN LIMITATION, pinned as current behaviour, not endorsed.
+
+        Unlike `extract_function_body`, this walk is NOT quote-aware.  It is
+        now the SINGLE place that limitation lives, which is the point of
+        factoring it out: making it quote-aware later is one edit against one
+        pin rather than two of each.
+        """
+        src = '{ label: "a } b", open: 3 }'
+
+        assert walk_balanced(src, 0) == '{ label: "a }', (
+            'if this now returns the full block the walk became quote-aware — '
+            'a real improvement, but update this pin deliberately'
+        )
 
 
 class TestExtractDfDataBlock:

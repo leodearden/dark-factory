@@ -23,6 +23,7 @@ from _dashboard_helpers import (
     extract_function_body,
     find_script_position,
     strip_js_comments,
+    walk_balanced,
 )
 
 # ---------------------------------------------------------------------------
@@ -239,36 +240,34 @@ def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
 def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
     """Return the literal assigned to ``const <name> =``, delimiters included.
 
-    Same depth walk as ``extract_df_data_block``, re-anchored: that helper
-    only matches the ``key: {`` seed-object form used by data.js and so cannot
-    locate a module-scope ``const`` declaration.  ``open_char`` selects the
+    A second ANCHOR over the shared ``walk_balanced``, exactly as
+    ``extract_df_data_block`` is the first: that helper only matches the
+    ``key: {`` seed-object form used by data.js and so cannot locate a
+    module-scope ``const`` declaration, but the depth walk underneath is the
+    same one and is no longer written out twice.  ``open_char`` selects the
     delimiter pair, so one walk serves both the ``PARITY_REFINEMENT`` object
     and the ``PARITY_PLAIN`` array.
+
+    Stays LOCAL to this module rather than joining ``_dashboard_helpers``:
+    this anchor has exactly one consumer (memory_evals_fmt.js's two parity
+    declarations), so hoisting it would move code no other suite can reach.
+    The duplication worth removing was the walk, and that is gone.
 
     Returns the empty string if the declaration is not found — callers assert
     on that explicitly, because "the declaration was deleted" and "the
     declaration is empty" are different failures with different fixes.
 
-    Same string-literal caveat as ``extract_df_data_block``: the walk does not
-    skip delimiters inside quoted strings.  Acceptable here for the same
-    reason — these two declarations hold short identifier keys and plain
+    ``walk_balanced``'s string-literal caveat applies (it does not skip
+    delimiters inside quoted strings) and is stated once, there.  Acceptable
+    here because these two declarations hold short identifier keys and plain
     prose values, neither of which embeds a brace or a bracket.
     """
     close_char = {'{': '}', '[': ']'}[open_char]
     m = re.search(rf'\bconst\s+{re.escape(name)}\s*=\s*{re.escape(open_char)}', src)
     if m is None:
         return ''
-    start = m.end() - 1  # index of the opening delimiter
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == open_char:
-            depth += 1
-        elif c == close_char:
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
+    # m.end() - 1 is the index of the opening delimiter.
+    return walk_balanced(src, m.end() - 1, open_char, close_char)
 
 
 # ---------------------------------------------------------------------------

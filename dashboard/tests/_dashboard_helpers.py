@@ -1077,7 +1077,7 @@ def destructure_bindings(brace_body: str) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# window.DF_DATA seed-block extraction.
+# Balanced-delimiter walking, and window.DF_DATA seed-block extraction.
 #
 # The dashboard's served data.js carries its fixture payload as a
 # `window.DF_DATA = { KEY: { ... }, ... }` literal, and several suites need to
@@ -1089,8 +1089,18 @@ def destructure_bindings(brace_body: str) -> list[tuple[str, str]]:
 # byte-identical.  Its contract lives in
 # test_jsx_source_helpers.py::TestExtractDfDataBlock.
 #
-# Two behaviours differ from its sibling `extract_function_body` and are
-# deliberately kept as they were rather than changed in the move: it returns
+# The WALK is separated from the ANCHOR for the same reason `extract_function_body`
+# was rebuilt on `find_function_params`: two helpers needed the identical
+# depth loop with DIFFERENT anchors, so keeping the loop in both meant the
+# string-literal blind spot below was documented — and would have to be
+# fixed — in two places.  `walk_balanced` is the loop;
+# `extract_df_data_block` anchors it on data.js's `key: {` seed form and
+# test_tab_memory_evals.py's `_extract_const_object` anchors it on a
+# module-scope `const NAME = {`/`[` declaration.  Its own contract lives in
+# test_jsx_source_helpers.py::TestWalkBalanced.
+#
+# Two behaviours differ from the sibling `extract_function_body` and are
+# deliberately kept as they were rather than changed in the move: these return
 # `''` SILENTLY on a miss where the other RAISES (every call site already
 # asserts on the returned value, so raising would only relocate their
 # failures), and the depth walk is NOT quote-aware where the other is.  Both
@@ -1099,16 +1109,48 @@ def destructure_bindings(brace_body: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def walk_balanced(
+    src: str, start: int, open_char: str = '{', close_char: str = '}'
+) -> str:
+    """Return ``src`` from ``start`` through the delimiter matching ``src[start]``.
+
+    ``start`` must be the index OF the opening delimiter; both callers get it
+    from a regex whose pattern ends on that delimiter (``m.end() - 1``).  The
+    walk counts ``open_char``/``close_char`` so a NESTED pair does not
+    terminate it early — which is the whole reason a ``[^}]*`` regex was
+    rejected for this job.
+
+    Returns the delimited text INCLUDING both delimiters, or the empty string
+    if the opening delimiter is never closed.  Returning ``''`` rather than
+    raising is the deliberate policy of this family (see the banner above).
+
+    Note: the depth walk does not skip delimiters inside JS string literals,
+    so a quoted ``{`` or ``}`` miscounts.  This is the single place that
+    limitation now lives; the callers document what makes it acceptable for
+    the sources they read.
+    """
+    depth = 0
+    for i in range(start, len(src)):
+        c = src[i]
+        if c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    return ''
+
+
 def extract_df_data_block(src: str, key: str) -> str:
     """Return the body of the ``<key>: { ... }`` seed object, braces included.
 
     Locates ``<key>:`` followed by ``{`` (allowing arbitrary whitespace), then
-    walks forward counting ``{``/``}`` to find the matching close brace.
+    hands off to ``walk_balanced`` to find the matching close brace.
     This is brace-aware: a simple regex ``[^}]*`` would stop at the first
     nested ``}`` and miss later keys.
     Returns the empty string if no matching block is found.
 
-    Note: the brace-depth walk does not skip ``{``/``}`` inside JS string
+    Note: ``walk_balanced`` does not skip ``{``/``}`` inside JS string
     literals.  This is acceptable because the data.js seed block uses simple
     numeric/array values and does not embed brace characters inside quoted
     strings.
@@ -1116,17 +1158,7 @@ def extract_df_data_block(src: str, key: str) -> str:
     m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
     if m is None:
         return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
+    return walk_balanced(src, m.end() - 1)  # m.end() - 1 is the opening `{`
 
 
 # ---------------------------------------------------------------------------
