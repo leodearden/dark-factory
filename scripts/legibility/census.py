@@ -974,6 +974,18 @@ def render_report(
             "-- NOTHING filed; review before filing._"
         )
     elif filed_ticket_ids:
+        # These are TICKET ids, not task ids: submit_task answers the curator
+        # path with {"ticket": ...} and the create/combine/drop decision lands
+        # asynchronously, so no task id exists when this report is written.
+        # The preamble supplies that semantics; the bullets stay because a
+        # ticket id is directly actionable (resolve_ticket takes one) and is
+        # the operator's only handle on what this run filed.
+        lines.append(
+            f"_{len(filed_ticket_ids)} ticket(s) filed -- the curator's "
+            "create/combine/drop decision is still pending, so no task id "
+            "exists yet; resolve_ticket returns the task id once it does._"
+        )
+        lines.append("")
         lines.extend(f"- {ticket_id}" for ticket_id in filed_ticket_ids)
     else:
         lines.append("_none filed._")
