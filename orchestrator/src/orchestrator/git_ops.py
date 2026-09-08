@@ -236,55 +236,29 @@ _INDEX_LOCK_WARN_INTERVAL_S = 30.0
 _INDEX_LOCK_STALE_FLOOR_S = 300.0
 
 
-# Bounded attempt budget for `git worktree add --detach`, shared by BOTH
-# worktree-minting sites (GitOps._create_merge_worktree and
-# GitOps.ephemeral_worktree) via git_ops.py::GitOps._worktree_add_with_retry.
-# Replaces ephemeral_worktree's former function-local `_MAX_ADD_RETRIES` at
-# the IDENTICAL value, so that method's pinned 3-attempt / [0.5, 1.0]-backoff
-# tests (test_ephemeral_worktree.py::TestEphemeralWorktreeRetry) are
-# unaffected by the extraction.
+# Bounded attempt budget for `git worktree add --detach`, shared by the two
+# sites that RETRY one, via git_ops.py::GitOps._worktree_add_with_retry.
 _WORKTREE_ADD_MAX_ATTEMPTS = 3
 
-# `_ENOSPC_MARKERS` is deliberately IMPORTED from verify_classify (see the
-# import block above) rather than copied a third time. The tuple already
-# exists verbatim twice — verify_classify.py::_ENOSPC_MARKERS (canonical,
-# carrying the "do not invent new ENOSPC strings; extend that constant
-# instead" instruction) and merge_queue.py::_ENOSPC_MARKERS — and each
-# declares itself a single grounded vocabulary. A third copy would make that
-# claim false and let the three drift. The import is cycle-free:
-# verify_classify imports only orchestrator.verify_categories and
-# orchestrator.verify_cmd, neither of which imports anything from
-# orchestrator. If a new grounded ENOSPC sample appears, extend
-# verify_classify's tuple — never re-declare one here.
+# `_ENOSPC_MARKERS` is imported from verify_classify (see the import block
+# above) rather than re-declared here; extend that constant when a new
+# grounded ENOSPC sample appears. merge_queue.py::_ENOSPC_MARKERS is still a
+# separate verbatim copy — consolidating all three is not this module's call.
 
 
 def _worktree_add_failure_is_retryable(rc: int, out: str, err: str) -> bool:
     """Is a failed ``git worktree add --detach`` worth retrying?
 
-    The SINGLE shared predicate for both worktree-minting sites
-    (git_ops.py::GitOps._create_merge_worktree and
-    git_ops.py::GitOps.ephemeral_worktree), consumed through
-    git_ops.py::GitOps._worktree_add_with_retry.
-
     The shape is deliberately NEGATIVE — retry by default, fail fast only on
     a known non-transient cause — rather than a positive "is this
-    contention?" matcher. A positive allow-list would need a pattern for
-    every transient shape git can emit, and the two archived transient
-    samples share no token: ``data/verify-logs`` task 4215 is ``fatal:
-    Invalid path '.../.git/worktrees/_merge-9a6caddb': No such file or
-    directory`` (the ADMINISTRATIVE registration path, not the checkout
-    path) while task 4545 is a bare ``Preparing worktree (detached HEAD
-    ae6e7e9)`` with no cause line at all. Any allow-list built from one
-    would silently stop retrying the other — and would stop retrying
-    whatever novel transient shape appears next.
+    contention?" allow-list. The archived transient samples share no token
+    (one a ``fatal: Invalid path`` on git's ADMINISTRATIVE registration dir,
+    the other a bare ``Preparing worktree`` progress line with no cause at
+    all), so an allow-list built from either would silently stop retrying
+    the other, and stop retrying whatever shape appears next.
 
-    ENOSPC stays loud and unretried (task 3692's ``/repo/.worktrees/cas-b No
-    space left on device``): a full disk does not heal in 1.5s of backoff, so
-    retrying there only delays the operator signal.
-
-    Both streams are inspected, matched case-insensitively against the whole
-    combined output — the same shape merge_queue.py::_verify_hit_enospc
-    applies to the same vocabulary.
+    ENOSPC is the counter-case: a full disk does not heal in 1.5s of
+    backoff, so retrying there only delays the operator signal.
     """
     haystack = f'{out}\n{err}'.lower()
     return not any(marker in haystack for marker in _ENOSPC_MARKERS)
@@ -3124,61 +3098,41 @@ class GitOps:
     ) -> tuple[int, str, str, int]:
         """Run ``git worktree add --detach <path> <ref>`` with bounded retry.
 
-        The SINGLE shared driver for both worktree-minting sites —
-        git_ops.py::GitOps._create_merge_worktree and
-        git_ops.py::GitOps.ephemeral_worktree — so exactly one retry loop
-        exists in this module. Up to :data:`_WORKTREE_ADD_MAX_ATTEMPTS`
-        attempts against the SAME *path* (the caller mints one uuid per
-        call, not per attempt), with ``0.5 * attempt`` seconds of linear
-        backoff between them: ``[0.5, 1.0]``.
+        The only retrying add in this module: the two sites that retry a
+        ``git worktree add`` — git_ops.py::GitOps._create_merge_worktree and
+        git_ops.py::GitOps.ephemeral_worktree — both mint through here, so
+        exactly one retry loop and one retryability predicate
+        (git_ops.py::_worktree_add_failure_is_retryable) exist. Every
+        attempt targets the SAME *path*; the caller mints one uuid per call,
+        not per attempt.
 
-        Retryability is decided by
-        git_ops.py::_worktree_add_failure_is_retryable — retry by default,
-        break IMMEDIATELY on a known non-transient cause (ENOSPC), because
-        a full disk does not heal in 1.5s of backoff.
-
-        Returns:
-            ``(rc, stdout, stderr, attempts)`` from the LAST attempt made,
-            where *attempts* is how many adds were actually issued (1 on a
-            first-try success or an ENOSPC fast-fail, up to
-            :data:`_WORKTREE_ADD_MAX_ATTEMPTS` otherwise).
-
-        This method NEVER raises on a failed add — it returns a non-zero
-        *rc* and lets each caller shape its own exception type, since the
-        two call sites raise different ones (``RuntimeError`` for the merge
-        worktree, whose callers catch broadly on it, vs the typed
+        Returns ``(rc, stdout, stderr, attempts)`` from the LAST attempt
+        made, and NEVER raises on a failed add. The two callers raise
+        different exception types (``RuntimeError`` for the merge worktree,
+        whose callers catch broadly on it, vs the typed
         :class:`EphemeralWorktreeError` that verify.py's two probes
-        pattern-match on and that has a :class:`BlockDisposition` row).
-        A driver that raised would force one of them to
-        catch-and-retranslate, losing the rc/streams the caller needs to
-        build its own message.
+        pattern-match on and that has a :class:`BlockDisposition` row), so a
+        driver that raised would force one of them to catch-and-retranslate,
+        losing the rc and streams it needs to build its own message.
 
-        :class:`WorktreeMissing` (which ``_run`` raises when ``cwd`` has
-        vanished) and any bare ``OSError`` from ``create_subprocess_exec``
-        under EMFILE/ENOMEM deliberately propagate UNRETRIED: neither is a
-        ``git worktree add`` failure — the child never ran — so retrying
-        would burn backoff on a condition that cannot heal, and both are
-        already handled as their own typed signals upstream.
+        :class:`WorktreeMissing` and any bare ``OSError`` from ``_run``
+        propagate UNRETRIED: the child never ran, so neither is an add
+        failure, and both are typed signals already handled upstream.
 
         Args:
             path: The worktree path to mint. Reused across every attempt.
             ref: Commit-ish to pin the detached worktree at.
-            label: Caller-supplied diagnostic prefix, named in the WARNING
-                emitted for each absorbed retry so an operator can grep
-                which minting site flaked.
+            label: Diagnostic prefix naming the calling site in the WARNING
+                emitted for each absorbed retry, so an operator can grep
+                which one flaked.
 
         Note:
-            Issues NO other git subprocess between attempts. No ``git
-            worktree prune`` — categorically forbidden under DD5, since a
-            broad prune deregisters every concurrently-active sibling
-            probe/merge worktree (the 2026-07-04 warm-lane
-            registration-wipe incident, df 2097-2100). And no scoped ``git
-            worktree remove --force`` either: nothing was successfully
-            registered from THIS call's perspective, so removing is at
-            best a no-op and at worst acts on state we did not create —
-            and test_ephemeral_worktree.py's
-            ``test_raises_ephemeral_worktree_error_after_exhausting_retries``
-            pins ``remove_calls == []`` when the add never succeeded.
+            Issues NO other git subprocess between attempts — in particular
+            never ``git worktree prune``, categorically forbidden under DD5
+            because a broad prune deregisters every concurrently-active
+            sibling worktree, and never a scoped ``git worktree remove
+            --force``, since nothing was successfully registered from this
+            call's perspective.
         """
         rc, out, err, attempt = 1, '', 'not attempted', 0
         for attempt in range(1, _WORKTREE_ADD_MAX_ATTEMPTS + 1):
@@ -3200,19 +3154,11 @@ class GitOps:
                     label, rc, attempt, _WORKTREE_ADD_MAX_ATTEMPTS, path, ref,
                     err, out,
                 )
-                # Real `git worktree add` creates its target directory
-                # early, before it can fail (pinned by
-                # test_ephemeral_worktree.py::
-                # test_add_failure_leaves_no_leaked_directory_under_worktree_base).
-                # Without clearing that residue the next attempt against
-                # the same path fails deterministically with "'<path>'
-                # already exists" — turning a bounded retry into a
-                # GUARANTEED second failure that names a self-inflicted
-                # cause instead of the real one. `ignore_errors=True`
-                # inside `suppress` because a failed cleanup must never
-                # mask the add failure being retried.
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(path, ignore_errors=True)
+                # git creates the target directory before it can fail.
+                # Leaving that residue would make the next attempt fail
+                # deterministically with "'<path>' already exists", naming a
+                # self-inflicted cause instead of the real one.
+                shutil.rmtree(path, ignore_errors=True)
                 await asyncio.sleep(0.5 * attempt)
         return rc, out, err, attempt
 
@@ -3234,11 +3180,8 @@ class GitOps:
         lock contention (concurrent sibling probes serialise on git's
         repo-level metadata lock), then yield the path.  That retry is NOT
         spelled here: it is delegated to
-        git_ops.py::GitOps._worktree_add_with_retry, the single shared
-        driver this method and git_ops.py::GitOps._create_merge_worktree
-        both mint through (task 5140), so exactly one retry loop and one
-        retryability predicate exist in this module.  A NON-retryable add
-        failure (ENOSPC) is not retried at all — see case (c) under
+        git_ops.py::GitOps._worktree_add_with_retry (task 5140).  A
+        NON-retryable add failure (ENOSPC) is not retried at all — see (c) under
         ``Raises`` below.
 
         On exit — normal return OR an exception raised in the ``async
@@ -3358,13 +3301,6 @@ class GitOps:
                 ) from e
 
             try:
-                # The SHARED driver — the single retry loop in this module,
-                # also used by git_ops.py::GitOps._create_merge_worktree
-                # (task 5140). It supplies the bounded attempts and the
-                # `0.5 * attempt` backoff this method used to spell inline,
-                # plus the ENOSPC fast-fail the inline loop lacked (it
-                # branched solely on `rc == 0`, so it blanket-retried a full
-                # disk three times).
                 rc, out, err, attempts = await self._worktree_add_with_retry(
                     tmp_path, sha, label=f'ephemeral_worktree({kind.name})',
                 )
@@ -12242,23 +12178,12 @@ class GitOps:
         at that exact commit, supporting speculative merges where N+1 is
         merged against N's merge commit.
 
-        The ``git worktree add --detach`` is retried up to
-        :data:`_WORKTREE_ADD_MAX_ATTEMPTS` times with ``0.5 * attempt``
-        seconds of linear backoff on a TRANSIENT failure, and fails
-        IMMEDIATELY on a non-retryable one (ENOSPC), via the same
-        git_ops.py::GitOps._worktree_add_with_retry driver
-        git_ops.py::GitOps.ephemeral_worktree uses — one loop and one
-        predicate for both worktree-minting sites.
-
-        The retry is grounded, not defensive: five archived occurrences
-        under ``data/verify-logs`` (tasks 3692, 3420, 3869, 4215, 4545;
-        2026-08-10 -> 2026-09-06) blocked a merge outright on a single
-        non-zero rc here, and the transient shapes among them —
-        4215's ``fatal: Invalid path '.../.git/worktrees/_merge-9a6caddb'``
-        on git's ADMINISTRATIVE registration path, and 4545's bare
-        ``Preparing worktree (detached HEAD ae6e7e9)`` — are exactly what a
-        bounded retry absorbs. 3692's ``No space left on device`` is the
-        counter-case the predicate fast-fails.
+        The ``git worktree add --detach`` is retried on a TRANSIENT failure
+        and fails IMMEDIATELY on a non-retryable one (ENOSPC), via
+        git_ops.py::GitOps._worktree_add_with_retry.  The retry is grounded,
+        not defensive: five archived occurrences under ``data/verify-logs``
+        (tasks 3692, 3420, 3869, 4215, 4545) blocked a merge outright on a
+        single non-zero rc here.
         """
         import uuid
         merge_id = uuid.uuid4().hex[:8]
@@ -12287,33 +12212,20 @@ class GitOps:
         )
         if rc != 0:
             # The `Failed to create merge worktree: ` PREFIX is load-bearing
-            # beyond this module — three test modules construct it verbatim
-            # to simulate this failure (test_merge_queue_resolve_release.py,
-            # test_merge_queue_concurrent_verify.py) and
-            # docs/legibility/confusion-codebook.yaml keys two entries on it,
-            # so operator greps and the codebook both depend on it. Do not
-            # drop it in a later refactor; only the suffix is free.
+            # beyond this module: other test modules construct it verbatim to
+            # simulate this failure and docs/legibility/confusion-codebook.yaml
+            # keys two entries on it. Only the suffix is free to change.
             #
-            # `rc` is carried because it, not stdout, is the decisive missing
-            # datum: FOUR of the five archived occurrences under
-            # data/verify-logs carried no cause line at all, and git writes
-            # both its `Preparing worktree` progress line and its fatals to
-            # stderr — so a stderr that stops after the progress line most
-            # likely means the child never printed a fatal, which a NEGATIVE
-            # rc (signal kill) would reveal and the old message could not.
-            # `!r` on both streams so an EMPTY stream renders as a visible
-            # '' rather than collapsing into whitespace, distinguishing "git
-            # said nothing" from "we never captured it". The attempt count
-            # tells the reader whether the failure was retried at all — how
-            # an operator tells an ENOSPC fast-fail from an exhausted
-            # transient.
-            # A failed add still leaves the target directory git created
-            # early, and `_merge-` is a PROTECTED_PREFIXES band the reaper
-            # will never reclaim. No caller can clean it up either — both
-            # guard on the path this call never returned — so without this
-            # every exhausted-retry or ENOSPC failure would accrete one
-            # permanent directory under worktree_base, feeding the very
-            # disk pressure ENOSPC reports.
+            # `!r` on both streams so an EMPTY stream renders as a visible ''
+            # rather than collapsing into whitespace — distinguishing "git said
+            # nothing" from "we never captured it", the ambiguity the archived
+            # occurrences left unresolved.
+            #
+            # git created the target directory before failing, `_merge-` is a
+            # PROTECTED_PREFIXES band the reaper never reclaims, and no caller
+            # can clear a path this call never returned — so without this
+            # rmtree every failure here accretes one permanent directory under
+            # worktree_base, feeding the disk pressure ENOSPC reports.
             shutil.rmtree(merge_wt, ignore_errors=True)
             raise RuntimeError(
                 f'Failed to create merge worktree: git worktree add --detach '

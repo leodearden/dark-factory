@@ -1227,7 +1227,7 @@ class TestEphemeralWorktreeWarmSeed:
 
 
 # ---------------------------------------------------------------------------
-# task 5140 step-9: both minting sites converge on ONE predicate + ONE driver
+# task 5140 step-9: both retrying sites converge on ONE predicate + ONE driver
 # ---------------------------------------------------------------------------
 
 

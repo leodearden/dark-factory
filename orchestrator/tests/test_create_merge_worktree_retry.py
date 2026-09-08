@@ -17,9 +17,10 @@ discrimination, and stdout + rc discarded.  Five archived occurrences under
     which must NOT be blanket-retried (it does not heal in 1.5s of backoff;
     retrying only delays the operator signal).
 
-This module covers the three pieces that close that gap, each shared by BOTH
-worktree-minting sites (``_create_merge_worktree`` and ``ephemeral_worktree``)
-so exactly one retry loop and one predicate exist in git_ops.py:
+This module covers the three pieces that close that gap, each shared by the
+two sites that retry a ``git worktree add`` (``_create_merge_worktree`` and
+``ephemeral_worktree``) so exactly one retry loop and one predicate exist in
+git_ops.py:
 
   step-1: ``_worktree_add_failure_is_retryable`` — the single shared
           predicate, plus the ``_ENOSPC_MARKERS`` single-vocabulary identity
@@ -32,7 +33,7 @@ The harness is adopted verbatim in shape from
 ``orchestrator/tests/test_ephemeral_worktree.py`` (``GitOps(GitConfig(),
 tmp_path)`` + a patched ``orchestrator.git_ops._run`` recording argvs +
 a patched ``orchestrator.git_ops.asyncio.sleep``) so retry/backoff
-assertions read identically across both minting paths and no real backoff
+assertions read identically across both retrying paths and no real backoff
 wall-clock enters the suite.
 """
 from __future__ import annotations
@@ -212,7 +213,7 @@ def _add_argvs(calls: list[list[str]]) -> list[list[str]]:
 class TestWorktreeAddWithRetry:
     """step-3: ``GitOps._worktree_add_with_retry(path, ref, *, label)``.
 
-    The single shared driver behind both minting sites. Returns
+    The single shared driver behind both retrying sites. Returns
     ``(rc, stdout, stderr, attempts)`` and NEVER raises on a failed add —
     shaping the error is each caller's job, because the two call sites need
     different exception types (``RuntimeError`` vs the typed
