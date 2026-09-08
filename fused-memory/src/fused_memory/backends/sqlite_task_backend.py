@@ -3331,8 +3331,14 @@ class SqliteTaskBackend:
             # clean success. Callers wanting a details rewrite alongside a
             # hints attach must SPLIT the call — a metadata-only write with
             # ``append=True``, then a details-only write with ``append``
-            # OMITTED. Pinned by
-            # tests/test_sqlite_task_backend.py::test_update_task_details_and_metadata_append_true_concatenates_details.
+            # OMITTED. Every clause above is pinned in
+            # tests/test_sqlite_task_backend.py — the ``details=`` spelling of
+            # the hazard by
+            # test_update_task_details_and_metadata_append_true_concatenates_details,
+            # the ``prompt=`` spelling by
+            # test_update_task_prompt_and_metadata_append_true_concatenates_details,
+            # and the split-call remedy by
+            # test_update_task_split_call_details_rewrite_leaves_one_body_and_unions_hints.
             existing_details = row['details'] or ''
             new_details: str | None = None
             if details is not None:

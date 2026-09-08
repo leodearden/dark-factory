@@ -7217,12 +7217,14 @@ async def test_update_task_details_and_metadata_append_true_concatenates_details
     first run by design: task 4216 is a prompt/payload text correction and
     changes no merge semantics. Do NOT "fix" the backend to make it fail.
 
-    The second half pins the SPLIT-CALL REMEDY the corrected prompt
-    prescribes: a metadata-only ``append=True`` attach followed by a
-    details-only call with ``append`` OMITTED leaves exactly ONE copy of the
-    details body while the hints still union.
+    Scope: the ``details=`` spelling of the combined call only. Its two
+    siblings pin the rest of the same contract independently, so a
+    regression in one cannot mask the others:
+    ``test_update_task_prompt_and_metadata_append_true_concatenates_details``
+    (the ``prompt=`` spelling of this same hazard) and
+    ``test_update_task_split_call_details_rewrite_leaves_one_body_and_unions_hints``
+    (the split-call remedy the corrected Stage-2 prompt prescribes).
     """
-    # ── the combined call: metadata succeeds, details silently duplicates ──
     await backend.add_task(
         project_root=project_root,
         title='combined-row',
@@ -7255,7 +7257,68 @@ async def test_update_task_details_and_metadata_append_true_concatenates_details
         'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
     }, f'metadata half must union hints and preserve siblings: {task["metadata"]}'
 
-    # ── the split-call remedy: one hints attach, one clean details rewrite ──
+
+@pytest.mark.asyncio
+async def test_update_task_prompt_and_metadata_append_true_concatenates_details(
+    backend, project_root,
+):
+    """The ``prompt=`` spelling of the same hazard (task 4216).
+
+    ``update_task``'s body branch is ``details`` first, ``prompt`` as the
+    fallback — and BOTH write the same ``details`` TEXT column under the
+    same ``append`` flag. A caller that reaches for the legacy ``prompt=``
+    parameter alongside a ``memory_hints`` attach therefore duplicates the
+    body exactly as the ``details=`` sibling above does.
+
+    This exists because the backend comment and the Stage-2 prompt both
+    state the hazard covers ``details`` AND ``prompt``; without this case
+    the ``prompt`` half of that claim would be asserted in two places and
+    pinned in none. GREEN on first run by design — characterization, not a
+    behaviour change.
+    """
+    await backend.add_task(
+        project_root=project_root,
+        title='prompt-row',
+        details='ORIGINAL BODY',
+        metadata=json.dumps({
+            'files': ['src/c.py'],
+            'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        prompt='REWRITTEN BODY',
+        metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
+        append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+
+    assert task['details'] == 'ORIGINAL BODY\n\nREWRITTEN BODY', (
+        'append=True must concatenate the details column via the prompt '
+        f'branch too; got: {task["details"]!r}'
+    )
+    assert task['metadata'] == {
+        'files': ['src/c.py'],
+        'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+    }, f'metadata half must union hints and preserve siblings: {task["metadata"]}'
+
+
+@pytest.mark.asyncio
+async def test_update_task_split_call_details_rewrite_leaves_one_body_and_unions_hints(
+    backend, project_root,
+):
+    """The SPLIT-CALL REMEDY prescribed by the corrected Stage-2 prompt (task 4216).
+
+    A metadata-only ``append=True`` attach followed by a details-only call
+    with ``append`` OMITTED leaves exactly ONE copy of the details body
+    while the hints still union and sibling keys survive.
+
+    Split out from
+    ``test_update_task_details_and_metadata_append_true_concatenates_details``
+    deliberately: the remedy is the shape Stage 2 is now told to emit, so a
+    regression here must surface on its own rather than be masked behind a
+    failure of the combined-call hazard characterization.
+    """
     await backend.add_task(
         project_root=project_root,
         title='split-row',
@@ -7267,16 +7330,16 @@ async def test_update_task_details_and_metadata_append_true_concatenates_details
     )
     # call 1 — metadata only, append=True (the hints attach)
     await backend.update_task(
-        '2', project_root=project_root,
+        '1', project_root=project_root,
         metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
         append=True,
     )
     # call 2 — details only, append OMITTED (the clean rewrite)
     await backend.update_task(
-        '2', project_root=project_root,
+        '1', project_root=project_root,
         details='REWRITTEN BODY',
     )
-    split = await backend.get_task('2', project_root=project_root)
+    split = await backend.get_task('1', project_root=project_root)
 
     assert split['details'] == 'REWRITTEN BODY', (
         'the split-call remedy must leave exactly ONE copy of the details '
