@@ -962,6 +962,20 @@ async def run(
               ``None`` and ``probe_failed`` is ``True`` when the probe could
               not be taken; ``blind_spot`` is then ``False``, since an
               unobserved population must never be asserted as a blind spot.
+            - structural_floor (dict): the PERMANENT floor on the residual
+              backlog (task 4436) — ``{'undated_kept_count',
+              'undrainable_count', 'undrainable_ids'}``. Diagnostic only,
+              NEVER part of the delete set: it exists so a ``--check``
+              violation that no re-run can ever clear is legible as such
+              rather than as a transient over-backlog. Composed of two
+              structurally different arms (see
+              :func:`find_undrainable_markers`): the UNDATED arm, which
+              ``--delete-ids``/``--terminal-drain`` can still reach and
+              which is therefore relative to THIS invocation's delete set,
+              and the PROTECTED arm, which no flag of this script drains at
+              all. ``undated_kept_count`` is repeated here beside
+              ``undrainable_count`` deliberately — the raw count is not the
+              floor, and the two can differ in both directions.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
             - tombstoned (int, only when apply=True): task-3041 ledger rows
@@ -1168,23 +1182,6 @@ async def run(
     stale = find_stale_markers(members, now_dt, max_age_days=max_age_days)
     terminal = find_terminal_task_markers(members, terminal_ids)
 
-    # Diagnostic only — never added to the delete set. Surfaces the subset of
-    # `members` find_stale_markers can never drain regardless of
-    # --max-age-days (task 2596 amendment, reviewer_comprehensive #1/#2): an
-    # operator wiring --check --max-backlog 0 against a population with a
-    # nonzero undated_kept_count would otherwise see a perpetual violation
-    # with no visibility into why the residual floors above zero.
-    undated_kept = find_undated_markers(members)
-    if undated_kept:
-        logger.warning(
-            'sweep_orphan_flag_markers: %d of %d enumerated markers have a '
-            'missing/unparseable created_at and are permanently kept by '
-            'find_stale_markers regardless of --max-age-days (even 0) — '
-            'this sets a floor on the residual backlog that age-draining '
-            'alone cannot reach below for --check/--max-backlog. Use '
-            '--delete-ids or --terminal-drain to remove them if warranted.',
-            len(undated_kept), len(members),
-        )
     # Best-effort: an id in delete_ids that doesn't match any enumerated
     # member is simply absent from `targeted` — never a crash.
     targeted = [m for m in members if m['id'] in delete_ids]
@@ -1264,6 +1261,41 @@ async def run(
         orphans = [m for m in orphans if id(m) not in protected_obj_ids]
 
     orphan_ids = [o['id'] for o in orphans]
+
+    # --- Structural floor (task 4436) ---
+    #
+    # Diagnostic only — computed FROM the finished delete set and never fed
+    # back into it. Deliberately placed AFTER the protected subtraction
+    # above: `seen_ids` from the union loop is now a strict SUPERSET of what
+    # is actually deleted, so a protected member some automatic predicate
+    # also catches (a `cycle_summary` mirror is a kind-orphan too) would be
+    # classified as drained and the floor under-reported — the false
+    # negative this block exists to eliminate. `orphan_ids` is the report's
+    # own published delete set, so deriving the floor from it also keeps the
+    # block consistent with `orphan_count` by construction rather than by a
+    # second, drifting derivation.
+    #
+    # `undated_kept_count` is duplicated INSIDE the block on purpose, so the
+    # block reads self-describingly in a journal or a done_provenance.note
+    # with the raw count and the true floor side by side — exactly the
+    # distinction operators have been getting wrong. After task 4435 the two
+    # can differ in BOTH directions: an undated kind-orphan is drained and
+    # floors nothing, while a dated protected mirror floors permanently
+    # while contributing 0 to the raw count.
+    drained_ids = set(orphan_ids)
+    undated_kept = find_undated_markers(members)
+    undrainable = find_undrainable_markers(members, drained_ids)
+    if undated_kept:
+        logger.warning(
+            'sweep_orphan_flag_markers: %d of %d enumerated markers have a '
+            'missing/unparseable created_at and are permanently kept by '
+            'find_stale_markers regardless of --max-age-days (even 0) — '
+            'this sets a floor on the residual backlog that age-draining '
+            'alone cannot reach below for --check/--max-backlog. Use '
+            '--delete-ids or --terminal-drain to remove them if warranted.',
+            len(undated_kept), len(members),
+        )
+
     # The found-intersection of args.delete_ids with the enumerated members
     # (not the raw input list) — order-preserving per `members`.
     targeted_correction_ids = [m['id'] for m in targeted]
@@ -1296,6 +1328,11 @@ async def run(
         'protected_skipped_count': len(protected),
         'protected_skipped_ids': [m['id'] for m in protected],
         'cross_check': cross_check,
+        'structural_floor': {
+            'undated_kept_count': len(undated_kept),
+            'undrainable_count': len(undrainable),
+            'undrainable_ids': [m['id'] for m in undrainable],
+        },
     }
 
     if args.apply:
