@@ -5,12 +5,15 @@ sys.path pollution — mirrors the pattern in test_check_asyncmock_assertion_sty
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import logging
 import types
 from pathlib import Path
 
 import pytest
+
+from fused_memory.utils.target_store_preflight import TargetStoreMissing
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_tasks.py'
 
@@ -1204,3 +1207,131 @@ class TestExtractTasksFalsyInputs:
             if r.levelno >= logging.WARNING and r.name == 'audit_duplicate_tasks'
         ]
         assert warnings == []
+
+
+# ---------------------------------------------------------------------------
+# TestRunTargetStorePreflight
+# ---------------------------------------------------------------------------
+
+class _RecordingBackendFactory:
+    """Stand-in for SqliteTaskBackend that RECORDS every construction.
+
+    Doubles as the "guard fired before the backend existed" probe: reaching
+    ``get_tasks`` is precisely what auto-creates the empty tasks.db, so a
+    refusal that happens after construction has already lost.
+    """
+
+    def __init__(self):
+        self.constructions: list[object] = []
+
+    def __call__(self, taskmaster_config=None, **kwargs):  # noqa: ARG002
+        self.constructions.append(taskmaster_config)
+        return _FakeRunBackend()
+
+
+class _FakeRunBackend:
+    """Minimal start/get_tasks/close surface ``_run()`` drives directly."""
+
+    def __init__(self):
+        self.started = False
+        self.closed = False
+        self.get_tasks_calls: list[str] = []
+
+    async def start(self):
+        self.started = True
+
+    async def close(self):
+        self.closed = True
+
+    async def get_tasks(self, project_root, tag=None):  # noqa: ARG002
+        self.get_tasks_calls.append(project_root)
+        return {'tasks': []}
+
+
+class _FakeFusedMemoryConfigWithTaskmaster:
+    """Fake FusedMemoryConfig() whose .taskmaster is configured (non-None),
+    so ``_run()`` proceeds past its early-return guard.  ``_run()`` only ever
+    checks ``config.taskmaster is None``, never inspects its fields."""
+
+    def __init__(self, *args, **kwargs):
+        self.taskmaster = object()
+
+
+def _args(project_root: Path, *, apply: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        project_root=str(project_root),
+        config=None,
+        apply=apply,
+        threshold=0.90,
+        tag=None,
+        min_id=1000,
+    )
+
+
+@pytest.mark.asyncio
+class TestRunTargetStorePreflight:
+    """The target-store refusal (task 4319) — the first ``_run()`` tests here.
+
+    ``SqliteTaskBackend.get_tasks`` auto-creates ``.taskmaster/tasks/tasks.db``
+    and returns ``{"tasks": []}`` for ANY ``--project-root``, never raising.
+    ``.taskmaster/`` is neither present in nor tracked by a task worktree, so
+    without this guard a worktree path yields an empty task tree, an empty
+    plan, zero mutations and exit 0 — a false all-clear.
+
+    ``_run()`` imports the backend and config FUNCTION-LOCALLY, so these
+    monkeypatch the SOURCE module paths; patching an attribute on the script
+    module would have no effect.
+    """
+
+    @pytest.mark.parametrize('apply', [False, True])
+    async def test_refuses_a_missing_task_store(
+        self, tmp_path: Path, monkeypatch, apply: bool,
+    ):
+        factory = _RecordingBackendFactory()
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', factory,
+        )
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_args(tmp_path, apply=apply))
+
+        # Refused BEFORE the backend was constructed — reaching get_tasks is
+        # what would have auto-created the empty db.
+        assert factory.constructions == []
+
+    async def test_refusal_leaves_the_db_absent(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
+            _RecordingBackendFactory(),
+        )
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_args(tmp_path, apply=False))
+
+        assert not (tmp_path / '.taskmaster').exists()
+
+    async def test_proceeds_when_the_db_exists(self, tmp_path: Path, monkeypatch):
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True)
+        db.touch()
+        factory = _RecordingBackendFactory()
+        monkeypatch.setattr(
+            'fused_memory.config.schema.FusedMemoryConfig',
+            _FakeFusedMemoryConfigWithTaskmaster,
+        )
+        monkeypatch.setattr(
+            'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', factory,
+        )
+
+        exit_code = await _mod._run(_args(tmp_path, apply=False))
+
+        assert exit_code == 0
+        assert len(factory.constructions) == 1
