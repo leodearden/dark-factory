@@ -2731,7 +2731,7 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
     assert str(kwargs["codebook_path"]) in committed
     assert str(kwargs["census_state_path"]) in committed
 
-    # (e) the outcome names the review file instead of a bare filed_tasks=0
+    # (e) the outcome names the review file instead of a bare filed_tickets=0
     assert outcome.status == "done"
     assert outcome.filed_ticket_ids == []
     assert outcome.dry_run is not None
@@ -3343,8 +3343,13 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
     assert payloads_path in out
     assert "7 payload" in out
     assert "nothing filed" in out.lower()
-    # a bare filed_tasks=0 would read as "a normal run that filed nothing"
+    # a bare zero count would read as "a normal run that filed nothing".
+    # Both labels are asserted absent: filed_tasks= is the pre-4965 spelling
+    # (kept so this guard still refuses a revert to it), filed_tickets= is the
+    # live one -- without the second line the rename would have quietly left
+    # this guard vacuous.
     assert "filed_tasks=0" not in out
+    assert "filed_tickets=0" not in out
 
 
 def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeypatch, capsys):

@@ -816,7 +816,7 @@ class DryRunFiling:
     ``render_report`` (which must not let an empty ``filed_ticket_ids`` read
     as a normal run that filed nothing) and ``CensusOutcome`` (so
     ``main``'s summary line can name the review file instead of printing a
-    misleading ``filed_tasks=0``). ``None`` in place of this record means
+    misleading ``filed_tickets=0``). ``None`` in place of this record means
     the run filed normally."""
 
     path: str
@@ -2706,7 +2706,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if outcome.dry_run is not None:
-        # A bare filed_tasks=0 here would read as "a normal run that had
+        # A bare filed_tickets=0 here would read as "a normal run that had
         # nothing to file" -- name the review file and the count instead.
         print(
             f"census: done -- report={outcome.report_path} "
@@ -2718,7 +2718,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"census: done -- report={outcome.report_path} "
-        f"filed_tasks={len(outcome.filed_ticket_ids)} stop_reason={outcome.stop_reason}"
+        f"filed_tickets={len(outcome.filed_ticket_ids)} stop_reason={outcome.stop_reason}"
     )
     return 0
 
