@@ -627,3 +627,77 @@ class TestInterIterationRebaseRederivesStepStatus:
         step_1 = plan['steps'][0]
         assert step_1['status'] == 'done'
         assert step_1['commit'] == await workflow._get_head_commit()
+
+    async def test_multi_step_log_entry_is_not_trusted_as_per_step_provenance(
+        self, config, git_ops, task_assignment,
+    ):
+        """A ledger entry naming SEVERAL steps must not lend its sha to any of
+        them — the honest post-rebase HEAD is recorded for all instead.
+
+        An entry's ``commit`` is the POST-ITERATION HEAD
+        (``workflow.py::_iteration_commit_provenance``) and ``steps_completed``
+        is the LIST of every step that round finished (the ledger writer's
+        ``newly_completed``), so a round that completes two steps records ONE
+        sha that belongs to at most the last of them. Feeding that into the
+        per-step ladder would reproduce the collapse this class's sibling test
+        pins — and in a strictly WORSE form: step-1 would stop carrying an
+        obvious coarse marker and start carrying a specific commit that is
+        really step-2's. This asserts step-1 is never handed step-2's replay.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('v1\n')
+        commit_a = await git_ops.commit(wt, 'feat: GREEN — step-1')
+        (wt / 'impl.py').write_text('v2\n')
+        commit_b = await git_ops.commit(wt, 'feat: GREEN — step-2')
+        assert commit_a and commit_b and commit_a != commit_b
+
+        workflow.plan = _write_plan(artifacts, workflow, [
+            {'id': 'step-1', 'type': 'impl', 'status': 'pending', 'commit': None},
+            {'id': 'step-2', 'type': 'impl', 'status': 'pending', 'commit': None},
+        ])
+        # ONE entry for BOTH steps, carrying the round's post-iteration HEAD —
+        # exactly the shape the real implementer ledger writer emits when an
+        # iteration commits more than one step.
+        artifacts.append_iteration_log({
+            'agent': 'implementer',
+            'steps_completed': ['step-1', 'step-2'],
+            'commit': commit_b,
+        })
+
+        repo = config.project_root
+        (repo / 'sibling.txt').write_text('sibling fix\n')
+        await _run(['git', 'add', 'sibling.txt'], cwd=repo)
+        await _run(['git', 'commit', '-m', 'sibling fix'], cwd=repo)
+
+        result = await workflow._inter_iteration_rebase()
+        assert result is not None, 'Rebase should have happened (main advanced).'
+
+        plan = artifacts.read_plan()
+        by_id = {s['id']: s for s in plan['steps']}
+        step_1, step_2 = by_id['step-1'], by_id['step-2']
+        post_rebase_head = await workflow._get_head_commit()
+
+        assert step_1['status'] == 'done'
+        assert step_2['status'] == 'done'
+
+        # THE POINT: step-1 must not be attributed step-2's work. Resolving
+        # commit_b through the ladder would land exactly there.
+        _, step_1_subject, _ = await _run(
+            ['git', 'log', '-1', '--format=%s', step_1['commit']], cwd=wt,
+        )
+        assert step_1_subject.strip() != 'feat: GREEN — step-2', (
+            f"step-1 recorded {step_1['commit']!r}, which is step-2's replay — "
+            'a multi-step ledger entry was mistaken for per-step provenance'
+        )
+
+        # Both fall to the honest coarse marker instead.
+        assert step_1['commit'] == post_rebase_head
+        assert step_2['commit'] == post_rebase_head
+
+        # And the reachability invariant still holds.
+        for step in (step_1, step_2):
+            assert await git_ops.is_ancestor(step['commit'], post_rebase_head)
