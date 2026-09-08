@@ -616,6 +616,42 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 # The runner
 # ---------------------------------------------------------------------------
 
+def markdown_sibling(report_path: str | Path) -> Path:
+    """Where the markdown for *report_path* goes, or ``ValueError`` if nowhere.
+
+    COMPOSED from the stem, not derived by replacing the last suffix.
+    ``with_suffix('.md')`` maps ``foo.md`` back to ``foo.md``, so the markdown
+    overwrote the JSON that had just been written — every number the run paid
+    for, gone, with no error, on a script whose output is a committed
+    artifact.
+
+    A FUNCTION OF THE ARGUMENT ALONE, which is why it is one: nothing about
+    the collision depends on what the run measures, so it is knowable before
+    any work is done. It used to be evaluated at the bottom of
+    :func:`run_judge_eval`, after ``build_judge_cases``, after the whole
+    per-case ``judge_fn`` loop and after ``score_cases`` — which protected
+    the two FILES and nothing else. On a live run ``--report-path foo.md``
+    spent every LLM call for the corpus and then raised with no artifact
+    written at all, so the operator paid for the run and got nothing.
+    Callers evaluate it up front instead: :func:`run_judge_eval` at its first
+    statement, and :func:`_run` before it so much as reads the fixture.
+
+    ``guard_committed_report`` does not cover this: that guard addresses
+    dry-run/``--limit`` publishing and returns early for any non-committed
+    path, so ``--report-path foo.md`` sailed straight through it.
+    """
+    report_path = Path(report_path)
+    sibling = report_path.parent / (report_path.stem + '.md')
+    if sibling == report_path:
+        raise ValueError(
+            f'report_path {str(report_path)!r} composes the same path as its '
+            f'markdown sibling {str(sibling)!r}, so the markdown would '
+            f'overwrite the JSON report — pass a report_path whose stem+".md" '
+            f'differs from it (e.g. a .json suffix)',
+        )
+    return sibling
+
+
 def run_judge_eval(
     *,
     records: Sequence[Mapping[str, Any]],
@@ -638,13 +674,15 @@ def run_judge_eval(
     A dangling candidate id raises ``KeyError`` for the same reason — a
     silently-skipped candidate narrows a slate the report claims was 5 wide.
 
-    THE MARKDOWN SIBLING NEVER OVERWRITES THE REPORT. It is composed as
-    ``report_path.parent / (report_path.stem + '.md')`` and a *report_path*
-    that composes back to itself RAISES before either file is written.
-    ``guard_committed_report`` does not cover this: that guard addresses
-    dry-run/``--limit`` publishing and returns early for any non-committed
-    path, so ``--report-path foo.md`` sailed straight through it.
+    THE MARKDOWN SIBLING NEVER OVERWRITES THE REPORT. :func:`markdown_sibling`
+    composes it and RAISES on a *report_path* that composes back to itself —
+    resolved as this function's FIRST statement, before a single case is
+    built or a single verdict is bought, so the mistake costs nothing rather
+    than merely leaving the two files intact after a paid run.
     """
+    report_path = Path(report_path)
+    markdown_path = markdown_sibling(report_path)
+
     cases = build_judge_cases(records, distractors=distractors)
     by_id = {str(r['memory_id']): r for r in records}
     logger.info('Built %d case(s) from %d record(s)', len(cases), len(records))
@@ -694,21 +732,9 @@ def run_judge_eval(
         )
     report = build_report(scored=scored, provenance=run_provenance)
 
-    report_path = Path(report_path)
-    # COMPOSED from the stem, not derived by replacing the last suffix.
-    # `with_suffix('.md')` maps `foo.md` back to `foo.md`, so the markdown
-    # overwrote the JSON that had just been written — every number the run
-    # paid for, gone, with no error. Raised BEFORE either write so the
-    # mistake costs nothing; a warning on a script whose output is a
-    # committed artifact would be read after the loss.
-    markdown_path = report_path.parent / (report_path.stem + '.md')
-    if markdown_path == report_path:
-        raise ValueError(
-            f'report_path {str(report_path)!r} composes the same path as its '
-            f'markdown sibling {str(markdown_path)!r}, so the markdown would '
-            f'overwrite the JSON report — pass a report_path whose stem+".md" '
-            f'differs from it (e.g. a .json suffix)',
-        )
+    # `markdown_path` was composed (and its collision with `report_path`
+    # rejected) at the top of this function — reused here rather than
+    # recomposed, so the path that was validated is the path that is written.
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     markdown_path.write_text(render_markdown(report))
@@ -899,6 +925,14 @@ def _run(args: Any) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
+
+    # FIRST, ahead of the fixture load and the config: `--report-path foo.md`
+    # is a bad ARGUMENT, and whether it collides with its markdown sibling is
+    # decided by the string alone. `run_judge_eval` re-resolves this on the
+    # path it is finally handed (which `guard_committed_report` may have
+    # redirected); rejecting here just means the operator is told now instead
+    # of after a corpus-wide run they paid for.
+    markdown_sibling(args.report_path)
 
     # BEFORE any work, and outside the --limit block: a bare --dry-run also
     # defaults to the committed path, and used to rewrite both committed

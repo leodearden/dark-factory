@@ -1138,9 +1138,14 @@ class TestRunJudgeEval:
 
         `with_suffix('.md')` composes `foo.md` back to `foo.md`: the report is
         written and then overwritten by its own markdown, losing every number
-        the run paid for, silently. Raising BEFORE either write makes the
-        mistake cost nothing — a warning on a script whose output is a
-        committed artifact would be read after the loss.
+        the run paid for, silently. `markdown_sibling` raises before the run
+        does ANY work — not merely before the two writes — so the mistake
+        costs nothing at all rather than costing a whole corpus of LLM calls
+        for no artifact. That stronger claim is what
+        :meth:`test_a_dot_md_report_path_costs_nothing_because_it_raises_first`
+        pins; this one stays on the files. A warning instead of a raise, on a
+        script whose output is a committed artifact, would be read after the
+        loss.
         """
         target = tmp_path / 'foo.md'
         with pytest.raises(ValueError) as excinfo:
