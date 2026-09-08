@@ -147,19 +147,26 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # diff. Both runs audited the same 385 found_on_main tasks out of a
 # 5153-task corpus, with zero task-id drift between them.
 #
-# Result: NO found_on_main task newly enters `misattributed` or
-# `deliverable_absent`. Exactly 6 tasks changed verdict and all 6 LEFT
-# `misattributed`: 1495, 3869, 4517 -> `unverifiable`; 2273 ->
-# `deliverable_absent`; 3924, 4265 -> `ok`. Aggregate `deliverable_absent`
-# rose 1 -> 2, which reads like the regression this measurement exists to
-# catch, but is task 2273 moving misattributed -> deliverable_absent —
-# flagged to flagged, already surfaced for human review both before and
-# after. That is why the per-task diff, not the aggregate
+# Result: no previously-unflagged found_on_main task becomes flagged.
+# Nothing newly enters `misattributed`, and the one task that newly reads
+# `deliverable_absent` — 2273 — was already flagged `misattributed` before
+# the fix. Exactly 6 tasks changed verdict and all 6 LEFT `misattributed`:
+# 1495, 3869, 4517 -> `unverifiable`; 2273 -> `deliverable_absent`; 3924,
+# 4265 -> `ok`. Aggregate `deliverable_absent` rose 1 -> 2, which reads
+# like the regression this measurement exists to catch, but is that same
+# 2273 move — flagged to flagged, already surfaced for human review both
+# before and after. That is why the per-task diff, not the aggregate
 # `verdict_counts`, is the artifact that actually answers the question.
 # Two reverse-direction effects were traced analytically through
-# `_classify_core` below; NEITHER fired on this corpus — no task moved
-# `ok` -> anything (effect 2) and no task was newly flagged
-# `misattributed` (effect 1):
+# `_classify_core` below; NEITHER showed a verdict-visible occurrence on
+# this corpus — no task moved `ok` -> anything (effect 2) and no task was
+# newly flagged `misattributed` (effect 1). A verdict-level diff can only
+# observe an effect for a task that actually reaches the relevant rung of
+# the precedence ladder (`commit_not_on_main` > `misattributed` >
+# `reverted` > `deliverable_absent` > `unverifiable` > `ok`, first match
+# wins — see `classify` above); a task already sitting at a higher rung in
+# both runs would mask either effect from a verdict diff without the
+# effect having occurred:
 #   (1) self-citation SUPPRESSION narrows too, not just other-task
 #       DETECTION — a message citing the audited task ONLY via bare-paren
 #       while citing a *different* task in one of the three surviving
@@ -170,15 +177,20 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 #       TestClassifyMisattributed.test_self_citation_only_in_bare_paren_form_now_flags_misattributed
 #       below; accepted as rare for this corpus, since self-citation here
 #       is overwhelmingly written in the conventional-commit subject form.
-#       Reachable in principle, measured non-occurring on this
-#       corpus (task 4784, 2026-09-08).
+#       No verdict-visible occurrence on this corpus (task 4784,
+#       2026-09-08) — a task already at the higher-precedence
+#       `commit_not_on_main` rung in both runs would mask this effect from
+#       a verdict diff without it being absent.
 #   (2) a found_on_main task with no declared files whose only self-
 #       citation was bare-paren reclassifies `ok` -> `unverifiable`.
 #       Relabeling only, not a new gating false positive: `unverifiable`
 #       is not a member of `_FLAGGED_VERDICTS` below, so it never trips
 #       `_has_flagged_findings` / `--fail-on-findings`.
-#       Reachable in principle, measured non-occurring on this
-#       corpus (task 4784, 2026-09-08).
+#       No verdict-visible occurrence on this corpus (task 4784,
+#       2026-09-08) — a task already at `commit_not_on_main`,
+#       `misattributed`, `reverted`, or `deliverable_absent` in both runs
+#       would mask this effect from a verdict diff without it being
+#       absent.
 #
 # Neither is thereby proven unreachable: this is a point-in-time
 # observation of one corpus, not a static guarantee, and a future commit
