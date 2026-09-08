@@ -36,6 +36,7 @@
 - The duplicate class accepts BOTH `restated` and `amended`, because the curator's labels do not separate a verbatim restatement from a rediscovery carrying a novel fragment. The split between them is reported as a distribution and is not scored as error.
 - The distractor class is a control this script constructs, not a curator label: one case per cluster whose slate carries no correct attach target at all. It is what distinguishes a judge that classifies from a judge that attaches to whatever it is shown.
 - Every accuracy here is measured over the WHOLE labelled corpus, not over the [t_low, t_high) middle band the production judge is actually responsible for. `build_judge_cases` emits a case for every non-canonical record and `run_judge_eval` calls the judge on each one directly — `decide_band`, `t_high` and `t_low` never enter the picture, and the band decision handed to `judge_write` is SYNTHESIZED as a middle-band one. So these figures include records that in production are answered deterministically without the judge ever seeing them, and whether the middle band alone would score higher or lower is not measured here. Filtering the cases to the band would need real per-record similarities and is deliberately not done.
+- `judge_candidate_count` and `judge_enabled` were BACKFILLED into this artifact rather than emitted by the run that measured it: both fields postdate the run, and re-running the eval to emit them would buy a fresh live measurement and replace every number here. The values recorded are the ones the measuring run resolved — `write_triage.judge_candidate_count: 5` and `write_triage.judge_enabled: true` have shipped unchanged from the commit that introduced those knobs, which predates this run, through today. The measured figures corroborate both: `candidate_count: 5` equals the cap, so the prompt-time trim was a no-op, and a run with the judge arm off answers `stored` to every case, which would have scored `duplicate` 0.0 rather than the value recorded here. Every other field, and every number, is as the run wrote it.
 
 ## Provenance
 
@@ -43,6 +44,8 @@
 - `judge_provider`: `openai`
 - `judge_model`: `gpt-4o-mini`
 - `limit`: `None`
+- `judge_candidate_count`: `5`
+- `judge_enabled`: `True`
 - `record_count`: `104`
 - `case_count`: `102`
 - `candidate_count`: `5`
