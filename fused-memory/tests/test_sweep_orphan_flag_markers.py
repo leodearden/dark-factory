@@ -2598,6 +2598,189 @@ class TestStructuralFloorWarning:
 
 
 # ===========================================================================
+# Tests: the checked constraint — structural_floor.gate_unsatisfiable (task 4436)
+# ===========================================================================
+
+class TestUnsatisfiableGateIsChecked:
+    """The constraint itself: a --check --max-backlog below the permanent
+    floor is reported as structurally unsatisfiable, and said out loud.
+
+    The exit-code surface is deliberately unchanged (see
+    scripts/fused-memory-flag-marker-check.sh's already-adjudicated ruling
+    that a distinct code buys separability nowhere it is consumed), so the
+    JSON block IS the machine-readable discriminator — exactly as
+    cross_check.blind_spot is for the enumeration blind spot.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    _service = staticmethod(TestStructuralFloorReportBlock._service)
+    _undated = staticmethod(TestStructuralFloorReportBlock._undated)
+
+    def _args(
+        self,
+        apply: bool = False,
+        max_backlog: int = 0,
+        check: bool = False,
+    ):
+        """A namespace carrying the gate config, unlike TestRun's."""
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+            delete_ids=None, max_backlog=max_backlog, check=check,
+        )
+
+    @staticmethod
+    def _errors(caplog) -> list[str]:
+        return [r.message for r in caplog.records if r.levelno == logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_floor_above_ceiling_is_reported_unsatisfiable(self):
+        """(a) One undrainable member against --max-backlog 0."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['max_backlog'] == 0
+        assert block['gate_unsatisfiable'] is True
+
+    @pytest.mark.asyncio
+    async def test_ceiling_that_accommodates_the_floor_is_satisfiable(self):
+        """(b) The same population against --max-backlog 1."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=1), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['max_backlog'] == 1
+        assert block['gate_unsatisfiable'] is False
+
+    @pytest.mark.asyncio
+    async def test_all_drainable_population_is_satisfiable_at_zero(self):
+        """(c) A population that drains to 0 passes a --max-backlog 0 gate."""
+        members = [_orphan('o1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['structural_floor']['undrainable_count'] == 0
+        assert report['structural_floor']['gate_unsatisfiable'] is False
+
+    @pytest.mark.asyncio
+    async def test_protected_only_population_is_unsatisfiable(self):
+        """(d) PROTECTED-ONLY UNSATISFIABILITY — the case a floor keyed on
+        undated markers alone would have wrongly passed.
+
+        Everything here is dated, so undated_kept_count is 0; the protected
+        mirror nonetheless floors the backlog permanently, and task 4435's
+        own WARNING already asserts in prose that a gate below that floor can
+        never pass.
+        """
+        members = [_orphan('o1'), _mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 0
+        assert block['undrainable_count'] == 1
+        assert block['gate_unsatisfiable'] is True
+
+    @pytest.mark.asyncio
+    async def test_namespace_without_check_or_max_backlog_defaults_safely(self, caplog):
+        """(e) THE ARGS GOTCHA — a namespace carrying NEITHER field.
+
+        Exactly what TestRun._args builds, and what ~40 existing tests pass.
+        A bare args.check / args.max_backlog would AttributeError across all
+        of them, so the getattr defaults are pinned here directly rather than
+        left to be discovered as collateral damage.
+        """
+        import types as _types
+        bare = _types.SimpleNamespace(
+            apply=False, project_id='dark_factory', max_age_days=14,
+        )
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(bare, memory_service, now=self._NEUTRAL_NOW)
+
+        block = report['structural_floor']
+        assert block['max_backlog'] == 0, 'default ceiling'
+        assert block['gate_unsatisfiable'] is True, 'floor 1 > default ceiling 0'
+        assert self._errors(caplog) == [], 'no --check is being evaluated'
+
+    @pytest.mark.asyncio
+    async def test_check_with_unsatisfiable_gate_logs_one_error(self, caplog):
+        """(f) DIAGNOSIS — an operator evaluating the gate is told, loudly,
+        that re-running can never clear it."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is True
+        errors = self._errors(caplog)
+        assert len(errors) == 1, f'Expected exactly one ERROR, got: {errors!r}'
+        message = errors[0]
+        assert 'u1' in message, f'Expected the floor member named: {message!r}'
+        assert '--max-backlog' in message
+        # The floor (1) and the ceiling (0) are both named, and the message
+        # says plainly that re-running is futile. Assert on tokens, not prose.
+        assert '1' in message and '0' in message
+        assert 'never' in message.lower(), f'Expected a "can never pass": {message!r}'
+
+    @pytest.mark.asyncio
+    async def test_no_check_logs_no_error_but_still_reports_the_fact(self, caplog):
+        """(g) The nightly --apply --terminal-drain service passes no --check,
+        so it must not gain a spurious ERROR for a gate it never evaluates —
+        while still recording the satisfiability fact in its journal JSON."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=False),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is True
+        assert self._errors(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_check_with_satisfiable_gate_logs_no_error(self, caplog):
+        """(h) A gate that CAN pass is silent, even under --check."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=1, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is False
+        assert self._errors(caplog) == []
+
+
+# ===========================================================================
 # Tests: run() surfaces the tombstone count in the report (task 4435)
 # ===========================================================================
 
