@@ -58,9 +58,11 @@ Over **W**:
 | `verdict_voided` (`chain_dead`) | 126 | 154 |
 | void rate | **0.297** | **0.583** |
 | void points | `{'dispatch': 126}` | `{'dispatch': 154}` |
-| voids that burned a verify | **0** | **0** |
+| voids that burned a speculative verify | **0** | **0** |
 | voids discarded pre-verify | **126** | **154** |
+| voids that could not be classified | **0** | **0** |
 | distinct dead-base SHAs / max voids from one | 120 / 2 | 131 / 3 |
+| voids naming no dead base | 0 | 0 |
 | landed with speculation ahead (loose) | 351/507 (0.692) | 191/323 (0.591) |
 | ...and not voided first (strict) | 255/507 (0.503) | 84/323 (0.260) |
 
@@ -103,11 +105,28 @@ one shared predicate,
 
 Over **W**, in BOTH projects, every single `verdict_voided` row carries
 `point='dispatch'` — 126/126 and 154/154 — and **zero** of them (0/126, 0/154)
-had a `merge_verify` for the same task between the item's last preceding
-`speculative_merge` and the void. That second measurement is independent of
-the `point` label: it is computed from the `merge_verify` rows themselves
-(`scripts/merge_lane_throughput.py::compute_speculation`, `void_anatomy`), so
-the two agree without sharing a source.
+had a *speculative* `merge_verify` for the same task between the item's last
+preceding `speculative_merge` and the void. That second measurement is
+independent of the `point` label: it is computed from the `merge_verify` rows
+themselves (`scripts/merge_lane_throughput.py::compute_speculation`,
+`void_anatomy`), so the two agree without sharing a source.
+
+Two properties of that zero are worth stating, because both are ways it could
+have been an artifact rather than a finding:
+
+- It counts **speculative** verifies only. The join key available on these
+  rows is the task COLUMN, not a request id
+  (`scripts/merge_lane_throughput.py::_by_task`), so an unfiltered search of
+  the interval would credit a post-merge verify — or a rebased-gate re-verify
+  for an *earlier* attempt on the same task — to the expensive arm. The error
+  would have run inflationary, i.e. toward "the voids do burn verifies", which
+  is the opposite of this section's claim and so would not have been caught by
+  a reader checking the conclusion for wishful arithmetic.
+- The `pre_verify` count is a **genuine tally, not a residue**. Voids the
+  measure cannot read at all (unparseable timestamp, NULL task_id) are counted
+  in a third `unclassifiable` arm rather than absorbed by the subtraction, and
+  that arm is **0 / 126** and **0 / 154** over **W**. Every chain-dead void in
+  both projects was actually classified; none is being *assumed* cheap.
 
 ### Why the adoption arm is empirically empty — by design, not by luck
 
@@ -225,6 +244,13 @@ would account for most voids. They do not. Over **W**:
 - dark_factory: 120 distinct dead-base SHAs over 126 voids; **max 2** voids
   from any single SHA.
 - reify: 131 distinct over 154 voids; **max 3**.
+
+Both figures are over SHAs that a void actually named: voids carrying no
+`dead_link` are tallied separately (`dead_link_unknown`) and excluded from the
+fan-out, so a bucket of unattributable rows cannot masquerade as one base
+killing many — which is the precise shape this section reads as amplification.
+Over **W** that separate tally is **0** in both projects, so all 126 and all
+154 voids do name a base and the fan-out is computed over the whole population.
 
 Voids are **independent stragglers**, not one head failure cascading. This is
 consistent with § 2: the `_verifier_loop` cascade already re-merges the
@@ -395,7 +421,10 @@ relative to the re-merge, making the two units interchangeable after all.
 "stop wasting verify slots on doomed speculations" is aimed at a cost of zero.
 This is stated explicitly so the policy PRD's author does not re-derive it —
 and so that if `verify_burned` ever becomes non-zero (the measure now reports
-it) the deprioritisation is revisited rather than inherited.
+it) the deprioritisation is revisited rather than inherited. That trigger is
+load-bearing, which is why the counter is deliberately conservative: it counts
+only *speculative* verifies in the interval, so it does not fire on an
+unrelated verify for an earlier attempt on the same task (§ 2).
 
 **NOT PROPOSED: re-enabling `speculation_probe`.** § 4a — inert in both
 projects with a dated operator deactivation whose stated reason (no genuine
@@ -411,10 +440,16 @@ knob would be ranking against nothing.
   without re-deriving them.
 - **Task 5050 (A)** — this task extended its script with the strict
   `speculative_ahead_adopted` measure and the `void_anatomy` split
-  (pre-verify / verify-burned, plus `dead_link` fan-out), carried them into
-  `void_rate_by_project`, and surfaced both on the text report and `--json`.
-  The existing `speculative_ahead` key and every existing printed line are
-  unchanged.
+  (pre-verify / verify-burned / unclassifiable, plus `dead_link` fan-out),
+  carried them into `void_rate_by_project`, and surfaced both on the text
+  report and `--json`. The existing `speculative_ahead` key and every existing
+  printed line are unchanged. Three classifier details a later consumer should
+  not have to rediscover: `verify_burned` counts speculative verifies only,
+  `speculative_ahead_adopted` is disqualified by `chain_dead` voids only (the
+  same filter the void rate uses, so a new void reason cannot silently shrink
+  it), and the `dead_link` fan-out excludes the unknown-base sentinel. Each
+  was tightened after review; none moved a number in this report, all of which
+  were re-measured over **W** afterwards.
 - **Tasks 5056 (E) and 5059 (H)** — see § 3 and the 2026-09-07 correction in
   `plans/merge-lane-throughput-prd.md`: compare against this report's rows,
   not against § Background's speculative-ahead cell.
