@@ -125,6 +125,7 @@ from pathlib import Path
 __all__ = [
     'TargetStoreMissing',
     'assert_target_store_exists',
+    'task_store_path',
 ]
 
 
@@ -147,6 +148,27 @@ class TargetStoreMissing(RuntimeError):
     that actually exists — an absolute ``--queue-dir``, or the main checkout as
     ``--project-root`` — or create the store deliberately first.
     """
+
+
+def task_store_path(project_root: Path | str) -> Path:
+    """Return the tasks.db a ``--project-root`` resolves to.
+
+    Lives here, rather than being spelled out at each call site, so the three
+    task-store scripts in ``fused-memory/scripts/`` (``audit_duplicate_tasks``,
+    ``audit_found_on_main_provenance``, ``correct_found_on_main_backlog``) all
+    guard the SAME path -- ``scripts/`` is not a package, so a shared module is
+    the only place they can agree.
+
+    Mirrors
+    ``fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend._db_path``
+    by construction, deliberately WITHOUT importing it: that is a private
+    staticmethod, and importing the backend module at guard time would defeat
+    the point of refusing before the backend exists. The duplication is one
+    three-segment join, and a drift between the two shows up as a guard that
+    refuses a project that works (loud), never as one that passes a project
+    that does not (silent).
+    """
+    return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
 
 
 def assert_target_store_exists(
