@@ -61,7 +61,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from _dashboard_helpers import extract_function_body
+from _dashboard_helpers import extract_function_body, find_function_params
 
 # ---------------------------------------------------------------------------
 # The served-asset fixtures (`charts_jsx_body`, `tab_analytics_jsx_body`,
@@ -73,30 +73,43 @@ from _dashboard_helpers import extract_function_body
 
 
 def _extract_signature(src: str, fn_name: str) -> str:
-    """Return the parameter-list text of ``function <fn_name>(...)``, parens excluded."""
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    assert m is not None, (
-        f'no `function {fn_name}(` declaration found in the source — the '
-        'component was renamed or converted to another declaration form, and '
-        'every assertion in this file would go vacuously GREEN.'
+    """Return the parameter-list text of ``function <fn_name>(...)``, parens excluded.
+
+    A thin projection over the shared `find_function_params` paren-depth walk.
+    It stays module-local rather than being hoisted because it has exactly one
+    consumer (`_default_format_y` below); what was worth sharing was the WALK,
+    not this slice of its result.  It cannot be replaced by
+    `extract_function_body` either: that returns the BODY, and the two slices
+    are disjoint — `_default_format_y` regexes `formatY = <default>` out of the
+    PARAMETER LIST, which the body excludes.
+
+    The miss message is kept file-specific: naming the vacuous-GREEN
+    consequence for THIS file is more use at this call site than the shared
+    helper's four-way wording.
+    """
+    def _miss(what: str) -> BaseException:
+        return AssertionError(
+            f'no `function {fn_name}(` declaration found in the source ({what}) '
+            '— the component was renamed or converted to another declaration '
+            'form, and every assertion in this file would go vacuously GREEN.'
+        )
+
+    # This caller wants the params, not the body that follows them, so the
+    # returned mask is unused here.
+    _masked, params_start, params_end = find_function_params(
+        src, fn_name, miss=_miss,
     )
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    assert paren_depth == 0, f'unbalanced parameter list for `function {fn_name}(`'
-    return src[m.end() : i - 1]
+    return src[params_start:params_end]
 
 
 # ---------------------------------------------------------------------------
-# Extractors.  Each asserts LOUDLY when its regex misses — a silent '' would
-# make a rename turn this whole file into a permanent false GREEN.  That is
-# also why `_component_body` needs no guard of its own: `extract_function_body`
-# raises rather than returning '' (task 3549).
+# Extractors.  Each fails LOUDLY on a miss — a silent '' would make a rename
+# turn this whole file into a permanent false GREEN.  Neither needs a guard of
+# its own any more: both are projections over shared `_dashboard_helpers`
+# helpers that RAISE rather than return '' (task 3549, task 4881).
+# `_component_body` takes the BODY via `extract_function_body`;
+# `_extract_signature` above takes the PARAMETER LIST via the same
+# `find_function_params` paren walk that helper is built on.
 # ---------------------------------------------------------------------------
 
 
