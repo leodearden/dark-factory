@@ -35,7 +35,10 @@ a runbook an agent executes at run time must SHOW the values, not point at a
 Python file — wrapped in a ``merge-state-vocab`` marked span naming the
 partition the list must equal. Same convention as ``CONTRIBUTING.md``'s
 ``lint-command-mirror`` block and ``skills/prd/references/gates.md``'s
-``inv-trigger-shapes`` span.
+``inv-trigger-shapes`` span. Each registry entry also DECLARES the partitions
+its file must pin, and that declaration is asserted as a multiset — otherwise a
+site could lose one span's markers, and with them the pin on that list, while
+the rest of the file kept the guard green.
 
 WHAT THIS GUARD DELIBERATELY DOES NOT PIN.
 
@@ -79,10 +82,12 @@ live assertions re-read every committed artifact fresh.
 """
 from __future__ import annotations
 
+import collections
 import importlib.util
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -248,6 +253,31 @@ _PARTITION_RE = re.compile(r"partition=([A-Z][A-Z0-9_]*)")
 _TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_]*\b")
 
 
+def _opens_inside_html_comment(lines: list[str], index: int, marker_column: int) -> bool:
+    """Is the begin marker at ``lines[index][marker_column:]`` inside an HTML comment?
+
+    STRUCTURAL, not same-line. The obvious spelling — ``"<!--" in
+    line[:marker_column]`` — recognises the comment carrier only when the opener
+    shares the marker's line, so an author who writes
+
+        <!--
+             merge-state-vocab:begin partition=LIVE_STATES
+             Mirrors shared/src/shared/merge_state.py::LIVE_STATES -->
+
+    falls into the BARE-marker branch, and the begin comment's own body (the
+    pointer prose and the ``-->`` line) is swallowed into the span. That fails
+    SILENTLY — green today, and a confusing "the list lost every member" the day
+    the pointer prose happens to name a vocabulary token — which is the one
+    outcome this module's extractor contract promises never to produce.
+
+    So the question asked is "is this marker inside an unclosed ``<!--``?",
+    answered over everything preceding it: the last opener wins unless a closer
+    came after it. Cheap enough to do per marker (five files, fourteen markers).
+    """
+    before = "\n".join([*lines[:index], lines[index][:marker_column]])
+    return before.rfind("<!--") > before.rfind("-->")
+
+
 def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
     """Every ``merge-state-vocab`` span in *text*, as ``(partition_name, body)``.
 
@@ -258,9 +288,15 @@ def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
     context. Four pinned sites use the first carrier and one uses the second, so a
     scanner that handled only one would leave the other silently unpinned.
 
+    Which carrier a marker uses is decided STRUCTURALLY, by
+    ``_opens_inside_html_comment`` — an opener on an earlier line counts — rather
+    than by looking for ``<!--`` on the marker's own line. See that helper for the
+    shape a same-line test mis-reads.
+
     The begin comment's own body is EXCLUDED from the returned span: it carries the
     source-of-truth pointer, this module's path and the partition name, any of
-    which would join the extracted value set if swallowed.
+    which would join the extracted value set if swallowed. The BARE carrier has no
+    such body, so there the rest of the marker's own line is kept as span content.
 
     Every malformation raises loudly, naming *source*. The highest-value case is
     ZERO spans — that is what an edit which deletes the markers but keeps the list
@@ -291,7 +327,7 @@ def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
             )
 
             marker_column = line.index(_BEGIN_MARKER)
-            if "<!--" in line[:marker_column]:
+            if _opens_inside_html_comment(lines, index, marker_column):
                 close_index = index
                 while close_index < len(lines) and "-->" not in lines[close_index]:
                     close_index += 1
@@ -304,7 +340,16 @@ def extract_spans(text: str, *, source: str) -> list[tuple[str, str]]:
                 remainder = lines[close_index].split("-->", 1)[1]
                 body_start = close_index + 1
             else:
-                remainder = ""
+                # The bare carrier has no comment body to exclude, so whatever
+                # follows the marker on its own line is span content, not pointer
+                # prose. Dropping it (the previous `remainder = ""`) silently ate
+                # the values of a single-line span such as
+                # `merge-state-vocab:begin partition=CANCEL_STATES 'done' | 'unknown'`
+                # — and the resulting comparison would send a reader to fix a list
+                # that is fine. The `partition=NAME` fragment that rides along here
+                # is harmless: `NAME` is UPPER_SNAKE and so matches no lowercase
+                # token, and `partition` is in neither vocabulary.
+                remainder = line[marker_column + len(_BEGIN_MARKER) :]
                 body_start = index + 1
 
             open_span = (partition_name, body_start, remainder, line_number)
@@ -415,26 +460,56 @@ def assert_span_matches(
     )
 
 
-# Every artifact that restates a merge-state vocabulary inline, and WHAT is pinned
-# there. `test_registry_is_complete` checks this registry against a scan, so it
-# cannot quietly fall behind the repo the way the prose sites did.
-PINNED_SITES = {
+# Every artifact that restates a merge-state vocabulary inline, as
+# `path -> (expected partitions, what is pinned there)`.
+# `test_registry_is_complete` checks this registry against a scan, so it cannot
+# quietly fall behind the repo the way the prose sites did.
+#
+# WHY THE PARTITION TUPLE IS DATA AND NOT PROSE (esc-4829 review). The prose half
+# is documentation; the tuple is asserted. Without it, the only structural claim
+# made about a registered site was "carries >= 1 span", so deleting ONE span's
+# markers and corrupting the list they used to pin left the whole guard green:
+# the remaining spans satisfied the >= 1 check, `find_unregistered_sites` skips
+# every registered file by construction, and the now-unmarked list was invisible
+# to both. MEASURED on this tree before the fix — dropping merge-queue's
+# LIVE_STATES markers together with `finalizing` from that list still reported
+# `52 passed`. The tuple is a MULTISET (order-insensitive, duplicates
+# significant): `skills/unblock-low-risk/SKILL.md` legitimately pins LIVE_STATES
+# twice, once per polling arm it documents.
+#
+# WHAT THIS STILL DOES NOT CATCH, stated so nobody assumes otherwise: a
+# registered file GROWING a brand-new unwrapped list. The reviewer's suggested
+# closure — require every discriminating token in a registered file to sit inside
+# some span — was MEASURED against this tree and rejected: the five registered
+# files carry 5, 9, 9, 11 and 12 distinct discriminating tokens OUTSIDE their
+# spans, all of it legitimate prose explaining what the values mean (`merge_status
+# collapses all of them except done_wip_recovery to blocked`, and so on). Any
+# threshold that passes today's prose is far above "one new list", so the check
+# would cost real prose freedom while catching nothing. The registry scan's
+# threshold is the wrong instrument here; a reviewer reading the diff is the
+# right one.
+PINNED_SITES: dict[str, tuple[tuple[str, ...], str]] = {
     "escalation/src/escalation/server.py": (
+        ("CANCEL_STATES",),
         "the `merge_cancel` docstring's CANCEL_STATES span (bare markers — an HTML "
-        "comment in a docstring would render literally)"
+        "comment in a docstring would render literally)",
     ),
     "skills/merge-queue/SKILL.md": (
-        "live set, poll terminal set, submit terminal + non-terminal sets"
+        ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL", "LIVE_STATES", "TERMINAL_STATES"),
+        "live set, poll terminal set, submit terminal + non-terminal sets",
     ),
     "skills/unblock/SKILL.md": (
+        ("TERMINAL_STATES", "POLL_STOP_STATES"),
         "the two poll tuples — branch arm (TERMINAL_STATES) and scoped arms "
-        "(POLL_STOP_STATES)"
+        "(POLL_STOP_STATES)",
     ),
     "skills/unblock-low-risk/SKILL.md": (
-        "live set (twice), submit terminal + non-terminal sets"
+        ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL", "LIVE_STATES", "LIVE_STATES"),
+        "live set (twice), submit terminal + non-terminal sets",
     ),
     "skills/escalation-watcher/SKILL.md": (
-        "poll terminal set, submit terminal + non-terminal sets"
+        ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL", "TERMINAL_STATES"),
+        "poll terminal set, submit terminal + non-terminal sets",
     ),
 }
 
@@ -561,7 +636,7 @@ def tracked_skill_markdown(*, root: Path = REPO_ROOT) -> list[Path]:
 def find_unregistered_sites(
     *,
     files: list[Path] | None = None,
-    registry: dict[str, str] | None = None,
+    registry: Mapping[str, object] | None = None,
     rule_sites: dict[str, str] | None = None,
     discriminating: frozenset[str] | None = None,
     threshold: int = _ENUMERATION_THRESHOLD,
@@ -663,6 +738,35 @@ LIVE = {"queued", "verifying", "gate", "finalizing"}
 ```
 <!-- merge-state-vocab:end -->
 """
+
+# The fourth begin-comment form: the opener on its own line, the marker BELOW it.
+# No pinned site writes it today, and that is exactly why it is fixtured — a
+# same-line `"<!--" in line[:marker_column]` test reads this as the BARE carrier
+# and swallows the pointer prose and the `-->` into the span body, silently. The
+# decoy is deliberate: the swallowed prose names `already_merged`, so the failure
+# would show up as a wrong value set rather than as a parse error.
+_MULTILINE_OPENER_SPAN = """\
+<!--
+     merge-state-vocab:begin partition=LIVE_STATES
+     Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Not `already_merged`,
+     which is a MergeSubmitStatus member.
+-->
+Live: `queued`, `verifying`, `gate`, `finalizing`
+<!-- merge-state-vocab:end -->
+"""
+
+# The bare carrier carrying its values on the marker's OWN line. Nothing writes
+# this today either; it is the symmetric hole — a bare branch that dropped the
+# marker line's remainder would extract an empty body and report "the list lost
+# every member" about a list that is intact.
+_SINGLE_LINE_BARE_SPAN = '''\
+def merge_cancel() -> dict:
+    """Cancel a pending merge request.
+
+    merge-state-vocab:begin partition=LIVE_STATES 'queued' | 'verifying' | 'gate' | 'finalizing'
+    merge-state-vocab:end
+    """
+'''
 
 _TWO_SPANS = """\
 <!-- merge-state-vocab:begin partition=LIVE_STATES -->
@@ -921,6 +1025,41 @@ def test_extract_spans_reads_a_single_line_begin_comment() -> None:
 
     assert [name for name, _ in spans] == ["LIVE_STATES"]
     assert "finalizing" in spans[0][1]
+
+
+def test_extract_spans_reads_a_begin_comment_whose_opener_is_on_its_own_line() -> None:
+    """`<!--` above the marker is still the COMMENT carrier, not the bare one.
+
+    The carrier decision is structural (`_opens_inside_html_comment`) precisely so
+    this shape cannot fall through to the bare branch, where the begin comment's
+    pointer prose — `already_merged` and all — would be read as span content and
+    the comparison would fail for a reason that has nothing to do with the list.
+    """
+    spans = extract_spans(_MULTILINE_OPENER_SPAN, source=_FIXTURE_SOURCE)
+
+    assert [name for name, _ in spans] == ["LIVE_STATES"]
+    body = spans[0][1]
+    assert "finalizing" in body
+    assert "Mirrors shared/src/shared/merge_state.py" not in body, "begin comment leaked in"
+    assert "already_merged" not in body, "begin comment's decoy leaked in"
+    # The values equal the partition exactly — the assertion the live sites make.
+    values = extract_values(body, vocabulary_values(load_vocabulary()), source=_FIXTURE_SOURCE)
+    assert values == frozenset({"queued", "verifying", "gate", "finalizing"})
+
+
+def test_extract_spans_keeps_the_values_on_a_bare_markers_own_line() -> None:
+    """A one-line bare span keeps its own remainder as the body.
+
+    The bare carrier has no comment body to strip, so text after the marker is
+    span content. Dropping it produced an EMPTY body, which `extract_values`
+    reports as "this list lost every member" — sending a reader to fix a list
+    that is intact.
+    """
+    spans = extract_spans(_SINGLE_LINE_BARE_SPAN, source="server.py")
+
+    assert [name for name, _ in spans] == ["LIVE_STATES"]
+    values = extract_values(spans[0][1], vocabulary_values(load_vocabulary()), source="server.py")
+    assert values == frozenset({"queued", "verifying", "gate", "finalizing"})
 
 
 def test_extract_spans_reads_every_span_in_order() -> None:
@@ -1306,7 +1445,7 @@ def test_pinned_sites_all_exist(relative_path: str) -> None:
     """
     assert _is_tracked(relative_path), (
         f"{relative_path} is in PINNED_SITES but is not tracked by git (task 4829) — "
-        f"{PINNED_SITES[relative_path]}. Either the file was renamed (update the "
+        f"{PINNED_SITES[relative_path][1]}. Either the file was renamed (update the "
         f"registry) or it was deleted (drop the entry)."
     )
     assert (REPO_ROOT / relative_path).is_file(), (
@@ -1315,19 +1454,36 @@ def test_pinned_sites_all_exist(relative_path: str) -> None:
 
 
 @pytest.mark.parametrize("relative_path", sorted(PINNED_SITES))
-def test_every_pinned_site_carries_at_least_one_span(relative_path: str) -> None:
-    """Each registered site still carries its `merge-state-vocab` markers.
+def test_every_pinned_site_carries_exactly_its_declared_spans(relative_path: str) -> None:
+    """Each registered site still carries EVERY `merge-state-vocab` span it declares.
 
     Separated from the equality check below because the two failures mean
-    different things: a MISSING span means the pin itself was lost (the list is
+    different things: a missing span means the pin itself was lost (the list is
     now free to drift with nothing red), while a mismatched span means the pin
     is working and caught something.
+
+    The comparison is a MULTISET of partition names, not a count and not a set:
+    counting would let one span be swapped for another, and a set would let
+    `skills/unblock-low-risk/SKILL.md` lose one of its two LIVE_STATES spans
+    silently. Extra spans fail too — a span nobody declared is either a real new
+    list (declare it) or a stray marker (delete it).
     """
+    expected, description = PINNED_SITES[relative_path]
     text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
     spans = extract_spans(text, source=relative_path)
+    found = [name for name, _ in spans]
 
-    assert spans, f"{relative_path}: no spans — {PINNED_SITES[relative_path]}"
+    assert collections.Counter(found) == collections.Counter(expected), (
+        f"{relative_path}: pins {sorted(found)!r} but PINNED_SITES declares "
+        f"{sorted(expected)!r} (task 4829) — {description}. A DECLARED-but-absent "
+        f"partition means that span's markers were deleted while its list stayed "
+        f"behind, free to drift with nothing red (`extract_spans` cannot see an "
+        f"unmarked list, and the registry scan skips registered files by "
+        f"construction). A FOUND-but-undeclared one means a new list was wrapped "
+        f"without being declared here. Fix the file, or update the declaration if "
+        f"the change was intended."
+    )
 
 
 @pytest.mark.parametrize("relative_path", sorted(PINNED_SITES))
@@ -1354,6 +1510,26 @@ def test_every_span_matches_its_partition(relative_path: str) -> None:
             source=relative_path,
             partition_name=partition_name,
         )
+
+
+def test_registry_declares_only_known_partitions() -> None:
+    """Every partition name a registered site declares is one this guard can compare.
+
+    A typo here (`TERMINAL_STATUSES`) would otherwise surface as "this file pins
+    the wrong partitions", sending a reader to edit a SKILL.md that is correct.
+    Same contract as `extract_spans`' check on the `partition=` markers, applied
+    to the other side of the comparison.
+    """
+    declared = {
+        name for expected, _ in PINNED_SITES.values() for name in expected
+    }
+    unknown = sorted(declared - set(_REQUIRED_PARTITIONS))
+
+    assert not unknown, (
+        f"PINNED_SITES declares {unknown!r}, which name no partition of "
+        f"{_repo_relative(_VOCABULARY_MODULE)} (task 4829). Known partitions are "
+        f"{list(_REQUIRED_PARTITIONS)}."
+    )
 
 
 def test_registry_is_complete() -> None:
