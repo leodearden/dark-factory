@@ -1002,6 +1002,81 @@ def strip_js_comments(source: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# window.DF_CHARTS namespace destructure/export parsing.
+#
+# charts.jsx publishes its components as `window.DF_CHARTS = { ... }` and each
+# consumer picks them up with `const { ... } = window.DF_CHARTS`.  Several
+# suites parse those two lines rather than hardcoding a component list, so the
+# list they check against can never drift from what the files actually say.
+#
+# `destructure_bindings` returns (canonical, local) PAIRS, and each caller
+# projects the half it needs.  This is not fussiness — the three consumers it
+# replaces answer OPPOSITE questions over the identical line:
+#   test_charts_consumer_bindings wants the LOCAL/alias name  — what the file
+#       must actually reference, since the alias is what it renders by;
+#   test_charts_axis_labels wants the CANONICAL/source name   — what must
+#       actually exist on the namespace object;
+#   test_tab_burndown wants BOTH, as an alias -> canonical map.
+# On tabs.jsx's real `HistBar: HB` those are 'HB' and 'HistBar'.  A primitive
+# that picked one side would silently INVERT one of the two suites, which is
+# precisely the canonical-vs-alias slip test_charts_consumer_bindings.py
+# freezes a negative-control fixture against.
+#
+# The list shape is load-bearing for the same reason: order is preserved and
+# duplicates are NOT collapsed, because the callers' own collection shapes
+# differ (dict last-wins / ordered list keeping duplicates / deduped set).
+# Share the parser, not the policy — each consumer also keeps its own
+# search-vs-finditer choice and its own miss behaviour.
+#
+# The `[^{}]*` class in both patterns is brace-HOSTILE ON PURPOSE and must NOT
+# be widened.  Two independent reasons, from the two suites that documented it:
+#   - Widening to swallow the other DF_CHARTS access shapes is actively wrong,
+#     not merely extra work: a namespace binding's own name IS used, so a naive
+#     extension flags it as a false positive; and member reads off a namespace
+#     object are not statically enumerable the way a destructure list is.  The
+#     defect these suites exist to catch can only exist in the destructure
+#     shape anyway.
+#   - A NESTED brace must fail loudly at the call site that names the coupling,
+#     rather than yield a half-read binding list that turns a downstream
+#     assertion red with an unrelated-looking message.  Three call sites turn
+#     the miss into a self-naming assertion for exactly that reason.
+#
+# Contract: test_jsx_source_helpers.py::TestDfChartsDestructure.
+# ---------------------------------------------------------------------------
+
+DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
+"""The CONSUMER shape: `const { Foo, Bar: B } = window.DF_CHARTS`."""
+
+DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
+"""The PROVIDER shape: `window.DF_CHARTS = { Foo, Bar }` in charts.jsx."""
+
+
+def destructure_bindings(brace_body: str) -> list[tuple[str, str]]:
+    """Split a destructure/object-literal brace body into (canonical, local) pairs.
+
+    *brace_body* is the inside of the braces — typically ``m.group(1)`` from one
+    of the two patterns above, though the surrounding braces are harmless.
+
+    ``{ StackedAreaChart, HistBar: HB }`` yields
+    ``[('StackedAreaChart', 'StackedAreaChart'), ('HistBar', 'HB')]``: a bare
+    name is BOTH canonical and local; an aliased one splits on the FIRST colon,
+    canonical left and local right.  Both halves are whitespace-stripped, empty
+    parts (a trailing comma, say) produce no entry, and source ORDER is
+    preserved with DUPLICATES INTACT so each caller can impose its own
+    collection shape.
+    """
+    pairs: list[tuple[str, str]] = []
+    for part in brace_body.strip().strip('{}').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        canonical, _, alias = part.partition(':')
+        canonical = canonical.strip()
+        pairs.append((canonical, alias.strip() or canonical))
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # window.DF_DATA seed-block extraction.
 #
 # The dashboard's served data.js carries its fixture payload as a
