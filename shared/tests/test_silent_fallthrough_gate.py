@@ -22,11 +22,13 @@ References:
 from __future__ import annotations
 
 import textwrap
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import pytest
 from silent_fallthrough_scan import (
     KNOWN_VALUE_ERROR_RESOLVERS,
+    ParsedFile,
     Violation,
     find_violations,
     find_violations_in_tree,
@@ -740,7 +742,7 @@ class _TreeScanData(NamedTuple):
     parse_failures: list    # list[str]
 
 
-def _build_tree_scan_data(records) -> _TreeScanData:
+def _build_tree_scan_data(records: Sequence[ParsedFile]) -> _TreeScanData:
     """Derive the gate's inputs from already-parsed :class:`ParsedFile` records.
 
     A WALK and nothing else — no read, no parse. Both were done once, for the
@@ -765,8 +767,16 @@ def _build_tree_scan_data(records) -> _TreeScanData:
         if record.syntax_error is not None:
             parse_failures.append(f"{record.path}: {record.syntax_error}")
             continue
+        # tree XOR syntax_error is a ParsedFile invariant, but it is documented
+        # prose rather than something a type checker can see — narrow it
+        # explicitly, and assert it so a broken invariant fails loudly here.
+        tree = record.tree
+        assert tree is not None, (
+            f"{record.path}: ParsedFile carries neither a tree nor a "
+            f"syntax_error — silent_fallthrough_scan.ParsedFile invariant broken"
+        )
         violations.extend(
-            find_violations_in_tree(record.tree, record.relpath, record.source)
+            find_violations_in_tree(tree, record.relpath, record.source)
         )
     violation_key_counts: _Counter[tuple[str, str, str]] = _Counter(
         violation_key(v) for v in violations
@@ -780,7 +790,7 @@ def _build_tree_scan_data(records) -> _TreeScanData:
 
 
 @pytest.fixture(scope="session")
-def tree_scan_data(first_party_tree) -> _TreeScanData:
+def tree_scan_data(first_party_tree: Sequence[ParsedFile]) -> _TreeScanData:
     """Scan the first-party tree once per test session.
 
     All integration and integrity tests consume this fixture rather than

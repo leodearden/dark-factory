@@ -28,12 +28,13 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 import silent_fallthrough_scan as sfs
 import test_config_dir_archival_gate as archival_gate
-from silent_fallthrough_scan import iter_first_party_files
+from silent_fallthrough_scan import ParsedFile, iter_first_party_files
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -76,6 +77,21 @@ def isolated_parse_cache(monkeypatch):
     cache: dict = {}
     monkeypatch.setattr(sfs, '_PARSE_CACHE', cache)
     return cache
+
+
+def _parsed_tree(record: ParsedFile) -> ast.Module:
+    """The record's tree, with the ParsedFile XOR invariant narrowed and checked.
+
+    ``tree`` is ``ast.Module | None`` and only prose says it is set whenever
+    ``syntax_error`` is not — which a type checker cannot see. Asserting it here
+    both narrows the type and turns a broken invariant into a named failure
+    instead of an ``AttributeError`` several frames deeper.
+    """
+    assert record.tree is not None, (
+        f'{record.relpath}: ParsedFile carries neither a tree nor a '
+        f'syntax_error — silent_fallthrough_scan.ParsedFile invariant broken'
+    )
+    return record.tree
 
 
 class _WorkCounter:
@@ -386,7 +402,9 @@ class TestFindViolationsInTree:
 # ---------------------------------------------------------------------------
 
 
-def _prefix_tree_scan_reference(records):
+def _prefix_tree_scan_reference(
+    records: Sequence[ParsedFile],
+) -> tuple[list[Path], list[sfs.Violation], list[str]]:
     """Recompute the gate's inputs with the PRE-4520 loop's plumbing.
 
     Reproduces the old fixture statement for statement — the same
@@ -421,8 +439,8 @@ def _prefix_tree_scan_reference(records):
     """
     files = list(iter_first_party_files(_REPO_ROOT))
     by_path = {record.path: record for record in records}
-    violations = []
-    parse_failures = []
+    violations: list[sfs.Violation] = []
+    parse_failures: list[str] = []
     for filepath in files:
         record = by_path[filepath]
         rel = str(filepath.relative_to(_REPO_ROOT))
@@ -430,7 +448,7 @@ def _prefix_tree_scan_reference(records):
             parse_failures.append(f'{filepath}: {record.syntax_error}')
             continue
         violations.extend(
-            sfs.find_violations_in_tree(record.tree, rel, record.source)
+            sfs.find_violations_in_tree(_parsed_tree(record), rel, record.source)
         )
     return files, violations, parse_failures
 
@@ -563,7 +581,9 @@ class TestSilentFallthroughGateUsesTheSharedTree:
 _TRACKED_FILE_BUDGET = 40
 
 
-def _unfiltered_archival_scan(records):
+def _unfiltered_archival_scan(
+    records: Sequence[ParsedFile],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """The archival scan with NO prefilter — a parent map for every file.
 
     The pre-4520 ``_scan`` body, verbatim apart from taking already-parsed
@@ -571,11 +591,12 @@ def _unfiltered_archival_scan(records):
     multiset: the argument that a source-text prefilter cannot drop a site is
     sound, but this asserts it rather than trusting it.
     """
-    sites = []
-    archival_refs = []
+    sites: list[tuple[str, str]] = []
+    archival_refs: list[tuple[str, str]] = []
     for record in records:
-        parent_map = sfs._build_parent_map(record.tree)
-        for node in ast.walk(record.tree):
+        tree = _parsed_tree(record)
+        parent_map = sfs._build_parent_map(tree)
+        for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id in archival_gate._ARCHIVAL_NAMES:
                 archival_refs.append(
                     (record.relpath, sfs._compute_qualname(node, parent_map))

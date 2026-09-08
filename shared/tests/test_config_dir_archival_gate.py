@@ -28,11 +28,12 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from config_dir_archival_allowlist import ARCHIVED, AUDITED_SITES, DISPOSITIONS
-from silent_fallthrough_scan import _build_parent_map, _compute_qualname
+from silent_fallthrough_scan import ParsedFile, _build_parent_map, _compute_qualname
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -59,7 +60,7 @@ _ARCHIVAL_NAMES = frozenset({'archive_task_transcripts', 'archive_before_delete'
 _TRACKED_NAMES = _ARCHIVAL_NAMES | {'TaskConfigDir'}
 
 
-def _scan(records) -> tuple[list[_SiteKey], list[_SiteKey]]:
+def _scan(records: Sequence[ParsedFile]) -> tuple[list[_SiteKey], list[_SiteKey]]:
     """Return ``(construction_sites, archival_reference_sites)``.
 
     One AST walk yields both halves of the audit:
@@ -132,9 +133,18 @@ def _scan(records) -> tuple[list[_SiteKey], list[_SiteKey]]:
             continue
         if record.syntax_error is not None:
             raise record.syntax_error
-        parent_map = _build_parent_map(record.tree)
+        # tree XOR syntax_error is a ParsedFile invariant, but it is documented
+        # prose rather than something a type checker can see, so narrow it
+        # explicitly — and assert it, so a provider that ever broke the
+        # invariant fails here instead of raising AttributeError deeper in.
+        tree = record.tree
+        assert tree is not None, (
+            f'{record.relpath}: ParsedFile carries neither a tree nor a '
+            f'syntax_error — silent_fallthrough_scan.ParsedFile invariant broken'
+        )
+        parent_map = _build_parent_map(tree)
         rel = record.relpath
-        for node in ast.walk(record.tree):
+        for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id in _ARCHIVAL_NAMES:
                 archival_refs.append((rel, _compute_qualname(node, parent_map)))
                 continue
@@ -154,7 +164,9 @@ def _scan(records) -> tuple[list[_SiteKey], list[_SiteKey]]:
 
 
 @pytest.fixture(scope='session')
-def scan_result(first_party_tree) -> tuple[list[_SiteKey], list[_SiteKey]]:
+def scan_result(
+    first_party_tree: Sequence[ParsedFile],
+) -> tuple[list[_SiteKey], list[_SiteKey]]:
     """Scan the shared first-party tree once per SESSION, not once per module.
 
     Session-scoped since task 4520: this gate used to re-enumerate, re-read and
