@@ -43,15 +43,6 @@ import httpx
 
 from dashboard.config import DashboardConfig
 
-# The uvicorn `timeout_keep_alive` default that the escalation MCP servers run
-# on (orchestrator/src/orchestrator/harness.py sets no override) — also
-# httpx's own stock keepalive_expiry. Used below only as a fixed reference
-# point to pin the shipped configuration's value; keepalive_expiry does NOT
-# need to sit below this to avoid a race — see
-# dashboard/src/dashboard/app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS for why the
-# setting can never pre-empt a server-side close regardless of its value.
-_UVICORN_KEEPALIVE_DEFAULT = 5.0
-
 # merge_halt.py's module docstring names a "3s polling loop". keepalive_expiry
 # must sit strictly ABOVE this or a connection never survives one poll cycle
 # and every cycle pays a fresh handshake.
@@ -88,37 +79,30 @@ class TestBuildHttpLimits:
         limits = _build_http_limits(_config(tmp_path, escalation=1, fused=1))
         assert isinstance(limits, httpx.Limits)
 
-    def test_keepalive_expiry_is_armed_and_bounds_reuse_staleness(
+    def test_keepalive_expiry_pins_the_shipped_value_above_the_poll_interval(
         self, tmp_path,
     ):
-        """Armed (not None) and sits in a band that still lets reuse happen.
+        """Pins the shipped value, plus the one band assertion with a real reason.
 
         keepalive_expiry is evaluated only lazily, at pool reuse, with no
         background reaper (see
         ``dashboard/src/dashboard/app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS`` for
-        the verified mechanism) — so it does NOT race, undercut, or win
-        against either server's close. This pins the shipped configuration:
-        the knob is armed rather than left ``None``, and sits in a band that
-        still lets a connection survive one ~3s poll cycle instead of paying
-        a fresh handshake every time.
+        the verified mechanism), so it neither races nor pre-empts any
+        server-side close, regardless of its value. This test pins the
+        shipped number itself — omitting the kwarg would silently fall back
+        to httpx's stock 5.0 instead — plus the one band that carries a true,
+        independent rationale: a pooled connection must survive one ~3s poll
+        cycle or pooling is defeated and every poll pays a fresh handshake.
         """
-        from dashboard.app import _build_http_limits
+        from dashboard.app import _HTTP_KEEPALIVE_EXPIRY_SECONDS, _build_http_limits
 
         expiry = _build_http_limits(_config(tmp_path, escalation=1, fused=1)).keepalive_expiry
 
-        assert expiry is not None, (
-            'keepalive_expiry must be armed, not left None — omitting the '
-            'argument leaves the age-based expiry check permanently unarmed '
-            '(httpcore never sets _expire_at), an unmeasured, strictly '
-            'looser configuration than what ships today'
-        )
-        assert expiry < _UVICORN_KEEPALIVE_DEFAULT, (
-            f'keepalive_expiry={expiry} pins the shipped configuration below '
-            f'the {_UVICORN_KEEPALIVE_DEFAULT}s reference value — this is not '
-            f'a race threshold (the setting cannot pre-empt a server-side '
-            f'close; see dashboard/src/dashboard/app.py::'
-            f'_HTTP_KEEPALIVE_EXPIRY_SECONDS), just a pin on the number that '
-            f'shipped'
+        assert expiry == _HTTP_KEEPALIVE_EXPIRY_SECONDS, (
+            f'keepalive_expiry={expiry} must equal the shipped '
+            f'_HTTP_KEEPALIVE_EXPIRY_SECONDS={_HTTP_KEEPALIVE_EXPIRY_SECONDS} — '
+            f'omitting the kwarg would silently fall back to httpx stock 5.0 '
+            f'instead'
         )
         assert expiry > _DASHBOARD_POLL_INTERVAL, (
             f'keepalive_expiry={expiry} is at-or-below the ~{_DASHBOARD_POLL_INTERVAL}s '
