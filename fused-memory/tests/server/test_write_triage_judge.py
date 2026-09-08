@@ -1463,6 +1463,124 @@ class TestJudgeWriteAnthropicArm:
         assert verdict == OUTCOME_RESTATED
 
 
+class TestTheClientIsReleased:
+    """The SDK client is built per middle-band write and must not be leaked.
+
+    `_call_llm` constructs `AsyncOpenAI`/`AsyncAnthropic` on every triaged
+    write. Neither defines `__del__` (verified against openai 2.31.0), so an
+    unclosed client abandons an `httpx` connection pool — sockets and TLS
+    state — to the garbage collector, on a path that runs once per write in a
+    single long-lived server process.
+
+    The per-call CONSTRUCTION is deliberate and stays: a cached client keyed
+    to a config that hot-reloads would pin a stale `model`/`api_url` past a
+    reload the operator was told had applied, silently turning a green-tier
+    knob into a restart-only one. That rationale is fully preserved by
+    closing the client at the end of the call, which is what these tests pin.
+    """
+
+    @staticmethod
+    def _closing(client: MagicMock) -> MagicMock:
+        """Wrap *client* so `async with` yields it and records the exit."""
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released_on_the_happy_path(self) -> None:
+        client = self._closing(_openai_client(_payload('restates')))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_anthropic_client_is_released_on_the_happy_path(self) -> None:
+        client = self._closing(
+            _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends'))]),
+        )
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('provider', 'ctor', 'attr'),
+        [
+            ('openai', 'openai.AsyncOpenAI', 'chat'),
+            ('anthropic', 'anthropic.AsyncAnthropic', 'messages'),
+        ],
+        ids=['openai', 'anthropic'],
+    )
+    async def test_the_client_is_released_on_the_timeout_path(
+        self, provider: str, ctor: str, attr: str,
+    ) -> None:
+        """The WORST case, and the one an `await ...; close()` shape misses.
+
+        `asyncio.wait_for` CANCELS the in-flight request, so a close written
+        after the awaited call never runs — the pool is abandoned precisely
+        when the provider is slow, i.e. exactly when writes are piling up.
+        """
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = self._closing(MagicMock())
+        if provider == 'openai':
+            client.chat.completions.create = AsyncMock(side_effect=_hang)
+        else:
+            client.messages.create = AsyncMock(side_effect=_hang)
+        with patch(ctor, return_value=client), pytest.raises(TimeoutError):
+            await judge_write(
+                memory_service=_judge_svc(provider, judge_timeout_seconds=0.01),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_client_is_released_when_the_transport_raises(self) -> None:
+        """A release must not depend on the call having succeeded."""
+        client = self._closing(MagicMock())
+        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(RuntimeError):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_releasing_does_not_swallow_the_failure(self) -> None:
+        """`async with` is not an exception handler — INV-4 depends on this.
+
+        A release that suppressed the exception would hand `triage_write` a
+        silent success, and `_call_llm`'s "NO try/except ANYWHERE" property
+        would be gone: no `exc_info` log, no counted fail-open, and a broken
+        judge reading exactly like a healthy one. The `__aexit__` doubles
+        above return False for the same reason; this pins that the real code
+        does not rely on one returning True.
+        """
+        client = self._closing(MagicMock())
+        client.__aexit__ = AsyncMock(return_value=True)
+        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(RuntimeError):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+
 class TestJudgeWriteFailuresRaise:
     """Every failure PROPAGATES. `triage_write` owns the fail-open counting.
 
