@@ -1118,10 +1118,13 @@ _MEASURED_DRIFT_ROWS = (
     (
         "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml", 2906, "α4",
         "enforcement-matrix-suite-exists",
-        # BENIGN — both spellings deliver. Resynced anyway so the sweep can
-        # assert zero drift rather than carrying an allowlist.
+        # RE-REPAIRED ON BOTH SIDES (task 4783): the docstring-prose anchor
+        # broke silently if anyone reworded the docstring, so this row now
+        # anchors on the suite's own class identifier instead — same rule as
+        # the γ1/3536 row below. See
+        # test_alpha4_anchor_is_an_identifier_inside_the_certified_suite.
         _grep("test_sandbox_enforcement_matrix", ["orchestrator/tests/"]),
-        _grep("Landlock enforcement-matrix suite", ["orchestrator/tests/"]),
+        _grep("TestSandboxEnforcementMatrix", ["orchestrator/tests/"]),
     ),
     (
         "plans/task-escalation-state-graph-prd.capability-manifest.yaml", 3534, "η0",
@@ -1378,4 +1381,82 @@ def test_live_sidecars_carry_the_resynced_descriptors(
         f"would re-stamp the stale spelling over the repair), OR this check was "
         f"legitimately re-repaired on BOTH sides since — in which case update "
         f"this row's `resynced` element and see this test's maintenance contract."
+    )
+
+
+def test_alpha4_anchor_is_an_identifier_inside_the_certified_suite():
+    """The α4 (task 2906) delivered-check pattern must name a definition the
+    suite OWNS, not prose it merely contains.
+
+    This is a NON-VACUITY + DISCRIMINATION guard, distinct from the exact-
+    descriptor pin above. `test_live_sidecars_carry_the_resynced_descriptors`
+    only proves the tasks.db side and the sidecar AGREE with each other; it
+    is blind to whether the agreed-upon pattern still matches anything on
+    main, or whether it merely happens to appear inside prose that is free
+    to be reworded independently of the suite it describes. Nothing else
+    would notice a break here: the audit sweep needs the gitignored
+    tasks.db and can never run in CI.
+
+    This test greps the TRACKED tree for the sidecar's OWN pattern — read
+    off the sidecar via load_capability_manifest, never hardcoded here, so
+    it tracks whatever the sidecar actually ships — using the working-tree
+    form of the exact production argv
+    (orchestrator/src/orchestrator/delivered_checks.py::_run_grep_check:
+    `git -C <root> grep -E -e <pattern> <ref> -- <paths>`), and asserts:
+      (a) it matches at least one line — the non-vacuity floor: a delivered
+          check that matches nothing silently fails the delta gate on main;
+      (b) every match is inside test_sandbox_enforcement_matrix.py — the
+          anchor must not leak onto a sibling suite (the pre-4545 spelling
+          `test_sandbox_enforcement_matrix` did, at test_landlock.py:53);
+      (c) at least one match, `lstrip()`ed, starts with "class " or "def " —
+          the anchor names a definition the suite owns, not prose it merely
+          contains. This is what makes the test discriminating: the prior
+          module-docstring-prose anchor's only hit was the docstring line
+          itself and fails this assertion.
+
+    Scoped to the α4 row ONLY, not generalized over all eight measured rows:
+    the 3618 row is DELIBERATELY superseded and failing by design (`expect:
+    absent` on `gzip.open`, which task 3578 restored — confirmed present in
+    shared/src/shared/transcript_archive.py), so a corpus-wide
+    satisfiability sweep would be a doomed assertion.
+    """
+    root = _repo_root()
+    if root is None:
+        pytest.skip("not a git checkout")
+
+    relpath = "plans/os-sandbox-worktree-containment-prd.capability-manifest.yaml"
+    doc = load_capability_manifest(Path(root) / relpath)
+    matches = [
+        cap for task in doc.tasks if task.label == "α4"
+        for cap in task.capabilities if cap.name == "enforcement-matrix-suite-exists"
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one enforcement-matrix-suite-exists capability "
+        f"under label α4 in {relpath}, found {len(matches)}"
+    )
+    check = matches[0].delivered_check
+    assert check is not None
+
+    completed = subprocess.run(
+        ["git", "-C", root, "grep", "-E", "-n", "-e", check.pattern, "--",
+         *check.paths],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 0, (
+        f"pattern {check.pattern!r} matched nothing under {check.paths!r}; "
+        f"the delivered check would silently fail on main "
+        f"(stderr: {completed.stderr!r})"
+    )
+    parsed = [line.split(":", 2) for line in completed.stdout.splitlines() if line]
+    assert parsed, "grep reported rc=0 but produced no output lines"
+
+    paths_matched = {fields[0] for fields in parsed}
+    assert paths_matched == {"orchestrator/tests/test_sandbox_enforcement_matrix.py"}, (
+        f"anchor {check.pattern!r} leaked outside the certified suite: "
+        f"{sorted(paths_matched)}"
+    )
+
+    assert any(fields[2].lstrip().startswith(("class ", "def ")) for fields in parsed), (
+        f"anchor {check.pattern!r} does not name a definition the suite "
+        f"owns — no matched line starts with 'class '/'def ' after lstrip()"
     )
