@@ -201,12 +201,22 @@ def _require_systemd_user_manager() -> None:
 # Per-invocation isolation: a unique throwaway template name
 # ---------------------------------------------------------------------------
 
-# The single shared constant.  _unique_template() GENERATES names with this
-# prefix and _prune_stale_selftest_units() only ever DELETES names with it, so
-# "the prune can never touch a real unit" is structural rather than a pair of
-# string literals free to drift apart.  It cannot prefix-match `lms-arm@` (the
-# real unit the script under test targets) or any dark-factory unit.
-_SELFTEST_PREFIX = "lms-dropin-selftest-"
+# The single shared stem.  _unique_template() GENERATES names with
+# _SELFTEST_PREFIX and _prune_stale_selftest_units() DELETES names with
+# _SELFTEST_PREFIX or exactly equal to _DEFAULT_TEMPLATE, so "the prune can
+# never touch a real unit" is structural rather than a set of string literals
+# free to drift apart.  Neither can prefix-match `lms-arm@` (the real unit the
+# script under test targets) or any dark-factory unit.
+#
+# Two names rather than one widened prefix, on purpose: the generator binds
+# ONLY _SELFTEST_PREFIX, so a real unit can never be generated into pruning
+# scope; the prune additionally recognises the ONE fixed default name a
+# by-hand run falls back to (see the .sh's TEMPLATE= line, pinned above by
+# test_default_template_constant_matches_the_shell_default).  Both descend
+# from _SELFTEST_STEM so they cannot drift apart from each other.
+_SELFTEST_STEM = "lms-dropin-selftest"
+_SELFTEST_PREFIX = f"{_SELFTEST_STEM}-"  # what _unique_template() generates
+_DEFAULT_TEMPLATE = f"{_SELFTEST_STEM}@"  # what the .sh falls back to by hand
 
 
 def _unique_template() -> str:
