@@ -96,6 +96,22 @@ class PsiSample:
     ``read_ok=False`` is the DA-D6 fail-open sentinel (see ``read_psi_sample``):
     an unreadable or unparseable /proc/pressure/* file degrades the whole
     sample rather than partially gating on incomplete data.
+
+    v2 (PRD ``plans/load-throttle-harmonisation-prd.md`` §6.1) appends five
+    defaulted fields carrying two further, independently-read components:
+
+    - ``runqueue_ratio`` — ``procs_running`` from /proc/stat divided by
+      ``len(os.sched_getaffinity(0))``; ``runqueue_read_ok`` says whether that
+      read succeeded (see ``read_runqueue_ratio``).
+    - ``own_cpu_some10`` — the ``some avg10`` of the READING PROCESS's own
+      cgroup ``cpu.pressure``; ``own_cgroup`` is the cgroup path actually read
+      (``''`` when none was resolved) and ``own_read_ok`` says whether that
+      read succeeded (see ``read_own_cgroup_pressure``).
+
+    Each component carries its own ok flag so a partially-degraded sample is
+    distinguishable from a healthy one BY VALUE rather than collapsing to a
+    flat sentinel. The defaults are the "component absent" reading, so every
+    shipped keyword construction stays valid.
     """
 
     cpu_some10: float
@@ -103,6 +119,11 @@ class PsiSample:
     mem_full10: float
     io_some10: float
     read_ok: bool
+    runqueue_ratio: float = 0.0
+    runqueue_read_ok: bool = False
+    own_cpu_some10: float = 0.0
+    own_cgroup: str = ''
+    own_read_ok: bool = False
 
     def saturated(self, cfg) -> bool:
         """Return True if any PSI metric is at/over its configured avg10 threshold.
