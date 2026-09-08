@@ -1938,7 +1938,27 @@ class TestReferentFindingOperatorLog:
         assert 'set-membership' in payload
 
     @pytest.mark.asyncio
-    async def test_no_finding_is_reported_at_debug_only(self, service, caplog):
+    async def test_the_finding_is_reported_at_warning_and_not_at_debug(
+        self, service, caplog,
+    ):
+        """BOTH halves of the claim, inside ONE debug-level capture.
+
+        The shape this replaces (`test_no_finding_is_reported_at_debug_only`)
+        was NEGATIVE-ONLY: capturing at DEBUG, it asserted merely that no DEBUG
+        record named the check. That is trivially true of a `logger.debug` this
+        pass never makes, so it passed unchanged with the `logger.warning`
+        emission deleted outright — precisely the regression its name claimed to
+        guard. Verified by mutation before this rewrite landed: with the
+        emission removed the old test still passed and this one fails. Do not
+        restore the negative-only shape; "not at DEBUG" means nothing unless it
+        sits beside "and IS at WARNING".
+
+        The fixture is deliberately NON-CORROBORATED (its fact cites nothing),
+        so the INFO demotion does not apply to it, and it produces ONE finding,
+        so the per-episode warning cap does not either. Both would otherwise
+        change the expected level for reasons that have nothing to do with what
+        this test pins.
+        """
         with caplog.at_level(logging.DEBUG,
                              logger='fused_memory.services.memory_service'):
             await service._verify_episode_referents(
@@ -1946,10 +1966,9 @@ class TestReferentFindingOperatorLog:
                 referents=(Referent(number='3127'),),
             )
 
-        debug_only = [r for r in caplog.records
-                      if r.levelno == logging.DEBUG and 'set-membership' in
-                      r.getMessage()]
-        assert not debug_only
+        emitted = _records_for(caplog, 'e1')
+        assert [r.levelno for r in emitted] == [logging.WARNING]
+        assert 'set-membership' in emitted[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_a_clean_episode_logs_no_warning(self, service, caplog):
@@ -2780,3 +2799,4 @@ class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
                 _one_membership_finding_episode(), group_id='dark_factory',
                 referents=(Referent(number='3127'),),
             )
+
