@@ -29,8 +29,11 @@ from pathlib import Path
 
 import pytest
 from _dashboard_helpers import (
+    DF_CHARTS_DESTRUCTURE_RE,
+    DF_CHARTS_EXPORT_RE,
     ScriptTagCollector,
     assert_script_loads_before,
+    destructure_bindings,
     extract_df_data_block,
     extract_function_body,
     find_function_params,
@@ -567,6 +570,100 @@ class TestFindFunctionParams:
             find_function_params(
                 src, 'Foo', miss=lambda what: AssertionError(f'{sentinel}: {what}'),
             )
+
+
+class TestDfChartsDestructure:
+    """The shared `window.DF_CHARTS` destructure/export parser.
+
+    The primitive returns (canonical, local) PAIRS rather than one side,
+    because the three consumers it replaces project OPPOSITE halves of the
+    same line: test_charts_consumer_bindings wants the LOCAL/alias name (what
+    the file must actually reference), test_charts_axis_labels wants the
+    CANONICAL/source name (what must exist on the namespace object), and
+    test_tab_burndown wants both at once.  On `HistBar: HB` those are `'HB'`
+    and `'HistBar'` — disjoint — so a primitive that picked a side would
+    silently invert one suite.
+    """
+
+    def test_a_bare_name_is_both_canonical_and_local(self) -> None:
+        assert destructure_bindings('{ StackedAreaChart }') == [
+            ('StackedAreaChart', 'StackedAreaChart'),
+        ]
+
+    def test_an_alias_splits_canonical_left_local_right(self) -> None:
+        """`Canonical: alias` — the source name binds to the local name."""
+        assert destructure_bindings('{ StackedAreaChart, HistBar: HB }') == [
+            ('StackedAreaChart', 'StackedAreaChart'),
+            ('HistBar', 'HB'),
+        ]
+
+    def test_it_splits_on_the_first_colon_only(self) -> None:
+        assert destructure_bindings('a: b: c') == [('a', 'b: c')]
+
+    def test_both_halves_are_whitespace_stripped(self) -> None:
+        assert destructure_bindings('\n   HistBar   :   HB   \n') == [
+            ('HistBar', 'HB'),
+        ]
+
+    def test_empty_parts_and_trailing_commas_produce_no_entry(self) -> None:
+        assert destructure_bindings('A, , B,') == [('A', 'A'), ('B', 'B')]
+
+    def test_source_order_is_preserved_and_duplicates_are_not_collapsed(self) -> None:
+        """The LIST shape is load-bearing — each caller does its own projection.
+
+        consumer_bindings' `_unused_bindings` must report a repeated binding
+        twice; burndown's dict collapses last-wins; axis_labels' set dedupes.
+        Collapsing here would take that choice away from all three.
+        """
+        assert destructure_bindings('A, B, A') == [
+            ('A', 'A'), ('B', 'B'), ('A', 'A'),
+        ]
+
+    def test_the_two_projections_are_opposite_halves(self) -> None:
+        """The `HistBar: HB` case both consumer suites hinge on."""
+        pairs = destructure_bindings('{ StackedAreaChart, HistBar: HB }')
+
+        assert [local for _canonical, local in pairs] == ['StackedAreaChart', 'HB']
+        assert {canonical for canonical, _local in pairs} == {
+            'StackedAreaChart', 'HistBar',
+        }
+
+    def test_destructure_re_matches_the_consumer_shape(self) -> None:
+        src = "const { StackedAreaChart, HistBar: HB } = window.DF_CHARTS;"
+
+        m = DF_CHARTS_DESTRUCTURE_RE.search(src)
+
+        assert m is not None
+        assert destructure_bindings(m.group(1)) == [
+            ('StackedAreaChart', 'StackedAreaChart'), ('HistBar', 'HB'),
+        ]
+
+    def test_export_re_matches_the_provider_shape(self) -> None:
+        src = "window.DF_CHARTS = { StackedAreaChart, LineChart };"
+
+        m = DF_CHARTS_EXPORT_RE.search(src)
+
+        assert m is not None
+        assert {c for c, _ in destructure_bindings(m.group(1))} == {
+            'StackedAreaChart', 'LineChart',
+        }
+
+    def test_a_nested_brace_yields_no_match(self) -> None:
+        """The `[^{}]*` class is brace-HOSTILE by design; do not widen it.
+
+        Three call sites turn this miss into a loud, self-naming failure that
+        points at the nested brace.  Widening it would instead let the parser
+        return a half-read binding list, and a sweep built on that list would
+        go quietly wrong rather than loudly red.
+        """
+        nested = "const { StackedAreaChart, opts: { a: 1 } } = window.DF_CHARTS;"
+
+        assert DF_CHARTS_DESTRUCTURE_RE.search(nested) is None
+
+    def test_export_re_is_equally_brace_hostile(self) -> None:
+        nested = "window.DF_CHARTS = { StackedAreaChart, opts: { a: 1 } };"
+
+        assert DF_CHARTS_EXPORT_RE.search(nested) is None
 
 
 class TestExtractDfDataBlock:
