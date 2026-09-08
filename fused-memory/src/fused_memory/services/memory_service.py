@@ -1641,6 +1641,38 @@ class ReconcileStats:
 #: outright: it "folds in", and is "not a distinct leaf".
 REFERENT_CHECKS: tuple[str, ...] = ('set-membership', 'per-edge-pairing')
 
+#: THE closed vocabulary of finding AXES — the counter buckets that are not
+#: check names (task 3671, PRD leaf zeta). Registered here for the reason
+#: :data:`REFERENT_CHECKS` and :data:`REFERENT_REPAIR_OUTCOMES` are: leaf iota
+#: keys a rate off these names, so a bucket must be REGISTERED rather than
+#: spelled as a bare string at the construction site and again at every reader.
+#:
+#: An AXIS answers an independent question ABOUT a finding; a CHECK names which
+#: rule produced it. Axes increment ALONGSIDE whichever check fired, so
+#: :meth:`MemoryService.referent_finding_counts` deliberately does not sum to
+#: the finding total. The two:
+#:
+#: * ``'unresolvable'`` — no correct target could be determined, so the finding
+#:   is recorded and LEFT ALONE. A numerator over the checks, not a third check.
+#: * ``'corroborated'`` — the edge's own fact names the node it is already
+#:   attached to, so :func:`_candidate_pool`'s corroboration veto emptied the
+#:   pool. A NO-OBSERVABLE-DEFECT row: real and recorded, but not evidence of a
+#:   scanner regression, and the dominant legitimate ``source='metadata'`` write
+#:   shape produces it routinely. Registered as its own axis, and NOT folded out
+#:   of the check bucket, so leaf iota can SUBTRACT it from the membership rate
+#:   — which needs the denominator still there. Conflating it into the check
+#:   would let ordinary ambient-task writes read as a scanner regression, the
+#:   same argument ``'failed'`` makes one register down.
+#:
+#: DELIBERATELY NARROWER THAN "structurally unactionable". `_candidate_pool`'s
+#: other two vetoes (an ambiguous endpoint, a ``source='metadata'`` fallback)
+#: also produce unactionable rows, but neither is derivable from anything the
+#: finding record carries — widening this axis to cover them would require a
+#: stored flag, i.e. a second site that must agree with the guard in lockstep,
+#: which is the drift this whole subsystem is built to avoid. Their volume is
+#: bounded by `_REFERENT_FINDING_WARN_CAP` instead.
+REFERENT_FINDING_AXES: tuple[str, ...] = ('unresolvable', 'corroborated')
+
 #: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
 #: the ``entity_mint.lock_timeout_seconds`` config hop is missing, None or the
 #: wrong type. Matches the schema default; the LIVE config value is what
@@ -2560,13 +2592,14 @@ class MemoryService:
         # vocabulary, so unlike the per-agent storm counters above it needs no
         # pruning.
         #
-        # Keyed off REFERENT_CHECKS so the check vocabulary lives at ONE site
-        # and a third check cannot escape the counter. The extra 'unresolvable'
-        # bucket is a SECOND, ORTHOGONAL axis (whether a finding can be acted on)
-        # rather than a third check, so the buckets deliberately do not sum to
-        # the finding total.
+        # Keyed off REFERENT_CHECKS and REFERENT_FINDING_AXES so BOTH
+        # vocabularies live at ONE site each and neither a third check nor a
+        # third axis can escape the counter. The axes are ORTHOGONAL questions
+        # about a finding (can it be acted on; does its own fact corroborate the
+        # attachment) rather than further checks, so the buckets deliberately do
+        # not sum to the finding total.
         self._referent_finding_counts: dict[str, int] = dict.fromkeys(
-            (*REFERENT_CHECKS, 'unresolvable'), 0,
+            (*REFERENT_CHECKS, *REFERENT_FINDING_AXES), 0,
         )
         # INV-4 storm escape for the REPAIR sub-pass (task 3672, PRD leaf eta):
         # the counter half of the alarm whose fire half is
@@ -4000,6 +4033,11 @@ class MemoryService:
             self._referent_finding_counts[finding.check] += 1
             if not finding.resolvable:
                 self._referent_finding_counts['unresolvable'] += 1
+            if finding.corroborated:
+                # ALONGSIDE the check bucket, never instead of it: leaf iota
+                # SUBTRACTS this axis from the membership rate, which needs the
+                # denominator to still be there. See REFERENT_FINDING_AXES.
+                self._referent_finding_counts['corroborated'] += 1
             # WARNING, not DEBUG. The task calls out today's `logger.debug`-only
             # ReconcileStats shape as unacceptable here, and a misattached edge
             # is a correctness defect an operator should see. This line is the
@@ -5101,15 +5139,25 @@ class MemoryService:
         mirrors :meth:`referent_source_counts` rather than inventing a second
         idiom in this file.
 
-        THE BUCKETS ARE TWO ORTHOGONAL AXES, NOT A PARTITION.
+        THE BUCKETS ARE THREE ORTHOGONAL AXES, NOT A PARTITION.
         ``'set-membership'`` and ``'per-edge-pairing'`` answer "which check
         fired" and do partition the findings between them (they are ordered, so
-        an endpoint failing both is counted once, under membership).
-        ``'unresolvable'`` answers the independent question "could a correct
-        target be determined at all", and increments ALONGSIDE whichever check
-        fired. So the three counts intentionally do not sum to the finding
-        total, and ``unresolvable`` is a numerator over the other two, not a
-        third category.
+        an endpoint failing both is counted once, under membership). The other
+        two — :data:`REFERENT_FINDING_AXES` — each answer an independent
+        question and increment ALONGSIDE whichever check fired, so the counts
+        intentionally do not sum to the finding total and are numerators over
+        the checks rather than further categories:
+
+        * ``'unresolvable'`` — could a correct target be determined at all?
+        * ``'corroborated'`` — does the edge's OWN FACT name the node it is
+          already attached to? SUBTRACT this from the membership rate. Such a
+          finding is real and is recorded, but it has no observable defect:
+          ``_candidate_pool``'s corroboration veto already emptied its pool, and
+          the dominant legitimate write shape produces it routinely (an agent
+          dispatched on task 3668 writing about Task 2500). Counting it as a
+          membership hit would let ordinary ambient-task writes read as a
+          scanner regression — the same argument ``'failed'`` makes in
+          :data:`REFERENT_REPAIR_OUTCOMES`.
 
         Every bucket exists from construction, so a reader never has to
         distinguish "zero" from "absent". Returns a COPY, so a caller cannot
