@@ -607,6 +607,86 @@ def find_protected_markers(members: list[dict]) -> list[dict]:
     return [m for m in members if is_protected_mirror_record(m.get('metadata'))]
 
 
+def find_undrainable_markers(
+    members: list[dict],
+    drained_ids: set[str] | frozenset[str],
+) -> list[dict]:
+    """Return the PERMANENT floor on ``after.total_source`` for this run.
+
+    The enumerated members no invocation of this sweep can reach, minus the
+    ones *drained_ids* — this run's finished delete set — already covers.
+    ``run()`` reports the result as ``structural_floor.undrainable_count``,
+    and :func:`unsatisfiable_backlog_gate` turns it into the checked
+    constraint that a ``--check --max-backlog N`` below this floor can never
+    pass (task 4436).
+
+    TWO STRUCTURALLY DIFFERENT ARMS compose the floor, and the difference
+    matters to the remedy:
+
+    - The UNDATED arm (:func:`find_undated_markers`) is INVOCATION-RELATIVE.
+      ``find_stale_markers`` fail-safe KEEPs a missing/unparseable
+      ``created_at`` at every ``max_age_days`` including ``0``, and the
+      in-cycle collector ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool``
+      applies the same KEEP-on-uncertainty posture, so no age cutoff reaches
+      these members — but ``--delete-ids`` and ``--terminal-drain`` still
+      can. That is why this arm is subtracted by *drained_ids*: a member the
+      run is about to delete floors nothing, and its remedy is another
+      invocation.
+    - The PROTECTED arm (:func:`find_protected_markers`) is ABSOLUTE. Those
+      records are refused unconditionally at the delete choke point,
+      overriding even ``--delete-ids`` (task 3041/4435), so no flag of this
+      script drains them; the remedy is the fused-memory MCP
+      ``delete_memory`` tool or a corrected ``source`` enumeration. This arm
+      is therefore NOT subtracted by *drained_ids*: a protected member sits
+      in ``after.total_source`` whatever a caller believes it is deleting,
+      so subtracting it would UNDER-report the floor — the exact
+      false-negative this constraint exists to eliminate. The distinction is
+      unobservable from ``run()``, which removes protected members from the
+      delete set before calling this, so the two arms agree there; keeping
+      the arm absolute is what makes the predicate independent of its caller
+      having done that subtraction correctly.
+
+    ``undated_kept_count`` is NOT the floor, and keying a constraint on it
+    manufactures false "unsatisfiable" verdicts:
+    ``find_orphan_markers`` / ``find_taskless_markers`` /
+    ``find_terminal_task_markers`` never consult ``created_at``, so an
+    undated member any of them catches IS drained this run and floors
+    nothing. The two counts can now differ in BOTH directions — an undated
+    kind-orphan is drained and floors nothing; a fully dated protected
+    mirror floors permanently while contributing ``0`` to the raw count.
+
+    EXTENSION: this predicate is defined over the KEEP-sets, not over an
+    enumerated list of floor sources. When task 5129 adds the second
+    protected predicate :func:`find_protected_markers`' docstring names
+    (``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS``,
+    task 4375) and it joins the same subtraction, its records become floor
+    here by construction rather than by someone remembering to widen a list.
+
+    Pure, sync, no I/O. Composed from the two keep-predicates rather than
+    re-deriving either rule, so neither can drift from its floor
+    consequence. Census figures and operator guidance live in
+    ``docs/flag-marker-sweep-recurring.md``, not here.
+
+    Args:
+        members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+        drained_ids: Ids this run's delete set covers — ``run()`` passes the
+            FINAL, post-protected-subtraction ``orphan_ids``.
+
+    Returns:
+        Subset of *members* that is undated OR protected and not in
+        *drained_ids*. Scroll order and object identity are preserved, and a
+        member matching both arms appears exactly once.
+    """
+    undated_ids = {m['id'] for m in find_undated_markers(members)}
+    protected_ids = {m['id'] for m in find_protected_markers(members)}
+    return [
+        m for m in members
+        if m['id'] in protected_ids
+        or (m['id'] in undated_ids and m['id'] not in drained_ids)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Async delete
 # ---------------------------------------------------------------------------
