@@ -1466,6 +1466,31 @@ class TestJudgeWriteAnthropicArm:
         assert [m['role'] for m in kwargs['messages']] == ['user']
 
     @pytest.mark.asyncio
+    async def test_this_arm_is_pinned_deterministic_like_the_other(self) -> None:
+        """`temperature=0.0` on BOTH arms — the openai one already had it.
+
+        Omitting it here does not mean "unset": Anthropic's default is 1.0,
+        so this arm was sampling. `_call_llm`'s own docstring scopes only
+        `response_format` to one provider, so the asymmetry contradicts the
+        module's stated contract as well as the openai arm.
+
+        It is not cosmetic. This is a classifier answering ONE word from a
+        closed vocabulary under a 64-token cap with no JSON mode on this arm,
+        so sampling buys nothing and raises the odds of a preamble or a
+        truncated payload — each of which is a `JudgeOutputError`, and
+        therefore a COUNTED fail-open on the write path rather than a bad
+        answer.
+        """
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends'))])
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert client.messages.create.call_args.kwargs['temperature'] == 0.0
+
+    @pytest.mark.asyncio
     async def test_a_non_text_first_block_does_not_crash_the_read(self) -> None:
         """A leading non-text block must not be read as the answer."""
         client = _anthropic_client([
