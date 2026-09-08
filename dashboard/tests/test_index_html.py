@@ -8,7 +8,6 @@ Guards against:
 
 from __future__ import annotations
 
-import html.parser
 import re
 from pathlib import Path
 
@@ -20,44 +19,12 @@ from _cache_buster_helpers import (
     resolve_redux_base_state,
     sole_cache_buster_version,
 )
+from _dashboard_helpers import assert_script_loads_before, find_script_position
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Matches well-formed SRI hashes: sha256/384/512 followed by a base64 payload.
 _SRI_HASH_RE = re.compile(r'^sha(256|384|512)-[A-Za-z0-9+/=]{20,}$')
-
-
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-
-    ``index`` is the tag's 0-based position in ``_ScriptTagCollector.script_attrs``
-    (document order, since the list preserves insertion order).  Returning attrs
-    alongside the position avoids a second parse when the caller also needs the
-    src or other attributes.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
 
 
 def test_static_index_html_serves_200(client):
@@ -98,7 +65,7 @@ def test_cdn_script_has_sri_integrity(
     Parametrised over marked and DOMPurify — both are required by the
     MarkdownText component in tab_tasks.jsx.
     """
-    result = _find_script_position(index_html_body, src_prefix)
+    result = find_script_position(index_html_body, src_prefix)
     attrs = result[1] if result is not None else None
     assert attrs is not None, (
         f'No <script src="{src_prefix}..."> tag found in index.html. '
@@ -116,7 +83,7 @@ def test_cdn_script_has_sri_integrity(
 
 
 # ---------------------------------------------------------------------------
-# Helper-level coverage for _find_script_position (synthetic HTML)
+# Helper-level coverage for find_script_position (synthetic HTML)
 # ---------------------------------------------------------------------------
 
 _MARKED_TAG = '<script src="https://unpkg.com/marked@x/y.js"></script>'
@@ -145,17 +112,17 @@ _FIND_SCRIPT_POSITION_CASES = [
         'missing-tag-returns-none',
     ],
 )
-def test_find_script_position_returns_document_order(
+def testfind_script_position_returns_document_order(
     body: str, src_prefix: str, expected_position: int | None
 ) -> None:
-    """_find_script_position returns the 0-indexed document position of the
+    """find_script_position returns the 0-indexed document position of the
     first <script> tag whose src starts with src_prefix, or None if absent.
 
     Exercises synthetic HTML so that a future bad ordering of the real
     index.html would actually be caught (i.e. proves the helper distinguishes
     good-order from bad-order).
     """
-    result = _find_script_position(body, src_prefix)
+    result = find_script_position(body, src_prefix)
     actual_pos = result[0] if result is not None else None
     assert actual_pos == expected_position
 
@@ -165,61 +132,6 @@ def test_find_script_position_returns_document_order(
 # ---------------------------------------------------------------------------
 
 _TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'If it loads after, {after_label} may execute before {before_label} '
-        f'is defined — the silent-failure class the smoke test was added to catch.'
-    )
 
 
 @pytest.mark.parametrize(
@@ -247,7 +159,7 @@ def test_cdn_script_loads_before_tab_tasks_jsx(
     future edit adding those attributes fails loudly rather than silently passing
     a check that no longer reflects execution order.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         src_prefix,
         _TAB_TASKS_PREFIX,
@@ -301,7 +213,7 @@ def test_load_order_assertion_fires_on_deferred_cdn(
     )
     body = cdn_tag + _TAB_TASKS_TAG
     with pytest.raises(AssertionError, match=match_pattern):
-        _assert_script_loads_before(
+        assert_script_loads_before(
             body,
             'https://unpkg.com/marked@',
             _TAB_TASKS_PREFIX,
@@ -336,7 +248,7 @@ def test_load_order_assertion_fires_on_deferred_tab_tasks(
     )
     body = cdn_tag + bad_tab_tasks_tag
     with pytest.raises(AssertionError, match=match_pattern):
-        _assert_script_loads_before(
+        assert_script_loads_before(
             body,
             'https://unpkg.com/marked@',
             _TAB_TASKS_PREFIX,
@@ -392,9 +304,9 @@ def test_tab_curator_loads_before_app_jsx(
     """tab_curator.jsx must load AFTER its deps and BEFORE app.jsx.
 
     Parametrized over the four required ordering pairs using the generic
-    _assert_script_loads_before helper rather than bespoke per-case logic.
+    assert_script_loads_before helper rather than bespoke per-case logic.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         before_prefix,
         after_prefix,
@@ -416,7 +328,7 @@ def test_load_order_assertion_passes_for_classic_scripts() -> None:
     cdn_tag = '<script src="https://unpkg.com/marked@x/y.js"></script>'
     body = cdn_tag + _TAB_TASKS_TAG
     # Must complete without raising — classic script, correct document order.
-    _assert_script_loads_before(
+    assert_script_loads_before(
         body,
         'https://unpkg.com/marked@',
         _TAB_TASKS_PREFIX,
@@ -442,7 +354,7 @@ def test_graph_layout_js_loads_before_tab_tasks(index_html_body: str) -> None:
     undefined, and TaskGraph would throw the moment it tries to call one of
     those functions.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _GRAPH_LAYOUT_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -471,7 +383,7 @@ def test_prd_grouping_js_loads_before_tab_tasks(index_html_body: str) -> None:
     would silently produce undefined, and the "group by PRD" view would throw
     the moment it tries to call one of those functions.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _PRD_GROUPING_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -501,7 +413,7 @@ def test_runtime_format_js_loads_before_tabs(index_html_body: str) -> None:
     all), that destructure would silently produce undefined, and OrchTab would
     throw the moment it tries to call rtCell/rtAge.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _RUNTIME_FORMAT_PREFIX,
         _TABS_PREFIX,
@@ -523,7 +435,7 @@ def test_runtime_format_js_loads_before_tab_tasks(index_html_body: str) -> None:
     all), that destructure would silently produce undefined, and TaskDetail
     would throw the moment it tries to call rtCell.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _RUNTIME_FORMAT_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -570,7 +482,7 @@ def test_orch_filter_js_loads_before_tabs(index_html_body: str) -> None:
     losing the per-facet sentence this task added. Correct load order is the
     real contract; the guard only keeps a missing module from blanking the tab.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _ORCH_FILTER_PREFIX,
         _TABS_PREFIX,
@@ -618,7 +530,7 @@ def test_spark_path_js_loads_before_charts(index_html_body: str) -> None:
     (loud-over-silent degradation); this ordering guard is what keeps that
     loudness from ever reaching a browser.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _SPARK_PATH_PREFIX,
         _CHARTS_PREFIX,
@@ -667,7 +579,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
     The destructure is deliberate (loud-over-silent degradation); this
     ordering guard is what keeps that loudness from ever reaching a browser.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TASK_STATUS_COUNTS_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -698,7 +610,7 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 # satisfied `'pins_recovery' in body` with the render arm deleted).
 #
 # The assertions below are NOT that anti-pattern returning under a new name.
-# `_assert_script_loads_before` walks real <script> tags with html.parser and
+# `assert_script_loads_before` walks real <script> tags with html.parser and
 # compares their document positions, checking defer/async/type=module along the
 # way; it reads the page's STRUCTURE, not its source text, and there is no
 # other way to state a load-order invariant. The served-200 checks exercise the
@@ -738,7 +650,7 @@ def test_task_row_cells_js_loads_before_tab_tasks(index_html_body: str) -> None:
     Tasks tab never renders. The destructure is deliberate (loud-over-silent
     degradation); this ordering guard keeps that loudness out of a browser.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TASK_ROW_CELLS_PREFIX,
         _TAB_TASKS_PREFIX,
@@ -761,7 +673,7 @@ def test_task_row_cells_js_loads_before_tabs(index_html_body: str) -> None:
     of. Both consumers need their own ordering assertion; covering only
     tab_tasks.jsx would let a tag inserted between the two JSX files pass.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TASK_ROW_CELLS_PREFIX,
         _TABS_PREFIX,
@@ -797,7 +709,7 @@ def test_burndown_bands_js_loads_before_tabs(index_html_body: str) -> None:
     bands: it throws while tabs.jsx is evaluating, so every tab that file
     defines goes with it.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _BURNDOWN_BANDS_PREFIX,
         _TABS_PREFIX,
@@ -830,7 +742,7 @@ def test_pins_recovery_js_loads_before_tab_escalations(index_html_body: str) -> 
     window.DF_PINS_RECOVERY at top-level execution time with no fallback; it
     feeds the "pinning" StatTile in the analytics strip.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _PINS_RECOVERY_PREFIX,
         _TAB_ESCALATIONS_PREFIX,
@@ -854,7 +766,7 @@ def test_pins_recovery_js_loads_before_tab_escalation_analytics(
     while tab_escalations.jsx holds the StatTile. Each consumer therefore needs
     its own ordering assertion.
     """
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _PINS_RECOVERY_PREFIX,
         _TAB_ESC_ANALYTICS_PREFIX,
