@@ -1098,7 +1098,7 @@ class TestScanProcessGroupsUnderPath:
     @pytest.mark.asyncio
     @pytest.mark.timeout(15)
     async def test_scan_respects_exclude_pgids(self, tmp_path):
-        """END TO END: a REAL pgid under root is still dropped by exclude_pgids.
+        """END TO END: a REAL pgid under root is dropped, its neighbour kept.
 
         ONE /proc walk, deliberately (task 4520). Each walk reads every live
         pid on the host — 1100+ pids and 23.3 MB of ``maps`` when this was
@@ -1108,34 +1108,55 @@ class TestScanProcessGroupsUnderPath:
         pytest-timeout's ``func_only=False``) also covers setup and teardown.
         The bound is untouched; the WORK is halved.
 
-        Nothing is lost, because the removed assertions are carried elsewhere
+        TWO sleepers, ONE walk — and the second one is load-bearing, not
+        decoration. ``scan_process_groups_under_path`` wraps the entire walk in
+        a blanket ``except Exception: return set()``, so "the excluded pid is
+        absent" is equally satisfied by a scan that never saw the tree at all:
+        a stat-format change, a ``_PROC_ROOT`` mishap or a permissions change
+        would blow the walk up, get laundered into an empty set, and turn this
+        test GREEN. The unexcluded ``keeper`` is the witness that separates
+        EXCLUDED from NEVER FOUND AT ALL. It costs a fork, not a second walk;
+        the walk count is the thing this test exists to keep at one.
+
+        The coverage that a single walk cannot carry is carried elsewhere,
         against the identical helper:
 
-        * "a sleeper whose cwd is under root IS returned" —
-          :meth:`test_scan_matches_cwd_under_root_and_respects_boundary`, which
-          also pins the ``<root>XYZ`` prefix boundary;
-        * the cwd == root EQUALITY branch, and the exclusion branch itself —
+        * the ``<root>XYZ`` prefix boundary and the "outside" case —
+          :meth:`test_scan_matches_cwd_under_root_and_respects_boundary`;
+        * the cwd == root EQUALITY branch, selective exclusion across several
+          groups, and same-pgrp de-duplication —
           :class:`TestScanProcessGroupsAgainstASyntheticProc`, exhaustively and
-          deterministically: it controls the whole pid population, so it can
-          also assert selective exclusion (one group dropped, the others kept)
-          and same-pgrp de-duplication, neither of which a walk over 1100
-          uncontrolled pids can express.
+          deterministically, because it controls the whole pid population,
+          which a walk over 1100 uncontrolled pids cannot.
 
-        What only a REAL walk can prove, and what this test therefore keeps: a
-        genuinely live process group, planted with cwd == root, is excluded
-        end-to-end through the real procfs.
+        What only a REAL walk can prove, and what this test therefore keeps:
+        genuinely live process groups under root are told apart — one named in
+        *exclude_pgids* dropped, one not named returned — end-to-end through
+        the real procfs.
         """
         root = tmp_path.resolve() / '_merge-verify'
-        root.mkdir()
-        proc = await _spawn_sleeper_in(root)
+        keeper_cwd = root / 'build'
+        keeper_cwd.mkdir(parents=True)
+        excluded = await _spawn_sleeper_in(root)
+        keeper = await _spawn_sleeper_in(keeper_cwd)
         try:
-            assert proc.pid not in scan_process_groups_under_path(
-                root, exclude_pgids=frozenset({proc.pid})
+            found = scan_process_groups_under_path(
+                root, exclude_pgids=frozenset({excluded.pid})
+            )
+            assert excluded.pid not in found, (
+                f'pgid {excluded.pid} was named in exclude_pgids and must not '
+                f'be returned; got {found}'
+            )
+            assert keeper.pid in found, (
+                f'pgid {keeper.pid} (cwd {keeper_cwd}, NOT excluded) is missing '
+                f'from {found} — the walk never reached the tree, which would '
+                f'make the exclusion assertion above pass vacuously'
             )
         finally:
-            _kill_group(proc.pid)
-            with contextlib.suppress(Exception):
-                await proc.wait()
+            for p in (excluded, keeper):
+                _kill_group(p.pid)
+                with contextlib.suppress(Exception):
+                    await p.wait()
 
     def test_scan_never_raises_on_unreadable_pid(self, monkeypatch, tmp_path):
         """A readlink that raises (vanished / permission-denied pid) is swallowed.
@@ -1337,8 +1358,26 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         assert 800 not in found and 810 not in found
 
     def test_a_missing_proc_root_yields_an_empty_set(self, tmp_path, monkeypatch):
-        """The `not proc_dir.exists()` branch — an empty result, not a raise."""
+        """The `not proc_dir.exists()` branch — an empty result, not a raise.
+
+        Asserted against the UNSAFE helper, because the public wrapper cannot
+        express this: it converts ANY exception into ``set()``, so an empty
+        result from it is equally consistent with the intended early return,
+        with an unexpected raise from anywhere in the walk, and with a walk
+        that simply matched nothing — the branch named in this docstring would
+        not actually be pinned. Against
+        ``_scan_process_groups_under_path_unsafe`` a raise FAILS the test
+        instead of being laundered into the expected answer. Reaching a module
+        internal is the idiom this class already relies on (``_PROC_ROOT``,
+        ``_pid_references_path_at_or_under``).
+
+        The public wrapper is then asserted too, so the branch stays pinned
+        through the layer callers actually use.
+        """
         monkeypatch.setattr('shared.proc_group._PROC_ROOT', tmp_path / 'absent')
+        assert proc_group_module._scan_process_groups_under_path_unsafe(
+            str(tmp_path), frozenset()
+        ) == set()
         assert scan_process_groups_under_path(tmp_path) == set()
 
 
