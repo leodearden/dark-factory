@@ -1017,3 +1017,195 @@ class TestReadPsiSampleFailOpen:
             return PSI_MEM_TEXT if name == 'memory' else PSI_IO_TEXT
 
         self._assert_sentinel(read_psi_sample(read=read))
+
+
+class TestReadPsiSampleV2Composition:
+    """read_psi_sample assembles three INDEPENDENT components.
+
+    INV-11: a partially-degraded sample is distinguishable from a healthy one
+    BY VALUE, per component — a host failure must not discard a runqueue or
+    own-cgroup reading that actually succeeded.
+    """
+
+    def _sources(self, tmp_path):
+        """A fully-healthy set of injected paths, §6.3 row 1 shaped."""
+        cgroup_file = tmp_path / 'cgroup'
+        cgroup_file.write_text(CGROUP_UNDER_SLICE)
+        root = tmp_path / 'sys'
+        directory = root / SLICE_PATH.lstrip('/')
+        directory.mkdir(parents=True)
+        (directory / 'cpu.pressure').write_text(PSI_CPU_TEXT)
+        stat_file = tmp_path / 'stat'
+        stat_file.write_text(PROC_STAT_TEXT)
+        return dict(
+            proc_stat_path=stat_file,
+            proc_cgroup_path=cgroup_file,
+            cgroup_root=root,
+        )
+
+    def _healthy_read(self):
+        sources = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+        return lambda name: sources[name]
+
+    def _raising_read(self):
+        def read(name):
+            raise FileNotFoundError(f'/proc/pressure/{name}')
+
+        return read
+
+    def test_all_ten_fields_populated_when_every_component_succeeds(self, tmp_path):
+        import os
+
+        from shared.psi import read_psi_sample
+
+        sample = read_psi_sample(
+            read=self._healthy_read(), project_id='x', **self._sources(tmp_path)
+        )
+
+        assert sample.read_ok is True
+        assert sample.cpu_some10 == pytest.approx(2.50)
+        assert sample.mem_some10 == pytest.approx(1.23)
+        assert sample.mem_full10 == 0.0
+        assert sample.io_some10 == pytest.approx(0.75)
+        assert sample.runqueue_read_ok is True
+        assert sample.runqueue_ratio == pytest.approx(64 / len(os.sched_getaffinity(0)))
+        assert sample.own_read_ok is True
+        assert sample.own_cpu_some10 == pytest.approx(2.50)
+        assert sample.own_cgroup.endswith('df-x.slice')
+
+    def test_host_failure_keeps_the_other_two_components(self, tmp_path):
+        from shared.psi import read_psi_sample
+
+        sample = read_psi_sample(
+            read=self._raising_read(), project_id='x', **self._sources(tmp_path)
+        )
+
+        assert sample.read_ok is False
+        assert sample.cpu_some10 == 0.0
+        assert sample.mem_some10 == 0.0
+        assert sample.mem_full10 == 0.0
+        assert sample.io_some10 == 0.0
+        assert sample.runqueue_read_ok is True
+        assert sample.runqueue_ratio > 0
+        assert sample.own_read_ok is True
+        assert sample.own_cgroup.endswith('df-x.slice')
+
+    def test_unparseable_host_source_keeps_the_other_two_components(self, tmp_path):
+        from shared.psi import read_psi_sample
+
+        def read(name):
+            if name == 'io':
+                return 'garbage line with no avg fields\n'
+            return PSI_CPU_TEXT if name == 'cpu' else PSI_MEM_TEXT
+
+        sample = read_psi_sample(read=read, project_id='x', **self._sources(tmp_path))
+
+        assert sample.read_ok is False
+        assert sample.cpu_some10 == 0.0
+        assert sample.runqueue_read_ok is True
+        assert sample.own_read_ok is True
+
+    def test_only_runqueue_missing(self, tmp_path):
+        from shared.psi import read_psi_sample
+
+        sources = self._sources(tmp_path)
+        sources['proc_stat_path'] = tmp_path / 'absent'
+        sample = read_psi_sample(read=self._healthy_read(), project_id='x', **sources)
+
+        assert sample.read_ok is True
+        assert sample.runqueue_read_ok is False
+        assert sample.runqueue_ratio == 0.0
+        assert sample.own_read_ok is True
+
+    def test_only_own_cgroup_unreadable_still_names_the_attempted_path(self, tmp_path):
+        from shared.psi import read_psi_sample
+
+        cgroup_file = tmp_path / 'cgroup'
+        cgroup_file.write_text(CGROUP_UNDER_SLICE)
+        stat_file = tmp_path / 'stat'
+        stat_file.write_text(PROC_STAT_TEXT)
+
+        sample = read_psi_sample(
+            read=self._healthy_read(),
+            project_id='x',
+            proc_stat_path=stat_file,
+            proc_cgroup_path=cgroup_file,
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert sample.read_ok is True
+        assert sample.runqueue_read_ok is True
+        assert sample.own_read_ok is False
+        assert sample.own_cpu_some10 == 0.0
+        assert sample.own_cgroup.endswith('df-x.slice')
+
+    def test_every_component_failing_still_returns(self, tmp_path):
+        from shared.psi import read_psi_sample
+
+        sample = read_psi_sample(
+            read=self._raising_read(),
+            project_id='x',
+            proc_stat_path=tmp_path / 'absent',
+            proc_cgroup_path=tmp_path / 'absent-too',
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert sample.read_ok is False
+        assert sample.runqueue_read_ok is False
+        assert sample.own_read_ok is False
+        assert sample.own_cgroup == ''
+
+    def test_project_id_none_still_reads_the_leaf_cgroup(self, tmp_path):
+        from shared.psi import read_psi_sample
+
+        sources = self._sources(tmp_path)
+        directory = sources['cgroup_root'] / SCOPE_PATH.lstrip('/')
+        directory.mkdir(parents=True)
+        (directory / 'cpu.pressure').write_text(PSI_IO_TEXT)
+
+        sample = read_psi_sample(
+            read=self._healthy_read(), project_id=None, **sources
+        )
+
+        assert sample.own_read_ok is True
+        assert sample.own_cgroup == SCOPE_PATH
+
+    def test_zero_argument_call_still_works(self):
+        """The scheduler's shipped self._read_psi_sample() call shape."""
+        from shared.psi import PsiSample, read_psi_sample
+
+        assert isinstance(read_psi_sample(), PsiSample)
+
+
+@pytest.mark.skipif(
+    not (
+        __import__('pathlib').Path('/proc/pressure/cpu').exists()
+        and __import__('pathlib').Path('/sys/fs/cgroup/cgroup.controllers').exists()
+    ),
+    reason='needs live host PSI and a cgroup-v2 unified hierarchy',
+)
+class TestLiveSignal:
+    """The task's user-observable signal, read from the live host."""
+
+    def test_reads_a_real_runqueue_and_own_cgroup(self):
+        import pathlib
+
+        from shared.psi import read_psi_sample
+
+        sample = read_psi_sample(project_id='dark_factory')
+
+        assert sample.runqueue_read_ok is True
+        assert sample.runqueue_ratio > 0
+        assert sample.own_read_ok is True
+
+        # own_cgroup names the READING PROCESS's own cgroup, or an ancestor
+        # slice of it — NOT the orchestrator unit: a verify leg runs in a
+        # df-verify-*.scope, so asserting the orchestrator's path would be
+        # wrong under the very harness that runs this test.
+        live = next(
+            line[len('0::') :]
+            for line in pathlib.Path('/proc/self/cgroup').read_text().splitlines()
+            if line.startswith('0::')
+        )
+        assert sample.own_cgroup
+        assert live.startswith(sample.own_cgroup)
