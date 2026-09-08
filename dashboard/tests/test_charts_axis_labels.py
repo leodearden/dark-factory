@@ -257,9 +257,12 @@ def _df_charts_export_names(charts_jsx_body: str) -> set:
     assert m is not None, (
         'could not read the `window.DF_CHARTS = { ... }` export literal in '
         'charts.jsx. The overwhelmingly likely cause is a NESTED BRACE inside '
-        'that literal: the pattern is `[^{}]*` by design, and the identical '
-        'pattern in test_tab_burndown.py:53 would silently yield an empty set '
-        'and fail test_every_labels_prop_sits_on_a_chart_component with an '
+        'that literal: `_dashboard_helpers.py::DF_CHARTS_EXPORT_RE` is '
+        '`[^{}]*` by design. That is ONE shared object every DF_CHARTS '
+        'consumer imports, so a nested brace does not break this module alone '
+        '— test_tab_burndown.py reads the same pattern, where the miss is '
+        'silent and surfaces as an empty export set failing '
+        'test_every_labels_prop_sits_on_a_chart_component with an '
         'unrelated-looking message. Keep every export a bare identifier.'
     )
     return _binding_names(m.group(1))
@@ -646,15 +649,18 @@ def test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts(
     # discoverable from the failure rather than only from the comment above.
     # It MUST come before `_df_charts_export_names`, which runs the very same
     # `search` and asserts on it internally: ordered the other way this line is
-    # unreachable, because the helper always raises first with a message that
-    # does not name test_tab_burndown.py.
+    # unreachable, because the helper always raises first with a message scoped
+    # to this module's own read, which does not spell out that the pattern is
+    # shared or where else the same nested brace surfaces.
     assert DF_CHARTS_EXPORT_RE.search(charts_jsx_body) is not None, (
         'the window.DF_CHARTS export literal no longer parses under the '
-        r'`window\.DF_CHARTS\s*=\s*\{([^{}]*)\}` pattern that '
-        'test_tab_burndown.py:53 also uses — something in it grew a nested '
-        'brace. There it fails as an empty export set and a confusing '
-        '"not a chart component" error far from the cause. Every DF_CHARTS '
-        'export must stay a BARE IDENTIFIER.'
+        r'`window\.DF_CHARTS\s*=\s*\{([^{}]*)\}` pattern of '
+        '`_dashboard_helpers.py::DF_CHARTS_EXPORT_RE` — something in it grew a '
+        'nested brace. That pattern is the single shared object EVERY DF_CHARTS '
+        'consumer imports, so this breaks all of them at once: in '
+        'test_tab_burndown.py the same miss is silent, and surfaces as an empty '
+        'export set and a confusing "not a chart component" error far from the '
+        'cause. Every DF_CHARTS export must stay a BARE IDENTIFIER.'
     )
 
     exported = _df_charts_export_names(charts_jsx_body)
@@ -1083,7 +1089,8 @@ def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> No
     Also pins the ORDERING fix in the routing test: `DF_CHARTS_EXPORT_RE` is
     what fails on a nested-brace literal, and `_df_charts_export_names` raises on
     the identical `search`, so only the standalone assertion placed BEFORE that
-    call can ever be the one that names test_tab_burndown.py in its message.
+    call can ever be the one that spells out the shared-pattern coupling in its
+    message.
     """
     pre_fix = _df_charts_destructure(_PRE_FIX_TABS_DESTRUCTURE)
     assert 'LineChart' in pre_fix, (
@@ -1099,7 +1106,8 @@ def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> No
 
     assert DF_CHARTS_EXPORT_RE.search(_NESTED_BRACE_EXPORT) is None, (
         'the brace-hostile export pattern now matches a literal containing a '
-        'nested brace, so neither this module nor test_tab_burndown.py:53 would '
-        'notice one being introduced — and test_tab_burndown.py would go on to '
-        'fail opaquely on an empty export set.'
+        'nested brace, so NO DF_CHARTS consumer would notice one being '
+        'introduced: they all read the single shared '
+        '`_dashboard_helpers.py::DF_CHARTS_EXPORT_RE`, and test_tab_burndown.py '
+        'would go on to fail opaquely on an empty export set.'
     )

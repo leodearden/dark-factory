@@ -408,8 +408,13 @@ class TestEscalationAnalyticsCacheability:
 # The tests below consume the served-asset fixtures (tab_analytics_jsx_body,
 # app_jsx_body, shell_jsx_body, index_html_body) that now live in conftest.py
 # and `extract_function_body` from _dashboard_helpers (task 3549), plus the
-# load-order helpers still local to this file (ScriptTagCollector,
-# find_script_position, assert_script_loads_before).
+# load-order helpers `find_script_position` and `assert_script_loads_before`,
+# which are ALSO imported from _dashboard_helpers rather than defined here:
+# task 4881 retired the byte-identical copy this module and four others each
+# carried, together with the `ScriptTagCollector` those two parse with (which
+# is why it is not in this module's import list — nothing here calls it
+# directly).  Their contract lives in
+# test_jsx_source_helpers.py::TestScriptOrderHelpers.
 
 
 # ---------------------------------------------------------------------------
