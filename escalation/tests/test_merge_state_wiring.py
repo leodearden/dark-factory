@@ -12,11 +12,12 @@ the real ``shared/src/shared`` directory, so submodules still load from disk —
 only ``shared/__init__.py`` (which drags in aiosqlite) is skipped.  That works
 precisely because this module is NOT re-exported from the package ``__init__``.
 
-Harness patterns are taken wholesale from the existing suite:
-``_call_merge_status`` (test_server.py), ``_stub_git_ops`` / ``_make_config``
-(test_merge_status_git_authority.py), ``_call_merge_request`` /
-``_call_merge_cancel`` / ``_make_orch_config`` / ``_make_registry``
-(test_server_chokepoint.py).
+Harness patterns are taken wholesale from the existing suite: ``_stub_git_ops``
+/ ``_make_config`` (test_merge_status_git_authority.py), ``_make_orch_config`` /
+``_make_registry`` (test_server_chokepoint.py).  The three merge-tool invocation
+wrappers, which the suite had re-typed verbatim in four modules, are imported
+from ``_merge_tool_calls`` instead — see that module for why the copies were not
+migrated here too.
 """
 from __future__ import annotations
 
@@ -29,7 +30,15 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from shared.merge_state import CANCEL_STATES, LIVE_STATES, TERMINAL_STATES, MergeState
+from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
+from shared.merge_state import (
+    CANCEL_STATES,
+    EPISTEMIC_STATES,
+    LIVE_STATES,
+    POLL_STOP_STATES,
+    TERMINAL_STATES,
+    MergeState,
+)
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -58,21 +67,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-async def _call_merge_status(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('merge_status')
-    return await tool.fn(**kwargs)
-
-
-async def _call_merge_request(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('merge_request')
-    return await tool.fn(**kwargs)
-
-
-async def _call_merge_cancel(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('merge_cancel')
-    return await tool.fn(**kwargs)
 
 
 def _live_worker(raw_state: str, request_id: str = 'mr-live') -> types.SimpleNamespace:
@@ -146,7 +140,7 @@ class TestMergeStatusTier1EmitsLiveStates:
         harness = types.SimpleNamespace(
             _merge_worker=_live_worker(raw), _terminal_retention=None
         )
-        result = await _call_merge_status(_server(tmp_path, harness), request_id='mr-live')
+        result = await call_merge_status(_server(tmp_path, harness), request_id='mr-live')
 
         _assert_is_member(result['state'], LIVE_STATES, f'Tier-1 raw={raw!r}')
         assert result['state'] == expected
@@ -164,7 +158,7 @@ class TestMergeStatusTier1EmitsLiveStates:
         harness = types.SimpleNamespace(
             _merge_worker=_live_worker('some_future_worker_state'), _terminal_retention=None
         )
-        result = await _call_merge_status(_server(tmp_path, harness), request_id='mr-live')
+        result = await call_merge_status(_server(tmp_path, harness), request_id='mr-live')
 
         assert result['state'] == 'some_future_worker_state'
         assert not isinstance(result['state'], MergeState)
@@ -194,7 +188,7 @@ class TestMergeStatusDurableTiersEmitTerminalStates:
         self, tmp_path: Path, raw: str, expected: MergeState
     ) -> None:
         harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=_ring(raw))
-        result = await _call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
+        result = await call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
 
         _assert_is_member(result['state'], TERMINAL_STATES, f'durable raw={raw!r}')
         # Collapse behaviour is UNCHANGED by the switchover.
@@ -207,9 +201,29 @@ class TestMergeStatusDurableTiersEmitTerminalStates:
 @pytest.mark.asyncio
 class TestMergeStatusTier4EmitsUnknown:
     async def test_no_record_anywhere_returns_unknown_member(self, tmp_path: Path) -> None:
-        result = await _call_merge_status(_server(tmp_path), request_id='mr-nothing')
+        """Tier 4's `unknown` is pinned to the POLL partitions, not the cancel one.
 
-        _assert_is_member(result['state'], CANCEL_STATES, 'Tier-4')
+        ``POLL_STOP_STATES`` and ``CANCEL_STATES`` hold the same members today, so
+        pinning this to ``CANCEL_STATES`` — as it did before this amendment —
+        could not fail.  That equality is incidental: they are the stop sets of two
+        different call sites, and PRD beta widens what ``merge_status`` may return
+        without touching ``merge_cancel``.  In a file whose whole purpose is
+        asserting the right partition per call site, a poll assertion checked
+        against the cancel vocabulary would silently start checking the wrong
+        contract the moment the two diverge.
+
+        ``EPISTEMIC_STATES`` is the tighter of the two claims and is asserted as
+        well: Tier 4 fires when the server has NO RECORD of the request, so what it
+        reports is a state of knowledge, not an outcome the merge reached.
+        """
+        result = await call_merge_status(_server(tmp_path), request_id='mr-nothing')
+
+        _assert_is_member(result['state'], POLL_STOP_STATES, 'Tier-4')
+        assert result['state'] in EPISTEMIC_STATES, (
+            f"Tier-4 returned {result['state']!r}, an OUTCOME state — a poll that "
+            'found no record anywhere must report what the server knows, not what '
+            'the merge did.'
+        )
         assert result['state'] == MergeState.unknown
 
 
@@ -240,7 +254,7 @@ class TestMergeStatusTier35EmitsDone:
                 worktree_dir='.worktrees',
             ),
         )
-        result = await _call_merge_status(
+        result = await call_merge_status(
             _server(tmp_path, harness, orch_config=config), task_id='123'
         )
 
@@ -275,7 +289,7 @@ class TestMergeCancelEmitsCancelStates:
         )
 
     async def test_no_waiter_miss_returns_unknown_member(self, tmp_path: Path) -> None:
-        result = await _call_merge_cancel(_server(tmp_path), request_id='mr-never-seen')
+        result = await call_merge_cancel(_server(tmp_path), request_id='mr-never-seen')
 
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel no-waiter miss')
@@ -285,7 +299,7 @@ class TestMergeCancelEmitsCancelStates:
         harness = types.SimpleNamespace(
             _merge_worker=None, _terminal_retention=_ring('superseded', 'mr-gone')
         )
-        result = await _call_merge_cancel(_server(tmp_path, harness), request_id='mr-gone')
+        result = await call_merge_cancel(_server(tmp_path, harness), request_id='mr-gone')
 
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel durable hit')
@@ -294,10 +308,10 @@ class TestMergeCancelEmitsCancelStates:
 
     async def test_pending_waiter_returns_abandoned_member(self, tmp_path: Path) -> None:
         server = self._queue_server(tmp_path)
-        submitted = await _call_merge_request(
+        submitted = await call_merge_request(
             server, task_id='c1', branch='c1', worktree=str(tmp_path / 'wt-c1'), wait_secs=0
         )
-        result = await _call_merge_cancel(server, request_id=submitted['request_id'])
+        result = await call_merge_cancel(server, request_id=submitted['request_id'])
 
         assert result['cancelled'] is True
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel pending')
@@ -313,7 +327,7 @@ class TestMergeCancelEmitsCancelStates:
             orch_config=OrchestratorConfig(project_root=tmp_path / 'repo'),
             merge_inflight_registry=InFlightMergeRegistry(),
         )
-        submitted = await _call_merge_request(
+        submitted = await call_merge_request(
             server, task_id='c2', branch='c2', worktree=str(tmp_path / 'wt-c2'), wait_secs=0
         )
         cancel_tool = await server.get_tool('merge_cancel')  # fetch BEFORE resolving
@@ -335,7 +349,7 @@ class TestMergeCancelEmitsCancelStates:
             orch_config=OrchestratorConfig(project_root=tmp_path / 'repo'),
             merge_inflight_registry=InFlightMergeRegistry(),
         )
-        submitted = await _call_merge_request(
+        submitted = await call_merge_request(
             server, task_id='c3', branch='c3', worktree=str(tmp_path / 'wt-c3'), wait_secs=0
         )
         cancel_tool = await server.get_tool('merge_cancel')  # fetch BEFORE resolving
@@ -363,7 +377,7 @@ class TestWireCompatibility:
 
     async def test_response_json_round_trips_to_a_plain_string(self, tmp_path: Path) -> None:
         harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=_ring('done'))
-        result = await _call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
+        result = await call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
 
         round_tripped = json.loads(json.dumps(result))
         assert round_tripped['state'] == 'done'
@@ -371,7 +385,7 @@ class TestWireCompatibility:
 
     async def test_plain_str_comparison_still_holds(self, tmp_path: Path) -> None:
         harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=_ring('conflict'))
-        result = await _call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
+        result = await call_merge_status(_server(tmp_path, harness), request_id='mr-ring')
 
         # The exact shape of every pre-existing assertion in the suite.
         assert result['state'] == 'conflict'
