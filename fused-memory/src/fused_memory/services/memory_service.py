@@ -1749,7 +1749,23 @@ class ReferentFinding:
     which_end: str
     #: Which check fired; one of :data:`REFERENT_CHECKS`.
     check: str
-    #: The node the edge is attached to today.
+    #: The node the edge is attached to today — as THIS EPISODE'S in-memory
+    #: result reported it, PRE-NORMALIZATION. Recorded for the operator log,
+    #: with the same caveat :attr:`old_endpoint_name` carries one field down and
+    #: for the same reason: this pass is the EIGHTH sub-pass of
+    #: ``_reconcile_episode_identity``, running after
+    #: ``_normalize_task_node_names`` and ``_dedup_episode_nodes``, both of which
+    #: call ``graphiti.merge_entities``. A node that LOST such a merge no longer
+    #: exists in the graph, so an operator following this uuid out of a warning
+    #: payload can query one that resolves to nothing — just as a spelling can
+    #: have been normalized out from under the name beside it.
+    #:
+    #: Leaf eta is unaffected: ``reassign_edge`` keys on the EDGE uuid
+    #: (:attr:`edge_uuid`) and never on this one, so a dead value is recorded
+    #: but never acted on. The cost is operator-facing only, which is why this
+    #: is DOCUMENTED rather than re-resolved live — re-resolving would add a
+    #: backend round-trip per finding inside the identity-lock critical section,
+    #: to refresh a field nothing reads.
     old_endpoint_uuid: str
     #: That node's name as this episode's result reported it. Recorded for the
     #: operator log; the VERDICT is keyed off :attr:`endpoint_referent`, since a
