@@ -2,15 +2,17 @@ prd: plans/info-l0-disposition-router-prd.md
 schema_version: 1
 tasks:
 - label: α
-  task_id: null
-  title: Info-L0 disposition vocabulary, pin helper, mechanical-role registry, event type
+  task_id: 5221
+  title: Info-L0 disposition vocabulary, pin helper, mechanical-role registry, event
+    type
   capabilities:
   - name: resolution-classes-extended
-    binding: capability→producer (built by α) — home escalation/models.py::RESOLUTION_CLASSES; validated at EscalationQueue.resolve / submit_resolved / server.resolve_issue
+    binding: capability→producer (built by α) — home escalation/models.py::RESOLUTION_CLASSES;
+      validated at EscalationQueue.resolve / submit_resolved / server.resolve_issue
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: "'observation-consumed'"
+      pattern: '''observation-consumed'''
       paths:
       - escalation/src/escalation/models.py
       expect: present
@@ -24,7 +26,8 @@ tasks:
       - escalation/src/escalation/
       expect: present
   - name: pin-gating-helper
-    binding: capability→producer (built by α) — escalation/pins.py::is_queue_handoff wrapping classify_pins
+    binding: capability→producer (built by α) — escalation/pins.py::is_queue_handoff
+      wrapping classify_pins
     verdict: PASS
     delivered_check:
       kind: grep
@@ -33,7 +36,8 @@ tasks:
       - escalation/src/escalation/pins.py
       expect: present
   - name: mechanical-role-registry
-    binding: capability→producer (built by α) — escalation/classify.py::INFO_L0_MECHANICAL_ROLES beside _REAPER_SWEEP_RESOLVERS
+    binding: capability→producer (built by α) — escalation/classify.py::INFO_L0_MECHANICAL_ROLES
+      beside _REAPER_SWEEP_RESOLVERS
     verdict: PASS
     delivered_check:
       kind: grep
@@ -51,11 +55,12 @@ tasks:
       - orchestrator/src/orchestrator/event_store.py
       expect: present
 - label: γ
-  task_id: null
+  task_id: 5222
   title: Severity-aware gating, all-info L2 refusal, watcher rung
   capabilities:
   - name: gating-predicate-consumes-pins
-    binding: capability→producer (built by γ) — workflow.py::_is_gating_escalation disjunct 3 and _wait_for_resolution short-circuit consume escalation.pins.is_queue_handoff
+    binding: capability→producer (built by γ) — workflow.py::_is_gating_escalation
+      disjunct 3 and _wait_for_resolution short-circuit consume escalation.pins.is_queue_handoff
     verdict: PASS
     delivered_check:
       kind: grep
@@ -64,7 +69,9 @@ tasks:
       - orchestrator/src/orchestrator/workflow.py
       expect: present
   - name: promote-refuses-info-only-cluster
-    binding: rejection-mechanism (built by γ, pinned by boundary #10) — server.py::promote_to_l2 returns status refused / code info_only_cluster when severity omitted and derived == info
+    binding: 'rejection-mechanism (built by γ, pinned by boundary #10) — server.py::promote_to_l2
+      returns status refused / code info_only_cluster when severity omitted and derived
+      == info'
     verdict: PASS
     delivered_check:
       kind: grep
@@ -73,7 +80,8 @@ tasks:
       - escalation/src/escalation/server.py
       expect: present
   - name: watcher-info-only-rung
-    binding: capability→producer (built by γ) — skills/escalation-watcher-auto/SKILL.md documents the refused response and the close-at-L1-with-digest rung
+    binding: capability→producer (built by γ) — skills/escalation-watcher-auto/SKILL.md
+      documents the refused response and the close-at-L1-with-digest rung
     verdict: PASS
     delivered_check:
       kind: grep
@@ -82,7 +90,9 @@ tasks:
       - skills/escalation-watcher-auto/SKILL.md
       expect: present
   - name: truthful-no-steward-reason
-    binding: capability→producer (built by γ) — blocked reason names the gating L2 ids and 'no steward applicable' instead of 'Steward re-escalated to human' when zero stewards ran
+    binding: capability→producer (built by γ) — blocked reason names the gating L2
+      ids and 'no steward applicable' instead of 'Steward re-escalated to human' when
+      zero stewards ran
     verdict: PASS
     delivered_check:
       kind: grep
@@ -91,11 +101,14 @@ tasks:
       - orchestrator/src/orchestrator/workflow.py
       expect: present
 - label: δ
-  task_id: null
-  title: Info-L0 router — exit finalizer, reaper branch, startup routing, status-info aggregates, curator convert leg
+  task_id: 5223
+  title: Info-L0 router — exit finalizer, reaper branch, startup routing, status-info
+    aggregates, curator convert leg
   capabilities:
   - name: exit-finalizer-routes-info-l0s
-    binding: capability→producer (built by δ) — workflow.py::_on_terminal_cleanups gains a disposition_info_l0s entry, executed by CancellationScope.supervise on every exit before lock_released
+    binding: capability→producer (built by δ) — workflow.py::_on_terminal_cleanups
+      gains a disposition_info_l0s entry, executed by CancellationScope.supervise
+      on every exit before lock_released
     verdict: PASS
     delivered_check:
       kind: grep
@@ -104,7 +117,8 @@ tasks:
       - orchestrator/src/orchestrator/workflow.py
       expect: present
   - name: single-applier-module
-    binding: capability→producer (built by δ) — orchestrator/escalation_router.py applier used by the finalizer, the reaper and the startup amnesty
+    binding: capability→producer (built by δ) — orchestrator/escalation_router.py
+      applier used by the finalizer, the reaper and the startup amnesty
     verdict: PASS
     delivered_check:
       kind: grep
@@ -114,13 +128,16 @@ tasks:
       - orchestrator/src/orchestrator/harness.py
       expect: present
   - name: reaper-info-branch-no-verbatim-promotion
-    binding: capability→producer (built by δ) — harness.py::_reap_orphan_l0_escalations routes severity=info before has_open_l1; blocking path unchanged (boundary #13)
+    binding: 'capability→producer (built by δ) — harness.py::_reap_orphan_l0_escalations
+      routes severity=info before has_open_l1; blocking path unchanged (boundary #13)'
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: the branch is a control-flow change inside an existing function; pinned by boundary #5/#11/#13 executed fixtures, not expressible as a presence grep
+      reason: 'the branch is a control-flow change inside an existing function; pinned
+        by boundary #5/#11/#13 executed fixtures, not expressible as a presence grep'
   - name: loud-fallback-preserves-hint
-    binding: rejection-mechanism (built by δ, boundary #3/#4) — fallback L1 carries suggested_action convert_to_task, never manual_intervention
+    binding: 'rejection-mechanism (built by δ, boundary #3/#4) — fallback L1 carries
+      suggested_action convert_to_task, never manual_intervention'
     verdict: PASS
     delivered_check:
       kind: grep
@@ -130,7 +147,8 @@ tasks:
       - escalation/src/escalation/
       expect: present
   - name: status-info-aggregate-role
-    binding: capability→producer (built by δ) — one info L1 per class per sweep filed as agent_role harness-info-l0-router, deduped by has_open_l1(sentinel, category=)
+    binding: capability→producer (built by δ) — one info L1 per class per sweep filed
+      as agent_role harness-info-l0-router, deduped by has_open_l1(sentinel, category=)
     verdict: PASS
     delivered_check:
       kind: grep
@@ -139,7 +157,8 @@ tasks:
       - orchestrator/src/orchestrator/
       expect: present
   - name: d9-hold-bounded-by-config
-    binding: capability→producer (built by δ) — config.py info_l0_router_ticket_timeout_secs bounds the reaper-owned ticket hold (INV-7)
+    binding: capability→producer (built by δ) — config.py info_l0_router_ticket_timeout_secs
+      bounds the reaper-owned ticket hold (INV-7)
     verdict: PASS
     delivered_check:
       kind: grep
@@ -148,13 +167,16 @@ tasks:
       - orchestrator/src/orchestrator/config.py
       expect: present
   - name: curator-leg-uses-redirect-safe-client
-    binding: capability→producer (wired on main) — scheduler.py::Scheduler.dispatch_tool → mcp_call('{url}/mcp'); δ must not add a raw '/mcp/' POST (task 4023 class)
+    binding: capability→producer (wired on main) — scheduler.py::Scheduler.dispatch_tool
+      → mcp_call('{url}/mcp'); δ must not add a raw '/mcp/' POST (task 4023 class)
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: negative constraint on transport choice; reviewed in δ's plan, not greppable without false positives
+      reason: negative constraint on transport choice; reviewed in δ's plan, not greppable
+        without false positives
   - name: analytics-dispositioned-bucket
-    binding: capability→producer (built by δ) — dashboard escalation_analytics buckets the four new classes as dispositioned
+    binding: capability→producer (built by δ) — dashboard escalation_analytics buckets
+      the four new classes as dispositioned
     verdict: PASS
     delivered_check:
       kind: grep
@@ -163,11 +185,13 @@ tasks:
       - dashboard/src/dashboard/data/escalation_analytics.py
       expect: present
 - label: β
-  task_id: null
+  task_id: 5224
   title: Reviewer sees open info notes and dispositions them via the verdict
   capabilities:
   - name: verdict-carries-note-dispositions
-    binding: capability→producer (built by β) — verdict_tools.py::submit_review_verdict + _submit_review_verdict accept note_dispositions; roles.py::_REVIEWER_CONTRACT_TEMPLATE declares it
+    binding: capability→producer (built by β) — verdict_tools.py::submit_review_verdict
+      + _submit_review_verdict accept note_dispositions; roles.py::_REVIEWER_CONTRACT_TEMPLATE
+      declares it
     verdict: PASS
     delivered_check:
       kind: grep
@@ -177,7 +201,9 @@ tasks:
       - orchestrator/src/orchestrator/agents/roles.py
       expect: present
   - name: workflow-applies-dispositions
-    binding: capability→producer (built by β) — artifacts.py::ReviewAggregation carries note_dispositions; workflow.py::_execute_verify_review_loop applies them after _review returns
+    binding: capability→producer (built by β) — artifacts.py::ReviewAggregation carries
+      note_dispositions; workflow.py::_execute_verify_review_loop applies them after
+      _review returns
     verdict: PASS
     delivered_check:
       kind: grep
@@ -187,7 +213,8 @@ tasks:
       - orchestrator/src/orchestrator/artifacts.py
       expect: present
   - name: reviewer-briefing-notes-block
-    binding: capability→producer (built by β) — briefing.py::build_reviewer_prompt appends '# Implementer notes (open info escalations)' when notes exist
+    binding: capability→producer (built by β) — briefing.py::build_reviewer_prompt
+      appends '# Implementer notes (open info escalations)' when notes exist
     verdict: PASS
     delivered_check:
       kind: grep
@@ -196,11 +223,13 @@ tasks:
       - orchestrator/src/orchestrator/agents/briefing.py
       expect: present
 - label: ε
-  task_id: null
+  task_id: 5226
   title: Docs and companion corrections for the info-L0 router
   capabilities:
   - name: operations-holds-are-explicit-section
-    binding: capability→producer (built by ε) — OPERATIONS.md gains the router classes and the 'holds are explicit' rule; ARCHITECTURE.md describes the consumer chain and restart routing
+    binding: capability→producer (built by ε) — OPERATIONS.md gains the router classes
+      and the 'holds are explicit' rule; ARCHITECTURE.md describes the consumer chain
+      and restart routing
     verdict: PASS
     delivered_check:
       kind: grep
@@ -210,7 +239,8 @@ tasks:
       - ARCHITECTURE.md
       expect: present
   - name: repend-prd-d4-addendum
-    binding: capability→producer (built by ε) — dated addendum in plans/escalation-repend-state-machine-prd.md narrowing D4 for info
+    binding: capability→producer (built by ε) — dated addendum in plans/escalation-repend-state-machine-prd.md
+      narrowing D4 for info
     verdict: PASS
     delivered_check:
       kind: grep
@@ -220,12 +250,15 @@ tasks:
       - plans/info-l0-blocking-l2-spurious-escalation-analysis.md
       expect: present
 - label: ω
-  task_id: null
+  task_id: 5227
   title: Integration gate — boundary sketch executed end-to-end through real paths
   capabilities:
   - name: boundary-rows-executed
-    binding: producer:β, producer:γ, producer:δ upstream — all twenty rows of the PRD boundary-test sketch run as fixtures through the real harness/workflow/reaper/server code paths
+    binding: producer:β, producer:γ, producer:δ upstream — all twenty rows of the
+      PRD boundary-test sketch run as fixtures through the real harness/workflow/reaper/server
+      code paths
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: the gate is the executed test suite itself (INV-10); a presence grep cannot express 'twenty rows green'
+      reason: the gate is the executed test suite itself (INV-10); a presence grep
+        cannot express 'twenty rows green'
