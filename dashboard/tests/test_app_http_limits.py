@@ -20,10 +20,11 @@ reasons:
    the pool is next used, with no background reaper, so it can never pre-empt
    a server-side close regardless of its value (verified mechanism:
    ``dashboard/src/dashboard/app.py::_HTTP_KEEPALIVE_EXPIRY_SECONDS``).
-   Pinning it explicitly just avoids the alternative of omitting the
-   argument, which would leave ``httpx.Limits`` carrying
-   ``keepalive_expiry=None`` — an unmeasured, strictly looser configuration
-   in which the age-based expiry check can never fire at all.
+   Omitting the argument would leave httpx's stock 5.0, which the same
+   verified-mechanism block measured as behaviourally IDENTICAL to 4.0 on
+   this install — so 4.0 is pinned explicitly not because it behaves any
+   differently, but to keep the shipped number visible and reviewable at
+   the call site.
 
 This is a GUARD on worst-case pool growth, not a leak fix. It does NOT fix
 CLOSE-WAIT accumulation (owned by the task-3857 re-spec).
@@ -50,8 +51,10 @@ _DASHBOARD_POLL_INTERVAL = 3.0
 
 # httpx's stock DEFAULT_LIMITS (httpx/_config.py): max_connections=100,
 # max_keepalive_connections=20. Spelled out here rather than read off
-# `httpx.Limits()`, whose no-arg defaults are None — DEFAULT_LIMITS is a
-# separate module constant that httpx does not re-export publicly.
+# `httpx.Limits()`, whose no-arg defaults are None for these two `max_*`
+# fields specifically (`keepalive_expiry` defaults to 5.0, not None) — and
+# DEFAULT_LIMITS itself is a separate module constant that httpx does not
+# re-export publicly, so it can't be read off that way either.
 _HTTPX_STOCK_MAX_CONNECTIONS = 100
 _HTTPX_STOCK_MAX_KEEPALIVE = 20
 

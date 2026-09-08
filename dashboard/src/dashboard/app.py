@@ -466,12 +466,14 @@ async def _metrics_loop(
 # stays above that.
 #
 # 4.0 is KEPT here rather than removed, even though no value was ever shown
-# to beat any other: omitting the argument leaves httpx.Limits carrying
-# keepalive_expiry=None, which reaches httpcore as an unset `_expire_at`, so
-# the age term above could never fire at all. That is a third, never-measured
-# configuration with strictly looser idle retention than what ships today,
-# and adopting it silently is out of scope for what is otherwise a
-# comment-only correction.
+# to beat any other: omitting the argument would leave httpx's own stock
+# 5.0 (httpx 0.28.1), which the measurement two paragraphs above found
+# behaviourally IDENTICAL to 4.0 on this install — the other value already
+# shown not to matter, not a looser or unarmed configuration. The explicit
+# 4.0 is retained NOT because any behavioural difference was demonstrated,
+# but to keep the shipped number pinned and reviewable at this call site,
+# and to keep this correction comment-only rather than moving a runtime
+# value.
 _HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
 
 # TWO DIMENSIONS, BOUNDED DIFFERENTLY — the distinction matters:
