@@ -962,6 +962,17 @@ class EscalationQueue:
         definition no longer pending, so recovering it would only add
         archive I/O to the fast path for a record the filter would discard
         anyway.
+
+        Recovery is further gated to a ``'vanished'`` path whose parent is
+        the queue ROOT (the same root/archive tier test the pre-scan above
+        already makes).  An archive-tier path going ``'vanished'`` is
+        overwhelmingly ``archive.prune_archive`` rmtree-ing its whole dated
+        subdir wholesale — a genuine deletion recovery cannot help with, not
+        the root -> archive move this recovery targets — and re-locating it
+        anyway would cost a full targeted archive rglob (the archive is
+        shared across every project) plus a negative-cache write for an id
+        that is genuinely gone.  This deliberately leaves a second,
+        archive-to-archive relocation (e.g. a re-date) unrecovered.
         """
         # Build the candidate path list.
         paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
@@ -1004,15 +1015,25 @@ class EscalationQueue:
             # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
             # distinguishable from a genuinely faulty file (WARNING).
             esc, reason = read_escalation_for_scan(path, context='queue.get_by_task')
-            if reason == 'vanished' and status != 'pending':
+            if reason == 'vanished' and status != 'pending' and path.parent == self.queue_dir:
                 # Task 5118 (follow-up to task 5111's amendment 8): for an
                 # archive-including scan, a record relocated root -> archive
                 # inside this window landed in NEITHER the pre-scan archive
                 # glob above nor this still-a-hit read, so it would otherwise
                 # drop out of the listing silently.  It MOVED, it did not
-                # vanish -- re-locate it fresh (this also covers a second
-                # relocation, e.g. an archive-to-archive re-date) and retry
-                # the read once before giving up on it.
+                # vanish -- re-locate it fresh and retry the read once before
+                # giving up on it.
+                #
+                # Gated to the ROOT tier (path.parent == self.queue_dir), the
+                # same root/archive test the pre-scan above already uses.
+                # An ARCHIVE-tier path going 'vanished' is overwhelmingly
+                # archive.prune_archive rmtree-ing its whole dated subdir --
+                # a genuine deletion this recovery cannot help with, not the
+                # root -> archive move it targets. Recovering it anyway would
+                # cost a full targeted rglob (archive.py's archive is shared
+                # across every project) plus a negative-cache write for an id
+                # that is genuinely gone. This deliberately leaves a second,
+                # archive-to-archive relocation (e.g. a re-date) unrecovered.
                 relocated = self._locate_path(path.stem)
                 if relocated is not None:
                     esc, reason = read_escalation_for_scan(
