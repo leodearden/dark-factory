@@ -39,15 +39,24 @@ def _parameter_list(source: str, func_name: str) -> str:
     """Return the raw parameter-list text of a ``function <func_name>(`` decl.
 
     ``extract_function_body`` deliberately EXCLUDES the signature, so it cannot
-    answer "which props does this component destructure". Both components
-    asserted on here take a single destructured object with no nested parens,
-    so a non-greedy up-to-``)`` match is exact.
+    answer "which props does this component destructure".
 
-    Raises rather than returning ``''`` on a miss, for the same reason
-    ``extract_function_body`` does: an empty parameter list makes every
-    ABSENCE assertion below pass vacuously — a permanent false GREEN.
+    Walks paren DEPTH rather than matching up to the first ``)``: a parameter
+    default can carry its own parens (``onSelect = () => {}``), and a
+    stop-at-the-first-``)`` match would silently return a TRUNCATED list. The
+    ABSENCE assertions below would then run against text that never reached
+    the name they forbid — vacuously GREEN for the same reason an empty list
+    is, which is why this raises rather than returning ``''`` on a miss (the
+    rule ``extract_function_body`` follows).
+
+    Same paren-depth walk as test_charts_axis_labels.py's ``_extract_signature``.
+    Its proper home is ``_dashboard_helpers`` beside ``extract_function_body``/
+    ``strip_js_comments``, and hoisting it there is tracked by ticket
+    tkt_0RSN5VVGAVK7BQ8K9GX4PM2YBZ (see test_esc_flow_diagram.py's header note
+    on this helper family); task 4137 holds a lock on neither file, so it fixes
+    the truncation here instead of widening its merge surface.
     """
-    match = re.search(rf'function\s+{re.escape(func_name)}\s*\(([^)]*)\)', source)
+    match = re.search(rf'\bfunction\s+{re.escape(func_name)}\s*\(', source)
     assert match is not None, (
         f'Could not locate the `function {func_name}(` signature in '
         f'tab_tasks.jsx. Either the component was removed/renamed, or it was '
@@ -55,7 +64,19 @@ def _parameter_list(source: str, func_name: str) -> str:
         f'declaration is matched. This cannot silently return an empty '
         f'parameter list: an absence assertion over one would pass vacuously.'
     )
-    return match.group(1)
+    depth, i = 1, match.end()
+    while i < len(source) and depth > 0:
+        if source[i] == '(':
+            depth += 1
+        elif source[i] == ')':
+            depth -= 1
+        i += 1
+    assert depth == 0, (
+        f'Unbalanced parameter list for `function {func_name}(` in '
+        f'tab_tasks.jsx — the walk ran off the end of the file. Returning the '
+        f'partial slice would make an absence assertion over it meaningless.'
+    )
+    return source[match.end():i - 1]
 
 
 @pytest.fixture(scope='module')
@@ -83,15 +104,14 @@ def tasks_tab_code(tasks_tab_body):
 
 
 @pytest.fixture(scope='module')
-def project_task_graph_code(tab_tasks_jsx_body):
-    """ProjectTaskGraph's body, comments blanked."""
-    return strip_js_comments(extract_function_body(tab_tasks_jsx_body, 'ProjectTaskGraph'))
+def tab_tasks_jsx_code(tab_tasks_jsx_body):
+    """The WHOLE file with comments blanked.
 
-
-@pytest.fixture(scope='module')
-def project_prd_groups_code(tab_tasks_jsx_body):
-    """ProjectPrdGroups' body, comments blanked."""
-    return strip_js_comments(extract_function_body(tab_tasks_jsx_body, 'ProjectPrdGroups'))
+    Deliberately unscoped, unlike ``tasks_tab_code``: the one assertion that
+    uses it forbids a token ANYWHERE in the module, which is a claim no
+    per-component slice can make.
+    """
+    return strip_js_comments(tab_tasks_jsx_body)
 
 
 class TestFocusHeaderWiring:
@@ -159,52 +179,63 @@ class TestFocusHeaderWiring:
             'shownCount is its shown array\'s length by construction.'
         )
 
-    def test_narrowing_happens_at_exactly_one_site(
-        self, project_task_graph_code, project_prd_groups_code
-    ):
-        """focusSubset must no longer be called inside either per-project
-        component.
+    def test_narrowing_happens_at_exactly_one_site(self, tab_tasks_jsx_code):
+        """focusSubset must not be called ANYWHERE in tab_tasks.jsx.
 
-        Both used to call it with identical expressions (one per view), and the
-        header counted a third array. Hoisting the narrowing to a single call
-        site in projects.map is what makes it impossible to feed the header and
-        the body different arrays again.
+        The flat and grouped views used to call it with identical expressions
+        (one each) while the header counted a third array. Hoisting the
+        narrowing to the single focusGroupView call in projects.map is what
+        makes it impossible to feed the header and the body different arrays
+        again — so this is whole-file rather than per-component: a second call
+        inlined in the map callback, or in a newly reintroduced per-project
+        wrapper, reopens exactly the same drift and no component-scoped
+        assertion would see it.
         """
-        assert 'focusSubset(' not in project_task_graph_code, (
-            'ProjectTaskGraph still calls focusSubset(...) — the narrowing must '
-            'arrive as the graphTasks prop from the single focusGroupView call '
-            'that also produces the header count.'
-        )
-        assert 'focusSubset(' not in project_prd_groups_code, (
-            'ProjectPrdGroups still calls focusSubset(...) — the narrowing must '
-            'arrive as the graphTasks prop from the single focusGroupView call '
-            'that also produces the header count.'
+        assert 'focusSubset(' not in tab_tasks_jsx_code, (
+            'tab_tasks.jsx calls focusSubset(...) again — narrowing must happen '
+            'only in the single focusGroupView call that also produces the '
+            'header count, or the header can once more display a number for an '
+            'array the group body did not render.'
         )
 
-    @pytest.mark.parametrize('component', ['ProjectTaskGraph', 'ProjectPrdGroups'])
-    def test_components_take_graph_tasks_not_focus_state(self, tab_tasks_jsx_body, component):
-        """Both per-project components take the already-narrowed array.
+    @pytest.mark.parametrize('component', ['TaskGraph', 'ProjectPrdGroups'])
+    @pytest.mark.parametrize('focus_prop', ['focusMode', 'focusAnchorId'])
+    def test_rendering_components_take_no_focus_state(
+        self, tab_tasks_jsx_body, component, focus_prop
+    ):
+        """Neither component the group body renders may take focus state.
+
+        These are the two the projects.map callback hands ``groupView.shown``
+        to — TaskGraph for the flat view, ProjectPrdGroups for the grouped one.
+        Keeping focusMode/focusAnchorId out of their parameter lists is what
+        prevents a second narrowing site growing back and diverging from the
+        header count again.
+
+        The PROP NAME the narrowed array arrives under is deliberately NOT
+        pinned: whether it is spelled ``tasks`` or ``graphTasks`` is a naming
+        choice this file has no opinion about, and a rename must not turn it
+        red. What it does insist on is a NON-EMPTY parameter list, without
+        which the absence below would pass vacuously.
 
         Asserted against each function's SIGNATURE text rather than the whole
         file, so an unrelated occurrence of the same identifier elsewhere
-        cannot satisfy it. Keeping focusMode/focusAnchorId out of the
-        parameter list is what prevents a second narrowing site growing back.
+        cannot satisfy it, and by regex rather than by splitting on commas: a
+        defaulted parameter (``focusMode = false``) is not an exact set member
+        but is every bit the focus state this forbids.
         """
         params = _parameter_list(tab_tasks_jsx_body, component)
-        names = {n.strip() for n in params.replace('{', ',').replace('}', ',').split(',') if n.strip()}
-        assert 'graphTasks' in names, (
-            f'{component} does not destructure a graphTasks prop (params: '
-            f'{sorted(names)}) — it must receive the array the header counted, '
-            f'not re-derive it.'
+        assert params.strip(), (
+            f'{component} declares an empty parameter list. It is rendered with '
+            f'an already-narrowed task array, so this is either a rewrite this '
+            f'test no longer measures or a bad parse — and the absence '
+            f'assertion below would pass vacuously over it.'
         )
-        assert 'focusMode' not in names, (
-            f'{component} still destructures focusMode — focus state must not '
-            f'reach the per-project components at all, or the narrowing can '
-            f'diverge from the header count again.'
-        )
-        assert 'focusAnchorId' not in names, (
-            f'{component} still destructures focusAnchorId — focus state must '
-            f'not reach the per-project components at all.'
+        assert not re.search(rf'\b{focus_prop}\b', params), (
+            f'{component} takes {focus_prop} (params: {params.strip()!r}). Focus '
+            f'state must not reach the components that render a group body at '
+            f'all: the narrowing belongs to the single focusGroupView call that '
+            f'also produces the header count, and a second one can diverge from '
+            f'it again.'
         )
 
     def test_emptied_by_focus_renders_a_focus_specific_empty_state(self, tasks_tab_code):
@@ -220,13 +251,18 @@ class TestFocusHeaderWiring:
         groupTasksByPrd([]) yields zero boxes, so the body renders a silently
         blank .prd-groups div.
         """
-        assert re.search(r'\.emptiedByFocus\b', tasks_tab_code), (
-            'TasksTab never branches on focusGroupView\'s emptiedByFocus — a '
-            'group emptied by focus renders blank (grouped view) or claims the '
-            'filter emptied it (flat view).'
-        )
-        assert 'className="empty"' in tasks_tab_code, (
-            'TasksTab renders no .empty element for the emptied-by-focus case.'
+        assert re.search(
+            r'\.emptiedByFocus\b[^;]{0,200}?className="empty"',
+            tasks_tab_code,
+            re.DOTALL,
+        ), (
+            'TasksTab has no .empty element inside an emptiedByFocus branch — a '
+            'group emptied by focus renders blank (grouped view: '
+            'groupTasksByPrd([]) yields zero boxes) or claims the filter '
+            'emptied it (flat view). The two tokens are required in ONE '
+            'expression on purpose: as independent whole-body existence checks '
+            'this passed on the header suffix plus any unrelated .empty element '
+            'in TasksTab, so deleting the body branch left it green.'
         )
 
     def test_header_explains_an_emptied_group_even_when_collapsed(self, tasks_tab_code):
