@@ -61,7 +61,13 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from _dashboard_helpers import extract_function_body, find_function_params
+from _dashboard_helpers import (
+    DF_CHARTS_DESTRUCTURE_RE,
+    DF_CHARTS_EXPORT_RE,
+    destructure_bindings,
+    extract_function_body,
+    find_function_params,
+)
 
 # ---------------------------------------------------------------------------
 # The served-asset fixtures (`charts_jsx_body`, `tab_analytics_jsx_body`,
@@ -206,16 +212,14 @@ def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
 # ---------------------------------------------------------------------------
 
 _SPARK_PATH_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_SPARK_PATH')
-# Deliberately the SAME brace-hostile pattern as test_tab_burndown.py:53's
-# `_DF_CHARTS_EXPORT_RE`, copied verbatim rather than imported (this repo's test
-# modules do not import each other).  Asserted on explicitly below so that a
-# nested `{}` in the export literal fails HERE, naming the coupling, instead of
-# there as an opaque "could not parse the DF_CHARTS exports".
-_DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
-# The CONSUMER side of that export, for the last hop of the route (tabs.jsx).
-# Same pattern as test_charts_consumer_bindings.py:43 and test_tab_burndown.py,
-# again copied rather than imported.
-_DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
+# `_SPARK_PATH_DESTRUCTURE_RE` above stays LOCAL: it is a different namespace
+# and this is its only consumer.  The DF_CHARTS pair it shadows does NOT — both
+# are imported from `_dashboard_helpers` (see that module's banner for why the
+# brace-hostile `[^{}]*` must stay).  All three feed the same shared
+# `destructure_bindings`; only the projection below is this module's own.
+# The wrappers still assert on a miss explicitly, so that a nested `{}` fails
+# HERE, naming the coupling, instead of downstream as an opaque "could not
+# parse the DF_CHARTS exports".
 
 _SPARK_PATH_JS = (
     Path(__file__).resolve().parent.parent
@@ -230,7 +234,7 @@ def _binding_names(brace_body: str) -> set:
     namespace, which is the one that has to actually exist on it. A bare
     `axisY` is both source and local.
     """
-    return {part.split(':', 1)[0].strip() for part in brace_body.split(',') if part.strip()}
+    return {canonical for canonical, _local in destructure_bindings(brace_body)}
 
 
 def _spark_path_destructure(charts_jsx_body: str) -> set:
@@ -249,7 +253,7 @@ def _spark_path_destructure(charts_jsx_body: str) -> set:
 
 def _df_charts_export_names(charts_jsx_body: str) -> set:
     """Key names in the ``window.DF_CHARTS = { ... }`` export literal."""
-    m = _DF_CHARTS_EXPORT_RE.search(charts_jsx_body)
+    m = DF_CHARTS_EXPORT_RE.search(charts_jsx_body)
     assert m is not None, (
         'could not read the `window.DF_CHARTS = { ... }` export literal in '
         'charts.jsx. The overwhelmingly likely cause is a NESTED BRACE inside '
@@ -263,7 +267,7 @@ def _df_charts_export_names(charts_jsx_body: str) -> set:
 
 def _df_charts_destructure(src: str) -> set:
     """Names ``src`` pulls off ``window.DF_CHARTS`` by destructure, across all of them."""
-    matches = list(_DF_CHARTS_DESTRUCTURE_RE.finditer(src))
+    matches = list(DF_CHARTS_DESTRUCTURE_RE.finditer(src))
     assert matches, (
         'this source no longer has a `const { ... } = window.DF_CHARTS` destructure '
         'at all — either it was rewired onto a namespace binding (`const C = '
@@ -644,7 +648,7 @@ def test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts(
     # `search` and asserts on it internally: ordered the other way this line is
     # unreachable, because the helper always raises first with a message that
     # does not name test_tab_burndown.py.
-    assert _DF_CHARTS_EXPORT_RE.search(charts_jsx_body) is not None, (
+    assert DF_CHARTS_EXPORT_RE.search(charts_jsx_body) is not None, (
         'the window.DF_CHARTS export literal no longer parses under the '
         r'`window\.DF_CHARTS\s*=\s*\{([^{}]*)\}` pattern that '
         'test_tab_burndown.py:53 also uses — something in it grew a nested '
@@ -1076,7 +1080,7 @@ def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> No
     check" and pass forever. So each is run against a frozen source in which it
     must report the bad answer.
 
-    Also pins the ORDERING fix in the routing test: `_DF_CHARTS_EXPORT_RE` is
+    Also pins the ORDERING fix in the routing test: `DF_CHARTS_EXPORT_RE` is
     what fails on a nested-brace literal, and `_df_charts_export_names` raises on
     the identical `search`, so only the standalone assertion placed BEFORE that
     call can ever be the one that names test_tab_burndown.py in its message.
@@ -1093,7 +1097,7 @@ def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> No
         'consumer from an unwired one and its assertion is vacuous.'
     )
 
-    assert _DF_CHARTS_EXPORT_RE.search(_NESTED_BRACE_EXPORT) is None, (
+    assert DF_CHARTS_EXPORT_RE.search(_NESTED_BRACE_EXPORT) is None, (
         'the brace-hostile export pattern now matches a literal containing a '
         'nested brace, so neither this module nor test_tab_burndown.py:53 would '
         'notice one being introduced — and test_tab_burndown.py would go on to '
