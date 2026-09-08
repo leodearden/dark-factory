@@ -4714,13 +4714,47 @@ class ReconciliationHarness:
             # the leak.  Fail-open: _finding_has_reference only drops a
             # finding when _derive_affected_ids is clearly empty; anything
             # ambiguous (legacy affected_ids or any typed citation) passes.
+            # Task 4781: split the drop bucket a second way.  Precedence is
+            # deliberate — _finding_has_citation_failures is checked BEFORE
+            # falling back to "never cited", because a citation_failures
+            # marker can only exist on a finding that DID have a citation to
+            # verify (see _finding_has_citation_failures's docstring). A
+            # phantom-cited finding must never be miscounted as evidence that
+            # Stage 3 stopped citing.
             referenceable: list[dict] = []
+            dropped_phantom_cited: list[dict] = []
             dropped_placeholders: list[dict] = []
             for finding in actionable:
                 if _finding_has_reference(finding):
                     referenceable.append(finding)
+                elif _finding_has_citation_failures(finding):
+                    dropped_phantom_cited.append(finding)
                 else:
                     dropped_placeholders.append(finding)
+
+            # Task 4781: a phantom-cited finding is a REAL finding whose
+            # evidence evaporated after Stage 3 cited it (its cited mem0 id(s)
+            # no longer resolve — see citation_verifier.py::verify_cited_memories).
+            # It is still dropped here, same as a never-cited placeholder:
+            # _derive_affected_ids(finding) is empty either way, so a
+            # remediation agent would have no task/entity/edge/memory identity
+            # to investigate, and _escalate's fingerprint would fall back to a
+            # description-only hash that folds unrelated findings together —
+            # exactly the leak _finding_has_reference exists to close. What
+            # changes is attribution: this drop is logged and (step-6) alarmed
+            # under its own name, so it is never misfiled as "Stage 3 stopped
+            # citing findings".
+            for finding in dropped_phantom_cited:
+                logger.warning(
+                    'reconciliation.remediation_dropped_phantom_cited_finding',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'finding_category': finding.get('category', ''),
+                        'description': finding.get('description', ''),
+                        'citation_failures': finding.get('citation_failures') or [],
+                    },
+                )
 
             for finding in dropped_placeholders:
                 logger.warning(
