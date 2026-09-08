@@ -717,7 +717,27 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 # on a run that may have completed. It cannot be repaired by keying on the
 # ABSENCE of ``replacing crashed worker``, because that line is suppressed
 # under ``-q`` too: the negative signal is unsound precisely in the case it
-# would be meant to cover. dark-factory's own addopts do not use ``-q``.
+# would be meant to cover.
+#
+# MEASURED (task 5082 debug pass, 2026-09-08) -- this limitation is NOT a corner
+# case for dark-factory, and an earlier revision of this note wrongly implied it
+# was. dark-factory's own *addopts* carry no ``-q``, but that is the wrong place
+# to look: all SEVEN module-scoped configs run
+# ``pytest tests/ --tb=short -q --timeout=300`` (shared/, escalation/,
+# orchestrator/, fused-memory/, dashboard/, sampler/, cockpit/
+# ``orchestrator.yaml``), and the module-scoped leg is exactly the path that
+# produced the specimen this note is written from: ``attempt-2.orchestrator.
+# test.log``, where a gw7 death truncated the suite at ``[ 32%]`` (6677 of 20717
+# collected) and the marker is absent. So on this project's own verify output
+# `_is_worker_death_truncated_session` is INERT today -- fail-safe, but silent.
+#
+# A ``-q``-robust discriminator DOES exist and was reproduced both ways: the
+# final progress line of a bailout run stays below ``[100%]`` while a recovering
+# (``--max-worker-restart > 0``) run still reaches ``[100%]``, so it separates
+# the two cases this detector cares about without either suppressed line.
+# Adopting it would change this detector's frozen detection signal -- which four
+# consumers key off -- so the debug pass filed it for the architect rather than
+# widening the design unilaterally.
 _XDIST_SESSION_ABORTED_RE = re.compile(
     r"worker gw\d+ crashed and worker restarting disabled"
     r"|maximum crashed workers reached: \d+",
