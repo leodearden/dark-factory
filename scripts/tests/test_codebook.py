@@ -1408,21 +1408,35 @@ _T4892_CANDIDATE_SESSION = "task-4892-lettered-option-collision"
 
 
 def test_live_codebook_carries_the_lettered_option_collision_candidate():
-    """FIX 2 lands as a pending candidate — forced by the mechanism, not chosen.
+    """FIX 2 lands as a candidate — forced by the mechanism, not chosen.
 
     `apply_coding_record` never fabricates an entry ("only the census promotes
     candidates to entries"), and no existing entry or candidate covers the
     pattern, so there is nothing to match against either. Candidate is the only
-    disposition the sole-writer path can produce, and it correctly routes
+    shape the sole-writer path can produce, and it correctly routes
     adjudication to the census — the body chartered to decide whether a single
     observation deserves promotion.
+
+    What this guards: the candidate record EXISTS in the live codebook, is
+    uniquely located by its stable sighting session, is not duplicated by a
+    re-run of the merger, and carries a schema-valid id and disposition.
 
     Located by SIGHTING SESSION, deliberately not by literal candidate id:
     `apply_coding_record` derives the `-<n>` suffix from how many same-date
     candidates already exist, so a rebase against a nightly merger run
     legitimately shifts `cand-20260908-<n>`. The session is stable.
 
-    Presence and disposition only — no assertion on title/cause prose, matching
+    The disposition is deliberately NOT pinned to "pending" — the census owns
+    that field and may legitimately promote or reject this candidate
+    (`census.py::promote_candidate` / `::reject_candidate` both RETAIN the
+    candidate record and restamp its disposition), so pinning one value would
+    turn this test red on correct system behaviour. The property that pin was
+    reaching for — the merger never fabricates an adjudication — is unit-tested
+    with fixture data above, in
+    `test_apply_coding_record_does_not_duplicate_rejected_candidate` and its
+    `..._promoted_candidate` twin. Do not re-tighten it.
+
+    Presence and identity only — no assertion on title/cause prose, matching
     the identity style of the live-corpus tests above.
     """
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
@@ -1441,9 +1455,18 @@ def test_live_codebook_carries_the_lettered_option_collision_candidate():
     )
     candidate = carrying[0]
 
-    assert candidate.get("disposition") == "pending", (
-        "the merger must never fabricate an adjudication — only census.py "
-        f"writes disposition, got {candidate.get('disposition')!r}"
+    carried = [
+        s
+        for s in candidate.get("sightings") or []
+        if s.get("session") == _T4892_CANDIDATE_SESSION
+    ]
+    assert len(carried) == 1, (
+        "the sole writer must not duplicate the sighting on a re-run — "
+        f"expected exactly one {_T4892_CANDIDATE_SESSION!r} sighting, got {len(carried)}"
+    )
+    assert candidate.get("disposition") in mod.DISPOSITIONS, (
+        "disposition must be a schema-valid value; the census owns which one "
+        f"(got {candidate.get('disposition')!r}, allowed {mod.DISPOSITIONS})"
     )
     assert mod._CANDIDATE_ID_RE.match(candidate.get("id") or ""), (
         f"candidate id does not match cand-<yyyymmdd>-<n>: {candidate.get('id')!r}"
