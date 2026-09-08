@@ -1673,6 +1673,29 @@ REFERENT_CHECKS: tuple[str, ...] = ('set-membership', 'per-edge-pairing')
 #: bounded by `_REFERENT_FINDING_WARN_CAP` instead.
 REFERENT_FINDING_AXES: tuple[str, ...] = ('unresolvable', 'corroborated')
 
+#: Per-EPISODE ceiling on INDIVIDUALLY logged verification findings, after which
+#: the operator log emits one aggregate line instead (task 3671, PRD leaf zeta).
+#:
+#: TEN, taken from the sibling :data:`_REFERENT_REPAIR_STREAK_THRESHOLD` in this
+#: same subsystem rather than invented: both answer the same operator question
+#: ("how many of these do I need to see before I have the picture?"), and two
+#: unrelated magic numbers in one subsystem is a tuning surface nobody can hold
+#: in their head.
+#:
+#: A LOG-VOLUME POLICY NUMBER, NOT AN ACCURACY THRESHOLD. Nothing downstream
+#: keys off it — the counters and :attr:`ReferentStats.findings` are outside the
+#: cap entirely — so retuning it cannot change a verdict, a rate, or a repair.
+#: Every test computes its expectations FROM this constant for that reason, so a
+#: retune can never red the suite.
+#:
+#: A LOWER value costs diagnostic detail: the individually-logged findings are
+#: where an operator reads WHICH edges are wrong, and ten distinct payloads is
+#: about the smallest sample that shows whether a storm is one repeated shape or
+#: many. A HIGHER one buys nothing once the aggregate line exists — past a dozen
+#: near-identical payloads the marginal line adds no diagnosis, and the storm's
+#: SIZE, which is what the aggregate reports, is the thing that matters.
+_REFERENT_FINDING_WARN_CAP: int = 10
+
 #: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
 #: the ``entity_mint.lock_timeout_seconds`` config hop is missing, None or the
 #: wrong type. Matches the schema default; the LIVE config value is what
@@ -4026,6 +4049,12 @@ class MemoryService:
                 finding, new_endpoint_uuid=uuid_by_name[name],
             )
 
+        # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below and
+        # `stats.findings` stay outside it entirely, so suppression costs leaf
+        # iota no rate signal and leaf eta no finding — see
+        # `_REFERENT_FINDING_WARN_CAP`.
+        warned = 0
+        suppressed = 0
         for finding in stats.findings:
             # The two INV-2 surfaces no consumer has to parse a log for: the
             # process-lifetime counter leaf iota reads, and the return value
@@ -4070,9 +4099,48 @@ class MemoryService:
             # surfaces are the counters above and `stats.findings`, and NEITHER
             # is affected by this level: a corroborated finding is counted and
             # returned in full regardless.
+            #
+            # CAPPED, and only on the warn-level half. One episode can carry
+            # hundreds of edges, and `replay_from_store` re-writing a backlog
+            # multiplies that across every episode in the queue — an unbounded
+            # per-finding warning turns the surface that exists to make a defect
+            # VISIBLE into the surface that buries every other line an operator
+            # needs. Corroborated findings are demoted before the cap is
+            # applied, so the budget is spent on findings that indicate a defect
+            # rather than on the dominant legitimate ambient-task shape.
+            if finding.corroborated:
+                level = logging.INFO
+            elif warned < _REFERENT_FINDING_WARN_CAP:
+                level = logging.WARNING
+                warned += 1
+            else:
+                suppressed += 1
+                continue
             logger.log(
-                logging.INFO if finding.corroborated else logging.WARNING,
-                'Referent verification finding: %s', finding.to_dict(),
+                level, 'Referent verification finding: %s', finding.to_dict(),
+            )
+
+        if suppressed:
+            # THE TRUNCATION ANNOUNCES ITSELF rather than the log simply
+            # stopping. A silently shortened log is a fail-soft path with
+            # nothing to hear it, which is exactly what INV-4 forbids: the
+            # counter is the MACHINE half of that escape and this line is the
+            # OPERATOR half, and a storm is precisely the condition in which the
+            # operator half matters most. It carries the size of the storm and
+            # its per-check shape, so what the suppressed lines would have shown
+            # in aggregate is still legible.
+            logger.warning(
+                'Referent verification finding storm: %d further finding(s) '
+                'suppressed from this episode after the first %d were logged '
+                'individually; per-check totals for the episode: %s. Every '
+                'finding is on the return value and in the counters — only the '
+                'log is capped.',
+                suppressed,
+                _REFERENT_FINDING_WARN_CAP,
+                {
+                    check: sum(1 for f in stats.findings if f.check == check)
+                    for check in REFERENT_CHECKS
+                },
             )
 
         return stats

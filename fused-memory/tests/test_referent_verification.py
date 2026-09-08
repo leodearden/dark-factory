@@ -2548,12 +2548,12 @@ class TestTheOperatorWarningIsCappedPerEpisode:
     ):
         """The storm signal INV-4 asks for. The counter is the machine half of
         the escape; this line is the operator half."""
-        cap = _warn_cap()
+        cap, overflow = _warn_cap(), 5
 
         with caplog.at_level(logging.INFO,
                              logger='fused_memory.services.memory_service'):
             await service._verify_episode_referents(
-                _finding_storm_episode(cap + 5), group_id='dark_factory',
+                _finding_storm_episode(cap + overflow), group_id='dark_factory',
                 referents=(Referent(number='3127'),),
             )
 
@@ -2561,11 +2561,13 @@ class TestTheOperatorWarningIsCappedPerEpisode:
         assert len(storm) == 1
         assert storm[0].levelno == logging.WARNING
         message = storm[0].getMessage()
-        # How many were suppressed...
-        assert str(5) in message
+        # How many were suppressed — matched as a PHRASE, not as a bare digit,
+        # which any other number in the line would satisfy.
+        assert f'{overflow} further finding' in message
+        assert 'suppressed' in message
         # ...and the per-check totals for the episode, so the shape of the
         # storm is legible without the suppressed lines.
-        assert f"'set-membership': {cap + 5}" in message
+        assert f"'set-membership': {cap + overflow}" in message
         assert "'per-edge-pairing': 0" in message
 
     @pytest.mark.asyncio
