@@ -40,6 +40,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
+from _worktree_add_fakes import make_fake_run
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
@@ -112,30 +113,16 @@ MAIN_SHA = 'c' * 40
 
 
 def _make_fake_run(add_rcs: list[int], calls: list[list[str]]):
-    """Fake ``orchestrator.git_ops._run`` recording every argv into *calls*.
+    """``make_fake_run`` driven by ``git worktree add`` return codes alone.
 
-    ``git worktree add`` return codes are consumed in order from *add_rcs*
-    (the last entry repeats once exhausted). A successful add mkdirs the
-    ``--detach`` target, mirroring what real ``git worktree add`` does, so
-    a later unconditional ``shutil.rmtree`` has something real on disk to
-    remove. Every other command (e.g. ``git worktree remove``) always
-    succeeds.
+    A non-zero rc is given the ``lock contention`` stderr these tests'
+    retry assertions assume — a shape the shared retryability predicate
+    classifies as transient.
     """
-    state = {'add_calls': 0}
-
-    async def _fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        if 'worktree' in cmd and 'add' in cmd:
-            idx = state['add_calls']
-            rc = add_rcs[idx] if idx < len(add_rcs) else add_rcs[-1]
-            state['add_calls'] += 1
-            if rc == 0:
-                detach_idx = cmd.index('--detach')
-                Path(cmd[detach_idx + 1]).mkdir(parents=True, exist_ok=True)
-            return (rc, '', '' if rc == 0 else 'lock contention')
-        return (0, '', '')
-
-    return _fake_run
+    return make_fake_run(
+        [(rc, '', '' if rc == 0 else 'lock contention') for rc in add_rcs],
+        calls,
+    )
 
 
 class TestEphemeralWorktreeNamingAndAdd:
@@ -1231,30 +1218,6 @@ class TestEphemeralWorktreeWarmSeed:
 # ---------------------------------------------------------------------------
 
 
-def _make_fake_run_streams(
-    results: list[tuple[int, str, str]], calls: list[list[str]],
-):
-    """Like :func:`_make_fake_run` but yielding a per-attempt
-    ``(rc, stdout, stderr)`` triple, which the task-5140 stream-content
-    assertions need. A successful add still mkdirs the ``--detach`` target.
-    """
-    state = {'add_calls': 0}
-
-    async def _fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        if 'worktree' in cmd and 'add' in cmd:
-            idx = state['add_calls']
-            rc, out, err = results[idx] if idx < len(results) else results[-1]
-            state['add_calls'] += 1
-            if rc == 0:
-                detach_idx = cmd.index('--detach')
-                Path(cmd[detach_idx + 1]).mkdir(parents=True, exist_ok=True)
-            return (rc, out, err)
-        return (0, '', '')
-
-    return _fake_run
-
-
 class TestEphemeralWorktreeSharedRetryDriver:
     """task 5140 step-9: ``ephemeral_worktree`` routes its ``git worktree
     add`` through the SAME ``GitOps._worktree_add_with_retry`` driver
@@ -1317,7 +1280,7 @@ class TestEphemeralWorktreeSharedRetryDriver:
         with (
             patch(
                 'orchestrator.git_ops._run',
-                side_effect=_make_fake_run_streams(
+                side_effect=make_fake_run(
                     [(1, '', 'No space left on device')], calls,
                 ),
             ),
@@ -1354,7 +1317,7 @@ class TestEphemeralWorktreeSharedRetryDriver:
         with (
             patch(
                 'orchestrator.git_ops._run',
-                side_effect=_make_fake_run_streams(
+                side_effect=make_fake_run(
                     [(1, 'OUT-MARKER', 'ERR-MARKER')], calls,
                 ),
             ),

@@ -44,6 +44,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
+from _worktree_add_fakes import make_fake_run
 
 import orchestrator.git_ops as git_ops_mod
 import orchestrator.verify_classify as verify_classify_mod
@@ -165,47 +166,6 @@ class TestWorktreeAddRetryPredicate:
 MERGE_SHA = 'a' * 40
 
 
-def _make_fake_add(
-    results: list[tuple[int, str, str]],
-    calls: list[list[str]],
-    *,
-    mkdir_on_failure: bool = False,
-    exists_at_entry: list[bool] | None = None,
-):
-    """Fake ``orchestrator.git_ops._run`` recording every argv into *calls*.
-
-    Generalises ``test_ephemeral_worktree.py::_make_fake_run`` (which yields
-    per-attempt rcs only) to yield a per-attempt ``(rc, stdout, stderr)``
-    triple, which the stream-content assertions below need. Results are
-    consumed in order; the last entry repeats once exhausted.
-
-    A successful add mkdirs the ``--detach`` target, mirroring real ``git
-    worktree add``.  With *mkdir_on_failure* a FAILED add mkdirs it too —
-    which is also what real git does, since it creates the target directory
-    early, before the add can fail.  When *exists_at_entry* is supplied,
-    each add records whether the target already existed on entry, which is
-    how the between-attempts residue clearing is observed.
-    """
-    state = {'add_calls': 0}
-
-    async def _fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        if 'worktree' in cmd and 'add' in cmd:
-            detach_idx = cmd.index('--detach')
-            target = Path(cmd[detach_idx + 1])
-            if exists_at_entry is not None:
-                exists_at_entry.append(target.exists())
-            idx = state['add_calls']
-            rc, out, err = results[idx] if idx < len(results) else results[-1]
-            state['add_calls'] += 1
-            if rc == 0 or mkdir_on_failure:
-                target.mkdir(parents=True, exist_ok=True)
-            return (rc, out, err)
-        return (0, '', '')
-
-    return _fake_run
-
-
 def _add_argvs(calls: list[list[str]]) -> list[list[str]]:
     return [c for c in calls if 'worktree' in c and 'add' in c]
 
@@ -237,7 +197,7 @@ class TestWorktreeAddWithRetry:
         with (
             patch(
                 'orchestrator.git_ops._run',
-                side_effect=_make_fake_add(
+                side_effect=make_fake_run(
                     [(1, '', TRANSIENT_4215_STDERR), (1, '', 'lock contention'), (0, '', '')],
                     calls,
                 ),
@@ -275,7 +235,7 @@ class TestWorktreeAddWithRetry:
         with (
             patch(
                 'orchestrator.git_ops._run',
-                side_effect=_make_fake_add([(1, 'OUTMARK', 'ERRMARK')], calls),
+                side_effect=make_fake_run([(1, 'OUTMARK', 'ERRMARK')], calls),
             ),
             patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
         ):
@@ -304,7 +264,7 @@ class TestWorktreeAddWithRetry:
         with (
             patch(
                 'orchestrator.git_ops._run',
-                side_effect=_make_fake_add([(1, '', ENOSPC_3692_STDERR)], calls),
+                side_effect=make_fake_run([(1, '', ENOSPC_3692_STDERR)], calls),
             ),
             patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
         ):
@@ -336,7 +296,7 @@ class TestWorktreeAddWithRetry:
         with (
             patch(
                 'orchestrator.git_ops._run',
-                side_effect=_make_fake_add([(0, '', '')], calls),
+                side_effect=make_fake_run([(0, '', '')], calls),
             ),
             patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
         ):
@@ -369,7 +329,7 @@ class TestWorktreeAddWithRetry:
         with (
             patch(
                 'orchestrator.git_ops._run',
-                side_effect=_make_fake_add(
+                side_effect=make_fake_run(
                     [(1, '', 'lock contention'), (1, '', 'lock contention'), (0, '', '')],
                     calls,
                     mkdir_on_failure=True,
@@ -406,7 +366,7 @@ class TestWorktreeAddWithRetry:
             caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
             patch(
                 'orchestrator.git_ops._run',
-                side_effect=_make_fake_add(
+                side_effect=make_fake_run(
                     [(1, '', TRANSIENT_4545_STDERR), (0, '', '')], calls,
                 ),
             ),
@@ -479,34 +439,13 @@ def _make_fake_merge_run(
     rev_parse_sha: str = MAIN_HEAD_SHA,
     mkdir_on_failure: bool = False,
 ):
-    """Fake ``_run`` for ``_create_merge_worktree``.
-
-    Beyond the per-attempt ``git worktree add`` results, this also answers
-    the ``git fetch`` / ``git rev-parse`` calls the ``base_sha is None``
-    branch makes — ``rev-parse`` returns *rev_parse_sha* on stdout with a
-    trailing newline, exactly as real git does, so the caller's ``.strip()``
-    is genuinely exercised.
-    """
-    state = {'add_calls': 0}
-
-    async def _fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        if 'worktree' in cmd and 'add' in cmd:
-            detach_idx = cmd.index('--detach')
-            target = Path(cmd[detach_idx + 1])
-            idx = state['add_calls']
-            rc, out, err = (
-                add_results[idx] if idx < len(add_results) else add_results[-1]
-            )
-            state['add_calls'] += 1
-            if rc == 0 or mkdir_on_failure:
-                target.mkdir(parents=True, exist_ok=True)
-            return (rc, out, err)
-        if 'rev-parse' in cmd:
-            return (0, f'{rev_parse_sha}\n', '')
-        return (0, '', '')
-
-    return _fake_run
+    """``make_fake_run`` with the ``git rev-parse`` answer the
+    ``base_sha is None`` branch of ``_create_merge_worktree`` needs."""
+    return make_fake_run(
+        add_results, calls,
+        mkdir_on_failure=mkdir_on_failure,
+        rev_parse_sha=rev_parse_sha,
+    )
 
 
 class TestCreateMergeWorktreeRetry:
