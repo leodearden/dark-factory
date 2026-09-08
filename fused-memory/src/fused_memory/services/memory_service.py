@@ -1923,6 +1923,31 @@ def _endpoint_referent(endpoint_name: str, *, group_id: str) -> Referent | None:
     return local_referent(referent, group_id=group_id)
 
 
+def _referent_sort_key(referent: Referent) -> tuple[str, str, str]:
+    """The total order every rendered or returned referent SEQUENCE is sorted by.
+
+    THE single site for that rule (INV-5), because its callers must agree and
+    their correctness is one argument, not two: referents reach both as
+    FROZENSETS, whose iteration order is not stable across processes under hash
+    randomization, so an unsorted sequence would make :func:`_candidate_targets`'
+    output and a finding's ``cited`` payload differ run to run for byte-identical
+    inputs — undiffable in leaf eta's audit and unassertable without re-sorting
+    at every call site that reads them.
+
+    Keys on the IDENTITY TRIPLE ``(kind, project_id, number)`` — what a
+    :class:`~fused_memory.utils.canonical_labels.Referent` IS, and the same
+    triple its equality and hash are defined on — rather than on the rendered
+    :attr:`~fused_memory.utils.canonical_labels.Referent.node_name`, which drops
+    ``kind`` for a foreign referent and would therefore stop being a total order
+    the moment a second kind is registered.
+
+    ``number`` sorts as a STRING, matching how it is stored, so ``'10'`` precedes
+    ``'9'``. Nothing keys off numeric rank; the property required here is
+    STABILITY, not arithmetic order.
+    """
+    return (referent.kind, referent.project_id, referent.number)
+
+
 def _candidate_pool(
     *,
     referents: frozenset[Referent],
@@ -2153,11 +2178,14 @@ def _candidate_targets(
             verbatim to :func:`_candidate_pool` (veto 2).
 
     Returns:
-        The surviving candidates, sorted by ``(kind, project_id, number)``.
+        The surviving candidates, sorted by :func:`_referent_sort_key`.
         Sorted rather than kept in the caller's first-seen order because the
         inputs are FROZENSETS, whose iteration order is not stable across
         processes under hash randomization — and a finding must be stable across
-        runs and diffable in eta's audit.
+        runs and diffable in eta's audit. Through the shared key rather than an
+        inline ``lambda`` because the ``cited`` rendering in
+        :meth:`MemoryService._verify_episode_referents` sorts for this exact
+        reason and must not drift from it.
     """
     # `other_endpoint` may be None; None is simply not a member of a
     # frozenset[Referent], and typeshed types `frozenset.__sub__` as accepting
@@ -2166,7 +2194,7 @@ def _candidate_targets(
         referents=referents, cited=cited, endpoint=endpoint,
         ambiguous=ambiguous, source=source,
     ) - {endpoint, other_endpoint}
-    return tuple(sorted(pool, key=lambda r: (r.kind, r.project_id, r.number)))
+    return tuple(sorted(pool, key=_referent_sort_key))
 
 def _unresolvable_reason(
     candidates: tuple[Referent, ...],
@@ -3954,15 +3982,23 @@ class MemoryService:
             cited_declared = cited & referent_set
             # The same citations rendered for the RECORD, so a finding carries
             # the evidence that decided it and not merely the declared set it
-            # was compared against. Sorted for the reason `_candidate_targets`
-            # sorts its survivors — `cited` is a frozenset, whose iteration
-            # order is not stable across processes under hash randomization.
-            cited_names = tuple(
-                r.node_name
-                for r in sorted(
-                    cited, key=lambda r: (r.kind, r.project_id, r.number),
-                )
-            )
+            # was compared against. Sorted through `_referent_sort_key`, the
+            # single site for that rule, and for the reason it documents:
+            # `cited` is a frozenset, whose iteration order is not stable across
+            # processes under hash randomization.
+            #
+            # LAZY and memoized per EDGE, for the same reason the scan above is
+            # deferred and in the same critical section. Its only reader is the
+            # `ReferentFinding(...)` site below — the ~0.2% path — so paying a
+            # sort plus a rendering on every task-labelled edge that produces no
+            # finding is the identical waste deferring the scan just removed,
+            # charged to the same serialized per-group `_identity_lock_for`
+            # queue. `None` is the sentinel rather than a falsy default because
+            # `()` is a LEGITIMATE computed value (a fact citing nothing), and
+            # per-edge rather than per-endpoint so both ends of one edge still
+            # share ONE rendering.
+            cited_names: tuple[str, ...] | None = None
+
 
             for index, end in enumerate(ends):
                 which_end, endpoint_uuid, endpoint_name, endpoint_referent = end
@@ -4041,6 +4077,11 @@ class MemoryService:
                     source=referent_source,
                 )
                 resolvable = len(candidates) == 1
+                if cited_names is None:
+                    cited_names = tuple(
+                        r.node_name
+                        for r in sorted(cited, key=_referent_sort_key)
+                    )
                 stats.findings.append(ReferentFinding(
                     edge_uuid=edge_uuid,
                     which_end=which_end,
