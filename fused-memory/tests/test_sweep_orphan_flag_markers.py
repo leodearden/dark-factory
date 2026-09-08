@@ -739,6 +739,136 @@ class TestFindProtectedMarkers:
 
 
 # ===========================================================================
+# Tests: find_undrainable_markers (task 4436)
+# ===========================================================================
+
+class TestFindUndrainableMarkers:
+    """Tests for the pure function find_undrainable_markers(members, drained_ids).
+
+    The PERMANENT floor on ``after.total_source``: the enumerated members no
+    invocation of this sweep can ever drain, minus the ones this run's delete
+    set already covers. Two structurally different arms compose it — the
+    UNDATED arm (``find_undated_markers``; invocation-relative, because
+    ``--delete-ids``/``--terminal-drain`` can still reach it) and the
+    PROTECTED arm (``find_protected_markers``; absolute, refused
+    unconditionally at the delete choke point even against ``--delete-ids``).
+    """
+
+    @staticmethod
+    def _undated(id: str, created_at: str | None = None) -> dict:
+        """Build an undated member with a valid kind and non-terminal task_id.
+
+        Mirrors ``TestFindUndatedMarkers._dated``: ``_member``'s hardcoded
+        ``created_at='2026-01-01T00:00:00Z'`` is always dated, so the undated
+        shapes are built by hand. Carries kind+task_id so no OTHER predicate
+        catches it — isolating the undated dimension.
+        """
+        member: dict = {
+            'id': id,
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': '9001',
+            },
+        }
+        if created_at is not None:
+            member['created_at'] = created_at
+        return member
+
+    def test_missing_created_at_and_undrained_is_returned(self):
+        """(a) A member with no created_at key that this run does not delete
+        floors the backlog."""
+        member = self._undated('missing1')
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [missing1], got: {result!r}'
+
+    def test_none_created_at_and_undrained_is_returned(self):
+        """(b) created_at explicitly None is undated, hence floor."""
+        member = self._undated('none1')
+        member['created_at'] = None
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [none1], got: {result!r}'
+
+    def test_unparseable_created_at_and_undrained_is_returned(self):
+        """(c) An unparseable created_at is undated, hence floor."""
+        member = self._undated('bad1', created_at='not-a-date')
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [bad1], got: {result!r}'
+
+    def test_undated_but_drained_is_not_returned(self):
+        """(d) THE UNDATED KEY CASE — a member the delete set already covers
+        sets NO floor, however undated it is.
+
+        This is why ``undated_kept_count`` is the wrong number to key a
+        constraint on: ``find_orphan_markers`` / ``find_taskless_markers`` /
+        ``find_terminal_task_markers`` never consult ``created_at``, so an
+        undated member any of them catches IS drained this run.
+        """
+        member = self._undated('drained1')
+        result = _mod.find_undrainable_markers([member], {'drained1'})
+        assert result == [], f'Expected [] (already drained), got: {result!r}'
+
+    def test_dated_protected_members_are_returned(self):
+        """(e) THE PROTECTED ARM — fully DATED protected records floor the
+        backlog even though ``find_undated_markers`` returns neither.
+
+        The protected-mirror guard refuses them at every age and under every
+        flag, so they are undrainable in a strictly stronger sense than an
+        undated member is.
+        """
+        mirror = _mirror('m1')
+        stamp = _ledger_stamp('l1')
+        assert _mod.find_undated_markers([mirror, stamp]) == [], (
+            'Fixture drift: the protected arm must be exercised by DATED members'
+        )
+        result = _mod.find_undrainable_markers([mirror, stamp], set())
+        assert result == [mirror, stamp], f'Expected [m1, l1], got: {result!r}'
+
+    def test_protected_member_is_returned_even_when_in_drained_ids(self):
+        """(f) The protected arm does not depend on the caller having
+        subtracted protected members from its delete set first.
+
+        ``run()`` does subtract them, so this state is unreachable there —
+        which is exactly why the predicate must not TRUST that it happened.
+        """
+        mirror = _mirror('m1')
+        result = _mod.find_undrainable_markers([mirror], {'m1'})
+        assert result == [mirror], f'Expected [m1], got: {result!r}'
+
+    @pytest.mark.parametrize('drained_ids', [set(), {'keep'}])
+    def test_ordinary_dated_member_is_never_returned(self, drained_ids):
+        """(g) A dated, kinded, task_id-carrying marker floors nothing,
+        in or out of the delete set."""
+        member = _member('keep')
+        result = _mod.find_undrainable_markers([member], drained_ids)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_undated_and_protected_member_appears_exactly_once(self):
+        """(h) The two arms are an id-deduplicated UNION, not a concatenation."""
+        both = _mirror('both1')
+        del both['created_at']
+        assert _mod.find_undated_markers([both]) == [both], 'Fixture drift: not undated'
+        assert _mod.find_protected_markers([both]) == [both], 'Fixture drift: not protected'
+        result = _mod.find_undrainable_markers([both], set())
+        assert result == [both], f'Expected exactly one [both1], got: {result!r}'
+
+    def test_empty_input_returns_empty(self):
+        """(i) Empty input list returns empty list."""
+        assert _mod.find_undrainable_markers([], set()) == []
+
+    def test_preserves_order_and_identity(self):
+        """(j) Returned dicts are the same objects, in scroll order —
+        matching TestFindUndatedMarkers.test_preserves_order_and_identity."""
+        undated = self._undated('u1')
+        stamp = _ledger_stamp('l1')
+        members = [_orphan('o1'), undated, _member('keep'), stamp]
+        result = _mod.find_undrainable_markers(members, set())
+        assert result == [undated, stamp], f'Expected [u1, l1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
+
+
+# ===========================================================================
 # Tests: delete_orphan_markers
 # ===========================================================================
 
