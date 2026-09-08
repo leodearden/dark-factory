@@ -3656,7 +3656,17 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         # subprocess completion past a short deadline; the discriminating
         # invariant is the FLOCK_WAIT_CEILING_SECS assertion below (task
         # 3369), never this ceiling, which only bounds a wedged child.
-        stdout, stderr = proc.communicate(timeout=60)
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        finally:
+            # task 4092/4946: kill_holder_tree so a communicate() timeout
+            # here does not leak the child leader -- and any
+            # start_new_session build command verify.py spawned under it --
+            # while we still hold the flock; a child killed before the
+            # unlock below can never win the lock and proceed.  Free on the
+            # success path: communicate() has already reaped the child, so
+            # the ALREADY-REAPED SHORT CIRCUIT returns at once.
+            kill_holder_tree(proc, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(held_fd, fcntl.LOCK_UN)
