@@ -525,7 +525,8 @@ with `append=True` for the hints attach, then a separate details-only call with 
 `append` OMITTED for the details rewrite; or (2) when you deliberately want to APPEND \
 a new section to `details`, pass ONLY the new section text with `append=True` and let \
 the backend do the concatenation — never re-send the existing body. Either way, verify \
-by reading the response's `details` field or a follow-up \
+by reading the response's `updated_task.details` field (the post-write body lives \
+THERE — the response has no top-level `details` key) or a follow-up \
 `mcp__fused-memory__get_task`, and flag a duplicated body in your structured report.
 
 The additive union above ALSO covers a task whose stored `memory_hints` are in the \
