@@ -489,6 +489,109 @@ class TestTrippingMetric:
             sample.tripping_metric(self._all_arms_cfg())
 
 
+# Realistic /proc/stat surroundings — the reader must find procs_running
+# among them, not merely parse a one-line file.
+PROC_STAT_TEXT = (
+    'cpu  1234567 890 234567 89012345 6789 0 12345 0 0 0\n'
+    'cpu0 123456 89 23456 8901234 678 0 1234 0 0 0\n'
+    'intr 987654321 0 0 0\n'
+    'ctxt 1234567890\n'
+    'btime 1757000000\n'
+    'processes 9876543\n'
+    'procs_running 64\n'
+    'procs_blocked 2\n'
+)
+
+
+class TestReadRunqueueRatio:
+    """procs_running / len(os.sched_getaffinity(0)), fail-open by value."""
+
+    def _write(self, tmp_path, text, name='stat'):
+        path = tmp_path / name
+        path.write_text(text)
+        return path
+
+    def test_happy_path_ratio_and_read_ok(self, tmp_path):
+        import os
+
+        from shared.psi import read_runqueue_ratio
+
+        reading = read_runqueue_ratio(
+            proc_stat_path=self._write(tmp_path, PROC_STAT_TEXT)
+        )
+
+        assert reading.read_ok is True
+        assert isinstance(reading.ratio, float)
+        assert reading.ratio == pytest.approx(64 / len(os.sched_getaffinity(0)))
+
+    def test_missing_file_degrades_by_value(self, tmp_path):
+        from shared.psi import read_runqueue_ratio
+
+        reading = read_runqueue_ratio(proc_stat_path=tmp_path / 'absent')
+
+        assert reading.read_ok is False
+        assert reading.ratio == 0.0
+
+    def test_no_procs_running_line_degrades_by_value(self, tmp_path):
+        from shared.psi import read_runqueue_ratio
+
+        text = 'cpu  1 2 3 4\nctxt 5\nprocs_blocked 2\n'
+        reading = read_runqueue_ratio(proc_stat_path=self._write(tmp_path, text))
+
+        assert reading.read_ok is False
+        assert reading.ratio == 0.0
+
+    def test_malformed_procs_running_degrades_by_value(self, tmp_path):
+        from shared.psi import read_runqueue_ratio
+
+        text = 'cpu  1 2 3 4\nprocs_running abc\nprocs_blocked 2\n'
+        reading = read_runqueue_ratio(proc_stat_path=self._write(tmp_path, text))
+
+        assert reading.read_ok is False
+        assert reading.ratio == 0.0
+
+    def test_procs_running_with_no_value_degrades_by_value(self, tmp_path):
+        from shared.psi import read_runqueue_ratio
+
+        text = 'cpu  1 2 3 4\nprocs_running\nprocs_blocked 2\n'
+        reading = read_runqueue_ratio(proc_stat_path=self._write(tmp_path, text))
+
+        assert reading.read_ok is False
+        assert reading.ratio == 0.0
+
+    def test_unreadable_as_text_degrades_by_value(self, tmp_path):
+        """Path.read_text() raises UnicodeDecodeError on non-UTF-8 content."""
+        from shared.psi import read_runqueue_ratio
+
+        path = tmp_path / 'stat'
+        path.write_bytes(b'procs_running \xff\xfe\n')
+        reading = read_runqueue_ratio(proc_stat_path=path)
+
+        assert reading.read_ok is False
+        assert reading.ratio == 0.0
+
+    def test_directory_in_place_of_file_degrades_by_value(self, tmp_path):
+        from shared.psi import read_runqueue_ratio
+
+        (tmp_path / 'stat').mkdir()
+        reading = read_runqueue_ratio(proc_stat_path=tmp_path / 'stat')
+
+        assert reading.read_ok is False
+        assert reading.ratio == 0.0
+
+    def test_is_a_plain_function_with_no_cfg_or_host_psi_dependency(self):
+        """The reader takes no cfg and no host-PSI seam — it is orthogonal to
+        both, which is what lets read_psi_sample compose it independently."""
+        import inspect
+
+        from shared.psi import read_runqueue_ratio
+
+        params = inspect.signature(read_runqueue_ratio).parameters
+        assert list(params) == ['proc_stat_path']
+        assert params['proc_stat_path'].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params['proc_stat_path'].default is not inspect.Parameter.empty
+
+
 class TestReadPsiSampleHappyPath:
     def _fake_read(self):
         # Note: the memory pressure file is read under the name 'memory', not 'mem'.
