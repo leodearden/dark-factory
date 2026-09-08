@@ -22632,3 +22632,16 @@ candidates:
     origin_phase: prd
     manifested_phase: review
     evidence_quote: 'On 2026-08-20 the boundary guard scanned the FIXED set only... Parameter-aware detection did not exist until commit cb68bc3369, feat(4696), 2026-08-25. So for the whole 2026-08-20 to 2026-08-25 window... Concrete counterexample: /home/leo/src/reify/data/escalations/archive/2026-08-22/esc-plan-tools-markup-residue-1.json (2026-08-21T21:17:56Z)... its matched_pattern is the canonical opener prefix, not the closer for ''decision'', because ''decision'' is not in the fixed set.'
+- id: cand-20260908-1
+  title: Unqualified lettered option back-reference across documents that each own their own a/b/c list
+  cause: 'A cross-document back-reference cites bare option letters (e.g. "the (b)/(c) refutations") without naming which document''s list owns them. When both documents independently letter their options a/b/c, a reader in document order binds the letters to the WRONG list — the one they have already read — and concludes that a still-live decision was already refuted, closing an open task as unactionable. The failure is silent: both documents are internally consistent and correct, so nothing is wrong to find in either one; the defect exists only in the unqualified reference between them, and it bites hardest when the ambiguous citation PRECEDES the live mandate in document order. Remedy: scope every cross-document letter to its owning list, and add the reciprocal clause at the cited-from site so the disambiguation works from either entry point.'
+  area: cross-document reference integrity
+  first_seen: '2026-09-08'
+  disposition: pending
+  sightings:
+  - date: '2026-09-08'
+    project: dark_factory
+    session: task-4892-lettered-option-collision
+    origin_phase: prd
+    manifested_phase: architect
+    evidence_quote: '`plans/reify-flag-marker-backlog-rca-2026-07-22.md` §6a.3''s ADDENDUM 2026-08-17 closes with "Full ruling, dated census and the (b)/(c) refutations: `docs/flag-marker-sweep-recurring.md` §"Decision (task 3923)"." Those (b)/(c) are the linked document''s own list, about the retired `--check` gate. But §5 of the SAME document owns an unrelated "Optional hardening" a/b/c whose b and c are the two edits carried by task 2917 (measured `pending`), and §6a.5 records that mandate — three lines AFTER the ambiguous citation. A reader going top to bottom meets the "refutations" first and concludes 2917''s ratified work was already refuted. The same bullet''s earlier "retired (option a)" is the same collision: that "a" is the linked document''s, while §6a.5''s "Option a" is §5''s. Filed as esc-2917-2 by task 2917''s architect.'
