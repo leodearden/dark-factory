@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 import types
@@ -1215,6 +1216,70 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
     would guarantee a storm escalation describing a failure that is not
     happening, which trains an operator to ignore the alarm.
     """
+
+    @pytest.mark.asyncio
+    async def test_the_disabled_branch_says_so_in_the_log(self, caplog) -> None:
+        """An unlogged kill switch is indistinguishable from a novel corpus.
+
+        This branch returns `stored` with no log line, no counter and nothing
+        on the ack to tell it apart — reproducing exactly the state
+        `_DEFAULT_JUDGE_ENABLED = True` is justified against in its own
+        comment: "the operator would flip `enabled`, get stub behaviour, and
+        read the all-`stored` ack stream as evidence the corpus is novel".
+        Defaulting the knob to True does not help the operator who sets it to
+        False and then reads the logs.
+
+        INFO, not a counter: the reviewer is right that counting this would be
+        wrong. It is a decision, not a failure, and routing it through the
+        fail-open counter would fire a storm escalation describing an outage
+        that is not happening.
+        """
+        with caplog.at_level(logging.INFO):
+            verdict = await judge_write(
+                memory_service=_judge_svc(judge_enabled=False),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == OUTCOME_STORED
+        disabled = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'judge_enabled' in r.getMessage()
+        ]
+        assert disabled, [r.getMessage() for r in caplog.records]
+        message = disabled[0].getMessage()
+        assert OUTCOME_STORED in message, message
+
+    @pytest.mark.asyncio
+    async def test_the_enabled_path_emits_no_such_record(self, caplog) -> None:
+        """One line per write is affordable only while the switch is ENGAGED."""
+        client = _openai_client(_payload('restates'))
+        with caplog.at_level(logging.INFO), \
+                patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert not [
+            r for r in caplog.records if 'judge_enabled' in r.getMessage()
+        ], [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_the_empty_slate_branch_stays_quiet(self, caplog) -> None:
+        """Deliberately NOT logged: it is per-write and would be noise.
+
+        The kill switch is an operator ACTION and is worth a line per write
+        while it is engaged; "this write matched nothing comparable" is the
+        ordinary case and would drown it.
+        """
+        with caplog.at_level(logging.INFO):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision(None), candidates=[],
+            )
+        assert verdict == OUTCOME_STORED
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_a_disabled_judge_answers_stored_and_makes_no_call(self) -> None:
