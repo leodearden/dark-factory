@@ -1736,6 +1736,42 @@ class ReferentFinding:
     #: finding.
     reason: str = ''
 
+    @property
+    def corroborated(self) -> bool:
+        """Does this edge's OWN FACT name the node it is already attached to?
+
+        The READ side of the corroboration veto whose single normative site is
+        :func:`_candidate_pool`'s ``if endpoint in cited: return frozenset()``.
+        True means the fact asserts the attachment is CORRECT, so the finding is
+        a no-observable-defect row: real, recorded, and not actionable. The
+        dominant legitimate write shape produces it — ``resolve_referents``
+        derives ``source='metadata'`` from an agent's ambient ``task_id``, and
+        "an agent working on task 3668 legitimately writes memories about Task
+        2500" is that function's own example.
+
+        A ``@property`` OVER THE RECORDED EVIDENCE, deliberately not a stored
+        boolean set where the finding is built. A stored flag is a second site
+        that must agree byte-for-byte with that guard, which is exactly the
+        INV-5 lockstep duplication ``utils/canonical_labels.py`` exists to
+        prevent — and exactly the failure mode that produced esc-3671-3's
+        blocking bug, where the guard had drifted out of the position its own
+        rationale assumed. Derived, the two cannot disagree. It is the same
+        property-not-field discipline :class:`ReferentStats` documents for its
+        counts and :attr:`Referent.node_name` follows for its rendering.
+
+        Deliberately NOT a :meth:`to_dict` key: that payload's key set is
+        contractually the dataclass FIELD names, and nothing is lost, because it
+        already carries both inputs — an operator reads the corroboration off
+        :attr:`cited` and :attr:`endpoint_referent` on the log line.
+
+        Its two consumers are the ``'corroborated'`` counter bucket (so leaf
+        iota can subtract these rows from the membership rate rather than read
+        them as scanner defects) and the operator log's level (INFO rather than
+        WARNING, for the alert-fatigue reason the pairing arm's
+        ``cited_declared`` narrowing already refused to create).
+        """
+        return self.endpoint_referent.node_name in self.cited
+
     def __post_init__(self) -> None:
         if self.check not in REFERENT_CHECKS:
             raise ValueError(
