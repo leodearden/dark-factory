@@ -4,6 +4,13 @@ Mem0/Qdrant — records missing the ``kind='stage1_flag_marker'`` metadata key
 (task-1659 orphans), lacking a usable ``task_id`` (task-2108 orphans), stale by age
 (task-1944 precedent), or referencing only terminal tasks (task-2103/2150 precedent).
 
+The residual this sweep cannot reach is a CHECKED, REPORTED constraint rather
+than a caveat (task 4436): every run emits a ``structural_floor`` block, and a
+``--check --max-backlog`` set below that floor is reported as
+``gate_unsatisfiable`` and logged as an ERROR instead of rendering as an
+ordinary over-backlog a re-run might clear. See
+``docs/flag-marker-sweep-recurring.md`` and :func:`find_undrainable_markers`.
+
 Task 2596 background
 ---------------------
 Task 2406 retired the Mem0 marker WRITE path entirely — ``flag_dedup.dedup_flags``
@@ -1709,10 +1716,14 @@ def _build_parser() -> argparse.ArgumentParser:
             'ceiling reached by typo would make backlog_verdict violate '
             'on any residual, forever, with no explanation). A '
             'before_done predicate wired with the default 0 may never be '
-            'satisfiable if the population has a nonzero '
-            "undated_kept_count (see run()'s report and WARNING log) — "
-            'set --max-backlog to at least that count, or run '
-            '--delete-ids/--terminal-drain first to clear it.'
+            'satisfiable: set it to at least the reported '
+            'structural_floor.undrainable_count, which is the population no '
+            'invocation of this script can drain. Do NOT read '
+            'undated_kept_count as that floor — an undated marker another '
+            'predicate catches IS drained, and a dated protected mirror is '
+            'not, so the two differ in both directions. A run whose ceiling '
+            'is below the floor reports gate_unsatisfiable: true and logs an '
+            'ERROR saying so.'
         ),
     )
     parser.add_argument(
