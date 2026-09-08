@@ -1694,6 +1694,23 @@ REFERENT_FINDING_AXES: tuple[str, ...] = ('unresolvable', 'corroborated')
 #: many. A HIGHER one buys nothing once the aggregate line exists — past a dozen
 #: near-identical payloads the marginal line adds no diagnosis, and the storm's
 #: SIZE, which is what the aggregate reports, is the thing that matters.
+#:
+#: IT BOUNDS THE WARN-LEVEL HALF ONLY, and the INFO half is uncapped ON PURPOSE.
+#: A corroborated finding is demoted below WARNING *before* this budget is
+#: applied (see the finding loop in
+#: :meth:`MemoryService._verify_episode_referents`), so it never consumes it and
+#: is never suppressed by it. What this constant protects is the ALERT channel —
+#: the level an operator is expected to read every line of — from being buried
+#: by the dominant legitimate ``source='metadata'`` shape. INFO is the OPT-IN
+#: diagnostic channel: capping it would withhold exactly the per-finding detail
+#: somebody switched it on to read, and it is switched on per module and
+#: switched off again the same way. Uncapped is not unbounded WORK either — the
+#: emission is guarded by ``logger.isEnabledFor``, so on a process that has not
+#: enabled INFO for this module the demoted half costs neither a payload dict
+#: nor a record. Nor can it lose the storm signal INV-4 requires: the
+#: ``'corroborated'`` counter axis moves once per finding at every level, and
+#: the aggregate line's per-check totals are computed over ALL of
+#: :attr:`ReferentStats.findings` rather than over what was logged.
 _REFERENT_FINDING_WARN_CAP: int = 10
 
 #: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
@@ -4202,9 +4219,29 @@ class MemoryService:
             else:
                 suppressed += 1
                 continue
-            logger.log(
-                level, 'Referent verification finding: %s', finding.to_dict(),
-            )
+            # THE PAYLOAD IS BUILT INSIDE THE LEVEL GUARD. `%s`-style lazy
+            # formatting defers the STRING rendering, never the `to_dict()`
+            # call that produces the argument — so an unguarded emission
+            # allocates a dict per finding even on a process where the level is
+            # off. `isEnabledFor` is what makes the uncapped INFO half above
+            # genuinely free when nobody asked for it (precedent:
+            # `orchestrator/src/orchestrator/scheduler.py::
+            # Scheduler._phase_select_scored`), which matters here because that
+            # half is the DOMINANT shape and this loop runs serialized inside
+            # the per-group identity lock.
+            #
+            # THE BUDGET IS DELIBERATELY OUTSIDE THE GUARD. `warned` and
+            # `suppressed` are a per-episode log-VOLUME policy, not a record of
+            # what a particular handler happened to keep; deciding them on
+            # handler configuration would make the aggregate line below count
+            # differently on two processes reading the same episode, and would
+            # silently uncap the log the moment a handler was reconfigured.
+            if logger.isEnabledFor(level):
+                logger.log(
+                    level, 'Referent verification finding: %s',
+                    finding.to_dict(),
+                )
+
 
         if suppressed:
             # THE TRUNCATION ANNOUNCES ITSELF rather than the log simply

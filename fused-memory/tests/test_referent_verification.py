@@ -2682,6 +2682,78 @@ class TestTheOperatorWarningIsCappedPerEpisode:
         assert _storm_lines(caplog) == []
 
 
+def _count_payload_builds(monkeypatch) -> list[str]:
+    """Record every `ReferentFinding.to_dict()` call, by edge uuid.
+
+    A frozen dataclass freezes INSTANCES, not the class, so the method can be
+    wrapped for the duration of one test.
+    """
+    built: list[str] = []
+    original = ReferentFinding.to_dict
+
+    def counting(self) -> dict:
+        built.append(self.edge_uuid)
+        return original(self)
+
+    monkeypatch.setattr(ReferentFinding, 'to_dict', counting)
+    return built
+
+
+class TestTheFindingPayloadIsBuiltOnlyWhenTheLevelIsEnabled:
+    """`%s` lazy formatting defers the string rendering, NEVER the `to_dict()`
+    that produces its argument.
+
+    So the dict is allocated per finding even where the record is thrown away,
+    unless the emission is guarded by `isEnabledFor` — and that guard is what
+    makes the deliberately UNCAPPED INFO half of the log (see
+    `_REFERENT_FINDING_WARN_CAP`) free on a process that never asked for INFO.
+    It matters here specifically because this loop runs serialized inside the
+    per-group `_identity_lock_for` critical section every other same-group write
+    queues behind, and because the demoted half is the DOMINANT shape.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_level_builds_no_payload_at_all(
+        self, service, caplog, monkeypatch,
+    ):
+        built = _count_payload_builds(monkeypatch)
+
+        with caplog.at_level(logging.CRITICAL,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _one_membership_finding_episode(), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert built == []
+        assert _records_for(caplog, 'e1') == []
+        # THE MACHINE SURFACES ARE UNTOUCHED by the log level — INV-2. Leaf eta
+        # reads this return value in-process, and it must never depend on how a
+        # handler happens to be configured.
+        assert [f.edge_uuid for f in stats.findings] == ['e1']
+        assert service.referent_finding_counts()['set-membership'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_demoted_half_costs_nothing_when_only_warning_is_on(
+        self, service, caplog, monkeypatch,
+    ):
+        """The uncapped INFO half's whole defence: at the default level it does
+        no per-finding work, while the warn half still emits in full."""
+        built = _count_payload_builds(monkeypatch)
+
+        with caplog.at_level(logging.WARNING,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _corroborated_and_genuine_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        corroborated = [f.edge_uuid for f in stats.findings if f.corroborated]
+        assert corroborated == ['e1']
+        assert built == ['e2']
+        assert [r.levelno for r in _records_for(caplog, 'e2')] == [logging.WARNING]
+
+
 class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
     """S2 (esc-3671-3): "could not look" must not read as "not there".
 
