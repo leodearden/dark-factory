@@ -122,10 +122,9 @@ type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 # scripts, tests/scripts, and the dominant `orchestrator` segment measured at
 # 1366.23s in task 3062 (a pre-cap, 2026-07-31 figure — task 4902 superseded
 # it with a heavier post-cap measurement; the current canonical figure is
-# MEASURED_FLEET_SEGMENT_SECS['orchestrator'] in
-# tests/scripts/test_fallback_verify_config.py, not repeated here. A heavier
-# segment only strengthens the "materially heavier" argument below, never
-# weakens it).
+# tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS,
+# key 'orchestrator', not repeated here. A heavier segment only strengthens
+# the "materially heavier" argument below, never weakens it).
 #
 # Two mechanisms bound the residual gap to a true production run. NEITHER is
 # credited in the sizing — they are stated so a reader can see the gap is

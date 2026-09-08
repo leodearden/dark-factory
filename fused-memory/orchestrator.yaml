@@ -66,10 +66,9 @@ type_check_command: "uv run --directory fused-memory pyright src/ tests/"
 # NINE registered configs today, including the dominant `orchestrator` segment
 # measured at 1366.23s (a pre-cap, 2026-07-31 figure in task 3062, superseded
 # by a heavier post-cap measurement in task 4902 — current canonical figure:
-# MEASURED_FLEET_SEGMENT_SECS['orchestrator'] in
-# tests/scripts/test_fallback_verify_config.py) — so a full gather is
-# materially heavier than what was measured, and W under-states the
-# fully-concurrent cost. Two uncredited
+# tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS,
+# key 'orchestrator') — so a full gather is materially heavier than what was
+# measured, and W under-states the fully-concurrent cost. Two uncredited
 # mechanisms bound the gap (verify_plan scoping, and the
 # shared.verify_admission slot gate whose wait falls outside the timeout
 # clock); what remains is what the 2.6x multiple absorbs, as an assumption
