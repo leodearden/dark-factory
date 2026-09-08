@@ -2267,6 +2267,209 @@ class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
 
 
 # ===========================================================================
+# Tests: run() emits the structural_floor block (task 4436)
+# ===========================================================================
+
+class TestStructuralFloorReportBlock:
+    """The permanent backlog floor, made machine-readable beside cross_check.
+
+    ``undated_kept_count`` alone is the WRONG number to key a constraint on,
+    and after task 4435 it can be wrong in BOTH directions: an undated
+    kind-orphan is drained and floors nothing, while a fully dated protected
+    mirror floors permanently while contributing ``0`` to the raw count.
+    This block reports the raw count and the true floor side by side.
+
+    Mirrors ``TestRunExcludesProtectedMirrorsFromTheDeleteSet``'s local
+    ``_args``/``_service`` shape and its delete-set boundary assertions
+    rather than reaching into ``TestRun``.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = False,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+        delete_ids: list[str] | None = None,
+    ):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _service(members: list[dict], *, apply: bool) -> AsyncMock:
+        memory_service = AsyncMock()
+        counts = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.count_memories_by_metadata = counts
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @staticmethod
+    def _undated(id: str, *, kind: str | None = 'stage1_flag_marker',
+                 task_id: str | None = '9001') -> dict:
+        """An undated member — no ``created_at`` key at all.
+
+        ``_member``'s hardcoded ``created_at`` is always dated, so undated
+        shapes are built by hand (the shape already used by
+        ``test_undated_members_are_kept_and_reported_with_warning``). The
+        default kind+task_id make it undrainable; pass ``kind=None`` to make
+        it a kind-orphan the delete set covers.
+        """
+        metadata: dict = {'source': 'stage1_flag_marker'}
+        if kind is not None:
+            metadata['kind'] = kind
+        if task_id is not None:
+            metadata['task_id'] = task_id
+        return {'id': id, 'metadata': metadata}
+
+    @pytest.mark.asyncio
+    async def test_block_shape(self):
+        """(a) The report carries a structural_floor dict with the floor keys."""
+        members = [_member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert isinstance(block, dict), f'Expected a dict, got: {block!r}'
+        assert {'undated_kept_count', 'undrainable_count', 'undrainable_ids'} <= set(block)
+
+    @pytest.mark.asyncio
+    async def test_undated_and_undrained_member_is_the_floor(self):
+        """(b) An undated member no other predicate catches floors the backlog."""
+        members = [_member('keep'), self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == [], (
+            f"Fixture drift: u1 must be undrained, got: {report['orphan_ids']!r}"
+        )
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['undrainable_ids'] == ['u1']
+
+    @pytest.mark.asyncio
+    async def test_undated_but_drained_member_floors_nothing(self):
+        """(c) THE FALSE-POSITIVE FIX, end to end.
+
+        An undated member that is ALSO a kind-orphan is in the delete set, so
+        it floors nothing — even though undated_kept_count counts it. Today's
+        WARNING is keyed on that raw count and tells an operator to raise
+        --max-backlog when the true floor is 0.
+        """
+        members = [self._undated('u1', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['u1'], (
+            f"Fixture drift: u1 must be drained, got: {report['orphan_ids']!r}"
+        )
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 1
+        assert block['undrainable_count'] == 0
+        assert block['undrainable_ids'] == []
+
+    @pytest.mark.asyncio
+    async def test_dated_protected_members_are_the_floor(self):
+        """(d) THE PROTECTED ARM, and the proof the block reads the
+        POST-subtraction delete set.
+
+        All three members are dated, so undated_kept_count is 0 — yet the two
+        protected records floor permanently. `m1` is ALSO a kind-orphan, so
+        it is in the union loop's `seen_ids`; computing the floor from that
+        superset would classify it as drained and under-report the floor,
+        which is the false negative this block exists to eliminate.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 0
+        assert block['undrainable_count'] == 2
+        assert block['undrainable_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_top_level_undated_kept_count_is_unchanged(self):
+        """(e) REGRESSION PIN — the top-level key survives verbatim.
+
+        It is asserted by existing tests AND extracted into
+        done_provenance.note by the orchestrator's before_done path, so
+        relocating it would break a durable provenance record.
+        """
+        members = [self._undated('u1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['undated_kept_count'] == 2, 'raw undated count, not the floor'
+        assert report['structural_floor']['undrainable_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_floor_never_widens_the_delete_set(self):
+        """(f) BOUNDARY — this block is diagnostic and must never delete.
+
+        Mirrors TestFlagForStage2IsNeverDeleted: no floor id appears in
+        orphan_ids, and under --apply delete_memory is never awaited with
+        one. Without this, a later edit could quietly turn a REPORTING
+        change into a DELETING one — the exact risk the rejected "make
+        find_undated_markers load-bearing in the delete set" option carries.
+        """
+        members = [_orphan('o1'), self._undated('u1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        floor_ids = set(report['structural_floor']['undrainable_ids'])
+        assert floor_ids == {'u1', 'm1', 'l1'}, f'Unexpected floor: {floor_ids!r}'
+        assert not (floor_ids & set(report['orphan_ids'])), (
+            f"Floor leaked into the delete set: {report['orphan_ids']!r}"
+        )
+        deleted_ids = {
+            call.kwargs['memory_id']
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'o1'}, f'Expected only o1 deleted, got: {deleted_ids!r}'
+        assert not (deleted_ids & floor_ids)
+
+    @pytest.mark.asyncio
+    async def test_all_dated_unprotected_population_has_no_floor(self):
+        """(g) The healthy steady state reports a zero floor."""
+        members = [_member('keep'), _orphan('o1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 0
+        assert block['undrainable_ids'] == []
+
+
+# ===========================================================================
 # Tests: run() surfaces the tombstone count in the report (task 4435)
 # ===========================================================================
 
