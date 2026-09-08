@@ -2058,9 +2058,11 @@ class TestGetRetriesRelocationBetweenLocateAndRead:
         doomed = queue.queue_dir / 'esc-1-1.json'
         flaky = unreadable_read_text(doomed)
 
-        with patch.object(Path, 'read_text', flaky):
-            with pytest.raises(PermissionError):
-                queue.get('esc-1-1')
+        with (
+            patch.object(Path, 'read_text', flaky),
+            pytest.raises(PermissionError),
+        ):
+            queue.get('esc-1-1')
 
     def test_get_returns_none_for_a_genuinely_nonexistent_id(self, tmp_path: Path):
         """An id that never existed still resolves to ``None`` (no retry
