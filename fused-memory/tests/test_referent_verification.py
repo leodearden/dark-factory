@@ -2344,3 +2344,118 @@ class TestCorroboratedIsDerivedFromTheRecordedEvidence:
 
         assert stats.findings[0].corroborated is False
         assert stats.findings[0].resolvable is True
+
+
+def _corroborated_and_genuine_episode() -> MockAddEpisodeResult:
+    """One corroborated finding (e1) and one genuine misattachment (e2).
+
+    Both fire SET MEMBERSHIP against the same declared set, so the only thing
+    that distinguishes them is whether the edge's own fact names the node it
+    landed on. That is what makes this the right fixture for a PER-FINDING
+    policy: an episode-level rule cannot tell them apart.
+    """
+    return _episode(
+        edges=[_edge('e1',
+                     fact='Task 2500 was completed as part of task 3668 by '
+                          'the merge worker',
+                     source='n-2500', target='n-worker'),
+               _edge('e2', fact='the deploy pipeline was retried',
+                     source='n-3129', target='n-x')],
+        nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+               MockNode(name='merge worker', uuid='n-worker'),
+               MockNode(name='Task 3129', uuid='n-3129'),
+               MockNode(name='deploy pipeline', uuid='n-x')],
+    )
+
+
+def _records_for(caplog, edge_uuid: str) -> list[logging.LogRecord]:
+    """Every emitted finding line whose payload names *edge_uuid*."""
+    return [r for r in caplog.records
+            if f"'edge_uuid': '{edge_uuid}'" in r.getMessage()]
+
+
+class TestCorroboratedFindingsAreNotOperatorWarnings:
+    """S1 (esc-3671-3): the membership arm's counterpart of the discipline the
+    pairing arm already keeps.
+
+    `test_no_counter_moves_and_no_warning_is_emitted_for_that_shape` is the
+    normative statement: a finding unactionable BY CONSTRUCTION must not raise
+    an operator WARNING for an endpoint with no observable defect. The pairing
+    arm achieves that by refusing to fire (`cited_declared` narrowing). The
+    membership arm CANNOT refuse — a corroborated endpoint really is outside the
+    declared set, and the PRD's postcondition is that it be RECORDED — so it
+    keeps the same discipline the only other way available: it records the
+    finding and demotes the line.
+
+    DEMOTED, NOT DROPPED. The evidence still reaches the log, one level down;
+    silently discarding it would be the fail-soft path INV-4 forbids.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_corroborated_finding_raises_no_warning(self, service, caplog):
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _corroborated_membership_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        assert [r for r in caplog.records
+                if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_it_is_still_logged_one_level_down(self, service, caplog):
+        """Demoted, never dropped: an operator who goes looking still finds the
+        full structured payload."""
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _corroborated_membership_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        emitted = _records_for(caplog, 'e1')
+        assert [r.levelno for r in emitted] == [logging.INFO]
+        message = emitted[0].getMessage()
+        assert 'set-membership' in message
+        assert 'Task 2500' in message
+
+    @pytest.mark.asyncio
+    async def test_the_return_value_keeps_the_finding_in_full(
+        self, service, caplog,
+    ):
+        """The LOG is the operator surface; `ReferentStats.findings` is the
+        machine surface leaf eta reads in-process. A log-level policy must never
+        cost eta a finding."""
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _corroborated_membership_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        assert len(stats.findings) == 1
+        payload = stats.findings[0].to_dict()
+        assert payload['edge_uuid'] == 'e1'
+        assert payload['check'] == 'set-membership'
+        assert payload['cited'] == ['Task 2500', 'Task 3668']
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+
+    @pytest.mark.asyncio
+    async def test_the_demotion_is_per_finding_not_per_episode(
+        self, service, caplog,
+    ):
+        """A corroborated finding and a genuine misattachment in ONE episode
+        must land on DIFFERENT levels. An episode-level rule — "this write looks
+        like ambient-task noise, quiet it down" — would swallow the defect the
+        pass exists to surface."""
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _corroborated_and_genuine_episode(), group_id='dark_factory',
+                referents=(Referent(number='3668'),),
+            )
+
+        assert [f.corroborated for f in stats.findings] == [True, False]
+        assert [r.levelno for r in _records_for(caplog, 'e1')] == [logging.INFO]
+        assert [r.levelno for r in _records_for(caplog, 'e2')] == [logging.WARNING]
