@@ -5442,45 +5442,52 @@ class TestPremiseGuardRunsOffEventLoop:
     async def test_registry_load_error_fails_open_and_is_attempted_once(
         self, tmp_path, caplog,
     ):
-        """RED: a registry load that RAISES must fail OPEN, and must not latch
+        """A registry load that RAISES must fail OPEN, and must not latch
         into a permanent failure.
 
-        VERIFIED EMPIRICALLY (not assumed): load_premise_registry only catches
-        FileNotFoundError/OSError on read_text and yaml.YAMLError on parse, so
-        a registry that is not valid UTF-8 raises UnicodeDecodeError — a
-        ValueError, NOT an OSError — despite that function's own docstring
-        claiming "The function never raises". The prior step (offloading the
-        lazy load via asyncio.to_thread, with
-        _premise_registry_load_attempted set only AFTER a successful
-        assignment) left this raise path unwrapped, so on the current branch:
-        (a) the exception escapes _maybe_premise_refuted_drop — whose own
-        docstring promises "Never raises" and whose callers curate() /
-        curate_batch_prepared() invoke it unguarded — and (b) the attempted
-        flag is never set, so EVERY subsequent call re-enters the load and
-        re-raises again: a one-shot failure becomes a permanent one for the
-        life of the process.
+        This pins THIS METHOD's own except-Exception wrapper around the
+        offloaded load — the last line of defence for
+        _maybe_premise_refuted_drop's "Never raises" contract, whose callers
+        curate() / curate_batch_prepared() invoke it unguarded. Two distinct
+        properties: (a) the exception does not escape, and (b)
+        _premise_registry_load_attempted still latches, so a one-shot
+        failure does not become a permanent one for the life of the process
+        (the flag is set only AFTER a successful assignment, so an unwrapped
+        raise would skip it and re-enter the load on every later call).
 
-        Writes the registry as genuinely non-UTF-8 bytes so the failure is
-        reached through the real load_premise_registry rather than fabricated
-        with a bare side_effect=RuntimeError — this is reachable in
-        production with no thread-pool weirdness and no mocking of the raise
-        itself. The patch wraps the real callable (captured before patching)
-        only to count invocations.
+        FAULT INJECTION, and why it is a direct raise rather than a real
+        malformed file (changed by task 4483): this test originally wrote
+        the registry as genuinely non-UTF-8 bytes, because
+        load_premise_registry then caught only FileNotFoundError/OSError on
+        read_text and yaml.YAMLError on parse — so UnicodeDecodeError (a
+        ValueError, NOT an OSError) escaped it despite its docstring
+        claiming "The function never raises". Task 4483 closed that gap: the
+        guard module now catches UnicodeDecodeError itself and degrades to
+        [], so a bad-encoding registry no longer reaches this wrapper at all
+        (that path is now covered one layer down, by
+        test_recon_code_fix_premise_guard.py). The wrapper it guards is NOT
+        dead, though: asyncio.to_thread is itself a raise path (thread-pool
+        failure/shutdown), and the guard module's internal excepts cannot
+        cover it. With no naturally-reachable in-process fault left to
+        trigger it, the raise is injected directly — same shape as the
+        sibling test_verification_failure_fails_open above.
         """
-        from fused_memory.middleware.recon_code_fix_premise_guard import (
-            load_premise_registry as real_load_premise_registry,
-        )
-
         source_root = tmp_path / "source_root"
         source_root.mkdir()
         (source_root / "memory_service.py").write_text(
             "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
         )
 
-        registry_path = tmp_path / "premise_registry.yaml"
-        registry_path.write_bytes(b"- name: \xff\xfe bad\n")
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
 
-        config = _make_config_with_premise_registry(str(registry_path))
+        config = _make_config_with_premise_registry(str(registry))
         curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
 
         candidate = CandidateTask(
@@ -5490,14 +5497,14 @@ class TestPremiseGuardRunsOffEventLoop:
 
         load_calls = 0
 
-        def counting_load(path):
+        def raising_load(path):
             nonlocal load_calls
             load_calls += 1
-            return real_load_premise_registry(path)
+            raise RuntimeError("registry load exploded")
 
         with patch(
             "fused_memory.middleware.recon_code_fix_premise_guard.load_premise_registry",
-            side_effect=counting_load,
+            side_effect=raising_load,
         ), caplog.at_level(logging.WARNING):
             decision1 = await curator._maybe_premise_refuted_drop(
                 candidate, candidate.payload_hash(),
