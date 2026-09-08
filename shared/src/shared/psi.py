@@ -39,6 +39,8 @@ __all__ = [
     'read_runqueue_ratio',
     'OwnCgroup',
     'resolve_own_cgroup',
+    'OwnPressureReading',
+    'read_own_cgroup_pressure',
 ]
 
 _AVG10_RE = re.compile(r'avg10=([0-9]+(?:\.[0-9]+)?)')
@@ -192,6 +194,56 @@ def resolve_own_cgroup(
     except Exception:
         logger.debug('own cgroup resolution failed; component degraded', exc_info=True)
         return OwnCgroup('', None)
+
+
+class OwnPressureReading(NamedTuple):
+    """The own-cgroup component of a PsiSample.
+
+    ``cgroup`` is the path that was ATTEMPTED, so it names which cgroup failed
+    even when ``read_ok`` is False.
+    """
+
+    cgroup: str
+    some_avg10: float
+    read_ok: bool
+
+
+def read_own_cgroup_pressure(
+    project_id: str | None,
+    *,
+    proc_cgroup_path: str | Path = _PROC_SELF_CGROUP,
+    cgroup_root: str | Path = _CGROUP_ROOT,
+) -> OwnPressureReading:
+    """Read the ``some avg10`` of the reading process's own cgroup cpu.pressure.
+
+    Resolution shapes are owned by PRD
+    ``plans/load-throttle-harmonisation-prd.md`` §6.3 (see
+    ``resolve_own_cgroup``). The text is handed to ``parse_pressure_file`` —
+    a cgroup cpu.pressure has the same some/full avg10 shape as
+    /proc/pressure/cpu, so there is no second parser (DA-D9), and that
+    parser's ``None`` already means "unparseable", which maps straight onto
+    ``read_ok=False`` — so an unreadable file is collapsed onto that same
+    sentinel and the two failures share one exit.
+
+    Never raises. A failure carries the attempted cgroup in the result so the
+    degradation is visible by value (INV-11), and re-resolves: a
+    ``df-<project_id>.slice`` that does not exist yet must be picked up when
+    it appears, without restarting the orchestrator.
+    """
+    own = resolve_own_cgroup(
+        project_id, proc_cgroup_path=proc_cgroup_path, cgroup_root=cgroup_root
+    )
+    if own.pressure_path is None:
+        return OwnPressureReading('', 0.0, False)
+    try:
+        parsed = parse_pressure_file(own.pressure_path.read_text())
+    except Exception:
+        logger.debug('own cgroup pressure unreadable; component degraded', exc_info=True)
+        parsed = None
+    if parsed is None:
+        resolve_own_cgroup.cache_clear()
+        return OwnPressureReading(own.path, 0.0, False)
+    return OwnPressureReading(own.path, parsed['some_avg10'], True)
 
 
 class _Arm(NamedTuple):
