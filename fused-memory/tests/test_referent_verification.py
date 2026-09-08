@@ -38,6 +38,7 @@ from _fm_helpers import (
     install_identity_mocks,
 )
 
+from fused_memory.services import memory_service as memory_service_module
 from fused_memory.services.memory_service import (
     REFERENT_CHECKS,
     MemoryService,
@@ -1909,3 +1910,153 @@ class TestReferentFindingOperatorLog:
             )
 
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+class TestPerEdgeFactScanIsLazy:
+    """The per-edge fact scan runs only when an endpoint IS a task label.
+
+    esc-3671-1's efficiency item. The scan's only consumers — the corroboration
+    veto, the pairing arm's `cited_declared` guard and `_candidate_pool`'s
+    intersection — are reached exclusively from the endpoint loop, and that loop
+    `continue`s immediately for an endpoint whose name is not a canonical task
+    label, which is the overwhelming majority of edges. Scanning every fact up
+    front therefore spends a regex pass per edge to produce a value nothing
+    reads, and it spends it SERIALIZED inside the per-group
+    `_identity_lock_for` critical section that other same-group writes queue
+    behind.
+
+    Deferring must not cost the "scanned ONCE per edge, not once per endpoint"
+    property the eager comment defends, so the two-task-endpoint case is pinned
+    explicitly: laziness is memoized per edge, not recomputed per end.
+    """
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[str]:
+        """Every text `_verify_episode_referents` hands `scan_content`.
+
+        Patches the name as imported INTO `memory_service` (line 93), which is
+        the binding the pass actually calls, and delegates to the real scanner
+        so the findings under test are the production ones.
+        """
+        scanned: list[str] = []
+        real = memory_service_module.scan_content
+
+        def _recording(text, **kwargs):
+            scanned.append(text)
+            return real(text, **kwargs)
+
+        monkeypatch.setattr(memory_service_module, 'scan_content', _recording)
+        return scanned
+
+    @pytest.mark.asyncio
+    async def test_an_edge_with_no_task_endpoint_is_never_scanned(
+        self, service, monkeypatch,
+    ):
+        """The ~99% shape: two plain entity endpoints, nothing to check.
+
+        The fact deliberately DOES cite a task, so an eager implementation
+        really does pay for the scan here. Laziness is decided by the
+        ENDPOINTS, not by whether the fact happens to be scannable.
+        """
+        scanned = self._spy(monkeypatch)
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3129 blocked the deploy pipeline',
+                         source='n-x', target='n-y')],
+            nodes=[MockNode(name='deploy pipeline', uuid='n-x'),
+                   MockNode(name='merge lane', uuid='n-y')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        # The edge was WALKED — laziness bounds the scan, never the coverage.
+        assert stats.edges_scanned == 1
+        assert stats.findings == []
+        assert scanned == []
+
+    @pytest.mark.asyncio
+    async def test_an_endpointless_edge_is_never_scanned(
+        self, service, monkeypatch,
+    ):
+        """The other half of the same shape: this episode's result does not
+        NAME either endpoint, so neither can be parsed at all."""
+        scanned = self._spy(monkeypatch)
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3129 blocked the deploy pipeline',
+                         source='n-absent', target='n-also-absent')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.edges_scanned == 1
+        assert stats.endpoints_unresolved == 2
+        assert scanned == []
+
+    @pytest.mark.asyncio
+    async def test_an_edge_with_two_task_endpoints_is_scanned_exactly_once(
+        self, service, monkeypatch,
+    ):
+        """ONCE PER EDGE, NOT ONCE PER ENDPOINT — the property the eager
+        placement bought and the deferral must not give back. Both ends parse,
+        so both reach the citation rules; one scan must serve them."""
+        scanned = self._spy(monkeypatch)
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3128 supersedes Task 3129',
+                         source='n-3128', target='n-3129')],
+            nodes=[MockNode(name='Task 3128', uuid='n-3128'),
+                   MockNode(name='Task 3129', uuid='n-3129')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert stats.endpoints_checked == 2
+        assert scanned == ['Task 3128 supersedes Task 3129']
+
+    @pytest.mark.asyncio
+    async def test_the_deferral_changes_no_finding(self, service, monkeypatch):
+        """Byte-for-byte equality with the eager behaviour on the mixed
+        membership + pairing fixture, so the deferral is provably an
+        efficiency change and not a semantic one.
+
+        The expected values were captured from the eager implementation before
+        the deferral landed; `reason` is pinned in full because it is the field
+        that would drift first if `cited` were ever computed from the wrong
+        text or at the wrong time.
+        """
+        scanned = self._spy(monkeypatch)
+
+        stats = await service._verify_episode_referents(
+            _mixed_findings_episode(), group_id='dark_factory',
+            referents=_MIXED_REFERENTS,
+        )
+
+        # One scan per edge: each of the two edges has a task-labelled end.
+        assert scanned == ['the deploy pipeline was retried',
+                           'Task 3075 blocks the merge lane']
+
+        membership, pairing = stats.findings
+        assert (membership.edge_uuid, membership.which_end, membership.check,
+                membership.old_endpoint_uuid, membership.old_endpoint_name,
+                membership.endpoint_referent, membership.referent_set,
+                membership.intended_referent, membership.resolvable) == (
+            'e1', 'source', 'set-membership', 'n-3129', 'Task 3129',
+            Referent(number='3129'), ('Task 3074', 'Task 3075'), None, False)
+        assert membership.reason == (
+            "more than one candidate target survives (['Task 3074', "
+            "'Task 3075']) and the edge fact does not discriminate between "
+            'them; recorded, not guessed at')
+
+        assert (pairing.edge_uuid, pairing.which_end, pairing.check,
+                pairing.old_endpoint_uuid, pairing.old_endpoint_name,
+                pairing.endpoint_referent, pairing.referent_set,
+                pairing.intended_referent, pairing.resolvable,
+                pairing.reason) == (
+            'e2', 'source', 'per-edge-pairing', 'n-3074', 'Task 3074',
+            Referent(number='3074'), ('Task 3074', 'Task 3075'),
+            Referent(number='3075'), True, '')
