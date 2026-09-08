@@ -358,12 +358,18 @@ def _prune_stale_selftest_units(
     TWO SAFETY PROPERTIES, each with its own test above, because this deletes
     files out of the operator's LIVE unit directory:
 
-    * Only ``_SELFTEST_PREFIX``-named units are ever considered -- the same
-      constant ``_unique_template()`` generates with, so a real ``lms-arm@``
-      or fleet unit is out of scope structurally, at any age.
+    * Only names ``_is_prunable_selftest_residue`` admits are ever
+      considered -- a ``_SELFTEST_PREFIX``-generated name (the same constant
+      ``_unique_template()`` generates with) PLUS exactly
+      ``_DEFAULT_TEMPLATE`` (the one fixed name a by-hand run falls back to),
+      both suffix-gated to ``.service``/``.service.d``.  See that function
+      for the full inclusion/exclusion table; a real ``lms-arm@`` or fleet
+      unit is out of scope structurally, at any age.
     * Anything NEWER than max_age_s is left alone.  Under 48-way concurrency a
       fresh selftest unit is a running sibling's fixture, and deleting it
-      would destroy that run.
+      would destroy that run -- and since the name gate above now also admits
+      the shared ``_DEFAULT_TEMPLATE`` name, this guard is what protects a
+      live BY-HAND run too, not just a concurrent pytest sibling.
 
     ``now`` and ``max_age_s`` are parameters rather than clock reads so the
     tests can drive this deterministically without sleeping or patching time.
@@ -374,9 +380,7 @@ def _prune_stale_selftest_units(
         if not unit_dir.is_dir():
             return
         for path in sorted(unit_dir.iterdir()):
-            if not path.name.startswith(_SELFTEST_PREFIX):
-                continue
-            if not path.name.endswith((".service", ".service.d")):
+            if not _is_prunable_selftest_residue(path.name):
                 continue
             try:
                 if now - path.stat().st_mtime <= max_age_s:
