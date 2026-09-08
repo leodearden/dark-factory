@@ -354,83 +354,6 @@ class TestHoldLease:
         assert self._names(lease_dir) == []
 
 
-class TestTheAcquisitionWindowIsClosed:
-    """A file that exists but is not yet flocked must never become a lease
-    that holds nothing off.
-
-    Between the ``O_CREAT | O_EXCL`` create and the ``flock``, a holder's file
-    is in the directory and unlocked — so a sweep landing in that window reads
-    it as dead and `reap_dead_leases` unlinks it.  A holder that shrugged at
-    that would then be locking an inode nothing can name: `live_leases` cannot
-    see it and never will again, so a bake-off of HOURS would report itself
-    guarded while every sweep for its whole life ignored it.  Amplifying a
-    microsecond race into an unguarded run is exactly the "guard that silently
-    never fires" the module docstring calls worse than no guard.
-
-    Driven through `_still_linked` — the check that closes the window —
-    because the real race is microseconds wide and cannot be hit
-    deterministically from a test.
-    """
-
-    def test_a_file_reaped_before_the_flock_is_re_acquired_under_a_new_name(
-        self, lease_dir, monkeypatch,
-    ):
-        """The holder ends up with a lease that is BOTH locked and named."""
-        mod = _mod()
-        answers = [False, True]
-        monkeypatch.setattr(mod, '_still_linked', lambda fd: answers.pop(0))
-
-        with mod.hold_lease(owner='e2-bake-off') as held:
-            published = sorted(path.name for path in lease_dir.iterdir())
-            live = mod.live_leases()
-
-        assert answers == [], 'the re-attempt never happened'
-        assert held is True
-        # One file, not two: the first attempt's litter is taken away rather
-        # than left for the reaper to notice six hours later.
-        assert len(published) == 1, published
-        assert [record['owner'] for record in live] == ['e2-bake-off']
-        assert sorted(lease_dir.iterdir()) == []
-
-    def test_it_fails_open_and_loud_rather_than_re_attempting_forever(
-        self, lease_dir, monkeypatch, capsys,
-    ):
-        """Bounded, because this runs inside live experiments: a pathological
-        loop must degrade to the documented fail-open rather than hang a
-        bake-off.  Same stderr shape as the unusable-directory case, so an
-        operator reads one message rather than two."""
-        mod = _mod()
-        monkeypatch.setattr(mod, '_still_linked', lambda fd: False)
-
-        with mod.hold_lease(owner='e2-bake-off') as held:
-            assert held is False
-            assert sorted(lease_dir.iterdir()) == [], 'litter left behind'
-
-        err = capsys.readouterr().err
-        assert str(lease_dir) in err
-        assert 'e2-bake-off' in err
-        assert 'NOT held off' in err
-
-    def test_an_ordinary_acquisition_consults_the_check_exactly_once(
-        self, lease_dir, monkeypatch,
-    ):
-        """No race, no re-attempt: the common path stays a single create."""
-        mod = _mod()
-        checked: list[int] = []
-        still_linked = mod._still_linked
-
-        def _record(fd):
-            checked.append(fd)
-            return still_linked(fd)
-
-        monkeypatch.setattr(mod, '_still_linked', _record)
-
-        with mod.hold_lease(owner='e2-bake-off') as held:
-            assert held is True
-
-        assert len(checked) == 1, checked
-
-
 def _wait_for_marker(marker_path: Path, timeout: float = 5.0) -> bool:
     """Poll for *marker_path* to appear; return False on timeout.
 
@@ -1123,23 +1046,23 @@ class TestDeadLeaseFilesAreReaped:
     ):
         """Two sweeps can overlap — an operator running this by hand while
         cron fires.  The loser of the race must return a count, not a
-        traceback."""
+        traceback, and must not claim litter the winner collected."""
         mod = _mod()
         lease_dir.mkdir(parents=True)
         doomed = lease_dir / 'raced.lease'
         doomed.write_text('{}')
-        probe = mod._is_held
+        real_open = mod.Path.open
 
-        def _is_held_then_someone_else_unlinks_it(path):
-            verdict = probe(path)
-            path.unlink(missing_ok=True)
-            return verdict
+        def _open_then_the_other_sweeper_unlinks_it(target, *args, **kwargs):
+            handle = real_open(target, *args, **kwargs)
+            doomed.unlink(missing_ok=True)
+            return handle
 
         monkeypatch.setattr(
-            mod, '_is_held', _is_held_then_someone_else_unlinks_it,
+            mod.Path, 'open', _open_then_the_other_sweeper_unlinks_it,
         )
 
-        assert mod.reap_dead_leases() == 1
+        assert mod.reap_dead_leases() == 0
         assert self._names(lease_dir) == []
 
     def test_main_reaps_dead_leases_on_a_sweep_that_proceeds(
@@ -1170,6 +1093,122 @@ class TestDeadLeaseFilesAreReaped:
 
             assert 'left-behind.lease' in self._names(lease_dir)
         capsys.readouterr()
+
+
+class TestAcquisitionSurvivesAConcurrentSweep:
+    """A sweep firing mid-acquisition must not silently un-guard the run.
+
+    `hold_lease` creates its file, THEN locks it.  In the window between
+    those two syscalls the file exists and is unlocked, so `reap_dead_leases`
+    reads it as litter.  If the unlink lands there, the holder goes on to
+    lock an inode that has no directory entry: it yields `held=True` while
+    `live_leases` — which can only see entries — correctly reports nothing.
+    Every later sweep in that run then proceeds and deletes exactly the
+    collections the lease exists to protect, with no diagnostic anywhere.
+
+    The interleave is driven through the `fcntl.flock` seam, which is the
+    only place either side can be suspended precisely inside the window.
+    """
+
+    @staticmethod
+    def _reap_once_inside(mod, monkeypatch, op_mask):
+        """Run one full sweep the FIRST time a matching flock is attempted.
+
+        Fires once: the retry must be allowed to succeed, or the test pins a
+        spin rather than a recovery.  Returns the list the sweeps' return
+        values are appended to.
+        """
+        real_flock = mod.fcntl.flock
+        sweeps: list[int] = []
+
+        def _flock(fd, operation, *args, **kwargs):
+            if operation & op_mask and not sweeps:
+                sweeps.append(mod.reap_dead_leases())
+            return real_flock(fd, operation, *args, **kwargs)
+
+        monkeypatch.setattr(mod.fcntl, 'flock', _flock)
+        return sweeps
+
+    def test_a_sweep_landing_between_the_create_and_the_lock_is_survived(
+        self, lease_dir, monkeypatch,
+    ):
+        """The reaper wins the window and removes the file.  The holder must
+        notice its entry is gone and start over, not report a lease nothing
+        can see."""
+        mod = _mod()
+        sweeps = self._reap_once_inside(mod, monkeypatch, mod.fcntl.LOCK_EX)
+
+        with mod.hold_lease(owner='e2-bake-off gw0') as held:
+            # The premise: the interleave really did reclaim the file.
+            assert sweeps == [1], 'the sweep never landed inside the window'
+            # The guard, stated the way a caller and a sweeper each see it.
+            assert held is True
+            assert [rec['owner'] for rec in mod.live_leases()] == [
+                'e2-bake-off gw0',
+            ]
+            # And the lease is now beyond a sweep's reach, which is the
+            # property the whole guard reduces to.
+            assert mod.reap_dead_leases() == 0
+            assert len(mod.live_leases()) == 1
+
+    def test_the_retry_leaves_no_second_file_behind(
+        self, lease_dir, monkeypatch,
+    ):
+        """Exactly one lease per holder, before and after a retry — an
+        abandoned attempt must not become litter of its own."""
+        mod = _mod()
+        self._reap_once_inside(mod, monkeypatch, mod.fcntl.LOCK_EX)
+
+        with mod.hold_lease(owner='e2-bake-off gw0') as held:
+            assert held is True
+            assert len(sorted(lease_dir.iterdir())) == 1
+
+        assert sorted(lease_dir.iterdir()) == []
+
+    def test_the_reaper_holds_its_probe_lock_across_the_unlink(
+        self, lease_dir,
+    ):
+        """The other half of the window, closed from the reaper's side.
+
+        Probing, releasing, then unlinking would let an acquiring holder take
+        LOCK_EX on a file already condemned.  While the shared probe lock is
+        held nothing can hold LOCK_EX, so a holder that acquires first is
+        seen as held and skipped instead.
+        """
+        mod = _mod()
+
+        with mod.hold_lease(owner='e2-bake-off gw1') as held:
+            assert held is True
+            [record] = mod.live_leases()
+            path = Path(record['path'])
+
+            assert mod._unlink_if_dead(path) is False
+            assert path.exists()
+
+    def test_a_holder_that_loses_every_attempt_fails_open_and_loudly(
+        self, lease_dir, monkeypatch, capsys,
+    ):
+        """Bounded, not a spin.  A holder that can never keep a file yields
+        False — the pre-guard behaviour — and says so on stderr rather than
+        reporting a lease that holds nothing off."""
+        mod = _mod()
+        real_flock = mod.fcntl.flock
+
+        def _always_reap_first(fd, operation, *args, **kwargs):
+            if operation & mod.fcntl.LOCK_EX:
+                mod.reap_dead_leases()
+            return real_flock(fd, operation, *args, **kwargs)
+
+        monkeypatch.setattr(mod.fcntl, 'flock', _always_reap_first)
+
+        with mod.hold_lease(owner='e2-bake-off gw0') as held:
+            assert held is False
+            assert mod.live_leases() == []
+
+        err = capsys.readouterr().err
+        assert 'NOT held off' in err
+        assert 'e2-bake-off gw0' in err
+        assert sorted(lease_dir.iterdir()) == []
 
 
 @pytest.mark.parametrize('suffix', ['main', 'gw0', 'gw11'])
