@@ -426,7 +426,9 @@ class TestWorktreeAddWithRetry:
         assert 'LABEL-MARKER' in msg, (
             f'expected the caller-supplied label in the warning; got {msg!r}'
         )
-        assert '1' in msg, f'expected the attempt number in the warning; got {msg!r}'
+        assert 'attempt 1/3' in msg, (
+            f'expected the attempt number in the warning; got {msg!r}'
+        )
 
     def test_worktree_missing_propagates_unretried(self, tmp_path: Path) -> None:
         """A vanished ``project_root`` is not a transient ADD failure — the
@@ -474,6 +476,7 @@ def _make_fake_merge_run(
     calls: list[list[str]],
     *,
     rev_parse_sha: str = MAIN_HEAD_SHA,
+    mkdir_on_failure: bool = False,
 ):
     """Fake ``_run`` for ``_create_merge_worktree``.
 
@@ -495,7 +498,7 @@ def _make_fake_merge_run(
                 add_results[idx] if idx < len(add_results) else add_results[-1]
             )
             state['add_calls'] += 1
-            if rc == 0:
+            if rc == 0 or mkdir_on_failure:
                 target.mkdir(parents=True, exist_ok=True)
             return (rc, out, err)
         if 'rev-parse' in cmd:
@@ -647,8 +650,14 @@ class TestCreateMergeWorktreeFinalFailure:
         ):
             asyncio.run(_body())
 
-        assert ENOSPC_3692_STDERR in str(exc_info.value), (
-            f'expected the ENOSPC cause to survive into the error; got {exc_info.value!s}'
+        msg = str(exc_info.value)
+        assert ENOSPC_3692_STDERR in msg, (
+            f'expected the ENOSPC cause to survive into the error; got {msg}'
+        )
+        # The reported count is how an operator tells a fast-fail from an
+        # exhausted transient, so the message must say one, not just do one.
+        assert 'after 1 attempt(s)' in msg, (
+            f'expected the fast-fail to REPORT its single attempt; got {msg!r}'
         )
         assert len(_add_argvs(calls)) == 1, (
             f'expected exactly ONE add attempt on a full disk; got {_add_argvs(calls)}'
@@ -692,7 +701,9 @@ class TestCreateMergeWorktreeFinalFailure:
         assert 'STDERR-MARKER' in msg, f'expected stderr in the message; got {msg!r}'
         assert 'STDOUT-MARKER' in msg, f'expected stdout in the message; got {msg!r}'
         assert 'rc=1' in msg, f'expected the rc in the message; got {msg!r}'
-        assert '3' in msg, f'expected the attempt count in the message; got {msg!r}'
+        assert 'after 3 attempt(s)' in msg, (
+            f'expected the attempt count in the message; got {msg!r}'
+        )
         assert len(_add_argvs(calls)) == 3
 
     def test_the_4545_truncated_shape_is_now_diagnosable(self, tmp_path: Path) -> None:
@@ -729,4 +740,45 @@ class TestCreateMergeWorktreeFinalFailure:
         assert "stdout=''" in msg, (
             f'expected an explicitly-empty stdout rather than a collapsed '
             f'blank; got {msg!r}'
+        )
+
+    @pytest.mark.parametrize(
+        ('add_result', 'expected_adds'),
+        [
+            ((1, '', TRANSIENT_4545_STDERR), 3),
+            ((1, '', ENOSPC_3692_STDERR), 1),
+        ],
+        ids=['exhausted-transient', 'enospc'],
+    )
+    def test_no_merge_directory_is_left_behind_when_the_add_never_succeeds(
+        self, tmp_path: Path, add_result: tuple[int, str, str], expected_adds: int,
+    ) -> None:
+        """Real ``git worktree add`` creates its target directory before it
+        can fail. ``_merge-`` is a ``PROTECTED_PREFIXES`` band the reaper
+        never reclaims, and neither caller can clear a path this call never
+        returned — so residue here would be permanent, and would feed the
+        very disk pressure the ENOSPC case reports.
+        """
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+
+        async def _body():
+            return await git_ops._create_merge_worktree(base_sha=BASE_SHA)
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_make_fake_merge_run(
+                    [add_result], calls, mkdir_on_failure=True,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+            pytest.raises(RuntimeError),
+        ):
+            asyncio.run(_body())
+
+        assert len(_add_argvs(calls)) == expected_adds
+        leaked = sorted(p.name for p in git_ops.worktree_base.glob('_merge-*'))
+        assert leaked == [], (
+            f'expected no _merge-* residue under {git_ops.worktree_base}; got {leaked}'
         )

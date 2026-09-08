@@ -12307,6 +12307,14 @@ class GitOps:
             # tells the reader whether the failure was retried at all — how
             # an operator tells an ENOSPC fast-fail from an exhausted
             # transient.
+            # A failed add still leaves the target directory git created
+            # early, and `_merge-` is a PROTECTED_PREFIXES band the reaper
+            # will never reclaim. No caller can clean it up either — both
+            # guard on the path this call never returned — so without this
+            # every exhausted-retry or ENOSPC failure would accrete one
+            # permanent directory under worktree_base, feeding the very
+            # disk pressure ENOSPC reports.
+            shutil.rmtree(merge_wt, ignore_errors=True)
             raise RuntimeError(
                 f'Failed to create merge worktree: git worktree add --detach '
                 f'{merge_wt} {checkout_ref} failed after {attempts} attempt(s) '
