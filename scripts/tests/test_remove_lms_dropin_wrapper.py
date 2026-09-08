@@ -784,6 +784,63 @@ def test_prune_leaves_a_fresh_selftest_unit_alone(tmp_path: Path) -> None:
     assert dropin_dir.exists(), "a FRESH selftest drop-in dir must survive"
 
 
+def test_prune_reaps_bare_default_template_residue_but_only_when_stale(tmp_path: Path) -> None:
+    """THE DEFECT this task fixes, plus the freshness guard that makes it safe.
+
+    (a) THE DEFECT, expected RED before step-6 wires the predicate in: a
+    STALE bare-default unit -- what a hand-run SIGKILLed before its
+    ``trap cleanup EXIT`` fires strands in the operator's live unit dir --
+    must be reaped.  Measured before this fix: both the unit and its
+    drop-in dir survive, because ``"lms-dropin-selftest@.service"`` does not
+    start with ``_SELFTEST_PREFIX``.
+
+    (b) SAFETY, expected green before and after -- a regression pin in this
+    module's "Expected GREEN on arrival" idiom.  This half is mandatory, not
+    decorative: the default template name is SHARED across every hand-run,
+    unlike ``_unique_template()``'s per-invocation names, so once the prune
+    can match it at all, ``_STALE_AFTER_S`` becomes the ONLY thing
+    separating "my abandoned residue" from "an operator's live hand-run
+    fixture".  Deleting a fresh one would tear that run down mid-test,
+    re-introducing from the cleanup side exactly the collision uniquification
+    was introduced to remove.  The margin is large and measured: a solo .sh
+    run is 5.2s against ``_STALE_AFTER_S = 3600.0`` (~690x).  This matters
+    most on the one path where the sweep runs UNSERIALIZED:
+    test_shell_selftest_passes calls ``_prune_stale_selftest_units`` BEFORE
+    entering ``_serialized_selftest_slot()``, so the freshness guard is the
+    ENTIRE protection there -- which is why this gets its own assertion
+    rather than riding on test_prune_leaves_a_fresh_selftest_unit_alone,
+    which covers only the unique-name arm.
+
+    Both halves use ``_DEFAULT_TEMPLATE`` -- never a re-typed literal, since
+    step-1 pins that constant to the .sh's actual default -- and separate tmp
+    unit dirs, so a bug that makes (a) pass by accident cannot also make (b)
+    pass by accident.
+    """
+    now = 1_000_000.0
+
+    stale_unit_dir = tmp_path / "stale" / "systemd" / "user"
+    stale_unit, stale_dropin_dir = _write_unit(
+        stale_unit_dir, _DEFAULT_TEMPLATE, age_s=7200.0, now=now
+    )
+
+    fresh_unit_dir = tmp_path / "fresh" / "systemd" / "user"
+    fresh_unit, fresh_dropin_dir = _write_unit(
+        fresh_unit_dir, _DEFAULT_TEMPLATE, age_s=5.0, now=now
+    )
+
+    _prune_stale_selftest_units(stale_unit_dir, now=now, max_age_s=3600.0)
+    _prune_stale_selftest_units(fresh_unit_dir, now=now, max_age_s=3600.0)
+
+    assert not stale_unit.exists(), f"stale {stale_unit.name} should have been pruned"
+    assert not stale_dropin_dir.exists(), (
+        f"stale {stale_dropin_dir.name}/ should have been pruned"
+    )
+    assert fresh_unit.exists(), (
+        "a FRESH bare-default unit belongs to a live hand-run and must survive"
+    )
+    assert fresh_dropin_dir.exists(), "a FRESH bare-default drop-in dir must survive"
+
+
 def test_prune_never_touches_a_non_selftest_unit(tmp_path: Path) -> None:
     """(c) SAFETY -- a real unit is never swept up, at ANY age.
 
