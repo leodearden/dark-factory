@@ -132,6 +132,36 @@ def _clean_match(reply):
     return f"    printf '{reply}\\n'\n    exit 0\n"
 
 
+def _nonmatching_output(reply):
+    """Producer SUCCEEDS, saying something that does not contain the token.
+
+    The second negative direction, and the one that actually happens in
+    production: `docker compose ps --status running` exits 0 listing only
+    qdrant because falkordb is genuinely down, or redis-cli answers an error
+    string instead of PONG. Distinct from `_SILENT_FAILURE` below in the path
+    it takes through the fixed code, not merely in its wording — the producer
+    exits 0, so the capture's `|| true` never fires and the `[[ ]]` decides on
+    real content rather than on the empty string left behind by a failure.
+    Nothing pinned that direction before, so every site's negative branch was
+    reachable only via a producer that had failed.
+
+    Body-identical to `_clean_match` by construction (print, exit 0) and
+    deliberately kept as its own name: what distinguishes the two scenarios is
+    the argument, and a call site reading `_clean_match("qdrant")` would say
+    the opposite of what it means.
+    """
+    return _clean_match(reply)
+
+
+# What each pair of sites sees when the thing it asks about is honestly absent.
+# The listings sites are told about qdrant — a real sibling service in the same
+# compose file, up while falkordb is not — and the ping sites get redis-cli's
+# error shape. Neither string contains the token its site looks for, which is
+# the whole content of the scenario.
+_LISTING_WITHOUT_FALKORDB = "qdrant"
+_REPLY_WITHOUT_PONG = "ERR unknown command"
+
+
 # A producer that says NOTHING and fails. The honest verdict for every site is
 # the negative branch, reached WITHOUT aborting — see each site's guard test.
 _SILENT_FAILURE = "    exit 1\n"
@@ -139,7 +169,17 @@ _SILENT_FAILURE = "    exit 1\n"
 
 # --- export-data.sh section 3: the FalkorDB BGSAVE flush --------------------
 # Both anchors are CODE (not comment prose), are unique in the file, and
-# survive the fix. Verified to yield the 18-line section-3 block.
+# survive the fix.
+#
+# NO LINE COUNT IS CLAIMED FOR ANY SLICE IN THIS FILE, and that is the same
+# objection the slicer's own docstring raises against pinned line numbers. The
+# three counts that used to sit in these three comments were all WRONG as
+# landed — the export block was called 18 lines when the commit that wrote the
+# claim had itself grown the block to 45 — because a count is invalidated by
+# any reflow of the region it describes and nothing checks it. The anchors
+# below plus `slice_section`'s self-naming AssertionError already carry the
+# claim that matters: the slice covers the site under test, or the test dies
+# loudly.
 _EXPORT_BGSAVE_START = 'info "Flushing FalkorDB to disk"'
 _EXPORT_BGSAVE_END = "\nfi\n"
 
@@ -232,6 +272,25 @@ def test_export_skips_the_flush_when_the_listing_says_nothing(tmp_path):
     assert "OK FalkorDB BGSAVE completed" not in combined, combined
 
 
+def test_export_skips_the_flush_when_the_listing_omits_falkordb(tmp_path):
+    """A healthy listing that simply does not name falkordb is a real "not running".
+
+    The production negative: `docker compose ps --status running` exits 0
+    having listed only qdrant. The section must take the else branch on it, and
+    must reach that verdict without aborting — the same `returncode == 0` claim
+    the silent-producer guard makes, on the path where `|| true` is NOT what
+    supplies the empty capture.
+    """
+    result = _run_export_bgsave(
+        tmp_path, _nonmatching_output(_LISTING_WITHOUT_FALKORDB)
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "WARN FalkorDB container not running" in combined, combined
+    assert "OK FalkorDB BGSAVE completed" not in combined, combined
+
+
 def test_export_flushes_falkordb_on_a_clean_listing(tmp_path):
     """Characterization: the ordinary path lists falkordb and exits 0."""
     result = _run_export_bgsave(tmp_path, _clean_match("falkordb"))
@@ -314,6 +373,17 @@ def test_import_stops_nothing_when_the_listing_says_nothing(tmp_path):
     assert _STOPPED not in combined, combined
 
 
+def test_import_stops_nothing_when_the_listing_omits_falkordb(tmp_path):
+    """A healthy listing naming only qdrant means there is nothing of ours to stop."""
+    result = _run_import_stop(
+        tmp_path, _nonmatching_output(_LISTING_WITHOUT_FALKORDB)
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _STOPPED not in combined, combined
+
+
 def test_import_stops_the_containers_on_a_clean_listing(tmp_path):
     """Characterization: the ordinary path lists falkordb and exits 0."""
     result = _run_import_stop(tmp_path, _clean_match("falkordb"))
@@ -325,7 +395,7 @@ def test_import_stops_the_containers_on_a_clean_listing(tmp_path):
 # --- import-data.sh section 7: the FalkorDB "wait for healthy" loop ---------
 # Anchor occurs exactly once on a non-comment line and survives the fix. The
 # same anchor shape task 4204 used for setup-host.sh's section-2 wait loop,
-# which this block is a literal copy of. Verified to yield the 11-line block.
+# which this block is a literal copy of.
 _IMPORT_WAIT_START = 'docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant'
 _IMPORT_WAIT_END = "\ndone\n"
 
@@ -396,6 +466,21 @@ def test_import_wait_times_out_when_the_ping_says_nothing(tmp_path):
     assert _HEALTHY not in combined, combined
 
 
+def test_import_wait_times_out_when_the_ping_answers_something_else(tmp_path):
+    """A redis-cli that ANSWERED, but not PONG, is not healthy either.
+
+    `docker compose exec` succeeds and the reply is an error string — the shape
+    a container that is up but not yet serving actually produces. The loop must
+    keep waiting and time out, not read "it replied" as "it is healthy".
+    """
+    result = _run_import_wait(tmp_path, _nonmatching_output(_REPLY_WITHOUT_PONG))
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_HEALTHY in combined, combined
+    assert _HEALTHY not in combined, combined
+
+
 def test_import_wait_reports_healthy_on_a_clean_ping(tmp_path):
     """Characterization: the ordinary path answers PONG and exits 0."""
     result = _run_import_wait(tmp_path, _clean_match("PONG"))
@@ -409,7 +494,6 @@ def test_import_wait_reports_healthy_on_a_clean_ping(tmp_path):
 # `end_after` is required so the slice runs THROUGH the `else` arm to the
 # block's own closing `fi` rather than stopping short at the `if`'s. Both
 # anchors occur exactly once, on non-comment lines, and survive the fix.
-# Verified to yield the 9-line block.
 _IMPORT_HEALTH_START = 'info "Health checks"'
 _IMPORT_HEALTH_END = "\nfi\n"
 _IMPORT_HEALTH_END_AFTER = 'warn "FalkorDB: not responding"'
@@ -460,6 +544,18 @@ def test_import_health_reports_pong_when_the_ping_is_sigpiped(tmp_path):
 def test_import_health_reports_not_responding_when_the_ping_says_nothing(tmp_path):
     """No reply is genuinely not responding — reached WITHOUT aborting the import."""
     result = _run_import_health(tmp_path, _SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_RESPONDING in combined, combined
+    assert _PONG_OK not in combined, combined
+
+
+def test_import_health_reports_not_responding_when_the_ping_answers_something_else(
+    tmp_path,
+):
+    """An error string is not a PONG — the import's closing signal must say so."""
+    result = _run_import_health(tmp_path, _nonmatching_output(_REPLY_WITHOUT_PONG))
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
