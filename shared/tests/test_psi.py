@@ -784,6 +784,133 @@ class TestResolveOwnCgroup:
         ).path == UNIT_PATH
 
 
+class TestReadOwnCgroupPressure:
+    """PRD §6.3 rows 1-3, executed against a real fixture sysfs tree.
+
+    Path injection (rather than a mocked read seam) is what makes this
+    executed parity: the reader walks a real directory tree, so the test pins
+    the implementation against the shared fixture shapes rather than against
+    itself.
+    """
+
+    def _tree(self, tmp_path, cgroup_text, pressure_at=None, pressure_text=PSI_CPU_TEXT):
+        """Build a /proc/self/cgroup fixture and an optional sysfs cpu.pressure."""
+        cgroup_file = tmp_path / 'cgroup'
+        cgroup_file.write_text(cgroup_text)
+        root = tmp_path / 'sys'
+        if pressure_at is not None:
+            directory = root / pressure_at.lstrip('/')
+            directory.mkdir(parents=True)
+            (directory / 'cpu.pressure').write_text(pressure_text)
+        return cgroup_file, root
+
+    def test_row_1_reads_the_project_slice_file(self, tmp_path):
+        from shared.psi import read_own_cgroup_pressure
+
+        cgroup_file, root = self._tree(
+            tmp_path, CGROUP_UNDER_SLICE, pressure_at=SLICE_PATH
+        )
+        reading = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+
+        assert reading.read_ok is True
+        assert reading.cgroup.endswith('df-x.slice')
+        # the file's `some avg10`, NOT its `full avg10` (0.30)
+        assert reading.some_avg10 == pytest.approx(2.50)
+
+    def test_row_2_reads_the_unit_file(self, tmp_path):
+        from shared.psi import read_own_cgroup_pressure
+
+        cgroup_file, root = self._tree(tmp_path, CGROUP_NO_SLICE, pressure_at=UNIT_PATH)
+        reading = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+
+        assert reading.read_ok is True
+        assert reading.cgroup == UNIT_PATH
+        assert reading.some_avg10 == pytest.approx(2.50)
+
+    def test_row_3_missing_pressure_file_names_the_attempted_cgroup(self, tmp_path):
+        """INV-11: a caller can tell WHICH cgroup failed, by value."""
+        from shared.psi import read_own_cgroup_pressure
+
+        cgroup_file, root = self._tree(tmp_path, CGROUP_UNDER_SLICE)
+        (root / SLICE_PATH.lstrip('/')).mkdir(parents=True)
+
+        reading = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+
+        assert reading.read_ok is False
+        assert reading.some_avg10 == 0.0
+        assert reading.cgroup.endswith('df-x.slice')
+
+    def test_unparseable_pressure_file_degrades_the_same_way(self, tmp_path):
+        from shared.psi import read_own_cgroup_pressure
+
+        cgroup_file, root = self._tree(
+            tmp_path,
+            CGROUP_UNDER_SLICE,
+            pressure_at=SLICE_PATH,
+            pressure_text='garbage line with no avg fields\n',
+        )
+        reading = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+
+        assert reading.read_ok is False
+        assert reading.some_avg10 == 0.0
+        assert reading.cgroup.endswith('df-x.slice')
+
+    def test_unreadable_proc_cgroup_yields_the_empty_reading(self, tmp_path):
+        from shared.psi import read_own_cgroup_pressure
+
+        reading = read_own_cgroup_pressure(
+            'x',
+            proc_cgroup_path=tmp_path / 'absent',
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert reading == ('', 0.0, False)
+
+    def test_never_raises_on_a_directory_in_place_of_the_pressure_file(self, tmp_path):
+        from shared.psi import read_own_cgroup_pressure
+
+        cgroup_file, root = self._tree(tmp_path, CGROUP_UNDER_SLICE)
+        (root / SLICE_PATH.lstrip('/') / 'cpu.pressure').mkdir(parents=True)
+
+        reading = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+
+        assert reading.read_ok is False
+
+    def test_failure_re_resolves_so_a_late_slice_is_picked_up(self, tmp_path):
+        """A df-<project_id>.slice that does not exist yet (3394 unlanded) must
+        be picked up when it appears, without restarting the orchestrator. The
+        failure path clears the resolver cache, so the test never touches it.
+        """
+        from shared.psi import read_own_cgroup_pressure
+
+        cgroup_file, root = self._tree(tmp_path, CGROUP_UNDER_SLICE)
+        directory = root / SLICE_PATH.lstrip('/')
+        directory.mkdir(parents=True)
+
+        first = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+        assert first.read_ok is False
+
+        (directory / 'cpu.pressure').write_text(PSI_CPU_TEXT)
+
+        second = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+        assert second.read_ok is True
+        assert second.some_avg10 == pytest.approx(2.50)
+
+
 class TestReadPsiSampleHappyPath:
     def _fake_read(self):
         # Note: the memory pressure file is read under the name 'memory', not 'mem'.
