@@ -63,6 +63,7 @@ import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import warnings
@@ -1823,6 +1824,101 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
         'so a session-escaped descendant (e.g. a verify.py '
         "start_new_session build command) survives the leader's own death "
         'as an orphan:\n  ' + '\n  '.join(offenders)
+    )
+
+
+def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree():
+    """_untorn_down_holders flags a swept holder iff it never reaches kill_holder_tree.
+
+    Deterministic AST-only cases (``ast.parse`` over a ``textwrap.dedent(...)``
+    source, zero subprocesses, zero timing).  ``holder_names`` is supplied
+    directly to each case, so this test pins ONLY the new helper, not
+    :func:`_spawn_verify_merge_bound_names`.
+
+    Case (d) is load-bearing: a matcher that merely asks "does this function
+    call kill_holder_tree anywhere?" would pass cases (a)-(c) AND vacuously
+    green Row 5 (which already calls ``kill_holder_tree(holder, ...)``) while
+    catching nothing -- (d) is the only case that kills that implementation,
+    because ``other``'s teardown must not excuse ``holder``'s absence.
+    """
+
+    def parse_func(source: str) -> ast.FunctionDef:
+        tree = ast.parse(textwrap.dedent(source))
+        (func,) = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+        return func
+
+    # (a) holder bound, no kill_holder_tree call at all.
+    func_a = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+    """)
+    assert _untorn_down_holders(func_a, {'holder'}) == ['f:holder'], (
+        'a holder with NO kill_holder_tree call anywhere in its function '
+        'must be flagged'
+    )
+
+    # (b) holder passed positionally in a finally:.
+    func_b = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_b, {'holder'}) == [], (
+        'a holder passed positionally to kill_holder_tree in a finally: '
+        'must not be flagged'
+    )
+
+    # (c) holder passed inside a nested `if holder is not None:` guard
+    # within the finally: -- pins that the helper walks nested bodies; this
+    # is the exact shape step-5 uses for Row 5's `waiter`.
+    func_c = parse_func("""
+        def f():
+            holder = None
+            try:
+                holder = spawn_verify_merge()
+                do_work()
+            finally:
+                if holder is not None:
+                    kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_c, {'holder'}) == [], (
+        'a holder passed to kill_holder_tree inside a nested if-guard '
+        'within the finally: must not be flagged -- the helper must walk '
+        'nested bodies'
+    )
+
+    # (d) ANTI-VACUITY (load-bearing, do not drop): two holders, only
+    # `other` passed to kill_holder_tree -- `holder` must still be flagged.
+    func_d = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            other = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(other, timeout=5)
+    """)
+    assert _untorn_down_holders(func_d, {'holder', 'other'}) == ['f:holder'], (
+        "kill_holder_tree(other) must not excuse holder's absence -- a "
+        'matcher that merely checks "is kill_holder_tree called anywhere?" '
+        'would wrongly return [] here'
+    )
+
+    # keyword spelling: kill_holder_tree's first parameter is named `proc`.
+    func_e = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(proc=holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_e, {'holder'}) == [], (
+        'a holder passed as the proc= keyword must not be flagged -- '
+        "kill_holder_tree's first parameter is named proc"
     )
 
 
