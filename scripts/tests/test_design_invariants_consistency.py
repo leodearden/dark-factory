@@ -2284,6 +2284,97 @@ def test_near_miss_alias_pairs_fails_loudly_on_an_empty_family() -> None:
     assert "family" in str(excinfo.value).lower()
 
 
+def test_alias_pairs_not_in_family_clears_an_exact_pairing() -> None:
+    """An exact `(number, slug)` match is a member of the family — clean."""
+    pairs = [_pair(2, "structured-facts-at-failure")]
+
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_alias_pairs_not_in_family_flags_a_renamed_slug_under_its_own_number() -> None:
+    """RENAME drift: the right number, a slug the family no longer spells that way.
+
+    MEASURED gap: `near_miss_alias_pairs` returns `[]` for this pairing because
+    its limb 3 clears a token confusable with nothing canonical — a renamed
+    slug is exactly that, confusable with neither its own former spelling nor
+    any other canonical slug. Strict membership has no such carve-out.
+    """
+    pairs = [_pair(9, "quiet-degradation-forbidden")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_pairing_under_a_retired_number() -> None:
+    """RETIRE drift: a number the family no longer defines at all.
+
+    Same measured gap as the rename case: the token is confusable with nothing
+    canonical, so `near_miss_alias_pairs` clears it while strict membership
+    cannot — the number is not even a key in the family.
+    """
+    pairs = [_pair(11, "legacy-fallback-behavior")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_renumbered_slug() -> None:
+    """RENUMBER drift: a canonical slug cited under the wrong number.
+
+    Also caught by `near_miss_alias_pairs` (limb 2) — pinned here too so the
+    strict rule's whole coverage is stated in one place rather than split
+    across two test sections.
+    """
+    pairs = [_pair(2, "no-silent-fail-soft")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_proper_prefix_under_its_own_number() -> None:
+    """Shorthand `near_miss_alias_pairs` clears is still not an EXACT member.
+
+    Deliberate asymmetry with the near-miss guard, which carves out a proper
+    prefix under its own number as legitimate shorthand (measured: twelve
+    correct citations live this way — see
+    `test_near_miss_alias_pairs_clears_a_proper_prefix_under_its_own_number`).
+    Strict family membership has no shorthand carve-out: only an exact
+    `(number, slug)` pairing counts as pinned.
+    """
+    pairs = [_pair(4, "storm-escape")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_module_local_numbering_scheme() -> None:
+    """Proof the predicate is UNSAFE to run repo-wide — why it stays per-site.
+
+    `near_miss_alias_pairs` clears this because the token is confusable with
+    nothing canonical — a real citation of a PRD-local invariant list (task
+    2885's `INV-3 dangling-successor-edge`), not this family. Strict family
+    membership has no such carve-out and flags it too, which is exactly why
+    this predicate must never run over ordinary repo content: a guard wrong on
+    every module-local numbering scheme in the repo would be silenced.
+    """
+    pairs = [_pair(3, "dangling-successor-edge")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_fails_loudly_on_an_empty_family() -> None:
+    """An empty family RAISES rather than returning `[]`, per the extractor contract.
+
+    With no canonical pairings to check membership against, every pairing
+    would trivially be a non-member and the verdict would be meaningless.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        alias_pairs_not_in_family([_pair(2, "no-silent-fail-soft")], [])
+
+    assert "family" in str(excinfo.value).lower()
+
+
 # ---------------------------------------------------------------------------
 # doc_anchored_slug_citations / noncanonical_citations — the CITATION guard
 #
