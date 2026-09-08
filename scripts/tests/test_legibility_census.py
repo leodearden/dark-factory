@@ -145,14 +145,18 @@ def _make_fake_invoke(response_fn=None, *, default="{}"):
     return fake_invoke
 
 
-def _make_fake_submit_fn(*, id_prefix="task"):
+def _make_fake_submit_fn():
     """Fake curator-path `submit_fn(**kwargs) -> dict` seam. Records every
-    call's kwargs in `.calls` and returns an incrementing fake task id."""
+    call's kwargs in `.calls` and mimics the curator path's real return --
+    `{"ticket": "tkt_<n>"}`, an incrementing TICKET id, never a task id
+    (fused_memory/server/tools.py::submit_task). Task 4965: this double
+    previously returned `{"id": ...}`, a shape the live seam never
+    produces, which is why the whole suite agreed with the defect."""
     calls = []
 
     def fake_submit_fn(**kwargs):
         calls.append(kwargs)
-        return {"id": f"{id_prefix}-{len(calls)}"}
+        return {"ticket": f"tkt_{len(calls)}"}
 
     fake_submit_fn.calls = calls
     return fake_submit_fn
@@ -1144,7 +1148,7 @@ def test_render_report_contains_dated_header_and_all_sections():
         matrix_md="| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n",
         mining_result=_sample_mining_result(),
         synthesis_md="Fable synthesis prose goes here.",
-        filed_task_ids=["1234", "1235"],
+        filed_ticket_ids=["1234", "1235"],
         cost_note="~$3.42 across 20 Sonnet calls + 1 Fable call.",
     )
 
@@ -1176,7 +1180,7 @@ def test_render_report_force_marker_present_when_forced():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_task_ids=[],
+        filed_ticket_ids=[],
         cost_note="cost",
     )
     assert "--force" in report
@@ -1191,7 +1195,7 @@ def test_render_report_is_deterministic_no_clock():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_task_ids=["1"],
+        filed_ticket_ids=["1"],
         cost_note="cost",
     )
     assert mod.render_report(**kwargs) == mod.render_report(**kwargs)
@@ -1304,7 +1308,7 @@ def _render(**overrides):
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_task_ids=["1"],
+        filed_ticket_ids=["1"],
         cost_note="cost",
     )
     kwargs.update(overrides)
@@ -1505,7 +1509,7 @@ _PAYLOADS_PATH = "/p/plans/confusion-census-2026-07-30-payloads.json"
 
 def test_render_report_dry_run_filing_section_names_count_and_path():
     report = _render(
-        filed_task_ids=[],
+        filed_ticket_ids=[],
         dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     )
 
@@ -1519,7 +1523,7 @@ def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
     # An empty filed list plus a dry run must never read as "a normal run
     # that happened to file nothing" -- the dry-run wording wins.
     report = _render(
-        filed_task_ids=[],
+        filed_ticket_ids=[],
         dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
     )
 
@@ -1530,13 +1534,13 @@ def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
 
 
 def test_render_report_without_dry_run_filed_tasks_section_unchanged():
-    filed = _render(filed_task_ids=["1234", "1235"])
+    filed = _render(filed_ticket_ids=["1234", "1235"])
     filed_section = filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
     assert "- 1234" in filed_section
     assert "- 1235" in filed_section
     assert "dry-run" not in filed_section.lower()
 
-    none_filed = _render(filed_task_ids=[])
+    none_filed = _render(filed_ticket_ids=[])
     none_section = none_filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
     assert "_none filed._" in none_section
     assert "dry-run" not in none_section.lower()
@@ -1550,7 +1554,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_task_ids=["1"],
+        filed_ticket_ids=["1"],
         cost_note="cost",
     )
     assert report == _GOLDEN_FLAGLESS_REPORT
@@ -1870,7 +1874,7 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     # --- outcome: filed task ids + report path + saturation stop_reason ---
     assert outcome.status == "done"
     assert outcome.report_path == str(kwargs["report_path"])
-    assert outcome.filed_task_ids == ["task-1"]
+    assert outcome.filed_ticket_ids == ["tkt_1"]
     assert outcome.stop_reason == "exhausted"
 
 
@@ -2006,7 +2010,7 @@ def test_run_census_submit_fn_raising_is_best_effort_not_fatal(tmp_path, caplog)
         outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done", "one filing failure must not abort the pipeline"
-    assert outcome.filed_task_ids == []
+    assert outcome.filed_ticket_ids == []
     assert any("submit_fn" in r.message for r in caplog.records), "must log loudly, not swallow silently"
 
     # the codebook was already persisted before filing was attempted, and the
@@ -2052,16 +2056,68 @@ def test_run_census_submit_fn_non_dict_result_is_not_counted_as_filed(tmp_path, 
         outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert outcome.filed_task_ids == [], (
-        "a non-dict submit_fn result must not crash .get('id'), and must not "
-        "be counted as a genuinely-filed task"
+    assert outcome.filed_ticket_ids == [], (
+        "a non-dict submit_fn result must not crash the ticket read, and must "
+        "not be counted as a genuinely-filed ticket"
     )
-    assert any("no usable id" in r.message for r in caplog.records), "must log loudly, not swallow silently"
+    assert any("no ticket id" in r.message for r in caplog.records), "must log loudly, not swallow silently"
 
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
     filed_section = report_text.split("## Filed Tasks")[1].split("## Cost")[0]
     assert "None" not in filed_section, "an id-less result must never render as a '- None' bullet"
     assert "_none filed._" in filed_section
+
+
+# ---------------------------------------------------------------------------
+# task 4965 step-3: the warn-and-exclude branch's REAL shape. A rejected or
+# failed submit_task answers `{'error': str(exc), 'error_type': ...}`
+# (fused_memory/middleware/task_interceptor.py::TaskInterceptor) -- a dict
+# with no ticket key. That, not the synthetic None above, is what actually
+# reaches this branch in production, so it is pinned here.
+# ---------------------------------------------------------------------------
+
+def test_run_census_submit_fn_error_shape_is_not_counted_as_filed(tmp_path, caplog):
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+    ]
+    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_verify_fn = _make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"})
+
+    def error_returning_submit_fn(**kwargs):
+        return {"error": "backlog full", "error_type": "BacklogFull"}
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[batch],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=error_returning_submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", "a rejected filing must not abort the pipeline"
+    assert outcome.filed_ticket_ids == [], (
+        "an {'error', 'error_type'} result means NOTHING was filed -- it must "
+        "never inflate the filed-ticket count"
+    )
+    assert any("no ticket id" in r.message for r in caplog.records), (
+        "a rejected filing must be logged loudly, not swallowed silently"
+    )
+
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    filed_section = report_text.split("## Filed Tasks")[1].split("## Cost")[0]
+    assert "_none filed._" in filed_section
+    assert "backlog full" not in filed_section, (
+        "an error payload must never leak into the human-facing report as a bullet"
+    )
+    assert "None" not in filed_section, "an unfilable result must never render as a '- None' bullet"
 
 
 def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
@@ -2634,7 +2690,7 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
 
     # (e) the outcome names the review file instead of a bare filed_tasks=0
     assert outcome.status == "done"
-    assert outcome.filed_task_ids == []
+    assert outcome.filed_ticket_ids == []
     assert outcome.dry_run is not None
     assert outcome.dry_run.path == str(payloads_path)
     assert outcome.dry_run.payload_count == 1
@@ -2824,7 +2880,7 @@ def test_run_census_without_dry_run_files_normally_and_writes_no_payload_file(tm
     outcome = mod.run_census(**kwargs)
 
     assert len(fake_submit_fn.calls) == 1, "the flagless path still files per payload"
-    assert outcome.filed_task_ids == ["task-1"]
+    assert outcome.filed_ticket_ids == ["tkt_1"]
     assert outcome.dry_run is None
     assert list(tmp_path.glob("*-payloads.json")) == []
 
@@ -2974,7 +3030,7 @@ def _make_fake_main_run_census(outcome=None):
         calls.append(kwargs)
         return outcome or mod.CensusOutcome(
             status="done", report_path="plans/confusion-census-2026-01-02.md",
-            filed_task_ids=["1234"], stop_reason="exhausted",
+            filed_ticket_ids=["1234"], stop_reason="exhausted",
         )
 
     fake_run_census.calls = calls
@@ -3227,7 +3283,7 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
         outcome=mod.CensusOutcome(
             status="done",
             report_path="plans/confusion-census-2026-07-30.md",
-            filed_task_ids=[],
+            filed_ticket_ids=[],
             stop_reason="capped",
             dry_run=mod.DryRunFiling(path=payloads_path, payload_count=7),
         )
