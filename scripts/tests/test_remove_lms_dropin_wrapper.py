@@ -300,6 +300,48 @@ def test_default_template_constant_matches_the_shell_default() -> None:
 _STALE_AFTER_S = 3600.0
 
 
+def _is_prunable_selftest_residue(name: str) -> bool:
+    """Whether *name* is selftest residue that ``_prune_stale_selftest_units``
+    may reap, gated by TWO independent properties:
+
+    * THE SUFFIX GATE, evaluated FIRST.  Only a ``.service`` or
+      ``.service.d`` name can be residue at all; anything else returns False
+      immediately.  This is what keeps the sweep away from ``_LOCK_NAME`` and
+      from any future selftest-prefixed bookkeeping file -- it is not
+      cosmetic, see the rationale in ``_systemd_user_manager_skip_reason``
+      (declining to widen this filter to cover a dot-file) and above
+      ``_LOCK_NAME`` itself, and the ``non_units`` half of
+      ``test_prune_never_touches_a_non_selftest_unit``.
+    * THE NAME GATE.  The remaining stem must either start with
+      ``_SELFTEST_PREFIX`` (a unique name ``_unique_template()`` generated)
+      or equal ``_DEFAULT_TEMPLATE`` exactly (the ONE fixed name the .sh
+      falls back to, pinned to the .sh's actual literal by
+      ``test_default_template_constant_matches_the_shell_default``).  Real
+      units (``lms-arm@``, ``fused-memory``, ``dark-factory-dashboard``) are
+      excluded structurally, at any age, by this gate alone.
+
+      The default arm is what this task adds, and is EXACT EQUALITY rather
+      than a widened prefix: ``"lms-dropin-selftest@"`` does not start with
+      ``"lms-dropin-selftest-"``, which is why the old prefix-only filter
+      could never reach it.  Equality (rather than
+      ``startswith(_SELFTEST_STEM)``) is what keeps the near-misses pinned by
+      ``test_prune_match_predicate_admits_selftest_residue_and_nothing_else``
+      excluded.
+    """
+    # 1. Suffix gate first.  "x.service.d".endswith(".service") is already
+    #    False, so checking ".service.d" ahead of ".service" doesn't change
+    #    which names match -- it just makes the two-suffix intent explicit
+    #    rather than incidental.
+    for suffix in (".service.d", ".service"):
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            break
+    else:
+        return False
+    # 2. Name gate: a unique generated name, or exactly the bare default.
+    return stem.startswith(_SELFTEST_PREFIX) or stem == _DEFAULT_TEMPLATE
+
+
 def _prune_stale_selftest_units(
     unit_dir: Path,
     *,
