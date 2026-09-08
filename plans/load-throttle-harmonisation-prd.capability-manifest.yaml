@@ -1,0 +1,490 @@
+# Machine-readable twin of load-throttle-harmonisation-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract, validated by
+# shared/src/shared/capability_manifest.py::CapabilityManifestDoc.
+#
+# task_id is null until commit_planning stamps it. Labels rho1/rho2/rho3 are
+# filed in the `reify` project against this dark_factory-hosted PRD; their
+# delivered_check paths are therefore reify-repo-relative, evaluated by reify's
+# own dispatch gate. Greek labels are ASCII-transliterated for the primed and
+# numbered ones (delta_prime, epsilon1, epsilon2) so a label is never ambiguous
+# in a log line.
+prd: plans/load-throttle-harmonisation-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "PsiSample v2 and readers (runqueue ratio, own-cgroup pressure, None-tolerant saturated, D10 tripping_metric)"
+    capabilities:
+      - name: "psi-sample-defaulted-fields-are-non-breaking"
+        binding: "capability→producer (wired) — every PsiSample( construction repo-wide is keyword-only; census n=11 (shared/src/shared/psi.py::_FAIL_OPEN, ::read_psi_sample, shared/tests/test_psi.py x7, four orchestrator test modules)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'runqueue_ratio'
+          paths: ["shared/src/shared/psi.py"]
+          expect: present
+      - name: "own-cgroup-resolver"
+        binding: "producer:α — resolve_own_cgroup is absent repo-wide today; §6.1 makes it separately injectable from the read seam"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'def resolve_own_cgroup'
+          paths: ["shared/src/shared/psi.py"]
+          expect: present
+      - name: "tripping-metric-with-the-d10-rank"
+        binding: "producer:α — tripping_metric is absent repo-wide (grep over *.py returns zero hits); β is the consumer and is downstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'def tripping_metric'
+          paths: ["shared/src/shared/psi.py"]
+          expect: present
+      - name: "read-psi-sample-takes-project-id"
+        binding: "producer:α — the signature is (*, read=read_pressure) today; the read seam is unchanged (shared/src/shared/psi.py::read_psi_sample)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'own_read_ok'
+          paths: ["shared/src/shared/psi.py"]
+          expect: present
+      - name: "saturated-tolerates-none-thresholds"
+        binding: "producer:α — shared/src/shared/psi.py::PsiSample.saturated does a bare >= on four thresholds today"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "None-tolerance is a truth-table property proved by boundary rows 4-5, not a greppable token"
+      - name: "procs-running-readable-and-affinity-denominated"
+        binding: "capability→producer (wired) — /proc/stat procs_running exists; the sole in-repo reader is the diagnostic scripts/cgroup-stall-ratio.py. Live probe 2026-09-08: 101 / len(os.sched_getaffinity(0))=32 = 3.16"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a live-kernel property; the production reader itself is what α builds"
+      - name: "own-cgroup-pressure-readable-from-the-orchestrator"
+        binding: "capability→producer (wired) — live probe 2026-09-08: /proc/self/cgroup 0:: readable; the orchestrator unit cgroup .../app.slice/orchestrator-dark-factory.service reads cpu.pressure 'some avg10=35.03'"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "host state, not repo state — this is exactly what α's own signal asserts on this host"
+      - name: "loop-thread-occupancy-bounded"
+        binding: "INV-8 — three small procfs reads per gate tick (~150 s cadence); the cgroup resolution is cached per process and re-resolved only after a read failure"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a worst-case wall-time argument, not a pattern"
+
+  - label: "β"
+    task_id: null
+    title: "psi_admission v2 — gate wiring, config vocabulary + validators, dispatch_deferred payload, yaml-leak fix, boundary test"
+    note: "Re-scopes existing task 3590 and absorbs 4063. The yaml re-land that 3590's item 6 demanded moves to γ (dark-factory) and ρ1 (reify); 3590's 'remove the self-refuting census entry' clause does NOT fire (PRD §2 item 6)."
+    capabilities:
+      - name: "runqueue-ratio-config-leaf"
+        binding: "producer:β — PsiAdmissionConfig has 6 fields today and none of them is runqueue_ratio (orchestrator/src/orchestrator/config.py::PsiAdmissionConfig)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'runqueue_ratio'
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "own-cpu-some-config-leaf"
+        binding: "producer:β — shipped None (off) per D2; consumed by PsiSample.saturated from α"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'own_cpu_some_avg10'
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "psi-threshold-range-rejection"
+        binding: "rejection-mechanism — absent today: the four avg10 fields are plain Field(default=...) with no ge/le, while the sibling min_inflight_floor carries ge=1. 4063 absorbed; β adds the load AND hot-reload rejection tests"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'le=100'
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "new-leaves-auto-register-green-tier"
+        binding: "capability→producer (wired) — orchestrator/src/orchestrator/config.py::_submodel_leaf_paths enumerates submodel_cls.model_fields, registered as _submodel_leaf_paths('psi_admission', PsiAdmissionConfig); the reload test is parametrised over the same model_fields"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: '_submodel_leaf_paths\(.psi_admission.'
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "default-85-pin-retired-with-the-default"
+        binding: "capability→producer (wired) — 3 sites in orchestrator/tests/test_config_psi_admission_reload.py assert or construct 85.0; β moves them when cpu_some_avg10 becomes None"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'cpu_some_avg10 == 85\.0'
+          paths: ["orchestrator/tests/"]
+          expect: absent
+      - name: "live-yaml-leak-closed-without-touching-conftest"
+        binding: "capability→producer (wired) — census: 19 OrchestratorConfig( across the three scheduler test files, 3 already explicit, 16 bare. Leak re-reproduced on current main 2026-09-08 (9 failed / 9 passed with the block present; 18 passed without)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'psi_admission=PsiAdmissionConfig\(\)'
+          paths: ["orchestrator/tests/test_scheduler_hermetic_psi.py"]
+          expect: present
+      - name: "dispatch-deferred-carries-the-whole-sample"
+        binding: "capability→producer (wired) — orchestrator/src/orchestrator/scheduler.py::Scheduler._note_heavy_deferral already emits a data dict {metric, value, in_flight, floor}; β widens it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'own_cgroup'
+          paths: ["orchestrator/src/orchestrator/scheduler.py"]
+          expect: present
+      - name: "metric-ranking-test-moves-to-d10"
+        binding: "capability→producer (wired) — orchestrator/tests/test_scheduler_dispatch_admission.py::TestDispatchAdmissionMetricRanking asserts on the emitted event's data['metric'], i.e. behaviour (INV-10), so it moves with the rank rather than being deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'runqueue_ratio'
+          paths: ["orchestrator/tests/test_scheduler_dispatch_admission.py"]
+          expect: present
+      - name: "4063-absorbed-with-no-orphaned-dependents"
+        binding: "DAG-direction — full 5178-task scan 2026-09-08: zero tasks list 4063 in dependencies, and 4063 itself has none. Its claimant heartbeat is stale since 2026-09-04"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a task-graph fact settled at decompose time, not a repo pattern"
+
+  - label: "γ"
+    task_id: null
+    title: "dark-factory yaml: harmonised psi_admission block"
+    capabilities:
+      - name: "harmonised-block-lands-in-the-df-yaml"
+        binding: "producer:γ — psi_admission: is absent from dark-factory-orchestrator.yaml today (grep: zero hits)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'runqueue_ratio: 4\.0'
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+      - name: "equal-floor-of-3"
+        binding: "producer:γ — D3; the five idle orchestrators keep the code default 1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'min_inflight_floor: 3'
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+      - name: "check-config-reports-zero-unknown-keys"
+        binding: "capability→producer (wired) — orchestrator/src/orchestrator/cli.py::check_config is an unknown-key linter that exits 1 on a genuinely unknown key; the leaves exist only after β, which is upstream"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an executed-CLI outcome (boundary row 9), not a pattern — INV-10 tier 1"
+      - name: "every-leaf-classifies-applied"
+        binding: "capability→producer (wired) — orchestrator/src/orchestrator/config.py::diff_config"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "observed on the next config_reload / restart, not greppable"
+      - name: "the-comment-is-a-dated-pointer-not-a-restatement"
+        binding: "INV-9 — §6.2 is the home. Per §Corrections (3) the comment must NOT cite reify's fleet-load-detector as corroboration: that detector's ratio is load1/nproc, a different quantity from procs_running/nproc"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'fleet.load.detector'
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: absent
+
+  - label: "δ"
+    task_id: null
+    title: "Sampler metrics + 30-day retention + install script + calibration script"
+    note: "Re-scopes existing task 3592. Its dashboard half (a panel over load-samples.db) is out of scope per PRD §9; the calibration script is the consumer. Its stale dependency on 3590 is replaced by an edge to α, which is what actually delivers the readers."
+    capabilities:
+      - name: "runqueue-and-own-pressure-recorded"
+        binding: "producer:δ via α's readers upstream (edge δ→α); sampler/src/sampler/metrics.py already imports parse_pressure_file and read_pressure from shared.psi, so there is no second parser to build (INV-5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'runqueue_ratio'
+          paths: ["sampler/src/sampler/"]
+          expect: present
+      - name: "long-format-store-needs-no-migration"
+        binding: "capability→producer (wired) — sampler/src/sampler/store.py CREATE TABLE IF NOT EXISTS samples (ts, metric, value, window_mean, window_max): a new metric is a new stem, not a new column"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "open question 1 (stem vs a cgroup column) is δ's to settle; the schema fact is what makes the stem option free"
+      - name: "retention-becomes-configurable-at-30-days"
+        binding: "producer:δ — today a keyword default retain_seconds=86400 on sampler/src/sampler/store.py::LoadSampleStore.cleanup_old, called with no override from sampler/src/sampler/sampler.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: '2592000'
+          paths: ["sampler/src/sampler/"]
+          expect: present
+      - name: "install-script-replaces-the-loud-stub"
+        binding: "producer:δ — scripts/install-load-sampler.sh is a committed loud stub (mode 100755, exit 64) so δ′ can name it at submit; the two systemd templates already exist and nothing installs them"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'not implemented until task 3592 lands'
+          paths: ["scripts/install-load-sampler.sh"]
+          expect: absent
+      - name: "calibration-script-replaces-the-loud-stub"
+        binding: "producer:δ — scripts/load-threshold-calibration.py is a committed loud stub (mode 100755, exit 64); the --commit report shape to imitate is scripts/merge-pytest-n-ab-analysis.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'not implemented until task 3592 lands'
+          paths: ["scripts/load-threshold-calibration.py"]
+          expect: absent
+      - name: "drift-check-compares-parsed-mappings"
+        binding: "INV-10 — §6.4; a text diff of the two yaml blocks would pin wording rather than configuration"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "parsed-vs-text is a property of the comparison, not of a token in the file"
+      - name: "sampler-gate-vocabulary-parity"
+        binding: "INV-5 / boundary row 11 — the parity test enumerates PsiSample's trippable fields from the live dataclass rather than a transcribed list"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "derivation-from-source is what the test does; a grep would only find the test's name"
+
+  - label: "δ′"
+    task_id: null
+    title: "Sampler deploy (deterministic, before_done = scripts/install-load-sampler.sh)"
+    capabilities:
+      - name: "before-done-script-exists-and-is-executable-at-submit"
+        binding: "capability→producer (wired) — scripts/install-load-sampler.sh committed at mode 100755 in b6282847f9, ahead of this batch precisely because submit_task validates the path"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "validated by submit_task itself; a grep for the path would not prove the exec bit"
+      - name: "the-stub-can-never-run-for-real"
+        binding: "DAG-direction — producer:δ is upstream (edge δ′→δ) and the stub exits 64 with a one-line message naming 3592"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a dependency-graph property, checked at Step 4 wiring"
+      - name: "auto-deploy-preset-reaches-a-human-only-on-failure"
+        binding: "capability→producer (wired) — before_done present + always_escalates=false; target_unit null ⇒ blocking subprocess with a fresh-MainPID verify (docs/task-authoring.md §5). Worked example: task 5203"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a metadata shape validated at submit, not a repo pattern"
+      - name: "the-timer-runs-mains-code-so-delta-must-land-first"
+        binding: "capability→producer (wired) — dashboard/dark-factory-load-sampler.service carries WorkingDirectory=%h/src/dark-factory"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'WorkingDirectory=%h/src/dark-factory'
+          paths: ["dashboard/dark-factory-load-sampler.service"]
+          expect: present
+
+  - label: "ε1"
+    task_id: null
+    title: "Host-arm calibration gate (+14 d after sampler deployed and both blocks live)"
+    capabilities:
+      - name: "before-done-script-exists-and-is-executable-at-submit"
+        binding: "capability→producer (wired) — scripts/load-threshold-calibration.py committed at mode 100755 in b6282847f9"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "validated by submit_task itself"
+      - name: "arm-runqueue-ratio-is-produced-upstream"
+        binding: "DAG-direction — producer:δ is in the transitive closure (ε1 → δ′ → δ)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'runqueue_ratio'
+          paths: ["scripts/load-threshold-calibration.py"]
+          expect: present
+      - name: "at-least-14-days-of-samples-exist-when-it-fires"
+        binding: "capability→producer (wired) — milestone {mode: delayed, after_secs: 1209600}; a delayed milestone's clock starts only once every local and external dep is done (docs/task-authoring.md §6), and ε1's deps are δ′, γ and reify:ρ1"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a scheduler timing property (milestone_deps_satisfied_at), not a repo pattern"
+      - name: "act-then-ask-reaches-leo"
+        binding: "capability→producer (wired) — before_done present + always_escalates=true ⇒ run the action, then a born-at-L2 escalation; done after resume. Worked example: task 5204"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a metadata shape validated at submit"
+      - name: "the-gate-is-bounded-and-not-held-behind-3394"
+        binding: "INV-7 — ε1 deliberately carries no 3394 edge; that separation is the whole reason ε was split into ε1/ε2 during the authoring review"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an absence in the dependency graph, asserted at Step 4 wiring"
+
+  - label: "ε2"
+    task_id: null
+    title: "Own-arm calibration gate (+14 d after ε1 and 3394)"
+    capabilities:
+      - name: "before-done-script-exists-and-is-executable-at-submit"
+        binding: "capability→producer (wired) — scripts/load-threshold-calibration.py committed at mode 100755"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "validated by submit_task itself"
+      - name: "arm-own-cpu-some-is-produced-upstream"
+        binding: "DAG-direction — producer:δ is in the transitive closure (ε2 → ε1 → δ′ → δ)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'own_cpu_some_avg10'
+          paths: ["scripts/load-threshold-calibration.py"]
+          expect: present
+      - name: "the-slice-population-it-measures-exists"
+        binding: "DAG-direction — producer:3394 is upstream via a real add_dependency edge; the 14-day clock starts only after 3394 is done, so the recommendation is measured on the population it will govern"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a dependency-graph property"
+      - name: "the-own-arm-has-no-prior-basis-so-it-ships-off"
+        binding: "numeric-floor — D9/D2. A live unit read 2026-09-08 measured cpu.pressure some avg10=36.6 / avg300=40.9 at moderate load with procs_running 42-82, so a 40 threshold is NOT separated from ordinary load on the unit population; the slice population is a different one again. own_cpu_some_avg10 ships None"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'own_cpu_some_avg10'
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: absent
+
+  - label: "ρ1"
+    task_id: null
+    title: "reify yaml: harmonised psi_admission block + the companion PRD amendment"
+    note: "Filed in the reify project (project_root /home/leo/src/reify) against this dark_factory-hosted PRD; delivered_check paths are reify-repo-relative."
+    capabilities:
+      - name: "harmonised-block-lands-in-the-reify-yaml"
+        binding: "producer:ρ1 — reify's dark-factory-orchestrator.yaml carries psi_admission: {cpu_some_avg10: 70.0, min_inflight_floor: 3} today; §6.2 replaces it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'runqueue_ratio: 4\.0'
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+      - name: "cpu-some-arm-switched-off"
+        binding: "producer:ρ1 — D1; the shipped 70 blips (86% of reify's CPU holds are single-tick at 70-73)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'cpu_some_avg10: 70'
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: absent
+      - name: "the-leaves-exist-on-the-schema"
+        binding: "DAG-direction — producer:dark_factory:β upstream via a qualified external dep; an unknown submodel key is otherwise silently dropped and check-config flags it"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a cross-project dependency-graph property resolved by get_external_statuses at dispatch"
+      - name: "c-a1-is-re-sourced-and-its-contract-kept"
+        binding: "capability→producer (wired) — docs/prds/cpu-load-admission-control.md C-A1 reads 'Admits immediately while avg10 < THRESHOLD (/proc/pressure/cpu, host-portable %, no nproc-derived constant)'. Only the file changes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'own-slice'
+          paths: ["docs/prds/cpu-load-admission-control.md"]
+          expect: present
+      - name: "the-amendment-adds-rather-than-edits-a-premise"
+        binding: "capability→producer (wired) — §Corrections (2): the strings single-tenant / single-host / multi-tenant / multi-host do not occur anywhere in that 419-line document, and §2's framing is already many-source/one-host. ρ1 appends a dated amendment block; it must not hunt for a sentence to edit"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'single-tenant'
+          paths: ["docs/prds/cpu-load-admission-control.md"]
+          expect: absent
+      - name: "the-detector-block-and-its-census-entry-are-untouched"
+        binding: "capability→producer (wired) — PRD §2 item 6 and §Corrections (4): the runqueue arm reads /proc/stat directly and consumes nothing reify produces, so 3590's 'delete the self-refuting census entry' clause does not fire"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'fleet_load_detector'
+          paths: ["dark-factory-orchestrator.yaml"]
+          expect: present
+
+  - label: "ρ2"
+    task_id: null
+    title: "@own-slice for reify's verify gates and jobserver balancer, plus the extracted unit renderer"
+    note: "Scope widened at decompose per §Corrections (1): scripts/verify.sh and tests/infra/test_verify_admission_knob_parity.sh are added, because setting REIFY_PSI_GATE_PROC_PATH in verify_env alone would red that guard's completeness section. Also serialized behind ρ1 by a real edge — both leaves edit reify's dark-factory-orchestrator.yaml."
+    capabilities:
+      - name: "own-slice-sentinel-in-both-implementations"
+        binding: "producer:ρ2 — both scripts already take the PSI file from env with a cgroup-compatible parser (scripts/cpu-admit.sh::cpu_admit_read_avg10; scripts/jobserver-balancer.py::read_pressure). The sentinel itself is new"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'own-slice'
+          paths: ["scripts/cpu-admit.sh", "scripts/jobserver-balancer.py"]
+          expect: present
+      - name: "one-unit-rendering-site"
+        binding: "producer:ρ2 — render_jobserver_unit is absent repo-wide; the heredoc lives inline in scripts/setup-dev.sh::install_build_services. Extracting it is what lets ρ3 re-render from one site (INV-5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'render_jobserver_unit'
+          paths: ["scripts/setup-dev.sh"]
+          expect: present
+      - name: "admission-knob-parity-guard-satisfied-not-tripped"
+        binding: "rejection-mechanism — tests/infra/test_verify_admission_knob_parity.sh section (C1) fails on any verify_env key matching ^REIFY_(TEST_SEMAPHORE|PSI_GATE)_ without a KNOB_TABLE row, and section (B) then requires yaml value == the owning script's single ${KNOB:-} default. ρ2 must set both knobs, move BOTH verify.sh defaults to @own-slice, and add a KNOB_TABLE row each"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'REIFY_PSI_GATE_PROC_PATH'
+          paths: ["tests/infra/test_verify_admission_knob_parity.sh"]
+          expect: present
+      - name: "the-slice-name-to-place-the-unit-under"
+        binding: "DAG-direction — producer:dark_factory:3394 upstream via a qualified external dep; the name is df-<project_id>.slice with project_id from fused_memory.project_id = reify, never verify.py::_scope_tag_for"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'Slice=df-reify\.slice'
+          paths: ["scripts/setup-dev.sh"]
+          expect: present
+      - name: "the-fallback-is-value-preserving-not-a-silent-low-reading"
+        binding: "INV-11 / INV-SF-3 — no df-*.slice ancestor ⇒ read /proc/pressure/cpu and emit ONE WARNING per process (the balancer once at startup, cpu-admit.sh once per verify invocation, never per poll). The balancer's existing None-on-OSError path, which pressure_decide treats as low pressure, is untouched"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a once-per-process bound proved by the §6.3 parity fixtures, not by a token count"
+      - name: "partof-and-the-canary-timer-survive"
+        binding: "capability→producer (wired) — the heredoc already carries PartOf=orchestrator-reify.service, and reify-jobserver-canary.{service,timer} already exist and are enabled; ρ2 changes only Slice= and one Environment="
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'PartOf=orchestrator-reify\.service'
+          paths: ["scripts/setup-dev.sh"]
+          expect: present
+      - name: "redeploy-script-replaces-the-loud-stub"
+        binding: "producer:ρ2 — scripts/redeploy-jobserver-unit.sh is a committed loud stub so ρ3 can name it at submit; ρ2 writes the real one, sourcing render_jobserver_unit"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'not implemented until task'
+          paths: ["scripts/redeploy-jobserver-unit.sh"]
+          expect: absent
+
+  - label: "ρ3"
+    task_id: null
+    title: "Balancer unit re-deploy (deterministic, before_done = scripts/redeploy-jobserver-unit.sh)"
+    capabilities:
+      - name: "before-done-script-exists-and-is-executable-at-submit"
+        binding: "capability→producer (wired) — the loud stub is committed at mode 755 ahead of filing, matching reify's executable-script convention (77 of 85 scripts/*.sh are executable; the 8 that are not are sourced-only lib_*.sh helpers)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "validated by submit_task itself"
+      - name: "the-stub-can-never-run-for-real"
+        binding: "DAG-direction — producer:ρ2 is upstream (edge ρ3→ρ2) and the stub exits 64 naming its owning task (INV-SF-5: placeholders owned and loud)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a dependency-graph property"
+      - name: "it-corroborates-the-live-unit-not-the-render"
+        binding: "INV-3 / INV-SF-2 — asserts systemctl --user show reify-jobserver.service -p Slice,Environment after the restart and exits nonzero on mismatch"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an assertion against live machine state; a repo grep cannot see it"
+      - name: "held-back-is-observable-for-the-signal"
+        binding: "capability→producer (wired) — scripts/jobserver-balancer.py::write_held_back publishes to REIFY_JOBSERVER_HELD_BACK_FILE, default /tmp/reify-jobserver-held-back"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: 'held-back'
+          paths: ["scripts/jobserver-balancer.py"]
+          expect: present

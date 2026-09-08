@@ -353,6 +353,19 @@ mappings**, not text (INV-10).
 
 ## 8. Decomposition plan (G2 signals; overlay sizing)
 
+> **Decompose walk, 2026-09-08** — the capability manifest is
+> `plans/load-throttle-harmonisation-prd.capability-manifest.md` (+ its YAML
+> sidecar). All bindings PASS. Four premises in the prose above were corrected
+> during the walk and are carried into the filed tasks' own text; the manifest's
+> §Corrections is their home: (1) ρ2 must also move `verify.sh`'s two PSI-path
+> defaults and add `KNOB_TABLE` rows, or reify's admission-knob parity guard
+> goes red; (2) `cpu-load-admission-control.md` states no single-tenant premise,
+> so ρ1's amendment **adds** the multi-tenant framing rather than editing a
+> sentence (D7's substance is unchanged); (3) "matching reify's detector" is not
+> corroboration for `runqueue_ratio: 4.0` — that detector's ratio is
+> `load1/nproc`, a different quantity; (4) 3590's "remove the self-refuting
+> census entry" clause does not fire, per §2 item 6.
+
 - **α — `PsiSample` v2 and readers** (shared). Defaulted fields, `read_runqueue_ratio`,
   `resolve_own_cgroup`, `read_own_cgroup_pressure`, `None`-tolerant `saturated`, `tripping_metric`
   with the D10 rank, extended `read_psi_sample`; update `shared/tests/test_psi.py`'s truth table.
@@ -371,6 +384,15 @@ mappings**, not text (INV-10).
   `orchestrator/tests/{test_scheduler_dispatch_admission,test_scheduler_psi_saturation_transition,
   test_scheduler_hermetic_psi,test_config_psi_admission_reload}.py`, `OPERATIONS.md`,
   `docs/prds/dispatch-admission-load-cap.md`. *Deps:* α. ~600–1,000 LOC.
+  *G7 waiver: `storm-escape-required` — β extends the existing per-sample
+  fail-open (`read_ok=False` ⇒ non-saturated, rate-limited WARNING, no counter)
+  to two further components without adding a streak escalation. Both new arms
+  are off by code default, so an unreadable component makes an arm inert rather
+  than wrong, degrading to exactly today's shipped DA-D6 behaviour; the WARNING
+  names the component (INV-2); and δ gives the rate a real counter
+  (`own_read_ok:<cgroup>` rows) with ε1/ε2 as the supervised consumer on a
+  bounded 14-day clock. A streak escalation here would page a human about a
+  gate declining to throttle, which is the safe direction.*
 - **γ — dark-factory yaml block** (`complexity='simple'`). §6.2 verbatim; prove row 10 in a
   throwaway worktree before committing. *Signal:* row 9 for dark-factory; the next
   `config_reload`/restart shows every leaf `applied`. *Files:* `dark-factory-orchestrator.yaml`.
