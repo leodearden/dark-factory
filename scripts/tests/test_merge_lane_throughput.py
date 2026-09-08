@@ -1475,6 +1475,31 @@ def test_adopted_ahead_void_must_fall_after_the_LAST_preceding_speculation():
     assert result['speculative_ahead_adopted']['matched'] == 0
 
 
+def test_adopted_ahead_is_disqualified_only_by_a_CHAIN_DEAD_void():
+    # Every other number in compute_speculation is computed over the
+    # chain_dead-filtered voids, and the void rate's docstring states that
+    # filter as a deliberate property: a NEW void reason shows up as a
+    # shrinking numerator rather than being silently counted. The strict
+    # measure must not invert that — an unfiltered index would let a new
+    # reason quietly shrink the adopted share, where the drop reads as
+    # "speculation helped less" with nothing on the surface to say otherwise.
+    speculative = [_sm('C1', 0, '0')]
+    landing = [_f('C1', 9, 0)]
+    other = mlt.compute_speculation(
+        speculative, [_vv('C1', 0, 'dispatch', reason='other')], [], landing
+    )
+    assert other['n_voided_chain_dead'] == 0
+    assert other['speculative_ahead']['matched'] == 1
+    assert other['speculative_ahead_adopted']['matched'] == 1
+    # The same void with reason='chain_dead' DOES disqualify it, so the test
+    # pins the filter rather than a landing that could never be disqualified.
+    dead = mlt.compute_speculation(
+        speculative, [_vv('C1', 0, 'dispatch')], [], landing
+    )
+    assert dead['speculative_ahead']['matched'] == 1
+    assert dead['speculative_ahead_adopted']['matched'] == 0
+
+
 def test_adopted_ahead_has_the_same_shape_as_the_loose_measure():
     result = _adopted_result()
     assert set(result['speculative_ahead_adopted']) == set(
@@ -1579,17 +1604,66 @@ def test_void_anatomy_classifies_a_void_whose_task_never_speculated():
     assert result['void_anatomy']['verify_burned'] == 0
 
 
+def test_void_anatomy_counts_only_a_SPECULATIVE_verify_as_burned():
+    # The join key is the task COLUMN, not a request id, so a NON-speculative
+    # merge_verify in the interval (a post-merge verify, or a rebased-gate
+    # verify for an earlier attempt on the same task) is not evidence that a
+    # speculative verify was discarded. Booking it as verify_burned would be
+    # an INFLATIONARY error in the one arm whose non-zero-ness is the trigger
+    # to revisit the diagnosis's headline.
+    speculative = [_sm('B1', 0, '0')]
+    voided = [_vv('B1', 0, 'dispatch')]
+    non_spec = [_v('B1', 5, 0, 600_000, depth=1, speculative=False)]
+    anatomy = mlt.compute_speculation(
+        speculative, voided, non_spec, []
+    )['void_anatomy']
+    assert anatomy['verify_burned'] == 0
+    assert anatomy['pre_verify'] == 1
+    # Flip that same row to speculative and it IS the expensive arm — so the
+    # test pins the filter, not merely a quiet zero.
+    spec_verify = [_v('B1', 5, 0, 600_000, depth=1, speculative=True)]
+    anatomy = mlt.compute_speculation(
+        speculative, voided, spec_verify, []
+    )['void_anatomy']
+    assert anatomy['verify_burned'] == 1
+    assert anatomy['pre_verify'] == 0
+
+
+def test_void_anatomy_tallies_an_unreadable_void_as_unclassifiable():
+    # A void with an unparseable timestamp and one with a NULL task_id cannot
+    # be placed in either arm. They get their own tally rather than riding in
+    # pre_verify, which would silently spend them on the cheap arm — the arm
+    # this module's own conclusion rests on.
+    bad_ts = _vv('U1', 0, 'dispatch')
+    bad_ts['timestamp'] = 'not-a-timestamp'
+    no_task = _vv('U2', 1, 'dispatch')
+    no_task['task_id'] = None
+    anatomy = mlt.compute_speculation(
+        [], [bad_ts, no_task, _vv('U3', 2, 'dispatch')], [], []
+    )['void_anatomy']
+    assert anatomy['unclassifiable'] == 2
+    assert anatomy['pre_verify'] == 1
+    assert anatomy['verify_burned'] == 0
+    # Still counted as chain-dead voids and still tallied into the fan-out:
+    # unreadable for the arm split is not unreadable for everything.
+    assert anatomy['dead_link_distinct'] == 3
+
+
 def test_void_anatomy_arms_partition_the_chain_dead_voids():
     anatomy = _anatomy_result()
-    assert anatomy['verify_burned'] + anatomy['pre_verify'] == 4
+    assert (
+        anatomy['verify_burned'] + anatomy['pre_verify']
+        + anatomy['unclassifiable']
+    ) == 4
     # And over the shared fixture, where one voided row carries
     # reason='other': the anatomy is over CHAIN-DEAD voids only, so the arms
     # sum to n_voided_chain_dead and not to len(voided_events).
     result = _spec_result()
     anatomy = result['void_anatomy']
-    assert anatomy['verify_burned'] + anatomy['pre_verify'] == (
-        result['n_voided_chain_dead']
-    ) == 3
+    assert (
+        anatomy['verify_burned'] + anatomy['pre_verify']
+        + anatomy['unclassifiable']
+    ) == result['n_voided_chain_dead'] == 3
 
 
 def test_void_anatomy_reports_dead_link_fan_out():
@@ -1612,8 +1686,42 @@ def test_void_anatomy_tallies_a_void_with_no_dead_link_under_the_sentinel():
     # The module's UNKNOWN sentinel, same idiom as void_points — not a crash
     # and not a silent drop.
     assert anatomy['dead_link_unknown'] == 1
-    assert anatomy['dead_link_distinct'] == 2
+    # ONE real dead base. The sentinel is counted beside the fan-out, never
+    # among it: rows that name no base at all are not a dead base, and
+    # including them would present N unattributable voids as "N voids from one
+    # base" — the shape a reader takes for cascade amplification.
+    assert anatomy['dead_link_distinct'] == 1
     assert mlt.UNKNOWN == '(unknown)'
+
+
+def test_void_anatomy_fan_out_max_ignores_a_large_sentinel_bucket():
+    # The failure the exclusion prevents, at the scale that would matter: one
+    # real base voiding a single item, beside three voids naming no base. With
+    # the sentinel included the fan-out would read "max 3 voids from one dead
+    # base" and the diagnosis's cascade-amplification check would fire on rows
+    # that identify no base whatsoever.
+    strays = []
+    for i, task in enumerate(('S1', 'S2', 'S3')):
+        stray = _vv(task, 10 + i, 'dispatch')
+        del stray['data']['dead_link']
+        strays.append(stray)
+    anatomy = mlt.compute_speculation(
+        [], [_vv_link('F1', 0, 'deadA'), *strays], [], []
+    )['void_anatomy']
+    assert anatomy['dead_link_distinct'] == 1
+    assert anatomy['dead_link_max_voids'] == 1
+    assert anatomy['dead_link_unknown'] == 3
+
+
+def test_void_anatomy_fan_out_is_none_when_every_void_lacks_a_dead_link():
+    stray = _vv('S1', 0, 'dispatch')
+    del stray['data']['dead_link']
+    anatomy = mlt.compute_speculation([], [stray], [], [])['void_anatomy']
+    # No REAL base was named, so "the worst base killed n" has no answer —
+    # None, not 0 and not 1, exactly as on an empty window.
+    assert anatomy['dead_link_distinct'] == 0
+    assert anatomy['dead_link_max_voids'] is None
+    assert anatomy['dead_link_unknown'] == 1
 
 
 def test_void_anatomy_is_zero_and_none_shaped_on_an_empty_window():
@@ -1623,6 +1731,7 @@ def test_void_anatomy_is_zero_and_none_shaped_on_an_empty_window():
     assert anatomy == {
         'verify_burned': 0,
         'pre_verify': 0,
+        'unclassifiable': 0,
         'dead_link_distinct': 0,
         'dead_link_max_voids': None,
         'dead_link_unknown': 0,

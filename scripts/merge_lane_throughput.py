@@ -854,11 +854,17 @@ def compute_speculation(
     could shorten anything.  That over-counts precisely in the project whose
     voids dominate, so comparing two projects on the loose measure compares
     partly on how often each one wasted work.  ``speculative_ahead_adopted``
-    is STRICT: a landing counts only when no `verdict_voided` row for that
-    task falls strictly between its LAST preceding speculation and the
-    landing.  The window opens at the LAST preceding speculation, not the
+    is STRICT: a landing counts only when no CHAIN-DEAD `verdict_voided` row
+    for that task falls strictly between its LAST preceding speculation and
+    the landing.  The window opens at the LAST preceding speculation, not the
     first, because a task that is voided and then re-speculated did have live
-    speculation running ahead of the landing that actually happened.
+    speculation running ahead of the landing that actually happened.  The
+    disqualifying rows are the ``chain_dead``-filtered list, the SAME one the
+    void rate is computed over, so the filter discipline stated above holds
+    across the whole function: a new void reason shows up as a shrinking void
+    numerator and CANNOT silently shrink the adopted share, where the drop
+    would have read as "speculation helped less" with nothing on the surface
+    to say otherwise.
 
     The loose key is KEPT, not redefined, even though it is the one that
     disagrees with the throughput PRD's § Background rows: its printed line
@@ -873,10 +879,24 @@ def compute_speculation(
 
     VOID ANATOMY = what a chain-dead void actually COST, which is the number
     the void rate alone gets wrong.  A void is ``verify_burned`` only when a
-    `merge_verify` row for the same task ran strictly between that item's last
-    preceding `speculative_merge` and the void; every other chain-dead void is
-    ``pre_verify``, and the two arms partition ``n_voided_chain_dead`` by
-    construction.  The distinction is load-bearing because the two void arms
+    SPECULATIVE `merge_verify` row for the same task ran strictly between that
+    item's last preceding `speculative_merge` and the void — the same
+    ``data['speculative']`` filter the loose ahead measure applies, and for the
+    same reason: the join key is the task COLUMN and not a request id (see
+    :func:`_by_task`), so an unfiltered interval search would book a post-merge
+    verify, or a `_reverify_rebased_tree` gate verify for an EARLIER attempt on
+    that same task, as a burned speculative verify.  That error runs
+    INFLATIONARY and lands straight in the arm whose becoming non-zero is the
+    signal to revisit this whole reading, so it is filtered at the source
+    rather than caveated downstream.  Every other chain-dead void is
+    ``pre_verify`` — except one that cannot be classified at all (unparseable
+    timestamp, NULL task_id), which is tallied under ``unclassifiable``.  The
+    THREE arms partition ``n_voided_chain_dead`` by construction.  The third
+    arm exists so ``pre_verify`` stays a genuine count of cheap-arm voids
+    instead of doubling as the bucket for malformed rows: folding them in
+    would bias the split toward this module's own conclusion (that the voids
+    are all the cheap arm) by exactly the number of rows it failed to read.
+    The distinction is load-bearing because the two void arms
     in `merge_queue.py::SpeculativeMergeWorker` cost completely different
     things.  The ADOPTION arm (`merge_queue.py::SpeculativeMergeWorker._void_and_remerge`,
     reached from `_finalize_inflight`) discards a verify that has already run
@@ -898,8 +918,14 @@ def compute_speculation(
     SHAs and ``dead_link_max_voids`` the most voids attributable to any single
     one, so a fan-out near 1.0 rules out cascade amplification and a fat one
     would name the cascading base.  A void carrying no ``dead_link`` is
-    tallied under :data:`UNKNOWN` (counted by ``dead_link_unknown``) — the
-    same idiom as ``void_points`` — rather than crashing or being dropped.
+    tallied under :data:`UNKNOWN` (reported separately as
+    ``dead_link_unknown``) — the same idiom as ``void_points`` — rather than
+    crashing or being dropped, and the sentinel bucket is EXCLUDED from both
+    fan-out numbers.  It is not a dead base: letting it ride would report N
+    rows that name no base at all as "max N voids from one base", which is
+    precisely the shape a reader takes for cascade amplification, and the
+    separate ``dead_link_unknown`` tally would only unpick it for a reader who
+    noticed the coincidence.
 
     Every rate is ``None``, never ``0.0``, when its denominator is empty:
     "nothing was speculated in this window" is not "speculation was tried and
@@ -921,16 +947,25 @@ def compute_speculation(
 
     speculative_by_task = _by_task(speculative_events)
     verify_by_task = _by_task(verify_events)
-    voided_by_task = _by_task(voided_events)
+    # CHAIN-DEAD only, matching the void rate's filter: see the STRICT
+    # paragraph above for why a new void reason must not quietly shrink the
+    # adopted share.
+    voided_by_task = _by_task(chain_dead)
 
     # Void anatomy: which arm fired, and how far one dead base reached.
     verify_burned = 0
+    unclassifiable = 0
     dead_links: Counter[str] = Counter()
     for void in chain_dead:
         dead_links[str(void.get('data', {}).get('dead_link') or UNKNOWN)] += 1
         void_ts = _parse_ts(void.get('timestamp'))
         raw_task = void.get('task_id')
         if void_ts is None or raw_task is None:
+            # Its own arm, NOT pre_verify. This row was not read as a cheap
+            # void; it was not read at all, and silently spending it on the
+            # arm this module concludes in favour of is how a measurement
+            # starts agreeing with itself.
+            unclassifiable += 1
             continue
         void_task = str(raw_task)
         speculated = _last_before(
@@ -941,13 +976,21 @@ def compute_speculation(
             # verified between the two. Classified, not dropped: dropping it
             # would shrink the denominator and inflate whichever arm survived.
             continue
-        if _any_between(
-            verify_by_task.get(void_task, []), speculated[0], void_ts
-        ):
+        # SPECULATIVE verifies only, mirroring the loose ahead measure below:
+        # the task-column join would otherwise let an unrelated verify for an
+        # earlier attempt on this task inflate the expensive arm.
+        speculative_verifies = [
+            e for e in verify_by_task.get(void_task, [])
+            if e.get('data', {}).get('speculative')
+        ]
+        if _any_between(speculative_verifies, speculated[0], void_ts):
             verify_burned += 1
-    # Subtraction, not a second tally: the arms partition the chain-dead voids
-    # by construction, so no row can fall out of both.
-    pre_verify = len(chain_dead) - verify_burned
+    # Subtraction, not a second tally: the three arms partition the chain-dead
+    # voids by construction, so no row can fall out of all of them.
+    pre_verify = len(chain_dead) - verify_burned - unclassifiable
+    # The fan-out describes REAL dead bases; the sentinel bucket is counted
+    # beside them, never among them.
+    real_links = {k: v for k, v in dead_links.items() if k != UNKNOWN}
 
     total_landings = 0
     matched_landings = 0
@@ -1002,8 +1045,9 @@ def compute_speculation(
         'void_anatomy': {
             'verify_burned': verify_burned,
             'pre_verify': pre_verify,
-            'dead_link_distinct': len(dead_links),
-            'dead_link_max_voids': max(dead_links.values()) if dead_links else None,
+            'unclassifiable': unclassifiable,
+            'dead_link_distinct': len(real_links),
+            'dead_link_max_voids': max(real_links.values()) if real_links else None,
             'dead_link_unknown': dead_links.get(UNKNOWN, 0),
         },
     }
@@ -1670,10 +1714,15 @@ def _format_speculation(
     # The void anatomy belongs on the same screen as the void rate above: the
     # rate alone invites "that much verify capacity burned", which the
     # pre-verify arm is precisely the refutation of.
+    # `unclassifiable` rides on the same line rather than being printed only
+    # when non-zero: a reader checking that the arms sum to the void count
+    # above needs the third term visible even at 0, and a field that appears
+    # only on the bad day is a field nobody knows to look for.
     lines.append(
         f"      void anatomy: {anatomy['pre_verify']} pre-verify (build "
         f"discarded before host acquisition), "
-        f"{anatomy['verify_burned']} verify-burned"
+        f"{anatomy['verify_burned']} verify-burned, "
+        f"{anatomy['unclassifiable']} unclassifiable"
     )
     lines.append(
         f"      dead_link fan-out: {anatomy['dead_link_distinct']} distinct "
@@ -1789,7 +1838,8 @@ def format_report(bundles: Sequence[dict[str, Any]]) -> str:
                 f"{adopted['matched']}/{adopted['total']} "
                 f"({_rate(adopted['share'])}) strict; "
                 f"{anatomy['pre_verify']} pre-verify void(s), "
-                f"{anatomy['verify_burned']} verify-burned"
+                f"{anatomy['verify_burned']} verify-burned, "
+                f"{anatomy['unclassifiable']} unclassifiable"
             )
         lines.append(
             '  (side by side, never pooled: the spread between projects is '
