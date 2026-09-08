@@ -560,14 +560,14 @@ def test_build_claude_argv_unlinks_temp_files_when_build_raises() -> None:
     created: list[str] = []
     original_mkstemp = tempfile.mkstemp
 
-    def tracking_mkstemp(**kwargs):
-        fd, path = original_mkstemp(**kwargs)
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = original_mkstemp(*args, **kwargs)
         created.append(path)
         return fd, path
 
     with (
         patch('shared.cli_invoke.tempfile.mkstemp', side_effect=tracking_mkstemp),
-        pytest.raises(TypeError),
+        pytest.raises(TypeError, match='not JSON serializable'),
     ):
         build_claude_argv(
             model='opus',
