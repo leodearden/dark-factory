@@ -192,19 +192,27 @@ _MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
     storm_consequence=(
         'further review gates strand on verdicts that never land.'
     ),
-    #: The HONEST answer for this boundary, which is not plan-tools' (task
-    #: 4744). verdict-tools is the identical per-agent stdio subprocess with an
-    #: identically ephemeral stderr, and it has no durable journal yet — so it
-    #: names the only route that genuinely exists here rather than inheriting
-    #: either the retired "grep the orchestrator logs" sentence or a journal
-    #: path this server never writes, which would send an operator to a missing
-    #: file. A follow-up is filed to give this boundary the same journal
-    #: plan-tools now has; landing it changes exactly this one string.
+    #: The HONEST answer for this boundary, and still verdict-tools' OWN
+    #: rather than plan-tools' — it names verdict-tools' file. It used to name
+    #: transcript mining, because that was the only route that genuinely
+    #: existed while this server's fact channel was a log line nobody retains;
+    #: task 4917 gave the boundary the journal that follow-up promised, so this
+    #: string now points at it and the transcript instruction is RETIRED rather
+    #: than supplemented.
+    #:
+    #: COMPOSED from ``MARKUP_JOURNAL_DIRNAME`` rather than respelled, so the
+    #: constant stays the single owner of the path an operator is told to read
+    #: and the instruction cannot drift away from the artifact it names — which
+    #: is the failure mode this whole leaf exists to close.
     attribution_source=(
-        'this boundary has no durable per-event journal yet, so the leaking '
-        'caller must be mined out of data/orchestrator/agent-transcripts/ — '
-        'search the burst window for submit_review_verdict calls carrying '
-        'envelope markup'
+        'every markup fact this server sees is journalled one line per event '
+        f'to {markup_journal.MARKUP_JOURNAL_DIRNAME}/verdict-tools.jsonl under '
+        'the main checkout — each line carries subject_task_id, tool, param, '
+        'outcome and a UTC timestamp, so the leaking task is nameable from the '
+        "burst window's own lines (jq or grep '\"subject_task_id\"'); note "
+        'that under FORWARD_REPAIR a REPAIRED call is never bounced and never '
+        'reaches this escalation channel at all, so the journal is the only '
+        'place a repair is visible'
     ),
 )
 
