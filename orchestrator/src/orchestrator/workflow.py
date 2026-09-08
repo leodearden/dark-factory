@@ -9073,8 +9073,21 @@ class TaskWorkflow:
         orphaned-step path — a clean pass has no ``done_items`` failing the
         ``is_ancestor`` check at all and calls it zero times — and the WIP
         run's own filename union is now materialised lazily so tier 1 hits stop
-        paying for it. Hoisting that map to a per-pass ``GitOps`` helper is the
-        real fix and is filed as follow-up work; it needs an edit inside
+        paying for it. n is the number of ORPHANED done steps in one pass,
+        realistically well under 20, and the same full-range ``git log -p``
+        already ran per step on the no-WIP-run path before the reorder, so the
+        worst case is not new.
+
+        Caching the map was considered and DECLINED here (task 3651 design
+        decision 3), not merely deferred: a per-pass memo means either a
+        mutable-state parameter or an instance-level cache that must be
+        invalidated on every HEAD move, which buys a micro-optimisation on a
+        best-effort bookkeeping path at the cost of the property that makes
+        ``find_equivalent_commit`` trustworthy — no persisted state, re-derived
+        from live git on every call, identical across restarts. A follow-up
+        ticket carries the idea for anyone who later measures the cost as
+        actually binding; whoever picks it up must answer the staleness
+        question first, and must do it inside
         ``git_ops.py::find_equivalent_commit``, which task 3651 holds no lock
         for.
 
