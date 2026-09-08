@@ -2729,6 +2729,71 @@ async def test_an_incomplete_run_writes_in_place_when_there_is_nothing_to_protec
 
 
 @pytest.mark.asyncio
+async def test_a_superseded_sidecar_does_not_outlive_the_report_beside_it(
+    tmp_path, caplog,
+):
+    """A diverted run's sidecar must not survive the next write to the primary.
+
+    The diversion above protects a good artifact; nothing removed what it
+    left behind. Run A is incomplete and diverts to
+    `plural-enum-guard-recall-report.json.incomplete`; run B is complete and
+    writes in place. Without a cleanup, A's sidecar sits in a COMMITTED
+    directory next to a newer and better report, with nothing in either
+    filename saying which is which — an operator (or a `git status`) has to
+    open both and compare `measured_at`. That is exactly the 'a reader cannot
+    tell what happened' failure the per-graph `error`/`error_kind` fields
+    exist to close, moved up to the directory listing.
+
+    ``test_a_complete_run_always_writes_in_place`` looks like it covers this
+    and does not: in its flow the incomplete write went IN PLACE (there was
+    nothing to protect), so no sidecar was ever created and its
+    ``not ...exists()`` assertion passes vacuously. This test creates one
+    first.
+    """
+    json_out = tmp_path / 'recall.json'
+    md_out = tmp_path / 'recall.md'
+    sidecar_json = tmp_path / 'recall.json.incomplete'
+    sidecar_md = tmp_path / 'recall.md.incomplete'
+
+    good = await _report_with(complete=True)
+    bad = await _report_with(complete=False)
+
+    _mod._write_artifacts(good, str(json_out), str(md_out))
+    _mod._write_artifacts(bad, str(json_out), str(md_out))
+    assert sidecar_json.exists() and sidecar_md.exists(), (
+        'precondition: the diversion must actually have produced a sidecar, '
+        'or this test proves nothing'
+    )
+
+    with caplog.at_level('INFO'):
+        written = _mod._write_artifacts(good, str(json_out), str(md_out))
+
+    assert json.loads(json_out.read_text())['complete'] is True
+    assert not sidecar_json.exists(), 'the superseded sidecar outlived its replacement'
+    assert not sidecar_md.exists(), 'the superseded sidecar outlived its replacement'
+    assert str(json_out) in written
+
+    # Removing a file the operator was previously TOLD to go read is itself
+    # something to say out loud.
+    logs = '\n'.join(r.getMessage() for r in caplog.records)
+    assert str(sidecar_json) in logs
+    assert str(sidecar_md) in logs
+
+    # The rule is 'a write that reached the primary paths supersedes the
+    # sidecar', not 'a COMPLETE write does'. The residual case — a primary
+    # artifact that is itself incomplete, reachable only if one was replaced
+    # by hand — is cleared on the same terms, so a sidecar never outlives a
+    # report written after it regardless of how the primary got there.
+    _mod._write_artifacts(bad, str(json_out), str(md_out))  # diverts again
+    assert sidecar_json.exists()
+    json_out.write_text(sidecar_json.read_text())  # by hand: primary now incomplete
+    _mod._write_artifacts(bad, str(json_out), str(md_out))  # ...so this lands in place
+    assert json.loads(json_out.read_text())['complete'] is False
+    assert not sidecar_json.exists()
+    assert not sidecar_md.exists()
+
+
+@pytest.mark.asyncio
 async def test_a_complete_run_always_writes_in_place(tmp_path):
     """The regression guard: the protection must not degenerate to 'never write'.
 

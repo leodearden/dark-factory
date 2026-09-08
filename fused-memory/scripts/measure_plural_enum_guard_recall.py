@@ -2140,6 +2140,52 @@ def _existing_artifact_is_complete(json_path: Path) -> bool:
     return isinstance(payload, dict) and payload.get('complete') is True
 
 
+def _clear_superseded_sidecars(json_out: str, md_out: str) -> None:
+    """Remove any sidecar the write just made to the primary paths outdates.
+
+    A sidecar exists only because some EARLIER run was not allowed to replace
+    the primary artifact. Once a later run has written those primary paths,
+    that sidecar is older than what now sits beside it and describes a run
+    nobody should act on — but nothing about the two filenames says which is
+    newer, so an operator (or a `git status` in the committed `plans/`
+    directory) sees an `.incomplete` report next to the real one and has to
+    open both and compare `measured_at` to find out. That is the same 'a
+    reader cannot tell what happened' failure the per-graph `error` /
+    `error_kind` fields exist to close, one level up in the directory listing.
+
+    Keyed on 'a write reached the primary paths', NOT on 'the report was
+    complete': the invariant worth holding is that a sidecar never outlives a
+    report written after it, and the narrower rule would leave a leftover
+    behind in the one case — a primary artifact replaced by hand — where a
+    reader has the least context to sort it out.
+
+    Best-effort. A sidecar that cannot be removed is WARNED about and the
+    write still stands: failing a good measurement over a leftover file would
+    trade a confusing directory for a lost report.
+    """
+    for stale in (
+        Path(f'{json_out}{_INCOMPLETE_SUFFIX}'),
+        Path(f'{md_out}{_INCOMPLETE_SUFFIX}'),
+    ):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning(
+                'could not remove the superseded sidecar %s (%s). It is now '
+                'OLDER than the report just written beside it and should be '
+                'deleted by hand — left in place it reads as a second, '
+                'competing measurement.',
+                stale, exc,
+            )
+            continue
+        logger.info(
+            'removed the superseded sidecar %s — the report just written to '
+            'the primary path replaces it.', stale,
+        )
+
+
 def _write_artifacts(report: Report, json_out: str, md_out: str) -> str:
     """Write the report, without letting a bad run destroy a good one.
 
@@ -2165,6 +2211,11 @@ def _write_artifacts(report: Report, json_out: str, md_out: str) -> str:
     report. A COMPLETE report always writes in place — that is what the
     committed artifact is for.
 
+    The reverse also holds: a write that DOES reach the primary paths clears
+    any sidecar left by an earlier diverted run, because that sidecar is now
+    the older of two reports sitting side by side with nothing in either
+    filename to say so. See ``_clear_superseded_sidecars``.
+
     Returns the paths actually written, as a display string, so the caller can
     tell the operator where the report went. A run that silently wrote
     somewhere else is worse than one that clobbered: the reader of the
@@ -2174,8 +2225,9 @@ def _write_artifacts(report: Report, json_out: str, md_out: str) -> str:
     """
     json_path = Path(json_out)
     md_path = Path(md_out)
+    diverted = not report.complete and _existing_artifact_is_complete(json_path)
 
-    if not report.complete and _existing_artifact_is_complete(json_path):
+    if diverted:
         protected_json, protected_md = json_path, md_path
         json_path = Path(f'{json_out}{_INCOMPLETE_SUFFIX}')
         md_path = Path(f'{md_out}{_INCOMPLETE_SUFFIX}')
@@ -2191,6 +2243,10 @@ def _write_artifacts(report: Report, json_out: str, md_out: str) -> str:
     md_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(render_json(report))
     md_path.write_text(render_markdown(report))
+
+    if not diverted:
+        _clear_superseded_sidecars(json_out, md_out)
+
     return f'{json_path} {md_path}'
 
 
