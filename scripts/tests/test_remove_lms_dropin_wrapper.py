@@ -210,9 +210,21 @@ def _require_systemd_user_manager() -> None:
 # Two names rather than one widened prefix, on purpose: the generator binds
 # ONLY _SELFTEST_PREFIX, so a real unit can never be generated into pruning
 # scope; the prune additionally recognises the ONE fixed default name a
-# by-hand run falls back to (see the .sh's TEMPLATE= line, pinned above by
-# test_default_template_constant_matches_the_shell_default).  Both descend
-# from _SELFTEST_STEM so they cannot drift apart from each other.
+# by-hand run falls back to (see the .sh's TEMPLATE= line, pinned below, in
+# the step-5 section, by test_default_template_constant_matches_the_shell_default).
+# Both descend from _SELFTEST_STEM so they cannot drift apart from each other.
+#
+# That sharing has one operational consequence, not a correctness one: it
+# couples two independently-owned values -- the prefix _unique_template()
+# GENERATES, and the literal the .sh happens to default to.  Changing
+# _SELFTEST_STEM moves _SELFTEST_PREFIX and _DEFAULT_TEMPLATE TOGETHER, so a
+# future rename cannot reap residue already stranded under the OLD stem in an
+# operator's live ~/.config/systemd/user -- the predicate would no longer
+# recognise either the old prefix or the old default name.
+# test_default_template_constant_matches_the_shell_default only pins
+# _DEFAULT_TEMPLATE against the .sh's CURRENT literal; it says nothing about
+# residue a past rename left behind.  Treat any future _SELFTEST_STEM edit as
+# needing a paired one-off sweep of pre-existing residue under the old stem.
 _SELFTEST_STEM = "lms-dropin-selftest"
 _SELFTEST_PREFIX = f"{_SELFTEST_STEM}-"  # what _unique_template() generates
 _DEFAULT_TEMPLATE = f"{_SELFTEST_STEM}@"  # what the .sh falls back to by hand
@@ -244,51 +256,6 @@ def _unique_template() -> str:
     builds its probe unit as ``${TEMPLATE}probe.service``.
     """
     return f"{_SELFTEST_PREFIX}{os.getpid()}-{uuid4().hex[:8]}@"
-
-
-def test_default_template_constant_matches_the_shell_default() -> None:
-    """_DEFAULT_TEMPLATE must equal the .sh's actual fallback literal.
-
-    This is a VALUE contract between two files -- the functional default the
-    prune's bare-default arm must match -- NOT an assertion on prose,
-    comments or docstrings.  Same-shaped precedent:
-    tests/scripts/test_dashboard_service_template.py::
-    _assert_known_project_roots_comma_separated, which parses a systemd unit
-    file's Environment= line the same way: read the file, ``re.search`` an
-    ANCHORED ``^...$`` pattern under ``re.MULTILINE``, assert the match
-    exists, then assert on the extracted group.
-
-    Anchored rather than a substring/``in`` check on purpose -- MEASURED: the
-    literal ``lms-dropin-selftest@`` also appears in the .sh's own header
-    comment ("(lms-dropin-selftest@) plus a drop-in") and
-    ``LMS_SELFTEST_TEMPLATE=`` appears again in the Usage comment.  A naive
-    ``"lms-dropin-selftest@" in sh_text`` check stays True even after the
-    default on the ``TEMPLATE=`` line itself is changed to something else
-    entirely, so it would silently pass through the exact drift this test
-    exists to catch.
-
-    The variable-name half of the pattern is built from ``_TEMPLATE_ENV_VAR``
-    (``re.escape``d) rather than re-typed, so the two bind.  The forward
-    reference to ``_TEMPLATE_ENV_VAR`` (defined below, near the .sh-driving
-    helpers) is safe: globals resolve at CALL time, the same pattern this
-    module already documents for the forward reference to ``_SELFTEST_PREFIX``
-    in ``_systemd_user_manager_skip_reason``.
-    """
-    sh_text = SELFTEST_SH.read_text(encoding="utf-8")
-    pattern = r'^TEMPLATE="\$\{' + re.escape(_TEMPLATE_ENV_VAR) + r':-([^"}]+)\}"$'
-    match = re.search(pattern, sh_text, re.MULTILINE)
-    assert match is not None, (
-        f"{SELFTEST_SH} no longer has a line of the shape "
-        f'TEMPLATE="${{{_TEMPLATE_ENV_VAR}:-<default>}}" -- this test cannot '
-        "pin the .sh's default template without it."
-    )
-    assert match.group(1) == _DEFAULT_TEMPLATE, (
-        f"the .sh's default template ({match.group(1)!r}) has drifted from "
-        f"_DEFAULT_TEMPLATE ({_DEFAULT_TEMPLATE!r}).  The prune's bare-default "
-        "arm keys on _DEFAULT_TEMPLATE, so this drift makes a killed hand-run's "
-        "residue permanently unreapable again -- while every other assertion "
-        "in this module stays green."
-    )
 
 
 # How long a selftest unit must go untouched before it counts as abandoned.
@@ -671,6 +638,76 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
 # step-5: RED -- the stale-residue prune
 # ---------------------------------------------------------------------------
 
+def test_default_template_constant_matches_the_shell_default() -> None:
+    """_DEFAULT_TEMPLATE must equal the .sh's actual fallback literal.
+
+    Lives here, ahead of the predicate/prune tests below, rather than beside
+    _unique_template() where the .sh's default template plays no role: every
+    test in this section either asserts on _DEFAULT_TEMPLATE directly
+    (test_prune_match_predicate_admits_selftest_residue_and_nothing_else,
+    test_prune_reaps_bare_default_template_residue_but_only_when_stale) or
+    exercises the predicate that keys on it, so this pin belongs beside its
+    dependents rather than in the "Per-invocation isolation" section above,
+    which is about _unique_template()'s generated names only.
+
+    This is a VALUE contract between two files -- the functional default the
+    prune's bare-default arm must match -- NOT an assertion on prose,
+    comments or docstrings.  Same-shaped precedent:
+    tests/scripts/test_dashboard_service_template.py::
+    _assert_known_project_roots_comma_separated, which parses a systemd unit
+    file's Environment= line the same way: read the file, ``re.search`` an
+    ANCHORED ``^...$`` pattern under ``re.MULTILINE``, assert the match
+    exists, then assert on the extracted group.
+
+    Anchored rather than a substring/``in`` check on purpose -- MEASURED: the
+    literal ``lms-dropin-selftest@`` also appears in the .sh's own header
+    comment ("(lms-dropin-selftest@) plus a drop-in") and
+    ``LMS_SELFTEST_TEMPLATE=`` appears again in the Usage comment.  A naive
+    ``"lms-dropin-selftest@" in sh_text`` check stays True even after the
+    default on the ``TEMPLATE=`` line itself is changed to something else
+    entirely, so it would silently pass through the exact drift this test
+    exists to catch.
+
+    The pattern tolerates incidental formatting -- leading indentation,
+    dropped quotes around the ``${...}`` expansion, a trailing inline
+    comment -- WITHOUT weakening the anchor: it still requires the
+    (whitespace-trimmed) line to open with the literal ``TEMPLATE=``, which is
+    what keeps it from matching the header/Usage comments above and is the
+    property the anchoring exists for.  What it deliberately does NOT
+    tolerate is the default being split across a separate variable -- that
+    would be a structurally different assignment, and this module already
+    declines to auto-derive this kind of cross-file value contract (see
+    _DEFAULT_TEMPLATE's definition above and the analogous reasoning for
+    _TEMPLATE_ENV_VAR below).
+
+    The variable-name half of the pattern is built from ``_TEMPLATE_ENV_VAR``
+    (``re.escape``d) rather than re-typed, so the two bind.  The forward
+    reference to ``_TEMPLATE_ENV_VAR`` (defined below, near the .sh-driving
+    helpers) is safe: globals resolve at CALL time, the same pattern this
+    module already documents for the forward reference to ``_SELFTEST_PREFIX``
+    in ``_systemd_user_manager_skip_reason``.
+    """
+    sh_text = SELFTEST_SH.read_text(encoding="utf-8")
+    pattern = (
+        r'^\s*TEMPLATE="?\$\{'
+        + re.escape(_TEMPLATE_ENV_VAR)
+        + r':-([^"}]+)\}"?\s*(?:#.*)?$'
+    )
+    match = re.search(pattern, sh_text, re.MULTILINE)
+    assert match is not None, (
+        f"{SELFTEST_SH} no longer has a line of the shape "
+        f'TEMPLATE="${{{_TEMPLATE_ENV_VAR}:-<default>}}" -- this test cannot '
+        "pin the .sh's default template without it."
+    )
+    assert match.group(1) == _DEFAULT_TEMPLATE, (
+        f"the .sh's default template ({match.group(1)!r}) has drifted from "
+        f"_DEFAULT_TEMPLATE ({_DEFAULT_TEMPLATE!r}).  The prune's bare-default "
+        "arm keys on _DEFAULT_TEMPLATE, so this drift makes a killed hand-run's "
+        "residue permanently unreapable again -- while every other assertion "
+        "in this module stays green."
+    )
+
+
 def test_prune_match_predicate_admits_selftest_residue_and_nothing_else() -> None:
     """_is_prunable_selftest_residue must admit exactly the reapable residue.
 
@@ -859,13 +896,14 @@ def test_prune_never_touches_a_non_selftest_unit(tmp_path: Path) -> None:
     written to prevent.
 
     Second half: the SUFFIX filter, which neither the prefix case above nor
-    the age case in the previous test can reach.  The prune requires BOTH
-    _SELFTEST_PREFIX and a .service/.service.d suffix, and the suffix half is
-    load-bearing on its own -- see the rationale in
+    the age case in the previous test can reach.  The prune requires a name
+    _is_prunable_selftest_residue admits -- a _SELFTEST_PREFIX-generated name,
+    or exactly _DEFAULT_TEMPLATE -- AND a .service/.service.d suffix, and the
+    suffix half is load-bearing on its own -- see the rationale in
     _systemd_user_manager_skip_reason, which declines to widen it precisely
     because it is what keeps this sweep away from _LOCK_NAME.  Without a test,
-    widening the filter to the prefix alone would delete a live lock file with
-    every other prune assertion still green.
+    widening the filter to the name gate alone would delete a live lock file
+    with every other prune assertion still green.
     """
     now = 1_000_000.0
     unit_dir = tmp_path / "systemd" / "user"
