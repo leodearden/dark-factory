@@ -25,6 +25,7 @@ be determined is RECORDED and LEFT ALONE, never guessed at.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -2660,3 +2661,122 @@ class TestTheOperatorWarningIsCappedPerEpisode:
         assert len(_finding_lines(caplog, logging.WARNING)) == cap
         assert len(_finding_lines(caplog, logging.INFO)) == 3
         assert _storm_lines(caplog) == []
+
+
+class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
+    """S2 (esc-3671-3): "could not look" must not read as "not there".
+
+    `_intended_endpoint_uuid` collapses ABSENT and DUPLICATE-NAME-GROUP to
+    `new_endpoint_uuid=None` on purpose — leaf eta's `ensure_entity_node`
+    resolves-or-mints and handles both identically. A transient backend error
+    degrades to the same `None`, which is where the collapse stops being
+    deliberate: eta reads that field at exactly one site,
+    `minted=finding.new_endpoint_uuid is None`, so a FalkorDB blip books as
+    minted=True telemetry — a made-up node reported where an unavailable lookup
+    happened.
+
+    Zeta's job is to PRODUCE the discriminator; acting on it is eta's, and is
+    filed separately. Detection stays the primary result either way: the flag
+    EXTENDS `test_a_lookup_failure_never_loses_the_finding` rather than
+    replacing it, so the evidence still survives a backend that will not answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_transient_error_is_recorded_without_losing_the_finding(
+        self, service,
+    ):
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.uuid_lookup_degraded is True
+        # EXTENDS the existing contract, never replaces it: the uuid is still
+        # None and the finding is still resolvable and still recorded in full.
+        assert finding.new_endpoint_uuid is None
+        assert finding.resolvable is True
+
+    @pytest.mark.asyncio
+    async def test_a_clean_lookup_finding_nothing_is_not_degraded(self, service):
+        """ABSENT is a real answer the backend gave. eta mints; that is the
+        documented collapse and it stays exactly as it was."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid is None
+        assert stats.findings[0].uuid_lookup_degraded is False
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_name_group_is_not_degraded_either(self, service):
+        """The PRD measured 38 live name keys carrying more than one node.
+        Picking a survivor is `_resolve_or_create_entity`'s job under the
+        identity lock, so zeta declines — deliberately, not for lack of an
+        answer."""
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127', 'n-3127-dup'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid is None
+        assert stats.findings[0].uuid_lookup_degraded is False
+
+    @pytest.mark.asyncio
+    async def test_a_successful_lookup_is_not_degraded(self, service):
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            return_value=_rows('n-3127'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].new_endpoint_uuid == 'n-3127'
+        assert stats.findings[0].uuid_lookup_degraded is False
+
+    def test_the_flag_defaults_false_and_the_payload_carries_it(self):
+        """Fail-closed like `resolvable`: a record that never looked is not a
+        record whose lookup was degraded."""
+        assert _finding().uuid_lookup_degraded is False
+
+        payload = _finding(uuid_lookup_degraded=True).to_dict()
+        assert payload['uuid_lookup_degraded'] is True
+        assert json.loads(json.dumps(payload)) == payload
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    )
+    async def test_the_lookup_never_swallows_cancellation(self, service, exc_type):
+        """The `except (CancelledError, KeyboardInterrupt, SystemExit): raise`
+        arm ahead of the broad handler, mirroring the sibling contract test for
+        `_reconcile_episode_identity`.
+
+        Pins EXISTING behaviour that nothing in this file pinned: a
+        best-effort degradation that also swallowed cancellation would keep a
+        shutting-down process inside an identity-lock critical section.
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=exc_type('interrupted'),
+        )
+
+        with pytest.raises(exc_type):
+            await service._verify_episode_referents(
+                _one_membership_finding_episode(), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
