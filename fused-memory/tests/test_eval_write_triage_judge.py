@@ -1151,6 +1151,35 @@ class TestRunJudgeEval:
             f'{target} was left holding markdown where the JSON should be'
         )
 
+    def test_a_dot_md_report_path_costs_nothing_because_it_raises_first(
+        self, tmp_path: Path,
+    ) -> None:
+        """The guard's whole claim is that the mistake is free. Pin the COST.
+
+        Raising before the two WRITES only protects the two files. The
+        precondition is a function of *report_path* alone — knowable before
+        `build_judge_cases`, before the per-case `judge_fn` loop, before
+        `score_cases`. Evaluated after them, `--report-path foo.md` on a LIVE
+        run spends every LLM call for the whole 102-case corpus and then
+        raises with no artifact written at all: the operator pays for the run
+        and gets nothing. The unit tests above cannot see that, because
+        `_sibling_run` injects a free stub judge — so this asserts on the stub
+        judge's CALL LOG instead of on the files.
+        """
+        judge = _fake_judge()
+        with pytest.raises(ValueError):
+            _mod().run_judge_eval(
+                records=_corpus(),
+                judge_fn=judge,
+                report_path=tmp_path / 'foo.md',
+                provenance=dict(_PROVENANCE),
+                distractors=2,
+            )
+        assert judge.calls == [], (
+            f'the guard raised only after {len(judge.calls)} judge call(s); on a '
+            f'live run that is the whole corpus paid for and nothing written'
+        )
+
     def test_creates_the_report_directory(self, tmp_path: Path) -> None:
         nested = tmp_path / 'calibration' / 'nested'
         _mod().run_judge_eval(
@@ -1424,6 +1453,44 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
         )
         captured = self._captured(tmp_path, monkeypatch)
         assert captured['judge_enabled'] is False
+
+
+class TestADotMdReportPathIsRejectedAtArgumentTime:
+    """`--report-path foo.md` is a bad ARGUMENT, so `_run` refuses it up front.
+
+    Nothing about the collision depends on what the run measures, so making
+    the operator wait for a paid corpus-wide run to be told is pure waste.
+    Driven with a fixture that does NOT exist: if the check were ordered
+    after the fixture load — never mind after the judge loop — the failure
+    would be a `FileNotFoundError` naming the fixture instead of the
+    `ValueError` naming the report path.
+    """
+
+    @staticmethod
+    def _args(tmp_path: Path, name: str) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            config=None,
+            report_path=str(tmp_path / name),
+            fixture=str(tmp_path / 'no-such-fixture.jsonl'),
+            distractors=2,
+            limit=None,
+            dry_run=True,
+        )
+
+    def test_run_refuses_it_before_it_even_reads_the_fixture(
+        self, tmp_path: Path,
+    ) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _mod()._run(self._args(tmp_path, 'foo.md'))
+        assert str(tmp_path / 'foo.md') in str(excinfo.value), str(excinfo.value)
+
+    def test_a_json_report_path_is_not_refused_by_that_check(
+        self, tmp_path: Path,
+    ) -> None:
+        """The control: a well-formed path gets past it and fails LATER, on
+        the missing fixture, which is the next real precondition."""
+        with pytest.raises(FileNotFoundError):
+            _mod()._run(self._args(tmp_path, 'report.json'))
 
 
 # ---------------------------------------------------------------------------
@@ -1761,6 +1828,61 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
             f'judge_provider {provenance["judge_provider"]!r} is not a real '
             f'provider {list(write_triage_judge._KNOWN_PROVIDERS)} — this '
             f'artifact was written by a stub, not measured'
+        )
+
+    def test_the_committed_provenance_carries_the_whole_vocabulary(self) -> None:
+        """A field added to `PROVENANCE_KEYS` must reach the artifact too.
+
+        `build_report` backfills every key in the vocabulary, so a FRESH
+        report cannot omit one — `test_provenance_carries_every_key_even_when_nothing_was_measured`
+        pins that. The committed artifact is the gap: it is regenerated only
+        by a paid live run, so a field added afterwards leaves the file the
+        task-3169 operator actually reads silent on it, with the per-key
+        assertions below unable to notice because they each name one key by
+        hand. Measured 2026-08-27: `judge_candidate_count` and `judge_enabled`
+        were added and the committed report still carried the ten keys that
+        predated them.
+
+        A superset, not equality: an artifact from a run that recorded MORE
+        than the current vocabulary is stale provenance, not a lie, and must
+        not be a red test.
+        """
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        missing = set(_mod().PROVENANCE_KEYS) - set(report['provenance'])
+        assert not missing, (
+            f'the committed report does not disclose {sorted(missing)} — either '
+            f're-run the eval, or record the values the original run used and '
+            f'say so in the caveats'
+        )
+
+    def test_the_committed_report_says_the_judge_arm_was_live(self) -> None:
+        """The field exists because a disabled judge reads like a measurement.
+
+        `judge_write` returns `stored` on its first line when the kill switch
+        is off: every case answered with no provider call, `distractor`
+        scoring 1.0 and `duplicate` 0.0, and an artifact otherwise
+        indistinguishable from the corpus-wide run the flip gate reads. An
+        artifact silent on the switch reproduces exactly the hazard the field
+        was added to close.
+
+        `judge_candidate_count` is asserted only for WELL-FORMEDNESS, never
+        against the shipped config value: the knob is hot-reloadable, and
+        binding the two would make an operator's config edit demand a paid
+        re-measurement to get back to green.
+        """
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        provenance = report['provenance']
+        assert provenance['judge_enabled'] is True, (
+            f'judge_enabled={provenance["judge_enabled"]!r}: this artifact was '
+            f'produced with the judge arm off, so its per-class figures are '
+            f'the kill switch being measured, not the judge'
+        )
+        cap = provenance['judge_candidate_count']
+        assert isinstance(cap, int) and not isinstance(cap, bool) and cap > 0, (
+            f'judge_candidate_count={cap!r} — the width the model actually saw '
+            f'must be a positive integer'
         )
 
     def test_provenance_names_the_model_and_the_fixture(self) -> None:
