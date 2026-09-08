@@ -19,6 +19,7 @@ is deliberately NOT re-exported from ``shared/__init__.py``:
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -36,11 +37,15 @@ __all__ = [
     'read_psi_sample',
     'RunqueueReading',
     'read_runqueue_ratio',
+    'OwnCgroup',
+    'resolve_own_cgroup',
 ]
 
 _AVG10_RE = re.compile(r'avg10=([0-9]+(?:\.[0-9]+)?)')
 
 _PROC_STAT = '/proc/stat'
+_PROC_SELF_CGROUP = '/proc/self/cgroup'
+_CGROUP_ROOT = '/sys/fs/cgroup'
 
 
 def parse_pressure_file(text: str) -> dict[str, float] | None:
@@ -131,6 +136,62 @@ def read_runqueue_ratio(*, proc_stat_path: str | Path = _PROC_STAT) -> RunqueueR
     except Exception:
         logger.debug('runqueue read failed; component degraded', exc_info=True)
         return RunqueueReading(0.0, False)
+
+
+class OwnCgroup(NamedTuple):
+    """A resolved own-cgroup: the kernel path, and its sysfs cpu.pressure file.
+
+    ``pressure_path`` is ``None`` exactly when ``path`` is ``''`` — i.e. when
+    nothing could be resolved.
+    """
+
+    path: str
+    pressure_path: Path | None
+
+
+@functools.cache
+def resolve_own_cgroup(
+    project_id: str | None,
+    *,
+    proc_cgroup_path: str | Path = _PROC_SELF_CGROUP,
+    cgroup_root: str | Path = _CGROUP_ROOT,
+) -> OwnCgroup:
+    """Resolve the reading process's own cgroup and its cpu.pressure file.
+
+    Read the ``0::`` (unified-hierarchy) path from ``proc_cgroup_path`` and
+    walk it leaf-upward: the first segment equal to ``df-<project_id>.slice``
+    wins, else the leaf itself. Shapes are owned by PRD
+    ``plans/load-throttle-harmonisation-prd.md`` §6.3, which is also the home
+    of the parity fixtures this is tested against.
+
+    Owning the kernel-path-to-sysfs-path join is what gives ``cgroup_root`` a
+    purpose, and puts that join in exactly one home rather than duplicating it
+    in ``read_own_cgroup_pressure``.
+
+    The result is cached per process because the ~150 s gate tick must repeat
+    neither the walk nor the join. The key includes both injected paths, so a
+    fixture never shares an entry with the live defaults or with another
+    fixture. ``resolve_own_cgroup.cache_clear()`` is the public invalidation
+    seam — ``read_own_cgroup_pressure`` calls it after any read failure, and
+    tests use that same seam rather than reaching into module internals.
+
+    Never raises: any failure returns ``OwnCgroup('', None)``.
+    """
+    try:
+        text = Path(proc_cgroup_path).read_text()
+        line = next(line for line in text.splitlines() if line.startswith('0::'))
+        path = line[len('0::') :]
+        segments = path.split('/')
+        if project_id is not None:
+            slice_name = f'df-{project_id}.slice'
+            for depth in range(len(segments), 0, -1):
+                if segments[depth - 1] == slice_name:
+                    path = '/'.join(segments[:depth])
+                    break
+        return OwnCgroup(path, Path(cgroup_root) / path.lstrip('/') / 'cpu.pressure')
+    except Exception:
+        logger.debug('own cgroup resolution failed; component degraded', exc_info=True)
+        return OwnCgroup('', None)
 
 
 class _Arm(NamedTuple):
