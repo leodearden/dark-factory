@@ -63,6 +63,7 @@ from fused_memory.server.write_triage_judge import (
     VERDICT_KEY,
     JudgeOutputError,
     _call_llm,
+    _provider_credentials,
     build_judge_prompt,
     judge_write,
     parse_judge_verdict,
@@ -1071,6 +1072,118 @@ def _judge_svc(provider: str = 'openai', **write_triage) -> types.SimpleNamespac
         ),
         **write_triage,
     )
+
+
+def _creds_svc(**providers: object) -> types.SimpleNamespace:
+    """A service double carrying an `llm.providers.<name>` section per kwarg."""
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            write_triage=types.SimpleNamespace(),
+            llm=types.SimpleNamespace(
+                provider='openai',
+                model='m',
+                providers=types.SimpleNamespace(**providers),
+            ),
+        ),
+    )
+
+
+class TestProviderCredentials:
+    """The config -> SDK-kwargs hop, which had no coverage at all.
+
+    Replacing the whole body of `_provider_credentials` with `return {}` left
+    the suite green, so neither the `api_url` -> `base_url` RENAME nor the
+    `api_key` passthrough was pinned by anything. The rename is the part that
+    matters: both SDKs take `base_url`, so forwarding `api_url` verbatim is a
+    `TypeError` inside `_call_llm` — landing in `triage_write`'s fail-open arm
+    as a counted failure on every middle-band write, for a deployment that
+    pins a local OpenAI-compatible endpoint.
+    """
+
+    def test_a_configured_section_maps_onto_the_sdk_kwarg_names(self) -> None:
+        """`api_url` becomes `base_url`; `api_key` keeps its name."""
+        service = _creds_svc(
+            openai=types.SimpleNamespace(
+                api_key='sk-pinned', api_url='http://localhost:8000/v1',
+            ),
+        )
+        assert _provider_credentials(service, 'openai') == {
+            'api_key': 'sk-pinned',
+            'base_url': 'http://localhost:8000/v1',
+        }
+
+    def test_either_leaf_alone_is_forwarded(self) -> None:
+        """Pinning a key without an endpoint (and vice versa) is a real config."""
+        key_only = _creds_svc(openai=types.SimpleNamespace(api_key='sk-only'))
+        assert _provider_credentials(key_only, 'openai') == {'api_key': 'sk-only'}
+        url_only = _creds_svc(anthropic=types.SimpleNamespace(api_url='http://h/v1'))
+        assert _provider_credentials(url_only, 'anthropic') == {'base_url': 'http://h/v1'}
+
+    @pytest.mark.parametrize(
+        ('label', 'service'),
+        [
+            ('no providers section', _svc(llm=types.SimpleNamespace(
+                provider='openai', model='m', providers=None,
+            ))),
+            ('no entry for this provider', _creds_svc(
+                anthropic=types.SimpleNamespace(api_key='sk-other'),
+            )),
+            ('entry with neither leaf', _creds_svc(
+                openai=types.SimpleNamespace(),
+            )),
+            ('no llm section', _svc()),
+            ('unspecced mock', Mock()),
+        ],
+        ids=['no-providers', 'other-provider-only', 'empty-entry',
+             'no-llm', 'unspecced-mock'],
+    )
+    def test_an_unconfigured_provider_yields_an_empty_dict(
+        self, label: str, service: object,
+    ) -> None:
+        """Empty is a FIRST-CLASS result: both SDKs fall back to the env.
+
+        That is how this deployment is actually configured (`OPENAI_API_KEY`
+        in the shell, nothing in config.yaml), so raising here would break the
+        shipped path rather than a misconfigured one. `other-provider-only`
+        also pins that a sibling provider's key is not handed to the arm that
+        was actually selected.
+        """
+        assert _provider_credentials(service, 'openai') == {}, label
+
+    @pytest.mark.parametrize('value', ['', None, 0, b'sk-bytes', object()])
+    def test_a_blank_or_non_string_leaf_is_not_forwarded(self, value: object) -> None:
+        """An empty string must not be sent as a credential.
+
+        `AsyncOpenAI(api_key='')` does NOT fall back to the environment — it
+        authenticates with an empty key and 401s, which reads as an outage
+        rather than as the empty-leaf config that caused it. Dropping it
+        restores the env fallback, which is the behaviour an operator who
+        cleared the leaf is asking for.
+        """
+        service = _creds_svc(
+            openai=types.SimpleNamespace(api_key=value, api_url=value),
+        )
+        assert _provider_credentials(service, 'openai') == {}
+
+    @pytest.mark.asyncio
+    async def test_the_credentials_reach_the_sdk_constructor(self) -> None:
+        """The resolved kwargs are what the client is actually built with."""
+        service = _creds_svc(
+            openai=types.SimpleNamespace(api_key='sk-wire', api_url='http://h/v1'),
+        )
+        service.config.write_triage = types.SimpleNamespace(
+            judge_provider='openai', judge_model='test-model',
+        )
+        client = _openai_client(_payload('distinct'))
+        with patch('openai.AsyncOpenAI', return_value=client) as ctor:
+            await judge_write(
+                memory_service=service,
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert ctor.call_args.kwargs == {
+            'api_key': 'sk-wire', 'base_url': 'http://h/v1',
+        }
 
 
 class TestJudgeWriteDecisionsThatAreNotFailures:
