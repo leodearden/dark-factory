@@ -1320,16 +1320,24 @@ def test_live_codebook_annotates_the_stale_resume_sysprompt_sighting():
     claim that `build_claude_argv` omits `--system-prompt-file` had to land
     as a superseding SIBLING sighting on the same entry.
 
-    Asserted on session identity and list ORDER — not on the correction's
-    prose — matching the identity style of the live-corpus tests above. The
-    ordering half is load-bearing rather than cosmetic: the correction note
-    refers to "the wording above", which is only true if it is appended
+    Asserted PURELY on session identity, date, and list ORDER — never on the
+    prose of either note, matching the identity style of the live-corpus
+    tests above. A codebook note is documentation: pinning a substring of one
+    would forbid ever rewording it, which is especially wrong here, where the
+    2026-08-10 wording is the very wording now known to be false on main.
+    Deliberately not re-added in regex form either (esc-4892-4).
+
+    The ordering half is load-bearing rather than cosmetic: the correction
+    note refers to "the wording above", which is only true if it is appended
     after the record it supersedes.
 
-    The first half fails loudly if a future agent "helpfully" rewrites the
-    2026-08-10 note in place instead of annotating it. That original
-    observation was TRUE when made (task 3983 hoisted the flag out of the
-    resume branch the same day) and the never-delete boundary keeps it.
+    The first half fails loudly if a future agent deletes the 2026-08-10
+    observation instead of annotating it. That observation was TRUE when made
+    (task 3983 hoisted the flag out of the resume branch the same day) and
+    the never-delete boundary keeps it. Guarding against an in-place REWRITE
+    of a committed sighting's fields is a structural property of the sole
+    writer — a general post-condition alongside `assert_no_deletion` — not
+    something to approximate here by pinning one hand-picked phrase.
     """
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
 
@@ -1338,17 +1346,13 @@ def test_live_codebook_annotates_the_stale_resume_sysprompt_sighting():
     sightings = entries[0].get("sightings") or []
     by_session = {s.get("session"): i for i, s in enumerate(sightings)}
 
-    # (a) NEVER-REWRITE / NEVER-DELETE — the original observation survives verbatim.
+    # (a) NEVER-DELETE — the original dated observation is still present.
     assert _T4892_ORIGINAL_SESSION in by_session, (
         "the 2026-08-10 sighting was deleted from "
         f"{_T4892_ENTRY_ID!r} — sightings are immutable dated observations"
     )
     original = sightings[by_session[_T4892_ORIGINAL_SESSION]]
     assert original.get("date") == "2026-08-10"
-    assert "omits `--system-prompt-file`" in (original.get("note") or ""), (
-        "the 2026-08-10 note was rewritten in place; the task-4892 correction "
-        "must ANNOTATE it as pre-fix history via an appended sighting instead"
-    )
 
     # (b) THE CORRECTION IS PRESENT, and appended AFTER what it supersedes.
     assert _T4892_CORRECTION_SESSION in by_session, (
