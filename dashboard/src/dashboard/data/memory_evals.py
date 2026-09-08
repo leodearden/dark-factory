@@ -272,7 +272,7 @@ _LIMITS_PROVENANCE_KEYS = (
 # The invariant this enforces: no raw `!r` on an artifact-derived value in
 # an `_issue` detail, at any of the fifteen interpolations this task swept
 # — held by the closure test
-# `tests/test_memory_evals_data.py::TestAllIssueDetailsAreBounded` for the
+# `tests/test_memory_evals_data.py::TestAllIssueFieldsAreBounded` for the
 # twelve issue kinds its hostile tree exercises (see `required_kinds`
 # there), so an edit that reintroduces a raw `!r` at one of THOSE sites
 # fails loudly instead of silently reopening this exposure.  That test
