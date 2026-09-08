@@ -13328,6 +13328,133 @@ def test_record_placeholder_finding_drop_rolling_window(
     assert storm3['count'] >= _PLACEHOLDER_DROP_STORM_THRESHOLD
 
 
+# ── Task 4781: phantom-cited vs never-cited placeholder-finding drops ──────
+#
+# citation_verifier.py::verify_cited_memories (hoisted into every stage via
+# stages/base.py::BaseStage.run, task 2979) can strip EVERY citation from an
+# otherwise-real finding when a cited mem0 id no longer resolves, leaving
+# cited_memories == [] and a citation_failures marker behind. That finding is
+# indistinguishable from a task-1970 never-cited placeholder to
+# _finding_has_reference alone — both have _derive_affected_ids() == [] — but
+# the two causes are different: one is "Stage 3 never cited anything", the
+# other is "Stage 3 cited something and the evidence evaporated afterward".
+# _finding_has_citation_failures is the second predicate that tells them
+# apart; _maybe_remediate uses both to route each drop to its own log event
+# and its own storm counter instead of misattributing every drop to a
+# runaway Stage 3.
+
+
+def _make_phantom_cited_finding() -> dict:
+    """Return the POST-VERIFICATION shape of a finding stripped by
+    citation_verifier.py::verify_cited_memories (task 4781 repro).
+
+    Mirrors a real Stage-3 finding that DID cite a mem0 memory, but whose
+    citation failed to re-resolve at report-assembly time: cited_memories is
+    left empty and citation_failures carries the memory_not_found marker.
+    See test_phantom_stripped_finding_is_referenceless_but_carries_citation_failures
+    below, which pins this exact shape against the real producer.
+    """
+    return {
+        'description': 'Stale edge X',
+        'severity': 'moderate',
+        'actionable': True,
+        'category': 'stale_edge',
+        'suggested_action': 'Investigate',
+        'cited_memories': [],
+        'citation_failures': [
+            {'memory_id': 'mem-gone-1', 'store': 'mem0', 'reason': 'memory_not_found'},
+        ],
+    }
+
+
+class TestFindingHasCitationFailures:
+    """_finding_has_citation_failures must distinguish a finding whose citations
+    were stripped/flagged by phantom-citation verification from one that was
+    never touched by that pass at all.
+
+    step-1 (RED): _finding_has_citation_failures does not exist yet.
+    step-2 (GREEN): add it to harness.py as bool(finding.get('citation_failures')).
+    """
+
+    def test_missing_citation_failures_key_returns_false(self):
+        """A finding with no citation_failures key was never touched by verification."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        assert _finding_has_citation_failures(_make_placeholder_finding()) is False
+
+    def test_empty_citation_failures_list_returns_false(self):
+        """An empty citation_failures list carries no marker."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        assert _finding_has_citation_failures({'citation_failures': []}) is False
+
+    def test_none_citation_failures_returns_false(self):
+        """A None citation_failures value carries no marker."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        assert _finding_has_citation_failures({'citation_failures': None}) is False
+
+    def test_citation_failures_with_memory_not_found_marker_returns_true(self):
+        """A memory_not_found marker proves verification stripped a citation."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        assert _finding_has_citation_failures(_make_phantom_cited_finding()) is True
+
+    def test_citation_failures_with_verification_error_marker_returns_true(self):
+        """A verification_error marker also proves verification touched this
+        finding's citations — the citation is KEPT (citation_verifier.py:248),
+        but the finding still counts as citation-failures-bearing."""
+        from fused_memory.reconciliation.harness import _finding_has_citation_failures
+
+        finding = {
+            'citation_failures': [
+                {
+                    'memory_id': 'mem-x',
+                    'store': 'mem0',
+                    'reason': 'verification_error',
+                    'error_type': 'TimeoutError',
+                },
+            ],
+        }
+        assert _finding_has_citation_failures(finding) is True
+
+
+@pytest.mark.asyncio
+async def test_phantom_stripped_finding_is_referenceless_but_carries_citation_failures():
+    """Producer-contract pin, tying _make_phantom_cited_finding() to what the
+    REAL verify_cited_memories emits.
+
+    The _maybe_remediate tests in this file mock stage.run directly, so
+    BaseStage.run's verify_cited_memories pass never fires in-cycle — the
+    hand-built _make_phantom_cited_finding() fixture could silently drift
+    into fiction. This test instead calls the real producer
+    (citation_verifier.py::verify_cited_memories) against a finding whose
+    only citation is a mem0 id that fails to resolve, and asserts the
+    resulting shape is exactly what the fixture assumes.
+    """
+    from fused_memory.reconciliation.citation_verifier import verify_cited_memories
+    from fused_memory.reconciliation.harness import (
+        _finding_has_citation_failures,
+        _finding_has_reference,
+    )
+
+    finding = {
+        'actionable': True,
+        'description': 'Stale edge X',
+        'cited_memories': [{'memory_id': 'mem-gone-1', 'store': 'mem0'}],
+    }
+    svc = AsyncMock()
+    svc.get_memory_by_id.return_value = None
+
+    stats = await verify_cited_memories([finding], svc, 'test-project', stat_prefix='stage3')
+
+    assert stats['stage3_phantom_citations_dropped'] == 1
+    assert finding['cited_memories'] == []
+    assert _finding_has_reference(finding) is False
+    assert _finding_has_citation_failures(finding) is True
+    assert finding['citation_failures'][0]['reason'] == 'memory_not_found'
+
+
 # ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
 
 
