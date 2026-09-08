@@ -408,6 +408,12 @@ def git_artifacts(tmp_path):
     return a
 
 
+#: The opening angle bracket, spelled so no raw envelope sentinel ever
+#: appears verbatim in this file (a literal here corrupts the tool call
+#: that writes it). Same discipline as test_plan_tools_markup_repair.py.
+LT = chr(60)
+
+
 def _git_commit_file(repo: Path, name: str, content: str, message: str) -> str:
     """Write, stage and commit *name*; return the resulting sha."""
     (repo / name).write_text(content)
@@ -549,6 +555,166 @@ class TestMarkStepDone:
         assert any('step-1' in m and 'abc123' in m for m in warnings), (
             f'expected a loud WARNING naming the step and sha, got {warnings}'
         )
+
+    def test_unknown_step_is_reported_before_the_sha_is_probed(
+        self, git_artifacts, monkeypatch,
+    ):
+        """A typo'd step id gets the actionable 'not found' message, and git is
+        never consulted.
+
+        The cheap in-memory lookup runs FIRST: a call that cannot write must
+        not pay for two subprocesses, and must not answer a step-id typo with a
+        complaint about a sha that was never going to be recorded."""
+        self._setup_plan(git_artifacts)
+
+        def _boom(*_a, **_k):  # pragma: no cover - must never run
+            raise AssertionError('reachability was probed for an unknown step')
+
+        monkeypatch.setattr(plan_tools, '_sha_branch_reachability', _boom)
+
+        result = _mark_step_done(git_artifacts, 'typo-step', 'deadbeef' * 5)
+
+        assert result['status'] == 'error'
+        assert 'not found' in result['message']
+
+    def test_a_probe_timeout_records_and_warns_rather_than_rejecting(
+        self, git_artifacts, monkeypatch, caplog,
+    ):
+        """FAIL-OPEN covers a BLOWN-UP probe, not just a missing repo.
+
+        The `artifacts`-fixture test above reaches 'unknown' through probe 1's
+        non-zero rc. This reaches it through probe 2 raising inside a perfectly
+        healthy repo — the branch a mistake would silently flip from fail-OPEN
+        to fail-CLOSED, rejecting real committed work."""
+        self._setup_plan(git_artifacts)
+        sha = _git_commit_file(
+            git_artifacts.worktree, 'm.py', 'x = 3\n', 'feat: step-1',
+        )
+        real_run = subprocess.run
+
+        def _fake_run(argv, **kwargs):
+            if 'merge-base' in argv:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(plan_tools.subprocess, 'run', _fake_run)
+
+        with caplog.at_level(logging.WARNING):
+            result = _mark_step_done(git_artifacts, 'step-1', sha)
+
+        assert result['status'] == 'ok'
+        plan = git_artifacts.read_plan()
+        assert plan['steps'][0]['status'] == 'done'
+        assert plan['steps'][0]['commit'] == sha
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('step-1' in m and sha in m for m in warnings), (
+            f'expected a loud WARNING naming the step and sha, got {warnings}'
+        )
+
+    def test_a_rejection_still_reports_a_repair_that_already_landed(
+        self, git_artifacts,
+    ):
+        """The reject path must not swallow a markup repair.
+
+        `_read_plan_repaired` has ALREADY written the repair back to disk by
+        the time the guard runs, so a rejection that returned a bare dict would
+        lose the only report of a mutation the agent never made. The clean-plan
+        counterpart (`markup_repairs` ABSENT) is asserted in
+        `test_unreachable_sha_is_rejected`; this is the positive half, without
+        which a refactor could drop `_with_markup_repairs` here and stay
+        green."""
+        self._setup_plan(git_artifacts)
+        _add_design_decision(git_artifacts, 'A decision.', 'Clean rationale prose.')
+
+        # Poison the rationale with the measured trailing-residue shape, built
+        # from chr(60) so this file never carries a raw envelope literal.
+        clean = 'Clean rationale prose.'
+        residue = LT + '/rationale>' + '\n' + LT + '/invoke>' + '\n'
+        poisoned = git_artifacts.read_plan()
+        poisoned['design_decisions'][0]['rationale'] = clean + residue
+        git_artifacts.write_plan(poisoned)
+
+        repo = git_artifacts.worktree
+        subprocess.run(['git', 'switch', '-c', 'other2'], cwd=repo, check=True, capture_output=True)
+        side_sha = _git_commit_file(repo, 'side2.py', 'side\n', 'feat: side branch')
+        subprocess.run(['git', 'switch', 'main'], cwd=repo, check=True, capture_output=True)
+
+        result = _mark_step_done(git_artifacts, 'step-1', side_sha)
+
+        assert result['status'] == 'error'
+        repairs = result['markup_repairs']
+        assert [f['field'] for f in repairs] == ['rationale']
+        assert repairs[0]['outcome'] == 'repaired'
+        # The repair landed on disk; the step did not.
+        plan = git_artifacts.read_plan()
+        assert plan['design_decisions'][0]['rationale'] == clean
+        assert plan['steps'][0]['status'] == 'pending'
+        assert not plan['steps'][0].get('commit')
+
+
+class TestShaBranchReachability:
+    """The tri-state probe itself, and the fail-CLOSED boolean built on it."""
+
+    def test_the_two_probes_map_to_the_three_states(self, tmp_path, monkeypatch):
+        """rc-by-rc, with no repo involved — the table the callers rely on."""
+        calls: list[list[str]] = []
+
+        def _fake_run(argv, **_kwargs):
+            calls.append(argv)
+            rc = 0 if 'rev-parse' in argv else _fake_run.merge_base_rc
+            return subprocess.CompletedProcess(argv, rc, '', '')
+
+        monkeypatch.setattr(plan_tools.subprocess, 'run', _fake_run)
+
+        for rc, expected in ((0, 'reachable'), (1, 'unreachable'), (128, 'unreachable')):
+            _fake_run.merge_base_rc = rc
+            assert plan_tools._sha_branch_reachability(tmp_path, 'sha') == expected
+
+        # A repo that does not resolve says nothing about the sha.
+        def _no_repo(argv, **_kwargs):
+            return subprocess.CompletedProcess(argv, 128, '', 'not a git repository')
+
+        monkeypatch.setattr(plan_tools.subprocess, 'run', _no_repo)
+        assert plan_tools._sha_branch_reachability(tmp_path, 'sha') == 'unknown'
+
+    @pytest.mark.parametrize('failing_probe', ['rev-parse', 'merge-base'])
+    @pytest.mark.parametrize(
+        'exc',
+        [subprocess.TimeoutExpired(cmd=['git'], timeout=10), OSError('no git binary')],
+        ids=['timeout', 'oserror'],
+    )
+    def test_either_probe_blowing_up_is_unknown(
+        self, tmp_path, monkeypatch, failing_probe, exc,
+    ):
+        """Both probes, both exception families -> 'unknown', never a verdict.
+
+        Returning 'unreachable' from any of these four cells would turn an
+        infra fault into a rejection of real committed work."""
+        def _fake_run(argv, **_kwargs):
+            if failing_probe in argv:
+                raise exc
+            return subprocess.CompletedProcess(argv, 0, '', '')
+
+        monkeypatch.setattr(plan_tools.subprocess, 'run', _fake_run)
+
+        assert plan_tools._sha_branch_reachability(tmp_path, 'sha') == 'unknown'
+
+    @pytest.mark.parametrize(
+        ('state', 'expected'),
+        [('reachable', True), ('unreachable', False), ('unknown', False)],
+    )
+    def test_sha_exists_on_branch_is_the_fail_closed_projection(
+        self, tmp_path, monkeypatch, state, expected,
+    ):
+        """`_sha_exists_on_branch` == (reachability == 'reachable').
+
+        Pins the collapse of the two duplicated probes into one: the architect
+        guard keeps refusing on BOTH 'unreachable' and 'unknown', which is the
+        behaviour it had when it owned its own subprocess block."""
+        monkeypatch.setattr(
+            plan_tools, '_sha_branch_reachability', lambda *_a, **_k: state,
+        )
+        assert plan_tools._sha_exists_on_branch(tmp_path, 'sha') is expected
 
 
 # ---------------------------------------------------------------------------
