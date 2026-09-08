@@ -341,8 +341,17 @@ class TestBuildJudgeCases:
         assert _mod().LABEL_CANONICAL == calib.LABEL_CANONICAL
 
     def test_an_unknown_label_raises_rather_than_being_bucketed(self) -> None:
+        """The TYPE is contractual, not just the message.
+
+        `pytest.raises(Exception, match=...)` is satisfied by any exception
+        carrying that substring — including the `KeyError`/`TypeError` a
+        careless refactor would raise while LOOKING like the deliberate
+        refusal. `score_cases` raises `UnknownLabelError` for the same
+        condition at the scoring boundary, so pinning the type here is what
+        keeps the two boundaries agreeing.
+        """
         corpus = [*_corpus(), _rec('c1-mystery', 'c1', 'newly_invented_label')]
-        with pytest.raises(Exception, match='newly_invented_label'):
+        with pytest.raises(_mod().UnknownLabelError, match='newly_invented_label'):
             _mod().build_judge_cases(corpus, distractors=2)
 
     def test_every_label_in_the_committed_fixture_is_covered(self, records) -> None:
@@ -485,6 +494,38 @@ class TestBuildJudgeCases:
         assert sorted(clusters) == ['c1', 'c2', 'c3']
 
     def test_the_class_name_is_a_module_constant_not_a_literal(self) -> None:
+        """The control cases are LABELLED from the constant, not from a literal.
+
+        The name says "not a literal" and the assertion used to say
+        `CLASS_DISTRACTOR == 'distractor'` — which is the literal, asserted.
+        The property worth holding is that renaming the constant MOVES the
+        cases with it: a rename that missed `build_judge_cases` would leave
+        the controls carrying the old spelling while every class-vocabulary
+        test above still passed, and the mismatch would surface only as an
+        `UnknownLabelError` at scoring time.
+
+        Selected without naming the control class, so this cannot pass by
+        agreeing with itself.
+        """
+        alpha_labels = {
+            _calib().LABEL_DUPLICATE,
+            _calib().LABEL_DISTINCT,
+            _calib().LABEL_PSEUDO_CONTRADICTION,
+        }
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        controls = [c for c in cases if c['expected_class'] not in alpha_labels]
+        assert controls, 'no control cases were built'
+        for case in controls:
+            assert case['expected_class'] == _mod().CLASS_DISTRACTOR, case
+
+    def test_the_class_vocabulary_is_alphas_labels_plus_the_control(self) -> None:
+        """Composition AND wire spelling, which is what the test above claimed.
+
+        The tuple pins that the vocabulary is COMPOSED from alpha's constants
+        rather than re-typed here; the spelling is pinned separately because
+        `distractor` is a wire value — it appears in the committed artifact
+        and in the confusion table an operator reads at the task-3169 flip.
+        """
         assert _mod().CLASS_DISTRACTOR == 'distractor'
         assert tuple(_mod().EVAL_CLASSES) == (
             _calib().LABEL_DUPLICATE,
@@ -808,7 +849,25 @@ class TestRenderMarkdown:
 
     @classmethod
     def _row_cells(cls, md: str, name: str) -> dict[str, str]:
-        row = next(ln for ln in md.splitlines() if ln.startswith(f'| {name} |'))
+        """The per-class row for *name*, read from THAT table only.
+
+        Scoped to the section rather than scanned over the whole document.
+        Both tables key their rows `| <class> |`, so an unscoped `next(...)`
+        binds whichever table happens to come first and would silently answer
+        with confusion-table cells if the two were ever reordered — reading a
+        verdict count as an accuracy. Measured against a reordered render: the
+        unscoped lookup returns the confusion row and reports `accuracy = 2`
+        where the scorer holds `1.0`.
+
+        The cell-count assertion below is not a substitute. Today it would
+        catch that particular mis-bind by WIDTH (a confusion row is
+        `1 + len(EVAL_OUTCOMES)` = 5 cells against these 4) and report `row
+        has 5 cells` — the wrong diagnosis for the right failure. It stops
+        catching it entirely the moment the two widths coincide, e.g. a fifth
+        per-class column, or a fifth outcome paired with a dropped column.
+        """
+        section = cls._section(md, 'Per-class accuracy')
+        row = next(ln for ln in section.splitlines() if ln.startswith(f'| {name} |'))
         cells = cls._cells(row)
         assert len(cells) == len(cls.COLUMNS), (
             f'row has {len(cells)} cells, header declares {len(cls.COLUMNS)}: {row}'
@@ -824,13 +883,49 @@ class TestRenderMarkdown:
 
     def test_the_header_declares_the_columns_this_class_binds(self) -> None:
         """Pins the binding itself: a reordered header fails here, once."""
-        header = next(ln for ln in self._md().splitlines() if ln.startswith('| class |'))
+        section = self._section(self._md(), 'Per-class accuracy')
+        header = next(ln for ln in section.splitlines() if ln.startswith('| class |'))
         assert self._cells(header) == list(self.COLUMNS)
 
     def test_emits_one_row_per_class_including_the_empty_ones(self) -> None:
-        md = self._md()
+        """Every class appears, with ITS numbers — not merely a row.
+
+        `assert self._row_cells(md, name)` was an assertion on a non-empty
+        dict, which `_row_cells` returns for any row it finds at all; it could
+        not fail except by the row being absent, and said nothing about the
+        contents. The empty classes are the point: a class rendered with `0`
+        where the scorer holds `None` reads as a measured failure rather than
+        as not-measured, which is the distinction the whole pre-seeded
+        `per_class` dict exists to preserve.
+        """
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        scored = _mod().score_cases(cases, [OUTCOME_RESTATED] * len(cases))
+        md = _mod().render_markdown(
+            _mod().build_report(scored=scored, provenance=dict(_PROVENANCE)),
+        )
+        assert all(scored['per_class'][n]['n'] for n in _mod().EVAL_CLASSES), (
+            'the fixture must measure every class for the first half to bite'
+        )
         for name in _mod().EVAL_CLASSES:
-            assert self._row_cells(md, name), name
+            entry = scored['per_class'][name]
+            assert self._row_cells(md, name) == {
+                'class': name,
+                'n': str(entry['n']),
+                'correct': str(entry['correct']),
+                'accuracy': str(entry['accuracy']),
+            }, name
+
+        # And the empty ones the name promises: nothing measured at all, yet
+        # every class still renders a row, carrying `None` rather than `0.0`.
+        empty_md = _mod().render_markdown(
+            _mod().build_report(
+                scored=_mod().score_cases([], []), provenance=dict(_PROVENANCE),
+            ),
+        )
+        for name in _mod().EVAL_CLASSES:
+            assert self._row_cells(empty_md, name) == {
+                'class': name, 'n': '0', 'correct': '0', 'accuracy': 'None',
+            }, name
 
     def test_the_row_carries_that_classes_own_numbers(self) -> None:
         cases = _mod().build_judge_cases(_corpus(), distractors=2)
