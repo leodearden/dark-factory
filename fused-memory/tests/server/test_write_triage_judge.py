@@ -352,6 +352,27 @@ def _marked_ids(candidates: list[MemoryResult], attach_target_id: str) -> set[st
     }
 
 
+def _added_lines(candidates: list[MemoryResult], attach_target_id: str) -> list[str]:
+    """The lines naming a target ADDS to the rendering, in order.
+
+    A LIST, not a set. `_marked_ids` answers "which candidates does the mark
+    name", which is the right question for a marker that names the wrong
+    record — but it cannot see a marker that names TWO records whose ids
+    happen to collapse, and a set-valued assertion reads the same either way.
+    The count is its own invariant: AT MOST ONE candidate is ever marked, so
+    a second mark has to show up as a visible extra element rather than be
+    absorbed. Spelling-independent — it diffs against the same slate rendered
+    with no target instead of grepping for the mark's text.
+    """
+    unmarked = build_judge_prompt(
+        'new', candidates, attach_target_id=None,
+    ).splitlines()
+    marked = build_judge_prompt(
+        'new', candidates, attach_target_id=attach_target_id,
+    ).splitlines()
+    return [line for line in marked if line not in unmarked]
+
+
 class TestSelectJudgeCandidates:
     """Which of the retrieved results the judge actually gets to see.
 
@@ -663,6 +684,142 @@ class TestBuildJudgePrompt:
         second_only = set(second.splitlines()) - set(first.splitlines())
         assert any('m0' in line for line in first_only)
         assert any('m2' in line for line in second_only)
+
+    # --- AT MOST ONE candidate is ever marked -------------------------------
+    #
+    # The two clauses above ("is this the id?" / "does this carry that
+    # `parent_id`?") are both true SOMEWHERE on a slate holding a canonical
+    # parent AND one of its children, and that is the ordinary consolidated-
+    # topic case, not an exotic one: `_canonical_id_of` hoists a child winner
+    # to its parent id and `retrieve_candidates` returns children un-filtered,
+    # so parent+child co-occurrence in the top-n is expected. Deciding the
+    # question per candidate marks EVERY one of them, and the constant
+    # instruction sentence — "The candidate marked `attach_target` is the one
+    # this verdict will be filed against" — is then simply false. The target
+    # has to be resolved ONCE for the whole slate, with the same ORDERED
+    # precedence `select_judge_candidates`' rescue arm uses.
+
+    def test_a_parent_and_its_child_on_one_slate_are_marked_once(self) -> None:
+        """The regression: two clauses, both true, must still yield ONE mark."""
+        child = _result(
+            'child-1', 0.95,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        selected = select_judge_candidates(
+            [_result('parent-1', 0.90), child], 5, canonical_id='parent-1',
+        )
+        assert {r.id for r in selected} == {'parent-1', 'child-1'}
+        assert _marked_ids(selected, 'parent-1') == {'parent-1'}
+        assert _added_lines(selected, 'parent-1') == [
+            '  attach_target: parent-1',
+        ]
+
+    def test_several_children_do_not_multiply_the_mark(self) -> None:
+        """More children of the same parent must not mean more marks.
+
+        A consolidated topic accretes amendments, so three children of one
+        parent is the steady state rather than the edge. Per-candidate
+        evaluation scales the defect with the topic's age.
+        """
+        children = [
+            _result(
+                f'child-{i}', 0.95 - i / 100,
+                extra_metadata={
+                    'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1',
+                },
+            )
+            for i in range(3)
+        ]
+        candidates = [*children, _result('parent-1', 0.80)]
+        assert _marked_ids(candidates, 'parent-1') == {'parent-1'}
+        assert _added_lines(candidates, 'parent-1') == [
+            '  attach_target: parent-1',
+        ]
+
+    def test_an_exact_id_wins_over_a_child_that_points_at_it(self) -> None:
+        """Precedence is EXACT-ID-FIRST, and does not depend on slate order.
+
+        The same ordered `next(...) or next(...)` the rescue arm uses: the
+        `PARENT_ID_KEY` clause is the FALLBACK for a hoisted parent that is
+        absent from the slate, not a co-equal alternative. A resolver that
+        merely took the first candidate satisfying EITHER clause would mark
+        the child whenever the child outranks its parent — which is the
+        common case, since the child is why the parent was hoisted.
+        """
+        def _slate(child_first: bool) -> list[MemoryResult]:
+            child = _result(
+                'child-1', 0.95,
+                extra_metadata={
+                    'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1',
+                },
+            )
+            parent = _result('parent-1', 0.90)
+            return [child, parent] if child_first else [parent, child]
+
+        for child_first in (True, False):
+            candidates = _slate(child_first)
+            assert _marked_ids(candidates, 'parent-1') == {'parent-1'}, (
+                f'child_first={child_first}'
+            )
+            assert _added_lines(candidates, 'parent-1') == [
+                '  attach_target: parent-1',
+            ], f'child_first={child_first}'
+
+    def test_the_single_mark_holds_on_the_shapes_that_already_worked(
+        self,
+    ) -> None:
+        """Regression guard: neither existing shape may lose or gain a mark.
+
+        The flat exact-id slate and the HOISTED slate (the parent id absent
+        entirely, only the child carrying `PARENT_ID_KEY`) are what the two
+        clauses exist for. Resolving one target for the whole slate must leave
+        both marking exactly what they marked before — the fallback clause is
+        narrowed in precedence, not removed.
+        """
+        flat = [_result(f'm{i}', 0.9 - i / 100) for i in range(3)]
+        assert _marked_ids(flat, 'm1') == {'m1'}
+        assert _added_lines(flat, 'm1') == ['  attach_target: m1']
+
+        child = _result(
+            'child-1', 0.60,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        hoisted = [_result('m0', 0.90), _result('m1', 0.89), child]
+        assert 'parent-1' not in [c.id for c in hoisted]
+        assert _marked_ids(hoisted, 'parent-1') == {'child-1'}
+        assert _added_lines(hoisted, 'parent-1') == [
+            '  attach_target: child-1',
+        ]
+
+    def test_the_echo_control_still_holds_on_a_parent_and_child_slate(
+        self,
+    ) -> None:
+        """Resolving one target must not turn the marker into an echo.
+
+        Same control as `test_an_unrecognised_target_marks_nothing_and_does_
+        not_perturb`, re-applied to the slate the fix is about: an id naming
+        no candidate — and no `PARENT_ID_KEY` pointing at it — still renders
+        exactly as no target at all, and two such nonces render identically.
+        That is what `check_write_triage_attach_target.py::_echoes_argument`
+        separates a real marker from a free-text parameter by.
+        """
+        child = _result(
+            'child-1', 0.95,
+            extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
+        )
+        candidates = [child, _result('parent-1', 0.90)]
+        unmarked = build_judge_prompt('new', candidates, attach_target_id=None)
+        first = build_judge_prompt(
+            'new', candidates, attach_target_id='not-on-this-slate-1',
+        )
+        second = build_judge_prompt(
+            'new', candidates, attach_target_id='not-on-this-slate-2',
+        )
+        assert first == unmarked
+        assert second == unmarked
+        assert first == second
+        assert 'not-on-this-slate-1' not in first
+        assert 'not-on-this-slate-2' not in second
 
 
 class TestAttachTargetGateProbe:
