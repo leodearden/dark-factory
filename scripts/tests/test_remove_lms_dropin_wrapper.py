@@ -124,9 +124,8 @@ def _systemd_user_manager_skip_reason() -> str | None:
     unit_dir = _unit_dir()
     try:
         unit_dir.mkdir(parents=True, exist_ok=True)
-        # The probe name carries _SELFTEST_PREFIX and a `.service` suffix on
-        # purpose: those are the two things _prune_stale_selftest_units keys
-        # on, so a run SIGKILLed in the microseconds between the write and the
+        # The probe name satisfies _is_prunable_selftest_residue on purpose,
+        # so a run SIGKILLed in the microseconds between the write and the
         # unlink strands a file the existing sweep can still reap.  An
         # unprefixed name (or a bare tempfile) would strand residue nothing
         # could ever collect -- the exact accumulation the prune was written
@@ -637,9 +636,13 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
           multiplied the daemon-reload contention it was meant to model, while
           its three threads shared one PID -- so it modelled the SAME-process
           case, not the fleet's cross-process one.  Removed under esc-4200-2.)
-      (c) The shared _SELFTEST_PREFIX.  The generator and the prune bind the
-          SAME constant, so the prune's "never touch a real unit" property is
-          structural rather than a pair of string literals free to drift.
+      (c) The shared _SELFTEST_STEM.  The generator binds _SELFTEST_PREFIX;
+          the prune's predicate binds both _SELFTEST_PREFIX and
+          _DEFAULT_TEMPLATE -- and all three descend from the one
+          _SELFTEST_STEM constant, so the prune's "never touch a real unit"
+          property stays structural rather than a set of string literals
+          free to drift, even though it is now delivered by two sibling
+          constants instead of one.
       (d) A legal systemd unit-name charset.  Verified viable at plan time:
           PID-suffixed template names resolve correctly against a real
           manager.
@@ -951,10 +954,10 @@ def test_prune_is_silent_when_the_unit_dir_does_not_exist(tmp_path: Path) -> Non
 
 # The rendezvous file, in ~/.config/systemd/user because that (via $HOME) is
 # the one thing all 48 concurrent worktrees demonstrably share -- the same
-# reason the collision existed at all.  The leading dot and the absent unit
-# suffix keep systemd from ever parsing it, and _prune_stale_selftest_units
-# cannot reach it: that sweep requires BOTH the _SELFTEST_PREFIX prefix and a
-# .service/.service.d suffix, and this name has neither.
+# reason the collision existed at all.  The leading dot keeps systemd from
+# ever parsing it, and _prune_stale_selftest_units cannot reach it either:
+# _is_prunable_selftest_residue gates on a .service/.service.d suffix FIRST,
+# and this name has none.
 _LOCK_NAME = ".lms-dropin-selftest.lock"
 
 # Budget, sized against the suite's per-test --timeout=300
@@ -1248,9 +1251,12 @@ def test_selftest_template_seam_propagates(tmp_path: Path) -> None:
     failing because all three runs silently fell back to the shared default;
     that test is gone, so without this one a dropped seam degrades SILENTLY to
     `lms-dropin-selftest@` -- re-opening the measured collision defect, and
-    stranding that default unit in the live dir permanently, since both
-    _remove_template_residue and _prune_stale_selftest_units key on the
-    unique, hyphenated name.
+    stranding that default unit in the live dir for that run: cleanup's
+    _remove_template_residue still keys on the unique, hyphenated name, so it
+    will not touch a default-named unit.  _prune_stale_selftest_units now
+    also admits _DEFAULT_TEMPLATE, so the strand is bounded to
+    _STALE_AFTER_S rather than permanent -- but that is an hour-later mop-up,
+    not a substitute for the seam actually propagating.
 
     Driven through ``_run_selftest``, the SAME helper the real gate uses, so
     both halves of the seam are covered by one assertion.  An earlier version
