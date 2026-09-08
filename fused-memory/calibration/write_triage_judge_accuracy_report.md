@@ -35,6 +35,7 @@
 - false_contested counts EVERY contested verdict, and every one of them is a false positive — see contested_ground_truth. A judge structurally incapable of ever answering `contested` would score identically to a perfect one here, so a low number is not evidence that the contradiction detector works.
 - The duplicate class accepts BOTH `restated` and `amended`, because the curator's labels do not separate a verbatim restatement from a rediscovery carrying a novel fragment. The split between them is reported as a distribution and is not scored as error.
 - The distractor class is a control this script constructs, not a curator label: one case per cluster whose slate carries no correct attach target at all. It is what distinguishes a judge that classifies from a judge that attaches to whatever it is shown.
+- Every accuracy here is measured over the WHOLE labelled corpus, not over the [t_low, t_high) middle band the production judge is actually responsible for. `build_judge_cases` emits a case for every non-canonical record and `run_judge_eval` calls the judge on each one directly — `decide_band`, `t_high` and `t_low` never enter the picture, and the band decision handed to `judge_write` is SYNTHESIZED as a middle-band one. So these figures include records that in production are answered deterministically without the judge ever seeing them, and whether the middle band alone would score higher or lower is not measured here. Filtering the cases to the band would need real per-record similarities and is deliberately not done.
 
 ## Provenance
 
