@@ -2112,13 +2112,21 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
             f'{[e.id for e in results]}'
         )
 
-        # (b) The recovery is named at DEBUG for auditability.
+        # (b) The recovery ITSELF is named at DEBUG for auditability — not
+        # just the (also-DEBUG) 'vanished mid-scan' line read_escalation_for_scan
+        # already logs before the recovery even runs, which also mentions the
+        # path and would satisfy a substring-only check on its own. Assert on
+        # the recovery line's distinguishing wording so weakening or removing
+        # it (while the earlier 'vanished' line stays) still fails this test.
         debug_records = [
             r for r in caplog.records
             if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
         ]
-        assert any('esc-4176-2' in r.getMessage() for r in debug_records), (
-            f'Expected a DEBUG mentioning the recovered esc-4176-2; got: '
+        assert any(
+            'recovered' in r.getMessage() and 'esc-4176-2' in r.getMessage()
+            for r in debug_records
+        ), (
+            f'Expected a DEBUG naming the recovery of esc-4176-2; got: '
             f'{[r.getMessage() for r in debug_records]}'
         )
 
@@ -2145,6 +2153,88 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         assert [e.id for e in results] == ['esc-4176-1'], (
             f'Expected only the surviving pending record, got '
             f'{[e.id for e in results]}'
+        )
+
+    def test_get_by_task_drops_a_record_genuinely_deleted_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """The ``relocated is None`` branch: a record DELETED (not
+        relocated) mid-scan on an archive-including scan cannot be
+        recovered — the fresh ``_locate_path`` re-probe finds it nowhere —
+        so the listing must come back one short WITHOUT raising, exactly
+        like the pre-recovery behaviour for a genuine deletion.
+
+        Distinguishes recoverable relocation from real deletion the same
+        way ``TestGetRetriesRelocationBetweenLocateAndRead``'s deletion test
+        does for ``get()``: the interposition unlinks the file outright
+        instead of moving it into the archive tree.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        original_read_text = Path.read_text
+
+        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                doomed.unlink()
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', deleting_read_text):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record after a genuine mid-scan '
+            f'deletion (no recovery possible, no raise), got '
+            f'{[e.id for e in results]}'
+        )
+
+    def test_get_by_task_recovery_reread_failure_logs_reglob_context(
+        self, tmp_path: Path, caplog,
+    ):
+        """The recovery's OWN re-read can itself fail differently from the
+        first vanish — e.g. an EACCES fault at the newly-located archive
+        path.  That failure must be logged through the recovery's distinct
+        ``'queue.get_by_task (re-glob after vanish)'`` context, not silently
+        conflated with the ordinary scan's WARNING wording, and the record
+        must still be dropped (not raise) exactly like any other unreadable
+        file.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        relocated_path = archive_dir / 'esc-4176-2.json'
+        original_read_text = Path.read_text
+
+        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(str(doomed), str(relocated_path))
+            if self == relocated_path:
+                raise PermissionError(13, 'Permission denied', str(relocated_path))
+            return original_read_text(self, *args, **kwargs)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected the recovery to give up (not raise) after its own '
+            f're-read also fails, got {[e.id for e in results]}'
+        )
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.WARNING
+        ]
+        assert any('re-glob after vanish' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming the re-glob-after-vanish context; got: '
+            f'{[r.getMessage() for r in warnings]}'
         )
 
 
