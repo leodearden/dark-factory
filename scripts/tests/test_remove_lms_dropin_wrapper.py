@@ -622,6 +622,61 @@ def test_unique_template_is_a_legal_distinct_systemd_template_name() -> None:
 # step-5: RED -- the stale-residue prune
 # ---------------------------------------------------------------------------
 
+def test_prune_match_predicate_admits_selftest_residue_and_nothing_else() -> None:
+    """_is_prunable_selftest_residue must admit exactly the reapable residue.
+
+    Table-driven, and written BEFORE the predicate exists: the near-miss rows
+    below are what FORCE the default arm to be a tight ``stem ==
+    _DEFAULT_TEMPLATE`` equality check rather than a widened bare-stem prefix
+    match.  Nothing else in this module would catch that sloppier widening --
+    the existing test_prune_never_touches_a_non_selftest_unit only plants
+    ``lms-arm@``, the fleet units, ``_LOCK_NAME`` and a prefixed ``.conf``,
+    none of which are near-misses of the DEFAULT arm this task adds.
+
+    The ``.service``/``.service.d`` suffix gate must be evaluated FIRST
+    inside the predicate and must never be weakened: it is the only thing
+    standing between this sweep and ``_LOCK_NAME`` (see that case below).
+    """
+    cases: list[tuple[str, bool, str]] = [
+        # MUST MATCH -- today's unique generated names.
+        (f"{_SELFTEST_PREFIX}999-deadbeef@.service", True, "a unique generated unit"),
+        (f"{_SELFTEST_PREFIX}999-deadbeef@.service.d", True, "a unique generated drop-in dir"),
+        # MUST MATCH -- THE DEFECT this task fixes: the bare default a killed
+        # hand-run strands, unreapable before this predicate existed.
+        (f"{_DEFAULT_TEMPLATE}.service", True, "the bare-default unit a hand-run strands"),
+        (f"{_DEFAULT_TEMPLATE}.service.d", True, "the bare-default drop-in dir a hand-run strands"),
+        # MUST NOT MATCH -- real units, at any age.
+        ("lms-arm@.service", False, "the real unit the script under test targets"),
+        ("lms-arm@.service.d", False, "the real unit's drop-in dir"),
+        ("fused-memory.service", False, "a real fleet unit"),
+        ("dark-factory-dashboard.service", False, "a real fleet unit"),
+        ("dark-factory-dashboard.service.d", False, "a real fleet unit's drop-in dir"),
+        # MUST NOT MATCH -- the serialization lock: fails the suffix gate.
+        # fcntl.flock lives on the open file DESCRIPTION, so unlinking the
+        # path releases nothing -- it lets the next session create a fresh
+        # inode and take a second "exclusive" slot, silently unserializing
+        # the one real-systemd leg (seam added in commit fabf652c83).
+        (_LOCK_NAME, False, "the host-wide serialization lock"),
+        # MUST NOT MATCH -- selftest-prefixed/stemmed non-unit files.
+        (f"{_SELFTEST_PREFIX}x@.conf", False, "a selftest-prefixed non-unit file"),
+        (f"{_SELFTEST_STEM}.log", False, "a selftest-stemmed non-unit file"),
+        # MUST NOT MATCH -- near-misses of the widened default arm that a
+        # sloppy `startswith(_SELFTEST_STEM)` widening would wrongly admit,
+        # and which nothing else in the module can catch.
+        (f"{_SELFTEST_STEM}.service", False, "no '@' -- not a template at all"),
+        (f"{_SELFTEST_STEM}ZZZ@.service", False, "stem is a PREFIX of, not equal to, the default"),
+        (f"{_SELFTEST_STEM}@probe.service", False, "a resolved instance name, not the template file"),
+        # MUST NOT MATCH -- degenerate.
+        (".service", False, "empty stem"),
+        ("", False, "empty name"),
+    ]
+    for name, expected, why in cases:
+        assert _is_prunable_selftest_residue(name) is expected, (
+            f"{name!r} ({why}): expected _is_prunable_selftest_residue(name) is "
+            f"{expected!r}"
+        )
+
+
 def _write_unit(unit_dir: Path, template: str, *, age_s: float, now: float) -> tuple[Path, Path]:
     """Install a <template>.service + <template>.service.d/ pair aged age_s.
 
