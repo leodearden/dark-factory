@@ -1785,6 +1785,26 @@ class ReferentFinding:
     #: The uuid of :attr:`intended_referent`'s node, when it resolves to
     #: exactly one live node. See the class docstring for what ``None`` means.
     new_endpoint_uuid: str | None = None
+    #: Whether the :attr:`new_endpoint_uuid` lookup was DEGRADED — the backend
+    #: would not answer — as opposed to answering "no such node" or "that name
+    #: keys a duplicate group". All three yield ``new_endpoint_uuid=None``, and
+    #: the last two are a DELIBERATE collapse (leaf eta's ``ensure_entity_node``
+    #: resolves-or-mints and handles them identically); this flag is what stops
+    #: the first from being folded in with them.
+    #:
+    #: THE CONCRETE STAKE. Task 3672's landed repair path reads
+    #: :attr:`new_endpoint_uuid` at exactly ONE site —
+    #: ``minted=finding.new_endpoint_uuid is None`` in
+    #: :meth:`_repair_episode_referents` — so today a transient FalkorDB error
+    #: books as ``minted=True`` telemetry: a node reported as newly created
+    #: where in fact nobody could look. This flag is the discriminator that
+    #: makes that a one-line fix in eta; zeta produces it and does not act on it
+    #: (that consequence is filed as its own follow-up).
+    #:
+    #: Fail-closed like :attr:`resolvable`: a finding whose lookup never ran —
+    #: one with no ``intended_referent`` — is not a finding whose lookup was
+    #: degraded, so the default is ``False``.
+    uuid_lookup_degraded: bool = False
     #: Whether a correct target was determined. Defaults False — fail-closed.
     resolvable: bool = False
     #: Why not, when :attr:`resolvable` is False. Empty on a resolvable
@@ -1859,6 +1879,7 @@ class ReferentFinding:
                 else None
             ),
             'new_endpoint_uuid': self.new_endpoint_uuid,
+            'uuid_lookup_degraded': self.uuid_lookup_degraded,
             'resolvable': self.resolvable,
             'reason': self.reason,
         }
@@ -4034,19 +4055,27 @@ class MemoryService:
         # findings alone so the ~99.8% clean path issues ZERO extra queries
         # inside the per-group identity lock. One query per DISTINCT intended
         # referent, cached for this call.
-        uuid_by_name: dict[str, str | None] = {}
+        lookup_by_name: dict[str, tuple[str | None, bool]] = {}
         for index, finding in enumerate(stats.findings):
             if finding.intended_referent is None:
                 continue
             name = finding.intended_referent.node_name
-            if name not in uuid_by_name:
-                uuid_by_name[name] = await self._intended_endpoint_uuid(
+            if name not in lookup_by_name:
+                lookup_by_name[name] = await self._intended_endpoint_uuid(
                     name, group_id=group_id,
                 )
+            # The DEGRADATION is cached with the uuid, not re-derived: two
+            # findings pointing at the same intended referent share one lookup,
+            # so they must share its verdict too — a second finding reading
+            # `degraded=False` off a lookup that never re-ran would be exactly
+            # the drift caching exists to avoid.
+            endpoint_uuid, degraded = lookup_by_name[name]
             # `dataclasses.replace`, never mutation: the record is frozen
             # because it is evidence for destructive edge surgery.
             stats.findings[index] = dataclasses.replace(
-                finding, new_endpoint_uuid=uuid_by_name[name],
+                finding,
+                new_endpoint_uuid=endpoint_uuid,
+                uuid_lookup_degraded=degraded,
             )
 
         # THE CAP IS ON THE LOG AND ON NOTHING ELSE. Both counters below and
@@ -4147,7 +4176,7 @@ class MemoryService:
 
     async def _intended_endpoint_uuid(
         self, name: str, *, group_id: str
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         """The uuid of the node *name* denotes, or ``None`` — never a write.
 
         ``get_nodes_by_exact_name`` SPECIFICALLY, because it is documented
@@ -4169,6 +4198,20 @@ class MemoryService:
         backend error degrades the uuid to ``None`` rather than losing the
         finding. Detection is the primary result and the uuid is an audit
         convenience, so a lookup failure must not cost the evidence.
+
+        THE THIRD OUTCOME IS REPORTED, NOT COLLAPSED. The two paragraphs above
+        describe DELIBERATE collapses — absent and duplicate-name-group are one
+        answer because eta treats them as one. A backend that would not answer
+        at all is a different thing entirely, and returning a bare ``None`` for
+        it made "could not look" indistinguishable from "not there" at the one
+        site eta reads (``minted=finding.new_endpoint_uuid is None``). Hence the
+        pair: the uuid, and whether the lookup was DEGRADED. See
+        :attr:`ReferentFinding.uuid_lookup_degraded`.
+
+        Returns:
+            ``(uuid_or_None, degraded)``. ``degraded`` is ``True`` only for the
+            exception path — a clean lookup returning zero or many rows is an
+            ANSWER, and reports ``False``.
         """
         try:
             rows = await self.graphiti.get_nodes_by_exact_name(
@@ -4182,8 +4225,8 @@ class MemoryService:
                 'referent verification; recording the finding without one',
                 name, exc_info=True,
             )
-            return None
-        return rows[0]['uuid'] if len(rows) == 1 else None
+            return None, True
+        return (rows[0]['uuid'] if len(rows) == 1 else None), False
 
     async def _repair_episode_referents(
         self, stats: ReferentStats, *, group_id: str, episode_uuid: str = ''
