@@ -607,6 +607,35 @@ def parse_first_party_tree(repo_root: Path | str) -> tuple[ParsedFile, ...]:
       them together. A consumer that needs a specific file re-raises the
       recorded error itself.
 
+    COST — BOTH HALVES, because this trades CPU for resident memory and only
+    the CPU half is visible in a test duration. Measured on this worktree,
+    467 first-party files:
+
+    * CPU, the win: one cold read+parse of the whole tree is 5.0-5.6s, paid
+      ONCE per session. Before this provider the same tree was read twice and
+      parsed three times, and because pytest-timeout arms its timer over the
+      whole runtest protocol the duplicated work was charged to whichever
+      single test item happened to trigger a gate's fixture — 23.68s of setup
+      against a 60s budget (task 4520).
+    * MEMORY, the price: the returned records retain ~361 MB (peak 362 MB) —
+      ~21 MB of source text and ~340 MB of ``ast.Module`` — and, memoized for
+      the life of the process, they are never evicted. The pre-4520 ASTs were
+      TRANSIENT: each was parsed inside ``find_violations``, walked and
+      dropped, so steady-state retention was the violation list alone
+      (kilobytes). This is a step-change in a suite's RSS, and it lands
+      exactly when it is least welcome — on a host running several suites
+      concurrently, which is the oversubscription that made the CPU half a
+      problem in the first place.
+
+    The trade is deliberate and currently made in CPU's favour. If the memory
+    half starts to matter, the lever is to stop keeping every ``ast.Module``
+    alive — a per-record lazy parse, so files no gate ever walks are never
+    materialised. It is NOT ``_reset_parse_cache()`` on fixture teardown: a
+    session-scoped fixture finalises just before the process exits, so that
+    would release the memory moments before the OS did anyway, while making
+    any later ``parse_first_party_tree`` call re-read and re-parse all 467
+    files.
+
     Returns:
         An immutable tuple of :class:`ParsedFile`, in ``iter_first_party_files``
         order. The same tuple object is returned on every subsequent call for

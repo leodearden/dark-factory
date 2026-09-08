@@ -109,6 +109,12 @@ def first_party_tree():
     memoized on the resolved root, so a direct
     ``parse_first_party_tree(REPO_ROOT)`` call returns the same object.
 
+    That cost has two halves, and this fixture is what makes the second one
+    process-lifetime: ~5s of CPU paid once, and ~361 MB of ASTs retained until
+    the process exits (they were transient before task 4520).
+    ``parse_first_party_tree``'s docstring records both measurements and why
+    the trade is currently made in CPU's favour — read it before tuning either.
+
     Consumers walk the ASTs READ-ONLY — they are shared with every other gate.
     """
     from silent_fallthrough_scan import parse_first_party_tree
