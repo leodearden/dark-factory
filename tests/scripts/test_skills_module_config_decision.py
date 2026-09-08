@@ -212,10 +212,11 @@ SKILLS_CONSUMING_TESTS = (
     # payload literals against the live parser (task 5374).
     "tests/scripts/test_shadow_ruling_doc_contract.py",
     # Reads skills/prd/references/gates.md live via GATES_DOC.read_text() (the
-    # gates-family-inventory-row and inv-trigger-shapes marked-span checks), and
-    # its _enumeration_scan_files() walks every .md repo-wide with no skills/
-    # prune, feeding test_every_enumeration_site_is_pinned — the single
-    # broadest skills/ consumer in the repo (task 4941).
+    # gates-family-inventory-row and inv-trigger-shapes marked-span checks).
+    # _enumeration_scan_files() (.md) and _citation_scan_files() (.py + .md)
+    # both walk the repo with no skills/ prune, feeding
+    # test_every_enumeration_site_is_pinned and the citation-drift checks —
+    # the single broadest skills/ consumer in the repo (task 4941).
     "scripts/tests/test_design_invariants_consistency.py",
 )
 
