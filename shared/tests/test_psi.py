@@ -77,6 +77,89 @@ class TestParsePressureFileRehome:
         assert parse_pressure_file(PSI_MEM_TEXT) is not None
 
 
+class TestPsiSampleV2Fields:
+    """PRD `plans/load-throttle-harmonisation-prd.md` §6.1 — the v2 field surface.
+
+    The five v2 fields are appended WITH defaults so every shipped keyword
+    construction is unaffected (census: all 17 repo-wide are keyword).
+    """
+
+    V2_FIELD_ORDER = (
+        'cpu_some10',
+        'mem_some10',
+        'mem_full10',
+        'io_some10',
+        'read_ok',
+        'runqueue_ratio',
+        'runqueue_read_ok',
+        'own_cpu_some10',
+        'own_cgroup',
+        'own_read_ok',
+    )
+
+    def test_v1_construction_still_works_and_v2_fields_default(self):
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=10.0,
+            mem_some10=5.0,
+            mem_full10=1.0,
+            io_some10=5.0,
+            read_ok=True,
+        )
+        assert sample.runqueue_ratio == 0.0
+        assert sample.runqueue_read_ok is False
+        assert sample.own_cpu_some10 == 0.0
+        assert sample.own_cgroup == ''
+        assert sample.own_read_ok is False
+
+    def test_v2_fields_settable_by_keyword(self):
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=10.0,
+            mem_some10=5.0,
+            mem_full10=1.0,
+            io_some10=5.0,
+            read_ok=True,
+            runqueue_ratio=4.3,
+            runqueue_read_ok=True,
+            own_cpu_some10=55.0,
+            own_cgroup='/df.slice/df-x.slice',
+            own_read_ok=True,
+        )
+        assert sample.runqueue_ratio == pytest.approx(4.3)
+        assert sample.runqueue_read_ok is True
+        assert sample.own_cpu_some10 == pytest.approx(55.0)
+        assert sample.own_cgroup == '/df.slice/df-x.slice'
+        assert sample.own_read_ok is True
+
+    def test_v2_instance_stays_frozen(self):
+        import dataclasses
+
+        from shared.psi import PsiSample
+
+        sample = PsiSample(
+            cpu_some10=10.0,
+            mem_some10=5.0,
+            mem_full10=1.0,
+            io_some10=5.0,
+            read_ok=True,
+            runqueue_ratio=4.3,
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            sample.runqueue_ratio = 9.0  # type: ignore[misc]
+
+    def test_field_order_appends_v2_fields_last(self):
+        """The five v1 fields keep their positional slots (§6.1)."""
+        import dataclasses
+
+        from shared.psi import PsiSample
+
+        names = tuple(f.name for f in dataclasses.fields(PsiSample))
+        assert names == self.V2_FIELD_ORDER
+
+
 def _saturation_cfg():
     """Duck-typed cfg stub shaped like DA2's PsiAdmissionConfig (sibling task, not landed)."""
     return types.SimpleNamespace(
