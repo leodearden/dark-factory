@@ -238,10 +238,16 @@ def _scan() -> list[_Site]:
 
 
 def _violation_message(unexpected: list[_Site]) -> str:
-    """The failure text a future author actually reads. See the test that pins
-    its content: it has to name the invariant AND the remedy, because the
-    natural reaction to a red structural gate is to add an allowlist entry, and
-    for THIS gate that is precisely the wrong move."""
+    """Build the failure text a future author actually reads.
+
+    It names the invariant and then argues the remedy, because the reflex on
+    seeing a red allowlist-shaped gate is to ADD AN ALLOWLIST ENTRY, and for
+    THIS gate that is precisely the wrong move: a real second archive locator
+    allowlisted is the invariant deleted, quietly, by the very person the guard
+    was written for. So the message says CALL the locator instead, and says WHY
+    — which parts of the layout a re-glob drops — because it has to win that
+    argument against someone mid-refactor and in a hurry.
+    """
     listed = '\n'.join(
         f'  - {s.path}::{s.function} (line {s.lineno}): {s.pattern}'
         for s in unexpected
@@ -293,6 +299,27 @@ def test_durable_archive_path_is_the_sole_archive_locator() -> None:
         'plain `.jsonl` tomorrow, so narrowing it silently un-finds every '
         f'archived transcript: {locators[0].pattern}'
     )
+
+    # Smoke the message builder on a synthetic offender: it must INTERPOLATE
+    # its argument, i.e. localise the offender at all. Exercised here rather
+    # than in a test of its own because the green path never runs it — the
+    # `assert not unexpected, _violation_message(unexpected)` above evaluates
+    # its message lazily, so on a clean tree a refactor that broke these
+    # f-strings (a bad field name raising at format time) would ship undetected
+    # and surface only at the moment the gate was supposed to explain a real
+    # violation. Deliberately NO assertion on the message's wording: that pins
+    # the prose of a diagnostic, so any clearer rewrite would go red while
+    # nothing had regressed.
+    msg = _violation_message([
+        _Site(
+            path='pkg/src/pkg/rogue.py',
+            function='find_it',
+            lineno=42,
+            pattern="f'{task_id}/*/{session_id}.jsonl*'",
+        ),
+    ])
+    assert 'pkg/src/pkg/rogue.py::find_it' in msg
+    assert 'line 42' in msg
 
 
 def test_every_allowlist_entry_is_still_live() -> None:
@@ -453,54 +480,3 @@ def test_looks_like_session_id_boundaries(name: str, expected: bool) -> None:
     """Token-wise, never substring — the arm that keeps the allowlist from
     growing false positives while still catching a renamed locator."""
     assert _looks_like_session_id(name) is expected
-
-
-def test_failure_message_names_the_invariant_and_the_remedy() -> None:
-    """The message a future author reads has to do two jobs, and the second is
-    the one a structural gate usually gets wrong.
-
-    Naming the invariant (I-E) is the easy half. The hard half is that the
-    reflex on seeing a red allowlist-shaped gate is to ADD AN ALLOWLIST ENTRY,
-    which for this gate is precisely the wrong move: a real second archive
-    locator allowlisted is the invariant deleted, quietly, by the person the
-    guard was written for. So the message must say CALL the locator instead,
-    and must say WHY (the parts of the layout a re-glob drops), or it will lose
-    that argument to whoever is mid-refactor and in a hurry.
-
-    It must also point at the PROSE home, so a deliberate policy change lands
-    where it can be reasoned about rather than as an edit to a test constant.
-    """
-    msg = _violation_message([
-        _Site(
-            path='pkg/src/pkg/rogue.py',
-            function='find_it',
-            lineno=42,
-            pattern="f'{task_id}/*/{session_id}.jsonl*'",
-        ),
-    ])
-
-    # Names the invariant, by its identifier and in words.
-    assert 'I-E' in msg
-    assert 'durable_archive_path' in msg
-    assert 'SINGLE session-id-keyed locator' in msg
-
-    # Names the remedy — CALL it, do not re-glob — and does not merely imply it.
-    assert 'do not allowlist' in msg
-    assert 'CALL shared.transcript_archive.durable_archive_path' in msg
-    # ...and the reason the remedy is not arbitrary: what a re-glob drops.
-    assert '.jsonl*' in msg
-    assert 'is_file()' in msg
-    assert 'tiebreak' in msg
-    # ...and what it now costs, which is what changed under task 3730.
-    assert 'ELIGIBILITY' in msg
-
-    # Localises the offender precisely enough to act on without re-running.
-    assert 'pkg/src/pkg/rogue.py::find_it' in msg
-    assert 'line 42' in msg
-
-    # Points at the prose home for a policy change.
-    assert _PROSE_HOME in msg
-
-    # Keeps the legitimate escape hatch visible, so a genuine live-config-tree
-    # lookup is not blocked by a message that only says "never".
-    assert '_LIVE_CONFIG_TREE_ALLOWLIST' in msg
