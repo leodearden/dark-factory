@@ -161,13 +161,51 @@ class TestPsiSampleV2Fields:
 
 
 def _saturation_cfg():
-    """Duck-typed cfg stub shaped like DA2's PsiAdmissionConfig (sibling task, not landed)."""
+    """Duck-typed cfg stub in the v2 CODE-DEFAULT shape (PRD §6.2).
+
+    ``cpu_some_avg10``, ``runqueue_ratio`` and ``own_cpu_some_avg10`` are
+    ``None`` — off by code default (D1, D2). A test that needs an arm switched
+    on says so explicitly via ``_configured_cfg``, which is why the 85.0 that
+    used to live here now appears only where an operator-set cpu arm is the
+    thing under test.
+    """
     return types.SimpleNamespace(
-        cpu_some_avg10=85.0,
+        cpu_some_avg10=None,
         mem_some_avg10=15.0,
         mem_full_avg10=3.0,
         io_some_avg10=40.0,
+        runqueue_ratio=None,
+        own_cpu_some_avg10=None,
     )
+
+
+def _configured_cfg(**overrides):
+    """The v2 default stub with the named arms switched on."""
+    cfg = _saturation_cfg()
+    for name, value in overrides.items():
+        assert hasattr(cfg, name), name
+        setattr(cfg, name, value)
+    return cfg
+
+
+def _healthy_sample(**overrides):
+    """A host-readable all-quiet sample; overrides raise the arm under test."""
+    from shared.psi import PsiSample
+
+    fields = dict(
+        cpu_some10=0.0,
+        mem_some10=0.0,
+        mem_full10=0.0,
+        io_some10=0.0,
+        read_ok=True,
+        runqueue_ratio=0.0,
+        runqueue_read_ok=True,
+        own_cpu_some10=0.0,
+        own_cgroup='/df.slice/df-x.slice',
+        own_read_ok=True,
+    )
+    fields.update(overrides)
+    return PsiSample(**fields)
 
 
 class TestPsiSampleSaturated:
@@ -186,7 +224,8 @@ class TestPsiSampleSaturated:
         with pytest.raises(dataclasses.FrozenInstanceError):
             sample.cpu_some10 = 99.0  # type: ignore[misc]
 
-    def test_cpu_some_only_trips_saturation(self):
+    def test_cpu_some_trips_when_an_operator_configures_it(self):
+        """D1 turns the cpu arm off by default; it does not remove it."""
         from shared.psi import PsiSample
 
         sample = PsiSample(
@@ -196,7 +235,7 @@ class TestPsiSampleSaturated:
             io_some10=30.0,
             read_ok=True,
         )
-        assert sample.saturated(_saturation_cfg()) is True
+        assert sample.saturated(_configured_cfg(cpu_some_avg10=85.0)) is True
 
     def test_mem_some_only_trips_saturation(self):
         from shared.psi import PsiSample
@@ -270,6 +309,84 @@ class TestPsiSampleSaturated:
             io_some_avg10=0.0,
         )
         assert sample.saturated(zero_threshold_cfg) is False
+
+
+class TestSaturatedV2Arms:
+    """PRD §6.1 saturated() semantics: an arm never trips when its cfg
+    threshold is None or its component read_ok is False; host read_ok=False
+    still suppresses the WHOLE sample including the new arms (DA-D6).
+    """
+
+    def test_none_threshold_never_trips_cpu_arm(self):
+        """§7 row 4 — cpu_some10=99 against the v2 default stub."""
+        sample = _healthy_sample(cpu_some10=99.0)
+        assert sample.saturated(_saturation_cfg()) is False
+
+    def test_none_threshold_never_trips_runqueue_arm(self):
+        """§7 row 4 — runqueue_ratio=9 with cfg runqueue_ratio=None."""
+        sample = _healthy_sample(runqueue_ratio=9.0)
+        assert sample.saturated(_saturation_cfg()) is False
+
+    def test_none_threshold_never_trips_own_arm(self):
+        sample = _healthy_sample(own_cpu_some10=99.0)
+        assert sample.saturated(_saturation_cfg()) is False
+
+    def test_runqueue_arm_trips_when_configured_and_component_ok(self):
+        sample = _healthy_sample(runqueue_ratio=4.3, runqueue_read_ok=True)
+        assert sample.saturated(_configured_cfg(runqueue_ratio=4.0)) is True
+
+    def test_runqueue_arm_inert_when_component_read_failed(self):
+        """Same values, runqueue_read_ok=False — the arm must stay inert."""
+        sample = _healthy_sample(runqueue_ratio=4.3, runqueue_read_ok=False)
+        assert sample.saturated(_configured_cfg(runqueue_ratio=4.0)) is False
+
+    def test_own_arm_trips_when_configured_and_component_ok(self):
+        """§7 row 7 — own arm trips while every host arm is idle."""
+        sample = _healthy_sample(own_cpu_some10=55.0, own_read_ok=True)
+        assert sample.saturated(_configured_cfg(own_cpu_some_avg10=50.0)) is True
+
+    def test_own_arm_inert_when_component_read_failed(self):
+        """§7 row 3 — an unreadable slice file cannot trip the own arm."""
+        sample = _healthy_sample(own_cpu_some10=55.0, own_read_ok=False)
+        assert sample.saturated(_configured_cfg(own_cpu_some_avg10=50.0)) is False
+
+    def test_host_read_ok_false_suppresses_both_new_arms(self):
+        """DA-D6 — the outer host gate outranks every component flag."""
+        sample = _healthy_sample(
+            read_ok=False,
+            runqueue_ratio=9.0,
+            runqueue_read_ok=True,
+            own_cpu_some10=99.0,
+            own_read_ok=True,
+        )
+        cfg = _configured_cfg(runqueue_ratio=4.0, own_cpu_some_avg10=50.0)
+        assert sample.saturated(cfg) is False
+
+    def test_v1_cfg_without_new_attributes_is_tolerated(self):
+        """The alpha-before-beta ordering guard.
+
+        `scheduler.py::_phase_psi_gate` calls saturated() in live dispatch, and
+        between this change and beta's `PsiAdmissionConfig` v2 the cfg object
+        still carries only the four v1 thresholds. An absent attribute must
+        read as "arm off", not raise AttributeError inside the gate.
+        """
+        v1_cfg = types.SimpleNamespace(
+            cpu_some_avg10=85.0,
+            mem_some_avg10=15.0,
+            mem_full_avg10=3.0,
+            io_some_avg10=40.0,
+        )
+        sample = _healthy_sample(runqueue_ratio=9.0, own_cpu_some10=99.0)
+        assert sample.saturated(v1_cfg) is False
+
+    def test_v1_cfg_still_evaluates_the_host_arms(self):
+        v1_cfg = types.SimpleNamespace(
+            cpu_some_avg10=85.0,
+            mem_some_avg10=15.0,
+            mem_full_avg10=3.0,
+            io_some_avg10=40.0,
+        )
+        assert _healthy_sample(mem_full10=3.0).saturated(v1_cfg) is True
 
 
 class TestReadPsiSampleHappyPath:
