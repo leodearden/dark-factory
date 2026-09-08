@@ -1222,7 +1222,9 @@ prose
 
 ## Filed Tasks
 
-- 1
+_1 ticket(s) filed -- the curator's create/combine/drop decision is still pending, so no task id exists yet; resolve_ticket returns the task id once it does._
+
+- tkt_1
 
 ## Cost
 
@@ -1237,7 +1239,16 @@ flags introduce must be gated on a non-None flag value, so a run that
 passes none of them renders exactly this. Do NOT regenerate this constant
 to make a failing run pass -- a diff here means a cost-control rendering
 leaked into the unflagged path (and therefore into the nightly trickle,
-which launches census.py with no extra argv)."""
+which launches census.py with no extra argv).
+
+REVISED 2026-09-08 (task 4965), deliberately and for a reason unrelated to
+the leak above: the Filed Tasks body used to present the filed ids as TASK
+ids, which they never were. submit_task answers the curator path with a
+TICKET id and the create/combine/drop decision lands later, so the body now
+says so and the lock's input moved from `filed_task_ids=["1"]` (a bare "1"
+that reads as a task id) to `filed_ticket_ids=["tkt_1"]`. A future diff here
+is still the cost-control leak this lock exists to catch -- this one entry is
+the only sanctioned edit, and it is recorded so the two are distinguishable."""
 
 
 def _capped_mining_result(*, stop_reason, max_batches, batches=2):
@@ -1527,23 +1538,55 @@ def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
         dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
     )
 
-    section = report.split("## Filed Tasks", 1)[1].split("##", 1)[0]
+    section = report.split("## Filed Tasks", 1)[1].split("\n##", 1)[0]
     assert "_none filed._" not in section
     assert "dry-run" in section.lower()
     assert "nothing filed" in section.lower()
+    # Neither of the other two branches may leak in behind the dry-run wording.
+    assert "resolve_ticket" not in section
+    assert "create/combine/drop" not in section
+
+
+def test_render_report_filed_section_names_tickets_and_a_pending_decision():
+    # The ids in this section are TICKET ids: submit_task answers the curator
+    # path with {"ticket": ...} and the create/combine/drop decision lands
+    # asynchronously, so no task id exists when this report is written.
+    # Presenting them as task ids is the false claim task 4965 removes.
+    section = _render(filed_ticket_ids=["tkt_1", "tkt_2"]).split(
+        "## Filed Tasks", 1)[1].split("\n##", 1)[0]
+
+    assert "2 ticket" in section, "the section must name how many tickets were filed"
+    assert "pending" in section.lower(), "the curator decision is not yet made -- say so"
+    assert "create/combine/drop" in section, "name the decision that is pending"
+    assert "no task id exists yet" in section, (
+        "a reader must not take a ticket id for a task id -- fused-memory hard "
+        "rejects a ticket-shaped id where a task id is expected"
+    )
+    assert "resolve_ticket" in section, (
+        "name the handle that turns a ticket id into the eventual task id"
+    )
+    # The ids themselves stay: a ticket id is directly actionable, so the
+    # preamble supplies the semantics WITHOUT costing the operator the handle.
+    assert "- tkt_1" in section
+    assert "- tkt_2" in section
 
 
 def test_render_report_without_dry_run_filed_tasks_section_unchanged():
-    filed = _render(filed_ticket_ids=["1234", "1235"])
-    filed_section = filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "- 1234" in filed_section
-    assert "- 1235" in filed_section
+    filed = _render(filed_ticket_ids=["tkt_1234", "tkt_1235"])
+    filed_section = filed.split("## Filed Tasks", 1)[1].split("\n##", 1)[0]
+    assert "- tkt_1234" in filed_section
+    assert "- tkt_1235" in filed_section
     assert "dry-run" not in filed_section.lower()
 
+    # The empty branch is UNCHANGED -- no ticket count, no pending prose, just
+    # the placeholder. A run that filed nothing must not acquire a disclosure
+    # about a decision that was never triggered.
     none_filed = _render(filed_ticket_ids=[])
-    none_section = none_filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
+    none_section = none_filed.split("## Filed Tasks", 1)[1].split("\n##", 1)[0]
     assert "_none filed._" in none_section
     assert "dry-run" not in none_section.lower()
+    assert "ticket" not in none_section.lower()
+    assert "pending" not in none_section.lower()
 
 
 def test_render_report_flagless_output_is_byte_identical_golden():
@@ -1554,7 +1597,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_ticket_ids=["1"],
+        filed_ticket_ids=["tkt_1"],
         cost_note="cost",
     )
     assert report == _GOLDEN_FLAGLESS_REPORT
