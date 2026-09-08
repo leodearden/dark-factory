@@ -1397,3 +1397,54 @@ def test_task_4892_coding_record_applies_idempotently_to_the_live_codebook():
         )
 
     assert mod.validate(codebook) == []
+
+
+# ---------------------------------------------------------------------------
+# task 4892 step-4: RED (live-file guard) — the lettered-option-collision
+# pattern is recorded as a PENDING CANDIDATE, never a fabricated entry.
+# ---------------------------------------------------------------------------
+
+_T4892_CANDIDATE_SESSION = "task-4892-lettered-option-collision"
+
+
+def test_live_codebook_carries_the_lettered_option_collision_candidate():
+    """FIX 2 lands as a pending candidate — forced by the mechanism, not chosen.
+
+    `apply_coding_record` never fabricates an entry ("only the census promotes
+    candidates to entries"), and no existing entry or candidate covers the
+    pattern, so there is nothing to match against either. Candidate is the only
+    disposition the sole-writer path can produce, and it correctly routes
+    adjudication to the census — the body chartered to decide whether a single
+    observation deserves promotion.
+
+    Located by SIGHTING SESSION, deliberately not by literal candidate id:
+    `apply_coding_record` derives the `-<n>` suffix from how many same-date
+    candidates already exist, so a rebase against a nightly merger run
+    legitimately shifts `cand-20260908-<n>`. The session is stable.
+
+    Presence and disposition only — no assertion on title/cause prose, matching
+    the identity style of the live-corpus tests above.
+    """
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+
+    carrying = [
+        c
+        for c in codebook.get("candidates") or []
+        if any(
+            s.get("session") == _T4892_CANDIDATE_SESSION
+            for s in (c.get("sightings") or [])
+        )
+    ]
+    assert len(carrying) == 1, (
+        f"expected exactly one candidate carrying a {_T4892_CANDIDATE_SESSION!r} "
+        f"sighting, found {[c.get('id') for c in carrying]}"
+    )
+    candidate = carrying[0]
+
+    assert candidate.get("disposition") == "pending", (
+        "the merger must never fabricate an adjudication — only census.py "
+        f"writes disposition, got {candidate.get('disposition')!r}"
+    )
+    assert mod._CANDIDATE_ID_RE.match(candidate.get("id") or ""), (
+        f"candidate id does not match cand-<yyyymmdd>-<n>: {candidate.get('id')!r}"
+    )
