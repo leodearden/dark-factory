@@ -884,14 +884,25 @@ async def enumerate_valid_edge_facts(
     kind: str | None = None
 
     if structurally_incomplete:
-        reason = (
+        message = (
             f'enumerate_valid_edge_facts: hit the {max_pages}-page cap '
             f'(page_size={page_size}, enumerated={len(facts)}) while the last '
             f'page was still full — enumeration is incomplete. Re-run with a '
             f'larger --page-size.'
         )
+        logger.warning('%s', message)
+        # The carry-through rule this function's docstring states, applied
+        # here too — it used to be the one arm that broke it. The paginator
+        # observed this page cap and worded it, so ITS prose is what reaches
+        # the artifact; keeping its KIND while minting fresh PROSE produced a
+        # committed row whose `error` and `error_kind` came from different
+        # layers, which is the artifact/backend-log mismatch the rule exists
+        # to prevent. The message just logged is this function's separate
+        # account — stated in distinct edges, and carrying the remedy — and it
+        # is recorded only where the paginator reached a structural verdict
+        # with nothing to say.
+        reason = paged.reason or message
         kind = paged.incomplete_kind
-        logger.warning('%s', reason)
     elif census_before is None:
         reason = (
             'enumerate_valid_edge_facts: the census probe returned no usable '
@@ -909,7 +920,15 @@ async def enumerate_valid_edge_facts(
         )
         kind = INCOMPLETE_CENSUS_UNAVAILABLE
         logger.warning('%s', reason)
-    elif len(facts) < floor:
+    # `floor is not None` is RE-STATED rather than inherited from the two
+    # arms above. This arm compares against it and its body subtracts from it,
+    # and a chain whose None-safety rests on the ORDER of its neighbours
+    # becomes a TypeError the moment an arm is inserted or moved — inside the
+    # function whose entire job is to fail closed. Stated here, the narrowing
+    # is checked by pyright rather than by a reader tracing the chain. It
+    # cannot change which arm fires: `floor` is None exactly when one of the
+    # two census arms above has already fired.
+    elif floor is not None and len(facts) < floor:
         if corpus_moved:
             message = (
                 f'enumerate_valid_edge_facts: enumerated {len(facts)} distinct '

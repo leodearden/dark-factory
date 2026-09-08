@@ -580,6 +580,9 @@ def test_the_probe_and_production_read_the_same_population():
 
 
 _PAGE_SIZE = 4
+# Small enough that a 50-edge corpus cannot be read inside it, so the cap is
+# reached with the last page still full — the structural shortfall condition.
+_DELTA_PAGE_CAP = 3
 
 # Sentinel: derive the census count from the fake's own rows. A plain None
 # default would be indistinguishable from 'the probe answered None', which
@@ -2189,23 +2192,30 @@ async def test_every_incomplete_project_names_why_in_the_artifact():
     incomplete row, and a stray error string on a healthy one — which is what
     makes the field trustworthy enough to read without cross-checking a log.
 
-    The three graphs are the three shapes a reader has to be able to tell
+    The four graphs are the four shapes a reader has to be able to tell
     apart in a committed artifact months later, and today cannot:
 
     - ``alpha`` enumerated cleanly;
     - ``beta`` NEVER enumerated (its graph vanished mid-run — the KeyError
       path), so no query reached the paginator at all;
-    - ``gamma`` enumerated and came back SHORT of a census that bracketed it.
+    - ``gamma`` enumerated and came back SHORT of a census that bracketed it;
+    - ``delta`` exhausted the PAGE CAP with the last page still full — a
+      structural shortfall, and the second of the two paths where the
+      paginator, not this probe, is the layer that reached the verdict.
 
     ``beta`` and ``gamma`` are recorded identically today: ``valid_edges: 0``
     versus a partial count, both ``complete: false``, neither saying why. The
     responses they call for are opposite — re-run for the first, raise
     ``--page-size`` for the second.
 
-    ONE TAXONOMY, not two. ``gamma``'s kind is graphiti_client's own
-    ``INCOMPLETE_*`` value and its reason is the paginator's own prose,
-    verbatim, so the artifact and the backend's logs name the same failure
-    with the same string and nobody has to build a mapping between them. Only
+    ONE TAXONOMY, not two. ``gamma``'s and ``delta``'s kinds are
+    graphiti_client's own ``INCOMPLETE_*`` values and their reasons are the
+    paginator's own prose, verbatim, so the artifact and the backend's logs
+    name the same failure with the same string and nobody has to build a
+    mapping between them. BOTH paginator-judged paths are pinned, not just
+    the short read: an arm that kept the shipped KIND while minting fresh
+    PROSE would commit a row whose two halves came from different layers, and
+    pinning only one path left the other free to do exactly that. Only
     ``beta`` needs a probe-level kind, because no shipped kind describes a
     read that was never attempted.
 
@@ -2223,7 +2233,13 @@ async def test_every_incomplete_project_names_why_in_the_artifact():
     short_query = _FakeMovingCorpusQuery(
         _fake_rows(40), cap=_PAGE_SIZE, counts=[50, 51],
     )
-    queries = {'alpha': complete_query, 'gamma': short_query}
+    # 50 edges behind a 3-page cap at page_size=4: the loop stops with the
+    # last page still full, which is a STRUCTURAL shortfall the paginator
+    # itself diagnoses and words.
+    page_cap_query = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
+    queries = {
+        'alpha': complete_query, 'gamma': short_query, 'delta': page_cap_query,
+    }
 
     # What the SHIPPED paginator says about that same read, read off a twin
     # fake so the expectation is the layer's own wording rather than a copy
@@ -2239,9 +2255,28 @@ async def test_every_incomplete_project_names_why_in_the_artifact():
     )).reason
     assert short_query_reason, 'the paginator must have something to say'
 
+    page_cap_reason = (await _mod._paged_ro_query(
+        _mod._QueryFnGraph(_FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)),
+        _mod._EDGE_PAGE_CYPHER,
+        _mod._EDGE_COUNT_CYPHER,
+        page_size=_PAGE_SIZE,
+        max_pages=_DELTA_PAGE_CAP,
+    )).reason
+    assert page_cap_reason, 'the paginator must have something to say'
+    assert page_cap_reason != short_query_reason, (
+        'the two shortfalls must be distinguishable, or this test cannot tell '
+        'a carried-through reason from a coincidence'
+    )
+
     async def edge_source(project_id: str, *, page_size: int):
         # 'beta' is absent — the vanished-graph case, raised from the same
         # place a live backend would raise it.
+        if project_id == 'delta':
+            return await enumerate_valid_edge_facts(
+                queries[project_id],
+                page_size=page_size,
+                max_pages=_DELTA_PAGE_CAP,
+            )
         return await enumerate_valid_edge_facts(
             queries[project_id], page_size=page_size,
         )
@@ -2249,7 +2284,7 @@ async def test_every_incomplete_project_names_why_in_the_artifact():
     report = await run(
         _args(project_id=None, page_size=_PAGE_SIZE),
         edge_source=edge_source,
-        graph_lister=_lister('alpha', 'beta', 'gamma'),
+        graph_lister=_lister('alpha', 'beta', 'gamma', 'delta'),
     )
 
     by_id = {p.project_id: p for p in report.projects}
@@ -2293,6 +2328,18 @@ async def test_every_incomplete_project_names_why_in_the_artifact():
     assert by_id['gamma'].census_before == 50
     assert by_id['gamma'].census_after == 51
 
+    assert by_id['delta'].complete is False
+    assert by_id['delta'].error_kind == graphiti_client.INCOMPLETE_PAGE_CAP
+    assert by_id['delta'].error == page_cap_reason, (
+        "the page cap is the paginator's own verdict too, so its prose is "
+        'carried through verbatim exactly as the short read is — an arm that '
+        'kept the shipped kind but minted its own message would put the two '
+        'halves of one committed row in two different vocabularies'
+    )
+    assert by_id['delta'].valid_edges == _DELTA_PAGE_CAP * _PAGE_SIZE, (
+        'the cap must have truncated the read, or this row proves nothing'
+    )
+
     payload = json.loads(render_json(report))
     assert payload['schema_version'] == 3, (
         'the fields below are new; a schema-2 artifact beside this renderer '
@@ -2312,8 +2359,10 @@ async def test_every_incomplete_project_names_why_in_the_artifact():
     # carries the diagnostic reason. A bare `**NO**` is the defect.
     assert _mod.ENUMERATION_FAILED in markdown
     assert graphiti_client.INCOMPLETE_SHORT_READ in markdown
+    assert graphiti_client.INCOMPLETE_PAGE_CAP in markdown
     assert by_id['beta'].error in markdown
     assert by_id['gamma'].error in markdown
+    assert by_id['delta'].error in markdown
     for line in markdown.splitlines():
         if line.startswith('| `') and '**NO**' in line:
             assert line.count('`') > 2, (
