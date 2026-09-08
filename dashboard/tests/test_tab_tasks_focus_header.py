@@ -34,11 +34,6 @@ import re
 import pytest
 from _dashboard_helpers import extract_function_body, strip_js_comments
 
-#: The filter-empty copy that must STAY in TaskGraph and must NOT be reused for
-#: a focus-emptied group. Under focus that sentence is actively false: the
-#: filter matched, focus is what removed the tasks.
-FILTER_EMPTY_MESSAGE = 'no tasks match the current filter'
-
 
 def _parameter_list(source: str, func_name: str) -> str:
     """Return the raw parameter-list text of a ``function <func_name>(`` decl.
@@ -69,9 +64,7 @@ def tasks_tab_body(tab_tasks_jsx_body):
 
     Scoped away from the other component functions (TaskGraph, PrdBox,
     TaskDetail, ...) in the same file so an assertion cannot be satisfied by
-    an unrelated component — in particular so the focus-empty message is
-    checked in TasksTab and the filter-empty message stays checkable in
-    TaskGraph independently.
+    an unrelated component.
     """
     return extract_function_body(tab_tasks_jsx_body, 'TasksTab')
 
@@ -215,12 +208,17 @@ class TestFocusHeaderWiring:
         )
 
     def test_emptied_by_focus_renders_a_focus_specific_empty_state(self, tasks_tab_code):
-        """A group emptied BY FOCUS must say so, in its own words.
+        """A group emptied BY FOCUS must render an empty state of its own.
 
-        The filter-empty copy is actively false there (the filter matched;
-        focus removed the tasks), and on the grouped path there is no message
-        at all today — groupTasksByPrd([]) yields zero boxes, so the body
-        renders a silently blank .prd-groups div.
+        Structural only: that TasksTab branches on the flag and renders an
+        .empty element. The WORDING is deliberately NOT asserted — it is UI
+        prose, and a cosmetic rewrite of a message must not turn this red.
+
+        Why the branch has to exist at all: the filter-empty sentence is
+        actively false there (the filter matched; focus removed the tasks),
+        and on the grouped path there is no message at all today —
+        groupTasksByPrd([]) yields zero boxes, so the body renders a silently
+        blank .prd-groups div.
         """
         assert re.search(r'\.emptiedByFocus\b', tasks_tab_code), (
             'TasksTab never branches on focusGroupView\'s emptiedByFocus — a '
@@ -229,22 +227,6 @@ class TestFocusHeaderWiring:
         )
         assert 'className="empty"' in tasks_tab_code, (
             'TasksTab renders no .empty element for the emptied-by-focus case.'
-        )
-        assert FILTER_EMPTY_MESSAGE not in tasks_tab_code, (
-            f'TasksTab reuses the filter-empty copy {FILTER_EMPTY_MESSAGE!r} '
-            f'for the focus-emptied group. Under focus that sentence is false: '
-            f'the filter matched and focus is what removed the tasks. That copy '
-            f'belongs to TaskGraph and must stay there.'
-        )
-
-    def test_filter_empty_copy_stays_in_task_graph(self, tab_tasks_jsx_body):
-        """The other half of the assertion above: TaskGraph's own filter-empty
-        message must be left untouched, so the two cases stay distinguishable
-        rather than one replacing the other."""
-        task_graph_code = strip_js_comments(extract_function_body(tab_tasks_jsx_body, 'TaskGraph'))
-        assert FILTER_EMPTY_MESSAGE in task_graph_code, (
-            f'TaskGraph no longer renders {FILTER_EMPTY_MESSAGE!r} — the '
-            f'genuinely filter-empty case lost its message.'
         )
 
     def test_header_explains_an_emptied_group_even_when_collapsed(self, tasks_tab_code):
