@@ -1293,6 +1293,7 @@ class TestEphemeralWorktreeSharedRetryDriver:
             f'expected ephemeral_worktree to mint via the shared driver exactly '
             f'once; got {mock_driver.await_count} awaits'
         )
+        assert mock_driver.await_args is not None, 'await_args must be set after one await'
         (path_arg, ref_arg), _kwargs = mock_driver.await_args
         assert Path(path_arg).name.startswith(WorktreeKind.MAIN_PROBE.value), (
             f'expected the minted _mainprobe-* path handed to the driver; got {path_arg}'
