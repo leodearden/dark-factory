@@ -2572,6 +2572,61 @@ class TestBacklogVerdict:
 
 
 # ===========================================================================
+# Tests: unsatisfiable_backlog_gate (task 4436)
+# ===========================================================================
+
+class TestUnsatisfiableBacklogGate:
+    """Tests for the pure function unsatisfiable_backlog_gate(structural_floor,
+    max_backlog) (task 4436): is this gate configuration structurally
+    incapable of EVER passing?
+
+    The structural sibling of enumeration_blind_spot — it answers one
+    diagnostic question about the GATE rather than about the population, and
+    it distinguishes a TRANSIENT backlog violation, which a later drain
+    clears, from a PERMANENT one, which no re-run can.
+    """
+
+    @pytest.mark.parametrize('structural_floor,max_backlog', [
+        (1, 0),
+        (4, 3),
+    ])
+    def test_floor_above_ceiling_is_unsatisfiable(self, structural_floor, max_backlog):
+        """(a)/(d) A floor above the ceiling can never pass — the exact
+        `--check --max-backlog 0` footgun this task exists to make legible."""
+        assert _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog) is True
+
+    @pytest.mark.parametrize('structural_floor,max_backlog', [
+        (0, 0),
+        (3, 3),
+        (0, 5),
+    ])
+    def test_floor_at_or_under_ceiling_is_satisfiable(self, structural_floor, max_backlog):
+        """(b)/(c)/(e) A floor the ceiling accommodates is satisfiable.
+
+        (0, 0) is the measured-today population: the check must NOT fire on a
+        clean pool. (3, 3) is the BOUNDARY — the ceiling is inclusive, exactly
+        as backlog_verdict's is.
+        """
+        assert _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog) is False
+
+    @pytest.mark.parametrize('structural_floor', range(5))
+    @pytest.mark.parametrize('max_backlog', range(5))
+    def test_is_the_strict_complement_of_backlog_verdict(self, structural_floor, max_backlog):
+        """The two predicates can never disagree at the boundary.
+
+        Pins this constraint to the same inclusive `<=` semantics as the
+        verdict it describes. Without it, a later edit could drift the two
+        apart and make the structural_floor block claim "unsatisfiable" about
+        a gate that in fact passes — a checked constraint that lies, which is
+        worse than the prose caveat it replaces.
+        """
+        assert (
+            _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog)
+            is (_mod.backlog_verdict(structural_floor, max_backlog) == 1)
+        )
+
+
+# ===========================================================================
 # Tests: _resolve_check_exit_code (task 2596 amendment, reviewer_comprehensive #1)
 # ===========================================================================
 
