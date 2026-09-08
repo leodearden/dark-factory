@@ -19,6 +19,7 @@ from typing import NamedTuple
 import pytest
 from _dashboard_helpers import (
     assert_script_loads_before,
+    extract_df_data_block,
     extract_function_body,
     find_script_position,
     strip_js_comments,
@@ -87,41 +88,6 @@ def memory_evals_fmt_js_code(memory_evals_fmt_js_body):
     asserted present by exactly such a grep, matching only prose.
     """
     return strip_js_comments(memory_evals_fmt_js_body)
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named seed block from window.DF_DATA (brace-aware)
-# ---------------------------------------------------------------------------
-
-
-def _extract_df_data_block(src: str, key: str) -> str:
-    """Return the body of the ``<key>: { ... }`` seed object, braces included.
-
-    Locates ``<key>:`` followed by ``{`` (allowing arbitrary whitespace), then
-    walks forward counting ``{``/``}`` to find the matching close brace.
-    This is brace-aware: a simple regex ``[^}]*`` would stop at the first
-    nested ``}`` and miss later keys.
-    Returns the empty string if no matching block is found.
-
-    Note: the brace-depth walk does not skip ``{``/``}`` inside JS string
-    literals.  This is acceptable because the data.js seed block uses simple
-    numeric/array values and does not embed brace characters inside quoted
-    strings.
-    """
-    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
-    if m is None:
-        return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +239,7 @@ def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
 def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
     """Return the literal assigned to ``const <name> =``, delimiters included.
 
-    Same depth walk as ``_extract_df_data_block``, re-anchored: that helper
+    Same depth walk as ``extract_df_data_block``, re-anchored: that helper
     only matches the ``key: {`` seed-object form used by data.js and so cannot
     locate a module-scope ``const`` declaration.  ``open_char`` selects the
     delimiter pair, so one walk serves both the ``PARITY_REFINEMENT`` object
@@ -283,7 +249,7 @@ def _extract_const_object(src: str, name: str, open_char: str = '{') -> str:
     on that explicitly, because "the declaration was deleted" and "the
     declaration is empty" are different failures with different fixes.
 
-    Same string-literal caveat as ``_extract_df_data_block``: the walk does not
+    Same string-literal caveat as ``extract_df_data_block``: the walk does not
     skip delimiters inside quoted strings.  Acceptable here for the same
     reason — these two declarations hold short identifier keys and plain
     prose values, neither of which embeds a brace or a bracket.
@@ -464,7 +430,7 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
     )
 
     # (c) the DF_DATA seed block exists
-    seed_block = _extract_df_data_block(data_js_body, 'MEMORY_EVALS')
+    seed_block = extract_df_data_block(data_js_body, 'MEMORY_EVALS')
     assert seed_block, (
         'data.js has no MEMORY_EVALS seed in the `window.DF_DATA = {...}` '
         'literal. Without it the first render before the fetch completes '

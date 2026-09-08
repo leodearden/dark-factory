@@ -12,6 +12,7 @@ import re
 import pytest
 from _dashboard_helpers import (
     assert_script_loads_before,
+    extract_df_data_block,
     extract_function_body,
     find_script_position,
     strip_js_comments,
@@ -33,41 +34,6 @@ def tab_escalations_jsx_code(tab_escalations_jsx_body):
     and the assertion stays green.
     """
     return strip_js_comments(tab_escalations_jsx_body)
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named seed block from window.DF_DATA (brace-aware)
-# ---------------------------------------------------------------------------
-
-
-def _extract_df_data_block(src: str, key: str) -> str:
-    """Return the body of the ``<key>: { ... }`` seed object, braces included.
-
-    Locates ``<key>:`` followed by ``{`` (allowing arbitrary whitespace), then
-    walks forward counting ``{``/``}`` to find the matching close brace.
-    This is brace-aware: a simple regex ``[^}]*`` would stop at the first
-    nested ``}`` and miss later keys.
-    Returns the empty string if no matching block is found.
-
-    Note: the brace-depth walk does not skip ``{``/``}`` inside JS string
-    literals.  This is acceptable because the data.js seed block uses simple
-    numeric/array values and does not embed brace characters inside quoted
-    strings.
-    """
-    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
-    if m is None:
-        return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +62,7 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
         "data.js does not reference 'ESCALATIONS' — add it as the mapped key "
         "for '/api/v2/dashboard/escalations' in endpointsFor."
     )
-    seed_block = _extract_df_data_block(data_js_body, 'ESCALATIONS')
+    seed_block = extract_df_data_block(data_js_body, 'ESCALATIONS')
     assert seed_block, (
         'data.js does not contain an `ESCALATIONS: { ... }` seed block — '
         'add the initializer to the window.DF_DATA assignment so applyKey has '
@@ -112,9 +78,9 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
         'add it to the window.DF_DATA ESCALATIONS initializer in data.js.'
     )
     # summary sub-block: check by_level and by_status are nested under summary.
-    summary_block = _extract_df_data_block(seed_block, 'summary')
+    summary_block = extract_df_data_block(seed_block, 'summary')
     assert summary_block, (
-        'ESCALATIONS seed summary block not found via _extract_df_data_block — '
+        'ESCALATIONS seed summary block not found via extract_df_data_block — '
         'ensure summary is an object, not a scalar.'
     )
     assert re.search(r'\bby_level\s*:', summary_block), (

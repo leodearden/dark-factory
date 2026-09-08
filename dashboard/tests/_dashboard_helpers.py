@@ -939,6 +939,59 @@ def strip_js_comments(source: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# window.DF_DATA seed-block extraction.
+#
+# The dashboard's served data.js carries its fixture payload as a
+# `window.DF_DATA = { KEY: { ... }, ... }` literal, and several suites need to
+# scope an assertion to ONE key's object so a token elsewhere in the file
+# cannot satisfy it.
+#
+# This used to be a private copy in three test modules (test_tab_escalations,
+# test_tab_memory_evals, test_tab_escalation_analytics) whose code was
+# byte-identical.  Its contract lives in
+# test_jsx_source_helpers.py::TestExtractDfDataBlock.
+#
+# Two behaviours differ from its sibling `extract_function_body` and are
+# deliberately kept as they were rather than changed in the move: it returns
+# `''` SILENTLY on a miss where the other RAISES (every call site already
+# asserts on the returned value, so raising would only relocate their
+# failures), and the depth walk is NOT quote-aware where the other is.  Both
+# are pinned as current behaviour, so upgrading either later is a visible
+# contract edit rather than silent drift.
+# ---------------------------------------------------------------------------
+
+
+def extract_df_data_block(src: str, key: str) -> str:
+    """Return the body of the ``<key>: { ... }`` seed object, braces included.
+
+    Locates ``<key>:`` followed by ``{`` (allowing arbitrary whitespace), then
+    walks forward counting ``{``/``}`` to find the matching close brace.
+    This is brace-aware: a simple regex ``[^}]*`` would stop at the first
+    nested ``}`` and miss later keys.
+    Returns the empty string if no matching block is found.
+
+    Note: the brace-depth walk does not skip ``{``/``}`` inside JS string
+    literals.  This is acceptable because the data.js seed block uses simple
+    numeric/array values and does not embed brace characters inside quoted
+    strings.
+    """
+    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
+    if m is None:
+        return ''
+    start = m.end() - 1  # index of the opening `{`
+    depth = 0
+    for i in range(start, len(src)):
+        c = src[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    return ''
+
+
+# ---------------------------------------------------------------------------
 # Served-HTML script order.
 #
 # index.html loads its scripts as classic synchronous tags, so DOCUMENT order
