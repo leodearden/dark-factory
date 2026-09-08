@@ -459,6 +459,31 @@ class TestFindFunctionParams:
         assert src[params_start - 1] == '(', 'params_start is just past the open paren'
         assert src[params_end] == ')', 'params_end is the index OF the matching paren'
 
+    def test_an_empty_parameter_list_yields_an_empty_slice_not_a_miss(self) -> None:
+        """`function Foo()` degenerates to `params_start == params_end`.
+
+        This is the one shape where the two returned indices collapse onto
+        each other, so the params slice is `''` — and a caller could read that
+        as "lookup failed" rather than "this function takes no arguments".
+        The two ARE distinguishable, but only because a real miss RAISES
+        (pinned below) instead of returning an empty slice, so that
+        distinction is worth holding still.
+
+        The walk decrements on the immediately-following `)`, so `params_end`
+        still lands ON that paren and the body brace is still found past it.
+        """
+        src = 'function Foo() { const x = 1; }'
+
+        masked, params_start, params_end = find_function_params(src, 'Foo')
+
+        assert src[params_start:params_end] == ''
+        assert params_start == params_end
+        assert src[params_start - 1] == '(', 'params_start is still just past the open paren'
+        assert src[params_end] == ')', 'params_end is still the index OF the matching paren'
+
+        start = masked.find('{', params_end + 1)
+        assert src[start:] == '{ const x = 1; }'
+
     def test_the_body_brace_is_found_past_params_end(self) -> None:
         """`masked.find('{', params_end + 1)` is the body's opening brace."""
         src = 'function Foo(a) { const x = 1; }'
