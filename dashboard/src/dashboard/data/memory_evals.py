@@ -226,12 +226,66 @@ _LIMITS_PROVENANCE_KEYS = (
     'generator',
 )
 
-# A discarded queue record — or any single field read out of one before its
-# shape is known, such as a status or a fingerprint — is arbitrary JSON off
-# disk and may be arbitrarily large.  An issue detail names WHAT was read, so
-# the value is capped: an unbounded repr would put a multi-megabyte artifact
-# into every poll's payload, making the naming of the discard its own
-# degradation.
+# Every value this module interpolates into an `_issue` detail is read out
+# of unvalidated JSON off disk — an escalation queue record, a metrics run,
+# a per-eval limits artifact, or the root verdicts artifact — and may be
+# arbitrarily large.  Two shapes reach here, and the second is the
+# non-obvious one a future reader would otherwise re-litigate: a value with
+# no type guard at all (`record.get("id")`, `run_kind`, `verdict`,
+# `status`) is arbitrary JSON and may be a dict, a list, or a
+# multi-megabyte string; a value already `isinstance`-guarded to a
+# non-empty `str` (`metric_id`, `eval_id`, `latest_run_stamp`) is
+# type-safe but never length-guarded, because the guard proves the value
+# is a string, never that it is a short one — this second shape is exactly
+# the gap that let the sweep stay incomplete after task 4168.  A detail
+# names WHAT was read, so every one of these is capped: an unbounded repr
+# would put a multi-megabyte artifact into every poll's payload, making
+# the naming of the discard its own degradation.
+#
+# A THIRD shape reaches a detail without ever going through `_short_repr`:
+# `str(exc)` on the `unreadable_*` sites, and `entry["error"]` (itself a
+# `str(exc)`, built by
+# dashboard/src/dashboard/data/escalations.py::load_queue_escalations) on
+# `unreadable_escalation_file`.  These stay raw because they are bounded
+# BY the exception types each site's `try` actually narrows to
+# (`_ARTIFACT_ERRORS = (OSError, ValueError)`, at a read/parse boundary
+# BEFORE the artifact exists as Python data): a `json.JSONDecodeError`
+# message is one of a handful of fixed internal literals plus a
+# line/column/char offset, never the document's own bytes; `OSError`
+# carries the path (OS-length-bounded) and a fixed errno string;
+# `UnicodeDecodeError` carries one byte value and a position — none of
+# those can embed an artifact-derived string of attacker-chosen length.
+# The two `internal_error` sites are the exception: they catch bare
+# `Exception` as the last-resort bug boundary (see `build_memory_evals`'s
+# docstring), which is NOT bounded by construction the same way — a
+# future code path that let a builtin conversion raise on a JSON-derived
+# value (`int()`, `datetime.strptime()`, …) would leak it here unbounded.
+# Today nothing does: every such conversion in this module already
+# catches narrowly and routes the value through `_short_repr` at its own
+# point of failure (`unparseable_run_stamp` above is the pattern to
+# follow).  That is where a real fix belongs if a future conversion needs
+# one — capping `str(exc)` at the wide `internal_error` catch would trade
+# a shorter usually-fine bug message for no real protection, since a
+# leaked value is not guaranteed to fall within the first 120 characters
+# of it either.
+#
+# The invariant this enforces: no raw `!r` on an artifact-derived value in
+# an `_issue` detail, at any of the fifteen interpolations this task swept
+# — held by the closure test
+# `tests/test_memory_evals_data.py::TestAllIssueDetailsAreBounded` for the
+# twelve issue kinds its hostile tree exercises (see `required_kinds`
+# there), so an edit that reintroduces a raw `!r` at one of THOSE sites
+# fails loudly instead of silently reopening this exposure.  That test
+# does not enumerate the module's full issue-kind vocabulary: a brand-new
+# `_issue` call, or one for a kind its hostile tree does not already
+# trigger, is not covered by it and needs its own per-site bound and
+# test.  Two further deliberate exceptions stay uncapped: the
+# `seen_kinds` dedup key below (an internal `repr`, never emitted —
+# capping it would collide two distinct oversized kinds on their shared
+# prefix and silently swallow a real second issue), and `_issue`'s
+# structured `eval_id=` / `path=` kwargs (identity/locator fields the UI
+# groups and links on, where truncation would corrupt identity rather
+# than trim prose).
 _MAX_DISCARDED_VALUE_REPR = 120
 
 
@@ -398,7 +452,7 @@ def _read_limits(
             # Last-wins would silently change the displayed ``rule_kind``.
             _issue(
                 issues, 'duplicate_limits_verdict', eval_id=eval_dir.name, path=path,
-                detail=f'metric {metric_id!r} has more than one limits verdict; the first is used',
+                detail=f'metric {_short_repr(metric_id)} has more than one limits verdict; the first is used',
             )
             continue
         by_metric[metric_id] = record
@@ -448,7 +502,7 @@ def _by_metric_id(
         if metric_id in by_id:
             _issue(
                 issues, 'duplicate_metric_id', eval_id=eval_id, path=path,
-                detail=f'metric {metric_id!r} appears more than once in this run; the first record is used',
+                detail=f'metric {_short_repr(metric_id)} appears more than once in this run; the first record is used',
             )
             continue
         by_id[metric_id] = record
@@ -598,7 +652,7 @@ def _read_verdicts(
                 # link) by array order alone.  First wins, and the drop is named.
                 _issue(
                     issues, 'duplicate_verdict_entry', eval_id=eval_id, path=path,
-                    detail=f'metric {metric_id!r} has more than one verdict entry; the first is used',
+                    detail=f'metric {_short_repr(metric_id)} has more than one verdict entry; the first is used',
                 )
                 continue
             index[key] = entry
@@ -841,7 +895,7 @@ def _index_escalations(
             _issue(
                 issues, 'unknown_escalation_status', path=escalations_dir,
                 detail=(
-                    f'escalation {record.get("id")!r} has unrecognised status '
+                    f'escalation {_short_repr(record.get("id"))} has unrecognised status '
                     f'{_short_repr(status)}; not joined (only pending escalations are '
                     'treated as open)'
                 ),
@@ -856,7 +910,7 @@ def _index_escalations(
             _issue(
                 issues, 'unfingerprinted_escalation', path=escalations_dir,
                 detail=(
-                    f'escalation {record.get("id")!r} is open but carries no usable '
+                    f'escalation {_short_repr(record.get("id"))} is open but carries no usable '
                     f'dedupe_fingerprint ({_short_repr(fingerprint)}); it can never join '
                     'a metric row'
                 ),
@@ -867,8 +921,8 @@ def _index_escalations(
             _issue(
                 issues, 'duplicate_escalation_fingerprint', path=escalations_dir,
                 detail=(
-                    f'escalation {record.get("id")!r} shares dedupe_fingerprint '
-                    f'{_short_repr(fingerprint)} with {index[fingerprint].get("id")!r}; '
+                    f'escalation {_short_repr(record.get("id"))} shares dedupe_fingerprint '
+                    f'{_short_repr(fingerprint)} with {_short_repr(index[fingerprint].get("id"))}; '
                     'the first is used'
                 ),
             )
@@ -1054,7 +1108,7 @@ def _build_eval(
         except ValueError:
             _issue(
                 issues, 'unparseable_run_stamp', eval_id=eval_id, path=eval_dir,
-                detail=f'run_stamp {latest_run_stamp!r} is not in {_RUN_STAMP_FORMAT}',
+                detail=f'run_stamp {_short_repr(latest_run_stamp)} is not in {_RUN_STAMP_FORMAT}',
             )
         else:
             age_seconds = (now - run_at).total_seconds()
@@ -1086,6 +1140,12 @@ def _build_eval(
         # One issue per distinct (metric, kind): a kind that is wrong in every
         # run of a 90-run window is one problem, not ninety.  Deduped on the
         # repr so an unhashable value out of a malformed artifact cannot raise.
+        # This repr is an internal dedup key, never emitted into a detail, and
+        # deliberately NOT routed through `_short_repr`: capping it would make
+        # two distinct oversized kinds that differ only past the cap collide
+        # on their shared prefix, silently swallowing the second metric's
+        # `unknown_kind` issue (DD6/INV-2 forbids exactly that silent drop).
+        # The `unknown_kind` detail below IS capped — only the key stays raw.
         kind = current.get('kind')
         seen_kinds: set[str] = set()
         for _stamp, by_id, run_path in runs:
@@ -1110,14 +1170,17 @@ def _build_eval(
                 _issue(
                     issues, 'missing_kind', eval_id=eval_id, path=run_path,
                     detail=(
-                        f'metric {metric_id!r} carries no "kind" (a required M1 field), '
+                        f'metric {_short_repr(metric_id)} carries no "kind" (a required M1 field), '
                         'so it has no chart primitive'
                     ),
                 )
             else:
                 _issue(
                     issues, 'unknown_kind', eval_id=eval_id, path=run_path,
-                    detail=f'metric {metric_id!r} has kind {run_kind!r}, which has no chart primitive',
+                    detail=(
+                        f'metric {_short_repr(metric_id)} has kind {_short_repr(run_kind)}, '
+                        'which has no chart primitive'
+                    ),
                 )
 
         # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
@@ -1177,8 +1240,8 @@ def _build_eval(
                 issues, 'unknown_verdict', eval_id=eval_id,
                 path=eval_dir.parent / 'verdicts-current.json',
                 detail=(
-                    f'metric {metric_id!r} has verdict {verdict!r}, which is outside the '
-                    'M2 vocabulary and has no parity badge'
+                    f'metric {_short_repr(metric_id)} has verdict {_short_repr(verdict)}, '
+                    'which is outside the M2 vocabulary and has no parity badge'
                 ),
             )
 
@@ -1534,5 +1597,8 @@ def _build_payload(
             'orphan_verdict',
             eval_id=eval_id,
             path=memory_evals_dir / 'verdicts-current.json',
-            detail=f'verdict for metric {metric_id!r} matches no metric row in eval {eval_id!r}',
+            detail=(
+                f'verdict for metric {_short_repr(metric_id)} matches no metric row '
+                f'in eval {_short_repr(eval_id)}'
+            ),
         )
