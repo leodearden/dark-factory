@@ -231,6 +231,7 @@ import signal
 import subprocess
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -776,6 +777,20 @@ def load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     never the smaller cap, because callers derive caps from unrelated ceilings
     rather than choosing them above every base.
 
+    That regime is SAFE but INERT, and it WARNS (task 4890 amendment). With
+    ``cap_secs < base_secs`` the ``min`` can never raise the result above the
+    cap and the ``max`` can never let it fall below the base, so the answer is
+    ``base_secs`` at every load: the call site gets exactly zero load
+    protection, which is the opposite of what adopting this function looks
+    like it bought. Returning the safe value SILENTLY would make a
+    mis-derived cap undiscoverable -- the silent-degradation failure this
+    repo's design invariants name -- so a ``RuntimeWarning`` is emitted and
+    the returned value is unchanged. A warning rather than a raise because
+    the regime is REACHABLE by construction, not a programming error: caps
+    here come from unrelated ceilings (a per-test timeout axe, a leak
+    self-termination bound) that a future base may legitimately outgrow, and
+    failing the caller outright would trade an inert budget for a red suite.
+
     LOAD-PER-CORE, not worker count, is the right signal for the two test
     roots that use this: they run SERIALLY (no xdist, no random ordering), so
     the contention that stretches their subprocess spawns is EXTERNAL -- other
@@ -786,6 +801,22 @@ def load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     bash's integer operators compare, and those reject ``30.0`` -- the same
     constraint :func:`wait_proof_grace_secs` records.
     """
+    if cap_secs < base_secs:
+        # BEFORE the loadavg read, so the warning does not depend on the
+        # platform having one: the inertness is a property of the two
+        # arguments alone and holds identically on the fail-safe path.
+        warnings.warn(
+            f'load_scaled_grace(base_secs={base_secs}, cap_secs={cap_secs}): '
+            f'cap_secs is BELOW base_secs, so this budget is INERT -- '
+            f'max(base, min(cap, ...)) returns {base_secs} at every load and '
+            f'this call site gets no load protection at all. The value '
+            f'returned is still safe (never shorter than base_secs), which is '
+            f'why this warns instead of raising. Fix by raising cap_secs or '
+            f'lowering base_secs; if the cap is derived from a ceiling the '
+            f'base has outgrown, that ceiling is the thing to revisit.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
     try:
         load1 = os.getloadavg()[0]
     except (OSError, AttributeError):

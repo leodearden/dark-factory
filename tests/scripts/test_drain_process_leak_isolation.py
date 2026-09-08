@@ -33,6 +33,7 @@ import signal
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -578,7 +579,7 @@ class TestLoadScaledGrace:
     def test_the_floor_beats_the_cap_when_base_exceeds_it(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """base_secs > cap_secs returns base_secs, NOT cap_secs.
+        """base_secs > cap_secs returns base_secs, NOT cap_secs -- and WARNS.
 
         The ``max(base, min(cap, ...))`` ordering, which the four cases above
         never reach because each uses base=3 < cap=30. Pinned because callers
@@ -588,14 +589,45 @@ class TestLoadScaledGrace:
         SHORTENING a budget to it is the one behaviour a scaler must never
         have. Asserted at both an idle and a loaded host, since the clamp is
         the only term load can move.
+
+        BOTH HALVES MATTER, and the second was added by the task-4890
+        amendment. Safe is not enough: in this regime the ``min`` can never
+        raise the result above the cap and the ``max`` can never lower it
+        below the base, so the budget is INERT at every load and the call site
+        gets none of the load protection adopting this function looks like it
+        bought. Degrading to that silently is what would make a mis-derived cap
+        undiscoverable, so the warning is part of the contract and is asserted
+        here rather than left to a reader's inspection. No current call site is
+        in this regime (3 < 22, 20 < 120), so this is forward-looking.
         """
         monkeypatch.setattr(os, 'cpu_count', lambda: 32)
 
         monkeypatch.setattr(os, 'getloadavg', lambda: (10.0, 10.0, 10.0))
-        assert load_scaled_grace(20, cap_secs=5) == 20
+        with pytest.warns(RuntimeWarning, match='INERT'):
+            assert load_scaled_grace(20, cap_secs=5) == 20
 
         monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
-        assert load_scaled_grace(20, cap_secs=5) == 20
+        with pytest.warns(RuntimeWarning, match='INERT'):
+            assert load_scaled_grace(20, cap_secs=5) == 20
+
+    def test_the_ordinary_cap_above_base_regime_is_silent(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-vacuity for the warning above: every real call site is quiet.
+
+        A guard that fired on the normal `cap_secs >= base_secs` shape would
+        be noise every suite learns to ignore, which is the failure mode of a
+        warning nobody scoped. Covers the loaded, clamped and equal-bounds
+        cases, since those are the ones an off-by-one in the comparison would
+        reach first.
+        """
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            assert load_scaled_grace(3, cap_secs=30) == 30
+            assert load_scaled_grace(20, cap_secs=20) == 20
 
 
 # ---------------------------------------------------------------------------
