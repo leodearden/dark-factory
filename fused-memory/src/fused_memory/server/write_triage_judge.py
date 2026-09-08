@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.routing.json_extract import extract_json
@@ -62,6 +63,8 @@ from fused_memory.server.write_triage import (
 
 if TYPE_CHECKING:
     from fused_memory.models.memory import MemoryResult
+
+logger = logging.getLogger(__name__)
 
 
 class JudgeOutputError(Exception):
@@ -780,6 +783,15 @@ async def judge_write(
     which trains an operator to ignore the alarm that exists to catch a real
     one — the same boundary ``_stub_judge``'s own docstring draws.
 
+    The disabled branch SAYS so, at INFO, once per write while the switch is
+    engaged. Uncounted is not the same as unannounced: an unlogged kill
+    switch is indistinguishable from a novel corpus in the ack stream, which
+    is the very confusion the ``_DEFAULT_JUDGE_ENABLED = True`` comment
+    argues against — and defaulting the knob to True does nothing for the
+    operator who sets it to False. The empty-slate return stays unlogged
+    deliberately: it is the ordinary per-write case and would drown the line
+    that matters.
+
     PROVIDER. ``judge_provider``/``judge_model`` default to None and INHERIT
     ``llm.provider``/``llm.model``, which ship as ``openai``/``gpt-4o-mini``.
     That default is evidence-based, not preference: measured on this
@@ -791,6 +803,18 @@ async def judge_write(
     class, not a vendor pin.
     """
     if not resolve_judge_enabled(memory_service):
+        # SAID OUT LOUD, unlike the empty-slate return below. An unlogged
+        # kill switch is indistinguishable from a novel corpus in the ack
+        # stream — the exact confusion `_DEFAULT_JUDGE_ENABLED = True` is
+        # justified against, which defaulting the knob does nothing about for
+        # the operator who sets it False. INFO and not a counter: this is a
+        # decision, not a failure.
+        logger.info(
+            'write_triage judge disabled by config '
+            '(write_triage.judge_enabled=false); middle-band write acked as '
+            '%r without an LLM call',
+            OUTCOME_STORED,
+        )
         return OUTCOME_STORED
 
     # ONE expression for "the band's winner" on this path. The selector
