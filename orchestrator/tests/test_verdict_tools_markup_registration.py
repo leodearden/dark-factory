@@ -140,6 +140,25 @@ def journal_lines(root: Path) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def seed_plan(artifacts: TaskArtifacts) -> None:
+    """Write the plan a verdict is ABOUT — which is what attribution reads.
+
+    ``verdict_tools._markup_subject_task_id`` reads ``plan.json``'s own
+    ``task_id``, NOT ``metadata.json``'s, and in the fleet there always is one
+    by the time a verdict is submitted: the verdict is about that plan's diff.
+    The ``artifacts`` fixture writes only metadata (``TaskArtifacts.init``), so
+    a row that wants the real attribution answer rather than
+    ``markup_sink.resolve_subject``'s worktree-name fallback seeds it here.
+    """
+    artifacts.write_plan({
+        'task_id': 'test-1',
+        'title': 'Test task',
+        'analysis': 'A test',
+        'prerequisites': [],
+        'steps': [],
+    })
+
+
 async def repaired_call(artifacts: TaskArtifacts):
     """Drive the ``ISSUES_SPECIMEN`` leak through the REAL server, repaired.
 
@@ -810,6 +829,7 @@ class TestTheVerdictFactReachesADurableJournal:
     ):
         """(a) THE user-observable signal, on the measured leak shape."""
         self._steer(monkeypatch, tmp_path)
+        seed_plan(artifacts)
 
         await repaired_call(artifacts)
 
@@ -858,6 +878,7 @@ class TestTheVerdictFactReachesADurableJournal:
         None on this boundary. WHICH caller leaked is a per-event fact.
         """
         self._steer(monkeypatch, tmp_path)
+        seed_plan(artifacts)
 
         for _ in range(3):
             await repaired_call(artifacts)
