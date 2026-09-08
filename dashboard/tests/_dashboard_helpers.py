@@ -12,7 +12,7 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -670,15 +670,23 @@ async def make_recon_db(
 # assertion must first scope itself to one function's body — otherwise a token
 # appearing anywhere else in the file satisfies it and the test proves nothing.
 #
-# These two helpers used to be private copies in nine test modules (task 3549),
+# These helpers used to be private copies in nine test modules (task 3549),
 # under two names covering FOUR distinct implementations, so a fix had to be
 # applied nine times or not at all.  Their contract lives in
 # test_jsx_source_helpers.py.
 #
-# Both are built on ONE quote-aware scanner, `_scan_js`.  Giving them a scanner
-# each would re-create in miniature exactly the duplication this consolidation
-# removed — and they need the same answer to the same question: which stretches
-# of this text are NOT code?
+# There are three of them now.  `find_function_params` is the paren-depth walk
+# that locates a declaration's parameter list; `extract_function_body` resumes
+# from where it stops to take the body, and test_charts_axis_labels.py's
+# `_extract_signature` takes the params themselves.  Those two return DISJOINT,
+# adjacent slices of the same declaration, so neither can be built on the
+# other — but the walk that finds the boundary between them is one walk, and it
+# lives here rather than in each of them.
+#
+# All three are built on ONE quote-aware scanner, `_scan_js`.  Giving them a
+# scanner each would re-create in miniature exactly the duplication this
+# consolidation removed — and they need the same answer to the same question:
+# which stretches of this text are NOT code?
 # ---------------------------------------------------------------------------
 
 
@@ -814,6 +822,76 @@ def _mask_js(source: str, spans: Sequence[_JsSpan]) -> str:
     return masked
 
 
+def find_function_params(
+    source: str,
+    func_name: str,
+    miss: Callable[[str], BaseException] | None = None,
+) -> tuple[str, int, int]:
+    """Locate ``function <func_name>(``'s parameter list.
+
+    Returns ``(masked, params_start, params_end)`` where *masked* is the
+    `_mask_js` copy the caller keeps walking, ``source[params_start:params_end]``
+    is the parameter-list text with the parens EXCLUDED, and *params_end* is the
+    index OF the matching ``)``.  A caller wanting the body resumes with
+    ``masked.find('{', params_end + 1)``.
+
+    The search and the depth walk run over the mask, so a ``(``, ``)`` or the
+    word ``function`` inside a STRING LITERAL OR A COMMENT is not counted.  The
+    mask is length-preserving and index-aligned, so both indices address the
+    ORIGINAL source and the slice a caller takes is the real text.
+
+    Paren-DEPTH rather than "find the next ``)``": a destructured parameter
+    (``function Foo({ a, b }) {``) carries its own ``{``/``}`` pair inside the
+    parameter list, so a caller that took the first ``{`` after the opening
+    paren would get the destructuring pattern instead of the body.
+
+    The search regex is deliberately NOT line-anchored, so a declaration NESTED
+    inside another function is found (the real instance is
+    ``function statusMatches(s) {`` indented inside ``TasksTab`` in
+    tab_tasks.jsx).  Its trailing ``\\s*\\(`` is equally load-bearing in the
+    other direction: without it a prefix sibling declared earlier would shadow
+    the target — ``function TaskGraphEdges(`` at tab_tasks.jsx:33 precedes
+    ``function TaskGraph(`` at :151.
+
+    RAISES on a miss rather than returning a sentinel, because every consumer
+    slices the source by the returned indices and a sentinel would hand them a
+    silently wrong — or empty — slice, over which absence assertions pass
+    vacuously.  *miss* lets a caller supply the exception: `extract_function_body`
+    threads its own four-way wording through it, and test_charts_axis_labels.py
+    keeps a file-specific message.  The default raises ``AssertionError``.
+    """
+    def _default_miss(what: str) -> BaseException:
+        return AssertionError(
+            f'Could not locate the `function {func_name}(` parameter list: '
+            f'{what}. Either the function was removed or renamed, or it was '
+            f'rewritten as an arrow function or a class method — neither is '
+            f'matched, only a named `function` declaration is.'
+        )
+
+    _miss = miss if miss is not None else _default_miss
+
+    spans = _scan_js(source)
+    _assert_js_lexable(source, spans)
+    masked = _mask_js(source, spans)
+
+    match = re.search(rf'\bfunction\s+{re.escape(func_name)}\s*\(', masked)
+    if match is None:
+        raise _miss('no such declaration in this source')
+
+    paren_depth = 1
+    i = match.end()
+    while i < len(masked) and paren_depth > 0:
+        if masked[i] == '(':
+            paren_depth += 1
+        elif masked[i] == ')':
+            paren_depth -= 1
+        i += 1
+    if paren_depth != 0:
+        raise _miss('its parameter list is never closed')
+
+    return masked, match.end(), i - 1
+
+
 def extract_function_body(source: str, func_name: str) -> str:
     """Return the brace-delimited body of a ``function <func_name>(`` declaration.
 
@@ -860,26 +938,11 @@ def extract_function_body(source: str, func_name: str) -> str:
             f'empty body: an absence assertion over one would pass vacuously.'
         )
 
-    spans = _scan_js(source)
-    _assert_js_lexable(source, spans)
-    masked = _mask_js(source, spans)
+    masked, _params_start, params_end = find_function_params(
+        source, func_name, miss=_miss,
+    )
 
-    match = re.search(rf'\bfunction\s+{re.escape(func_name)}\s*\(', masked)
-    if match is None:
-        raise _miss('no such declaration in this source')
-
-    paren_depth = 1
-    i = match.end()
-    while i < len(masked) and paren_depth > 0:
-        if masked[i] == '(':
-            paren_depth += 1
-        elif masked[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        raise _miss('its parameter list is never closed')
-
-    start = masked.find('{', i)
+    start = masked.find('{', params_end + 1)
     if start == -1:
         raise _miss('no opening brace follows its parameter list')
 
