@@ -2176,3 +2176,119 @@ class TestFindingCarriesTheCitationsThatDecidedIt:
         # Both ends of one edge share ONE scan, so both carry the same rendering
         # — and it follows the fact's numeric order, not its textual one.
         assert {f.cited for f in stats.findings} == {('Task 3128', 'Task 3129')}
+
+
+class TestCorroboratedIsDerivedFromTheRecordedEvidence:
+    """S1 (esc-3671-3): the READ side of `_candidate_pool`'s corroboration veto.
+
+    A fact that names the very node its edge landed on is the strongest
+    available evidence the attachment is CORRECT, so `_candidate_pool` empties
+    the pool for it (`if endpoint in cited: return frozenset()`). The finding is
+    still recorded — "recorded and left alone, never guessed at" — but it is a
+    no-observable-defect row, and the counter and the operator log both need to
+    be able to tell it apart from a genuine misattachment.
+
+    DERIVED, never stored. A stored boolean set at the construction site would
+    be a second site that must agree byte-for-byte with that guard — the INV-5
+    lockstep duplication whose drift produced esc-3671-3's blocking bug, where a
+    guard sat one position away from where its own rationale assumed. Deriving
+    it from evidence the record now carries makes disagreement unrepresentable,
+    and it is the discipline `ReferentStats` already documents for its own
+    counts.
+    """
+
+    def test_it_is_true_exactly_when_the_fact_names_the_endpoint(self):
+        assert _finding(
+            endpoint_referent=Referent(number='2500'),
+            cited=('Task 2500', 'Task 3668'),
+        ).corroborated is True
+
+        assert _finding(
+            endpoint_referent=Referent(number='2500'),
+            cited=('Task 3668',),
+        ).corroborated is False
+
+        assert _finding(
+            endpoint_referent=Referent(number='2500'), cited=(),
+        ).corroborated is False
+
+    def test_it_compares_canonical_node_names_not_spellings(self):
+        """`cited` renders through `Referent.node_name`, so a foreign-qualified
+        citation is a DIFFERENT referent and must not corroborate a local
+        endpoint — the same discrimination `local_referent` exists to make."""
+        assert _finding(
+            endpoint_referent=Referent(number='2500'),
+            cited=('other_project:2500',),
+        ).corroborated is False
+
+    def test_it_is_not_a_key_in_the_payload(self):
+        """The key set is contractually the DATACLASS FIELD NAMES, and a derived
+        property is not a field. Nothing is lost: the payload already carries
+        `cited` and `endpoint_referent`, so an operator reads the corroboration
+        straight off the log line."""
+        payload = _finding(cited=('Task 2520',)).to_dict()
+
+        assert 'corroborated' not in payload
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+
+    @pytest.mark.asyncio
+    async def test_it_agrees_with_the_pool_veto_on_the_reachable_shape(
+        self, service,
+    ):
+        """esc-3671-3's shape, driven end-to-end rather than hand-built.
+
+        The property and the veto must answer the same question about the same
+        edge, which is the entire reason it is derived from `cited` rather than
+        stored beside it.
+        """
+        from fused_memory.services.memory_service import _candidate_pool
+
+        stats = await service._verify_episode_referents(
+            _corroborated_membership_episode(), group_id='dark_factory',
+            referents=(Referent(number='3668'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.corroborated is True
+        # The veto's own verdict on the same inputs: an EMPTY pool.
+        assert _candidate_pool(
+            referents=frozenset({Referent(number='3668')}),
+            cited=frozenset({Referent(number='2500'), Referent(number='3668')}),
+            endpoint=Referent(number='2500'),
+            ambiguous=frozenset(),
+            source='derived',
+        ) == frozenset()
+        # Recorded and left alone — the finding survives, it just cannot be
+        # acted on.
+        assert finding.resolvable is False
+
+    @pytest.mark.asyncio
+    async def test_a_pairing_finding_can_never_be_corroborated(self, service):
+        """Structural, not incidental: the pairing arm is reached only when
+        `endpoint_referent not in cited`, so the property is False there by
+        construction."""
+        stats = await service._verify_episode_referents(
+            _mixed_findings_episode(), group_id='dark_factory',
+            referents=_MIXED_REFERENTS,
+        )
+
+        pairing = [f for f in stats.findings if f.check == 'per-edge-pairing']
+        assert pairing
+        assert [f.corroborated for f in pairing] == [False]
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_misattached_endpoint_is_not_corroborated(
+        self, service,
+    ):
+        """The shape the whole pass exists to catch: the fact says nothing about
+        the node the edge landed on, so nothing corroborates it and it resolves
+        normally."""
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].corroborated is False
+        assert stats.findings[0].resolvable is True
