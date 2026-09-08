@@ -211,7 +211,7 @@ def emit_markup_storm_escalation(
     CLI and never reaches journald, and ``journald --user`` retention on this
     host is roughly 72h while measured storm records were read at 6-7 days old.
     The grep survives as corroboration — do not delete its tokens, which
-    ``test_the_remedy_names_the_token_its_producers_actually_log`` pins.
+    ``test_the_record_points_at_log_lines_that_actually_exist`` pins.
 
     ``count`` is ALREADY this project's own number: the producer keys one
     ``StormCounter`` per ``(project, outcome)`` pair, so a window can only ever

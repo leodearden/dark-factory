@@ -846,7 +846,7 @@ class TestEmitMarkupStormEscalation:
         while these records are read days later.
 
         The grep tokens SURVIVE as corroboration:
-        ``test_the_remedy_names_the_token_its_producers_actually_log`` asserts
+        ``test_the_record_points_at_log_lines_that_actually_exist`` asserts
         ``markup_guard_storm`` appears across detail+suggested_action, and
         demoting the instruction must not delete the token.
         """
