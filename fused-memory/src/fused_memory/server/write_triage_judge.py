@@ -655,9 +655,27 @@ async def _call_llm(
     The client is constructed PER CALL and deliberately not cached on a module
     global. ``add_memory`` is served by one long-lived server process, and a
     cached client keyed to a config that hot-reloads would pin a stale
-    model/api_url past a reload that the operator was told had applied —
-    silently converting a green-tier knob into a restart-only one. Client
-    construction is cheap relative to the round-trip it precedes.
+    ``model``/``api_url`` past a reload that the operator was told had
+    applied — silently converting a green-tier knob into a restart-only one.
+    Constructing here means a hot-reloaded ``api_key``/``api_url`` takes
+    effect on the very next call.
+
+    It is also CLOSED per call, via ``async with``. Neither SDK client
+    defines ``__del__`` (measured: openai 2.31.0, anthropic 0.92.0), so an
+    unclosed one abandons an ``httpx`` connection pool to the garbage
+    collector on every triaged write. The ``asyncio.wait_for`` sits INSIDE
+    the context deliberately: a timeout cancels the in-flight request, and a
+    close written after the awaited call would never run — leaking precisely
+    when the provider is slow and writes are piling up.
+
+    The remaining cost is the lost connection reuse: ~100–300ms of TCP+TLS
+    handshake per call, on the synchronous write path. That is a deliberate
+    trade — correctness of the hot-reload contract over latency — and is
+    recorded as a follow-up rather than resolved with a cache here.
+
+    ``async with`` is NOT an exception handler and must not become one: it
+    swallows nothing, so the no-``try``/``except`` property below still
+    holds exactly.
 
     NO ``try``/``except`` ANYWHERE. Every failure propagates to
     ``triage_write``'s ``except`` arm (write_triage.py:835), which logs with
@@ -672,37 +690,39 @@ async def _call_llm(
     if provider == 'openai':
         import openai  # noqa: PLC0415 — per-call import, matching judge.py
 
-        client = openai.AsyncOpenAI(**_provider_credentials(memory_service, provider))
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=model,
-                messages=[
-                    {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
-                    {'role': 'user', 'content': prompt},
-                ],
-                temperature=0.0,
-                max_tokens=_JUDGE_MAX_TOKENS,
-                response_format={'type': 'json_object'},
-            ),
-            timeout=timeout,
-        )
+        async with openai.AsyncOpenAI(
+            **_provider_credentials(memory_service, provider),
+        ) as client:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
+                        {'role': 'user', 'content': prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=_JUDGE_MAX_TOKENS,
+                    response_format={'type': 'json_object'},
+                ),
+                timeout=timeout,
+            )
         return response.choices[0].message.content or ''
 
     if provider == 'anthropic':
         import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
 
-        client = anthropic.AsyncAnthropic(
+        async with anthropic.AsyncAnthropic(
             **_provider_credentials(memory_service, provider),
-        )
-        response = await asyncio.wait_for(
-            client.messages.create(
-                model=model,
-                max_tokens=_JUDGE_MAX_TOKENS,
-                system=JUDGE_SYSTEM_PROMPT,
-                messages=[{'role': 'user', 'content': prompt}],
-            ),
-            timeout=timeout,
-        )
+        ) as client:
+            response = await asyncio.wait_for(
+                client.messages.create(
+                    model=model,
+                    max_tokens=_JUDGE_MAX_TOKENS,
+                    system=JUDGE_SYSTEM_PROMPT,
+                    messages=[{'role': 'user', 'content': prompt}],
+                ),
+                timeout=timeout,
+            )
         # First TEXT block, not first block: a leading thinking/tool_use block
         # must not be read as the answer.
         text_blocks = [b for b in response.content if b.type == 'text']

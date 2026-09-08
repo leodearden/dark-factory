@@ -1023,11 +1023,31 @@ class TestEveryResolverReadsLive:
 # ---------------------------------------------------------------------------
 
 
+def _client_double() -> MagicMock:
+    """A client double that is its own async context manager, like the SDKs.
+
+    `AsyncOpenAI.__aenter__` and `AsyncAnthropic.__aenter__` both `return
+    self` (read off openai 2.31.0 / anthropic 0.92.0), so `async with
+    client as c` binds the SAME object. A bare `MagicMock` instead returns a
+    FRESH child from `__aenter__`, which would make every `create` assertion
+    in this file inspect a different mock than the one `_call_llm` called —
+    passing or failing for reasons that have nothing to do with the code.
+
+    `__aexit__` returns False, because the real ones do: releasing a client
+    must not suppress an in-flight exception (see `TestTheClientIsReleased`).
+    """
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
 def _openai_client(content: str | None) -> MagicMock:
     """A fake ``AsyncOpenAI`` yielding *content* as the message body.
 
     Same construction shape as ``test_classifier.py::_make_mock_client`` — the
-    established openai double in this repo.
+    established openai double in this repo, plus the async-CM protocol the
+    client is used through.
     """
     message = MagicMock()
     message.content = content
@@ -1035,7 +1055,7 @@ def _openai_client(content: str | None) -> MagicMock:
     choice.message = message
     response = MagicMock()
     response.choices = [choice]
-    client = MagicMock()
+    client = _client_double()
     client.chat.completions.create = AsyncMock(return_value=response)
     return client
 
@@ -1057,7 +1077,7 @@ def _anthropic_client(blocks: list[FakeAnthropicTextBlock]) -> MagicMock:
     """A fake ``AsyncAnthropic`` whose ``messages.create`` yields *blocks*."""
     response = MagicMock()
     response.content = blocks
-    client = MagicMock()
+    client = _client_double()
     client.messages.create = AsyncMock(return_value=response)
     return client
 
@@ -1479,16 +1499,9 @@ class TestTheClientIsReleased:
     closing the client at the end of the call, which is what these tests pin.
     """
 
-    @staticmethod
-    def _closing(client: MagicMock) -> MagicMock:
-        """Wrap *client* so `async with` yields it and records the exit."""
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=False)
-        return client
-
     @pytest.mark.asyncio
     async def test_the_openai_client_is_released_on_the_happy_path(self) -> None:
-        client = self._closing(_openai_client(_payload('restates')))
+        client = (_openai_client(_payload('restates')))
         with patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(
                 memory_service=_judge_svc(),
@@ -1499,8 +1512,8 @@ class TestTheClientIsReleased:
 
     @pytest.mark.asyncio
     async def test_the_anthropic_client_is_released_on_the_happy_path(self) -> None:
-        client = self._closing(
-            _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends'))]),
+        client = _anthropic_client(
+            [FakeAnthropicTextBlock(text=_payload('amends'))],
         )
         with patch('anthropic.AsyncAnthropic', return_value=client):
             await judge_write(
@@ -1531,7 +1544,7 @@ class TestTheClientIsReleased:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = self._closing(MagicMock())
+        client = _client_double()
         if provider == 'openai':
             client.chat.completions.create = AsyncMock(side_effect=_hang)
         else:
@@ -1547,7 +1560,7 @@ class TestTheClientIsReleased:
     @pytest.mark.asyncio
     async def test_the_client_is_released_when_the_transport_raises(self) -> None:
         """A release must not depend on the call having succeeded."""
-        client = self._closing(MagicMock())
+        client = _client_double()
         client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
@@ -1559,26 +1572,38 @@ class TestTheClientIsReleased:
         client.__aexit__.assert_awaited()
 
     @pytest.mark.asyncio
-    async def test_releasing_does_not_swallow_the_failure(self) -> None:
-        """`async with` is not an exception handler — INV-4 depends on this.
+    @pytest.mark.parametrize(
+        ('module_name', 'attr'),
+        [('openai', 'AsyncOpenAI'), ('anthropic', 'AsyncAnthropic')],
+        ids=['openai', 'anthropic'],
+    )
+    async def test_the_real_clients_exit_does_not_swallow_an_exception(
+        self, module_name: str, attr: str,
+    ) -> None:
+        """A NEW dependency the `async with` introduces, pinned against the SDKs.
 
-        A release that suppressed the exception would hand `triage_write` a
-        silent success, and `_call_llm`'s "NO try/except ANYWHERE" property
-        would be gone: no `exc_info` log, no counted fail-open, and a broken
-        judge reading exactly like a healthy one. The `__aexit__` doubles
-        above return False for the same reason; this pins that the real code
-        does not rely on one returning True.
+        `async with` delegates the suppression decision to the object: an
+        `__aexit__` returning True swallows the in-flight exception. That
+        would hand `triage_write` a silent success and destroy `_call_llm`'s
+        "NO try/except ANYWHERE" property — no `exc_info` log, no counted
+        fail-open, and a broken judge reading exactly like a healthy one
+        answering "nothing matched" (INV-4).
+
+        The doubles above cannot pin this, because a double asserts only what
+        it was told to return. So this asks the REAL client classes, which is
+        where the contract actually lives, and it is what would fail if an SDK
+        upgrade ever started suppressing. No network: `__aexit__` closes the
+        transport and returns.
         """
-        client = self._closing(MagicMock())
-        client.__aexit__ = AsyncMock(return_value=True)
-        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
-        with patch('openai.AsyncOpenAI', return_value=client), \
-                pytest.raises(RuntimeError):
-            await judge_write(
-                memory_service=_judge_svc(),
-                content='c', project_id='p',
-                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
-            )
+        module = pytest.importorskip(module_name)
+        client = getattr(module, attr)(api_key='sk-not-used')
+        suppressed = await client.__aexit__(
+            RuntimeError, RuntimeError('boom'), None,
+        )
+        assert not suppressed, (
+            f'{attr}.__aexit__ returned {suppressed!r}; a truthy value would '
+            f'make `async with` swallow a judge failure into a silent `stored`'
+        )
 
 
 class TestJudgeWriteFailuresRaise:
@@ -1592,7 +1617,7 @@ class TestJudgeWriteFailuresRaise:
 
     @pytest.mark.asyncio
     async def test_a_transport_error_propagates(self) -> None:
-        client = MagicMock()
+        client = _client_double()
         client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
@@ -1614,7 +1639,7 @@ class TestJudgeWriteFailuresRaise:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = MagicMock()
+        client = _client_double()
         client.chat.completions.create = AsyncMock(side_effect=_hang)
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(TimeoutError):
@@ -1638,7 +1663,7 @@ class TestJudgeWriteFailuresRaise:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = MagicMock()
+        client = _client_double()
         client.messages.create = AsyncMock(side_effect=_hang)
         with patch('anthropic.AsyncAnthropic', return_value=client), \
                 pytest.raises(TimeoutError):
@@ -1739,7 +1764,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
 
         counter = TriageFailOpenCounter()
         service = self._mid_band_service(judge_timeout_seconds=0.01)
-        client = MagicMock()
+        client = _client_double()
         client.chat.completions.create = AsyncMock(side_effect=_hang)
 
         with patch('openai.AsyncOpenAI', return_value=client):
