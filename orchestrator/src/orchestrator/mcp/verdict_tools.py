@@ -370,6 +370,22 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
     # server the journal is not merely the best durable record of a repair —
     # it is the ONLY one.
     #
+    # WHAT THAT COSTS, and why it is paid lazily. The fact sink is awaited on
+    # every outcome, so the FORWARD_REPAIR success path now hops to a worker
+    # thread where a `logger.info` used to run inline; on the FIRST markup
+    # event in a given server process that thread also pays one
+    # `git rev-parse --git-common-dir` (markup_sink.resolve_project_root, 10s
+    # timeout) before the append. Successes are memoized, so it is once per
+    # process, and — like the escalation path above — it is reached only on the
+    # measured 0.27% of calls that carry a leak. Resolving eagerly in
+    # `create_server` instead would move that subprocess onto EVERY server
+    # construction, which is one per agent invocation including the ~99.7% that
+    # never leak, against the startup-latency constraint markup_sink's own
+    # header records (an import/exec stall past MCP_TIMEOUT gets the server
+    # silently dropped: tasks 1775 / 1776 / 2942). So the lazy shape is
+    # deliberate here for the same reason it is on plan-tools (task 4744), and
+    # a review that re-derives this trade should stop at this paragraph.
+    #
     # Both injected channels resolve their project root through the one
     # `_markup_project_root` seam. Behaviour-identical when unpatched (the seam
     # just forwards to what was already the default), and the correct coupling:

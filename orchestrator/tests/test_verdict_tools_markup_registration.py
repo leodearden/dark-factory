@@ -124,9 +124,15 @@ def journal_lines(root: Path) -> list[dict[str, Any]]:
     The path comes from :func:`markup_journal.journal_path` rather than being
     reconstructed, so a row cannot pass against a path the production wiring
     does not write. Copied from ``test_plan_tools_markup_guard.py`` with the
-    server label changed — a pytest helper is not importable across package
-    test trees, the same constraint this file's header already records for the
-    corpus loader.
+    server label changed — which sits in THIS directory, so the copy is a
+    choice and not a constraint (the header's not-importable note is about
+    ``shared/tests``, genuinely another package, and does not apply here). The
+    honest reason is the one the ``artifacts`` fixture above already gives for
+    its own duplication: promoting a helper to ``conftest.py`` widens its blast
+    radius across the whole orchestrator suite, which two consumers do not yet
+    justify. Both copies read the format ``markup_journal`` writes and
+    ``test_markup_journal.py`` pins, so neither can drift alone without that
+    file going red first.
     """
     path = markup_journal.journal_path(root, 'verdict-tools')
     if not path.exists():
@@ -588,14 +594,21 @@ class TestUnrepairableResidueIsPreserved:
 
         Patching ``_markup_project_root`` steers the escalation sink to
         ``tmp_path`` as well, so this row's residue filing opens a real
-        ``EscalationQueue`` under the temp tree. That is hermetic, and this row
-        asserts only on the journal — the residue floor is the business of the
-        UNPATCHED rows above.
+        ``EscalationQueue`` under the temp tree. That is hermetic, and it is
+        what makes this the ONE outcome where BOTH channels fire — so it is
+        also the only place the shared-ladder guarantee can be pinned end to
+        end. ``markup_sink.resolve_subject`` is deliberately one function
+        rather than a copy per channel, on the stated grounds that a guard
+        whose escalation and whose journal disagree about who leaked is worse
+        than either alone; the two assertions at the bottom are what would
+        catch that disagreement. The residue FLOOR (what happens when the queue
+        cannot be opened at all) stays the business of the UNPATCHED rows
+        above.
         """
         monkeypatch.setattr(
             verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-            raising=False,
         )
+        seed_plan(artifacts)
 
         await self._refuse(artifacts)
 
@@ -603,6 +616,22 @@ class TestUnrepairableResidueIsPreserved:
         assert len(facts) == 1, f'expected exactly one fact, got {facts!r}'
         assert facts[0]['outcome'] == 'unrepairable'
         assert facts[0]['tool'] == 'submit_review_verdict'
+        assert facts[0]['subject_task_id'] == 'test-1', (
+            "the seeded plan's own task_id — the refused call is attributed "
+            'exactly as a repaired one is, on the outcome where the caller is '
+            'bounced and the journal line is the only per-event record left'
+        )
+        # ...and the residue record filed on this same outcome names the SAME
+        # subject, which is what one shared ladder buys and two copies would
+        # eventually stop buying.
+        filed = sorted((tmp_path / 'data' / 'escalations').rglob('esc-*.json'))
+        assert len(filed) == 1, f'expected exactly one residue record, got {filed!r}'
+        record = json.loads(filed[0].read_text(encoding='utf-8'))
+        assert record['summary'].startswith('[test-1] '), (
+            f'the journal says test-1 leaked and the escalation says '
+            f'{record["summary"]!r} — one shared attribution ladder is the '
+            f'whole reason those cannot disagree'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -827,9 +856,23 @@ class TestTheVerdictFactReachesADurableJournal:
 
     @staticmethod
     def _steer(monkeypatch, tmp_path: Path) -> None:
+        """Point BOTH injected channels at *tmp_path*, failing if the seam went.
+
+        ``raising`` is left at its default TRUE deliberately. The step-1 rows
+        that first drove this passed it as False because the seam did not exist
+        yet; once the seam landed, that flag became the thing DISABLING the
+        only check that it still does. With it, a renamed or inlined
+        ``_markup_project_root`` would leave monkeypatch quietly creating an
+        unused attribute — and while most rows here would then fail loudly (an
+        empty journal), ``test_a_journal_outage_never_changes_the_outcome``
+        would pass VACUOUSLY: its assertions are all that the call succeeded,
+        which is equally true when the journal was never steered at the
+        directory collision it means to force.
+        ``test_plan_tools_markup_guard.py`` patches the identical seam the same
+        way.
+        """
         monkeypatch.setattr(
             verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-            raising=False,
         )
 
     @pytest.mark.asyncio
@@ -975,7 +1018,6 @@ class TestTheStormRecordNamesTheJournal:
         """
         monkeypatch.setattr(
             verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
-            raising=False,
         )
         seed_plan(artifacts)
 
