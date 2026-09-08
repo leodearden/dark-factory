@@ -237,11 +237,20 @@ def test_reify_orchestrator_service_structure() -> None:
 
 def test_reify_and_df_differ_only_in_config_and_description() -> None:
     """The two orchestrator service files must be identical except Description,
-    --config path, and the reify-only warm-lane mount gate.
+    --config path, the reify-only warm-lane mount gate, and the df-only
+    pytest-xdist worker cap.
 
     This guards the 'same shape' invariant: any structural drift (missing key,
     different Restart policy, etc.) that appears in one but not the other will
     break this test.
+
+    The two carve-outs below are per-project blocks, not drift. Each is stripped
+    from the file that carries it before the line-for-line comparison, so the
+    invariant still catches genuine drift in everything else. Ruled 2026-09-08
+    (esc-5063-5, option b): a degree of divergence between the units is
+    inevitable, so a new project-specific block belongs here as a named
+    carve-out rather than being mirrored into the other unit to keep the
+    line counts equal.
     """
     df_lines = DF_SERVICE.read_text(encoding="utf-8").splitlines()
     reify_lines = REIFY_SERVICE.read_text(encoding="utf-8").splitlines()
@@ -262,6 +271,25 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
         # Drop the comment block, the directive itself, and the single
         # trailing blank line that separates it from the next block.
         del reify_lines[start_idx : end_idx + 2]
+
+    # orchestrator-dark-factory.service alone caps pytest-xdist's `-n auto` for
+    # env inheritors that are NOT verify legs (the offline lane and agent-shell
+    # pytest runs). It is df-only because df's dark-factory-orchestrator.yaml
+    # carries a `verify_env: PYTEST_XDIST_AUTO_NUM_WORKERS` entry that overlays
+    # this value last and so keeps verify legs at their own width; reify's
+    # config has no such entry, so mirroring the cap here would silently narrow
+    # reify's verify legs instead of only its offline lane. Stripped rather than
+    # mirrored, per the esc-5063-5 ruling above.
+    xdist_cap_block_start = (
+        "# Cap pytest-xdist `-n auto` for everything that inherits this unit's env and is"
+    )
+    xdist_cap_directive = "Environment=PYTEST_XDIST_AUTO_NUM_WORKERS=8"
+    if xdist_cap_block_start in df_lines:
+        start_idx = df_lines.index(xdist_cap_block_start)
+        end_idx = df_lines.index(xdist_cap_directive, start_idx)
+        # Drop the comment block, the directive itself, and the single
+        # trailing blank line that separates it from the next block.
+        del df_lines[start_idx : end_idx + 2]
 
     assert len(df_lines) == len(reify_lines), (
         f"Service files have different line counts: df={len(df_lines)} reify={len(reify_lines)}"
