@@ -1673,8 +1673,11 @@ class ReferentFinding:
     ``finding.referent_set.append(...)`` open, letting a consumer quietly widen
     the set that justified the repair it is about to perform.
 
-    Keyword-only because eleven fields, seven of them strings, is exactly the
-    shape where a positional argument silently lands in the wrong slot.
+    Keyword-only because a record this wide, most of it strings, is exactly the
+    shape where a positional argument silently lands in the wrong slot. (The
+    count is deliberately not stated: it has grown twice already, and a docstring
+    that has to be recounted on every field addition is a docstring that goes
+    stale on the first one that forgets.)
 
     ``new_endpoint_uuid is None`` means "the node does not exist yet, or its
     name keys a duplicate-name group" — leaf eta resolves-or-mints via
@@ -1699,9 +1702,28 @@ class ReferentFinding:
     old_endpoint_name: str
     #: The parsed referent that name denotes — the thing actually compared.
     endpoint_referent: Referent
-    #: The declared referent set, as canonical node names, that the endpoint
-    #: was tested against.
+    #: The referent set the write DECLARED itself to be about, as canonical
+    #: node names. The SET-MEMBERSHIP arm is what tests the endpoint against
+    #: THIS; the pairing arm tests it against :attr:`cited`. Read the two
+    #: together — recording only this one is what left the pairing arm's
+    #: deciding input off the record (esc-3671-3).
     referent_set: tuple[str, ...]
+    #: The referents THIS EDGE'S OWN FACT names, as canonical node names.
+    #: The evidence that decided the PER-EDGE PAIRING arm, which fires
+    #: precisely on ``cited_declared and endpoint_referent not in cited``, and
+    #: — read together with :attr:`endpoint_referent` — the evidence behind
+    #: :func:`_candidate_pool`'s corroboration veto: an endpoint that appears
+    #: here is one the fact says the edge already belongs on.
+    #:
+    #: Recorded on BOTH arms, not just the one that reads it, so a consumer
+    #: never has to know which arm carries which evidence. SORTED, for the
+    #: reason :func:`_candidate_targets` sorts its survivors: the underlying
+    #: value is a frozenset, whose iteration order is not stable across
+    #: processes under hash randomization, and a finding must be stable across
+    #: runs and diffable in eta's audit. Empty is a real answer rather than an
+    #: absence — a fact naming no task is UNINFORMATIVE about where its edge
+    #: belongs, which is exactly why the pairing guard refuses to fire on it.
+    cited: tuple[str, ...] = ()
     #: The referent the edge SHOULD hang off, when exactly one candidate
     #: survives. ``None`` whenever :attr:`resolvable` is False.
     intended_referent: Referent | None = None
@@ -1739,6 +1761,7 @@ class ReferentFinding:
             'old_endpoint_name': self.old_endpoint_name,
             'endpoint_referent': self.endpoint_referent.node_name,
             'referent_set': list(self.referent_set),
+            'cited': list(self.cited),
             'intended_referent': (
                 self.intended_referent.node_name
                 if self.intended_referent is not None
@@ -3800,6 +3823,17 @@ class MemoryService:
             # could actually belong on. Computed once per edge, beside `cited`,
             # because both endpoints test against it.
             cited_declared = cited & referent_set
+            # The same citations rendered for the RECORD, so a finding carries
+            # the evidence that decided it and not merely the declared set it
+            # was compared against. Sorted for the reason `_candidate_targets`
+            # sorts its survivors — `cited` is a frozenset, whose iteration
+            # order is not stable across processes under hash randomization.
+            cited_names = tuple(
+                r.node_name
+                for r in sorted(
+                    cited, key=lambda r: (r.kind, r.project_id, r.number),
+                )
+            )
 
             for index, end in enumerate(ends):
                 which_end, endpoint_uuid, endpoint_name, endpoint_referent = end
@@ -3886,6 +3920,7 @@ class MemoryService:
                     old_endpoint_name=endpoint_name,
                     endpoint_referent=endpoint_referent,
                     referent_set=referent_names,
+                    cited=cited_names,
                     intended_referent=candidates[0] if resolvable else None,
                     resolvable=resolvable,
                     reason='' if resolvable else _unresolvable_reason(

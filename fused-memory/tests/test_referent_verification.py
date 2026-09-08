@@ -114,8 +114,8 @@ class TestReferentRecordVocabulary:
         assert finding.cited == ()
 
     def test_is_keyword_only(self):
-        """Positional construction of an eleven-field evidence record is how a
-        field silently lands in the wrong slot."""
+        """Positional construction of a record this wide is how a field
+        silently lands in the wrong slot."""
         with pytest.raises(TypeError):
             ReferentFinding('edge-1', 'source', 'set-membership')  # type: ignore[misc]
 
