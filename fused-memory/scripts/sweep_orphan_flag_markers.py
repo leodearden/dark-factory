@@ -976,6 +976,16 @@ async def run(
               all. ``undated_kept_count`` is repeated here beside
               ``undrainable_count`` deliberately — the raw count is not the
               floor, and the two can differ in both directions.
+              ``max_backlog`` is the EFFECTIVE ceiling (default ``0`` when
+              the namespace carries no ``--max-backlog``) and
+              ``gate_unsatisfiable`` is
+              :func:`unsatisfiable_backlog_gate` over the two. Both are
+              computed UNCONDITIONALLY, so a run without ``--check`` still
+              records the hypothetical gate's satisfiability into the
+              journal JSON; the loud ERROR is reserved for a gate actually
+              being evaluated. The exit code is unchanged either way — this
+              block is the machine-readable discriminator, as
+              ``cross_check`` is for the blind spot.
             - deleted (int, only when apply=True)
             - failed (list[str], only when apply=True)
             - tombstoned (int, only when apply=True): task-3041 ledger rows
@@ -1282,9 +1292,18 @@ async def run(
     # can differ in BOTH directions: an undated kind-orphan is drained and
     # floors nothing, while a dated protected mirror floors permanently
     # while contributing 0 to the raw count.
+    #
+    # The gate config is read with the module's established defensive idiom
+    # (see project_id/max_age_days/delete_ids above), NOT bare attribute
+    # access: ~40 existing callers build a namespace carrying neither field,
+    # and gate_unsatisfiable is computed unconditionally so a run without
+    # --check still records the hypothetical gate's satisfiability.
+    max_backlog: int = getattr(args, 'max_backlog', 0)
+    check: bool = getattr(args, 'check', False)
     drained_ids = set(orphan_ids)
     undated_kept = find_undated_markers(members)
     undrainable = find_undrainable_markers(members, drained_ids)
+    gate_unsatisfiable = unsatisfiable_backlog_gate(len(undrainable), max_backlog)
     # Keyed on the undated members this run does NOT delete, not on the raw
     # undated count: find_orphan_markers/find_taskless_markers/
     # find_terminal_task_markers never consult created_at, so an undated
@@ -1313,6 +1332,49 @@ async def run(
             'the reported structural_floor.undrainable_count. See '
             'docs/flag-marker-sweep-recurring.md.',
             len(undated_undrained), len(members),
+        )
+
+    # The exit code is deliberately NOT changed: `structural_floor` is the
+    # machine-readable discriminator, exactly as `cross_check` is for the
+    # enumeration blind spot (design decision 3, and the already-adjudicated
+    # ruling in scripts/fused-memory-flag-marker-check.sh's header — rc is
+    # this script's own, and the orchestrator's before_done path renders any
+    # rc != 0 identically as a predicate violation). The constraint refines
+    # the REASON, never the code, and can never flip a passing verdict:
+    # every floor member matches the `source` filter and survives the delete,
+    # so after.total_source >= len(undrainable) always.
+    #
+    # Field vs. log splits on `check` so both audiences are right: the
+    # nightly --apply --terminal-drain service (which passes no --check) gets
+    # the fact in its journal JSON without a spurious ERROR for a gate it
+    # never evaluates, while an operator who IS evaluating one gets an
+    # unmissable "stop re-running this".
+    if check and gate_unsatisfiable:
+        # Partitioned on PROTECTED-ness, not on undated-ness: a member that
+        # is both belongs under the protected arm, because --delete-ids
+        # cannot reach it and naming that remedy for it would be wrong.
+        protected_ids = {m['id'] for m in protected}
+        protected_floor_ids = [m['id'] for m in undrainable if m['id'] in protected_ids]
+        undated_floor_ids = [m['id'] for m in undrainable if m['id'] not in protected_ids]
+        logger.error(
+            'sweep_orphan_flag_markers: --check --max-backlog %d is '
+            'STRUCTURALLY UNSATISFIABLE against this population: %d '
+            'enumerated markers can never be drained by this script, which '
+            'is already above the ceiling, so this gate can NEVER pass and '
+            're-running it will never clear it. Undrainable: %s. Remedies '
+            'differ by arm — undated ids (%s) can be named in --delete-ids, '
+            'or reached with --terminal-drain if they cite terminal tasks; '
+            'protected ids (%s) cannot be drained by this script AT ALL and '
+            'need the fused-memory MCP delete_memory tool or a corrected '
+            'source enumeration (see delete_orphan_markers). Sufficient fix '
+            'either way: raise --max-backlog to at least %d. See '
+            'docs/flag-marker-sweep-recurring.md.',
+            max_backlog, len(undrainable),
+            ', '.join(m['id'] for m in undrainable),
+            ', '.join(undated_floor_ids) or 'none',
+            ', '.join(protected_floor_ids) or 'none',
+            len(undrainable),
+            extra={'project_id': project_id},
         )
 
     # The found-intersection of args.delete_ids with the enumerated members
@@ -1351,6 +1413,8 @@ async def run(
             'undated_kept_count': len(undated_kept),
             'undrainable_count': len(undrainable),
             'undrainable_ids': [m['id'] for m in undrainable],
+            'max_backlog': max_backlog,
+            'gate_unsatisfiable': gate_unsatisfiable,
         },
     }
 
