@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,36 @@ def read_pressure(name: str) -> str:
     return Path(f'/proc/pressure/{name}').read_text()
 
 
+class _Arm(NamedTuple):
+    """One row of the saturation truth table.
+
+    ``field`` is simultaneously the cfg attribute holding this arm's threshold
+    and the string ``tripping_metric`` reports, so the gate, the
+    ``dispatch_deferred`` payload and the operator vocabulary stay one set.
+    """
+
+    field: str
+    value: Callable[[PsiSample], float]
+    component_ok: Callable[[PsiSample], bool]
+
+
+_ARMS: tuple[_Arm, ...] = (
+    _Arm('mem_full_avg10', lambda s: s.mem_full10, lambda s: s.read_ok),
+    _Arm('runqueue_ratio', lambda s: s.runqueue_ratio, lambda s: s.runqueue_read_ok),
+    _Arm('own_cpu_some_avg10', lambda s: s.own_cpu_some10, lambda s: s.own_read_ok),
+    _Arm('mem_some_avg10', lambda s: s.mem_some10, lambda s: s.read_ok),
+    _Arm('io_some_avg10', lambda s: s.io_some10, lambda s: s.read_ok),
+    _Arm('cpu_some_avg10', lambda s: s.cpu_some10, lambda s: s.read_ok),
+)
+"""The saturation truth table, in the D10 reporting rank.
+
+Single home (heuristic 11): ``saturated`` reads it order-insensitively
+(``any``) and ``tripping_metric`` reads the SAME generator order-sensitively
+(first element), so the OR set and the rank cannot drift apart. The rank
+itself is owned by PRD ``plans/load-throttle-harmonisation-prd.md`` D10.
+"""
+
+
 @dataclass(frozen=True)
 class PsiSample:
     """Immutable PSI snapshot consumed by the orchestrator's dispatch-admission gate.
@@ -125,21 +156,34 @@ class PsiSample:
     own_cgroup: str = ''
     own_read_ok: bool = False
 
-    def saturated(self, cfg) -> bool:
-        """Return True if any PSI metric is at/over its configured avg10 threshold.
+    def _tripping_arms(self, cfg) -> Iterator[_Arm]:
+        """Yield the arms of ``_ARMS`` this sample trips, in D10 rank order."""
+        for arm in _ARMS:
+            threshold = getattr(cfg, arm.field, None)
+            if threshold is None:
+                continue
+            if not arm.component_ok(self):
+                continue
+            if arm.value(self) >= threshold:
+                yield arm
 
-        ``cfg`` is duck-typed (only ``cpu_some_avg10``, ``mem_some_avg10``,
-        ``mem_full_avg10``, and ``io_some_avg10`` are read) so this has no
-        dependency on DA2's ``PsiAdmissionConfig`` submodel. Always False when
-        ``read_ok`` is False (fail-open — a degraded sample must never trip
-        the gate, regardless of the threshold values).
+    def saturated(self, cfg) -> bool:
+        """Return True if any arm is at/over its configured avg10 threshold.
+
+        ``cfg`` is duck-typed — only the ``_ARMS`` field names are read, and
+        each is read with ``getattr(cfg, field, None)``, so an ABSENT attribute
+        and an explicit ``None`` both mean "this arm is off". That keeps a
+        v1 cfg (four thresholds, no ``runqueue_ratio`` / ``own_cpu_some_avg10``)
+        working in the live dispatch gate while the config-side v2 lands
+        separately, and it is the same reading the code defaults ask for.
+
+        An arm also never trips when its own component read failed. The host
+        ``read_ok`` gate stays OUTSIDE the loop, so an unreadable host PSI
+        sample is non-saturated as a whole — including the two non-host arms
+        (DA-D6 fail-open: a degraded sample must never trip the gate,
+        regardless of the threshold values).
         """
-        return self.read_ok and (
-            self.cpu_some10 >= cfg.cpu_some_avg10
-            or self.mem_some10 >= cfg.mem_some_avg10
-            or self.mem_full10 >= cfg.mem_full_avg10
-            or self.io_some10 >= cfg.io_some_avg10
-        )
+        return self.read_ok and any(self._tripping_arms(cfg))
 
 
 _FAIL_OPEN = PsiSample(
