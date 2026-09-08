@@ -1776,6 +1776,40 @@ def _bare_kill_offenders(func_node, holder_names: set[str]) -> list[str]:
     return offenders
 
 
+def _untorn_down_holders(func_node, holder_names: set[str]) -> list[str]:
+    """``"func:holder"`` for every swept holder never passed to a
+    ``kill_holder_tree(...)`` call anywhere in *func_node*.
+
+    Scoped to the WHOLE FUNCTION -- deliberately unlike
+    :func:`_bare_kill_offenders`, which is scoped per ``try`` body -- because
+    the failure this catches is the ABSENCE of any teardown, which no
+    per-body rule can see: a holder torn down in a completely different
+    ``try`` from where it was bound is still torn down.
+
+    Only a DIRECT ``ast.Name`` argument of the call (positional or keyword
+    value) counts as teardown; the argument subtree is deliberately not
+    walked, so an indirection such as ``kill_holder_tree(procs[0])`` is
+    reported as a finding rather than silently excused.  Keyword values are
+    included because ``kill_holder_tree``'s first parameter is named
+    ``proc``, making ``kill_holder_tree(proc=holder)`` a legal spelling.
+    """
+    torn_down: set[str] = set()
+    for node in ast.walk(func_node):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == 'kill_holder_tree'
+        ):
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Name):
+                torn_down.add(arg.id)
+        for keyword in node.keywords:
+            if isinstance(keyword.value, ast.Name):
+                torn_down.add(keyword.value.id)
+    return sorted(f'{func_node.name}:{name}' for name in holder_names - torn_down)
+
+
 def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     """Every spawn_verify_merge-bound holder's teardown goes through kill_holder_tree.
 
