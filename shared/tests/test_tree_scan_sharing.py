@@ -308,19 +308,30 @@ class TestParentMapIsLazy:
         monkeypatch.setattr(sfs, '_build_parent_map', boom)
         assert sfs.find_violations('def f(:\n', 'fake/broken.py') == []
 
-    def test_signature_a_qualname_and_hash_survive_laziness(self):
-        """Pinned against the pre-4520 values: laziness must not degrade qualname."""
+    def test_signature_a_qualname_survives_laziness(self):
+        """The nested qualname still resolves — pinned against the pre-4520 value.
+
+        ``qualname`` is the ONLY thing the parent map feeds, so it is the only
+        assertion that can detect a laziness regression here. ``content_hash``
+        was pinned alongside it and is not: ``_content_hash`` is
+        ``sha256(ast.unparse(node))[:12]`` over the node alone, never consulting
+        the map, so it would survive any degradation this test exists to catch
+        while binding the suite to ``ast.unparse``'s output — not a stability
+        guarantee across CPython minors, and this repo really does run
+        worktrees on different interpreters (3.13 in the main checkout, 3.14 in
+        several worktrees). Whole-record equality between the two scanner entry
+        points is pinned by
+        :meth:`TestFindViolationsInTree.test_matches_find_violations_exactly`.
+        """
         (violation,) = sfs.find_violations(_SIG_A_SOURCE, 'fake/module.py')
         assert violation.signature == 'a'
         assert violation.qualname == 'Harness.run'
-        assert violation.content_hash == '4d5edf203564'
 
-    def test_signature_b_qualname_and_hash_survive_laziness(self):
-        """Pinned against the pre-4520 values (the other half of the ratchet key)."""
+    def test_signature_b_qualname_survives_laziness(self):
+        """The other half: a sig-(b) violation's nested qualname still resolves."""
         (violation,) = sfs.find_violations(_SIG_B_SOURCE, 'fake/module.py')
         assert violation.signature == 'b'
         assert violation.qualname == 'Loader.load'
-        assert violation.content_hash == '92b98f5b67f9'
 
     def test_module_scope_violation_still_resolves(self):
         """The <module> fallback needs the map too — it must still be built."""
@@ -530,13 +541,20 @@ class TestSilentFallthroughGateUsesTheSharedTree:
 # a third private whole-tree parse
 # ---------------------------------------------------------------------------
 
-#: Identifiers the archival gate tracks. All three are Python identifiers, so
-#: an ``ast.Name``/``ast.Attribute`` carrying one cannot exist unless the
-#: literal substring is present in the file's source — which is what makes the
-#: gate's source-text prefilter exact rather than a heuristic.
-_TRACKED_NAMES = frozenset({
-    'TaskConfigDir', 'archive_task_transcripts', 'archive_before_delete',
-})
+# The tracked-name set is read through to ``archival_gate._TRACKED_NAMES``
+# rather than copied here — mirroring how :func:`_unfiltered_archival_scan`
+# already reaches through to ``archival_gate._ARCHIVAL_NAMES``. It is the exact
+# set whose behaviour this file exists to pin, and it has already grown once
+# (task 3619 added ``archive_before_delete``); a local copy would go stale on
+# the next entry, silently narrowing the ``tracked`` list below until
+# ``len(built) <= len(tracked)`` failed spuriously — a drift-triggered false
+# alarm in the guard whose whole job is to catch drift.
+#
+# Why the gate's prefilter is EXACT rather than a heuristic, which is what
+# makes the budget below meaningful: every tracked name is a Python
+# identifier, and the scan only ever matches ``ast.Name.id`` /
+# ``ast.Attribute.attr``, so a node carrying one cannot exist unless the
+# literal substring is present in the file's source.
 
 #: Ceiling on how many first-party files may mention a tracked name. 14 of 461
 #: today. A budget rather than an equality so ordinary churn does not turn this
@@ -607,22 +625,35 @@ class TestArchivalGateUsesTheSharedTree:
         """3% of the tree mentions a tracked name; the other 97% must cost nothing."""
         tracked = [
             record for record in first_party_tree
-            if any(name in record.source for name in _TRACKED_NAMES)
+            if any(name in record.source for name in archival_gate._TRACKED_NAMES)
         ]
         assert len(tracked) <= _TRACKED_FILE_BUDGET, (
             f'{len(tracked)} first-party files mention one of '
-            f'{sorted(_TRACKED_NAMES)} (budget {_TRACKED_FILE_BUDGET}). Either '
+            f'{sorted(archival_gate._TRACKED_NAMES)} (budget '
+            f'{_TRACKED_FILE_BUDGET}). Either '
             f'the names leaked into general use or the prefilter has stopped '
             f'being selective — the archival gate pays a parent map for each.'
         )
         assert tracked, 'no file mentions a tracked name — the gate is vacuous'
 
+        # Patch the binding ``_scan`` actually resolves. The gate does
+        # ``from silent_fallthrough_scan import _build_parent_map``, so it holds
+        # its OWN module-level reference and a ``setattr(sfs, ...)`` never
+        # reaches it — that spelling counted 0 maps forever and made the budget
+        # below pass vacuously (measured: 0 via sfs, 14 via the gate).
         built = []
-        real = sfs._build_parent_map
+        real = archival_gate._build_parent_map
         monkeypatch.setattr(
-            sfs, '_build_parent_map', lambda tree: (built.append(tree), real(tree))[1]
+            archival_gate,
+            '_build_parent_map',
+            lambda tree: (built.append(tree), real(tree))[1],
         )
         archival_gate._scan(first_party_tree)
+        assert built, (
+            'the parent-map counter intercepted nothing — _scan no longer '
+            'resolves _build_parent_map through test_config_dir_archival_gate, '
+            'so this budget would pass no matter what the prefilter did'
+        )
         assert len(built) <= len(tracked), (
             f'_scan built {len(built)} parent maps for {len(tracked)} files that '
             f'mention a tracked name — the source prefilter is not being applied'
