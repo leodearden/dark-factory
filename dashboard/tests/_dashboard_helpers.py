@@ -7,6 +7,7 @@ the same process.
 
 from __future__ import annotations
 
+import html.parser
 import json
 import re
 import sqlite3
@@ -935,3 +936,121 @@ def strip_js_comments(source: str) -> str:
     out.append(source[prev:])
 
     return ''.join(out)
+
+
+# ---------------------------------------------------------------------------
+# Served-HTML script order.
+#
+# index.html loads its scripts as classic synchronous tags, so DOCUMENT order
+# is EXECUTION order — which is what lets a text-level test assert that a
+# provider script loads before the consumer that dereferences it at module
+# scope.  That equivalence is fragile: `defer`, `async` or `type="module"` on
+# either tag breaks it, and a position comparison over a deferred pair is a
+# false pass, not a failure.  Hence the guard below runs BEFORE the comparison.
+#
+# These three used to be private copies in FIVE test modules
+# (test_esc_flow_diagram, test_index_html, test_tab_escalation_analytics,
+# test_tab_escalations, test_tab_memory_evals), so a fix to the false-pass
+# guard had to be applied five times or not at all.  Their contract lives in
+# test_jsx_source_helpers.py::TestScriptOrderHelpers.
+#
+# The five copies agreed byte-for-byte except in one place, resolved here in
+# favour of the canonical 4-of-5 form: the ORDERING failure message ends with
+# the caller's `consumer_note`, where test_index_html.py alone substituted a
+# fixed two-sentence string.  Nothing pins that message — the only tests that
+# match this helper's failure text (test_index_html.py:303 and :338) pin the
+# GUARD phrases, which are identical across all five — so both variants were
+# green, and this one strictly carries more information: it surfaces the note
+# at index_html's 13 note-passing call sites instead of discarding the notes
+# at the other four modules' 14 sites.  The guard messages themselves are
+# carried over verbatim and MUST stay that way; index_html's
+# `_DEFERRED_CDN_CASES` / `_DEFERRED_TAB_TASKS_CASES` turn them into
+# `pytest.raises(match=...)` patterns.
+# ---------------------------------------------------------------------------
+
+
+class ScriptTagCollector(html.parser.HTMLParser):
+    """Collects the attribute dicts for every <script> start-tag encountered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.script_attrs: list[dict[str, str | None]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag == 'script':
+            self.script_attrs.append(dict(attrs))
+
+
+def find_script_position(
+    body: str, src_prefix: str
+) -> tuple[int, dict[str, str | None]] | None:
+    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
+    starts with ``src_prefix``, or ``None`` if no such tag exists.
+
+    ``index`` is the tag's 0-based position in ``ScriptTagCollector.script_attrs``
+    (document order, since the list preserves insertion order).  Returning attrs
+    alongside the position avoids a second parse when the caller also needs the
+    src or other attributes.
+    """
+    collector = ScriptTagCollector()
+    collector.feed(body)
+    for i, attrs in enumerate(collector.script_attrs):
+        if (attrs.get('src') or '').startswith(src_prefix):
+            return i, attrs
+    return None
+
+
+def assert_script_loads_before(
+    body: str,
+    before_src_prefix: str,
+    after_src_prefix: str,
+    before_label: str,
+    after_label: str,
+    consumer_note: str = '',
+) -> None:
+    """Assert that the script for ``before_src_prefix`` loads BEFORE the
+    script for ``after_src_prefix`` in ``body``.  Combines a
+    defer/async/type=module false-pass guard with the document-order
+    position comparison.
+    """
+    before_result = find_script_position(body, before_src_prefix)
+    assert before_result is not None, (
+        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
+        f'{consumer_note}'
+    )
+    before_pos, before_attrs = before_result
+    before_src = before_attrs.get('src')
+
+    after_result = find_script_position(body, after_src_prefix)
+    assert after_result is not None, (
+        f'<script src="{after_src_prefix}..."> not found in index.html — '
+        f'cannot verify load-order invariant for {before_label}.'
+    )
+    after_pos, after_attrs = after_result
+
+    # Both tags must be classic synchronous scripts — otherwise document order
+    # diverges from execution order and the position comparison below is moot.
+    for _label, _attrs in [
+        (before_label, before_attrs),
+        (after_label, after_attrs),
+    ]:
+        assert 'defer' not in _attrs, (
+            f'{_label} has a defer attribute; document order no longer implies '
+            f'execution order, so the load-order check below may give a false pass.'
+        )
+        assert 'async' not in _attrs, (
+            f'{_label} has an async attribute; document order no longer implies '
+            f'execution order, so the load-order check below may give a false pass.'
+        )
+        assert (_attrs.get('type') or '').lower() != 'module', (
+            f'{_label} has type="module"; ES modules are deferred by default, '
+            f'so document order no longer implies execution order.'
+        )
+
+    assert before_pos < after_pos, (
+        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
+        f'BEFORE {after_label} (position {after_pos}). '
+        f'{consumer_note}'
+    )
