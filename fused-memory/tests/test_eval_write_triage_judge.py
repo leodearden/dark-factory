@@ -139,6 +139,77 @@ def _by_class(cases: list[dict], expected_class: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# _rotated
+# ---------------------------------------------------------------------------
+
+class TestRotated:
+    """The draw itself, tested directly — which is how `--limit` got away.
+
+    `_rotated` had no test of its own; it was exercised only through
+    `build_judge_cases`, where per-cluster pool exclusion masks it. That is
+    how a `--limit` run narrowing every slate to a single-cluster pool went
+    unnoticed: the narrowing happens HERE, in the `len(pool) < count` arm,
+    and nothing looked at it.
+    """
+
+    POOL = ['a', 'b', 'c', 'd']
+
+    def test_it_takes_count_entries_from_offset(self) -> None:
+        assert _mod()._rotated(self.POOL, 1, 2) == ['b', 'c']
+
+    def test_it_wraps_around_the_end(self) -> None:
+        """Wrapping is what keeps a late-index case from getting a short slate."""
+        assert _mod()._rotated(self.POOL, 3, 3) == ['d', 'a', 'b']
+
+    @pytest.mark.parametrize('offset', [4, 5, 9, 400])
+    def test_an_offset_past_the_end_is_the_same_window_as_its_modulus(
+        self, offset: int,
+    ) -> None:
+        """`build_judge_cases` passes the corpus index, which exceeds any pool."""
+        rotated = _mod()._rotated
+        assert rotated(self.POOL, offset, 2) == rotated(
+            self.POOL, offset % len(self.POOL), 2,
+        )
+
+    def test_a_short_pool_truncates_rather_than_repeating(self, caplog) -> None:
+        """Fewer entries than asked for, each ONCE, and said out loud.
+
+        Repeating an entry to reach the requested width would show the judge
+        the same record twice and quietly change what the accuracy figure
+        means; returning fewer is honest, but only if the report's reader can
+        tell, which is what the warning is for.
+        """
+        with caplog.at_level(logging.WARNING):
+            drawn = _mod()._rotated(['a', 'b'], 0, 5)
+        assert drawn == ['a', 'b']
+        assert len(drawn) == len(set(drawn))
+        assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+            'a narrowed slate must be announced, not inferred from the report'
+        )
+
+    def test_an_empty_pool_returns_empty_without_raising(self, caplog) -> None:
+        """`start = offset % len(pool)` is a ZeroDivisionError on an empty pool.
+
+        Reachable for real: a single-cluster corpus has no cross-cluster
+        records at all, so the pool is genuinely empty rather than merely
+        short.
+        """
+        with caplog.at_level(logging.WARNING):
+            assert _mod()._rotated([], 3, 2) == []
+
+    @pytest.mark.parametrize('count', [0, -1, -10])
+    def test_a_non_positive_count_returns_empty(self, count: int) -> None:
+        """`--distractors 0` is a legitimate run: canonical-only slates."""
+        assert _mod()._rotated(self.POOL, 1, count) == []
+
+    def test_a_zero_count_on_an_empty_pool_is_not_a_warning(self, caplog) -> None:
+        """Asking for nothing and getting nothing is not a narrowed slate."""
+        with caplog.at_level(logging.WARNING):
+            assert _mod()._rotated([], 0, 0) == []
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ---------------------------------------------------------------------------
 # build_judge_cases
 # ---------------------------------------------------------------------------
 
@@ -321,14 +392,53 @@ class TestBuildJudgeCases:
         assert first == second, 'case construction depends on input ORDER'
 
     def test_distractors_are_spread_rather_than_the_same_slate_every_time(
-        self, records,
+        self,
     ) -> None:
-        """A single globally-smallest slate reused 84 times would measure one
-        arbitrary pair of clusters, not the corpus.
+        """Two cases from the SAME cluster must not receive the same slate.
+
+        The property `_rotated` actually provides, asserted against the only
+        population that can show it. A corpus-wide `len(slates) > 1` is
+        guaranteed by per-cluster pool EXCLUSION alone — two cases in
+        different clusters draw from different pools and carry different
+        canonicals, so their slates differ however the draw is made. That is
+        why the previous form still passed with `_rotated` monkeypatched to
+        the `pool[:count]` its own docstring forbids: it was measuring
+        exclusion, not rotation.
+
+        Same-cluster cases share a canonical AND a pool, so a non-rotating
+        draw hands them a byte-identical slate — one arbitrary handful of
+        clusters measured over and over instead of the corpus.
         """
-        cases = _mod().build_judge_cases(records, distractors=4)
-        slates = {tuple(sorted(c['candidates'])) for c in cases}
-        assert len(slates) > 1, 'every case was shown an identical slate'
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        by_memory = {c['memory_id']: c for c in _by_class(cases, 'duplicate')}
+        first, second = by_memory['c1-dup-1'], by_memory['c1-dup-2']
+        assert first['candidates'][0] == second['candidates'][0] == 'c1-canon', (
+            'both cases must share the cluster canonical as the attach target'
+        )
+        assert first['candidates'] != second['candidates'], (
+            'two cases in one cluster were shown an identical slate'
+        )
+
+    def test_the_spread_assertion_fails_without_rotation(
+        self, monkeypatch,
+    ) -> None:
+        """The guard on the guard: pin that the assertion above can FAIL.
+
+        `_rotated`'s docstring names `pool[:count]` as the thing it exists not
+        to be, so that substitution is the exact defect to reproduce. Without
+        this, a future edit that weakens the spread assertion back into
+        something exclusion alone satisfies would go unnoticed.
+        """
+        module = _mod()
+        monkeypatch.setattr(
+            module, '_rotated', lambda pool, offset, count: pool[:count],
+        )
+        cases = module.build_judge_cases(_corpus(), distractors=2)
+        by_memory = {c['memory_id']: c for c in _by_class(cases, 'duplicate')}
+        assert (
+            by_memory['c1-dup-1']['candidates']
+            == by_memory['c1-dup-2']['candidates']
+        ), 'a non-rotating draw was expected to collapse the two slates'
 
     # -- the distractor control class --------------------------------------
 
