@@ -10,6 +10,7 @@ shapes so both suites pin the same parsing contract.
 from __future__ import annotations
 
 import types
+from typing import Any
 
 import pytest
 
@@ -192,7 +193,7 @@ def _healthy_sample(**overrides):
     """A host-readable all-quiet sample; overrides raise the arm under test."""
     from shared.psi import PsiSample
 
-    fields = dict(
+    fields: dict[str, Any] = dict(
         cpu_some10=0.0,
         mem_some10=0.0,
         mem_full10=0.0,
@@ -208,7 +209,7 @@ def _healthy_sample(**overrides):
     return PsiSample(**fields)
 
 
-def vars_of(sample):
+def vars_of(sample) -> dict[str, Any]:
     """The sample's fields as a plain dict, for building a variant of it."""
     import dataclasses
 

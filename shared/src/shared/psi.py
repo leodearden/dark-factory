@@ -15,6 +15,15 @@ is deliberately NOT re-exported from ``shared/__init__.py``:
 ``shared/tests/test_public_api.py::TestInitAllCompleteness`` pins
 ``shared.__all__`` to a hardcoded module union, so consumers import via
 ``from shared.psi import ...``.
+
+PSI v2 (PRD ``plans/load-throttle-harmonisation-prd.md`` §6.1/§6.3,
+2026-09-08) adds two further load signals beside host PSI: a runqueue ratio
+from /proc/stat and the reading process's own cgroup pressure. Each is an
+independent component with its own read_ok flag, and ``PsiSample`` carries
+all three.
+
+Every import here is stdlib, and must stay that way: ``shared.psi`` is a
+member of ``shared/tests/test_pure_stdlib_leaves.py::PURE_STDLIB_LEAVES``.
 """
 
 from __future__ import annotations
@@ -363,32 +372,33 @@ class PsiSample:
         return next(iter(self._tripping_arms(cfg))).field
 
 
-_FAIL_OPEN = PsiSample(
-    cpu_some10=0.0,
-    mem_some10=0.0,
-    mem_full10=0.0,
-    io_some10=0.0,
-    read_ok=False,
-)
+class _HostReading(NamedTuple):
+    """The host-PSI component: the four /proc/pressure/* fields plus its flag."""
+
+    cpu_some10: float
+    mem_some10: float
+    mem_full10: float
+    io_some10: float
+    read_ok: bool
 
 
-def read_psi_sample(*, read: Callable[[str], str] = read_pressure) -> PsiSample:
-    """Read and parse /proc/pressure/{cpu,memory,io} into a PsiSample.
+_HOST_FAIL_OPEN = _HostReading(0.0, 0.0, 0.0, 0.0, False)
 
-    Maps cpu.some -> cpu_some10, mem.some -> mem_some10, mem.full ->
-    mem_full10, and io.some -> io_some10.
+
+def _read_host_pressure(read: Callable[[str], str]) -> _HostReading:
+    """Read /proc/pressure/{cpu,memory,io}; degrade the four host fields together.
 
     Fail-open (DA-D6): if any source is unreadable (``read`` raises ANY
     exception -- e.g. ``OSError``, or a ``UnicodeDecodeError`` from non-UTF-8
-    content) or unparseable (``parse_pressure_file`` returns None), the WHOLE
-    sample degrades to the fail-open sentinel (all metrics 0.0,
-    read_ok=False) rather than gating on partial data — this must never
-    wedge dispatch. The except is deliberately broad rather than scoped to
-    ``OSError`` alone: a caller-injected ``read`` is untrusted, and "never
-    wedge dispatch" is an absolute guarantee, not one scoped to a single
-    exception type. Loud, rate-limited logging on this condition is the
-    caller's (DA3) responsibility; this function stays side-effect-light (at
-    most a single debug line) to avoid per-tick log spam.
+    content) or unparseable (``parse_pressure_file`` returns None), the whole
+    HOST component degrades to all-zeros with ``read_ok=False`` rather than
+    gating on partial data — this must never wedge dispatch. The except is
+    deliberately broad rather than scoped to ``OSError`` alone: a
+    caller-injected ``read`` is untrusted, and "never wedge dispatch" is an
+    absolute guarantee, not one scoped to a single exception type. Loud,
+    rate-limited logging on this condition is the caller's (DA3)
+    responsibility; this stays side-effect-light (at most a single debug
+    line) to avoid per-tick log spam.
     """
     try:
         cpu = parse_pressure_file(read('cpu'))
@@ -396,16 +406,61 @@ def read_psi_sample(*, read: Callable[[str], str] = read_pressure) -> PsiSample:
         io = parse_pressure_file(read('io'))
     except Exception:
         logger.debug('PSI read failed; failing open', exc_info=True)
-        return _FAIL_OPEN
+        return _HOST_FAIL_OPEN
 
     if cpu is None or mem is None or io is None:
         logger.debug('PSI parse failed (unparseable source); failing open')
-        return _FAIL_OPEN
+        return _HOST_FAIL_OPEN
 
-    return PsiSample(
+    return _HostReading(
         cpu_some10=cpu['some_avg10'],
         mem_some10=mem['some_avg10'],
         mem_full10=mem['full_avg10'],
         io_some10=io['some_avg10'],
         read_ok=True,
+    )
+
+
+def read_psi_sample(
+    *,
+    read: Callable[[str], str] = read_pressure,
+    project_id: str | None = None,
+    proc_stat_path: str | Path = _PROC_STAT,
+    proc_cgroup_path: str | Path = _PROC_SELF_CGROUP,
+    cgroup_root: str | Path = _CGROUP_ROOT,
+) -> PsiSample:
+    """Read the three PSI components into one PsiSample.
+
+    Maps cpu.some -> cpu_some10, mem.some -> mem_some10, mem.full ->
+    mem_full10, io.some -> io_some10, and adds the runqueue and own-cgroup
+    components (PRD ``plans/load-throttle-harmonisation-prd.md`` §6.1/§6.3).
+    ``project_id`` selects the slice name the own-cgroup resolver looks for.
+
+    The three sources are orthogonal, so they are read INDEPENDENTLY and
+    assembled once: a host-PSI failure zeroes only the four host fields and
+    sets ``read_ok=False``, while the runqueue and own-cgroup components keep
+    whatever they separately obtained. Collapsing a partial degradation to a
+    flat all-zero sentinel would discard a reading that actually succeeded,
+    which is the silent-fail-soft shape INV-11 forbids; ``saturated``'s outer
+    ``read_ok`` conjunct still makes such a sample non-saturated (DA-D6).
+
+    Never raises — every component failure is carried in the result by value.
+    """
+    host = _read_host_pressure(read)
+    runqueue = read_runqueue_ratio(proc_stat_path=proc_stat_path)
+    own = read_own_cgroup_pressure(
+        project_id, proc_cgroup_path=proc_cgroup_path, cgroup_root=cgroup_root
+    )
+
+    return PsiSample(
+        cpu_some10=host.cpu_some10,
+        mem_some10=host.mem_some10,
+        mem_full10=host.mem_full10,
+        io_some10=host.io_some10,
+        read_ok=host.read_ok,
+        runqueue_ratio=runqueue.ratio,
+        runqueue_read_ok=runqueue.read_ok,
+        own_cpu_some10=own.some_avg10,
+        own_cgroup=own.cgroup,
+        own_read_ok=own.read_ok,
     )
