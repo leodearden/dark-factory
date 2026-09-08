@@ -68,6 +68,7 @@ from _task_db_scan import (
     NO_DB_RESOLVED_MESSAGE,
     NO_PROJECT_ROOT_RESOLVED_MESSAGE,
     add_db_discovery_args,
+    decode_metadata,
     discover_db_paths,
     discover_project_roots,
     format_coverage_block,
@@ -253,6 +254,55 @@ def test_discover_db_paths_skips_project_root_without_tasks_db(tmp_path):
     root.mkdir()
 
     assert discover_db_paths(project_roots=[str(root)]) == []
+
+
+# ---------------------------------------------------------------------------
+# decode_metadata(raw) -> dict
+#
+# Promoted from a copy verbatim-duplicated across
+# audit_combine_gate_marker_loss.py and audit_manifest_descriptor_drift.py
+# (task 4782). Used only by the two AUDIT scripts, not by the leak scanners —
+# it is Tier 1 by shape (pure, no per-script semantics), not by adoption
+# count. These cases were previously asserted indirectly, through
+# load_combine_targets, in test_audit_combine_gate_marker_loss.py; asserted
+# here directly against the raw value, with no sqlite roundtrip needed.
+# ---------------------------------------------------------------------------
+
+def test_decode_metadata_null_degrades_to_empty_dict():
+    assert decode_metadata(None) == {}
+
+
+def test_decode_metadata_empty_string_degrades_to_empty_dict():
+    assert decode_metadata("") == {}
+
+
+def test_decode_metadata_malformed_json_degrades_to_empty_dict():
+    assert decode_metadata("{not json at all") == {}
+
+
+def test_decode_metadata_json_list_degrades_to_empty_dict():
+    """Valid JSON that decodes to a list, not a dict, is still degraded."""
+    assert decode_metadata('["curator_action"]') == {}
+
+
+def test_decode_metadata_json_scalar_degrades_to_empty_dict():
+    """A bare JSON scalar decodes fine but is not a dict — skipped, not raised."""
+    assert decode_metadata('"combine"') == {}
+    assert decode_metadata("17") == {}
+    assert decode_metadata("null") == {}
+
+
+def test_decode_metadata_non_str_non_bytes_degrades_to_empty_dict():
+    """A wrong-typed column value (e.g. an int) is corrupt data, not raised."""
+    assert decode_metadata(17) == {}
+
+
+def test_decode_metadata_valid_json_dict_round_trips():
+    assert decode_metadata('{"curator_action": "combine"}') == {"curator_action": "combine"}
+
+
+def test_decode_metadata_accepts_bytes():
+    assert decode_metadata(b'{"curator_action": "combine"}') == {"curator_action": "combine"}
 
 
 # ---------------------------------------------------------------------------

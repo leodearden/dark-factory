@@ -150,6 +150,13 @@ def test_load_combine_targets_metadata_keys_are_a_tuple(make_tasks_db):
 # malformed shape is skipped, and the well-formed combine row alongside it
 # still comes back. Asserted row-by-row rather than as one loop so a
 # regression names the exact shape that broke.
+#
+# THE RAW-VALUE DECODE MATRIX (None / "" / malformed JSON / a JSON list / a
+# JSON scalar all degrading to {}) MOVED to
+# scripts/tests/test_task_db_scan.py's decode_metadata tests as of task 4782,
+# which promoted _decode_metadata into scripts/_task_db_scan.py as a shared
+# Tier 1 helper. What stays here is what is genuinely THIS function's own
+# behaviour: the curator_action filter applied AFTER decoding.
 # ---------------------------------------------------------------------------
 
 # `make_tasks_db` defaults to the name 'tasks.db' inside a single tmp_path, so
@@ -169,29 +176,6 @@ def _survives_alongside(make_tasks_db, bad_metadata):
         name=f"tasks-{next(_DB_SEQ)}.db",
     )
     return set(load_combine_targets(str(db)))
-
-
-def test_load_combine_targets_skips_null_metadata(make_tasks_db):
-    assert _survives_alongside(make_tasks_db, None) == {("master", 2)}
-
-
-def test_load_combine_targets_skips_empty_string_metadata(make_tasks_db):
-    assert _survives_alongside(make_tasks_db, "") == {("master", 2)}
-
-
-def test_load_combine_targets_skips_invalid_json_metadata(make_tasks_db):
-    assert _survives_alongside(make_tasks_db, "{not json at all") == {("master", 2)}
-
-
-def test_load_combine_targets_skips_json_list_metadata(make_tasks_db):
-    assert _survives_alongside(make_tasks_db, '["curator_action"]') == {("master", 2)}
-
-
-def test_load_combine_targets_skips_json_scalar_metadata(make_tasks_db):
-    """A bare JSON scalar decodes fine but is not a dict — skipped, not raised."""
-    assert _survives_alongside(make_tasks_db, '"combine"') == {("master", 2)}
-    assert _survives_alongside(make_tasks_db, "17") == {("master", 2)}
-    assert _survives_alongside(make_tasks_db, "null") == {("master", 2)}
 
 
 def test_load_combine_targets_skips_dict_without_curator_action(make_tasks_db):

@@ -80,6 +80,7 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    decode_metadata,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
@@ -123,26 +124,6 @@ class CombineTarget(NamedTuple):
     metadata_keys: tuple[str, ...]
 
 
-def _decode_metadata(raw: object) -> dict:
-    """Decode a raw ``metadata`` blob into a dict, degrading to ``{}``.
-
-    Mirrors :func:`audit_wiped_metadata_files._decode_files`. Degrades for
-    NULL, an empty string, malformed JSON, or a payload that decodes to
-    anything other than a dict (a list, a bare scalar, ``null``). A corrupt
-    metadata blob is data to be skipped, never a reason to abort a sweep over
-    thousands of tasks.
-    """
-    if not raw or not isinstance(raw, (str, bytes)):
-        return {}
-    try:
-        payload = json.loads(raw)
-    except (ValueError, TypeError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    return payload
-
-
 def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTarget]:
     """Load every curator-combined task from *tasks_db_path*, keyed by ``(tag, id)``.
 
@@ -165,7 +146,7 @@ def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTar
     try:
         cursor = conn.execute("SELECT tag, id, status, metadata FROM tasks")
         for tag, task_id, status, metadata in cursor:
-            payload = _decode_metadata(metadata)
+            payload = decode_metadata(metadata)
             if payload.get("curator_action") != CURATOR_ACTION_COMBINE:
                 continue
             targets[(tag, task_id)] = CombineTarget(
@@ -253,7 +234,7 @@ def load_ticket_expectations(tickets_db_path: str, project_id: str) -> dict[str,
         for task_id, candidate_json in cursor:
             if task_id is None:
                 continue
-            candidate = _decode_metadata(candidate_json)
+            candidate = decode_metadata(candidate_json)
             metadata = candidate.get("metadata")
             if not isinstance(metadata, dict):
                 continue
