@@ -41,6 +41,7 @@ from _fm_helpers import (
 from fused_memory.services import memory_service as memory_service_module
 from fused_memory.services.memory_service import (
     REFERENT_CHECKS,
+    REFERENT_FINDING_AXES,
     MemoryService,
     ReferentFinding,
     ReferentStats,
@@ -1793,10 +1794,21 @@ class TestReferentFindingCounters:
     """
 
     def test_every_bucket_exists_from_construction(self, service):
-        """A reader never has to distinguish "zero" from "absent"."""
+        """A reader never has to distinguish "zero" from "absent".
+
+        Keyed off the CONSTANTS, not a literal, so the bucket vocabulary lives
+        at ONE site (INV-5) — a fourth bucket has to be REGISTERED rather than
+        spelled here and at the construction site and hoped to match.
+        """
         assert service.referent_finding_counts() == dict.fromkeys(
-            (*REFERENT_CHECKS, 'unresolvable'), 0,
+            (*REFERENT_CHECKS, *REFERENT_FINDING_AXES), 0,
         )
+
+    def test_the_axes_are_the_two_orthogonal_ones_not_checks(self):
+        """The axis vocabulary is closed too, and its members answer questions
+        ABOUT a finding rather than naming which check produced it."""
+        assert REFERENT_FINDING_AXES == ('unresolvable', 'corroborated')
+        assert not set(REFERENT_FINDING_AXES) & set(REFERENT_CHECKS)
 
     def test_the_counter_exists_even_with_no_write_journal(self, service):
         """Unconditional construction: the escape must not go dark in exactly
@@ -1852,10 +1864,50 @@ class TestReferentFindingCounters:
 
         assert set(service.referent_finding_counts().values()) == {0}
 
+    @pytest.mark.asyncio
+    async def test_a_corroborated_finding_moves_the_new_axis_too(self, service):
+        """ALONGSIDE the check bucket, never instead of it.
+
+        S1's fix is that leaf iota can SUBTRACT corroborated rows from the
+        membership rate — which needs the denominator still there. Folding them
+        out of `set-membership` instead would silently change what iota's
+        existing rate means, and would break the "buckets are orthogonal axes,
+        not a partition" contract the counter documents.
+        """
+        stats = await service._verify_episode_referents(
+            _corroborated_membership_episode(), group_id='dark_factory',
+            referents=(Referent(number='3668'),),
+        )
+
+        assert [f.corroborated for f in stats.findings] == [True]
+        counts = service.referent_finding_counts()
+        assert counts['corroborated'] == 1
+        assert counts['set-membership'] == 1
+        assert counts['unresolvable'] == 1
+        assert counts['per-edge-pairing'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_finding_leaves_the_corroborated_bucket_at_zero(
+        self, service,
+    ):
+        """The bucket covers the `endpoint in cited` veto ONLY. A misattached
+        edge nothing corroborates is the defect the pass exists to catch, and
+        must stay fully visible in iota's rate."""
+        await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        counts = service.referent_finding_counts()
+        assert counts['set-membership'] == 1
+        assert counts['corroborated'] == 0
+
     def test_the_accessor_returns_a_copy(self, service):
         service.referent_finding_counts()['set-membership'] = 99
+        service.referent_finding_counts()['corroborated'] = 99
 
         assert service.referent_finding_counts()['set-membership'] == 0
+        assert service.referent_finding_counts()['corroborated'] == 0
 
 
 class TestReferentFindingOperatorLog:
