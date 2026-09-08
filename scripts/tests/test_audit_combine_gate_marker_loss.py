@@ -156,7 +156,17 @@ def test_load_combine_targets_metadata_keys_are_a_tuple(make_tasks_db):
 # scripts/tests/test_task_db_scan.py's decode_metadata tests as of task 4782,
 # which promoted _decode_metadata into scripts/_task_db_scan.py as a shared
 # Tier 1 helper. What stays here is what is genuinely THIS function's own
-# behaviour: the curator_action filter applied AFTER decoding.
+# behaviour: the curator_action filter applied AFTER decoding — plus exactly
+# ONE retained decode case, the NULL row, kept deliberately as the
+# sqlite-ROUNDTRIP canary.
+#
+# WHY THAT ONE STAYS. The moved matrix asserts decode_metadata against PYTHON
+# values, so nothing over there would catch a pre-decode access on the raw
+# COLUMN — a `metadata.strip()` or a length check growing inside
+# load_combine_targets — raising AttributeError on a real NULL row mid-sweep.
+# NULL is the most common metadata shape in the live store, being exactly what
+# the curator-combine wipe this script audits produces, so it is the one case
+# worth paying a sqlite roundtrip for.
 # ---------------------------------------------------------------------------
 
 # `make_tasks_db` defaults to the name 'tasks.db' inside a single tmp_path, so
@@ -176,6 +186,12 @@ def _survives_alongside(make_tasks_db, bad_metadata):
         name=f"tasks-{next(_DB_SEQ)}.db",
     )
     return set(load_combine_targets(str(db)))
+
+
+def test_load_combine_targets_skips_null_metadata(make_tasks_db):
+    """The sqlite-roundtrip canary (see the matrix note above): a NULL column,
+    not a Python None handed straight to decode_metadata."""
+    assert _survives_alongside(make_tasks_db, None) == {("master", 2)}
 
 
 def test_load_combine_targets_skips_dict_without_curator_action(make_tasks_db):

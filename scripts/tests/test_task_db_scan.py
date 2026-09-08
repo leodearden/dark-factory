@@ -2,11 +2,13 @@
 the four READ-ONLY tasks.db sweep scripts (tasks 3336 and 3616, following task
 3286's "~134 identical lines" finding).
 
-Tier 1 (discovery: _DEFAULT_PROJECT_ROOTS / tasks_db_path /
+Tier 1 (discovery: _DEFAULT_PROJECT_ROOTS / tasks_db_path / decode_metadata /
 resolve_project_roots / discover_project_roots / discover_db_paths) is adopted
-by ALL FOUR sweep scripts. Tier 2 (leak-scanner CLI plumbing) is adopted by the
-two LEAK SCANNERS only; Tier 3 (audit-script CLI plumbing: run_audit_cli /
-sweep_project_roots / the AUDIT_EXIT_* codes / format_kv_line /
+by ALL FOUR sweep scripts — except decode_metadata, which is Tier 1 by SHAPE
+(pure, no per-script semantics) rather than by adoption count, and is used only
+by the two AUDIT scripts (task 4782). Tier 2 (leak-scanner CLI plumbing) is
+adopted by the two LEAK SCANNERS only; Tier 3 (audit-script CLI plumbing:
+run_audit_cli / sweep_project_roots / the AUDIT_EXIT_* codes / format_kv_line /
 format_coverage_block) by the two AUDIT scripts only. The split is
 load-bearing rather than cosmetic: Tier 2 sweeps db PATHS and accumulates
 MATCHES, Tier 3 sweeps project ROOTS and collects exactly one audit per root,
