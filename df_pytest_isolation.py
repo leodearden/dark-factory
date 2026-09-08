@@ -1609,14 +1609,39 @@ def _df_fleet_dir_redirect(tmp_path_factory: pytest.TempPathFactory):
     basetemp and is not the live dir), the per-root PROOF (each root's test still
     takes this fixture BY NAME, so deleting a conftest binding still fails
     collection), and per-call ``env=`` overrides still winning.
+
+    WHAT THE RULE CHECKS IS THE PATH, NOT THE FILESYSTEM, so the adopting branch
+    re-establishes the "directory is CREATED" contract itself with an idempotent
+    ``mkdir`` (task 4890 amendment) rather than trusting that whoever set the
+    variable had already made the directory.  A second soundness test here would
+    drift from :func:`fleet_dir_redirect_violation_reason`; simply making the
+    directory cannot, and is a no-op in the ordinary case where the owning
+    instance ``mktemp``'d it.
+
+    NOT gated on an ownership flag, deliberately.  The failure such a flag would
+    guard — some unrelated code leaving a basetemp-internal value behind for this
+    to inherit — needs that value to be present when this SESSION-scoped fixture
+    first runs, i.e. set by another root's instance of this very fixture, which
+    is the case adoption exists for.  A module-global flag would add mutable
+    process state whose own correctness then needs pinning, in exchange for
+    refusing a value that already satisfies the shared rule.  The branch is
+    instead proven end-to-end, in a real two-root session, by
+    ``tests/scripts/test_fleet_dir_isolation.py::TestTheAdoptBranchHoldsInARealSession``.
     """
     saved = os.environ.get(_FLEET_DIR_ENV)
     adopted = fleet_dir_redirect_target(saved, tmp_path_factory.getbasetemp())
     if adopted is not None:
         # Another root's instance already established a sound redirect for this
-        # session. Yield IT and touch nothing: creating a second dir here would
-        # overwrite the env var out from under the instance that owns it, and
-        # popping it on teardown would strip a value that instance still needs.
+        # session. Yield IT and touch os.environ NOT AT ALL: creating a second
+        # dir here would overwrite the env var out from under the instance that
+        # owns it, and popping it on teardown would strip a value that instance
+        # still needs.
+        #
+        # The one thing this branch does do is make the directory, because
+        # fleet_dir_redirect_target rules on the PATH and cannot know whether it
+        # exists -- see the docstring. Idempotent, and a no-op for the owning
+        # instance's mktemp'd dir.
+        adopted.mkdir(parents=True, exist_ok=True)
         yield adopted
         return
 

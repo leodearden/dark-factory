@@ -813,6 +813,159 @@ def _nested_run(
     )
 
 
+# ---------------------------------------------------------------------------
+# The redirect fixture's ADOPT branch, proven in a real two-root session
+# (task 4890 amendment; the behavioural fix for task 4398).
+#
+# TestFleetDirRedirectTarget covers the pure RULE. Nothing covered the FIXTURE
+# branch that consumes it, so an inverted condition or a dropped `return` in
+# _df_fleet_dir_redirect would have left every unit test above green -- and a
+# scoped run of either root alone stays green too, because the failure needs
+# two session-scoped instances live in ONE session. Only the top-level
+# both-roots command (scripts/orchestrator.yaml's test_command) reached it, and
+# a gating command is not a test: it says which RUN went red, not which branch.
+#
+# This reduces 4398 to its essentials in a nested pytest session -- two
+# sub-rootdirs, each with a conftest binding the fixture exactly as this repo's
+# three real roots do -- so the branch is pinned by something that names it.
+# ---------------------------------------------------------------------------
+
+# The binding IS the wiring, and it goes in a CONFTEST rather than a test
+# module: that is what the real roots do (conftest.py, scripts/tests/conftest.py,
+# orchestrator/tests/conftest.py) and it is what makes two independent instances
+# of one session-scoped fixture exist in a single session.
+_ADOPTION_CONFTEST = """\
+import sys
+from pathlib import Path
+
+# The copied df_pytest_isolation sits in the nested ROOT, one level above this
+# sub-root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from df_pytest_isolation import _df_fleet_dir_redirect  # noqa: F401
+"""
+
+# Each nested test RECORDS what its own root's instance yielded, so the outer
+# test can compare the two roots against each other -- the assertion that
+# discriminates adoption from clobbering, and the only one that does so
+# independently of the order pytest happens to run the modules in.
+_ADOPTION_TEST_TEMPLATE = """\
+import os
+from pathlib import Path
+
+
+def test_records_what_this_roots_fixture_yielded(_df_fleet_dir_redirect):
+    '''Takes the fixture BY NAME, exactly as each real root's own test does.'''
+    env = os.environ.get('ORCH_FLEET_DIR')
+
+    observed = Path(__file__).resolve().parent.parent / 'observed'
+    observed.mkdir(exist_ok=True)
+    (observed / __RECORD__).write_text(f'{_df_fleet_dir_redirect}\\n{env}\\n')
+
+    # The per-root identity assertion both real roots carry. THIS is what broke
+    # in task 4398: the instance that ran first kept yielding a path the env var
+    # no longer held once the second instance overwrote it.
+    assert Path(_df_fleet_dir_redirect).resolve() == Path(env or '').resolve()
+    # The fixture's "the directory is CREATED and left EMPTY" contract must
+    # survive adoption, which rules on the PATH and not on the filesystem.
+    assert Path(_df_fleet_dir_redirect).is_dir()
+"""
+
+
+def _adoption_test_source(record: str) -> str:
+    return _ADOPTION_TEST_TEMPLATE.replace('__RECORD__', repr(record))
+
+
+def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
+    """Run one pytest session spanning TWO sub-rootdirs that each bind the fixture.
+
+    The module order on the command line is A, B, A -- the shape task 4398
+    actually reported (``pytest scripts/tests/... tests/scripts/...
+    scripts/tests/...``), where the first root's SECOND module is the one that
+    runs after the other root's instance has had its chance to clobber the env
+    var. The outer assertions do not DEPEND on that order holding, since
+    comparing the two roots' recorded paths discriminates either way; it is
+    here because it costs one file and reproduces the original report exactly.
+    """
+    for sub in ('root_a', 'root_b'):
+        (root / sub).mkdir(parents=True)
+        (root / sub / 'conftest.py').write_text(_ADOPTION_CONFTEST)
+    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
+    (root / 'pytest.ini').write_text(_NESTED_INI)
+    (root / 'root_a' / 'test_a_first.py').write_text(_adoption_test_source('a-first'))
+    (root / 'root_b' / 'test_b_only.py').write_text(_adoption_test_source('b-only'))
+    (root / 'root_a' / 'test_a_second.py').write_text(_adoption_test_source('a-second'))
+    return subprocess.run(
+        [
+            sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
+            'root_a/test_a_first.py', 'root_b/test_b_only.py',
+            'root_a/test_a_second.py',
+        ],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+
+
+class TestTheAdoptBranchHoldsInARealSession:
+    """Two roots, one session, one redirect."""
+
+    def test_both_roots_yield_the_one_redirect_the_env_var_holds(
+        self, tmp_path: Path,
+    ) -> None:
+        """The end-to-end proof of ``_df_fleet_dir_redirect``'s adopt branch.
+
+        Asserts the PROPERTY, not the mechanism: whatever the two instances do
+        internally, they must agree on ONE directory and that directory must be
+        what ``ORCH_FLEET_DIR`` holds while each root's tests run. Both halves
+        are load-bearing -- agreeing on a path neither root exported would
+        satisfy the first one alone.
+
+        Without adoption this fails on the recorded paths (``fleet-dir0`` vs
+        ``fleet-dir1`` under one basetemp, which is verbatim what 4398
+        reported) and, when the A-B-A order holds, on the nested run's own exit
+        code as well.
+
+        Note the nested session INHERITS this session's ``ORCH_FLEET_DIR``,
+        which points into the OUTER basetemp -- so the first instance correctly
+        REFUSES it (a previous run's value is never adoptable) and mktemps, and
+        only the second adopts. That is the create path and the adopt path in
+        one run, in the order they occur in production.
+        """
+        root = tmp_path / 'two-roots'
+        result = _nested_adoption_run(root)
+        combined = result.stdout + result.stderr
+
+        assert result.returncode == 0, (
+            'a two-root nested session failed its own per-root identity '
+            'assertions -- the redirect fixture is clobbering across roots '
+            f'again (task 4398). stdout={result.stdout!r} '
+            f'stderr={result.stderr!r}'
+        )
+        assert '3 passed' in combined, (
+            'the nested session did not run all three modules, so it proves '
+            f'nothing about two live instances. output={combined!r}'
+        )
+
+        records = {
+            p.name: p.read_text().splitlines()
+            for p in sorted((root / 'observed').iterdir())
+        }
+        assert set(records) == {'a-first', 'a-second', 'b-only'}, records
+
+        yielded = {name: rec[0] for name, rec in records.items()}
+        env_seen = {name: rec[1] for name, rec in records.items()}
+
+        assert len(set(yielded.values())) == 1, (
+            'the two roots yielded DIFFERENT redirects, so at least one is '
+            'handing its tests a directory the env var does not name -- the '
+            f'adopt branch is not running. yielded={yielded!r}'
+        )
+        assert set(env_seen.values()) == set(yielded.values()), (
+            'every root agreed on a directory that is not what ORCH_FLEET_DIR '
+            'actually held, so a spawned script would read somewhere else '
+            f'entirely. yielded={yielded!r} env={env_seen!r}'
+        )
+
+
 class TestTheGuardFailsTheRunEndToEnd:
     """A leak must cost the RUN, not merely log something."""
 
