@@ -14,9 +14,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from escalation.dedupe import compute_content_fingerprint
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
+from fused_memory.utils.target_store_preflight import TargetStoreMissing
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'backfill_recon_escalations.py'
 
@@ -776,3 +779,69 @@ class TestSafetyAndCli:
         captured = capsys.readouterr()
         report = json.loads(captured.out)
         assert report.get('dry_run') is False
+
+
+# ---------------------------------------------------------------------------
+# TestRunTargetStorePreflight
+# ---------------------------------------------------------------------------
+
+class TestRunTargetStorePreflight:
+    """The target-store refusal (task 4319).
+
+    ``EscalationQueue.__init__`` does ``mkdir(parents=True, exist_ok=True)``,
+    so without this guard a run pointed at a missing queue dir manufactures an
+    empty queue, reports ``"pending_before": 0``, and exits 0 — a false
+    all-clear indistinguishable from a genuinely quiet queue. The
+    ``--queue-dir`` default is the RELATIVE ``./data/reconciliation/
+    escalations``, so that is what a run from a task worktree does.
+
+    Every OTHER class in this file constructs ``EscalationQueue(tmp_path)`` on
+    an EXISTING directory, so the guard is a verified no-op for them. If one of
+    them breaks, that is a signal the guard was placed wrongly (e.g. asserting
+    absoluteness) — not a licence to weaken it.
+    """
+
+    def test_dry_run_refuses_a_missing_queue_dir(self, tmp_path: Path) -> None:
+        """The DRY RUN refuses too: its report is exactly as false as an apply."""
+        with pytest.raises(TargetStoreMissing):
+            run(tmp_path / 'data' / 'reconciliation' / 'escalations', apply=False)
+
+    def test_apply_refuses_a_missing_queue_dir(self, tmp_path: Path) -> None:
+        with pytest.raises(TargetStoreMissing):
+            run(tmp_path / 'data' / 'reconciliation' / 'escalations', apply=True)
+
+    @pytest.mark.parametrize('apply', [False, True])
+    def test_refusal_leaves_no_litter(self, tmp_path: Path, apply: bool) -> None:
+        """The queue was never constructed, so the ``mkdir`` never happened."""
+        target = tmp_path / 'data' / 'reconciliation' / 'escalations'
+
+        with pytest.raises(TargetStoreMissing):
+            run(target, apply=apply)
+
+        assert not target.exists()
+        assert not (tmp_path / 'data').exists()
+
+    def test_main_does_not_return_zero_for_a_missing_queue_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """``main()`` returns 0 UNCONDITIONALLY, with no error accounting.
+
+        A refusal routed through the normal report path would therefore exit 0,
+        reproducing the very defect the guard exists to fix. It must raise.
+        """
+        import sys as _sys  # noqa: PLC0415
+
+        missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        old_argv = _sys.argv
+        try:
+            _sys.argv = ['backfill_recon_escalations.py', '--queue-dir', str(missing)]
+            with pytest.raises(TargetStoreMissing):
+                _mod.main()
+        finally:
+            _sys.argv = old_argv
+
+    def test_existing_queue_dir_passes_the_guard(self, tmp_path: Path) -> None:
+        """The guard does not require absoluteness, or a non-empty queue."""
+        report = run(tmp_path, apply=False)
+
+        assert report['pending_before'] == 0
