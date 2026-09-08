@@ -639,26 +639,35 @@ class TestVerdictToolsResidueChannelIsShared:
         assert not spec.residue_anchor_task_id.isdigit()
 
     def test_spec_declares_where_ITS_callers_can_be_identified(self):
-        """Task 4744: ``attribution_source`` is verdict-tools' OWN answer.
+        """Task 4917: ``attribution_source`` is verdict-tools' OWN answer, and
+        it now names verdict-tools' OWN journal.
 
-        plan-tools now journals every markup fact to a durable file and its
-        storm record names that path. verdict-tools is the IDENTICAL per-agent
-        stdio subprocess with an identically ephemeral stderr and has no journal
-        yet, so it declares the only route that genuinely exists there —
-        transcript mining. Inheriting either plan-tools' journal path or the old
-        "grep the orchestrator logs" sentence would ship an instruction that is
-        false at this boundary, which is the exact defect task 4744 fixes.
+        THIS ROW'S PREMISE EXPIRED, and the inversion is deliberate rather than
+        a weakening. It used to assert that the journal directory must NOT
+        appear here, on the written rationale that "naming a journal this
+        boundary does not write would send an operator to an empty or missing
+        file" — correct while the fact channel was a ``logger.info`` nobody
+        retains, and false the moment task 4917 wired the journal. The
+        GUARANTEE is unchanged: this boundary states its own answer, naming ITS
+        file, rather than inheriting plan-tools'.
         """
-        from orchestrator.mcp import markup_journal, plan_tools, verdict_tools
+        from orchestrator.mcp import plan_tools
 
         spec = verdict_tools._MARKUP_SINK_SPEC
-        assert 'data/orchestrator/agent-transcripts' in spec.attribution_source
-        assert 'orchestrator logs' not in spec.attribution_source
-        assert spec.attribution_source != plan_tools._MARKUP_SINK_SPEC.attribution_source
-        assert markup_journal.MARKUP_JOURNAL_DIRNAME not in spec.attribution_source, (
-            'naming a journal this boundary does not write would send an '
-            'operator to an empty or missing file'
+        assert (
+            f'{markup_journal.MARKUP_JOURNAL_DIRNAME}/verdict-tools.jsonl'
+            in spec.attribution_source
         )
+        assert 'data/orchestrator/agent-transcripts' not in spec.attribution_source, (
+            'the transcript-mining instruction is RETIRED, not merely '
+            'supplemented — leaving it would keep sending an operator down the '
+            'expensive route when a one-line grep now answers the question'
+        )
+        assert 'orchestrator logs' not in spec.attribution_source, (
+            'the unfollowable grep-the-logs sentence task 4744 retired must '
+            'not come back'
+        )
+        assert spec.attribution_source != plan_tools._MARKUP_SINK_SPEC.attribution_source
 
     def test_the_field_is_required_so_a_new_server_must_decide(self):
         """A DEFAULT is what would let the next server inherit silently.
@@ -906,3 +915,87 @@ class TestTheVerdictFactReachesADurableJournal:
         assert artifacts.read_verdict(REVIEWER_ROLE) is not None
         assert result.meta is not None
         assert result.meta['markup_repair']['outcome'] == 'repaired'
+
+
+# ---------------------------------------------------------------------------
+# The storm record POINTS AT the journal (task 4917).
+# ---------------------------------------------------------------------------
+
+
+class TestTheStormRecordNamesTheJournal:
+    """A durable artifact an operator cannot FIND is not durable.
+
+    ``MarkupSinkSpec.attribution_source`` is the one string rendered into the
+    burst alarm's body (``markup_sink.storm_detail``) and into its
+    ``suggested_action``. Wiring the journal without repointing that string
+    would move the dead end rather than close it: the record would still send a
+    reader to ``data/orchestrator/agent-transcripts/`` to mine by hand for an
+    answer that is now one grep away.
+    """
+
+    @staticmethod
+    def _storm_detail() -> str:
+        """The REAL rendered record, not the spec field read in isolation."""
+        from orchestrator.mcp import markup_sink
+
+        return markup_sink.storm_detail(
+            {
+                'count': 3,
+                'threshold': 3,
+                'window_seconds': 3600,
+                'outcome': 'repaired',
+                'project': None,
+            },
+            verdict_tools._MARKUP_SINK_SPEC,
+        )
+
+    def test_the_storm_detail_names_the_journal(self):
+        """(b) The body an operator reads, rendered through the real helper."""
+        detail = self._storm_detail()
+
+        assert f'{markup_journal.MARKUP_JOURNAL_DIRNAME}/verdict-tools.jsonl' in detail
+        assert 'orchestrator logs' not in detail, (
+            'the instruction task 4744 measured to be unfollowable must be '
+            'RETIRED, not merely supplemented'
+        )
+        assert 'plans/toolcall-markup-containment-prd.md' in detail, (
+            'the standing PRD pointer stays'
+        )
+
+    @pytest.mark.asyncio
+    async def test_following_the_records_own_instruction_now_succeeds(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """(c) The end-to-end row, and the only one that catches the two halves
+        drifting apart.
+
+        Asserting the record's prose alone would pin an instruction that is
+        merely better-worded. So this one FOLLOWS it: pull the path the record
+        names out of its own body, open that exact file, and read the line.
+        """
+        monkeypatch.setattr(
+            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
+            raising=False,
+        )
+        seed_plan(artifacts)
+
+        await repaired_call(artifacts)
+
+        named = [tok for tok in self._storm_detail().split() if tok.endswith('.jsonl')]
+        assert len(named) == 1, (
+            f'the record must name exactly one journal to open, got {named!r}'
+        )
+        path = tmp_path / named[0]
+        assert path == markup_journal.journal_path(tmp_path, 'verdict-tools'), (
+            'the instruction and the artifact must be the same path, which is '
+            'why both are composed from MARKUP_JOURNAL_DIRNAME'
+        )
+        assert path.is_file(), (
+            f'the record sends an operator to {named[0]}, which does not exist'
+        )
+        (line,) = [
+            json.loads(entry)
+            for entry in path.read_text(encoding='utf-8').splitlines()
+            if entry.strip()
+        ]
+        assert line['subject_task_id'] == 'test-1'
