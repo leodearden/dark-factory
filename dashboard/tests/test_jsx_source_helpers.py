@@ -28,7 +28,13 @@ import sys
 from pathlib import Path
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _dashboard_helpers import (
+    ScriptTagCollector,
+    assert_script_loads_before,
+    extract_function_body,
+    find_script_position,
+    strip_js_comments,
+)
 
 
 class TestExtractFunctionBody:
@@ -424,6 +430,273 @@ def _resolved_client_scope(request) -> str | None:
         if marker is not None:
             return getattr(marker, 'scope', None)
     return None
+
+
+class TestScriptOrderHelpers:
+    """The served-HTML script-order helper trio's contract.
+
+    These three used to be copied verbatim into five modules
+    (test_esc_flow_diagram, test_index_html, test_tab_escalation_analytics,
+    test_tab_escalations, test_tab_memory_evals), so a fix to the false-pass
+    guard had to be applied five times or not at all.  Everything pinned below
+    was measured off those copies before the move, so the consolidation cannot
+    silently change an outcome.
+
+    The three guard phrases in particular are pinned VERBATIM because
+    test_index_html.py's `_DEFERRED_CDN_CASES` / `_DEFERRED_TAB_TASKS_CASES`
+    turn them into `pytest.raises(match=...)` patterns; a reworded message
+    there would make those parametrizations match nothing.
+    """
+
+    # -- ScriptTagCollector ------------------------------------------------
+
+    def test_collector_records_one_attrs_dict_per_script_start_tag(self) -> None:
+        """One entry per <script> START tag, in document order."""
+        collector = ScriptTagCollector()
+        collector.feed(
+            '<html><head>'
+            '<script src="/a.js"></script>'
+            '<script src="/b.js" defer></script>'
+            '</head></html>'
+        )
+
+        assert [a.get('src') for a in collector.script_attrs] == ['/a.js', '/b.js']
+        assert collector.script_attrs[1].get('defer') is not None or (
+            'defer' in collector.script_attrs[1]
+        ), 'valueless attributes must still be recorded as keys'
+
+    def test_collector_counts_inline_scripts(self) -> None:
+        """An inline (src-less) <script> still consumes an index.
+
+        Load-order positions are indices into this list, so a tag that did not
+        consume one would shift every later position and could invert a
+        comparison.
+        """
+        collector = ScriptTagCollector()
+        collector.feed(
+            '<script src="/a.js"></script>'
+            '<script>window.X = 1;</script>'
+            '<script src="/b.js"></script>'
+        )
+
+        assert len(collector.script_attrs) == 3
+        assert 'src' not in collector.script_attrs[1]
+        assert [a.get('src') for a in collector.script_attrs] == [
+            '/a.js', None, '/b.js',
+        ]
+
+    def test_collector_ignores_non_script_tags(self) -> None:
+        collector = ScriptTagCollector()
+        collector.feed('<link rel="stylesheet" href="/a.css"><div><p>hi</p></div>')
+
+        assert collector.script_attrs == []
+
+    # -- find_script_position ----------------------------------------------
+
+    def test_find_returns_index_and_attrs_for_the_first_prefix_match(self) -> None:
+        """`(index, attrs)` for the FIRST tag whose src startswith the prefix."""
+        body = (
+            '<script src="/static/vendor/react.js"></script>'
+            '<script src="/static/redux/store.js"></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        result = find_script_position(body, '/static/redux/')
+
+        assert result is not None
+        index, attrs = result
+        assert index == 1, 'index is the 0-based position in document order'
+        assert attrs.get('src') == '/static/redux/store.js'
+
+    def test_find_index_counts_inline_scripts(self) -> None:
+        """The index is a document-order position over ALL script tags."""
+        body = (
+            '<script>window.DF = {};</script>'
+            '<script src="/static/app.js"></script>'
+        )
+
+        result = find_script_position(body, '/static/app.js')
+
+        assert result is not None
+        assert result[0] == 1
+
+    def test_find_returns_none_when_no_tag_matches(self) -> None:
+        body = '<script src="/static/app.js"></script>'
+
+        assert find_script_position(body, '/static/missing') is None
+
+    def test_find_treats_a_srcless_tag_as_empty_string(self) -> None:
+        """No `src` coerces to `''`, so it matches only an empty prefix.
+
+        The `or ''` is what stops `None.startswith` blowing up on an inline
+        script, and the empty string only ever prefix-matches `''`.
+        """
+        body = '<script>window.X = 1;</script>'
+
+        assert find_script_position(body, '/static/') is None
+
+        result = find_script_position(body, '')
+        assert result is not None
+        assert result[0] == 0
+
+    # -- assert_script_loads_before ----------------------------------------
+
+    def test_passes_when_before_precedes_after(self) -> None:
+        body = (
+            '<script src="/static/vendor/react.js"></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        assert_script_loads_before(
+            body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+        )
+
+    def test_raises_naming_the_missing_before_prefix(self) -> None:
+        body = '<script src="/static/redux/tabs.jsx"></script>'
+
+        with pytest.raises(AssertionError, match=r'No <script src="/static/vendor/'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    def test_raises_distinctly_when_the_after_tag_is_absent(self) -> None:
+        """A missing AFTER tag gets its own message, not the missing-BEFORE one."""
+        body = '<script src="/static/vendor/react.js"></script>'
+
+        with pytest.raises(AssertionError) as exc:
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+        message = str(exc.value)
+        assert 'cannot verify load-order invariant for react' in message
+        assert not message.startswith('No <script src=')
+
+    def test_raises_on_out_of_order_pair(self) -> None:
+        body = (
+            '<script src="/static/redux/tabs.jsx"></script>'
+            '<script src="/static/vendor/react.js"></script>'
+        )
+
+        with pytest.raises(AssertionError, match=r'must load\s+BEFORE'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    def test_out_of_order_message_interpolates_the_consumer_note(self) -> None:
+        """The ordering failure carries the caller's `consumer_note`.
+
+        This is the ONE place the five copies diverged — test_index_html.py
+        alone dropped the note for a fixed two-sentence string.  The unified
+        helper adopts the canonical 4-of-5 form, which makes the note visible
+        at index_html's 13 note-passing call sites instead of discarding the
+        notes at the other four modules' 14 sites.  No test anywhere matches
+        the ordering message, so either variant satisfies the suite; this one
+        strictly carries more information.
+        """
+        body = (
+            '<script src="/static/redux/tabs.jsx"></script>'
+            '<script src="/static/vendor/react.js"></script>'
+        )
+        note = 'tabs.jsx dereferences React at module scope.'
+
+        with pytest.raises(AssertionError) as exc:
+            assert_script_loads_before(
+                body,
+                '/static/vendor/',
+                '/static/redux/',
+                'react',
+                'tabs',
+                note,
+            )
+
+        assert note in str(exc.value)
+
+    # -- the defer/async/type=module false-pass guard ----------------------
+
+    @pytest.mark.parametrize('offender', ['before', 'after'])
+    def test_defer_on_either_tag_trips_the_guard(self, offender: str) -> None:
+        """`defer` divorces document order from execution order on EITHER tag."""
+        before_attr = ' defer' if offender == 'before' else ''
+        after_attr = ' defer' if offender == 'after' else ''
+        body = (
+            f'<script src="/static/vendor/react.js"{before_attr}></script>'
+            f'<script src="/static/redux/tabs.jsx"{after_attr}></script>'
+        )
+
+        with pytest.raises(AssertionError, match='defer attribute'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    @pytest.mark.parametrize('offender', ['before', 'after'])
+    def test_async_on_either_tag_trips_the_guard(self, offender: str) -> None:
+        before_attr = ' async' if offender == 'before' else ''
+        after_attr = ' async' if offender == 'after' else ''
+        body = (
+            f'<script src="/static/vendor/react.js"{before_attr}></script>'
+            f'<script src="/static/redux/tabs.jsx"{after_attr}></script>'
+        )
+
+        with pytest.raises(AssertionError, match='async attribute'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    @pytest.mark.parametrize('offender', ['before', 'after'])
+    def test_type_module_on_either_tag_trips_the_guard(self, offender: str) -> None:
+        before_attr = ' type="module"' if offender == 'before' else ''
+        after_attr = ' type="module"' if offender == 'after' else ''
+        body = (
+            f'<script src="/static/vendor/react.js"{before_attr}></script>'
+            f'<script src="/static/redux/tabs.jsx"{after_attr}></script>'
+        )
+
+        with pytest.raises(
+            AssertionError, match=r'type="module".*deferred by default'
+        ):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    def test_type_is_compared_case_insensitively(self) -> None:
+        """`type="MODULE"` is the same module semantics; the guard lowercases."""
+        body = (
+            '<script src="/static/vendor/react.js" type="MODULE"></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        with pytest.raises(AssertionError, match='deferred by default'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
+
+    def test_a_non_module_type_does_not_trip_the_guard(self) -> None:
+        """`type="text/javascript"` is a classic script — order still holds."""
+        body = (
+            '<script src="/static/vendor/react.js" type="text/javascript"></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        assert_script_loads_before(
+            body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+        )
+
+    def test_the_guard_runs_before_the_order_comparison(self) -> None:
+        """A deferred pair fails with the GUARD message even when in order.
+
+        Otherwise a `defer` regression would pass silently: document order
+        would still be right while execution order was not.
+        """
+        body = (
+            '<script src="/static/vendor/react.js" defer></script>'
+            '<script src="/static/redux/tabs.jsx"></script>'
+        )
+
+        with pytest.raises(AssertionError, match='defer attribute'):
+            assert_script_loads_before(
+                body, '/static/vendor/', '/static/redux/', 'react', 'tabs',
+            )
 
 
 class TestSharedServedAssetFixtures:
