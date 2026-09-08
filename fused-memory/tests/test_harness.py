@@ -13455,6 +13455,169 @@ async def test_phantom_stripped_finding_is_referenceless_but_carries_citation_fa
     assert finding['citation_failures'][0]['reason'] == 'memory_not_found'
 
 
+@pytest.mark.asyncio
+async def test_maybe_remediate_logs_phantom_cited_drop_under_its_own_event(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """PHANTOM-CITED: a finding whose only citation was stripped by
+    phantom-citation verification must log under its OWN event name — not the
+    never-cited-placeholder event — and the marker's ids/reasons must ride
+    along in the log record's extra fields so an operator can see them.
+
+    RED on the current tree: _maybe_remediate has no branch for
+    citation_failures-bearing findings, so this finding falls into the
+    dropped_placeholders bucket and logs
+    'reconciliation.remediation_dropped_placeholder_finding' instead.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    await event_buffer.push(_make_event('test-project'))
+
+    phantom_finding = _make_phantom_cited_finding()
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[phantom_finding])
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    phantom_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.remediation_dropped_phantom_cited_finding'
+    ]
+    assert len(phantom_records) >= 1, (
+        f'Expected at least one "reconciliation.remediation_dropped_phantom_cited_finding" '
+        f'log record; got records: {[r.getMessage() for r in caplog.records]}'
+    )
+
+    placeholder_records = [
+        r for r in caplog.records
+        if r.getMessage() == 'reconciliation.remediation_dropped_placeholder_finding'
+    ]
+    assert placeholder_records == [], (
+        f'Phantom-cited drop must NOT log under the never-cited placeholder event; '
+        f'got: {[r.getMessage() for r in placeholder_records]}'
+    )
+
+    record = phantom_records[0]
+    assert getattr(record, 'project_id', None) == 'test-project'
+    assert getattr(record, 'parent_run_id', None) == run.id
+    assert getattr(record, 'finding_category', None) == phantom_finding['category']
+    assert getattr(record, 'description', None) == phantom_finding['description']
+    citation_failures = getattr(record, 'citation_failures', None)
+    assert citation_failures[0]['reason'] == 'memory_not_found'
+    assert citation_failures[0]['memory_id'] == 'mem-gone-1'
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_phantom_cited_drop_excluded_from_placeholder_counter(
+    journal, event_buffer, mock_memory_service,
+):
+    """The never-cited-placeholder storm counter must count ONLY never-cited
+    drops — a phantom-cited drop must not feed it, or a citation-verification
+    outage would be misattributed to 'Stage 3 stopped citing'.
+
+    RED on the current tree: _maybe_remediate treats the phantom-cited
+    finding as just another referenceless finding, so
+    _record_placeholder_finding_drop fires for BOTH findings, not just the
+    never-cited one.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._record_placeholder_finding_drop = MagicMock(return_value=None)
+
+    await event_buffer.push(_make_event('test-project'))
+
+    phantom_finding = _make_phantom_cited_finding()
+    placeholder_finding = _make_placeholder_finding()
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(
+        harness.stages[2], items_flagged=[phantom_finding, placeholder_finding],
+    )
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    assert harness._record_placeholder_finding_drop.call_count == 1, (
+        f'Expected _record_placeholder_finding_drop to fire exactly once (the '
+        f'never-cited placeholder only), got calls: '
+        f'{harness._record_placeholder_finding_drop.call_args_list}'
+    )
+
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert remediation_runs == [], (
+        f'Both findings cite nothing investigable; expected no remediation run, '
+        f'got {len(remediation_runs)}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_phantom_cited_finding_still_dropped_from_remediation_batch(
+    journal, event_buffer, mock_memory_service,
+):
+    """MIXED: a phantom-cited finding alongside a reference-bearing finding.
+
+    Remediation must still run (the reference-bearing finding is genuinely
+    actionable), and the phantom-cited finding must NOT reach Stage 1's
+    remediation_findings — it still cites nothing investigable, even though
+    its drop is now attributed and alarmed differently from a never-cited
+    placeholder.  This is the regression pin: re-attributing the drop must
+    not turn it into a leak into the remediation batch.
+
+    Passes today (the two-way partition already drops it, just under the
+    wrong label) — this pins that the three-way partition in step-4 does not
+    change that outcome.
+    """
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+
+    captured: dict = {}
+
+    async def capture_attrs(stage):
+        captured['remediation_findings'] = stage.remediation_findings
+
+    phantom_finding = _make_phantom_cited_finding()
+    reference_bearing_finding = _make_s3_findings()[0]  # carries affected_ids
+
+    _mock_stage_run(stage1, before_return=capture_attrs)
+    _mock_stage_run(stages[1])
+    _mock_stage_run(
+        stages[2], items_flagged=[phantom_finding, reference_bearing_finding],
+    )
+
+    await event_buffer.push(_make_event('test-project'))
+
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    remediation_runs = [r for r in recent_runs if r.run_type == 'remediation']
+    assert len(remediation_runs) == 1, (
+        f'Expected exactly one remediation run (mixed batch has a real finding), '
+        f'got {len(remediation_runs)}'
+    )
+
+    assert captured.get('remediation_findings') == [reference_bearing_finding], (
+        f'Expected remediation_findings to contain only the reference-bearing finding, '
+        f'got {captured.get("remediation_findings")!r}'
+    )
+
+
 # ── Tests for Task 1655: live-workflow escalation gate ─────────────────────
 
 
