@@ -1,4 +1,25 @@
-"""Script-agnostic harness for executing a SLICE of any shell script under test.
+"""Script-agnostic harness for slicing, running and LINTING shell scripts under test.
+
+THREE RESPONSIBILITIES, NAMED HERE SO THE MODULE IS NOT A JUNK DRAWER BY
+ACCIDENT. Each is shared by more than one suite, and each would otherwise be
+a verbatim second copy:
+
+  1. THE SLICER — `find_in_code` / `slice_section` / `slice_shell_function`,
+     plus the runner `run_with_preamble` / `stub_bin_dir` / `write_stub`.
+  2. THE PROBE SCAFFOLD — `SIGPIPE_BULK_BYTES` and `dispatch_stub_body`, the
+     two things every `producer | grep -q` probe suite needs to script a
+     PATH stub and provoke the SIGPIPE half of the defect.
+  3. THE DETECTOR — `grep_q_offenders`, the source-level rule the file-scoped
+     sweeps assert, with its guard-the-guard in
+     test_setup_host_probe_pipelines.py.
+
+(2) and (3) are a rule about ONE specific defect and are not, strictly, about
+slicing. They live here anyway, and that is a decision: both consumers of the
+slicer are exactly the two probe suites, so a third module would be imported
+by the same two files and split one subject across two homes. Should a suite
+ever want the slicer WITHOUT the probe machinery, splitting (2)+(3) into a
+sibling is the right move at that point — the import sites are the only thing
+that would change.
 
 Sibling-helper module, following the `systemd_unit_invariants.py` precedent that
 tests/scripts/conftest.py explicitly supports: pyproject sets
@@ -33,8 +54,8 @@ script-agnostic core moved HERE parameterized by script path, and
 setup_host_sections.py became a thin binder whose public API is unchanged — its
 four consumer suites need no edits and act as the regression net for the move.
 The alternative was a verbatim second copy of ~100 lines of slicer plus a second
-copy of the `| grep -q` detector and its eleven-case guard, which is exactly the
-drift class this repo keeps paying to remove.
+copy of the `| grep -q` detector and its whole guard-the-guard case set, which
+is exactly the drift class this repo keeps paying to remove.
 """
 
 from __future__ import annotations
@@ -220,19 +241,80 @@ def run_with_preamble(
     )
 
 
+# --- the shared probe scaffold ----------------------------------------------
+# What a `producer | grep -q` probe suite needs beyond the slicer: a stub body
+# that reports the producer's own status, and a payload size big enough to make
+# the SIGPIPE half of the defect deterministic. Both were verbatim per-suite
+# copies before (test_setup_host_probe_pipelines.py and
+# test_script_probe_pipelines.py), which is the drift this module exists to stop.
+
+# Trailing bytes a producer writes AFTER the matching line, to provoke the
+# SIGPIPE half of the misread.
+#
+# MEASURED, not chosen for roundness. Reproduction rate of the misread, 30
+# trials per size against this stub shape:
+#
+#     65536 -> 26/30      131072 -> 30/30      262144 -> 30/30      1MiB -> 30/30
+#
+# Whether the producer is scheduled to write again BEFORE grep closes the read
+# end is a race, so near the 64KiB pipe buffer the defect is intermittent — at
+# 65536 the reply is small enough to sometimes land whole. 262144 is the first
+# round size measured deterministic with margin. Do NOT lower this: a value in
+# the flaky band leaves the SIGPIPE tests only probabilistically able to catch a
+# reintroduced pipeline, and one below the buffer cannot catch it at all.
+# (Consistent with the ~82KB flip point recorded at setup-host.sh's orchestrator
+# gate — that gate's producer writes in one burst, these do not, so the
+# thresholds are close but not the same number.)
+#
+# THIS IS TEST-SIZING GUIDANCE AND NOTHING MORE. It is NOT a claim that smaller
+# payloads are safe: measured under task 4981 on bash 5.2.21, a 270-BYTE reply
+# with the marker on line 1 still missed 25 times in 4000 evaluations (0.6%,
+# every miss rc=141), while the `[[ ]]` form missed 0 in 4000. A sub-buffer site
+# is a low-rate FLAKE, not a non-site.
+#
+# Note the constant only affects how reliably a probe test is RED against the
+# OLD form: the fixed form drains the producer through a command substitution,
+# where there is no pipe to signal, so a fixed site is deterministic.
+SIGPIPE_BULK_BYTES = 262144
+
+
+def dispatch_stub_body(branches: tuple[tuple[str, str], ...]) -> str:
+    """A `case "$*"` body running one of *branches* — (glob, text) pairs.
+
+    `case` is the stub's LAST command, so the taken branch's own status becomes
+    the stub's exit status. That is deliberate and load-bearing: the producer's
+    status IS the thing these probe tests are about, and a trailing `exit 0`
+    here would swallow it and make every one of them vacuously green. The
+    catch-all exits 0 so the invocations that are not under test stay silent.
+    """
+    arms = "".join(f"  {glob})\n{text}    ;;\n" for glob, text in branches)
+    return 'case "$*" in\n' + arms + "  *)\n    exit 0\n    ;;\nesac\n"
+
+
 # --- the `| grep -q` detector ----------------------------------------------
 # Shared by every file-scoped sweep that forbids the construct (currently
 # test_setup_host_probe_pipelines.py and test_script_probe_pipelines.py), so
-# the three regexes below exist ONCE. Its guard-the-guard —
+# the rule below exists ONCE. Its guard-the-guard —
 # test_setup_host_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline,
-# seven planted spellings plus four must-not-match cases — stays in that suite
-# and now guards the copy BOTH consumers use.
+# planted spellings that must match plus the shapes that must not — stays in
+# that suite and now guards the copy BOTH consumers use.
 
 # A grep on the receiving end of a pipe, plus its arguments up to the end of
 # THAT command: `[^|;&)]*` stops at the next pipeline stage, at a `;` or `&&`,
 # and at the close of a command substitution, so a `-q` belonging to some later
 # command on the same line is never read as this grep's.
-_GREP_PIPE = re.compile(r"\|\s*grep\s+(?P<args>[^|;&)]*)")
+#
+# THE `||` LOOKAROUNDS ARE NOT DECORATION. Without them the trailing bar of an
+# OR operator reads as a pipe, so `cmd || grep -q pat "$file"` is reported as an
+# offender — but that is a grep over a FILE run only when `cmd` failed: there is
+# no pipeline, no producer, and nothing for `pipefail` to conflate. The same
+# false positive the "a `grep -q` over a FILE is not swept in" carve-out already
+# excludes in its bare form. None of the swept scripts writes it today, so this
+# is latent by construction: it would first surface as a confusing sweep failure
+# against a future author's perfectly legitimate line, which is the worst moment
+# to discover a lint rule is wrong. Pinned in the must-not-match set of
+# test_setup_host_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline.
+_GREP_PIPE = re.compile(r"(?<!\|)\|(?!\|)\s*grep\s+(?P<args>[^|;&)]*)")
 
 # Every spelling of "exit on the first match and close the read end": the short
 # clusters (`-q`, `-qF`, `-Fq`, `-iq`) and GNU's long forms. Matched against
@@ -244,7 +326,7 @@ _GREP_PIPE = re.compile(r"\|\s*grep\s+(?P<args>[^|;&)]*)")
 _QUIET_FLAG = re.compile(r"-[A-Za-z]*q[A-Za-z]*|--quiet|--silent")
 
 
-def _pipes_into_quiet_grep(line):
+def _pipes_into_quiet_grep(line: str) -> bool:
     """True when *line* feeds a producer into a grep that exits on first match."""
     return any(
         any(_QUIET_FLAG.fullmatch(token) for token in match.group("args").split())
@@ -252,7 +334,7 @@ def _pipes_into_quiet_grep(line):
     )
 
 
-def grep_q_offenders(source):
+def grep_q_offenders(source: str) -> list[tuple[int, str]]:
     """Every non-comment line of *source* piping a producer into a quiet grep."""
     return [
         (n, line)

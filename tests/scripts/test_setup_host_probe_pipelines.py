@@ -31,29 +31,11 @@ from setup_host_sections import (
     stub_bin_dir,
     write_stub,
 )
-from shell_sections import grep_q_offenders
-
-# Trailing bytes a producer writes AFTER the matching line, to provoke (b).
-#
-# MEASURED, not chosen for roundness. Reproduction rate of the misread, 30
-# trials per size against this exact stub shape:
-#
-#     65536 -> 26/30      131072 -> 30/30      262144 -> 30/30      1MiB -> 30/30
-#
-# Whether the producer is scheduled to write again BEFORE grep closes the read
-# end is a race, so near the 64KiB pipe buffer the defect is intermittent — at
-# 65536 the reply is small enough to sometimes land whole. 262144 is the first
-# round size measured deterministic with margin. Do NOT lower this: a value in
-# the flaky band leaves the SIGPIPE tests only probabilistically able to catch a
-# reintroduced pipeline, and one below the buffer cannot catch it at all.
-# (Consistent with the ~82KB flip point recorded at setup-host.sh's
-# orchestrator gate — that gate's producer writes in one burst, this one does
-# not, so the two thresholds are close but not the same number.)
-#
-# Note this only affects how reliably the tests are RED against the OLD form:
-# the fixed form drains the producer through a command substitution, where
-# there is no pipe to signal, so the tests below are deterministic once fixed.
-BULK_BYTES = 262144
+from shell_sections import (
+    SIGPIPE_BULK_BYTES,
+    dispatch_stub_body,
+    grep_q_offenders,
+)
 
 # --- section 2: the FalkorDB "wait for healthy" loop -----------------------
 # Both anchors are CODE (not comment prose), are unique in the file, and
@@ -74,19 +56,6 @@ def _stub_bin(tmp_path):
     stub_bin = stub_bin_dir(tmp_path)
     write_stub(stub_bin, "sleep", "exit 0\n")
     return stub_bin
-
-
-def _dispatch_stub_body(branches):
-    """A `case "$*"` body running one of *branches* — (glob, text) pairs.
-
-    `case` is the stub's LAST command, so the taken branch's own status becomes
-    the stub's exit status. That is deliberate and load-bearing: the producer's
-    status IS the thing these tests are about, and a trailing `exit 0` here
-    would swallow it and make every test below vacuously green. The catch-all
-    exits 0 so the invocations that are not under test stay silent.
-    """
-    arms = "".join(f"  {glob})\n{text}    ;;\n" for glob, text in branches)
-    return 'case "$*" in\n' + arms + "  *)\n    exit 0\n    ;;\nesac\n"
 
 
 def _run_probe(
@@ -110,7 +79,7 @@ def _run_probe(
     asserted rather than defaulted to "": an empty default would quietly
     install a stub that runs nothing and exits 0, which is a PASSING probe
     for a producer that was never scripted, i.e. exactly the vacuous green
-    `_dispatch_stub_body` is written to avoid.
+    `dispatch_stub_body` is written to avoid.
     """
     stub_bin = _stub_bin(tmp_path)
     if stub_name is not None:
@@ -138,7 +107,7 @@ def _compose_env(tmp_path):
 
 # Scenario bodies for the docker exec branch. Indented to sit inside `case`.
 _REPLY_THEN_NONZERO = "    printf 'PONG\\n'\n    exit 1\n"
-_REPLY_THEN_BULK = f"    printf 'PONG\\n'\n    head -c {BULK_BYTES} /dev/zero | tr '\\0' x\n"
+_REPLY_THEN_BULK = f"    printf 'PONG\\n'\n    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
 _SILENT_FAILURE = "    exit 1\n"
 _CLEAN_REPLY = "    printf 'PONG\\n'\n    exit 0\n"
 
@@ -149,7 +118,7 @@ def _docker_stub_body(exec_body):
     The `up -d` invocation falls to the catch-all and exits 0 silently; only
     the exec branch is under test.
     """
-    return _dispatch_stub_body((('*" exec "*', exec_body),))
+    return dispatch_stub_body((('*" exec "*', exec_body),))
 
 
 def _falkordb_probe(start, end):
@@ -253,7 +222,7 @@ _LISTING_NAMES_IT_THEN_NONZERO = (
 )
 _LISTING_NAMES_IT_THEN_BULK = (
     "    printf 'jcodemunch: uvx jcodemunch-mcp - Connected\\n'\n"
-    f"    head -c {BULK_BYTES} /dev/zero | tr '\\0' x\n"
+    f"    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
 )
 _LISTING_WITHOUT_IT = "    printf 'some-other-server: uvx other - Connected\\n'\n    exit 0\n"
 _LISTING_UNREADABLE = "    exit 1\n"
@@ -265,7 +234,7 @@ def _run_jcodemunch(tmp_path, list_body):
         tmp_path,
         slice_section(_JCODEMUNCH_START, _JCODEMUNCH_END),
         stub_name="claude",
-        stub_body=_dispatch_stub_body(
+        stub_body=dispatch_stub_body(
             (
                 ('*"mcp add"*', f"    printf '{_ADD_SENTINEL}\\n'\n    exit 0\n"),
                 ('*"mcp list"*', list_body),
@@ -470,8 +439,8 @@ def test_the_grep_q_sweep_detects_a_planted_pipeline():
 
     Guards the SHARED detector in tests/scripts/shell_sections.py, so it covers
     this file's sweep and test_script_probe_pipelines.py's alike. One detector
-    deserves one guard: a second copy of these eleven cases would be the same
-    drift this extraction removed.
+    deserves one guard: a second copy of this case set would be the same drift
+    this extraction removed.
     """
     planted = (
         "if foo | grep -q BAR; then\n"
@@ -496,3 +465,9 @@ def test_the_grep_q_sweep_detects_a_planted_pipeline():
     assert grep_q_offenders("if grep -q '^\\[Install\\]' \"$unit\"; then\n") == []
     # And a `-q` belonging to a LATER command on the line is not this grep's.
     assert grep_q_offenders("if foo | grep -F BAR; then bar -q; fi\n") == []
+    # Nor is the trailing bar of an OR operator a pipe. `cmd || grep -q pat f`
+    # runs grep over a FILE only when cmd failed: no pipeline, no producer, and
+    # nothing for `pipefail` to conflate. None of the swept scripts writes this
+    # today, so without a case here the false positive stays invisible until it
+    # fails a future author's legitimate line.
+    assert grep_q_offenders('cmd || grep -q pat "$f"\n') == []

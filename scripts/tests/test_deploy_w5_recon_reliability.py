@@ -32,18 +32,19 @@ RECON_MARKER = "test-recon-marker-xyz"
 # Trailing bytes the fake journalctl writes AFTER the marker, to provoke the
 # SIGPIPE half of the `| grep -q` misread.
 #
-# MEASURED, not chosen for roundness -- 30 trials per size against this stub
-# shape: 65536 -> 26/30, 131072 -> 30/30, 262144 -> 30/30, 1MiB -> 30/30.
-# Whether the producer is scheduled to write again BEFORE grep closes the read
-# end is a race, so near the 64KiB pipe buffer the defect is intermittent. Do
-# NOT lower this: a value in that flaky band leaves the SIGPIPE test only
-# probabilistically able to catch a reintroduced pipeline.
+# THE MEASUREMENTS AND THE "DO NOT LOWER THIS" ARGUMENT LIVE IN ONE PLACE:
+# tests/scripts/shell_sections.py::SIGPIPE_BULK_BYTES. This is a duplicated
+# VALUE, deliberately not a duplicated RATIONALE — restating the trial counts
+# here is how three copies of the same number drift into three different
+# numbers, and a future measurement that moves the threshold should have to
+# edit exactly one comment.
 #
-# TEST-SIZING guidance only. It is NOT a claim that smaller journals are safe:
-# measured under task 4981 on bash 5.2.21, a 270-BYTE payload with the marker
-# on line 1 still missed 25 times in 4000 evaluations (0.6%, every miss
-# rc=141), while the `[[ ]]` form missed 0 in 4000. A sub-buffer site is a
-# low-rate FLAKE, not a non-site.
+# It is a duplicated value only because scripts/tests/ cannot import a
+# tests/scripts/ helper: scripts/tests/conftest.py puts scripts/,
+# scripts/legibility/ and scripts/local-model-serving/ on sys.path and NOT
+# tests/scripts/, and widening that conftest to make one constant importable is
+# a directory-boundary change well outside what this constant is worth. Should
+# the boundary ever open, this becomes an import.
 BULK_BYTES = 262144
 
 

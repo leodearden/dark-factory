@@ -3,7 +3,8 @@
 Covers scripts/export-data.sh, scripts/import-data.sh and
 scripts/deploy-w5-recon-reliability.sh. The sibling suite
 test_setup_host_probe_pipelines.py does the same job for scripts/setup-host.sh,
-and the two share one slicer and one detector (tests/scripts/shell_sections.py).
+and the two share one slicer, one probe scaffold (`SIGPIPE_BULK_BYTES` and
+`dispatch_stub_body`) and one detector — all in tests/scripts/shell_sections.py.
 
 WHY THESE EXIST. `producer | grep -q PAT` reports the PRODUCER's exit status
 under `set -o pipefail`, not grep's verdict, so an `if` guarding on it can take
@@ -40,6 +41,8 @@ import pathlib
 import pytest
 from shell_sections import (
     REPO_ROOT,
+    SIGPIPE_BULK_BYTES,
+    dispatch_stub_body,
     grep_q_offenders,
     run_with_preamble,
     slice_section,
@@ -51,29 +54,6 @@ from shell_sections import (
 EXPORT_DATA_PATH = REPO_ROOT / "scripts" / "export-data.sh"
 IMPORT_DATA_PATH = REPO_ROOT / "scripts" / "import-data.sh"
 DEPLOY_W5_PATH = REPO_ROOT / "scripts" / "deploy-w5-recon-reliability.sh"
-
-# Trailing bytes a producer writes AFTER the matching line, to provoke (b).
-#
-# MEASURED, not chosen for roundness — inherited from the reproduction sweep in
-# test_setup_host_probe_pipelines.py, 30 trials per size:
-#
-#     65536 -> 26/30      131072 -> 30/30      262144 -> 30/30      1MiB -> 30/30
-#
-# Whether the producer is scheduled to write again BEFORE grep closes the read
-# end is a race, so near the 64KiB pipe buffer the defect is intermittent. Do
-# NOT lower this: a value in that flaky band leaves the SIGPIPE tests only
-# probabilistically able to catch a reintroduced pipeline.
-#
-# This is TEST-SIZING guidance and nothing more. It is NOT a claim that smaller
-# payloads are safe — measured under task 4981 on bash 5.2.21, a 270-BYTE reply
-# with the marker on line 1 still missed 25 times in 4000 evaluations (0.6%,
-# every miss rc=141), while the `[[ ]]` form missed 0 in 4000. A sub-buffer site
-# is a low-rate FLAKE, not a non-site.
-#
-# Note the constant only affects how reliably the tests are RED against the OLD
-# form: the fixed form drains the producer through a command substitution, where
-# there is no pipe to signal, so the tests below are deterministic once fixed.
-BULK_BYTES = 262144
 
 
 # --- the shared scaffold ----------------------------------------------------
@@ -110,19 +90,6 @@ def _preamble(tmp_path: pathlib.Path) -> str:
     )
 
 
-def _dispatch_stub_body(branches):
-    """A `case "$*"` body running one of *branches* — (glob, text) pairs.
-
-    `case` is the stub's LAST command, so the taken branch's own status becomes
-    the stub's exit status. That is deliberate and load-bearing: the producer's
-    status IS the thing these tests are about, and a trailing `exit 0` here
-    would swallow it and make every test below vacuously green. The catch-all
-    exits 0 so the invocations that are not under test stay silent.
-    """
-    arms = "".join(f"  {glob})\n{text}    ;;\n" for glob, text in branches)
-    return 'case "$*" in\n' + arms + "  *)\n    exit 0\n    ;;\nesac\n"
-
-
 def _run_probe(tmp_path, section_text, *, docker_body):
     """Run *section_text* in a tmp tree against a scripted `docker`.
 
@@ -157,7 +124,7 @@ def _match_then_nonzero(reply):
 
 def _match_then_bulk(reply):
     """Producer emits the match, then keeps writing until grep closes the pipe — case (b)."""
-    return f"    printf '{reply}\\n'\n    head -c {BULK_BYTES} /dev/zero | tr '\\0' x\n"
+    return f"    printf '{reply}\\n'\n    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
 
 
 def _clean_match(reply):
@@ -210,7 +177,7 @@ def _run_export_bgsave(tmp_path, ps_body):
     return _run_probe(
         tmp_path,
         slice_section(EXPORT_DATA_PATH, _EXPORT_BGSAVE_START, _EXPORT_BGSAVE_END),
-        docker_body=_dispatch_stub_body(
+        docker_body=dispatch_stub_body(
             (
                 ('*" ps "*', ps_body),
                 ('*" exec "*', _lastsave_counter(tmp_path)),
@@ -308,7 +275,7 @@ def _run_import_stop(tmp_path, ps_body):
             _IMPORT_STOP_END,
             end_after=_IMPORT_STOP_END_AFTER,
         ),
-        docker_body=_dispatch_stub_body((('*" ps "*', ps_body),)),
+        docker_body=dispatch_stub_body((('*" ps "*', ps_body),)),
     )
 
 
@@ -391,7 +358,7 @@ def _run_import_wait(tmp_path, exec_body):
     return _run_probe(
         tmp_path,
         _falkordb_probe(_IMPORT_WAIT_START, _IMPORT_WAIT_END),
-        docker_body=_dispatch_stub_body((('*" exec "*', exec_body),)),
+        docker_body=dispatch_stub_body((('*" exec "*', exec_body),)),
     )
 
 
@@ -463,7 +430,7 @@ def _run_import_health(tmp_path, exec_body):
             _IMPORT_HEALTH_END,
             end_after=_IMPORT_HEALTH_END_AFTER,
         ),
-        docker_body=_dispatch_stub_body((('*" exec "*', exec_body),)),
+        docker_body=dispatch_stub_body((('*" exec "*', exec_body),)),
     )
 
 
@@ -529,9 +496,10 @@ def test_never_pipes_a_producer_into_grep_q(script):
     GUARD-THE-GUARD lives elsewhere, deliberately. The detector is the shared
     `grep_q_offenders` in tests/scripts/shell_sections.py, and
     test_setup_host_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline
-    pins it against seven planted spellings and four must-not-match cases —
-    on behalf of BOTH sweeps. One detector deserves one guard; a second copy
-    of those eleven cases here would be the drift this arrangement removes.
+    pins it against every planted spelling that must match and every shape that
+    must not — on behalf of BOTH sweeps. One detector deserves one guard; a
+    second copy of that case set here would be the drift this arrangement
+    removes.
 
     SCOPE IS FILE-SCOPED AND THAT IS A DECISION, not an oversight. Running
     this same detector over every *.sh in the repo finds 295 lines. The
