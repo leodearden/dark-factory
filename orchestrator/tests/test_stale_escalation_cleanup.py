@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -73,6 +74,18 @@ def _strand_events(harness: Harness) -> list[dict]:
         for name, payload in harness.event_store.events  # type: ignore[union-attr]
         if name == str(EventType.stale_l0_strand_dismissed)
     ]
+
+
+def _pending_secs_for(detail: str, esc_id: str) -> float:
+    """Parse a strand's rendered ``pending {N}s`` out of the aggregate detail.
+
+    ``detail`` is free-text prose (harness.py's per-strand ``lines``
+    rendering), not structured data, so this can't just index a dict the way
+    a strand event payload can.
+    """
+    match = re.search(rf'{re.escape(esc_id)} \(task \S+\): pending (\d+)s', detail)
+    assert match is not None, f'no pending_secs entry for {esc_id} in detail:\n{detail}'
+    return float(match.group(1))
 
 
 @pytest.fixture
@@ -557,7 +570,13 @@ class TestStaleL0StrandEscalationSurvivesRestart:
         assert 'esc-5189-7' in detail
         assert 'esc-5190-1' in detail
         assert '5189' in detail and '5190' in detail
-        assert '75480' in detail  # the pending age, in seconds
+        # pending_secs is wall-clock-derived (age is recomputed at sweep time,
+        # so elapsed time between seeding and the sweep adds to the seeded
+        # value), so assert the property the docstring claims — each
+        # strand's rendered age is close to its seeded age — rather than an
+        # exact literal, mirroring the tolerance check at line 430.
+        assert abs(_pending_secs_for(detail, 'esc-5189-7') - STRAND_AGE_SECS) < 5
+        assert abs(_pending_secs_for(detail, 'esc-5190-1') - (STRAND_AGE_SECS + 600)) < 5
 
     async def test_second_sweep_with_open_aggregate_files_no_duplicate(
         self, strand_harness: Harness
