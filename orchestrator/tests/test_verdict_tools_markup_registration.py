@@ -27,6 +27,7 @@ TWO CONSTRAINTS THIS FILE ENCODES, both measured:
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.mcp import markup_journal, verdict_tools
 from orchestrator.mcp.verdict_tools import _SINGLETON_ROLE_TOOLS, create_server
 
 # ---------------------------------------------------------------------------
@@ -113,9 +115,52 @@ def guard_of(server) -> MarkupGuardMiddleware:
     return guards[0]
 
 
+def journal_lines(root: Path) -> list[dict[str, Any]]:
+    """Every verdict-tools markup fact journalled under *root*, parsed.
+
+    An absent file reads as no lines rather than raising: "the journal was
+    never written" is an assertable outcome here, not an error.
+
+    The path comes from :func:`markup_journal.journal_path` rather than being
+    reconstructed, so a row cannot pass against a path the production wiring
+    does not write. Copied from ``test_plan_tools_markup_guard.py`` with the
+    server label changed — a pytest helper is not importable across package
+    test trees, the same constraint this file's header already records for the
+    corpus loader.
+    """
+    path = markup_journal.journal_path(root, 'verdict-tools')
+    if not path.exists():
+        return []
+    text = path.read_text(encoding='utf-8')
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
 # ---------------------------------------------------------------------------
 # The B14 signal: a REQUIRED list-typed parameter, absorbed and restored.
 # ---------------------------------------------------------------------------
+
+
+async def repaired_call(artifacts: TaskArtifacts):
+    """Drive the ``ISSUES_SPECIMEN`` leak through the REAL server, repaired.
+
+    Module level rather than a method because two suites need it: the B14
+    recovery rows below, and the durable-journal rows, which want the one
+    outcome that never touches the escalation channel (task 4917).
+    """
+    record = specimen(ISSUES_SPECIMEN)
+    assert record['expected_outcome'] == 'repaired'
+    assert record['expected_recovered'] == ['issues']
+    # `issues` is ABSENT from the wire — the caller supplied only these
+    # three, which is exactly what the specimen's own `supplied` records.
+    assert sorted(record['supplied']) == ['reviewer', 'summary', 'verdict']
+
+    server = create_server(artifacts, REVIEWER_ROLE)
+    async with Client(server) as client:
+        return await client.call_tool('submit_review_verdict', {
+            'reviewer': REVIEWER_ROLE,
+            'verdict': 'ISSUES_FOUND',
+            record['param']: record['value'],
+        })
 
 
 class TestSubmitReviewVerdictForwardsRepaired:
@@ -128,20 +173,7 @@ class TestSubmitReviewVerdictForwardsRepaired:
     """
 
     async def _call(self, artifacts: TaskArtifacts):
-        record = specimen(ISSUES_SPECIMEN)
-        assert record['expected_outcome'] == 'repaired'
-        assert record['expected_recovered'] == ['issues']
-        # `issues` is ABSENT from the wire — the caller supplied only these
-        # three, which is exactly what the specimen's own `supplied` records.
-        assert sorted(record['supplied']) == ['reviewer', 'summary', 'verdict']
-
-        server = create_server(artifacts, REVIEWER_ROLE)
-        async with Client(server) as client:
-            return await client.call_tool('submit_review_verdict', {
-                'reviewer': REVIEWER_ROLE,
-                'verdict': 'ISSUES_FOUND',
-                record['param']: record['value'],
-            })
+        return await repaired_call(artifacts)
 
     @pytest.mark.asyncio
     async def test_the_call_succeeds(self, artifacts: TaskArtifacts):
@@ -520,20 +552,35 @@ class TestUnrepairableResidueIsPreserved:
         assert 'nothing was preserved' in payload['hint'].lower()
 
     @pytest.mark.asyncio
-    async def test_the_fact_still_fires(self, artifacts: TaskArtifacts, caplog):
+    async def test_the_fact_still_fires(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
         """(g) INV-2: EVERY outcome emits ``markup_detected``, including this
         one. A refusal that emitted no fact would be invisible to the storm
-        counter and to any consumer watching the leak rate."""
-        import logging
+        counter and to any consumer watching the leak rate.
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.verdict_tools'):
-            await self._refuse(artifacts)
+        READ OFF THE JOURNAL, not off ``caplog``. This row used to parse the
+        ``orchestrator.mcp.verdict_tools`` logger, because the fact channel WAS
+        a ``logger.info`` — a line that reached only a per-agent stdio
+        subprocess's stderr. Task 4917 retires that emitter for the durable
+        journal, so the channel this row reads changes while its guarantee does
+        not: the fact must still fire on the outcome nothing else records
+        per-event.
 
-        facts = [
-            json.loads(rec.getMessage().split(' ', 1)[1])
-            for rec in caplog.records
-            if rec.getMessage().startswith('markup_detected ')
-        ]
+        Patching ``_markup_project_root`` steers the escalation sink to
+        ``tmp_path`` as well, so this row's residue filing opens a real
+        ``EscalationQueue`` under the temp tree. That is hermetic, and this row
+        asserts only on the journal — the residue floor is the business of the
+        UNPATCHED rows above.
+        """
+        monkeypatch.setattr(
+            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
+            raising=False,
+        )
+
+        await self._refuse(artifacts)
+
+        facts = journal_lines(tmp_path)
         assert len(facts) == 1, f'expected exactly one fact, got {facts!r}'
         assert facts[0]['outcome'] == 'unrepairable'
         assert facts[0]['tool'] == 'submit_review_verdict'
@@ -719,3 +766,122 @@ class TestVerdictToolsResidueChannelIsShared:
             last_resort=None,
         )
         assert await sink({'error_type': 'mcp_markup_unrepairable'}) is None
+
+
+# ---------------------------------------------------------------------------
+# The fact reaches a DURABLE journal (task 4917).
+# ---------------------------------------------------------------------------
+
+
+class TestTheVerdictFactReachesADurableJournal:
+    """One line per EVENT, carrying the identity the storm summary cannot.
+
+    THE HEADLINE ROW HERE IS THE REPAIRED ONE, which is what makes this
+    boundary different from plan-tools'. verdict-tools declares FORWARD_REPAIR,
+    so a repaired call SUCCEEDS: the tool body runs, the verdict lands, the
+    caller is never bounced, and ``escalation_sink`` is never consulted at all
+    (it sees only unrepairable residue and window storms). The only
+    caller-visible trace is a ``meta['markup_repair']`` block on a response
+    nobody retains. So on this boundary the journal is not merely the BEST
+    durable record of a repair — before task 4917 there was no other.
+
+    It is also the cleanest rig: because the repaired path never touches the
+    escalation channel, these rows need no fake queue and no clock.
+
+    Every row steers the project root through the ``_markup_project_root``
+    seam. That indirection is load-bearing, not convenience:
+    ``make_fact_journal``'s default resolver is bound at module-DEFINITION
+    time, so patching ``markup_sink.resolve_project_root`` afterwards would not
+    reach a server ``create_server`` has already built — the journal would run
+    a real ``git rev-parse`` against a bare ``tmp_path``, resolve nothing, and
+    write no line whether or not the wiring landed.
+    """
+
+    @staticmethod
+    def _steer(monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(
+            verdict_tools, '_markup_project_root', lambda worktree: tmp_path,
+            raising=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_repaired_call_is_journalled_with_its_task_id(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """(a) THE user-observable signal, on the measured leak shape."""
+        self._steer(monkeypatch, tmp_path)
+
+        await repaired_call(artifacts)
+
+        (line,) = journal_lines(tmp_path)
+        assert line['tool'] == 'submit_review_verdict'
+        assert line['param'] == 'summary'
+        assert line['outcome'] == 'repaired'
+        assert line['server'] == 'verdict-tools'
+        assert line['subject_task_id'] == 'test-1', (
+            "the seeded plan's own task_id — this is what lets an operator "
+            'name the leaking agent without mining agent transcripts'
+        )
+        assert 'issues' in line['recovered_params']
+        assert datetime.fromisoformat(line['ts'])
+
+    @pytest.mark.asyncio
+    async def test_the_journal_is_the_only_durable_trace_of_a_repair(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """(b) The boundary-specific row: FORWARD_REPAIR leaves nothing else.
+
+        The call is not bounced, so no refusal payload carries the repair; the
+        escalation channel is not consulted, so no residue record does either.
+        Only the journal knows this happened at all.
+        """
+        self._steer(monkeypatch, tmp_path)
+
+        result = await repaired_call(artifacts)
+
+        assert result.data['status'] == 'ok'
+        assert artifacts.read_verdict(REVIEWER_ROLE) is not None
+        assert sorted(artifacts.root.glob('markup_residue-*.json')) == [], (
+            'a repaired call never reaches the residue channel'
+        )
+        assert len(journal_lines(tmp_path)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_burst_is_one_line_per_event(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """(c) The journal is per-EVENT; the storm escalation is per-WINDOW.
+
+        This is the whole division of labour. A storm record can only ever say
+        "N calls leaked in this window" — its own fields are count / threshold
+        / window_seconds / outcome / project, and ``project`` is structurally
+        None on this boundary. WHICH caller leaked is a per-event fact.
+        """
+        self._steer(monkeypatch, tmp_path)
+
+        for _ in range(3):
+            await repaired_call(artifacts)
+
+        lines = journal_lines(tmp_path)
+        assert len(lines) == 3, 'one line per repair, not one per window'
+        assert {line['subject_task_id'] for line in lines} == {'test-1'}
+
+    @pytest.mark.asyncio
+    async def test_a_journal_outage_never_changes_the_outcome(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """(d) The journal is ADDITIVE: the outcome is decided before it runs.
+
+        Forced here by making the journal path an existing DIRECTORY, so the
+        append cannot open it. A review gate must not strand because a
+        record-keeping file could not be written.
+        """
+        markup_journal.journal_path(tmp_path, 'verdict-tools').mkdir(parents=True)
+        self._steer(monkeypatch, tmp_path)
+
+        result = await repaired_call(artifacts)
+
+        assert result.data['status'] == 'ok'
+        assert artifacts.read_verdict(REVIEWER_ROLE) is not None
+        assert result.meta is not None
+        assert result.meta['markup_repair']['outcome'] == 'repaired'
