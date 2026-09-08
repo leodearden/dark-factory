@@ -1358,6 +1358,54 @@ def backlog_verdict(after_total_source: int, max_backlog: int) -> int:
     return 0 if after_total_source <= max_backlog else 1
 
 
+def unsatisfiable_backlog_gate(structural_floor: int, max_backlog: int) -> bool:
+    """Is this gate configuration structurally incapable of EVER passing?
+
+    The sibling of :func:`enumeration_blind_spot`, asked of the GATE rather
+    than of the population. It distinguishes the two very different
+    situations that both render as a plain ``rc=1``:
+
+    - a TRANSIENT backlog violation — the residual is over the ceiling
+      today, and a drain (or simply a later run) clears it, reported as
+      ``False``;
+    - a PERMANENT one — the residual can never fall to the ceiling because
+      records this sweep cannot delete already exceed it, reported as
+      ``True``. Re-running is futile, and the remedy is a different flag or
+      a different ceiling, not patience.
+
+    Task 4436 exists because that distinction was carried only by prose. See
+    :func:`find_undrainable_markers` for what composes the floor and which
+    of its two arms each remedy addresses.
+
+    SAFE TO ADD WITHOUT TOUCHING THE VERDICT. Every floor member matches the
+    ``source`` filter and survives the delete, so
+    ``after.total_source >= structural_floor`` always; a ``True`` here
+    therefore already implies :func:`backlog_verdict` returns ``1``. This
+    predicate refines the DIAGNOSIS and can never flip a passing verdict to
+    failing. A scroll cap only makes the observed floor an UNDER-estimate,
+    which keeps that inequality safe in the same direction.
+
+    Both ceilings are inclusive, so this is the strict complement of
+    :func:`backlog_verdict` at the boundary: for every ``(floor, ceiling)``,
+    ``unsatisfiable_backlog_gate(f, c) is (backlog_verdict(f, c) == 1)``.
+    That identity is pinned by a test — the two must never drift into
+    disagreeing, which would make the report claim "unsatisfiable" about a
+    gate that in fact passes.
+
+    Pure, sync, no I/O.
+
+    Args:
+        structural_floor: Count of members no invocation of this sweep can
+            drain — ``len(find_undrainable_markers(...))``, published as
+            ``structural_floor.undrainable_count``.
+        max_backlog: Ceiling the residual count must not exceed.
+
+    Returns:
+        ``True`` iff ``structural_floor > max_backlog``.
+    """
+    return structural_floor > max_backlog
+
+
 def _resolve_check_exit_code(
     report: dict,
     max_backlog: int,
