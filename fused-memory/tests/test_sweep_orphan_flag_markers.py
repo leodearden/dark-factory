@@ -2470,6 +2470,134 @@ class TestStructuralFloorReportBlock:
 
 
 # ===========================================================================
+# Tests: run()'s undated WARNING is keyed on the UNDRAINED subset (task 4436)
+# ===========================================================================
+
+class TestStructuralFloorWarning:
+    """The false-positive fix: the created_at WARNING speaks for the floor,
+    not for the raw undated count.
+
+    Today the WARNING fires whenever ``undated_kept_count`` is nonzero and
+    tells the operator to raise ``--max-backlog`` — even when every undated
+    member is in this run's delete set and the true floor is 0.
+
+    The two arms of the floor keep SEPARATE log lines on purpose. This one
+    names ``missing/unparseable created_at``, which is simply false for a
+    fully dated protected mirror; the protected arm has its own WARNING
+    (task 4435) that already states its floor correctly.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _UNDATED_MARKER = 'missing/unparseable created_at'
+
+    # Borrowed from the sibling class above: same populations, different
+    # question (the JSON block vs. the journal line). Re-wrapped in
+    # staticmethod because attribute access unwraps the descriptor, and a
+    # bare function assigned to a class attribute rebinds as an INSTANCE
+    # method — which would silently pass `self` as `members`.
+    _args = TestStructuralFloorReportBlock._args
+    _service = staticmethod(TestStructuralFloorReportBlock._service)
+    _undated = staticmethod(TestStructuralFloorReportBlock._undated)
+
+    @staticmethod
+    def _undated_warnings(caplog) -> list[str]:
+        return [
+            record.message for record in caplog.records
+            if record.levelno == logging.WARNING
+            and TestStructuralFloorWarning._UNDATED_MARKER in record.message
+        ]
+
+    @pytest.mark.asyncio
+    async def test_drained_undated_member_logs_no_warning(self, caplog):
+        """(a) THE FIX — an undated member the delete set already covers is
+        not a finding, so nothing is logged about it.
+
+        Against current behaviour this FAILS: undated_kept_count is 1, so
+        the WARNING fires and tells an operator to raise --max-backlog when
+        the true floor is 0.
+        """
+        members = [self._undated('u1', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 1, 'Fixture drift: u1 must be undated'
+        assert report['orphan_ids'] == ['u1'], 'Fixture drift: u1 must be drained'
+        assert report['structural_floor']['undrainable_count'] == 0
+        assert self._undated_warnings(caplog) == [], (
+            'A member the sweep is about to delete is not a finding: '
+            f'{self._undated_warnings(caplog)!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_undrained_undated_residue_logs_one_warning_with_remedies(self, caplog):
+        """(b) A genuine residue logs exactly one WARNING naming the undrained
+        count, the total enumerated, and every remedy."""
+        members = [_member('keep'), self._undated('u1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 2, 'Fixture drift: two undated members'
+        assert report['structural_floor']['undrainable_count'] == 1
+
+        warnings = self._undated_warnings(caplog)
+        assert len(warnings) == 1, f'Expected exactly one WARNING, got: {warnings!r}'
+        message = warnings[0]
+        # The UNDRAINED count (1), not the raw undated count (2), of 3 enumerated.
+        assert '1 of 3' in message, f'Expected the undrained count, got: {message!r}'
+        for remedy in ('--delete-ids', '--terminal-drain', '--max-backlog'):
+            assert remedy in message, f'Expected {remedy} named as a remedy: {message!r}'
+
+    @pytest.mark.asyncio
+    async def test_all_dated_population_logs_nothing(self, caplog):
+        """(c) An all-dated population is silent, as it is today."""
+        members = [_member('keep'), _orphan('o1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 0
+        assert self._undated_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_protected_arm_keeps_its_own_warning_and_is_not_swallowed(self, caplog):
+        """(d) SCOPE GUARD — the two arms keep separate log lines.
+
+        A dated protected member floors the backlog but has no created_at
+        problem, so the created_at WARNING must NOT speak for it. Its own
+        task-4435 WARNING must still fire: the re-key must not silently
+        swallow the other arm.
+        """
+        members = [_mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['undrainable_count'] == 1, 'm1 floors'
+        assert report['structural_floor']['undated_kept_count'] == 0, 'but is dated'
+        assert self._undated_warnings(caplog) == [], (
+            f'created_at is not this floor\'s cause: {self._undated_warnings(caplog)!r}'
+        )
+        assert any(
+            record.levelno == logging.WARNING and 'protected records' in record.message
+            for record in caplog.records
+        ), f'The protected arm lost its own WARNING: {[r.message for r in caplog.records]!r}'
+
+
+# ===========================================================================
 # Tests: run() surfaces the tombstone count in the report (task 4435)
 # ===========================================================================
 
