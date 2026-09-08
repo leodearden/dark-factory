@@ -592,6 +592,198 @@ class TestReadRunqueueRatio:
         assert params['proc_stat_path'].default is not inspect.Parameter.empty
 
 
+# PRD `plans/load-throttle-harmonisation-prd.md` §6.3 is the SINGLE HOME of
+# these two cgroup shapes; reify's rho2 builds the same strings on the bash
+# side, so the two implementations are pinned against one table rather than
+# against each other (INV-5, accepted with executed parity as the mirror).
+# Constructed here exactly as that table spells them.
+CGROUP_UNDER_SLICE = (
+    '0::/user.slice/user-1000.slice/user@1000.service/'
+    'df.slice/df-x.slice/df-verify-x-0123456789ab.scope\n'
+)
+CGROUP_NO_SLICE = (
+    '0::/user.slice/user-1000.slice/user@1000.service/app.slice/orchestrator-x.service\n'
+)
+
+SLICE_PATH = '/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice'
+SCOPE_PATH = f'{SLICE_PATH}/df-verify-x-0123456789ab.scope'
+UNIT_PATH = '/user.slice/user-1000.slice/user@1000.service/app.slice/orchestrator-x.service'
+
+
+@pytest.fixture(autouse=True)
+def _clear_own_cgroup_cache():
+    """resolve_own_cgroup caches per process; keep tests independent of order."""
+    from shared.psi import resolve_own_cgroup
+
+    resolve_own_cgroup.cache_clear()
+    yield
+    resolve_own_cgroup.cache_clear()
+
+
+class TestResolveOwnCgroup:
+    """PRD §6.3 rows 1-2: parse the 0:: path, walk leaf-upward for
+    df-<project_id>.slice, else the leaf itself; derive the sysfs path."""
+
+    def _cgroup_file(self, tmp_path, text, name='cgroup'):
+        path = tmp_path / name
+        path.write_text(text)
+        return path
+
+    def test_row_1_resolves_to_the_project_slice(self, tmp_path):
+        """§6.3 row 1 — the scope segment is dropped for the slice ancestor."""
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_UNDER_SLICE),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == SLICE_PATH
+        assert own.path.endswith('df-x.slice')
+        assert own.pressure_path == tmp_path / 'sys' / SLICE_PATH.lstrip('/') / 'cpu.pressure'
+
+    def test_row_2_falls_back_to_the_leaf_unit(self, tmp_path):
+        """§6.3 row 2 — no ancestor matches, so the leaf wins."""
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_NO_SLICE),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == UNIT_PATH
+        assert own.pressure_path == tmp_path / 'sys' / UNIT_PATH.lstrip('/') / 'cpu.pressure'
+
+    def test_none_project_id_resolves_to_the_leaf(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            None,
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_UNDER_SLICE),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == SCOPE_PATH
+
+    def test_non_matching_project_id_resolves_to_the_leaf(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'y',
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_UNDER_SLICE),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == SCOPE_PATH
+
+    def test_project_id_with_underscore_matches(self, tmp_path):
+        """D5: the slice name comes from fused_memory.project_id, which carries
+        underscores — never verify.py's dash-sanitised scope tag."""
+        from shared.psi import resolve_own_cgroup
+
+        text = '0::/user.slice/df.slice/df-dark_factory.slice/df-verify-df-abc.scope\n'
+        own = resolve_own_cgroup(
+            'dark_factory',
+            proc_cgroup_path=self._cgroup_file(tmp_path, text),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == '/user.slice/df.slice/df-dark_factory.slice'
+
+    def test_prefers_the_v2_line_on_a_hybrid_host(self, tmp_path):
+        """Tolerance for co-present cgroup-v1 lines. Explicitly NOT a §6.3
+        parity fixture — the table's rows are unified-hierarchy only."""
+        from shared.psi import resolve_own_cgroup
+
+        text = (
+            '12:pids:/user.slice/user-1000.slice/session-3.scope\n'
+            '4:cpu,cpuacct:/user.slice\n'
+            + CGROUP_UNDER_SLICE
+        )
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, text),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == SLICE_PATH
+
+    def test_absent_proc_cgroup_file_degrades_by_value(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'x', proc_cgroup_path=tmp_path / 'absent', cgroup_root=tmp_path / 'sys'
+        )
+
+        assert own.path == ''
+        assert own.pressure_path is None
+
+    def test_no_v2_line_degrades_by_value(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        text = '12:pids:/user.slice/user-1000.slice/session-3.scope\n4:cpu,cpuacct:/user.slice\n'
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, text),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == ''
+        assert own.pressure_path is None
+
+    def test_result_is_cached_per_process(self, tmp_path):
+        """INV-8: the ~150s gate tick must not repeat the walk or the join."""
+        from shared.psi import resolve_own_cgroup
+
+        cgroup_file = self._cgroup_file(tmp_path, CGROUP_UNDER_SLICE)
+        first = resolve_own_cgroup(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=tmp_path / 'sys'
+        )
+
+        cgroup_file.write_text(CGROUP_NO_SLICE)
+        second = resolve_own_cgroup(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=tmp_path / 'sys'
+        )
+
+        assert second is first
+        assert second.path == SLICE_PATH
+
+    def test_cache_clear_makes_the_next_call_observe_the_new_contents(self, tmp_path):
+        """cache_clear() is the public invalidation seam — the same one
+        read_own_cgroup_pressure uses after a read failure, so no test has to
+        reach into module internals."""
+        from shared.psi import resolve_own_cgroup
+
+        cgroup_file = self._cgroup_file(tmp_path, CGROUP_NO_SLICE)
+        assert resolve_own_cgroup(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=tmp_path / 'sys'
+        ).path == UNIT_PATH
+
+        cgroup_file.write_text(CGROUP_UNDER_SLICE)
+        resolve_own_cgroup.cache_clear()
+
+        assert resolve_own_cgroup(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=tmp_path / 'sys'
+        ).path == SLICE_PATH
+
+    def test_distinct_injected_paths_do_not_share_a_cache_entry(self, tmp_path):
+        """The key includes both injected paths, so fixtures never collide
+        with each other or with the live defaults."""
+        from shared.psi import resolve_own_cgroup
+
+        a = self._cgroup_file(tmp_path, CGROUP_UNDER_SLICE, name='a')
+        b = self._cgroup_file(tmp_path, CGROUP_NO_SLICE, name='b')
+
+        assert resolve_own_cgroup(
+            'x', proc_cgroup_path=a, cgroup_root=tmp_path / 'sys'
+        ).path == SLICE_PATH
+        assert resolve_own_cgroup(
+            'x', proc_cgroup_path=b, cgroup_root=tmp_path / 'sys'
+        ).path == UNIT_PATH
+
+
 class TestReadPsiSampleHappyPath:
     def _fake_read(self):
         # Note: the memory pressure file is read under the name 'memory', not 'mem'.
