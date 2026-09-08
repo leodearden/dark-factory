@@ -339,6 +339,35 @@ def _finding_has_reference(finding: dict) -> bool:
     return bool(_derive_affected_ids(finding))
 
 
+def _finding_has_citation_failures(finding: dict) -> bool:
+    """Return True iff *finding* carries a ``citation_failures`` marker.
+
+    ``fused_memory/reconciliation/citation_verifier.py::verify_cited_memories``
+    is the sole writer of ``citation_failures`` (called from every stage via
+    ``stages/base.py::BaseStage.run``), and it only ever inspects a finding
+    that ALREADY had a ``cited_memories`` entry to check. So a truthy
+    ``citation_failures`` is positive evidence that the stage DID call a
+    ``cite_*`` follow-up — the opposite of what ``_finding_has_reference``
+    screens for, which is a finding that never cited anything at all.
+
+    Both marker reasons route here: ``memory_not_found`` (the citation is
+    DROPPED from ``cited_memories``) and ``verification_error`` (the citation
+    is KEPT, verification just couldn't confirm it). Neither reason changes
+    what a marker proves — verification touched this finding's citations —
+    so this predicate does not filter on ``reason``.
+
+    Plain truthiness is deliberate: a malformed non-list value (or any other
+    truthy junk) fails SAFE by routing to the phantom-cited branch, i.e. AWAY
+    from the never-cited-placeholder storm alarm, rather than being
+    mis-counted as evidence of a stage that stopped citing.
+
+    Task 4781: used by ``_maybe_remediate`` alongside ``_finding_has_reference``
+    to tell a phantom-cited drop (evidence evaporated after citing) apart from
+    a never-cited placeholder drop (never cited in the first place).
+    """
+    return bool(finding.get('citation_failures'))
+
+
 # Module-local sleep binding — allows tests to patch sleep without touching
 # the global asyncio namespace.
 _sleep = asyncio.sleep
