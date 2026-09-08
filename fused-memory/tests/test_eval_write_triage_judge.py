@@ -1498,22 +1498,73 @@ class TestGuardCommittedReport:
         assert got == committed
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
-    def test_the_guard_is_reached_outside_the_limit_block(self) -> None:
-        """`_run` must consult the guard on EVERY path, not just `--limit`.
 
-        Asserted against the call SITE rather than by driving `_run` (which
-        would need a config, a fixture load and a provider resolution) —
-        narrow, but it is exactly the structural mistake being pinned: the
-        guard nested one `if` too deep.
-        """
-        import inspect  # noqa: PLC0415
+class TestABareDryRunCannotReachTheCommittedArtifact:
+    """The guard must be consulted on EVERY path, driven rather than read.
 
-        source = inspect.getsource(_mod()._run)
-        head = source.split('if args.limit is not None:')[0]
-        assert 'guard_committed_report(' in head, (
-            'the guard must run before/outside the --limit block, or a bare '
-            '--dry-run reaches the committed artifact again'
+    Replaces a test that asserted `'guard_committed_report(' in
+    inspect.getsource(_run).split('if args.limit is not None:')[0]`. That
+    passes UNCONDITIONALLY the moment the split literal is reworded or moved:
+    `str.split` on an absent separator returns the WHOLE function body, so the
+    guard could sink back inside the `--limit` block — the exact structural
+    mistake being pinned — and the assertion would still find it. Per the repo
+    norm it is replaced with behaviour, not hardened into a better grep.
+
+    Driven through `main()` rather than a hand-built args namespace, so the
+    argparse DEFAULT for `--report-path` is what gets guarded — that default
+    is the whole hazard: a bare `--dry-run`, the first invocation in the
+    module docstring, aims at the committed artifact without the operator
+    naming it.
+    """
+
+    def test_a_bare_dry_run_leaves_both_committed_artifacts_byte_identical(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import sys  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        fixture = tmp_path / 'synthetic_corpus.jsonl'
+        fixture.write_text(
+            ''.join(json.dumps(record) + '\n' for record in _corpus()),
         )
+
+        committed = Path(_mod()._DEFAULT_REPORT_PATH)
+        sibling = committed.parent / (committed.stem + '.md')
+        assert committed.exists() and sibling.exists(), (
+            'precondition: both committed artifacts are on disk to be clobbered'
+        )
+        before = {path: path.read_bytes() for path in (committed, sibling)}
+        before_mtimes = {path: path.stat().st_mtime_ns for path in before}
+
+        # The redirect target, pointed somewhere hermetic. `guard_committed_report`
+        # imports `tempfile` inside itself, so the module attribute is the seam.
+        redirect_dir = tmp_path / 'redirected'
+        redirect_dir.mkdir()
+        monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(redirect_dir))
+        monkeypatch.setattr(sys, 'argv', [
+            'eval_write_triage_judge.py', '--dry-run', '--fixture', str(fixture),
+        ])
+
+        assert _mod().main() == 0
+
+        for path, content in before.items():
+            assert path.read_bytes() == content, (
+                f'a --dry-run rewrote {path.name} with fixed-answer numbers — '
+                f'the guard is not reached on the bare --dry-run path'
+            )
+            assert path.stat().st_mtime_ns == before_mtimes[path], (
+                f'{path.name} was rewritten (identically, this time) — the '
+                f'guard must not let a dry run touch it at all'
+            )
+
+        redirected = redirect_dir / _mod()._DRY_RUN_REPORT_NAME
+        assert redirected.exists(), (
+            'the dry run must still publish its throwaway where the redirect '
+            'warning says it did, or "prove the pipeline" proves nothing'
+        )
+        assert json.loads(redirected.read_text())['provenance'][
+            'judge_provider'
+        ] == 'dry-run'
 
 
 class TestCommittedJudgeAccuracyReportIsTraceable:
@@ -1693,7 +1744,18 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         provenance = report['provenance']
         assert provenance['limit'] is None, (
             f'the committed report is a --limit {provenance["limit"]!r} smoke, '
-            f'not the corpus-wide measurement — re-run the eval without --limit'
+            f'not the corpus-wide measurement — re-run the eval without '
+            f'--limit. `guard_committed_report` only WARNS on a --limit run '
+            f'(deliberately: its numbers are the judge\'s own, just partial), '
+            f'so nothing but this assertion stands between a partial artifact '
+            f'and the task-3169 flip gate'
+        )
+        assert provenance['case_count'] == sum(
+            entry['n'] for entry in report['per_class'].values()
+        ), (
+            'the population the provenance CLAIMS was measured and the one the '
+            'per-class table actually scores disagree — the artifact is not '
+            'internally consistent'
         )
         assert provenance['judge_provider'] in write_triage_judge._KNOWN_PROVIDERS, (
             f'judge_provider {provenance["judge_provider"]!r} is not a real '
