@@ -1493,10 +1493,17 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
 # so `scripts/tests/` could reach it too -- the two test roots cannot import
 # each other's test modules. It is imported at the top of this file and bound
 # back under the SAME module-local name `_load_scaled_grace`, so every call
-# site and every `test_load_scaled_grace_*` case below keeps working
-# unchanged; those tests then double as regression coverage on the shared
-# definition. The behaviour is identical -- the promoted body is this one,
-# character for character.
+# site below keeps working unchanged. The behaviour is identical -- the
+# promoted body is this one, character for character.
+#
+# The four `test_load_scaled_grace_*` cases that used to sit here MOVED with
+# the definition, to `tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace`
+# (task 4890 amendment). They were not a cross-root mirror -- that module is
+# in THIS root, so the import barrier that justifies duplicating a test never
+# applied, and after the promotion both copies exercised the same shared
+# function. What stays here is only what is WRAPPER-specific: `_spawn_run_budget`,
+# `_wait_for_path_scaled` and `_set_started_grace`, each of which uses the
+# scaler as an ORACLE rather than re-deriving its floor/scale/clamp arithmetic.
 
 
 # _NOT_FLAGGED_GRACE_BASE_SECS: raised from 2 to 8 (task 3451). Derived, not
@@ -1543,52 +1550,6 @@ def _set_started_grace(env: dict[str, str]) -> int:
     return grace
 
 
-def test_load_scaled_grace_idle_host_returns_base_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """load-per-core <= 1 (idle host) floors at base_secs -- no scaling up."""
-    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _load_scaled_grace(3, cap_secs=30) == 3
-
-
-def test_load_scaled_grace_scales_up_with_load_per_core(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """load-per-core > 1 scales grace up to ceil(base_secs * loadavg / cpu_count)."""
-    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _load_scaled_grace(3, cap_secs=30) == 6
-
-
-def test_load_scaled_grace_clamps_to_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pathological load is clamped at cap_secs instead of growing unbounded."""
-    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _load_scaled_grace(3, cap_secs=30) == 30
-
-
-def test_load_scaled_grace_getloadavg_error_returns_base(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """getloadavg unavailable (OSError or AttributeError) fails safe to base_secs."""
-
-    def _raise_oserror() -> tuple[float, float, float]:
-        raise OSError("getloadavg not supported on this platform")
-
-    monkeypatch.setattr(os, "getloadavg", _raise_oserror)
-    assert _load_scaled_grace(3, cap_secs=30) == 3
-
-    def _raise_attributeerror() -> tuple[float, float, float]:
-        raise AttributeError("os has no getloadavg on this platform")
-
-    monkeypatch.setattr(os, "getloadavg", _raise_attributeerror)
-    assert _load_scaled_grace(3, cap_secs=30) == 3
-
-
 # ===========================================================================
 # Task 3486: _wait_for_path_scaled -- load-scaled readiness-gate policy
 # ===========================================================================
@@ -1610,8 +1571,9 @@ def test_wait_for_path_scaled_returns_load_scaled_budget_on_loaded_host(
     output -- used as the oracle for arg-forwarding (cap_secs in
     particular), so a change to how arguments reach _load_scaled_grace is
     pinned here without duplicating its floor/scale/clamp/error-safe
-    arithmetic, already pinned once by the test_load_scaled_grace_* family
-    above. That oracle alone can't catch a bug shared by both functions, so
+    arithmetic, already pinned once by
+    tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace.
+    That oracle alone can't catch a bug shared by both functions, so
     a literal expected value is also pinned below (96.0 loadavg / 32 cores
     => load-per-core 3.0, base 5 => ceil(5 * 3.0) = 15).
 
@@ -1717,8 +1679,9 @@ def test_wait_for_path_scaled_adds_extra_secs_unscaled(
     ) == _load_scaled_grace(10, cap_secs=_READINESS_WAIT_CAP_SECS) + 1.0
 
     # Pathological host: the cap clamps only the scaled part; extra_secs
-    # survives the clamp untouched. Mirrors test_load_scaled_grace_clamps_to_cap
-    # one layer up.
+    # survives the clamp untouched. Mirrors
+    # tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace
+    # ::test_it_clamps_to_the_cap one layer up.
     monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 32)
     assert (
@@ -1736,7 +1699,8 @@ def test_wait_for_path_scaled_cap_secs_override_widens_the_clamp(
     independently-capped _load_scaled_grace(5) halves it replaced. Pinned
     here at the policy layer so the override itself is tested once, rather
     than only implicitly through that call site. Mirrors
-    test_load_scaled_grace_clamps_to_cap one layer up.
+    tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace
+    ::test_it_clamps_to_the_cap one layer up.
     """
     monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 32)
@@ -1898,8 +1862,9 @@ def test_spawn_run_cap_leaves_headroom_inside_governing_timeout() -> None:
 
     Deliberately just this one static invariant between the two module-
     level constants, no monkeypatching: the scale/floor/clamp arithmetic
-    _spawn_run_budget delegates to is already pinned by the
-    test_load_scaled_grace_* family above, and _spawn_run_budget's own
+    _spawn_run_budget delegates to is already pinned by
+    tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace,
+    and _spawn_run_budget's own
     forwarding of it is pinned against real subprocess.run calls by the
     test_run_spawn_* family below -- re-deriving that arithmetic a third
     time here would be pure duplication (task 3599 amendment; a prior
@@ -2017,8 +1982,9 @@ def test_set_started_grace_writes_env_matching_return(
     """_set_started_grace delegates to _load_scaled_grace and writes the
     identical value into env["SPAWN_STARTED_GRACE_SECS"] as a string.
 
-    The floor/scale/cap arithmetic itself is already pinned three ways by
-    the test_load_scaled_grace_* tests above (idle/scale/clamp/error-safe);
+    The floor/scale/cap arithmetic itself is already pinned four ways by
+    tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace
+    (idle/scale/clamp/error-safe);
     re-deriving that same arithmetic here through _set_started_grace would
     just be duplicate coverage of task 2733's tests. The only contract that
     is genuinely new at this layer is that _set_started_grace's return

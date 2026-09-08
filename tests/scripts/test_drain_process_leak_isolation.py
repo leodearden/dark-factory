@@ -56,6 +56,7 @@ from df_pytest_isolation import (  # noqa: E402
     fixture_marker,
     leaked_drain_process_reason,
     leaked_drain_processes,
+    load_scaled_grace,
     read_leaked_pid,
     run_in_new_session,
     wait_pid_gone,
@@ -495,6 +496,106 @@ class TestWaitProofGraceSecs:
         """
         assert wait_proof_grace_secs(3) == 30
         assert wait_proof_grace_secs(20) == 80
+
+
+class TestLoadScaledGrace:
+    """The shared subprocess-budget scaler both test roots resolve through.
+
+    Promoted out of ``tests/scripts/test_spawn_claude.py`` (task 4890) so
+    ``scripts/tests/`` can reach it: the two roots cannot import each other's
+    test modules, and ``df_pytest_isolation`` is the established home for
+    cross-root helpers. The first four cases are that file's own
+    ``test_load_scaled_grace_*`` family, MOVED here rather than mirrored (task
+    4890 amendment). A mirror was the wrong shape: both modules sit in the SAME
+    root, so the cross-root import barrier that justifies duplicating a test
+    never applied, and after the promotion both sets exercised one shared
+    definition -- straight duplication. ``test_spawn_claude.py`` keeps only its
+    WRAPPER-specific tests (``_spawn_run_budget``, ``_wait_for_path_scaled``,
+    ``_set_started_grace``), which use this scaler as an oracle rather than
+    re-deriving its arithmetic. The fifth case pins an ordering property this
+    repo now depends on and the original four never covered.
+
+    Colocated with :class:`TestWaitProofGraceSecs` so every
+    ``df_pytest_isolation`` budget helper -- the derived wait-proving grace,
+    its self-termination ceiling, the spawn-timeout cap and this scaler -- is
+    pinned in ONE module instead of scattered across three.
+
+    ``os.getloadavg``/``os.cpu_count`` are patched on the ``os`` MODULE, not
+    on a per-module alias, so the patch is visible from
+    ``df_pytest_isolation``'s own namespace.
+    """
+
+    def test_an_idle_host_returns_base_exactly_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """load-per-core <= 1 floors at base_secs -- no scaling up at all.
+
+        This is the byte-identical-when-unloaded guarantee every call site
+        that adopts this scaler depends on: adopting it can LENGTHEN a budget
+        under contention and can never shorten one or slow an idle run.
+        """
+        monkeypatch.setattr(os, 'getloadavg', lambda: (10.0, 10.0, 10.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+    def test_it_scales_with_load_per_core(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ceil(base_secs * loadavg1 / cpu_count) once the host is oversubscribed."""
+        monkeypatch.setattr(os, 'getloadavg', lambda: (64.0, 64.0, 64.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 6
+
+    def test_it_clamps_to_the_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pathological host stays bounded instead of growing without limit."""
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 30
+
+    def test_no_loadavg_on_this_platform_fails_safe_to_base(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both spellings of "this platform has no loadavg" return base_secs.
+
+        Fail-safe rather than fail-open: an unavailable signal must not turn
+        a budget into something SHORTER than the caller asked for.
+        """
+        def _raise_oserror() -> tuple[float, float, float]:
+            raise OSError('getloadavg not supported on this platform')
+
+        monkeypatch.setattr(os, 'getloadavg', _raise_oserror)
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+        def _raise_attributeerror() -> tuple[float, float, float]:
+            raise AttributeError('os has no getloadavg on this platform')
+
+        monkeypatch.setattr(os, 'getloadavg', _raise_attributeerror)
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+    def test_the_floor_beats_the_cap_when_base_exceeds_it(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """base_secs > cap_secs returns base_secs, NOT cap_secs.
+
+        The ``max(base, min(cap, ...))`` ordering, which the four cases above
+        never reach because each uses base=3 < cap=30. Pinned because callers
+        pass caps DERIVED from an unrelated ceiling (a per-test timeout axe, a
+        leak self-termination bound) rather than caps chosen to sit above every
+        base -- so a cap below a base is a reachable combination, and silently
+        SHORTENING a budget to it is the one behaviour a scaler must never
+        have. Asserted at both an idle and a loaded host, since the clamp is
+        the only term load can move.
+        """
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        monkeypatch.setattr(os, 'getloadavg', lambda: (10.0, 10.0, 10.0))
+        assert load_scaled_grace(20, cap_secs=5) == 20
+
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+        assert load_scaled_grace(20, cap_secs=5) == 20
 
 
 # ---------------------------------------------------------------------------
