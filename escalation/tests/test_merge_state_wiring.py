@@ -320,7 +320,7 @@ class TestMergeCancelEmitsCancelStates:
         req = mq.get_nowait()
         req.result.set_result(MergeOutcome(status='already_merged', reason='late resolve'))
 
-        result = await cancel_tool.fn(request_id=submitted['request_id'])
+        result = await cancel_tool.fn(request_id=submitted['request_id'])  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
 
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel mid-finalize')
@@ -342,7 +342,7 @@ class TestMergeCancelEmitsCancelStates:
         req = mq.get_nowait()
         req.result.set_exception(RuntimeError('worker blew up'))
 
-        result = await cancel_tool.fn(request_id=submitted['request_id'])
+        result = await cancel_tool.fn(request_id=submitted['request_id'])  # type: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
 
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel excepted future')
