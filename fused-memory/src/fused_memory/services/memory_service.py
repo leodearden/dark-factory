@@ -3718,31 +3718,6 @@ class MemoryService:
         for edge in edges:
             stats.edges_scanned += 1
             edge_uuid = getattr(edge, 'uuid', '') or ''
-            # Scanned ONCE per edge, not once per endpoint. The FACT is what
-            # pairing reads — not the episode content — because the fact is the
-            # per-edge assertion whose subject must match the endpoint it landed
-            # on; the episode body is about the write as a whole and cannot
-            # discriminate between two edges of the same episode.
-            #
-            # PERMISSIVE mode (no `known_project_ids`), matching the choice
-            # gamma made and documented in `resolve_referents`. Threading
-            # `self._known_projects` here would fork that decision mid-PRD, and
-            # would DROP a foreign reference the fact genuinely makes — turning
-            # a true negative into a false pairing finding.
-            #
-            # `scan.refs` already excludes `scan.ambiguous`, so nothing further
-            # is filtered out here: an ambiguous reference is deliberately
-            # invisible to this check rather than evidence for it.
-            cited = frozenset(
-                scan_content(
-                    getattr(edge, 'fact', '') or '', group_id=group_id,
-                ).refs
-            )
-            # The referents this edge's fact names that the write also DECLARED
-            # itself to be about — i.e. the concrete alternatives this edge
-            # could actually belong on. Computed once per edge, beside `cited`,
-            # because both endpoints test against it.
-            cited_declared = cited & referent_set
             # BOTH ends are resolved before EITHER is checked: the candidate
             # rule needs the OTHER end's referent (a target equal to it would be
             # the self-loop `reassign_edge` refuses), which is only knowable once
@@ -3778,6 +3753,53 @@ class MemoryService:
                     endpoint_name,
                     _endpoint_referent(endpoint_name, group_id=group_id),
                 ))
+
+            if all(end[3] is None for end in ends):
+                # Neither end is a canonical task label, so neither citation
+                # rule below is reachable and the scan would produce a value
+                # nothing reads. This is the ~99% shape, and skipping it here is
+                # the whole point of computing the scan AFTER the ends rather
+                # than before them: the pass runs SERIALIZED inside the
+                # per-group `_identity_lock_for` critical section that every
+                # other same-group write queues behind, so a regex pass per edge
+                # is charged to that queue. `endpoints_unresolved` has already
+                # been counted above; the loop below would `continue` on every
+                # end anyway, so this is an efficiency short-circuit and not a
+                # coverage one.
+                continue
+
+            # Scanned AT MOST ONCE PER EDGE, and only once an endpoint is a task
+            # label — never once per endpoint. The FACT is what pairing reads —
+            # not the episode content — because the fact is the per-edge
+            # assertion whose subject must match the endpoint it landed on; the
+            # episode body is about the write as a whole and cannot discriminate
+            # between two edges of the same episode.
+            #
+            # Computed HERE, after both ends are parsed and before either is
+            # checked, so the single scan still serves both endpoints: hoisting
+            # it into the endpoint loop below would scan a two-task-endpoint
+            # edge twice, which is the property the original eager placement
+            # bought and this deferral must not give back.
+            #
+            # PERMISSIVE mode (no `known_project_ids`), matching the choice
+            # gamma made and documented in `resolve_referents`. Threading
+            # `self._known_projects` here would fork that decision mid-PRD, and
+            # would DROP a foreign reference the fact genuinely makes — turning
+            # a true negative into a false pairing finding.
+            #
+            # `scan.refs` already excludes `scan.ambiguous`, so nothing further
+            # is filtered out here: an ambiguous reference is deliberately
+            # invisible to this check rather than evidence for it.
+            cited = frozenset(
+                scan_content(
+                    getattr(edge, 'fact', '') or '', group_id=group_id,
+                ).refs
+            )
+            # The referents this edge's fact names that the write also DECLARED
+            # itself to be about — i.e. the concrete alternatives this edge
+            # could actually belong on. Computed once per edge, beside `cited`,
+            # because both endpoints test against it.
+            cited_declared = cited & referent_set
 
             for index, end in enumerate(ends):
                 which_end, endpoint_uuid, endpoint_name, endpoint_referent = end
