@@ -30,7 +30,7 @@ import sqlite3
 import statistics
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 KEY = 'PYTEST_XDIST_AUTO_NUM_WORKERS'
@@ -144,7 +144,7 @@ def main() -> int:
     else:
         verdict['recommendation'] = f'insufficient data: need >={MIN_N} passed non-speculative merge verifies per arm (16: {a16.get("n", 0)}, 8: {a8.get("n", 0)})'
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     lines = [f'# Merge-leg pytest `-n` A/B (16 vs 8) — cut {now.isoformat(timespec="minutes")}', '',
              f'Source: `{args.db}` (`merge_verify` events, runner=local, since {since.isoformat(timespec="minutes")}).',
              'Arms from `config_reload` events changing `verify_env.' + KEY + '`:', '']
