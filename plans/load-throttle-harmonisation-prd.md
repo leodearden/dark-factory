@@ -444,7 +444,7 @@ Edges: β→α; γ→β; δ→α; δ′→δ; ε1→{δ′, γ, reify:ρ1}; ε2�
    The stem avoids a schema migration. Decide in δ.
 2. **Calibration regime split** — percentiles + hold fractions alone (the floor), or additionally
    "saturated when a verify timeout occurred in the window". Decide in δ.
-3. **Balancer reservoir retirement** once 3394 + 5205 exist and ε reports own-slice pressure rarely
+3. **Balancer reservoir retirement** once 3394 + 5205 exist and ε2 reports own-slice pressure rarely
    above 50 while tokens are held. Decide on ε2's data; file then.
 4. **`min_inflight_floor` for the five idle orchestrators** — leave at 1 (proposed).
 5. **Own-arm value after ε2** — ε2 recommends; γ/ρ1's successor commit switches it on. Decide then.
