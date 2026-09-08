@@ -1877,6 +1877,24 @@ class ReferentFinding:
         them as scanner defects) and the operator log's level (INFO rather than
         WARNING, for the alert-fatigue reason the pairing arm's
         ``cited_declared`` narrowing already refused to create).
+
+        PRECONDITION — ``node_name`` IS INJECTIVE OVER THE REGISTERED KINDS.
+        The veto it derives from compares :class:`Referent` OBJECTS (equality on
+        the ``(kind, project_id, number)`` triple); this compares their
+        RENDERINGS, because that is what :attr:`cited` carries, and the two
+        agree only while distinct referents cannot render alike.
+        :attr:`Referent.node_name` drops ``kind`` entirely for a FOREIGN
+        referent (``f'{project_id}:{number}'``), so the rendering is injective
+        purely because ``canonical_labels._KIND_LABELS`` holds exactly one kind
+        today. Register a second, and a foreign citation of the new kind
+        corroborates a foreign ``'task'`` endpoint of the same number — a genuine
+        misattachment silently demoted to INFO and booked as corroborated, i.e.
+        exactly the divergence deriving the property was chosen to make
+        unrepresentable. That precondition is PINNED rather than merely noted:
+        ``tests/test_referent_verification.py::
+        TestCorroboratedIsDerivedFromTheRecordedEvidence::
+        test_node_name_is_injective_over_the_registered_kinds`` reds the moment
+        a kind is added, and carries the two admissible repairs.
         """
         return self.endpoint_referent.node_name in self.cited
 
@@ -4016,7 +4034,6 @@ class MemoryService:
             # share ONE rendering.
             cited_names: tuple[str, ...] | None = None
 
-
             for index, end in enumerate(ends):
                 which_end, endpoint_uuid, endpoint_name, endpoint_referent = end
                 if endpoint_referent is None:
@@ -4241,7 +4258,6 @@ class MemoryService:
                     level, 'Referent verification finding: %s',
                     finding.to_dict(),
                 )
-
 
         if suppressed:
             # THE TRUNCATION ANNOUNCES ITSELF rather than the log simply

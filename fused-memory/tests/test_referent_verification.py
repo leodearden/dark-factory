@@ -47,6 +47,7 @@ from fused_memory.services.memory_service import (
     ReferentFinding,
     ReferentStats,
 )
+from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import Referent
 
 
@@ -1629,6 +1630,24 @@ def _one_membership_finding_episode() -> MockAddEpisodeResult:
     )
 
 
+def _three_findings_one_referent_episode() -> MockAddEpisodeResult:
+    """Three edge ends landed on Task 3129 while the write declared 3127.
+
+    Three findings sharing ONE intended referent, so the second pass issues
+    exactly one backend lookup and the other two findings read its CACHED
+    verdict — the shape both the caching contract and its degradation contract
+    are pinned on.
+    """
+    return _episode(
+        edges=[_edge('e1', source='n-3129', target='n-x'),
+               _edge('e2', source='n-3129', target='n-y'),
+               _edge('e3', source='n-y', target='n-3129')],
+        nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+               MockNode(name='deploy pipeline', uuid='n-x'),
+               MockNode(name='merge lane', uuid='n-y')],
+    )
+
+
 class TestNewEndpointUuidResolution:
     """Read-only, lazy, and never issued on the clean path."""
 
@@ -1719,17 +1738,10 @@ class TestNewEndpointUuidResolution:
         service.graphiti.get_nodes_by_exact_name = AsyncMock(
             return_value=_rows('n-3127'),
         )
-        result = _episode(
-            edges=[_edge('e1', source='n-3129', target='n-x'),
-                   _edge('e2', source='n-3129', target='n-y'),
-                   _edge('e3', source='n-y', target='n-3129')],
-            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
-                   MockNode(name='deploy pipeline', uuid='n-x'),
-                   MockNode(name='merge lane', uuid='n-y')],
-        )
 
         stats = await service._verify_episode_referents(
-            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+            _three_findings_one_referent_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
         )
 
         assert len(stats.findings) == 3
@@ -2293,6 +2305,50 @@ class TestCorroboratedIsDerivedFromTheRecordedEvidence:
             cited=('other_project:2500',),
         ).corroborated is False
 
+    def test_node_name_is_injective_over_the_registered_kinds(self):
+        """The PRECONDITION this property is derived under, pinned so that
+        registering a second referent kind REDS this suite instead of silently
+        weakening the guard.
+
+        `_candidate_pool`'s veto compares `Referent` OBJECTS — equality on the
+        `(kind, project_id, number)` triple — while `corroborated` compares
+        their `node_name` RENDERINGS, because rendered names are what `cited`
+        carries. The two agree only while distinct referents cannot render
+        alike, and `Referent.node_name` drops `kind` entirely for a FOREIGN
+        referent (`f'{project_id}:{number}'`), so today's injectivity rests
+        wholly on `_KIND_LABELS` holding exactly one kind. Add a second and a
+        foreign citation of the new kind corroborates a foreign 'task' endpoint
+        of the same number: a genuine misattachment demoted to INFO and booked
+        into the 'corroborated' counter axis.
+
+        WHEN THIS REDS, DO NOT RELAX IT. Two repairs are admissible: qualify the
+        kind in the foreign rendering so `node_name` stays injective, or change
+        `corroborated` to compare referent IDENTITY (carry the cited referents
+        on the record beside their renderings). The derivation exists to make
+        the property and the veto unable to disagree, and a name collision is
+        precisely a disagreement.
+
+        Lives here rather than in tests/test_canonical_labels.py because it pins
+        a precondition of THIS property; task 4506 holds no lock on that file
+        (esc-3671-3 amendment pass).
+        """
+        kinds = sorted(canonical_labels._KIND_LABELS)
+        # BOTH renderings, because they fail differently: the local form
+        # discriminates on the kind LABEL ('Task 2500' vs a second label) and
+        # stays injective, while the foreign form drops the kind and is the one
+        # that collides.
+        for project_id in ('', 'other_project'):
+            rendered = {
+                Referent(number='2500', kind=kind, project_id=project_id).node_name
+                for kind in kinds
+            }
+            assert len(rendered) == len(kinds), (
+                f'Referent.node_name collides across registered kinds {kinds} '
+                f'for project_id={project_id!r}: rendered {sorted(rendered)}. '
+                'ReferentFinding.corroborated compares renderings and would '
+                'now disagree with _candidate_pool\'s object-identity veto.'
+            )
+
     def test_it_is_not_a_key_in_the_payload(self):
         """The key set is contractually the DATACLASS FIELD NAMES, and a derived
         property is not a field. Nothing is lost: the payload already carries
@@ -2792,6 +2848,38 @@ class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
         # None and the finding is still resolvable and still recorded in full.
         assert finding.new_endpoint_uuid is None
         assert finding.resolvable is True
+
+    @pytest.mark.asyncio
+    async def test_every_finding_sharing_one_degraded_lookup_reports_it(
+        self, service,
+    ):
+        """The DRIFT the tuple-caching exists to prevent, in the only shape that
+        can exhibit it: a second finding reading `degraded=False` off a lookup
+        that never re-ran.
+
+        Three findings, ONE distinct intended referent, so exactly one backend
+        call is made and the other two read its cached verdict. Every other test
+        in this class drives `_one_membership_finding_episode`, which yields a
+        single finding — so an implementation that set the flag only on the
+        finding whose call actually raised would pass all of them, and
+        `test_one_lookup_per_distinct_intended_referent` next door covers the
+        multi-finding case only on the SUCCESSFUL path (uuid, not degradation).
+        """
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(
+            side_effect=RuntimeError('falkor down'),
+        )
+
+        stats = await service._verify_episode_referents(
+            _three_findings_one_referent_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 3
+        assert all(f.uuid_lookup_degraded for f in stats.findings)
+        # The verdict is SHARED, not re-derived — the flag rides with the uuid
+        # on one cache entry, so a single failed call marks all three.
+        assert all(f.new_endpoint_uuid is None for f in stats.findings)
+        assert service.graphiti.get_nodes_by_exact_name.await_count == 1
 
     @pytest.mark.asyncio
     async def test_a_clean_lookup_finding_nothing_is_not_degraded(self, service):
