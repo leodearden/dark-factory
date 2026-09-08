@@ -15,7 +15,7 @@ cross-checks every other site against it. It never stores its own snapshot slug
 list: a hardcoded constant here would be one more lock-step copy, stale on the
 next invariant exactly like the prose sites were.
 
-THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
+THE FIVE PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
   * ``docs/legibility/design-invariants.md`` — SOURCE OF TRUTH. Its
     ``## INV-N `slug``` headings define the family.
   * ``docs/legibility/design-invariants-fixtures.md`` — one fixture section per
@@ -25,6 +25,8 @@ THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
     family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
   * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it may name at most one
     invariant, never a restatement of the family.
+  * ``docs/code-quality.md`` — a PARTIAL `INV-N`-to-heuristic mapping, pinned
+    pair-wise against the normative doc, never for completeness.
 
 STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
 artifacts — the cross-artifact correspondence that fails to auto-extend when an
@@ -84,6 +86,7 @@ NORMATIVE_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants.md"
 FIXTURES_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants-fixtures.md"
 GATES_DOC = REPO_ROOT / "skills" / "prd" / "references" / "gates.md"
 CONTRIBUTING_DOC = REPO_ROOT / "CONTRIBUTING.md"
+CODE_QUALITY_DOC = REPO_ROOT / "docs" / "code-quality.md"
 
 # A family this small would mean the normative doc stopped parsing, not that
 # dark-factory shrank its invariant list: eight are landed and none has ever been
@@ -423,6 +426,10 @@ PINNED_SITES = {
     ),
     "CONTRIBUTING.md": (
         "pinned as an ABSENCE: at most one by-name citation, never a restatement"
+    ),
+    "docs/code-quality.md": (
+        "a partial `INV-N`-to-heuristic mapping, pinned pair-wise against the "
+        "normative doc — never for completeness"
     ),
 }
 
