@@ -13,6 +13,7 @@ import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import yaml
 from hypothesis import given
 from hypothesis import strategies as st
@@ -647,3 +648,140 @@ class TestProjectWeightKeyFolding:
         built = replace(Priorities.default(), project_weights={'dark-factory': 4.0})
 
         assert built.project_weights == {'dark-factory': 4.0}
+
+
+class TestProjectWeightKeysOfAnyYamlType:
+    """load_priorities stays TOTAL over the non-str mapping keys yaml.safe_load
+    hands it for perfectly ordinary UNQUOTED hand edits (task 3812).
+
+    ``2085:`` parses as an int, ``1.5:`` as a float, ``yes:`` as a bool and
+    ``~:`` as None. The project_weights key fold added by this task sorts its
+    keys, and ``normalize_project_token(k) == k`` is False for every one of
+    those AND for a non-canonical str key like the very ``dark-factory:`` the
+    fold exists to repair -- so both land in the SAME first-element sort group
+    and the tuple comparison falls through to the RAW key, comparing e.g. an
+    int against a str. That TypeError escapes _priorities_from_dict ->
+    load_priorities OUTSIDE its ``except (OSError, yaml.YAMLError)`` guard,
+    breaking the documented 'never raises' contract and PRD section 2's hard
+    rule that a view is never a dependency: the cockpit would fail to start on
+    a hand-edited file that merely has an unquoted number for a key. Before
+    this task the raw table passed through untouched and such a key simply
+    never matched in score(), so it is a regression the fold introduced.
+
+    Every assertion below goes through a REAL priorities.yaml written to disk
+    and read back with load_priorities: only a real yaml.safe_load produces
+    non-str keys, so a hand-built dict would not reproduce the defect.
+
+    The pairing with ``dark-factory: 2.0`` is load-bearing, not decoration --
+    a lone non-str key sorts fine against itself and would NOT reproduce the
+    bug.
+    """
+
+    def _load(self, tmp_path, text):
+        from cockpit.priority import load_priorities
+
+        path = tmp_path / 'priorities.yaml'
+        path.write_text(text)
+        return load_priorities(path)
+
+    @pytest.mark.parametrize(
+        ('key_line', 'expected'),
+        [
+            ('  2085: 1.0\n', {'2085': 1.0, 'dark_factory': 2.0}),
+            ('  1.5: 1.0\n', {'1.5': 1.0, 'dark_factory': 2.0}),
+            ('  yes: 1.0\n', {'true': 1.0, 'dark_factory': 2.0}),
+            ('  ~: 1.0\n', {'dark_factory': 2.0}),
+        ],
+        ids=['int', 'float', 'bool', 'none'],
+    )
+    def test_a_non_str_key_beside_a_variant_key_loads_instead_of_raising(
+        self, tmp_path, key_line, expected
+    ):
+        """One non-str key next to one non-canonical str key -- the minimal
+        reproducer, once per key type yaml.safe_load can produce.
+
+        The assertion shape is deliberately the RETURNED table, never
+        pytest.raises: the contract being pinned is that load_priorities
+        returns a Priorities, so a test that merely tolerated the TypeError
+        would pin the opposite of what is wanted. The ``~`` (None) row folds
+        to the '' unset sentinel and is DROPPED -- see
+        test_a_key_that_folds_to_empty_is_dropped.
+        """
+        from cockpit.priority import Priorities
+
+        result = self._load(tmp_path, 'project_weights:\n' + key_line + '  dark-factory: 2.0\n')
+
+        assert isinstance(result, Priorities)
+        assert result.project_weights == expected
+
+    def test_all_key_types_and_both_spellings_in_one_table(self, tmp_path):
+        """All four non-str shapes plus both project spellings at once, so no
+        PAIR of key types can be left mutually incomparable by a fix that only
+        made one type sortable."""
+        result = self._load(
+            tmp_path,
+            'project_weights:\n'
+            '  2085: 1.0\n'
+            '  1.5: 2.0\n'
+            '  yes: 3.0\n'
+            '  ~: 4.0\n'
+            '  dark-factory: 5.0\n'
+            '  dark_factory: 6.0\n',
+        )
+
+        assert result.project_weights == {
+            '2085': 1.0,
+            '1.5': 2.0,
+            'true': 3.0,
+            # The canonical key still wins the collision with 'dark-factory'.
+            'dark_factory': 6.0,
+        }
+
+    def test_a_bare_task_id_key_is_folded_by_value_not_discarded(self, tmp_path):
+        """An unquoted int key must WORK, not merely not-crash.
+
+        Bare-task-id project tokens are real in this fleet (this task's own
+        registry_reader tests seed '3565' as a real spelling), so simply
+        DROPPING every non-str key would be the wrong repair: it would silently
+        discard a weight an operator did set on a live project.
+        """
+        from cockpit.priority import score
+
+        result = self._load(tmp_path, 'project_weights:\n  2085: 3.0\n')
+
+        assert result.project_weights == {'2085': 3.0}
+        assert score(_make_item(project='2085'), result, _NOW) > score(
+            _make_item(project='unmapped-project'), result, _NOW
+        )
+
+    def test_a_key_that_folds_to_empty_is_dropped(self, tmp_path, caplog):
+        """A key folding to '' -- the UNSET-project sentinel, not a token -- is
+        dropped, visibly.
+
+        ``~:`` (None), ``'':`` and ``'   ':`` all normalize to ''. Keeping one
+        would silently apply that weight to every row whose project is unset
+        (1,347 such records measured 2026-09-07), and would put the scorer back
+        in disagreement with panes.weight_editor.known_projects, which already
+        excludes '' -- the exact scorer/picker divergence task 3812 exists to
+        make impossible. Dropping is therefore right, but it must be VISIBLE:
+        each discard is logged at WARNING naming the raw key.
+        """
+        from cockpit.priority import score
+
+        with caplog.at_level(logging.WARNING):
+            result = self._load(
+                tmp_path,
+                "project_weights:\n  ~: 5.0\n  '': 6.0\n  '   ': 7.0\n  dark-factory: 1.0\n",
+            )
+
+        assert '' not in result.project_weights
+        assert result.project_weights == {'dark_factory': 1.0}
+        # Behavioural: an unset-project row still scores at defaults.project.
+        assert score(_make_item(project=''), result, _NOW) == score(
+            _make_item(project='unmapped-project'), result, _NOW
+        )
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        for raw_key in ('None', "''", "'   '"):
+            assert any('project_weights' in msg and raw_key in msg for msg in warnings), (
+                f'Expected a WARNING naming dropped key {raw_key}; got: {warnings}'
+            )
