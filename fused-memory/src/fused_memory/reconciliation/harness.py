@@ -152,6 +152,12 @@ _RECON_DEDUP_CONFIG = (
             # _record_placeholder_finding_drop).  Same fold rationale as
             # recon_watchdog_kill_storm above.
             'recon_remediation_placeholder_storm',
+            # Task 4781: aggregate storm alarm for actionable findings dropped
+            # from remediation after phantom-citation verification stripped
+            # every citation (see _PHANTOM_CITATION_DROP_STORM_FINDING /
+            # _record_phantom_citation_finding_drop).  Same fold rationale as
+            # the two storm categories above it.
+            'recon_remediation_phantom_citation_storm',
             # Task 2278: stable per-project finding identity (build_stale_snapshot_finding)
             # so a sustained task_count_snapshot cadence gap folds into a single pending
             # escalation per project instead of firing once per cycle.
