@@ -1337,6 +1337,15 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
             metadata_patch=dict(decision.patch),
             metadata_mode='merge',
             reason=WRITE_REASON,
+            # Attribution has TWO consumers and they read different fields:
+            # the write journal / storm alarm read ``_source``, while the
+            # metadata-vocabulary check this patch triggers
+            # (emit_schema_warnings, UnknownKeyStormDetector.record,
+            # file_unknown_key_storm_escalation) is keyed by ``agent_id``.
+            # Omitting the latter leaves every census line and storm bucket
+            # from this run attributed to a null agent, so both are set to
+            # the same value and the two views agree.
+            agent_id=WRITE_SOURCE,
             _source=WRITE_SOURCE,
         )
     except Exception as exc:
