@@ -587,6 +587,40 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
     return payloads
 
 
+def _ticket_id_from_submit_result(result) -> str | None:
+    """Extract the ticket id from one curator-path ``submit_task`` result,
+    or ``None`` when the call produced nothing filable.
+
+    SPOT for what that seam actually returns. ``submit_task`` answers the
+    curator path with ``{"ticket": "tkt_<id>"}`` -- a TICKET id, NOT a task
+    id (``fused_memory/server/tools.py::submit_task``,
+    ``fused_memory/middleware/task_interceptor.py::TaskInterceptor``). The
+    curator decides create/combine/drop asynchronously, so at this point in
+    a census run no task id exists yet; ``resolve_ticket`` obtains it later.
+    Callers must not label a value from here a task id -- fused-memory hard
+    rejects a ticket-shaped id passed where a task id is expected
+    (``tools.py::_reject_if_ticket_id``).
+
+    Two shapes yield ``None`` so the caller can log and exclude rather than
+    abort or inflate the filed count: a rejected or failed call answers
+    ``{"error": ..., "error_type": ...}`` (no ticket key), and a transport
+    fault can answer a non-dict. A non-string ``ticket`` value is refused
+    for the same reason -- an unusable value must never render as a report
+    bullet.
+
+    The synchronous planning-mode shape ``{"task_id": ..., "status":
+    "deferred", "planning_mode": True}`` is deliberately OUT OF SCOPE:
+    ``build_task_payloads`` omits ``planning_mode`` on purpose (PRD decision
+    9) so filing goes through the curator, and ``planning_mode=True`` is the
+    only switch to that shape. Accepting it here would be unreachable code
+    that quietly widens the contract this docstring states.
+    """
+    if not isinstance(result, dict):
+        return None
+    ticket_id = result.get("ticket")
+    return ticket_id if isinstance(ticket_id, str) else None
+
+
 # ---------------------------------------------------------------------------
 # promote_candidate / reject_candidate / retire_entry — census-only
 # codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
