@@ -137,11 +137,29 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # unaffected.
 #
 # That evidence covers only the SHRINKING direction (fewer/no ids
-# extracted) and was not re-measured live against the production task
-# corpus (review remediation, task 4705 amendment pass) — this task holds
-# no lock on that corpus to run a before/after `verdict_counts` diff, so
-# one is filed as a follow-up instead. Two reverse-direction effects were
-# traced through `_classify_core` below rather than measured live:
+# extracted). The GROWING direction was measured live against the
+# production task corpus by task 4784 (2026-09-08, HEAD dbc6410071): this
+# script's own dry-run report, run before and after task 4705's regex fix
+# with that one-line CITATION_PATTERN change as the sole variable —
+# patched into a copy of the then-current script rather than a checkout of
+# the pre-fix commit, since main had by then also gained task 4706's
+# `_classify_core` changes, which would have confounded a commit-to-commit
+# diff. Both runs audited the same 385 found_on_main tasks out of a
+# 5153-task corpus, with zero task-id drift between them.
+#
+# Result: NO found_on_main task newly enters `misattributed` or
+# `deliverable_absent`. Exactly 6 tasks changed verdict and all 6 LEFT
+# `misattributed`: 1495, 3869, 4517 -> `unverifiable`; 2273 ->
+# `deliverable_absent`; 3924, 4265 -> `ok`. Aggregate `deliverable_absent`
+# rose 1 -> 2, which reads like the regression this measurement exists to
+# catch, but is task 2273 moving misattributed -> deliverable_absent —
+# flagged to flagged, already surfaced for human review both before and
+# after. That is why the per-task diff, not the aggregate
+# `verdict_counts`, is the artifact that actually answers the question.
+# Two reverse-direction effects were traced analytically through
+# `_classify_core` below; NEITHER fired on this corpus — no task moved
+# `ok` -> anything (effect 2) and no task was newly flagged
+# `misattributed` (effect 1):
 #   (1) self-citation SUPPRESSION narrows too, not just other-task
 #       DETECTION — a message citing the audited task ONLY via bare-paren
 #       while citing a *different* task in one of the three surviving
@@ -152,11 +170,19 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 #       TestClassifyMisattributed.test_self_citation_only_in_bare_paren_form_now_flags_misattributed
 #       below; accepted as rare for this corpus, since self-citation here
 #       is overwhelmingly written in the conventional-commit subject form.
+#       Reachable in principle, measured non-occurring on this
+#       corpus (task 4784, 2026-09-08).
 #   (2) a found_on_main task with no declared files whose only self-
 #       citation was bare-paren reclassifies `ok` -> `unverifiable`.
 #       Relabeling only, not a new gating false positive: `unverifiable`
 #       is not a member of `_FLAGGED_VERDICTS` below, so it never trips
 #       `_has_flagged_findings` / `--fail-on-findings`.
+#       Reachable in principle, measured non-occurring on this
+#       corpus (task 4784, 2026-09-08).
+#
+# Neither is thereby proven unreachable: this is a point-in-time
+# observation of one corpus, not a static guarantee, and a future commit
+# message shaped like the traced cases above would still trip it.
 #
 # Residual, un-addressed false-positive source (out of this task's scope):
 # the `task/{id}` branch-mention alternative above matches ANYWHERE in the
