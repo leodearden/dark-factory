@@ -1816,14 +1816,23 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     Enumeration-free sweep of this module's own AST (see the banner above
     :func:`test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark`).
     For every ``test_*`` function, collects the local names bound from a
-    bare ``X = spawn_verify_merge(...)`` call, then asserts that no ``try``
-    handler/finalbody in that function calls ``<holder>.kill()``,
-    ``<holder>.terminate()``, or ``os.kill``/``os.killpg`` (with a swept
-    holder name anywhere in the argument subtree) directly unless the SAME
-    body also calls ``kill_holder_tree`` -- any of those raw-kill spellings
-    SIGKILLs/terminates only the leader, orphaning any session-escaped
-    descendant (e.g. one of verify.py's ``start_new_session`` build
-    commands) for the rest of its natural life (task 4092).
+    bare ``X = spawn_verify_merge(...)`` call, then makes TWO independent
+    claims about every such holder:
+
+    (i) no ``try`` handler/finalbody in that function calls
+    ``<holder>.kill()``, ``<holder>.terminate()``, or ``os.kill``/
+    ``os.killpg`` (with a swept holder name anywhere in the argument
+    subtree) directly unless the SAME body also calls ``kill_holder_tree``
+    -- any of those raw-kill spellings SIGKILLs/terminates only the leader,
+    orphaning any session-escaped descendant (e.g. one of verify.py's
+    ``start_new_session`` build commands) for the rest of its natural life
+    (task 4092); and
+
+    (ii) every swept holder is passed to a ``kill_holder_tree(...)`` call
+    SOMEWHERE in that function at all (:func:`_untorn_down_holders`) --
+    (i) only judges the quality of a teardown that exists, so a holder with
+    NO teardown anywhere satisfies (i) vacuously; (ii) closes that silent-
+    pass hole (task 4946).
 
     Carries the sibling sweep's anti-vacuity discipline: a matcher that
     silently stops matching is a guard reporting PASS while guarding
@@ -1834,6 +1843,7 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
     swept: dict[str, set[str]] = {}
     offenders: list[str] = []
+    untorn: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
@@ -1844,6 +1854,7 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
             continue
         swept[node.name] = holder_names
         offenders.extend(_bare_kill_offenders(node, holder_names))
+        untorn.extend(_untorn_down_holders(node, holder_names))
 
     missing = sorted(_KNOWN_HOLDER_TEARDOWN_ROWS - set(swept))
     assert not missing, (
@@ -1858,6 +1869,16 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
         'so a session-escaped descendant (e.g. a verify.py '
         "start_new_session build command) survives the leader's own death "
         'as an orphan:\n  ' + '\n  '.join(offenders)
+    )
+
+    assert not untorn, (
+        'these spawn_verify_merge-bound holders are never passed to '
+        'kill_holder_tree anywhere in their test, so a raised '
+        'communicate()/wait() timeout -- or any failing assertion before '
+        'the teardown -- leaks the leader AND every session-escaped '
+        'descendant verify.py started under it; a holder with NO teardown '
+        'must be a finding, not a silent pass (the raw-kill sweep above '
+        'only sees teardowns that exist):\n  ' + '\n  '.join(untorn)
     )
 
 
