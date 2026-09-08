@@ -995,16 +995,21 @@ class TestVerdicts:
     def test_orphan_verdict_metric_id_and_eval_id_are_capped(self, tmp_path: Path) -> None:
         """Both interpolations in this ONE detail are unvalidated JSON.
 
-        ``eval_id`` and ``metric_id`` are ``isinstance(..., str)``-guarded at
-        the verdicts read boundary (memory_evals.py::_read_verdicts) but never length-guarded — the
-        same size exposure as the duplicate-index details, one field over.
+        ``metric_id`` is ``isinstance(..., str)``-guarded at the verdicts
+        read boundary (memory_evals.py::_read_verdicts) but never
+        length-guarded — the same size exposure as the duplicate-index
+        details, one field over.  ``eval_id`` IS now length-guarded there
+        (task 4922, ``_MAX_EVAL_ID_LENGTH``): a value long enough to still
+        need capping in this detail's prose, but at the accepted limit, so
+        this exercises an ``eval_id`` that legitimately survives the read
+        boundary rather than one the new guard rejects.
         """
-        from dashboard.data.memory_evals import build_memory_evals
+        from dashboard.data.memory_evals import _MAX_EVAL_ID_LENGTH, build_memory_evals
 
         huge_metric_id = 'p' * 5000
-        huge_eval_id = 'q' * 5000
+        long_eval_id = 'q' * _MAX_EVAL_ID_LENGTH
         root, esc_dir = _verdicts_tree(tmp_path, entries=[
-            _verdict(huge_eval_id, huge_metric_id, 'alarm', fingerprint='fp-orphan-huge'),
+            _verdict(long_eval_id, huge_metric_id, 'alarm', fingerprint='fp-orphan-huge'),
         ])
 
         payload = build_memory_evals(root, esc_dir)
@@ -1017,11 +1022,12 @@ class TestVerdicts:
         _assert_capped(issue['detail'], values=2)
         assert 'matches no metric row in eval' in issue['detail']
         # The structured `eval_id=` kwarg is an identity field, not prose —
-        # it stays the untruncated original (design decision: truncating it
-        # would corrupt the UI's grouping/linking rather than just trim a
-        # detail).  A future over-eager sweep that routed it through
-        # `_short_repr` too would break that and nothing above would notice.
-        assert issue['eval_id'] == huge_eval_id
+        # it stays the untruncated original for any eval_id that survives
+        # the read boundary (design decision: truncating it would corrupt
+        # the UI's grouping/linking rather than just trim a detail).  A
+        # future over-eager sweep that routed it through `_short_repr` too
+        # would break that and nothing above would notice.
+        assert issue['eval_id'] == long_eval_id
 
     def test_missing_root_verdicts_is_named(self, tmp_path: Path) -> None:
         """Trends with a blank verdict column would otherwise look healthy."""

@@ -279,14 +279,50 @@ _LIMITS_PROVENANCE_KEYS = (
 # does not enumerate the module's full issue-kind vocabulary: a brand-new
 # `_issue` call, or one for a kind its hostile tree does not already
 # trigger, is not covered by it and needs its own per-site bound and
-# test.  Two further deliberate exceptions stay uncapped: the
+# test.  One further deliberate exception stays uncapped: the
 # `seen_kinds` dedup key below (an internal `repr`, never emitted —
 # capping it would collide two distinct oversized kinds on their shared
-# prefix and silently swallow a real second issue), and `_issue`'s
-# structured `eval_id=` / `path=` kwargs (identity/locator fields the UI
-# groups and links on, where truncation would corrupt identity rather
-# than trim prose).
+# prefix and silently swallow a real second issue).
+#
+# `_issue`'s structured `eval_id=` kwarg is deliberately NOT such an
+# exception — a truncated identity would be silently WRONG rather than
+# honestly abbreviated, so this cap is the wrong tool for it.  It is
+# instead closed at the read boundary, by rejection rather than
+# truncation; see `_MAX_EVAL_ID_LENGTH` immediately below for why that is
+# lossless.
+#
+# `_issue`'s structured `path=` kwarg needs no cap at all: every `path=`
+# argument in this module is filesystem-derived — a `Path` built from the
+# artifact-tree walk, or the `str(Path)` that
+# dashboard/src/dashboard/data/escalations.py::load_queue_escalations
+# returns at its skips projection — never artifact-derived, hence bounded
+# by construction rather than by any knob here.
 _MAX_DISCARDED_VALUE_REPR = 120
+
+# `_issue`'s structured `eval_id=` kwarg is an IDENTITY field — the
+# dashboard groups and links issue rows by it — so `_short_repr` above is
+# the wrong tool for it: a truncated identity reads as a real, distinct
+# eval_id and is silently WRONG, which is worse than the size exposure it
+# would fix.  The remedy is instead rejection at the read boundary, in
+# `_read_verdicts` below.
+#
+# Rejection is lossless: the only `eval_id` that can ever link a row is an
+# eval directory's own `name` (`_build_eval` assigns `eval_id =
+# eval_dir.name`, and `consumed` is keyed on it), and a single path
+# component is bounded by POSIX `NAME_MAX` on every filesystem this runs
+# on.  An `eval_id` longer than that was therefore already unmatchable by
+# construction — indexing it could only ever carry the artifact's own
+# unbounded bytes into every poll's payload, never link a real row.
+#
+# The comparison is in CHARACTERS, not encoded bytes: UTF-8 is at least
+# one byte per character, so `len(s) > _MAX_EVAL_ID_LENGTH` implies
+# `len(s.encode()) > _MAX_EVAL_ID_LENGTH` too — conservative in the safe
+# direction — and it never allocates an encoded copy of the hostile
+# multi-megabyte string this guard exists to contain.
+#
+# Held by `tests/test_memory_evals_data.py::TestVerdictEvalIdLengthIsBounded`
+# and `tests/test_memory_evals_data.py::TestAllIssueFieldsAreBounded`.
+_MAX_EVAL_ID_LENGTH = 255
 
 
 def _load_json(path: Path) -> Any:
@@ -637,7 +673,11 @@ def _read_verdicts(
             continue
         eval_id = entry.get('eval_id')
         metric_id = entry.get('metric_id')
-        if not isinstance(eval_id, str) or not isinstance(metric_id, str) or not eval_id or not metric_id:
+        if (
+            not isinstance(eval_id, str) or not isinstance(metric_id, str)
+            or not eval_id or not metric_id
+            or len(eval_id) > _MAX_EVAL_ID_LENGTH
+        ):
             # An object, but one that can never be keyed onto a row.  Dropping
             # it silently leaves that row's verdict absent — indistinguishable
             # from "no entry was ever written for it", which is the same
@@ -664,7 +704,8 @@ def _read_verdicts(
             issues, 'unidentified_verdicts', path=path,
             detail=(
                 f'{unkeyable} verdict entr(ies) carry no usable "eval_id"/"metric_id" pair '
-                'and cannot be matched to a metric row'
+                f'(absent, empty, not a string, or an "eval_id" longer than '
+                f'{_MAX_EVAL_ID_LENGTH} characters) and cannot be matched to a metric row'
             ),
         )
 
