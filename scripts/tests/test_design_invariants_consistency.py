@@ -896,6 +896,65 @@ def near_miss_alias_pairs(
     return near_misses
 
 
+def alias_pairs_not_in_family(
+    pairs: list[AliasPair], family: list[tuple[int, str]]
+) -> list[AliasPair]:
+    """The pairings of *pairs* whose `(number, token)` is not an EXACT member of *family*.
+
+    STRICT, where `near_miss_alias_pairs` above is deliberately LENIENT.
+    MEASURED against ``docs/code-quality.md``'s five live pairings rather than
+    reasoned about: `near_miss_alias_pairs` flags a RENUMBERING but returns
+    `[]` for a slug RENAME (``one-fact-one-home`` -> ``single-home-per-fact``)
+    and for a RETIREMENT (INV-11 removed), because its limb 3 deliberately
+    clears a token confusable with nothing canonical — and a renamed or
+    retired slug is exactly that: it no longer resembles anything in the
+    family, including its own former self. This predicate adds those two
+    modes; the renumbering case it also catches is coverage it shares with
+    `near_miss_alias_pairs`, not a duplicate of it — the rule here is a
+    different, stricter one that happens to catch it too.
+
+    MUST STAY PER-SITE, NEVER REPO-WIDE. The near-miss section comment above
+    already measured why a universal exact-match check is wrong: this repo
+    carries module-local `INV-n` numbering schemes unrelated to this family
+    (task 2885's PRD-local ``INV-3 dangling-successor-edge``,
+    test_lock_table.py's ``INV-1: strictly-higher-priority``), and "a guard
+    that is wrong half the time gets silenced". A registered `PINNED_SITES`
+    entry is the one context where that objection does not apply —
+    registration is the explicit claim that the file's relationship to the
+    family is mechanized — which is why this predicate is called only from a
+    per-site live assertion, never from the repo-wide scans.
+
+    A proper PREFIX shorthand under its own number — which
+    `near_miss_alias_pairs` clears as legitimate shorthand in ordinary prose —
+    IS reported here. That asymmetry is deliberate: shorthand is acceptable
+    when discussing an invariant, but not inside a mapping pinned for
+    correctness, where the pairing itself is the content being pinned.
+
+    Loud on an empty *family*, like `near_miss_alias_pairs`: with no canonical
+    pairings to check membership against, every pairing would trivially be a
+    non-member and the verdict would be meaningless.
+    """
+    assert family, (
+        "alias_pairs_not_in_family received an empty invariant family (task "
+        "5230) — with no canonical pairings to check membership against, "
+        "every pairing would trivially be a non-member and the verdict would "
+        "be meaningless."
+    )
+
+    canonical_pairs = set(family)
+
+    # Unpacked positionally rather than read by attribute, like
+    # `near_miss_alias_pairs` above: the rule is about a `(number, token)`
+    # pairing, not about the record type, so it stays exercisable with plain
+    # tuples in the fixture tests below.
+    non_members: list[AliasPair] = []
+    for pair in pairs:
+        _, number, token, _, _ = pair
+        if (number, token) not in canonical_pairs:
+            non_members.append(pair)
+    return non_members
+
+
 # The normative doc's FILENAME, not its full path: prose cites it as
 # `docs/legibility/design-invariants.md`, as `design-invariants.md`, and inside
 # longer sentences, and all three are the same pointer.
