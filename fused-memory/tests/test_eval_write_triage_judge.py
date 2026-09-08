@@ -762,12 +762,19 @@ _PROVENANCE = {
 }
 
 
-def _run(tmp_path: Path, *, judge=None, corpus=None, distractors: int = 2):
+def _run(
+    tmp_path: Path,
+    *,
+    judge=None,
+    corpus=None,
+    distractors: int = 2,
+    provenance=None,
+):
     return _mod().run_judge_eval(
         records=corpus if corpus is not None else _corpus(),
         judge_fn=judge if judge is not None else _fake_judge(),
         report_path=tmp_path / 'report.json',
-        provenance=dict(_PROVENANCE),
+        provenance=dict(_PROVENANCE if provenance is None else provenance),
         distractors=distractors,
     )
 
@@ -827,6 +834,64 @@ class TestBuildReport:
             'record_count', 'case_count', 'candidate_count', 'distractor_count',
         ):
             assert key in provenance, key
+
+    def test_the_provenance_vocabulary_is_a_module_constant(self) -> None:
+        """One place names the fields, so two places cannot disagree.
+
+        `EVAL_CLASSES` and `EVAL_OUTCOMES` already work this way. Provenance
+        did not: `build_report` backfilled a hand-typed triple and `_run`
+        supplied a different hand-typed set, so a field added to one was
+        simply absent from reports assembled through the other.
+        """
+        keys = _mod().PROVENANCE_KEYS
+        assert isinstance(keys, tuple)
+        assert set(keys) >= {
+            'fixture_path', 'judge_provider', 'judge_model', 'limit',
+            'record_count', 'case_count',
+            'candidate_count', 'candidate_count_min',
+            'distractor_count', 'distractor_count_requested',
+            'judge_candidate_count', 'judge_enabled',
+        }
+        assert len(set(keys)) == len(keys), 'a duplicated key is a typo'
+
+    def test_provenance_carries_every_key_even_when_nothing_was_measured(
+        self,
+    ) -> None:
+        """The backfill covers the WHOLE vocabulary, not three of its members.
+
+        `build_report`'s own docstring states the rule it then breaks: "An
+        ABSENT key cannot be told apart from an artifact predating the field."
+        It `setdefault`s `record_count`, `candidate_count` and
+        `distractor_count` and omits `candidate_count_min` and
+        `distractor_count_requested` — precisely the pair that discloses a
+        NARROWED slate. A report assembled by any caller that did not supply
+        them therefore reads exactly like a full-width run.
+        """
+        report = _mod().build_report(
+            scored=_mod().score_cases([], []),
+            provenance={},
+        )
+        provenance = report['provenance']
+        assert set(provenance) == set(_mod().PROVENANCE_KEYS)
+        for key in _mod().PROVENANCE_KEYS:
+            if key == 'case_count':
+                continue
+            assert provenance[key] is None, (
+                f'{key!r} was never measured, so it must read None rather '
+                f'than be absent — absent is indistinguishable from an '
+                f'artifact predating the field'
+            )
+        assert provenance['case_count'] == 0
+
+    def test_a_supplied_provenance_value_is_never_overwritten(self) -> None:
+        """The backfill fills GAPS. A measurement always wins over the default."""
+        report = _mod().build_report(
+            scored=_mod().score_cases([], []),
+            provenance={'candidate_count_min': 1, 'judge_enabled': False},
+        )
+        provenance = report['provenance']
+        assert provenance['candidate_count_min'] == 1
+        assert provenance['judge_enabled'] is False
 
     def test_the_report_round_trips_through_json(self) -> None:
         report = self._report()
@@ -1224,6 +1289,141 @@ class TestRunJudgeEval:
         assert provenance['candidate_count_min'] == 3
         assert provenance['distractor_count'] == 2
         assert provenance['distractor_count_requested'] == 2
+
+    def test_the_effective_cap_is_recorded_beside_the_built_width(
+        self, tmp_path: Path,
+    ) -> None:
+        """`candidate_count` is the slate BUILT. The model sees it TRIMMED.
+
+        `judge_write` re-trims via
+        `select_judge_candidates(..., resolve_judge_candidate_count(...))`, so
+        a slate built 3 wide against a cap of 2 reaches the model 2 wide and
+        `candidate_count: 3` overstates what was measured. With the shipped
+        `judge_candidate_count: 5` and the default `--distractors 4` the two
+        agree, which is why this is latent rather than visible.
+
+        Recorded ALONGSIDE the measurement, never in place of it: the cap is
+        a config value and `candidate_count` stays the width that was built.
+        """
+        report = _run(tmp_path, distractors=2, provenance={
+            **_PROVENANCE, 'judge_candidate_count': 2,
+        })
+        provenance = report['provenance']
+        assert provenance['candidate_count'] == 3, 'precondition: built 3 wide'
+        assert provenance['judge_candidate_count'] == 2
+
+    def test_a_slate_wider_than_the_effective_cap_is_logged_loudly(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The same silence the short-pool warning exists to break.
+
+        A run that builds wider than the model can see is measuring a
+        different slate from the one it publishes, and nothing in the
+        artifact says so.
+        """
+        with caplog.at_level(logging.WARNING):
+            _run(tmp_path, distractors=2, provenance={
+                **_PROVENANCE, 'judge_candidate_count': 2,
+            })
+        warnings = [
+            record.getMessage() % record.args if record.args else record.getMessage()
+            for record in caplog.records if record.levelno >= logging.WARNING
+        ]
+        assert any('measured' in message for message in warnings), warnings
+        assert any('3' in message and '2' in message for message in warnings), (
+            'the warning must name the width built and the cap it exceeds'
+        )
+
+    def test_a_slate_within_the_effective_cap_does_not_warn(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """A warning that always fires is a warning nobody reads."""
+        with caplog.at_level(logging.WARNING):
+            _run(tmp_path, distractors=2, provenance={
+                **_PROVENANCE, 'judge_candidate_count': 5,
+            })
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestRunResolvesTheJudgeConfigIntoProvenance:
+    """`_run` records the two config values that decide what was measured.
+
+    `run_judge_eval` measures the width it BUILT; what the model saw is that
+    width trimmed by `judge_candidate_count`. And whether the model saw
+    anything at all is `judge_enabled`: a run against a config with the kill
+    switch off returns `stored` on `judge_write`'s FIRST line, spends nothing,
+    and still writes a committed-looking report — in which `distractor` scores
+    1.0 (its only acceptable outcome IS `stored`) and `duplicate` scores 0.0.
+    Neither fact is recoverable from the artifact today.
+
+    Driven through `_run` with `run_judge_eval` captured, so this pins the
+    resolution wiring rather than the runner it hands off to.
+    """
+
+    def _captured(self, tmp_path: Path, monkeypatch) -> dict:
+        captured: dict = {}
+
+        def fake_run_judge_eval(**kwargs):
+            captured.update(kwargs['provenance'])
+            return _mod().build_report(
+                scored=_mod().score_cases([], []),
+                provenance=dict(kwargs['provenance']),
+            )
+
+        monkeypatch.setattr(_mod(), 'run_judge_eval', fake_run_judge_eval)
+        args = types.SimpleNamespace(
+            config=None,
+            report_path=str(tmp_path / 'report.json'),
+            fixture=str(FIXTURE_PATH),
+            distractors=2,
+            limit=None,
+            dry_run=True,
+        )
+        assert _mod()._run(args) == 0
+        return captured
+
+    @staticmethod
+    def _service():
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+        return types.SimpleNamespace(config=FusedMemoryConfig())
+
+    def test_provenance_records_the_effective_candidate_cap(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        captured = self._captured(tmp_path, monkeypatch)
+        expected = write_triage_judge.resolve_judge_candidate_count(self._service())
+        assert captured['judge_candidate_count'] == expected
+        assert isinstance(captured['judge_candidate_count'], int)
+
+    def test_provenance_records_whether_the_judge_arm_was_live(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        captured = self._captured(tmp_path, monkeypatch)
+        expected = write_triage_judge.resolve_judge_enabled(self._service())
+        assert captured['judge_enabled'] is expected
+        assert isinstance(captured['judge_enabled'], bool)
+
+    def test_a_disabled_judge_is_machine_detectable_in_the_artifact(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The kill switch is the one that costs the operator a decision.
+
+        `judge_write` returns `stored` on its first line when the switch is
+        off, so every case is answered without a provider call and the report
+        still looks like a measurement.
+        """
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            write_triage_judge, 'resolve_judge_enabled', lambda service: False,
+        )
+        captured = self._captured(tmp_path, monkeypatch)
+        assert captured['judge_enabled'] is False
 
 
 # ---------------------------------------------------------------------------
