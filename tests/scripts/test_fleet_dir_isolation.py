@@ -344,7 +344,12 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
 
     # The fixture's yielded value IS the redirect, not a parallel path. This is
     # the part that is genuinely per-root: it proves THIS rootdir's conftest
-    # bound the fixture that set the variable checked above.
+    # bound a LIVE instance of the fixture -- which then either ESTABLISHED the
+    # value checked above or ADOPTED one another root's instance had already
+    # established (df_pytest_isolation.fleet_dir_redirect_target, task 4890).
+    # The two are indistinguishable from here, deliberately: what this pins is
+    # that the yielded path and the env var AGREE, which is exactly what
+    # stopped holding in a two-root session before adoption existed.
     assert Path(_df_fleet_dir_redirect).resolve() == Path(value or '').resolve()
 
 
