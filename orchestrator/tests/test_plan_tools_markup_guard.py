@@ -55,6 +55,7 @@ single owner of the literal set (INV-5), plus the two structural prefixes.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -1097,6 +1098,103 @@ class TestTheStormEscape:
             (plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, 'pending')
         ] * 2
 
+    def _file_storm(self, queue, subject_task_id: str, record=None):
+        """One burst filed through the REAL filer against the fake queue.
+
+        Direct rather than through the rig because the case under test needs
+        two DIFFERENT subjects on one anchor, which one server process (whose
+        thunk reads one plan) cannot produce — the collision is across
+        worktrees, and the project-root queue is where they meet.
+        """
+        return markup_sink.file_storm(
+            Escalation,
+            queue,
+            Path('/tmp/wt'),
+            subject_task_id,
+            record or {
+                'count': 2, 'threshold': 2, 'window_seconds': 3600.0,
+                'outcome': 'rejected', 'project': None,
+                'crossing_agent_id': None,
+                'crossing_subject_task_id': None,
+                'crossing_subject_agent_role': None,
+                'callers': [],
+            },
+            plan_tools._MARKUP_SINK_SPEC,
+        )
+
+    def test_the_open_records_subject_reads_back_through_one_spelling(self):
+        """(b1) The writer and the reader must agree, or the check never fires.
+
+        ``storm_detail`` writes the subject line and ``_recorded_subject``
+        parses it; two spellings would make the comparison silently
+        always-differ, which is the trap ``markup_tripwire._DETAIL_OUTCOME_KEY``
+        exists to avoid for its own outcome line. Asserted as a round trip so
+        renaming one end fails here rather than in production.
+        """
+        queue = _FakeQueue()
+        self._file_storm(queue, 'task-a')
+
+        assert markup_sink._recorded_subject(queue.submitted[0]) == 'task-a'
+        # And a body this module did not write reads as "no subject", never as
+        # a crash and never as a guess.
+        assert markup_sink._recorded_subject(
+            Escalation(
+                id='esc-x', task_id='t', agent_role='r', severity='blocking',
+                category=markup_sink.MARKUP_STORM_CATEGORY,
+                summary='s', detail='some other producer squatted the anchor',
+                worktree='/tmp/wt', level=1,
+            )
+        ) is None
+
+    def test_a_fold_that_buries_a_different_caller_is_logged_at_error(self, caplog):
+        """(b2) The dedup must not silently unname a second caller.
+
+        The storm anchor lives in the PROJECT-ROOT queue every worktree's
+        plan-tools subprocess files into, while the summary is headlined
+        ``[subject_task_id]``. So the first burst fixes whose task id the
+        record names, and a later burst from a different worktree folds in
+        behind it. Info-level, that fold is indistinguishable from "nothing
+        happened" — a record confidently naming task A while task B's burst
+        left no trace, which is the misattribution the ``crossing_`` prefix
+        exists to rule out one layer up.
+
+        ERROR mirrors ``markup_tripwire``'s SUPPRESSED line, and carries the
+        same ``markup_guard_storm`` token so one grep finds the buried burst
+        beside the named one.
+        """
+        queue = _FakeQueue()
+        first = self._file_storm(queue, 'task-a')
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
+            second = self._file_storm(queue, 'task-b')
+
+        assert second == first, 'the fold still reports the open record'
+        assert len(queue.submitted) == 1, 'and still files no duplicate'
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, [r.getMessage() for r in caplog.records]
+        message = errors[0].getMessage()
+        assert 'markup_guard_storm' in message, message
+        assert 'task-a' in message and 'task-b' in message, message
+        assert first in message, message
+
+    def test_a_fold_naming_the_same_caller_stays_at_info(self, caplog):
+        """(b3) The negative control: an ERROR that always fires says nothing.
+
+        Same caller, same anchor — the ordinary "a leak running for hours"
+        fold, which is exactly what the dedup is FOR and must stay quiet.
+        """
+        queue = _FakeQueue()
+        self._file_storm(queue, 'task-a')
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
+            self._file_storm(queue, 'task-a')
+
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        assert any(
+            'not filing a duplicate' in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
     @pytest.mark.asyncio
     async def test_residue_records_never_dedup(
         self, monkeypatch, artifacts: TaskArtifacts
@@ -1249,13 +1347,20 @@ class TestTheStormEscape:
     def test_the_new_detail_lines_escape_a_caller_supplied_newline(self):
         """(i) ``!r``, pinned rather than left to convention.
 
-        The crossing axes are strings the leaking CALLER supplied, and
-        ``markup_tripwire._recorded_outcome`` parses a storm ``detail`` back for
-        its first ``outcome=`` line. An unescaped newline would inject a
-        spoofed one and silently disable the outcome-mismatch warning that is
-        an operator's only sign a burst folded into a record naming a different
-        outcome. Asserted on the real builder, because a future edit dropping
-        ``!r`` is invisible at every other layer.
+        The crossing axes are strings the leaking CALLER supplied, and this
+        body is line-oriented: a run of ``key=`` lines an operator reads
+        top-down and ``markup_sink._recorded_subject`` parses back off an
+        already-open record to catch a differently-attributed fold. An
+        unescaped newline would let the caller forge any of those lines.
+
+        NOT ``markup_tripwire._recorded_outcome`` — that parser only reads
+        records it fetched from its own ``markup-tripwire`` / ``markup-guard``
+        anchors, and these are filed under ``plan-tools-markup-storm``. The
+        forged-``outcome=`` assertion below is kept anyway because it is the
+        sharpest available probe of the escaping itself: this filer renders the
+        caller-supplied lines ABOVE its own ``outcome=`` line, so a dropped
+        ``!r`` shows up here first. Asserted on the real builder, because such
+        an edit is invisible at every other layer.
         """
         spoof = 'evil\noutcome=' + repr('repaired')
         detail = markup_sink.storm_detail(

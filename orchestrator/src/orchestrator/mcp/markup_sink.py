@@ -26,6 +26,7 @@ log-and-return-None on any failure.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 import subprocess
@@ -60,6 +61,19 @@ MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 #: caller's data.
 MARKUP_STORM_CATEGORY = 'mcp_markup_boundary_storm'
 MARKUP_STORM_LEVEL = 1
+
+#: The storm detail's SUBJECT line, spelled ONCE: :func:`storm_detail` writes it
+#: and :func:`_recorded_subject` reads it back off an already-open record to
+#: tell an operator when a burst folded into a record naming a DIFFERENT
+#: caller. Two spellings would make that comparison silently always-differ —
+#: the same trap ``markup_tripwire._DETAIL_OUTCOME_KEY`` exists to avoid for its
+#: own outcome line.
+#:
+#: It is also the FIRST line of the body, which is defence in depth: no
+#: caller-supplied value can be rendered ahead of it, so a forged
+#: ``subject_task_id=`` line could never be the one this parser reads even if
+#: the ``!r`` escaping below were ever dropped.
+DETAIL_SUBJECT_KEY = 'subject_task_id='
 
 #: Only ever used for a record the middleware grew LATER and this sink does not
 #: recognise. Filing it under a visible fallback is the point: silently
@@ -291,7 +305,7 @@ def residue_detail(
     one sink whose whole argument is against silent drops.
     """
     return '\n'.join([
-        f'subject_task_id={subject_task_id!r}',
+        f'{DETAIL_SUBJECT_KEY}{subject_task_id!r}',
         f'owner={record.get("owner")!r}',
         f'tool={record.get("tool")!r}',
         f'field={record.get("field")!r}',
@@ -335,11 +349,23 @@ def storm_detail(
     tells a reader the guard resolved nothing rather than that this sink
     dropped a field.
 
-    Every line is ``!r``, and on the ``crossing_*`` lines that is load-bearing
-    rather than stylistic: those are strings the leaking CALLER supplied, and
-    ``markup_tripwire._recorded_outcome`` parses a storm ``detail`` back for
-    its first ``outcome=`` line. An unescaped newline would inject a spoofed
-    one and silently disable the outcome-mismatch warning.
+    Every line is ``!r``, and on the ``crossing_*`` and ``callers`` lines that
+    is load-bearing rather than stylistic: those are strings the leaking CALLER
+    supplied, and this body is LINE-ORIENTED — a run of ``key=`` lines an
+    operator reads top-down and :func:`_recorded_subject` parses back off an
+    already-open record to catch a differently-attributed fold. An unescaped
+    newline in a caller-supplied value would let that caller forge any of those
+    lines. ``!r`` escapes newlines, and every line here uses it.
+
+    ``markup_tripwire._recorded_outcome`` does NOT read this body, and the
+    rationale above deliberately does not lean on it: that parser only ever
+    reads records it fetched from its OWN ``markup-tripwire`` / ``markup-guard``
+    anchors, while these are filed under ``spec.storm_anchor_task_id``
+    (``plan-tools-markup-storm``, ``verdict-tools-markup-storm``). The escaping
+    requirement here is this body's own. Should a cross-filer parse-back ever be
+    wanted, the ``outcome=`` line would first have to move ABOVE the
+    caller-supplied lines to satisfy the ordering ``markup_tripwire`` declares
+    mandatory; today it sits below them, and only ``!r`` makes that safe.
 
     The record's own attribution LEADS; the per-boundary corroboration route
     follows it and is the SPEC's (:attr:`MarkupSinkSpec.attribution_source`),
@@ -348,7 +374,7 @@ def storm_detail(
     "no evidence" rather than "I looked in the wrong place".
     """
     return '\n'.join([
-        f'subject_task_id={subject_task_id!r}',
+        f'{DETAIL_SUBJECT_KEY}{subject_task_id!r}',
         f'crossing_agent_id={record.get("crossing_agent_id")!r}',
         f'crossing_subject_task_id={record.get("crossing_subject_task_id")!r}',
         f'crossing_subject_agent_role={record.get("crossing_subject_agent_role")!r}',
@@ -371,6 +397,14 @@ def storm_detail(
         'window. Start there, then report it against '
         'plans/toolcall-markup-containment-prd.md.',
         '',
+        # BOUNDARY-SCOPED, not universal, and no longer this filer's to
+        # phrase. The route to a per-event answer differs per registration
+        # site — plan-tools journals every fact to a file, verdict-tools has
+        # no durable journal yet — so each site declares its own sentence in
+        # ``MarkupSinkSpec.attribution_source`` (task 4744, which also landed
+        # the plan-tools journal). This filer is shared, so a sentence baked
+        # in here would be silently inherited as a falsehood in a level-1
+        # operator record by the next site registered.
         'For per-event corroboration — one line per call rather than the '
         "window's fold — " + spec.attribution_source + '.',
     ])
@@ -435,6 +469,39 @@ def file_residue(
     return queue.submit(esc)
 
 
+def _recorded_subject(escalation: Any) -> str | None:
+    """The subject an ALREADY-OPEN burst alarm was filed with, or ``None``.
+
+    Read back off that record's own :data:`DETAIL_SUBJECT_KEY` line — the very
+    line :func:`storm_detail` writes — because the anchor dedup is
+    subject-AGNOSTIC. The anchor lives in the PROJECT-ROOT queue that every
+    worktree's server files into, so the burst that OPENS the record fixes
+    whose task id headlines it, and a later burst from a different worktree
+    folds in behind that headline. Without this read the queue would confidently
+    name one caller while another's burst left no trace at all — the exact
+    misattribution the ``crossing_`` prefix exists to avoid, one layer up.
+
+    ``None`` for a record naming no subject, which covers both a body this
+    module did not write (another producer squatting the shared anchor) and one
+    written before this line existed. NEVER raises: it feeds a log line on a
+    path whose only job is to return an id. Shape copied from
+    ``markup_tripwire._recorded_outcome``, the in-repo precedent for exactly
+    this read.
+    """
+    detail = getattr(escalation, 'detail', None)
+    if not isinstance(detail, str):
+        return None
+    for line in detail.splitlines():
+        if not line.startswith(DETAIL_SUBJECT_KEY):
+            continue
+        try:
+            value = ast.literal_eval(line[len(DETAIL_SUBJECT_KEY):])
+        except (ValueError, SyntaxError):
+            return None
+        return value if isinstance(value, str) else None
+    return None
+
+
 def file_storm(
     escalation_cls: Any,
     queue: Any,
@@ -448,6 +515,15 @@ def file_storm(
     The anchor dedup matters beyond the counter's own per-window rate limit: a
     leak running for hours would otherwise file one escalation per window, so
     those collapse into the single open record until an operator resolves it.
+
+    That fold is subject-BLIND, and the anchor sits in the project-root queue
+    every worktree's server files into — so a fold can quietly bury a burst
+    from a DIFFERENT caller behind the first one's headline. It is not silent:
+    :func:`_recorded_subject` reads the open record's own subject line back and
+    a mismatch is logged at ERROR, the same posture ``markup_tripwire`` takes
+    for a fold that names a different outcome. Not filing a second record is
+    still the right trade — the alarm is about the LEAK, which is one leak —
+    but "we chose not to file this" must not read as "nothing happened".
 
     A queue READ failure falls THROUGH to filing rather than bailing out —
     losing duplicate suppression is strictly better than losing the alarm for
@@ -474,10 +550,33 @@ def file_storm(
         if getattr(esc, 'category', None) == MARKUP_STORM_CATEGORY
     ]
     if open_alarms:
-        logger.info(
-            'markup guard: %s is already open for this burst (%r now); not '
-            'filing a duplicate', open_alarms[0].id, record,
-        )
+        open_subject = _recorded_subject(open_alarms[0])
+        if open_subject == subject_task_id:
+            logger.info(
+                'markup guard: %s is already open for this burst (%r now); not '
+                'filing a duplicate', open_alarms[0].id, record,
+            )
+        else:
+            # ERROR, not info, and mirroring ``markup_tripwire``'s SUPPRESSED
+            # line: the queue is about to say nothing at all about THIS
+            # caller. The summary is headlined with the subject, so a silent
+            # fold leaves a record confidently naming task A while task B's
+            # burst is invisible — the failure the attribution work exists to
+            # end, reintroduced by the dedup.
+            #
+            # This line inherits the same reachability limit the record's own
+            # prose states about the guard's other lines (task 4744 owns that
+            # channel), so it is a floor and not the fix: the FIX an operator
+            # has is in the message — resolving the open record lets the next
+            # burst file under its own subject.
+            logger.error(
+                'markup guard: markup_guard_storm SUPPRESSED — %s is already '
+                'open naming subject_task_id=%r, so this burst from '
+                'subject_task_id=%r gets no record of its own and its caller is '
+                'invisible in the queue; resolve that escalation to let the '
+                'next burst file. record=%r',
+                open_alarms[0].id, open_subject, subject_task_id, record,
+            )
         return open_alarms[0].id
 
     esc = escalation_cls(
