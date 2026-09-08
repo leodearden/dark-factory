@@ -3073,7 +3073,7 @@ def _make_fake_main_run_census(outcome=None):
         calls.append(kwargs)
         return outcome or mod.CensusOutcome(
             status="done", report_path="plans/confusion-census-2026-01-02.md",
-            filed_ticket_ids=["1234"], stop_reason="exhausted",
+            filed_ticket_ids=["tkt_1234"], stop_reason="exhausted",
         )
 
     fake_run_census.calls = calls
@@ -3345,6 +3345,35 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
     assert "nothing filed" in out.lower()
     # a bare filed_tasks=0 would read as "a normal run that filed nothing"
     assert "filed_tasks=0" not in out
+
+
+def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeypatch, capsys):
+    # The operator reads this line to learn what the run produced. It counts
+    # TICKETS -- submit_task's curator path returns a ticket id and the
+    # create/combine/drop decision lands later, so "filed_tasks=N" would
+    # overclaim N tasks that may not exist (task 4965).
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census(
+        outcome=mod.CensusOutcome(
+            status="done",
+            report_path="plans/confusion-census-2026-07-30.md",
+            filed_ticket_ids=["tkt_1", "tkt_2", "tkt_3"],
+            stop_reason="exhausted",
+        )
+    )
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "filed_tickets=3" in out
+    assert "filed_tasks=" not in out, (
+        "the count is of tickets, not tasks -- the old label overclaimed"
+    )
+    assert "stop_reason=exhausted" in out
+    assert "plans/confusion-census-2026-07-30.md" in out
 
 
 def test_main_missing_config_returns_nonzero(tmp_path, monkeypatch):
