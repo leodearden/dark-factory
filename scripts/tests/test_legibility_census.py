@@ -771,6 +771,54 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
 
 
 # ---------------------------------------------------------------------------
+# task 4965 step-1: RED — _ticket_id_from_submit_result(), the single source
+# of truth for what the REAL submit_task seam returns. Every shape below is
+# one the live tool actually produces; the helper is the only place census.py
+# is allowed to know that.
+# ---------------------------------------------------------------------------
+
+def test_ticket_id_from_submit_result_reads_the_curator_ticket_key():
+    # Source of truth: fused_memory/server/tools.py::submit_task docstring
+    # ("returns {'ticket': 'tkt_<id>'}") and
+    # fused_memory/middleware/task_interceptor.py::TaskInterceptor, which
+    # ends the curator path with `return {'ticket': ticket_id}`. There is NO
+    # "id" key on this path -- reading one is the defect task 4965 fixes.
+    assert mod._ticket_id_from_submit_result({"ticket": "tkt_42"}) == "tkt_42"
+
+
+def test_ticket_id_from_submit_result_rejects_the_error_shape():
+    # Source of truth: task_interceptor.py::TaskInterceptor answers a failed
+    # or rejected submit_task with
+    # `return {'error': str(exc), 'error_type': type(exc).__name__}` -- a dict
+    # with no ticket key. Nothing was filed, so nothing may be counted.
+    assert mod._ticket_id_from_submit_result(
+        {"error": "boom", "error_type": "ValueError"}
+    ) is None
+
+
+def test_ticket_id_from_submit_result_rejects_non_dict_results():
+    # A transport fault (or a seam that answers nothing at all) can yield a
+    # non-dict; a bare string is NOT a usable result even when it looks like
+    # a ticket id, because no contract says the seam ever returns one.
+    assert mod._ticket_id_from_submit_result(None) is None
+    assert mod._ticket_id_from_submit_result("tkt_1") is None
+    assert mod._ticket_id_from_submit_result(["tkt_1"]) is None
+
+
+def test_ticket_id_from_submit_result_rejects_empty_dict():
+    assert mod._ticket_id_from_submit_result({}) is None
+
+
+def test_ticket_id_from_submit_result_rejects_non_string_ticket_values():
+    # An unusable value must never reach the report as a "- None" (or
+    # "- {'id': 1}") bullet -- the caller excludes on None, so the helper
+    # must answer None rather than pass a non-string through.
+    assert mod._ticket_id_from_submit_result({"ticket": None}) is None
+    assert mod._ticket_id_from_submit_result({"ticket": {"id": 1}}) is None
+    assert mod._ticket_id_from_submit_result({"ticket": 42}) is None
+
+
+# ---------------------------------------------------------------------------
 # amend: _novel_clusters() dedup-by-title + titleless-candidate skip.
 # codebook.apply_coding_record groups new candidates BY TITLE (codebook.py:
 # 494), so verification must operate on the same set of resolvable titles --
