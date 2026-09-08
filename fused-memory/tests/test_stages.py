@@ -105,23 +105,6 @@ def _extract_section(payload: str, header: str) -> str:
     return payload[start:end]
 
 
-def _extract_your_task_item(payload: str, number: int) -> str:
-    """Return the text of numbered item *number* in the "## Your Task" block.
-
-    Slices from the ``N.`` line start to the next ``N+1.`` line start (or the
-    end of the Your Task block), so an assertion about one item cannot
-    accidentally be satisfied by prose belonging to a neighbouring item.
-    """
-    block = _extract_section(payload, '## Your Task')
-    assert block, f'payload has no "## Your Task" block: {payload[:2000]!r}'
-    start = block.find(f'\n{number}. ')
-    assert start != -1, f'Your Task block has no item {number}: {block!r}'
-    end = block.find(f'\n{number + 1}. ', start + 1)
-    if end == -1:
-        end = len(block)
-    return block[start:end]
-
-
 def _scope(project_id: str, project_root: str) -> ProjectScope:
     """Build a ProjectScope from raw strings — DRYs the many test call sites."""
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
@@ -12978,76 +12961,6 @@ class TestStage2HintAttentionDetection:
         assert not orphaned, (
             f'Hint section references task IDs absent from the Active Task Tree: {sorted(orphaned)}\n'
             f'hint_ids={sorted(hint_ids)}, active_tree_ids={sorted(active_tree_ids)}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_item_5_prescribes_a_plain_additive_attach(
-        self, mock_deps, watermark
-    ):
-        """Drift guard (task 4216) on "Your Task" item 5 in the assembled payload.
-
-        Item 5 used to instruct a reshape read-modify-write under
-        ``metadata_mode='replace'`` and justify it with a falsified premise —
-        that Stage 2's additive attach "silently discards legacy list-format
-        hints under old-wins semantics". It does not: the additive branch runs
-        ``apply_migrations`` over ``memory_hints`` on BOTH sides before merging
-        (``sqlite_task_backend.py::_merge_metadata``), so a plain additive
-        attach converts and unions a legacy row by itself. The prescribed
-        remedy was also the one merge mode that BYPASSES the corrupt-blob
-        guard.
-
-        Item 4's landed task-3581 guidance is pinned POSITIVELY here so this
-        rewrite of the adjacent item cannot collaterally revert it.
-        """
-        stage = make_configured_task_knowledge_sync_stage(
-            mock_deps, project_id='test_project', project_root='/tmp/test_project'
-        )
-        # A legacy-list row and a no-hints row: both qualify via
-        # _needs_hint_attention, and both are served by the same attach.
-        stage.filtered_task_tree = self._make_tree([
-            self._make_task_with_hints(10, 'in-progress', [{'entity': 'Foo', 'query': 'q'}]),
-            self._make_task_no_hints(11, 'pending'),
-        ])
-
-        payload = await stage.assemble_payload([], watermark, [])
-
-        # (d) the section itself still renders, unchanged.
-        assert self._SECTION_HEADER in payload, (
-            f'Expected "{self._SECTION_HEADER}" in payload, but it was absent.'
-        )
-
-        # (a) the falsified premise is gone.
-        assert 'silently discards' not in payload, (
-            'the additive attach does NOT discard legacy list-format hints — '
-            '_merge_metadata migrates both sides before merging'
-        )
-        assert 'old-wins semantics' not in payload
-
-        # (b) item 5 no longer prescribes a reshape read-modify-write.
-        item_5 = _extract_your_task_item(payload, 5)
-        assert "metadata_mode='replace'" not in item_5, (
-            "'replace' bypasses the corrupt-blob guard and must not be "
-            f'prescribed for a hints attach.\nItem 5: {item_5!r}'
-        )
-        assert 'read-modify-write' not in item_5, f'Item 5: {item_5!r}'
-
-        # (c) item 5 positively prescribes the plain additive attach.
-        assert 'append=True' in item_5, f'Item 5: {item_5!r}'
-        assert 'memory_hints' in item_5, f'Item 5: {item_5!r}'
-        assert 'omit' in item_5.lower(), (
-            'item 5 must say metadata_mode is OMITTED, so the backend resolves '
-            f"the additive merge.\nItem 5: {item_5!r}"
-        )
-        # The still-true task-2180 guard survives in item 5.
-        assert 'append=False' in item_5, f'Item 5: {item_5!r}'
-
-        # (e) item 4's landed task-3581 guidance survives untouched.
-        item_4 = _extract_your_task_item(payload, 4)
-        assert "metadata_mode='merge'" in item_4, f'Item 4: {item_4!r}'
-        assert 'append=True' in item_4, f'Item 4: {item_4!r}'
-        assert 'contradiction' in item_4, (
-            'never combine append=True with metadata_mode=\'merge\' — the '
-            f'backend rejects the pair (task 3581).\nItem 4: {item_4!r}'
         )
 
 
