@@ -3183,6 +3183,9 @@ class TestTheStormNamesItsCrossingCaller:
         """
         bounded = _bounded_axis('y' * (_ATTRIBUTION_AXIS_MAXLEN + 500))
 
+        # A str in, a str out — never widened to None on the truncating path,
+        # which would turn a too-long id into "nobody declared one".
+        assert isinstance(bounded, str)
         assert bounded.startswith('y' * _ATTRIBUTION_AXIS_MAXLEN)
         assert bounded.endswith('...')
         assert len(bounded) == _ATTRIBUTION_AXIS_MAXLEN + 3
