@@ -1156,18 +1156,18 @@ ROW5_WAITER_COMPLETION_CEILING_SECS: float = 60.0
 ROW5_HOLDER_TEARDOWN_CEILING_SECS: float = 5.0
 
 #: Worst-case FIXED (non-load-scaled) work in Row 5: the marker wait, the
-#: waiter subprocess's completion ceiling, and the finally block's holder
-#: teardown.  The marker term is counted TWICE because
-#: :func:`wait_for_marker_stable` spends its timeout on the existence gate and
-#: then a FRESH deadline on the settle loop -- worst case 40s, not 20s, a term
-#: the literal mark this replaced hid entirely.  (Deliberately excludes
-#: _setup_verify_repo's real git work and the in-process consumer half -- both
-#: small next to the headroom below, exactly as for Rows 1-4.)
+#: waiter subprocess's completion ceiling, and the finally block's TWO
+#: holder teardowns (waiter then holder).  The marker term is counted TWICE
+#: because :func:`wait_for_marker_stable` spends its timeout on the existence
+#: gate and then a FRESH deadline on the settle loop -- worst case 40s, not
+#: 20s, a term the literal mark this replaced hid entirely.  (Deliberately
+#: excludes _setup_verify_repo's real git work and the in-process consumer
+#: half -- both small next to the headroom below, exactly as for Rows 1-4.)
 _ROW5_WORST_CASE_FIXED_SECS: float = (
     2 * ROW_MARKER_CEILING_SECS
     + ROW5_WAITER_COMPLETION_CEILING_SECS
-    + ROW5_HOLDER_TEARDOWN_CEILING_SECS
-)  # 105.0
+    + 2 * ROW5_HOLDER_TEARDOWN_CEILING_SECS
+)  # 110.0
 
 #: Row 5's per-test opt-out from the inherited `timeout = 60`, in the same
 #: shape as ROW_PER_TEST_TIMEOUT_SECS above: 2x the FIXED terms (they do not
@@ -1178,7 +1178,7 @@ _ROW5_WORST_CASE_FIXED_SECS: float = (
 #: them as well would double-count the same elasticity.
 ROW5_PER_TEST_TIMEOUT_SECS: int = int(
     2 * _ROW5_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
-)  # 450
+)  # 460
 # ---------------------------------------------------------------------------
 
 
@@ -1575,7 +1575,8 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
     ``wait_subtree_gone`` kill confirmation -- so it cannot share their
     constant.  Its bounded terms are: two discovery waits (both on the
     load-scaled ceiling), the marker wait, the waiter subprocess's completion
-    ceiling, and the ``finally`` block's holder teardown.
+    ceiling, and the ``finally`` block's TWO holder teardowns (waiter then
+    holder).
 
     The marker term is counted TWICE on purpose:
     :func:`wait_for_marker_stable` spends its ``timeout`` on the
@@ -1591,13 +1592,13 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
         2 * ROW_DISCOVERY_CEILING_MAX_SECS
         + 2 * ROW_MARKER_CEILING_SECS
         + ROW5_WAITER_COMPLETION_CEILING_SECS
-        + ROW5_HOLDER_TEARDOWN_CEILING_SECS
+        + 2 * ROW5_HOLDER_TEARDOWN_CEILING_SECS
     )
     assert required <= ROW5_PER_TEST_TIMEOUT_SECS, (
         f'ROW5_PER_TEST_TIMEOUT_SECS ({ROW5_PER_TEST_TIMEOUT_SECS}) does not cover '
         f"Row 5's bounded worst case ({required}) -- both discovery waits at the "
         f'MAX ceiling, the marker existence gate AND its settle loop, the waiter '
-        f"subprocess's completion ceiling, and the holder teardown"
+        f"subprocess's completion ceiling, and both holder teardowns"
     )
 
     applied = [
@@ -4397,6 +4398,10 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     # ~9s). Pair it with a live heartbeat, mirroring Row 3, so it survives
     # for the whole span the test needs it.
     heartbeat_holder = HeartbeatWriter(holder, interval=0.2).start()
+    # task 4946: bound before the try so the finally below can tear it down
+    # even if wait_for_pgid_file/wait_subtree_live/wait_for_marker_stable
+    # raises before the waiter is ever spawned.
+    waiter = None
     try:
         holder_pgid_val = wait_for_pgid_file(pgf_holder)
         wait_subtree_live(holder_pgid_val, proc=holder)
@@ -4462,6 +4467,14 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         )
     finally:
         heartbeat_holder.stop_heartbeats()
+        # task 4946: a TimeoutExpired from waiter.communicate() above, or
+        # any of the six assertions before this finally failing, previously
+        # left the waiter leader -- and its session-escaped descendants --
+        # alive.  Tear the waiter down BEFORE the holder: it is the process
+        # contending for the lock the holder owns.  Free on the success
+        # path via kill_holder_tree's already-reaped short circuit.
+        if waiter is not None:
+            kill_holder_tree(waiter, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta
