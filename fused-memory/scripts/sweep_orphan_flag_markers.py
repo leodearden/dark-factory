@@ -1285,15 +1285,34 @@ async def run(
     drained_ids = set(orphan_ids)
     undated_kept = find_undated_markers(members)
     undrainable = find_undrainable_markers(members, drained_ids)
-    if undated_kept:
+    # Keyed on the undated members this run does NOT delete, not on the raw
+    # undated count: find_orphan_markers/find_taskless_markers/
+    # find_terminal_task_markers never consult created_at, so an undated
+    # member any of them catches IS drained here and floors nothing. Keying
+    # on the raw count told operators to raise --max-backlog against a
+    # population that drains to 0 perfectly well (task 4436).
+    #
+    # Scoped to the UNDATED arm specifically, NOT to the whole `undrainable`
+    # list: that list also carries protected mirrors, for which
+    # "missing/unparseable created_at" is simply false. The protected arm
+    # keeps its own WARNING above, which already states its floor correctly.
+    # Each line therefore has one well-defined subject and one remedy.
+    #
+    # A member the sweep is about to delete is not a finding, so the drained
+    # case gets no second WARNING of its own.
+    undated_undrained = [m for m in undated_kept if m['id'] not in drained_ids]
+    if undated_undrained:
         logger.warning(
             'sweep_orphan_flag_markers: %d of %d enumerated markers have a '
-            'missing/unparseable created_at and are permanently kept by '
-            'find_stale_markers regardless of --max-age-days (even 0) — '
-            'this sets a floor on the residual backlog that age-draining '
-            'alone cannot reach below for --check/--max-backlog. Use '
-            '--delete-ids or --terminal-drain to remove them if warranted.',
-            len(undated_kept), len(members),
+            'missing/unparseable created_at AND are uncovered by this run\'s '
+            'delete set — find_stale_markers keeps them at every '
+            '--max-age-days (including 0), so they are a permanent floor on '
+            'after.total_source that age-draining alone can never reach '
+            'below. Remedies: name them in --delete-ids, add --terminal-drain '
+            'if they cite terminal tasks, or set --max-backlog to at least '
+            'the reported structural_floor.undrainable_count. See '
+            'docs/flag-marker-sweep-recurring.md.',
+            len(undated_undrained), len(members),
         )
 
     # The found-intersection of args.delete_ids with the enumerated members
