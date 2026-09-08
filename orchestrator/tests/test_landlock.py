@@ -36,6 +36,7 @@ def _reset_landlock_probe():
 
 
 _VAR_TMP_SKIP_REASON = '/var/tmp not writable in this sandbox'
+_LANDLOCK_SKIP_REASON = 'landlock not supported on this kernel'
 
 
 @functools.cache
@@ -79,6 +80,43 @@ def _skip_var_tmp() -> bool:
     if os.environ.get('DF_REQUIRE_SANDBOX_TESTS') == '1':
         pytest.fail(
             f'DF_REQUIRE_SANDBOX_TESTS=1 but {_VAR_TMP_SKIP_REASON}: refusing to '
+            'silently skip the real-kernel sandbox enforcement tests.',
+            pytrace=False,
+        )
+    return True
+
+
+def _skip_landlock() -> bool:
+    """Whether landlock-dependent tests should be skipped in this environment.
+
+    The mirror of ``_skip_var_tmp`` above, for the OTHER arm of the two-part
+    guard every real-kernel row carries: those classes are gated on BOTH a
+    writable /var/tmp AND a landlock-capable kernel, so arming only the
+    /var/tmp arm would still let all 30 enforcement rows vanish silently the
+    moment the availability probe went False — the same green-suite /
+    empty-surface failure ``DF_REQUIRE_SANDBOX_TESTS`` exists to prevent,
+    merely relocated to the other guard (task 4635 amendment). And that arm is
+    the MORE likely of the two on a stable host: ``is_landlock_available()`` is
+    first-party code — a syscall probe exercised by this very module — so a
+    regression IN THE PROBE takes the surface down just as effectively as a
+    kernel that dropped Landlock.
+
+    Under ``DF_REQUIRE_SANDBOX_TESTS=1`` — armed via ``verify_env`` in the
+    top-level ``dark-factory-orchestrator.yaml``, on hosts known to have a
+    writable /var/tmp and a landlock-capable kernel (this one measured ABI 8) —
+    an unavailable landlock is therefore an environment-or-probe regression,
+    not a reason to skip. Fail loudly there.
+
+    Deliberately NOT applied to ``TestLandlockRefer``'s ``ABI < 2`` arm: an
+    ABI-1 kernel HAS landlock and the wrapper correctly omits REFER there, so
+    that skip is a genuine capability difference rather than a missing
+    enforcement surface, and it stays quiet even when armed.
+    """
+    if is_landlock_available():
+        return False
+    if os.environ.get('DF_REQUIRE_SANDBOX_TESTS') == '1':
+        pytest.fail(
+            f'DF_REQUIRE_SANDBOX_TESTS=1 but {_LANDLOCK_SKIP_REASON}: refusing to '
             'silently skip the real-kernel sandbox enforcement tests.',
             pytrace=False,
         )
@@ -156,10 +194,7 @@ class TestBuildLandlockCommand:
 # Test 3: integration — wrapper actually enforces the sandbox
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(
-    not is_landlock_available(),
-    reason='landlock not supported on this kernel',
-)
+@pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
 @pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
 class TestLandlockEnforcement:
     def test_allowed_and_denied_writes(self):
@@ -206,6 +241,12 @@ class TestLandlockEnforcement:
 # Test 3b: REFER (cross-directory rename) — fleet-outage regression guard
 # ---------------------------------------------------------------------------
 
+# Two separate marks, not one combined condition: landlock being ENTIRELY
+# absent is an environment regression (loud under DF_REQUIRE_SANDBOX_TESTS=1,
+# via _skip_landlock), whereas ABI 1 is not — that kernel has landlock and the
+# wrapper correctly omits REFER — so each arm keeps its own reason and its own
+# armed/quiet disposition.
+@pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
 @pytest.mark.skipif(
     landlock_mod._syscall_probe_abi() < 2,
     reason='landlock ABI < 2 has no REFER; the wrapper correctly omits it there',
@@ -359,10 +400,7 @@ class TestSandboxConfigBackendField:
 # redirected in-worktree transcript writes (PRD enforcement matrix rows 9/10)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(
-    not is_landlock_available(),
-    reason='landlock not supported on this kernel',
-)
+@pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
 @pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
 class TestLandlockClaudeHomeNarrowing:
     def test_denies_settings_but_allows_fleet_and_transcript(self):

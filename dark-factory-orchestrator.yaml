@@ -1036,6 +1036,27 @@ verify_env:
 # disappearance into a loud, named failure there, per the tests' own
 # docstrings.
 #
+# BOTH ARMS OF THE GUARD ARE ARMED, not just /var/tmp. Every real-kernel row
+# is gated on TWO skips — a writable /var/tmp AND a landlock-capable kernel —
+# so arming only the first would still let all 30 rows vanish silently the
+# moment `is_landlock_available()` went False, which on a stable host is the
+# MORE likely of the two: that probe is first-party code exercised by the very
+# suite it guards, so a regression IN THE PROBE drops the surface as
+# effectively as a kernel change would. Both test files therefore route their
+# availability guard through a `_skip_landlock()` helper that fails loudly
+# under this variable, mirroring `_skip_var_tmp()`. Measured on this host
+# before arming that second arm: landlock ABI 8. Deliberately NOT armed:
+# TestLandlockRefer's `ABI < 2` arm — an ABI-1 kernel HAS landlock and the
+# wrapper correctly omits REFER there, so that skip is a genuine capability
+# difference, not a missing enforcement surface.
+#
+# PINNED EXECUTABLY by orchestrator/tests/test_verify_env_sandbox_arming.py:
+# it loads THIS file through the real config model and asserts the resolved
+# verify_env still carries DF_REQUIRE_SANDBOX_TESTS == "1" for every verify
+# role, and that no module-level verify_env shadows it away. Deleting or
+# retyping the key below turns that test red rather than silently returning
+# the guards to dead code.
+#
 # SCOPE DECISION (explicit, not left implicit): fused-memory/tests/
 # reconciliation/test_recon_sandbox_guard.py carries a verbatim-duplicated
 # copy of the same _var_tmp_writable/_skip_var_tmp guard and reads this
