@@ -1705,6 +1705,83 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
 
 
 # ---------------------------------------------------------------------------
+# docs/code-quality.md — pinned as a PARTIAL mapping, pair-wise against the
+# normative doc
+#
+# The "Relationship to the design invariants" section maps a subset of the
+# family to Leo's fourteen numbered quality heuristics — four of eleven
+# invariants today, only those that already encode a heuristic in checkable
+# form — and that mapping is the section's entire content. Ratified by Leo on
+# 2026-09-03 (commit 7938676c28); this guard pins the mapping pair-wise
+# without editing a byte of the doc (task 5230).
+#
+# STRICT membership (`alias_pairs_not_in_family`), not the repo-wide near-miss
+# rule: MEASURED against this doc's five live pairings, `near_miss_alias_pairs`
+# flags a renumbering but misses a slug RENAME and a RETIREMENT — see
+# `alias_pairs_not_in_family`'s docstring for the full comparison — and both
+# leave a citation resolving to nothing, which a mapping pinned for
+# correctness cannot tolerate.
+#
+# Deliberately NO completeness limb. The section is a MAPPING claim naming
+# only the invariants that encode a quality heuristic, so it is partial by
+# construction and an exhaustiveness assertion would be wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_code_quality_doc_pairs_every_invariant_with_its_canonical_slug() -> None:
+    """LIVE: every `INV-N`/slug pairing in docs/code-quality.md is exact.
+
+    TWO assertions, deliberately no more.
+
+    NON-VACUITY FIRST. MEASURED: this doc's header carries a citation
+    (`INV-9 one-fact-one-home`) OUTSIDE the "Relationship to the design
+    invariants" mapping section, so deleting the whole mapping would still
+    leave `invariant_alias_pairs` returning one clean pairing without raising
+    its loud empty-parse error — the strict check below would then pass over
+    one clean pairing while the doc mapped nothing. This limb requires the
+    pairings to still name at least `_ENUMERATION_THRESHOLD` distinct
+    canonical slugs — exactly the condition that made this site registrable in
+    PINNED_SITES in the first place, so its failure means "de-register the
+    site", not "weaken this assertion".
+
+    THEN STRICT MEMBERSHIP. `alias_pairs_not_in_family` against
+    `canonical_family()` — no near-miss carve-outs — because a mapping pinned
+    for correctness must not let a renamed or retired slug read as clean.
+
+    NO COMPLETENESS LIMB. The section names only the invariants that already
+    encode a quality heuristic (4 of 11 today); it is a partial mapping by
+    construction, not an enumeration of the family, so asserting it covers
+    every invariant would be wrong.
+    """
+    text = CODE_QUALITY_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(CODE_QUALITY_DOC)
+
+    pairs = invariant_alias_pairs(text, source=source)
+
+    distinct_slugs = {token for _, _, token, _, _ in pairs}
+    assert len(distinct_slugs) >= _ENUMERATION_THRESHOLD, (
+        f"{source} names only {len(distinct_slugs)} distinct canonical "
+        f"slug(s) {sorted(distinct_slugs)} across its `INV-N`/slug pairings — "
+        f"under the {_ENUMERATION_THRESHOLD}-slug enumeration threshold that "
+        f"made this site registrable in PINNED_SITES in the first place (task "
+        f"5230). If the mapping section was trimmed or removed on purpose, "
+        f"de-register {source} from PINNED_SITES instead of weakening this "
+        f"assertion."
+    )
+
+    drifted = alias_pairs_not_in_family(pairs, canonical_family())
+    assert not drifted, (
+        f"{source} pairs (line, number, token) "
+        f"{[(p.line, p.number, p.token) for p in drifted]} with a number/slug "
+        f"combination that is not in the canonical family (task 5230). "
+        f"{_repo_relative(NORMATIVE_DOC)} is the only place a slug is defined "
+        f"— either renumber the citation to match it, or the slug was "
+        f"respelled or retired there and this doc's citation needs the same "
+        f"treatment."
+    )
+
+
+# ---------------------------------------------------------------------------
 # The fixtures doc's rehearsal verdict table — pinned for COVERAGE only
 #
 # The doc carries an explicit "Snapshot caveat" declaring the Verdict column a
