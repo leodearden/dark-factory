@@ -108,6 +108,10 @@ class TestReferentRecordVocabulary:
         assert finding.new_endpoint_uuid is None
         assert finding.resolvable is False
         assert finding.reason == ''
+        # DEFAULTED, so every existing construction site — including
+        # tests/test_referent_repair.py's `_finding()` and leaf eta's landed
+        # repair path — keeps constructing unchanged.
+        assert finding.cited == ()
 
     def test_is_keyword_only(self):
         """Positional construction of an eleven-field evidence record is how a
@@ -2060,3 +2064,115 @@ class TestPerEdgeFactScanIsLazy:
             'e2', 'source', 'per-edge-pairing', 'n-3074', 'Task 3074',
             Referent(number='3074'), ('Task 3074', 'Task 3075'),
             Referent(number='3075'), True, '')
+
+
+def _corroborated_membership_episode() -> MockAddEpisodeResult:
+    """esc-3671-3's reachable shape, verbatim from `_candidate_pool`'s docstring.
+
+    The edge hangs off the `Task 2500` node and its fact names BOTH that node
+    and the declared referent 3668 — "the same legitimate ambient-task write one
+    sentence longer". Membership fires (2500 is not declared), and the
+    corroboration veto empties the pool because the fact cites the very node the
+    edge landed on.
+    """
+    return _episode(
+        edges=[_edge('e1',
+                     fact='Task 2500 was completed as part of task 3668 by '
+                          'the merge worker',
+                     source='n-2500', target='n-worker')],
+        nodes=[MockNode(name='Task 2500', uuid='n-2500'),
+               MockNode(name='merge worker', uuid='n-worker')],
+    )
+
+
+class TestFindingCarriesTheCitationsThatDecidedIt:
+    """S3 (esc-3671-3): a finding must carry the evidence that made it fire.
+
+    `referent_set` is the DECLARED set. On the PAIRING arm the discriminating
+    input is not that set but the edge fact's own citations — the arm fires
+    precisely on `cited_declared and endpoint_referent not in cited` — and
+    before this field those citations were recoverable nowhere on the record.
+    An operator reading a pairing warning could see which referents the write
+    declared but not which ones the fact named, i.e. not the input that decided
+    the verdict.
+    """
+
+    def test_the_field_defaults_to_empty_and_is_a_tuple(self):
+        """A TUPLE for the reason `referent_set` is one: `frozen=True` blocks
+        rebinding only, so a list would leave `finding.cited.append(...)` open
+        on evidence for destructive edge surgery."""
+        assert _finding().cited == ()
+        assert isinstance(_finding().cited, tuple)
+        assert isinstance(_finding(cited=('Task 3075',)).cited, tuple)
+
+    def test_to_dict_renders_cited_as_a_json_safe_list(self):
+        payload = _finding(cited=('Task 3075', 'Task 3668')).to_dict()
+
+        assert payload['cited'] == ['Task 3075', 'Task 3668']
+        assert json.loads(json.dumps(payload)) == payload
+        # The self-maintaining key-set contract: a field the payload omits is a
+        # field the operator log silently drops.
+        assert set(payload) == {f.name for f in dataclasses.fields(ReferentFinding)}
+
+    @pytest.mark.asyncio
+    async def test_a_pairing_finding_carries_the_facts_citations(self, service):
+        """The arm whose evidence was missing. `cited == ('Task 3075',)` is
+        exactly what made `cited_declared` non-empty and fired the check."""
+        stats = await service._verify_episode_referents(
+            _mixed_findings_episode(), group_id='dark_factory',
+            referents=_MIXED_REFERENTS,
+        )
+
+        pairing = [f for f in stats.findings if f.check == 'per-edge-pairing']
+        assert [f.cited for f in pairing] == [('Task 3075',)]
+
+    @pytest.mark.asyncio
+    async def test_a_membership_finding_carries_them_too(self, service):
+        """Recorded on BOTH arms, not just the one that reads them, so a reader
+        never has to know which arm carries which evidence."""
+        stats = await service._verify_episode_referents(
+            _corroborated_membership_episode(), group_id='dark_factory',
+            referents=(Referent(number='3668'),),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'set-membership'
+        assert finding.endpoint_referent == Referent(number='2500')
+        assert finding.cited == ('Task 2500', 'Task 3668')
+        # And the declared set stays what it always was — the two fields are
+        # different questions, which is the whole point of recording both.
+        assert finding.referent_set == ('Task 3668',)
+
+    @pytest.mark.asyncio
+    async def test_a_fact_citing_nothing_records_no_citations(self, service):
+        """Empty is a real answer here, not an absence: an uninformative fact is
+        why the pairing arm's `cited_declared` guard refuses to fire."""
+        stats = await service._verify_episode_referents(
+            _one_membership_finding_episode(), group_id='dark_factory',
+            referents=(Referent(number='3127'),),
+        )
+
+        assert stats.findings[0].cited == ()
+
+    @pytest.mark.asyncio
+    async def test_the_citations_render_in_a_deterministic_order(self, service):
+        """`cited` is a FROZENSET internally, whose iteration order is not
+        stable across processes under hash randomization. Sorted for the same
+        reason `_candidate_targets` sorts its survivors: a finding must be
+        stable across runs and diffable in eta's audit."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3129 supersedes Task 3128',
+                         source='n-3129', target='n-3128')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='Task 3128', uuid='n-3128')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 2
+        # Both ends of one edge share ONE scan, so both carry the same rendering
+        # — and it follows the fact's numeric order, not its textual one.
+        assert {f.cited for f in stats.findings} == {('Task 3128', 'Task 3129')}
