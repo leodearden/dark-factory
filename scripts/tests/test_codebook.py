@@ -1298,96 +1298,144 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
 
 
 # ---------------------------------------------------------------------------
-# task 4892 step-1: RED (live-file guard) — the resume/--system-prompt-file
-# correction lands as an APPENDED superseding sighting, never as an in-place
-# rewrite of the 2026-08-10 note.
+# task 4892 (live-file guard) — both corrections landed through the sole
+# writer, and the committed registry still carries the committed record.
 # ---------------------------------------------------------------------------
 
 _T4892_ENTRY_ID = "guards-assert-unverified-diagnoses"
 _T4892_ORIGINAL_SESSION = "e16af1c5-de98-4252-8504-ce5d13bee3d6"
 _T4892_CORRECTION_SESSION = "task-4892-resume-sysprompt-correction"
+_T4892_CANDIDATE_SESSION = "task-4892-lettered-option-collision"
 _T4892_RECORD_PATH = (
     _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-4892-corrections.jsonl"
 )
 
+# What apply_coding_record copies verbatim from a match/candidate payload into
+# the sighting it appends. The optional three are emitted only when truthy, so
+# a payload that omits one is compared as omitting it.
+_SIGHTING_PAYLOAD_FIELDS = (
+    "origin_phase",
+    "manifested_phase",
+    "invariant_violated",
+    "note",
+    "evidence_quote",
+)
 
-def test_live_codebook_annotates_the_stale_resume_sysprompt_sighting():
-    """Both halves of the annotate-don't-rewrite contract for task 4892.
 
-    A sighting is an immutable dated observation: `apply_coding_record` can
-    only APPEND one, and there is no in-place note-amendment op anywhere in
-    scripts/legibility/. So the correction of the (now false) present-tense
-    claim that `build_claude_argv` omits `--system-prompt-file` had to land
-    as a superseding SIBLING sighting on the same entry.
+def _t4892_sightings_for(holder: dict, session: str) -> list[dict]:
+    return [s for s in holder.get("sightings") or [] if s.get("session") == session]
 
-    Asserted PURELY on session identity, date, and list ORDER — never on the
-    prose of either note, matching the identity style of the live-corpus
-    tests above. A codebook note is documentation: pinning a substring of one
-    would forbid ever rewording it, which is especially wrong here, where the
-    2026-08-10 wording is the very wording now known to be false on main.
-    Deliberately not re-added in regex form either (esc-4892-4).
 
-    The ordering half is load-bearing rather than cosmetic: the correction
-    note refers to "the wording above", which is only true if it is appended
-    after the record it supersedes.
+def _t4892_carriers(codebook: dict, record: dict):
+    """Each payload of *record* with (its key, the live records the sole writer
+    appends it to): a match goes to the entry named by its `entry_id`, a
+    candidate to the candidate(s) sharing its `title`."""
+    for match in record.get("matches") or []:
+        key = match.get("entry_id")
+        yield key, match, [e for e in codebook.get("entries") or [] if e.get("id") == key]
+    for candidate in record.get("candidates") or []:
+        key = candidate.get("title")
+        yield key, candidate, [
+            c for c in codebook.get("candidates") or [] if c.get("title") == key
+        ]
 
-    The first half fails loudly if a future agent deletes the 2026-08-10
-    observation instead of annotating it. That observation was TRUE when made
-    (task 3983 hoisted the flag out of the resume branch the same day) and
-    the never-delete boundary keeps it. Guarding against an in-place REWRITE
-    of a committed sighting's fields is a structural property of the sole
-    writer — a general post-condition alongside `assert_no_deletion` — not
-    something to approximate here by pinning one hand-picked phrase.
+
+def test_live_codebook_carries_the_task_4892_corrections():
+    """The committed §7.3 record and the committed registry still agree.
+
+    Both corrections went through the sole writer, which can only APPEND: the
+    now-false present-tense claim about `--system-prompt-file` is superseded by
+    a sibling sighting rather than rewritten in place, and the
+    lettered-option-collision pattern is filed as a candidate for the census to
+    adjudicate. Four properties, each invariant under every transition the
+    system is designed to make to this file:
+
+    (1) AGREEMENT — every payload in the record is carried, exactly once, by
+        exactly one live entry/candidate, field for field. A hand-edit of the
+        YAML (the in-place rewrite the append-only contract exists to prevent)
+        surfaces here as a mismatch. Two committed data artifacts compared
+        against each other — not the prose pin esc-4892-4 removed, which
+        asserted a substring of a note this record does not own.
+    (2) NEVER-DELETE — the 2026-08-10 observation is still present, still so
+        dated. It was true when made; only its present tense expired.
+    (3) ORDER — the correction follows what it supersedes: its note points the
+        reader at "the wording above".
+    (4) NO-OP — re-applying the record appends nothing, which is what makes a
+        rebase onto a nightly-rewritten main resolvable by re-running one CLI
+        command instead of hand-editing 22k lines of generated YAML.
+
+    Schema shape is not re-checked here: `test_live_codebook_is_v2_and_validates_green`
+    owns `validate() == []` over this file. The candidate's `disposition` and
+    its `cand-<yyyymmdd>-<n>` id are not pinned either — the census owns the
+    first and the merger derives the second from the same-date candidate count,
+    so both may legitimately change; each is located by its stable sighting
+    session instead.
     """
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
-
-    entries = [e for e in codebook.get("entries") or [] if e.get("id") == _T4892_ENTRY_ID]
-    assert len(entries) == 1, f"expected exactly one {_T4892_ENTRY_ID!r} entry"
-    sightings = entries[0].get("sightings") or []
-    by_session = {s.get("session"): i for i, s in enumerate(sightings)}
-
-    # (a) NEVER-DELETE — the original dated observation is still present.
-    assert _T4892_ORIGINAL_SESSION in by_session, (
-        "the 2026-08-10 sighting was deleted from "
-        f"{_T4892_ENTRY_ID!r} — sightings are immutable dated observations"
-    )
-    original = sightings[by_session[_T4892_ORIGINAL_SESSION]]
-    assert original.get("date") == "2026-08-10"
-
-    # (b) THE CORRECTION IS PRESENT, and appended AFTER what it supersedes.
-    assert _T4892_CORRECTION_SESSION in by_session, (
-        f"no superseding sighting on {_T4892_ENTRY_ID!r} for session "
-        f"{_T4892_CORRECTION_SESSION!r}"
-    )
-    assert by_session[_T4892_CORRECTION_SESSION] > by_session[_T4892_ORIGINAL_SESSION], (
-        "the correction sighting must follow the sighting it supersedes in list "
-        "order — its note points the reader at 'the wording above'"
-    )
-
-
-def test_task_4892_coding_record_applies_idempotently_to_the_live_codebook():
-    """The committed §7.3 record is already fully absorbed by the live codebook.
-
-    This is the nightly-clobber-safety property. The record file is committed
-    (not built ad-hoc and discarded) so the change is auditable as having gone
-    through the sole writer, and so a rebase onto a nightly-rewritten main is
-    resolved by re-running one CLI command rather than hand-editing 22k lines
-    of generated YAML. That re-derivation is only safe if re-applying is a
-    verified no-op — which is exactly what this asserts.
-    """
-    assert _T4892_RECORD_PATH.exists(), f"missing coding record: {_T4892_RECORD_PATH}"
     records = [
         json.loads(line)
         for line in _T4892_RECORD_PATH.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert records, "the task-4892 coding record file is empty"
+    sessions = {r.get("session") for r in records}
+    assert {_T4892_CORRECTION_SESSION, _T4892_CANDIDATE_SESSION} <= sessions, (
+        f"{_T4892_RECORD_PATH} no longer records both task-4892 corrections: "
+        f"{sorted(sessions)}"
+    )
 
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
+
+    # (1) AGREEMENT — the record is carried verbatim, once, by one holder.
     for record in records:
+        session = record.get("session")
         assert mod.validate_coding_record(record) == [], (
-            f"invalid §7.3 coding record for session {record.get('session')!r}"
+            f"invalid §7.3 coding record for session {session!r}"
         )
+        for key, payload, holders in _t4892_carriers(codebook, record):
+            carrying = [h for h in holders if _t4892_sightings_for(h, session)]
+            assert len(carrying) == 1, (
+                f"expected exactly one live record under {key!r} to carry a "
+                f"{session!r} sighting, found {[h.get('id') for h in carrying]}"
+            )
+            carried = _t4892_sightings_for(carrying[0], session)
+            assert len(carried) == 1, (
+                "the sole writer must not duplicate a sighting on a re-run — "
+                f"{session!r} appears {len(carried)}x on {carrying[0].get('id')!r}"
+            )
+            drift = {
+                field: (payload[field], carried[0].get(field))
+                for field in _SIGHTING_PAYLOAD_FIELDS
+                if payload.get(field) and payload[field] != carried[0].get(field)
+            }
+            assert drift == {}, (
+                f"the {session!r} sighting on {carrying[0].get('id')!r} no longer "
+                "matches the committed record — a committed sighting was "
+                f"rewritten in place {{field: (record, codebook)}}: {drift}"
+            )
+
+    # (2) NEVER-DELETE and (3) ORDER, on the annotated entry.
+    entries = [e for e in codebook.get("entries") or [] if e.get("id") == _T4892_ENTRY_ID]
+    assert len(entries) == 1, f"expected exactly one {_T4892_ENTRY_ID!r} entry"
+    sightings = entries[0].get("sightings") or []
+    order = {s.get("session"): i for i, s in enumerate(sightings)}
+
+    assert _T4892_ORIGINAL_SESSION in order, (
+        f"the 2026-08-10 sighting was deleted from {_T4892_ENTRY_ID!r} — "
+        "sightings are immutable dated observations"
+    )
+    original = sightings[order[_T4892_ORIGINAL_SESSION]]
+    assert original.get("date") == "2026-08-10", (
+        f"the {_T4892_ORIGINAL_SESSION!r} sighting was re-dated to "
+        f"{original.get('date')!r} — a dated observation is not editable"
+    )
+    assert order.get(_T4892_CORRECTION_SESSION, -1) > order[_T4892_ORIGINAL_SESSION], (
+        f"the {_T4892_CORRECTION_SESSION!r} sighting is missing from "
+        f"{_T4892_ENTRY_ID!r} or does not follow the 2026-08-10 sighting it "
+        "supersedes — its note points the reader at 'the wording above'"
+    )
+
+    # (4) NO-OP — the record is already fully absorbed, so re-running the sole
+    #     writer over it appends nothing.
+    for record in records:
         codebook, stats = mod.apply_coding_record(codebook, record)
         assert stats == {
             "matched": 0,
@@ -1396,82 +1444,6 @@ def test_task_4892_coding_record_applies_idempotently_to_the_live_codebook():
             "candidate_disposition_conflicts": 0,
             "record_invalid": False,
         }, (
-            f"re-applying session {record.get('session')!r} was not a no-op — the "
-            f"committed codebook has drifted from the committed record: {stats}"
+            f"re-applying session {record.get('session')!r} appended something — "
+            f"its sightings are not already absorbed by the live codebook: {stats}"
         )
-
-    assert mod.validate(codebook) == []
-
-
-# ---------------------------------------------------------------------------
-# task 4892 step-4: RED (live-file guard) — the lettered-option-collision
-# pattern is recorded as a PENDING CANDIDATE, never a fabricated entry.
-# ---------------------------------------------------------------------------
-
-_T4892_CANDIDATE_SESSION = "task-4892-lettered-option-collision"
-
-
-def test_live_codebook_carries_the_lettered_option_collision_candidate():
-    """FIX 2 lands as a candidate — forced by the mechanism, not chosen.
-
-    `apply_coding_record` never fabricates an entry ("only the census promotes
-    candidates to entries"), and no existing entry or candidate covers the
-    pattern, so there is nothing to match against either. Candidate is the only
-    shape the sole-writer path can produce, and it correctly routes
-    adjudication to the census — the body chartered to decide whether a single
-    observation deserves promotion.
-
-    What this guards: the candidate record EXISTS in the live codebook, is
-    uniquely located by its stable sighting session, is not duplicated by a
-    re-run of the merger, and carries a schema-valid id and disposition.
-
-    Located by SIGHTING SESSION, deliberately not by literal candidate id:
-    `apply_coding_record` derives the `-<n>` suffix from how many same-date
-    candidates already exist, so a rebase against a nightly merger run
-    legitimately shifts `cand-20260908-<n>`. The session is stable.
-
-    The disposition is deliberately NOT pinned to "pending" — the census owns
-    that field and may legitimately promote or reject this candidate
-    (`census.py::promote_candidate` / `::reject_candidate` both RETAIN the
-    candidate record and restamp its disposition), so pinning one value would
-    turn this test red on correct system behaviour. The property that pin was
-    reaching for — the merger never fabricates an adjudication — is unit-tested
-    with fixture data above, in
-    `test_apply_coding_record_does_not_duplicate_rejected_candidate` and its
-    `..._promoted_candidate` twin. Do not re-tighten it.
-
-    Presence and identity only — no assertion on title/cause prose, matching
-    the identity style of the live-corpus tests above.
-    """
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
-
-    carrying = [
-        c
-        for c in codebook.get("candidates") or []
-        if any(
-            s.get("session") == _T4892_CANDIDATE_SESSION
-            for s in (c.get("sightings") or [])
-        )
-    ]
-    assert len(carrying) == 1, (
-        f"expected exactly one candidate carrying a {_T4892_CANDIDATE_SESSION!r} "
-        f"sighting, found {[c.get('id') for c in carrying]}"
-    )
-    candidate = carrying[0]
-
-    carried = [
-        s
-        for s in candidate.get("sightings") or []
-        if s.get("session") == _T4892_CANDIDATE_SESSION
-    ]
-    assert len(carried) == 1, (
-        "the sole writer must not duplicate the sighting on a re-run — "
-        f"expected exactly one {_T4892_CANDIDATE_SESSION!r} sighting, got {len(carried)}"
-    )
-    assert candidate.get("disposition") in mod.DISPOSITIONS, (
-        "disposition must be a schema-valid value; the census owns which one "
-        f"(got {candidate.get('disposition')!r}, allowed {mod.DISPOSITIONS})"
-    )
-    assert mod._CANDIDATE_ID_RE.match(candidate.get("id") or ""), (
-        f"candidate id does not match cand-<yyyymmdd>-<n>: {candidate.get('id')!r}"
-    )
