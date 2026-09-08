@@ -2459,3 +2459,202 @@ class TestCorroboratedFindingsAreNotOperatorWarnings:
         assert [f.corroborated for f in stats.findings] == [True, False]
         assert [r.levelno for r in _records_for(caplog, 'e1')] == [logging.INFO]
         assert [r.levelno for r in _records_for(caplog, 'e2')] == [logging.WARNING]
+
+
+def _warn_cap() -> int:
+    """The per-episode warning cap, READ FROM THE CONSTANT.
+
+    Every expectation below is computed from this rather than from a literal,
+    so retuning a log-volume policy number can never red the suite. Imported
+    locally, the idiom this file already uses for module-private symbols
+    (`_candidate_targets`).
+    """
+    from fused_memory.services.memory_service import _REFERENT_FINDING_WARN_CAP
+
+    return _REFERENT_FINDING_WARN_CAP
+
+
+def _finding_storm_episode(
+    warn_findings: int, corroborated_findings: int = 0,
+) -> MockAddEpisodeResult:
+    """*warn_findings* genuine findings plus *corroborated_findings* vetoed ones.
+
+    The corroborated edges come FIRST, deliberately: a cap that counted every
+    finding rather than every WARN-LEVEL one would spend part of its budget on
+    them and visibly shortchange the genuine defects that follow.
+    """
+    edges = [_edge(f'c{i}',
+                   fact=f'Task {8000 + i} was completed as part of task 3127 '
+                        'by the merge worker',
+                   source=f'n-{8000 + i}', target='n-worker')
+             for i in range(corroborated_findings)]
+    edges += [_edge(f'w{i}', fact='the deploy pipeline was retried',
+                    source=f'n-{9000 + i}', target='n-x')
+              for i in range(warn_findings)]
+    nodes = [MockNode(name='deploy pipeline', uuid='n-x'),
+             MockNode(name='merge worker', uuid='n-worker')]
+    nodes += [MockNode(name=f'Task {8000 + i}', uuid=f'n-{8000 + i}')
+              for i in range(corroborated_findings)]
+    nodes += [MockNode(name=f'Task {9000 + i}', uuid=f'n-{9000 + i}')
+              for i in range(warn_findings)]
+    return _episode(edges=edges, nodes=nodes)
+
+
+def _finding_lines(caplog, level: int) -> list[logging.LogRecord]:
+    return [r for r in caplog.records
+            if r.levelno == level
+            and r.getMessage().startswith('Referent verification finding:')]
+
+
+def _storm_lines(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records
+            if 'Referent verification finding storm' in r.getMessage()]
+
+
+class TestTheOperatorWarningIsCappedPerEpisode:
+    """A2 (esc-3671-1), the headline item: an unbounded per-finding WARNING.
+
+    One `logger.warning` per finding, with no cap, no dedup and no warn-once. A
+    single malformed episode can carry hundreds of edges, and `replay_from_store`
+    re-writing a backlog multiplies that across every episode in the queue — so
+    the surface that exists to make a defect VISIBLE is also the surface that
+    can bury every other line an operator needs.
+
+    THE CAP BOUNDS THE LOG, NEVER THE RECORD. `ReferentStats.findings` is what
+    leaf eta reads in-process and the counters are what leaf iota samples;
+    capping the operator surface must cost neither. And the truncation ANNOUNCES
+    itself — a silently shortened log is a fail-soft path with nothing to hear
+    it, which is what INV-4 forbids.
+    """
+
+    @pytest.mark.asyncio
+    async def test_only_the_first_cap_findings_are_logged_individually(
+        self, service, caplog,
+    ):
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap + 5), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == cap
+
+    @pytest.mark.asyncio
+    async def test_the_suppression_announces_itself_exactly_once(
+        self, service, caplog,
+    ):
+        """The storm signal INV-4 asks for. The counter is the machine half of
+        the escape; this line is the operator half."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap + 5), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        storm = _storm_lines(caplog)
+        assert len(storm) == 1
+        assert storm[0].levelno == logging.WARNING
+        message = storm[0].getMessage()
+        # How many were suppressed...
+        assert str(5) in message
+        # ...and the per-check totals for the episode, so the shape of the
+        # storm is legible without the suppressed lines.
+        assert f"'set-membership': {cap + 5}" in message
+        assert "'per-edge-pairing': 0" in message
+
+    @pytest.mark.asyncio
+    async def test_the_return_value_keeps_every_finding_in_full(
+        self, service, caplog,
+    ):
+        """Leaf eta reads this in-process, inside the same critical section. A
+        log-volume policy must never cost it a finding."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            stats = await service._verify_episode_referents(
+                _finding_storm_episode(cap + 5), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert len(stats.findings) == cap + 5
+        field_names = {f.name for f in dataclasses.fields(ReferentFinding)}
+        assert all(set(f.to_dict()) == field_names for f in stats.findings)
+        assert {f.edge_uuid for f in stats.findings} == {
+            f'w{i}' for i in range(cap + 5)
+        }
+
+    @pytest.mark.asyncio
+    async def test_suppression_costs_no_counter_signal(self, service, caplog):
+        """Leaf iota's rate must not silently deflate the moment an episode
+        crosses a LOG-volume threshold."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap + 5), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert service.referent_finding_counts()['set-membership'] == cap + 5
+
+    @pytest.mark.asyncio
+    async def test_an_episode_under_the_cap_emits_no_aggregate_line(
+        self, service, caplog,
+    ):
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _one_membership_finding_episode(), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == 1
+        assert _storm_lines(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_an_episode_exactly_at_the_cap_emits_no_aggregate_line(
+        self, service, caplog,
+    ):
+        """The boundary: nothing was suppressed, so there is nothing to
+        announce. An off-by-one here would page on every full-budget episode."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap), group_id='dark_factory',
+                referents=(Referent(number='3127'),),
+            )
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == cap
+        assert _storm_lines(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_corroborated_findings_do_not_consume_the_warning_budget(
+        self, service, caplog,
+    ):
+        """The budget is spent on findings that indicate a defect, not on the
+        dominant legitimate ambient-task shape. The corroborated edges come
+        first in this fixture, so a cap counting every finding would emit fewer
+        than `cap` genuine warnings — and would announce a suppression that
+        never happened."""
+        cap = _warn_cap()
+
+        with caplog.at_level(logging.INFO,
+                             logger='fused_memory.services.memory_service'):
+            await service._verify_episode_referents(
+                _finding_storm_episode(cap, corroborated_findings=3),
+                group_id='dark_factory', referents=(Referent(number='3127'),),
+            )
+
+        assert len(_finding_lines(caplog, logging.WARNING)) == cap
+        assert len(_finding_lines(caplog, logging.INFO)) == 3
+        assert _storm_lines(caplog) == []
