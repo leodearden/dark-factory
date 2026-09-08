@@ -962,7 +962,40 @@ verify_admission_pytest_n: "8"
 # next run, put this back to 1 rather than raising it further — the box is CPU
 # constrained (verify was ~72% of a 99.3%-busy 32-core host on 2026-08-28) and
 # more verify concurrency is not free.
-verify_admission_task_slots: 3
+#
+# PUT BACK TO 1 (operator decision, Leo 2026-09-08, load-tuning session). The
+# "REVERSIBLE AND UNDER OBSERVATION" clause above fired: median task duration
+# did not fall, it rose. Measured from the same event store, orchestrator-module
+# TASK-LEG verify only:
+#   1 slot  (30 legs before 2026-09-03 15:58Z): median 2300s, 10% hit the 3600s wall
+#   3 slots (49 legs after):                    median censored at 3600s, 80% hit it
+# Merge verify median moved 2572s -> 3199s across the same step, and journal
+# timeouts/day went 2,1,3,7,13,9,7 (08-28..09-07). Dose-response against the
+# number of OTHER concurrent orchestrator-suite fan-outs: 0-0.5 others -> 1978s
+# median, 0/12 timeouts; >=0.5 others -> 3600s censored, 29/52 timeouts. So 2
+# slots is not a middle ground either. Slot time is not the constraint: the whole
+# task-lane leg volume (~240 legs/14d) sums to ~5.5h/day, i.e. ~23% of ONE slot.
+# The host is: 32 threads, 99% busy, runqueue p50 136 / p90 380 (PSI cpu-some
+# 49-72 and non-discriminating at this load, per task 3590).
+# The main-tip sweep (background role) shares this slot and was already live in
+# the 1-slot regime the 2300s figure comes from.
+verify_admission_task_slots: 1
+
+# Pin `-n auto` for every verify subprocess (task 3589's residual, operator
+# decision Leo 2026-09-08). pytest-xdist resolves `-n auto` via psutil physical
+# cores (16) when psutil is importable and via sched_getaffinity (32) when it is
+# not; psutil is only a `sampler` dependency, so it lands in a cold worktree's
+# .venv only through `uv sync --all-packages`. The MERGE test leg carries no `-n`
+# (it is deliberately exempt from verify_admission_pytest_n, see above) and so
+# ran 16 or 32 workers depending on that accident. This pins it at 16, the
+# physical-core count and the wall-clock optimum of 3589's loaded-host ladder;
+# it is NOT a merge throttle. Task/background legs are untouched: their explicit
+# `-n 8` beats this (the env var only feeds `-n auto`). This overlays LAST in
+# verify.py::_resolve_verify_env, so it also wins over the unit-level
+# PYTEST_XDIST_AUTO_NUM_WORKERS=8 that caps the offline lane and agent shells.
+# Green-tier (verify_env is in RELOADABLE_FIELDS).
+verify_env:
+  PYTEST_XDIST_AUTO_NUM_WORKERS: "16"
 
 # Fused memory HTTP server — port 8002
 # Port scheme: reify=xxx0, autopilot-video=xxx1, dark-factory=xxx2
