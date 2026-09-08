@@ -20,6 +20,7 @@ is deliberately NOT re-exported from ``shared/__init__.py``:
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -33,9 +34,13 @@ __all__ = [
     'read_pressure',
     'PsiSample',
     'read_psi_sample',
+    'RunqueueReading',
+    'read_runqueue_ratio',
 ]
 
 _AVG10_RE = re.compile(r'avg10=([0-9]+(?:\.[0-9]+)?)')
+
+_PROC_STAT = '/proc/stat'
 
 
 def parse_pressure_file(text: str) -> dict[str, float] | None:
@@ -88,6 +93,44 @@ def parse_pressure_file(text: str) -> dict[str, float] | None:
 def read_pressure(name: str) -> str:
     """Read /proc/pressure/<name> from the live kernel."""
     return Path(f'/proc/pressure/{name}').read_text()
+
+
+class RunqueueReading(NamedTuple):
+    """The runqueue component of a PsiSample; ``read_ok`` False means degraded."""
+
+    ratio: float
+    read_ok: bool
+
+
+def read_runqueue_ratio(*, proc_stat_path: str | Path = _PROC_STAT) -> RunqueueReading:
+    """Read ``procs_running`` / ``len(os.sched_getaffinity(0))`` from /proc/stat.
+
+    The ``procs_running`` extraction is the same line scan the in-repo
+    diagnostic ``scripts/cgroup-stall-ratio.py`` uses, so the production reader
+    and the diagnostic agree on which field they read. (Shape reuse only —
+    ``scripts/`` is not importable from ``shared``, which must stay a
+    ``PURE_STDLIB_LEAVES`` member.)
+
+    Never raises. Any failure — the file missing or unreadable, no
+    ``procs_running`` line, an unparseable value, an empty CPU affinity mask,
+    or ``sched_getaffinity`` absent on a non-Linux host — degrades to
+    ``RunqueueReading(0.0, False)``,
+    carrying the failure BY VALUE so the arm goes inert rather than wrong.
+    The broad except matches the module's shipped "never wedge dispatch"
+    stance; loud, rate-limited operator logging is the scheduler's job, so
+    this stays at a single debug line.
+    """
+    try:
+        text = Path(proc_stat_path).read_text()
+        line = next(
+            line for line in text.splitlines() if line.startswith('procs_running')
+        )
+        running = int(line.split()[1])
+        cpus = len(os.sched_getaffinity(0))
+        return RunqueueReading(running / cpus, True)
+    except Exception:
+        logger.debug('runqueue read failed; component degraded', exc_info=True)
+        return RunqueueReading(0.0, False)
 
 
 class _Arm(NamedTuple):
