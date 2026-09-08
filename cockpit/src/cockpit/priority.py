@@ -226,7 +226,7 @@ def _weight_table(data: dict[str, Any], key: str, fallback: dict[str, float]) ->
     return section if isinstance(section, dict) else fallback
 
 
-def _canonical_project_weights(table: dict[str, float]) -> dict[str, float]:
+def _canonical_project_weights(table: dict[Any, Any]) -> dict[str, float]:
     """Re-key *table* so every project weight is keyed on the CANONICAL token.
 
     A priorities.yaml is hand-edited, so its ``project_weights`` keys drift
@@ -251,16 +251,58 @@ def _canonical_project_weights(table: dict[str, float]) -> dict[str, float]:
     ``category_weights`` are deliberately NOT folded -- they are unrelated
     key vocabularies (an escalation severity, an operator's own category
     names), not project tokens, and folding them would silently rewrite
-    labels the operator chose. Values pass through verbatim; numeric
-    coercion is not this helper's job (see _coerce_weight_table).
+    labels the operator chose. Values pass through verbatim -- numeric
+    coercion is not this helper's job.
+
+    TOTALITY, and why *table* is annotated ``dict[Any, Any]``: this runs on
+    the load path of a HAND-EDITED file, and ``yaml.safe_load`` yields
+    non-str mapping keys for perfectly ordinary unquoted edits -- ``2085:``
+    is an int, ``1.5:`` a float, ``yes:`` a bool, ``~:`` None. This helper
+    must never raise out of ``load_priorities`` (its documented never-raises
+    contract, and PRD section 2's rule that a view is never a dependency: a
+    raise here would stop the cockpit starting). Two things make it total
+    over any key type. The sort key coerces with ``str(k)``, so keys of
+    different types are always comparable -- necessary because
+    ``normalize_project_token(k) == k`` is False for EVERY non-str key and
+    also for a non-canonical str key like ``dark-factory``, which puts them
+    in the same first-element group where the tuple falls through to the
+    second element. And ``normalize_project_token`` is itself total, because
+    it coerces its argument with ``str()`` first -- which is exactly why
+    ``str(k)`` is the right coercion here: the key-space the sort orders and
+    the key-space the fold produces stay in agreement. For str keys
+    ``str(k) == k``, so the COLLISION RULE above is provably unmoved (pinned
+    by TestProjectWeightKeyFolding's two collision tests, which are green
+    unchanged).
+
+    EMPTY FOLD IS DROPPED, visibly: a key normalizing to '' (``~:``, ``'':``,
+    ``'   ':``) is skipped with a WARNING naming the raw key and its type,
+    mirroring _warn_if_severity_weights_missing_escalation_vocabulary's
+    visible-not-silent idiom. '' is the UNSET-project sentinel, not a token:
+    keeping it would silently apply that weight to every row whose project is
+    unset, and would put the scorer back in disagreement with
+    ``panes.weight_editor.known_projects``, which already excludes '' -- the
+    exact scorer/picker divergence task 3812 exists to make impossible. Note
+    this drops only keys that fold to nothing: a non-str key with real
+    content is folded BY VALUE and kept (``2085:`` -> ``'2085'``), since
+    bare-task-id project tokens are real in this fleet.
 
     Because ``save_priorities`` re-emits whatever keys the in-memory table
     holds, a load->save cycle HEALS a drifted priorities.yaml in place: the
     next save writes the canonical keys back.
     """
     canonical: dict[str, float] = {}
-    for key in sorted(table, key=lambda k: (normalize_project_token(k) == k, k)):
-        canonical[normalize_project_token(key)] = table[key]
+    for key in sorted(table, key=lambda k: (normalize_project_token(k) == k, str(k))):
+        folded = normalize_project_token(key)
+        if not folded:
+            logger.warning(
+                'load_priorities: project_weights key %r (%s) normalizes to the empty '
+                'unset-project token and is DROPPED -- keeping it would silently weight '
+                'every row whose project is unset. Use a real project token as the key.',
+                key,
+                type(key).__name__,
+            )
+            continue
+        canonical[folded] = table[key]
     return canonical
 
 
@@ -279,8 +321,13 @@ def _priorities_from_dict(data: dict[str, Any]) -> Priorities:
         severity_weights=_weight_table(data, 'severity_weights', fallback.severity_weights),
         category_weights=_weight_table(data, 'category_weights', fallback.category_weights),
         # Folded AFTER _weight_table has resolved absent/null/non-mapping
-        # sections, so the helper only ever sees a mapping and cannot
-        # introduce a raise into load_priorities' never-raises contract.
+        # sections, so the helper only ever sees a mapping. That alone is NOT
+        # why it cannot raise into load_priorities' never-raises contract --
+        # a mapping's KEYS can still be any type yaml.safe_load produced. The
+        # totality argument has three legs: a mapping from _weight_table, a
+        # sort key total over arbitrary key types via str(k), and
+        # normalize_project_token total via its own str() coercion. See
+        # _canonical_project_weights' TOTALITY paragraph.
         # Folding the bundled fallback is a no-op -- it is {}.
         project_weights=_canonical_project_weights(
             _weight_table(data, 'project_weights', fallback.project_weights)
