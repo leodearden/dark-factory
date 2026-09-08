@@ -185,6 +185,27 @@ class PsiSample:
         """
         return self.read_ok and any(self._tripping_arms(cfg))
 
+    def tripping_metric(self, cfg) -> str:
+        """Return the name of the highest-ranked arm this sample trips.
+
+        Precondition: ``saturated(cfg)``. The emitter only reaches this after
+        the gate has already held, so a violation is a programming error, not
+        a fail-open case — hence ``ValueError`` rather than a sentinel return,
+        which would let a mis-wired emitter publish a metric for a sample that
+        never tripped.
+
+        The returned domain is the cfg FIELD NAMES, so the gate, the
+        ``dispatch_deferred`` payload and the operator vocabulary stay one set.
+        Ranking is whatever ``_ARMS`` order says; PRD
+        ``plans/load-throttle-harmonisation-prd.md`` D10 owns that rank.
+        """
+        if not self.saturated(cfg):
+            raise ValueError(
+                'tripping_metric() requires a saturated sample; '
+                f'saturated(cfg) is False for {self!r}'
+            )
+        return next(iter(self._tripping_arms(cfg))).field
+
 
 _FAIL_OPEN = PsiSample(
     cpu_some10=0.0,
