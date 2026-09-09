@@ -88,6 +88,22 @@ def _seed(
     return esc
 
 
+class TestSeedDefaultSummary:
+    """``_seed``'s default summary names THIS module, and that is load-bearing:
+    the C1-C4 tests share one module-scoped ``EscalationQueue``, so the summary is
+    what identifies the seeding module when a cross-test interference failure
+    surfaces a record."""
+
+    def test_seed_labels_records_with_this_modules_summary(self, tmp_path: Path) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        esc = _seed(queue, level=1, task_id='zeta-summary-pin')
+
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.summary == 'status-authority-gate test escalation (level=1)'
+
+
 # ---------------------------------------------------------------------------
 # Real-HTTP (header-driven) drive harness — C1-C4.
 # ---------------------------------------------------------------------------
