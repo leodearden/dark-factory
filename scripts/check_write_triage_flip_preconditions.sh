@@ -205,17 +205,12 @@ record_fail() { fail=1; failed_items="${failed_items}${1} "; }
 # *" 2 "* and *" 4 "*.
 item_failed() { case " $failed_items" in *" $1 "*) return 0 ;; esac; return 1; }
 
-# item 1 extracts the ref's package tree to a temp dir. `git archive` is
-# read-only and touches no .git state, unlike `git worktree add` -- which
-# matters in this repo, where refs are shared across every worktree.
+# Removed on exit however the script leaves. Filled by the single extraction
+# below, which both probe items read.
 PROBE_TMP=''
-PROBE5_TMP=''
 cleanup() {
   if [ -n "${PROBE_TMP:-}" ]; then
     rm -rf "$PROBE_TMP"
-  fi
-  if [ -n "${PROBE5_TMP:-}" ]; then
-    rm -rf "$PROBE5_TMP"
   fi
 }
 trap cleanup EXIT
@@ -242,6 +237,48 @@ read_ref_file() {
 note "write_triage flip preconditions — checked against ref '$REF' in $REPO"
 note ""
 
+# --- the ref's source tree, extracted ONCE for both probe items ---------------
+#
+# `git archive` is read-only and touches no .git state, unlike `git worktree
+# add` -- which matters in this repo, where refs are shared across every
+# worktree. write_triage.py and write_triage_judge.py are siblings in one tree,
+# so items 1 and 5 read the same extraction: a second archive of the same
+# pathspec buys nothing and costs wall clock the 120s delivered-check budget
+# cannot spare (see PROBE_TIMEOUT_CMD above).
+#
+# EXTRACTED is read by both items, and on failure BOTH fail closed -- each at
+# its own check site below, so `FAILING ITEMS` stays in ascending order and each
+# item's verdict sits with its own report. EXTRACT_ERROR carries the one
+# diagnosis both sites quote, so it is stated in one place. Every record_fail
+# runs in THIS shell -- never inside a `$(...)`, whose assignment a subshell
+# discards; that is how an unreadable ref once skipped a whole check block and
+# the gate exited 0 on unverifiable input.
+EXTRACTED=0
+EXTRACT_ERROR=''
+PROBE_TMP="$(mktemp -d 2>/dev/null)"
+if [ -z "$PROBE_TMP" ] || [ ! -d "$PROBE_TMP" ]; then
+  EXTRACT_ERROR="cannot create a temp dir to extract '$REF'"
+elif ! git -C "$REPO" archive "$REF" fused-memory/src 2>/dev/null \
+     | tar -x -C "$PROBE_TMP" 2>/dev/null; then
+  EXTRACT_ERROR="cannot extract fused-memory/src from ref '$REF'"
+else
+  EXTRACTED=1
+fi
+# BEST-EFFORT, and deliberately non-fatal. The real write_triage.py imports
+# shared.storm_counter, a different workspace member that no fused-memory/src
+# pathspec reaches. Extracting it too means item 5 measures the REF's copy
+# rather than whatever is installed. But a repo whose layout carries no
+# shared/src -- every hermetic fixture repo here, and any project laid out
+# differently -- must still get ordinary verdicts: a second archive that could
+# fail an item would be a new way for the gate to report UNVERIFIABLE against a
+# tree that is perfectly readable. So a failure here only drops the flag.
+PROBE5_EXTRA_ARGS=()
+if [ "$EXTRACTED" -eq 1 ] \
+   && git -C "$REPO" archive "$REF" shared/src 2>/dev/null \
+      | tar -x -C "$PROBE_TMP" 2>/dev/null; then
+  PROBE5_EXTRA_ARGS=(--extra-path "$PROBE_TMP/shared/src")
+fi
+
 # --- item 1: the judge path must bind a verdict to a determinate candidate ----
 #
 # EVERY unverifiable outcome here calls record_fail: a missing probe, a temp dir that
@@ -252,17 +289,8 @@ note ""
 if [ ! -f "$PROBE" ]; then
   note "FAIL  item 1  UNVERIFIABLE: probe missing at $PROBE. Failing closed."
   record_fail 1
-else
-  PROBE_TMP="$(mktemp -d 2>/dev/null)"
-  if [ -z "$PROBE_TMP" ] || [ ! -d "$PROBE_TMP" ]; then
-    note "FAIL  item 1  UNVERIFIABLE: cannot create a temp dir to extract '$REF'. Failing closed."
-    record_fail 1
-  elif ! git -C "$REPO" archive "$REF" fused-memory/src 2>/dev/null \
-       | tar -x -C "$PROBE_TMP" 2>/dev/null; then
-    note "FAIL  item 1  UNVERIFIABLE: cannot extract fused-memory/src from ref '$REF'."
-    note "              Failing closed."
-    record_fail 1
-  else
+elif [ "$EXTRACTED" -eq 1 ]; then
+  {
     # STDERR IS CAPTURED SEPARATELY, not folded in with 2>&1. The probe imports
     # the REF's tree, so anything that tree (or a transitive dependency) writes
     # at import time lands here -- measured on this checkout: a multi-line
@@ -346,7 +374,10 @@ else
       note "$(tail -n "$PROBE_STDERR_LINES" "$probe_err" 2>/dev/null \
         | sed 's/^/              /')"
     fi
-  fi
+  }
+else
+  note "FAIL  item 1  UNVERIFIABLE: $EXTRACT_ERROR. Failing closed."
+  record_fail 1
 fi
 
 # --- item 2: the committed accuracy artifact must be reproducible -------------
@@ -414,25 +445,17 @@ fi
 if [ ! -f "$PROBE5" ]; then
   note "FAIL  item 5  UNVERIFIABLE: probe missing at $PROBE5. Failing closed."
   record_fail 5
-else
-  PROBE5_TMP="$(mktemp -d 2>/dev/null)"
-  if [ -z "$PROBE5_TMP" ] || [ ! -d "$PROBE5_TMP" ]; then
-    note "FAIL  item 5  UNVERIFIABLE: cannot create a temp dir to extract '$REF'. Failing closed."
-    record_fail 5
-  elif ! git -C "$REPO" archive "$REF" fused-memory/src 2>/dev/null \
-       | tar -x -C "$PROBE5_TMP" 2>/dev/null; then
-    note "FAIL  item 5  UNVERIFIABLE: cannot extract fused-memory/src from ref '$REF'."
-    note "              Failing closed."
-    record_fail 5
-  else
+elif [ "$EXTRACTED" -eq 1 ]; then
+  {
     # Stderr captured separately, for item 1's reason: the probe EXECUTES the
     # ref's own triage module, so that tree's import-time chatter lands here and
     # would otherwise spend the 2000-char operator window on noise this gate
     # does not control. The probe carries its own WARNs on stdout, and last.
-    probe5_err="$PROBE5_TMP/probe.stderr"
+    probe5_err="$PROBE_TMP/probe5.stderr"
     probe5_out="$(${PROBE_TIMEOUT_CMD[@]+"${PROBE_TIMEOUT_CMD[@]}"} \
       "${PROBE5_PY_CMD[@]}" "$PROBE5" \
-      --src-root "$PROBE5_TMP/fused-memory/src" 2>"$probe5_err")"
+      --src-root "$PROBE_TMP/fused-memory/src" \
+      ${PROBE5_EXTRA_ARGS[@]+"${PROBE5_EXTRA_ARGS[@]}"} 2>"$probe5_err")"
     probe5_rc=$?
     show_probe5_stderr=0
     # BELT AND BRACES, and a HERE-STRING rather than a pipe: both for item 1's
@@ -468,7 +491,10 @@ else
       note "$(tail -n "$PROBE_STDERR_LINES" "$probe5_err" 2>/dev/null \
         | sed 's/^/              /')"
     fi
-  fi
+  }
+else
+  note "FAIL  item 5  UNVERIFIABLE: $EXTRACT_ERROR. Failing closed."
+  record_fail 5
 fi
 
 # --- premature-flip detection -------------------------------------------------
