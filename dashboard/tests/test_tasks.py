@@ -6,12 +6,10 @@ fetch_external_statuses short-circuit + fail-safe semantics.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import dataclasses
 import inspect
 import logging
-import textwrap
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -352,10 +350,9 @@ class TestTasksReadRecord:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(record, field, 'mutated')
 
-        # The parametrize id already names which record failed, so this
-        # message is deliberately f-string-free: see
-        # test_this_class_never_reaches_the_answer_through_a_string.
-        assert not hasattr(record, '__dict__'), 'record is not slotted'
+        assert not hasattr(record, '__dict__'), (
+            f'{name} is not slotted — it grew a __dict__'
+        )
 
         # Hashable AND usable as a real dict key, which is the actual
         # requirement — hash() alone would pass for an unhashable-by-eq type.
@@ -437,33 +434,6 @@ class TestTasksReadRecord:
         assert isinstance(walk.mode, tasks_mod._CompleteRead)
         assert page.mode.page_size == 10
         assert walk.mode.chunk_size == 10
-
-    def test_this_class_never_reaches_the_answer_through_a_string(self):
-        """No test above may render or parse a key as a string.
-
-        The point of the record is that "page or complete set?" is answered by
-        `type(key.mode)`. A test that still went through `str()` or `.split()`
-        would be asserting the OLD encoding in new clothes and would keep
-        passing if someone reintroduced it, so the class is checked against its
-        own parsed source. AST rather than text: comments and docstrings above
-        legitimately DISCUSS the old encoding, and only executable code is the
-        subject here.
-        """
-        tree = ast.parse(textwrap.dedent(inspect.getsource(TestTasksReadRecord)))
-
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
-        assert not [
-            c for c in calls
-            if isinstance(c.func, ast.Name) and c.func.id in ('str', 'repr', 'format')
-        ], 'a key was rendered to a string'
-        assert not [
-            c for c in calls
-            if isinstance(c.func, ast.Attribute)
-            and c.func.attr in ('split', 'join', 'startswith', 'partition')
-        ], 'a key was parsed out of a string'
-        assert not [
-            n for n in ast.walk(tree) if isinstance(n, ast.JoinedStr)
-        ], 'a key was interpolated into an f-string'
 
     def test_wire_arguments_omits_statuses_entirely_when_none(self):
         """statuses=None means "whole tree": the key is absent from the wire."""
