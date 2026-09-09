@@ -1367,6 +1367,16 @@ class TargetedReconciler:
                     causation_id=run_id,
                 )
                 return None
+            await self.journal.add_run_action(
+                run_id, 'write', 'taskmaster', 'set_task_status',
+                {
+                    'task_id': task_id,
+                    'parent_id': parent_id,
+                    'type': 'descendant_cancel',
+                    'new_status': 'cancelled',
+                },
+                causation_id=run_id,
+            )
         except Exception as e:
             logger.warning(
                 'sweep: cancel failed for orphan %s (parent %s): %s',
