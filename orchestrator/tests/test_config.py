@@ -1403,7 +1403,13 @@ class TestOrchestratorConfigSccache:
         config = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
         assert config.effective_verify_env == config.verify_env
 
-    def test_effective_verify_env_merges_sccache_backend(self):
+    def test_effective_verify_env_merges_sccache_backend(self, monkeypatch, tmp_path):
+        # Isolate from the ambient dark-factory-orchestrator.yaml, which the
+        # autouse _isolate_orch_config fixture pins ORCH_CONFIG_PATH at: its
+        # verify_env block merges into any bare OrchestratorConfig and would
+        # add keys the exact-equality assertion below does not expect.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         config = OrchestratorConfig(
             verify_env={'RUSTC_WRAPPER': 'sccache'},
             sccache=SccacheConfig(enabled=True, backend_env={'SCCACHE_REDIS': 'redis://h:6379'}),

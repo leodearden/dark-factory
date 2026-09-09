@@ -333,6 +333,12 @@ bypass (§5) and a **docs-only** commit landing under index-lock contention
 in the machine-operated main checkout (see `OPERATIONS.md` §"Working in
 the main checkout").
 
+These gates are the **floor**. The **bar** is `docs/code-quality.md` — the
+single normative definition of code quality (quality as the cost and risk of
+the next change, fourteen named heuristics, and the comment and test
+stances). Reviewers cite its heuristics by name; a change can pass every gate
+above and still be correctly rejected against it.
+
 ---
 
 ## 5. Git workflow
