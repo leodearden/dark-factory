@@ -49,7 +49,13 @@ from typing import Any, Literal, NamedTuple, get_args
 
 from fastmcp.server.middleware import Middleware
 
-from shared.uuid_prefix import PrefixToken, find_prefix_tokens
+# From ``fastmcp.tools.base``, which is where ``Middleware.on_call_tool``'s own
+# return annotation imports it from. NOT ``fastmcp.tools.tool``: that path is a
+# runtime-only backward-compat shim, so it imports fine but type-checks as
+# reportMissingImports.
+from fastmcp.tools.base import ToolResult
+
+from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute
 
 __all__ = [
     'FACT_OUTCOMES',
@@ -224,6 +230,60 @@ ProjectFor = Callable[[Mapping[str, Any]], str | None]
 Sink = Callable[[dict[str, Any]], Any | Awaitable[Any]]
 
 
+class _Planned(NamedTuple):
+    """One token SITE, with its resolution and the action the matrix chose.
+
+    The unit of the guard's second phase. Resolution happens per distinct
+    token because a store walk is expensive; everything after it happens per
+    site, because an edit and its fact describe a place in the argument map.
+    """
+
+    token: PrefixToken
+    resolution: Resolution
+    action: PrefixAction
+
+
+def _field(token: PrefixToken) -> str:
+    """The top-level argument name a token sits under.
+
+    The FLAT vocabulary C3's fact table names, and the same key the markup
+    guard's stream calls ``param``, so the two stay queryable the same way.
+    Depth is carried by the structured ``path`` beside it, never by encoding
+    it into this string.
+    """
+    return str(token.path[0])
+
+
+def _agent_id(arguments: Mapping[str, Any]) -> str | None:
+    """The agent this call attributes itself to, or ``None``. Never guessed.
+
+    Middleware sits above the tool bodies and has no equivalent of
+    fused-memory's ``_resolve_identity(ctx)``; all this layer has is the
+    call's own arguments. A non-string value yields ``None``: a caller that
+    sent a dict where a name belongs has not identified itself.
+    """
+    value = arguments.get('agent_id')
+    return value if isinstance(value, str) else None
+
+
+def _substitution_record(planned: _Planned) -> dict[str, Any]:
+    """One entry of ``meta.uuid_prefix_repair.substitutions``.
+
+    Carries BOTH ``field`` and ``path``: the flat name because C3's fact
+    vocabulary names it, and the structured list because that is what a
+    consumer needs to locate a nested edit without parsing anything
+    (heuristic 12).
+    """
+    candidate = planned.resolution.candidates[0]
+    return {
+        'field': _field(planned.token),
+        'path': list(planned.token.path),
+        'from': planned.token.token,
+        'to': candidate.id,
+        'namespace': candidate.namespace,
+    }
+
+
 class UuidPrefixGuardMiddleware(Middleware):
     """Resolve and police truncated-uuid prefixes at the FastMCP boundary.
 
@@ -289,6 +349,11 @@ class UuidPrefixGuardMiddleware(Middleware):
         event-loop thread for every call the factory makes. The INV-8 bound on
         that scan is stated in ``shared.uuid_prefix``'s module docstring.
         """
+        name = context.message.name
+        # The SAME dict object the tool will be called with, which is what
+        # makes the in-place write-back in :meth:`_expand` reach the tool. The
+        # ``or {}`` fallback can only produce a fresh dict for an empty
+        # argument map, and that map has no tokens and returns just below.
         arguments = context.message.arguments or {}
 
         tokens = find_prefix_tokens(arguments)
@@ -306,18 +371,11 @@ class UuidPrefixGuardMiddleware(Middleware):
             return await call_next(context)
 
         resolutions = await self._resolve(project, tokens)
-        actions = self._actions(context.message.name, resolutions)
-
-        # INERT. Read off the MATRIX rather than tested as ``outcome ==
-        # 'none'``: a second expression of the policy in the body is exactly
-        # what INV-1 forbids, because the two drift and only the declared one
-        # is checkable.
-        if all(action is PrefixAction.INERT for action in actions.values()):
+        plan = self._plan(name, tokens, resolutions)
+        if not plan:
             return await call_next(context)
 
-        raise NotImplementedError(
-            'the substitute / reject / forward arms land with their own steps'
-        )
+        return await self._deliver(context, call_next, name, arguments, project, plan)
 
     # -- resolution -------------------------------------------------------
 
@@ -361,20 +419,34 @@ class UuidPrefixGuardMiddleware(Middleware):
             return ToolClass.FORWARD_ON_AMBIGUITY
         return ToolClass.DEFAULT
 
-    def _actions(
-        self, name: str, resolutions: Mapping[str, Resolution]
-    ) -> dict[str, PrefixAction]:
-        """The declared action for each resolved token, straight off the matrix.
+    def _plan(
+        self,
+        name: str,
+        tokens: tuple[PrefixToken, ...],
+        resolutions: Mapping[str, Resolution],
+    ) -> tuple[_Planned, ...]:
+        """Pair each token SITE with its resolution and the action the matrix chose.
 
-        Per TOKEN, not per call: one call can cite one id that resolves
-        uniquely and another that is ambiguous, and the policy has something
-        different to say about each.
+        Per site and in document order, not per call: one call can cite an id
+        that resolves uniquely and another that is ambiguous, and the policy
+        has something different to say about each.
+
+        `none` sites are dropped HERE, and this is the only place the guard
+        discards a token — so every arm downstream operates on citations that
+        actually resolved and none of them has to re-check for the inert case.
+        An empty plan IS the inert outcome. Note that it is read off the
+        MATRIX rather than tested as ``outcome == 'none'``: a second
+        expression of the policy in the body is exactly what INV-1 forbids,
+        because the two drift and only the declared one is checkable.
         """
         tool_class = self._tool_class(name)
-        return {
-            token: POLICY_MATRIX[(resolution.outcome, tool_class)]
-            for token, resolution in resolutions.items()
-        }
+        planned = []
+        for token in tokens:
+            resolution = resolutions[token.token]
+            action = POLICY_MATRIX[(resolution.outcome, tool_class)]
+            if action is not PrefixAction.INERT:
+                planned.append(_Planned(token, resolution, action))
+        return tuple(planned)
 
     # -- the injected channels --------------------------------------------
 
@@ -405,3 +477,122 @@ class UuidPrefixGuardMiddleware(Middleware):
             )
             return None
         return result
+
+    # -- delivery ---------------------------------------------------------
+
+    async def _deliver(self, context, call_next, name, arguments, project, plan):
+        """Perform the actions the matrix chose. It decides; this executes.
+
+        Facts are emitted BEFORE the outcome is delivered, so a tool body that
+        raises cannot take the record of what the guard did down with it.
+        """
+        unimplemented = {p.action for p in plan} - {PrefixAction.SUBSTITUTE_AND_FORWARD}
+        if unimplemented:
+            raise NotImplementedError(f'no arm yet for {sorted(unimplemented)}')
+
+        report: dict[str, Any] = {}
+        expansions = tuple(p for p in plan if p.action is PrefixAction.SUBSTITUTE_AND_FORWARD)
+        if expansions:
+            report['substitutions'] = [_substitution_record(p) for p in expansions]
+
+        for planned in expansions:
+            await self._emit_fact(
+                name, planned, outcome='expanded',
+                agent_id=_agent_id(arguments), project=project,
+            )
+
+        self._expand(arguments, expansions)
+        return await self._forward(context, call_next, report)
+
+    @staticmethod
+    def _expand(arguments: dict[str, Any], expansions: tuple[_Planned, ...]) -> None:
+        """Apply every substitution, then write the result back IN PLACE.
+
+        REVERSE document order. ``substitute`` is span-exact against offsets
+        that an earlier replacement in the same string would have invalidated,
+        so folding from the back leaves every remaining span untouched. The
+        alternative — re-scanning after each replacement — costs a second
+        linear pass and can see different tokens once an expansion has landed.
+
+        The write-back is a clear-and-update on the SAME dict object rather
+        than a rebind. MEASURED (``mcp_markup_middleware``): ``call_next``
+        re-reads the arguments off the context, so mutating that object is
+        what actually reaches the tool; assigning a new dict to a local would
+        report a substitution that never happened.
+        """
+        if not expansions:
+            return
+        repaired: Any = arguments
+        for planned in reversed(expansions):
+            repaired = substitute(repaired, planned.token, planned.resolution.candidates[0].id)
+        arguments.clear()
+        arguments.update(repaired)
+
+    @staticmethod
+    async def _forward(context, call_next, report: dict[str, Any]):
+        """Let the call through and fold the report into ``meta``.
+
+        The report rides on ``meta`` and NEVER on ``structured_content`` or an
+        extra content block. Both alternatives are ruled out by measurement:
+        a middleware-authored ``structured_content`` fails the tool's own
+        output schema, and an appended content block corrupts any caller that
+        indexes ``content[0]``.
+
+        FOLDED into whatever meta came back rather than replacing it —
+        ``call_next``'s result already carries ``{'fastmcp': {'wrap_result':
+        True}}``, and discarding FastMCP's own signalling to deliver ours
+        would be a poor trade.
+        """
+        result = await call_next(context)
+        meta = dict(result.meta or {})
+        meta['uuid_prefix_repair'] = report
+        return ToolResult(
+            content=result.content,
+            structured_content=result.structured_content,
+            meta=meta,
+        )
+
+    # -- facts (INV-2) ----------------------------------------------------
+
+    async def _emit_fact(
+        self,
+        tool: str,
+        planned: _Planned,
+        *,
+        outcome: FactOutcome,
+        agent_id: str | None,
+        project: str,
+    ) -> None:
+        """Emit one ``uuid_prefix_detected``, and never change an outcome.
+
+        ONE builder for every arm, so the contracted key set cannot drift
+        between them. The record is COMPLETE even where the answer is
+        ``None``: ``namespace`` is present and null for a cross-namespace
+        ambiguity and for an unreachable store, so a consumer never has to
+        tell "no single namespace" apart from "that arm forgot the key".
+
+        Logged at INFO, not WARNING. `expanded` is the DESIGNED success path —
+        the same measurement that keeps it out of :data:`STORM_COUNTED_OUTCOMES`
+        — and a warning per success teaches a reader to ignore the channel.
+        The two fail-soft arms log their own WARNING beside this record.
+        """
+        candidates = planned.resolution.candidates
+        namespaces = {candidate.namespace for candidate in candidates}
+        fact = {
+            'fact': FACT_UUID_PREFIX_DETECTED,
+            'tool': tool,
+            'field': _field(planned.token),
+            'token': planned.token.token,
+            'outcome': outcome,
+            'candidate_ids': [candidate.id for candidate in candidates],
+            'namespace': next(iter(namespaces)) if len(namespaces) == 1 else None,
+            'agent_id': agent_id,
+            'project': project,
+        }
+        logger.info(
+            'uuid prefix guard: %s tool=%s field=%s token=%s candidates=%r project=%r',
+            outcome, tool, fact['field'], fact['token'], fact['candidate_ids'], project,
+        )
+        if self._fact_sink is None:
+            return
+        await self._call_sink(self._fact_sink, fact, 'fact')
