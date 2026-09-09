@@ -1784,7 +1784,9 @@ def test_code_quality_doc_pairs_every_invariant_with_its_canonical_slug() -> Non
         f"{_repo_relative(NORMATIVE_DOC)} is the only place a slug is defined "
         f"— either renumber the citation to match it, or the slug was "
         f"respelled or retired there and this doc's citation needs the same "
-        f"treatment."
+        f"treatment, or the citation used a shorthand prefix (e.g. `INV-4 "
+        f"storm-escape`) — ordinary prose may do that, but a mapping pinned "
+        f"for correctness may not, so spell the slug in full."
     )
 
 
@@ -2504,6 +2506,21 @@ def test_alias_pairs_not_in_family_flags_a_module_local_numbering_scheme() -> No
 
     assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
     assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_filters_per_pair_not_all_or_nothing() -> None:
+    """Per-pair filtering, not all-or-nothing — pins order preservation too.
+
+    MEASURED gap: every other test in this section passes a single-element
+    `pairs` list, so an all-or-nothing mutant (`return list(pairs) if
+    any((n, t) not in family for ...) else []`) survives every one of them.
+    Mirrors `test_near_miss_alias_pairs_is_asymmetric_in_the_number` above,
+    which pins the equivalent per-pair property for the lenient sibling.
+    """
+    clean = _pair(2, "structured-facts-at-failure")
+    drift = _pair(2, "no-silent-fail-soft", line=3)
+
+    assert alias_pairs_not_in_family([clean, drift], _ALIAS_FIXTURE_FAMILY) == [drift]
 
 
 def test_alias_pairs_not_in_family_fails_loudly_on_an_empty_family() -> None:
