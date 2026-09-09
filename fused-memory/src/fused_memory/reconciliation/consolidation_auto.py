@@ -300,6 +300,50 @@ def _is_incumbent(record: object, topic: str) -> bool:
     return metadata.get('canonical') is True and metadata.get('topic') == topic
 
 
+def _member_categories(
+    proposal: AutoProposal,
+    members: Mapping[str, Mapping[str, Any] | None | _Unreadable],
+) -> list[tuple[str, str]]:
+    """``(member_id, category)`` for every readable NON-incumbent member with one.
+
+    One home, because two rules read it: ``mixed_category`` fires when these
+    span more than one value, and ``canonical_category_mismatch`` compares the
+    incumbent against the single value they share. Two independent walks would
+    let those two rules disagree about which records they were talking about.
+
+    A member with NO category is skipped rather than counted as a distinct one:
+    an unstamped record predates the vocabulary rather than contradicting it,
+    and refusing on absence would refuse most older clusters.
+    """
+    pairs: list[tuple[str, str]] = []
+    for member_id in proposal.member_ids:
+        record = members.get(member_id)
+        if record is None or isinstance(record, _Unreadable):
+            continue
+        if _is_incumbent(record, proposal.topic):
+            continue
+        category = _metadata(record).get('category')
+        if isinstance(category, str):
+            pairs.append((member_id, category))
+    return pairs
+
+
+def _slug_jaccard(left: str, right: str) -> float:
+    """Token overlap of two topic slugs: ``|A n B| / |A u B|``.
+
+    ``topic_slug.TOPIC_SLUG_RE`` already guarantees a slug is lowercase
+    alphanumeric segments joined by single hyphens, so ``str.split('-')`` IS the
+    tokenizer. Writing a second one here would be a second rule about what a
+    slug is, and the two would drift.
+    """
+    left_tokens = set(left.split('-'))
+    right_tokens = set(right.split('-'))
+    union = left_tokens | right_tokens
+    if not union:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(union)
+
+
 def _member_hazards(
     proposal: AutoProposal,
     members: Mapping[str, Mapping[str, Any] | None | _Unreadable],
@@ -323,7 +367,6 @@ def _member_hazards(
     like two.
     """
     reasons: list[AutoReason] = []
-    categorised: list[tuple[str, str]] = []
 
     for member_id in proposal.member_ids:
         record = members.get(member_id)
@@ -409,10 +452,7 @@ def _member_hazards(
                     ),
                 )
 
-            category = metadata.get('category')
-            if isinstance(category, str):
-                categorised.append((member_id, category))
-
+    categorised = _member_categories(proposal, members)
     distinct = {category for _, category in categorised}
     if len(distinct) > 1:
         reasons.append(
@@ -425,6 +465,133 @@ def _member_hazards(
                 ),
             ),
         )
+
+    return reasons
+
+
+def _canonical_hazards(
+    proposal: AutoProposal,
+    members: Mapping[str, Mapping[str, Any] | None | _Unreadable],
+    canonical_count: int | None,
+) -> list[AutoReason]:
+    """Refusals about the topic's own canonical — the canonical half of rung 2.
+
+    HONEST BOUNDARY, stated rather than papered over: the incumbent-level codes
+    are reportable only when the proposal NAMES the incumbent. C2 gives this
+    function per-member reads plus a count and no way to read a record the
+    proposal did not name, so a canonical outside the member list is covered by
+    *canonical_count* alone. That is not a gap in practice — PRD B2/B4 both put
+    the incumbent in the member list, because an LLM re-proposing a topic
+    enumerates its canonical — and PRD D14 already assigns the residue, a stale
+    incumbent carrying no banner, to the human sitting rather than to code.
+    """
+    reasons: list[AutoReason] = []
+
+    if canonical_count is None:
+        # Fail closed. Zero is the MINT path, so reading "I could not find out"
+        # as "there is none" is exactly how a topic gets a second canonical.
+        reasons.append(
+            AutoReason(
+                code=AutoReasonCode.canonical_count_unavailable,
+                detail=(
+                    f'the number of canonicals for topic `{proposal.topic}` could '
+                    'not be determined; an unknown count is not a count of zero'
+                ),
+            ),
+        )
+    elif canonical_count > 1:
+        # Canonical uniqueness ships in WARN mode (`memory_metadata.enforce` is
+        # False, task 3626), so the count is probed rather than assumed.
+        reasons.append(
+            AutoReason(
+                code=AutoReasonCode.multiple_canonicals,
+                detail=(
+                    f'topic `{proposal.topic}` already has {canonical_count} '
+                    'canonicals; which one is authoritative is not decidable here'
+                ),
+            ),
+        )
+
+    categories = {category for _, category in _member_categories(proposal, members)}
+    sole_category = next(iter(categories)) if len(categories) == 1 else None
+
+    for member_id in proposal.member_ids:
+        record = members.get(member_id)
+        if not _is_incumbent(record, proposal.topic):
+            continue
+
+        metadata = _metadata(record)
+        present = sorted(key for key in CORRECTION_METADATA_KEYS if key in metadata)
+        banner = CORRECTION_BANNER_RE.search(_content(record)) is not None
+        if present or banner:
+            found = ', '.join(present) if present else 'a correction banner in its body'
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.canonical_carries_correction,
+                    ids=(member_id,),
+                    detail=(
+                        f'{member_id}, the canonical of topic `{proposal.topic}`, is '
+                        f'itself corrected or superseded ({found}); consolidating '
+                        'around it would build on a retracted index entry'
+                    ),
+                ),
+            )
+
+        category = metadata.get('category')
+        if sole_category is not None and isinstance(category, str) and category != sole_category:
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.canonical_category_mismatch,
+                    ids=(member_id,),
+                    detail=(
+                        f'{member_id} indexes topic `{proposal.topic}` under category '
+                        f'{category}, but its members are {sole_category}'
+                    ),
+                ),
+            )
+
+    return reasons
+
+
+def _slug_hazards(
+    proposal: AutoProposal,
+    existing_canonical_slugs: Sequence[str],
+    threshold: float,
+) -> list[AutoReason]:
+    """Refusals about the topic slug itself — the slug half of rung 2.
+
+    Two slugs that mean the same thing split one topic across two canonicals,
+    and nothing sweeps the split afterwards.
+    """
+    reasons: list[AutoReason] = []
+
+    for slug in existing_canonical_slugs:
+        # LOAD-BEARING SKIP. On every re-emission the topic ALREADY has a
+        # canonical, so its own slug is necessarily in this list and its
+        # self-Jaccard is 1.0. Without the skip the hazard fires on every
+        # tag-only refresh, PASS_TAG_ONLY becomes unreachable, and the predicate
+        # refuses precisely the case it was built for (PRD B2). The skip lives
+        # here rather than in the caller because task delta's executor and the
+        # task-theta migration script assemble this list independently, and
+        # either could forget it.
+        if slug == proposal.topic:
+            continue
+
+        ratio = _slug_jaccard(slug, proposal.topic)
+        # `>=`, not `>`: the fail-closed reading of C2's "above a config
+        # threshold". At the exact boundary a human gate costs one sitting,
+        # while a wrong auto-mint splits a topic permanently.
+        if ratio >= threshold:
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.slug_near_collision,
+                    detail=(
+                        f'proposed topic `{proposal.topic}` overlaps existing topic '
+                        f'`{slug}` at Jaccard {ratio:.2f} (threshold {threshold}); '
+                        'they may be one topic under two names'
+                    ),
+                ),
+            )
 
     return reasons
 
@@ -505,7 +672,13 @@ def evaluate_auto_predicate(
     # stamp a retracted record into that topic's scroll. A FAIL is not
     # actionable, so it carries no retained or stripped ids — the reasons name
     # every record involved, which is what the human sitting reads.
-    hazards = _member_hazards(proposal, members)
+    # One flat concatenation, so collecting every offender is structural rather
+    # than remembered: no arm can short-circuit another.
+    hazards = [
+        *_member_hazards(proposal, members),
+        *_canonical_hazards(proposal, members, canonical_count),
+        *_slug_hazards(proposal, existing_canonical_slugs, config.slug_collision_jaccard),
+    ]
     if hazards:
         return AutoVerdict(
             outcome=AutoOutcome.FAIL,
