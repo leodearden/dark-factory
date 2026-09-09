@@ -1670,9 +1670,12 @@ def _run_gate(
         full_env.pop('CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY', None)
     else:
         full_env['CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY'] = probe_py or sys.executable
-        full_env['CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY'] = (
-            probe_py or sys.executable
-        )
+        # NOT `probe_py`: that seam is item 1's, and the tests that pass one
+        # pass a STUB INTERPRETER that ignores its script and prints a canned
+        # item-1 report. Pointing item 5 at it would measure item 1's stub
+        # under item 5's marker, so item 5 would fail for a reason that has
+        # nothing to do with the triage module the repo carries.
+        full_env['CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY'] = sys.executable
     return subprocess.run(
         [str(script)],
         capture_output=True,
@@ -2415,7 +2418,9 @@ class TestVerdictReadingIsNotRaceProne:
         cannot reach (one in the probe itself). Build the fixture repo once and
         re-run only the gate.
         """
-        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        repo = _make_gate_repo(
+            tmp_path, judge='by_id', triage=_TRIAGE_CONSUMES, eval_src='fixed',
+        )
         gate = repo / 'scripts' / _GATE_SCRIPT.name
         verdicts = []
         for _ in range(30):
