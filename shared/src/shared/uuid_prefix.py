@@ -41,9 +41,10 @@ dependency to reach it. The module is not re-exported from
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any, NamedTuple
 
-__all__ = ['PrefixToken', 'find_prefix_tokens']
+__all__ = ['PrefixToken', 'find_prefix_tokens', 'substitute']
 
 
 #: The PRD §4-C1 grammar as ONE compiled expression. Both lookbehinds are
@@ -123,3 +124,59 @@ def _scan(value: str, path: tuple[str | int, ...]) -> list[PrefixToken]:
         PrefixToken(path=path, token=m.group(), start=m.start(), end=m.end())
         for m in _PREFIX_RE.finditer(value)
     ]
+
+
+def substitute(arguments: Mapping[str, Any], token: PrefixToken, full_id: str) -> dict[str, Any]:
+    """Return *arguments* with *token*'s span replaced by *full_id*.
+
+    MONOTONE, and enforced here rather than trusted: *full_id* must have
+    ``token.token`` as a prefix, or this raises ``ValueError`` naming both
+    values. That check is not decoration, it is what makes the design safe to
+    deploy. A wrong expansion under this rule is still VISIBLE in the stored
+    text and REVERSIBLE by truncation, because every character the author
+    actually wrote is still there. A replacement free to drop them would be
+    silent information loss that no reader downstream could detect. This
+    function is the only door through which that could happen, so the
+    invariant is enforced at the door (heuristic 10).
+
+    A PATH COPY, not a deep copy: only the containers along ``token.path`` are
+    rebuilt — O(depth), not O(size) — and every untouched substructure is
+    shared with the input by reference.
+
+    The input is NEVER mutated. The guard depends on that: the original
+    argument map is its fallback when a later token in the same call turns out
+    to be ambiguous or unresolvable, which is what makes "forwarded unchanged"
+    structurally true rather than incidental.
+
+    Single-token by design. Applying several is the caller's fold in REVERSE
+    document order, which keeps every remaining span valid without re-scanning;
+    a batch API would need its own ordering contract for no gain.
+    """
+    if not full_id.startswith(token.token):
+        raise ValueError(
+            f'refusing a non-monotone substitution: {full_id!r} does not start with '
+            f'the token it would replace, {token.token!r}. An expansion must keep the '
+            f'original characters so that a wrong one stays visible and reversible.'
+        )
+    trail: list[tuple[Any, str | int]] = []
+    node: Any = arguments
+    for key in token.path:
+        trail.append((node, key))
+        node = node[key]
+    rebuilt: Any = node[: token.start] + full_id + node[token.end :]
+    for container, key in reversed(trail):
+        rebuilt = _with_child(container, key, rebuilt)
+    return rebuilt
+
+
+def _with_child(container: Any, key: str | int, child: Any) -> Any:
+    """A shallow copy of *container* with one slot replaced.
+
+    Shallow is the point: every sibling comes across by reference, so the copy
+    costs O(width of this one node) and nothing deeper is touched.
+    """
+    if isinstance(key, int):
+        copied = list(container)
+        copied[key] = child
+        return copied
+    return {**container, key: child}
