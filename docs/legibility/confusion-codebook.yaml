@@ -892,6 +892,12 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: Escalation asserts diagnosis ('xdist-bare-crash-veto-misroute') but cites 'existing remediation effort (tasks 4176/4384/4405)' that steward explicitly states do not exist. Diagnosis rests on phantom evidence.
+  - date: '2026-09-08'
+    project: dark_factory
+    session: task-4892-resume-sysprompt-correction
+    origin_phase: implement
+    manifested_phase: verify
+    note: 'CORRECTION (task 4892). Supersedes the 2026-08-10 sighting (session e16af1c5-de98-4252-8504-ce5d13bee3d6) on this entry: the present-tense wording above describes the PRE-FIX state and is FALSE on main. Task 3983 (merged 03ff70c5dd, 2026-08-10) hoisted the system-prompt write out of the resume branch, so `--system-prompt-file` is now emitted UNCONDITIONALLY in `shared/src/shared/cli_invoke.py::build_claude_argv` (outside the `if resume_session_id:` branch), and `shared/src/shared/cli_invoke.py::invoke_claude_agent`''s docstring states the system prompt is re-passed on resume. The superseded note''s anchors were doubly unusable: its bare `cli_invoke.py:1170-1171` / `:2170` line pins had rotted, AND the bare filename is path-ambiguous — the file is under `shared/`, not `orchestrator/` — so both are repointed here as symbol references per CLAUDE.md''s `path/to/module.py::symbol` convention rather than as a third generation of line numbers. This annotates history and does NOT retract the 2026-08-10 finding, which was true when made; only its present tense has expired. The entry''s own thesis (a diagnosis asserted as documented fact without verification) is untouched.'
 - id: merge-state-not-git-corroborated
   title: Merge-lane state answers come from run-scoped caches and persisted snapshots that diverge from git truth
   severity: high
@@ -23184,3 +23190,16 @@ candidates:
     origin_phase: verify
     manifested_phase: verify
     evidence_quote: Hit the 22-min wall (exit 124), and the pipe swallowed the output — my mistake. Rather than re-run 19k tests blindly, let me target the actual regression surface of my diff.
+- id: cand-20260908-31
+  title: Unqualified lettered option back-reference across documents that each own their own a/b/c list
+  cause: 'A cross-document back-reference cites bare option letters (e.g. "the (b)/(c) refutations") without naming which document''s list owns them. When both documents independently letter their options a/b/c, a reader in document order binds the letters to the WRONG list — the one they have already read — and concludes that a still-live decision was already refuted, closing an open task as unactionable. The failure is silent: both documents are internally consistent and correct, so nothing is wrong to find in either one; the defect exists only in the unqualified reference between them, and it bites hardest when the ambiguous citation PRECEDES the live mandate in document order. Remedy: scope every cross-document letter to its owning list, and add the reciprocal clause at the cited-from site so the disambiguation works from either entry point.'
+  area: cross-document reference integrity
+  first_seen: '2026-09-08'
+  disposition: pending
+  sightings:
+  - date: '2026-09-08'
+    project: dark_factory
+    session: task-4892-lettered-option-collision
+    origin_phase: prd
+    manifested_phase: architect
+    evidence_quote: '`plans/reify-flag-marker-backlog-rca-2026-07-22.md` §6a.3''s ADDENDUM 2026-08-17 closes with "Full ruling, dated census and the (b)/(c) refutations: `docs/flag-marker-sweep-recurring.md` §"Decision (task 3923)"." Those (b)/(c) are the linked document''s own list, about the retired `--check` gate. But §5 of the SAME document owns an unrelated "Optional hardening" a/b/c whose b and c are the two edits carried by task 2917 (measured `pending`), and §6a.5 records that mandate — three lines AFTER the ambiguous citation. A reader going top to bottom meets the "refutations" first and concludes 2917''s ratified work was already refuted. The same bullet''s earlier "retired (option a)" is the same collision: that "a" is the linked document''s, while §6a.5''s "Option a" is §5''s. Filed as esc-2917-2 by task 2917''s architect.'
