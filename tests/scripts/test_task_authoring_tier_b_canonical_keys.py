@@ -55,6 +55,14 @@ silent by design) is orthogonal to this invariant and is not contradicted by it:
 this guard constrains the Canonical column only. Parser BEHAVIOUR for the
 individual keys is pinned by ``shared/tests/test_task_metadata.py``; neither
 implies the other.
+
+MARKER-SPAN EXTRACTION IS SHARED (task 4999). The begin/end marker-count and
+inversion assertions, and the slice between them, used to be a near-verbatim
+copy of the same machinery in ``test_task_authoring_blessed_keys_drift.py``
+(task 3780); both now call ``task_authoring_marker_span.marked_span``. This
+guard's OWN extraction of the table content — the Canonical column's
+backticked names — stays here, unmerged with that guard's fenced-listing
+extraction.
 """
 from __future__ import annotations
 
@@ -63,6 +71,7 @@ import re
 
 import pytest
 from shared.task_metadata import _BLESSED_METADATA_KEYS
+from task_authoring_marker_span import marked_span
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -90,6 +99,10 @@ def _table_rows(markdown_text):
     after the Tier-B heading"). A positional match quietly guards nothing the
     moment the section is renamed, reordered, or gains a second table; an
     explicit marker fails loudly instead, and the failure names what to restore.
+    The marker-count/inversion/slice machinery itself is shared with the
+    task-3780 guard next door via ``task_authoring_marker_span.marked_span``
+    (task 4999) — everything below the ``marked_span`` call is this guard's OWN
+    table-content extraction, which stays here rather than in the shared module.
 
     Every failure is a loud ``AssertionError`` naming the marker literal and the
     doc, never a ``[]``/``None`` return. That is the vacuity hazard and the whole
@@ -97,32 +110,15 @@ def _table_rows(markdown_text):
     downstream green while pinning nothing at all — strictly worse than having no
     guard, because the suite still reports success.
     """
-    begin_count = markdown_text.count(MARKER_BEGIN)
-    assert begin_count == 1, (
-        f"expected exactly one {MARKER_BEGIN!r} marker in docs/task-authoring.md, "
-        f"found {begin_count} (task 4303). This marker opens the Tier-B table "
-        f"whose Canonical column must be Tier-A blessed. If it was deleted, "
-        f"restore it immediately above that table; if it was duplicated, one of "
-        f"the two tables is unpinned and free to drift."
+    marked = marked_span(
+        markdown_text,
+        MARKER_BEGIN,
+        MARKER_END,
+        doc_path="docs/task-authoring.md",
+        task="task 4303",
+        label="Tier-B",
+        content="the Tier-B table",
     )
-    end_count = markdown_text.count(MARKER_END)
-    assert end_count == 1, (
-        f"expected exactly one {MARKER_END!r} marker to close {MARKER_BEGIN!r} in "
-        f"docs/task-authoring.md, found {end_count} (task 4303) — restore the "
-        f"closing marker immediately below the Tier-B table, and ABOVE the "
-        f"qualifying paragraphs, which are deliberately outside the marker."
-    )
-
-    begin_at = markdown_text.index(MARKER_BEGIN)
-    end_at = markdown_text.index(MARKER_END)
-    assert begin_at < end_at, (
-        f"the Tier-B markers are INVERTED in docs/task-authoring.md: "
-        f"{MARKER_END!r} appears before {MARKER_BEGIN!r} (task 4303). Swap them "
-        f"back around the table — as written they delimit an empty span and this "
-        f"guard would pin nothing."
-    )
-
-    marked = markdown_text[begin_at + len(MARKER_BEGIN):end_at]
     rows = [
         line.strip()
         for line in marked.splitlines()

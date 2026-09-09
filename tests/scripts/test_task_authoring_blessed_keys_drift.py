@@ -45,6 +45,13 @@ exception, the ``cross_repo`` explanation, the ``execution_class`` note) are
 deliberately outside the marker and unpinned, and this guard must not be extended
 to them. Parser BEHAVIOUR is pinned by ``shared/tests/test_task_metadata.py``;
 neither implies the other.
+
+MARKER-SPAN EXTRACTION IS SHARED (task 4999). The begin/end marker-count and
+inversion assertions, and the slice between them, used to be a near-verbatim
+copy of the same machinery in ``test_task_authoring_tier_b_canonical_keys.py``
+(task 4303); both now call ``task_authoring_marker_span.marked_span``. This
+guard's OWN extraction of the fenced content — the comma-separated key list —
+stays here, unmerged with that guard's markdown-table extraction.
 """
 from __future__ import annotations
 
@@ -52,6 +59,7 @@ import pathlib
 
 import pytest
 from shared.task_metadata import _BLESSED_METADATA_KEYS
+from task_authoring_marker_span import marked_span
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -73,6 +81,10 @@ def _documented_blessed_keys(markdown_text):
     block after the Tier-A heading"). A positional match quietly guards nothing
     the moment the section is renamed, reordered, or gains a second fence; an
     explicit marker fails loudly instead, and the failure names what to restore.
+    The marker-count/inversion/slice machinery itself is shared with the
+    task-4303 guard next door via ``task_authoring_marker_span.marked_span``
+    (task 4999) — everything below the ``marked_span`` call is this guard's OWN
+    fence-content extraction, which stays here rather than in the shared module.
 
     Every failure is a loud ``AssertionError`` naming the marker literal and the
     doc, never a ``[]``/``None`` return. That is the vacuity hazard and the whole
@@ -83,33 +95,18 @@ def _documented_blessed_keys(markdown_text):
     Returns the names in DOCUMENT ORDER (a list, not a set) so the caller can
     also detect an accidental double-entry, which set equality alone cannot see.
     """
-    begin_count = markdown_text.count(MIRROR_BEGIN)
-    assert begin_count == 1, (
-        f"expected exactly one {MIRROR_BEGIN!r} marker in docs/task-authoring.md, "
-        f"found {begin_count} (task 3780). This marker opens the fenced Tier-A "
-        f"listing that mirrors _BLESSED_METADATA_KEYS in "
-        f"shared/src/shared/task_metadata.py. If it was deleted, restore it "
-        f"immediately above that fence; if it was duplicated, one of the two "
-        f"listings is unpinned and free to drift."
+    marked = marked_span(
+        markdown_text,
+        MIRROR_BEGIN,
+        MIRROR_END,
+        doc_path="docs/task-authoring.md",
+        task="task 3780",
+        label="Tier-A mirror",
+        content=(
+            "the fenced Tier-A listing that mirrors _BLESSED_METADATA_KEYS in "
+            "shared/src/shared/task_metadata.py"
+        ),
     )
-    end_count = markdown_text.count(MIRROR_END)
-    assert end_count == 1, (
-        f"expected exactly one {MIRROR_END!r} marker to close {MIRROR_BEGIN!r} in "
-        f"docs/task-authoring.md, found {end_count} (task 3780) — restore the "
-        f"closing marker immediately below the fenced Tier-A listing, and above "
-        f"the explanatory paragraphs, which are deliberately outside the marker."
-    )
-
-    begin_at = markdown_text.index(MIRROR_BEGIN)
-    end_at = markdown_text.index(MIRROR_END)
-    assert begin_at < end_at, (
-        f"the Tier-A mirror markers are INVERTED in docs/task-authoring.md: "
-        f"{MIRROR_END!r} appears before {MIRROR_BEGIN!r} (task 3780). Swap them "
-        f"back around the fenced listing — as written they delimit an empty span "
-        f"and this guard would pin nothing."
-    )
-
-    marked = markdown_text[begin_at + len(MIRROR_BEGIN):end_at]
 
     # Strip the fence delimiter lines; everything between them is the listing.
     # Keeping this tolerant (bare names, wrapped across lines, no per-line
