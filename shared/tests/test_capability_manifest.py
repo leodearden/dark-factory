@@ -1751,8 +1751,9 @@ class TestMechanicalCheckKinds:
         assert MECHANICAL_CHECK_KINDS == ('grep', 'script', 'path')
 
     def test_is_derived_from_the_delivered_check_meta_literal(self):
-        assert MECHANICAL_CHECK_KINDS == get_args(
-            DeliveredCheckMeta.model_fields['kind'].annotation
+        assert (
+            get_args(DeliveredCheckMeta.model_fields['kind'].annotation)
+            == MECHANICAL_CHECK_KINDS
         )
 
     def test_does_not_contain_manual(self):

@@ -23,7 +23,7 @@ comment at the bottom of this module).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from shared.task_metadata import register_metadata_submodel
 
 __all__ = [
+    'MECHANICAL_CHECK_KINDS',
     'CapabilityManifestDoc',
     'DeliveredCheck',
     'DeliveredCheckMeta',
@@ -374,6 +375,9 @@ class DeliveredCheckMeta(_CheckFieldsBase):
     failed). Shares :class:`DeliveredCheck`'s descriptor fields (via
     :class:`_CheckFieldsBase`) and per-kind cross-field validation (via
     :func:`_check_kind_conditional_fields`).
+
+    This ``kind`` Literal is the definition of "mechanical" — see
+    :data:`MECHANICAL_CHECK_KINDS`, which derives from it.
     """
 
     name: str = Field(min_length=1)
@@ -392,6 +396,28 @@ class DeliveredCheckMeta(_CheckFieldsBase):
             timeout_secs=self.timeout_secs,
         )
         return self
+
+
+MECHANICAL_CHECK_KINDS: tuple[str, ...] = get_args(
+    DeliveredCheckMeta.model_fields['kind'].annotation
+)
+"""The check kinds the automated gate evaluates — everything but ``'manual'``.
+
+DERIVED from :class:`DeliveredCheckMeta`'s ``kind`` Literal rather than
+restated, because "mechanical" is not an independent concept that happens
+to coincide with that vocabulary — it IS that vocabulary, definitionally:
+mechanical means "copied into ``metadata.delivered_checks``", and
+:class:`DeliveredCheckMeta` is precisely the model of a metadata entry. So
+the two can never drift, and adding a kind is a one-place edit.
+
+Deriving from :class:`DeliveredCheckMeta` and not :class:`DeliveredCheck`
+is load-bearing: the latter also carries ``'manual'``, the one kind that
+must never be copied into metadata.
+
+Consumers: ``fused-memory``'s ``manifest_stamping`` copy filter and
+``scripts/audit_combine_gate_marker_loss.py``'s sweep, both of which
+previously hand-kept their own copy of the tuple.
+"""
 
 
 # The one sanctioned shared/ registration call (deploy_state.py precedent):
