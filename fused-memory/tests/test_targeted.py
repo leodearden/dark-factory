@@ -2471,6 +2471,59 @@ class TestSweepCancelledDescendants:
             f'Expected the exception text in the journal row, got: {detail!r}'
         )
 
+    @pytest.mark.asyncio
+    async def test_block_status_rejection_reports_nothing_and_skips_the_stamp(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog,
+    ):
+        """A refused block must not be reported, and must not stamp metadata.
+
+        This is the inverse of the dropped-stamp defect and the more damaging
+        direction: targeted.py::_unblock_veto_reason vetoes an unblock on
+        ``parent_cancelled`` / ``needs_recheck_against_main``, so stamping
+        them onto a task that was never blocked silently parks a live task
+        that nothing subsequently unparks.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+        mock_interceptor.set_task_status = AsyncMock(return_value=_backlog_rejection())
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+        blocks = self._descendant_actions(result, 'descendant_blocked')
+        assert not blocks, (
+            f'Nothing landed, so the sweep must report no block -- matching its '
+            f'own exception path; got: {blocks}'
+        )
+
+        mock_interceptor.update_task.assert_not_called()
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the rejected block'
+
+        status_skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert len(status_skips) == 1, (
+            f'Expected exactly one skip/set_task_status row, got: {status_skips}'
+        )
+        detail = status_skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
+        assert detail.get('parent_id') == 'A', f'Expected parent_id="A", got: {detail!r}'
+        assert detail.get('type') == 'descendant_block', f'got: {detail!r}'
+        assert detail.get('error') == 'ReconciliationBacklogExceeded', (
+            f'Expected the stable error_type code, got: {detail!r}'
+        )
+
+        stamp_skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        assert not stamp_skips, (
+            f'The metadata write was never attempted, so it must leave no row; '
+            f'got: {stamp_skips}'
+        )
+
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
 # Scenario shared via _fm_helpers.make_8df8_scenario (str ids, status='in-progress').
