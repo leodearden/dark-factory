@@ -13511,6 +13511,9 @@ async def test_maybe_remediate_logs_phantom_cited_drop_under_its_own_event(
     assert getattr(record, 'finding_category', None) == phantom_finding['category']
     assert getattr(record, 'description', None) == phantom_finding['description']
     citation_failures = getattr(record, 'citation_failures', None)
+    assert citation_failures is not None, (
+        'phantom-cited drop log record is missing citation_failures'
+    )
     assert citation_failures[0]['reason'] == 'memory_not_found'
     assert citation_failures[0]['memory_id'] == 'mem-gone-1'
 
