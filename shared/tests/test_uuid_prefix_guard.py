@@ -238,12 +238,22 @@ class _FakeResolver:
     instead of inferred from the number of facts.
     """
 
-    def __init__(self, answers: Mapping[str, guard.Resolution]) -> None:
+    def __init__(
+        self,
+        answers: Mapping[str, guard.Resolution],
+        raises: Mapping[str, Exception] | None = None,
+    ) -> None:
         self.answers = dict(answers)
+        # A resolver that can only ever ANSWER is not the port. INV-11 turns on
+        # the difference between a store that held nothing and a store that
+        # could not be reached, and only a fake that can fail can express it.
+        self.raises = dict(raises or {})
         self.calls: list[tuple[str | None, str]] = []
 
     async def __call__(self, project: str | None, prefix: str) -> guard.Resolution:
         self.calls.append((project, prefix))
+        if prefix in self.raises:
+            raise self.raises[prefix]
         return self.answers.get(prefix, NO_MATCH)
 
     @property
@@ -282,6 +292,7 @@ class Harness:
 def build_harness(
     *,
     answers: Mapping[str, guard.Resolution] | None = None,
+    raises: Mapping[str, Exception] | None = None,
     project_for: Callable[[Mapping[str, Any]], str | None] | None = None,
     **guard_kwargs: Any,
 ) -> Harness:
@@ -361,7 +372,7 @@ def build_harness(
         rec.record('delete_memory', memory_id=memory_id, store=store, project_id=project_id)
         return 'deleted'
 
-    resolver = _FakeResolver(answers or {})
+    resolver = _FakeResolver(answers or {}, raises)
     guard_kwargs.setdefault('fact_sink', facts.append)
     guard_kwargs.setdefault('escalation_sink', escalations.append)
     mcp.add_middleware(
@@ -1229,5 +1240,192 @@ class TestTheStormEscape:
             with pytest.raises(ToolError):
                 await h.call('add_memory', {'content': f'see {AMB}', 'project_id': PROJECT})
         results = await drive_forwards(h, 2)
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# B12 / INV-11 — the resolver could not be reached.
+# ---------------------------------------------------------------------------
+#
+# The guard's ONLY degraded path, and the one ruling that is not negotiable: a
+# boundary guard that turns a store outage into lost writes is worse than the
+# defect it exists to fix. So an outage is never a rejection and never
+# silence — it is a forward, said out loud on meta.
+
+OUTAGE = 'mem0'
+
+
+def outage_harness(**guard_kwargs: Any) -> Harness:
+    return build_harness(
+        raises={BFF: guard.ResolverUnavailable(OUTAGE), AMB: guard.ResolverUnavailable(OUTAGE)},
+        project_for=project_of,
+        **guard_kwargs,
+    )
+
+
+class TestB12ResolverUnavailable:
+    CALL = {
+        'content': f'the {BFF} record already answers this',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    async def test_the_tool_received_its_arguments_unchanged(self) -> None:
+        h = outage_harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == self.CALL['content']
+
+    async def test_meta_says_unavailable_and_names_the_failed_store(self) -> None:
+        """"The resolver is down" is not actionable; "mem0 is down" is."""
+        h = outage_harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+
+    async def test_one_fact_with_outcome_resolver_unavailable(self) -> None:
+        """No candidates were ever enumerated, so the record says so."""
+        h = outage_harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.facts == [
+            detection_fact(
+                outcome='resolver_unavailable',
+                candidate_ids=[],
+                namespace=None,
+            )
+        ]
+
+    async def test_the_storm_counter_records_it(self) -> None:
+        h = outage_harness(time_provider=_Clock())
+        for _ in range(3):
+            result = await h.call('add_memory', dict(self.CALL))
+        repair = repair_of(result) or {}
+        assert repair['storm'] == {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'outcome': 'resolver_unavailable',
+            'project': PROJECT,
+        }
+
+    async def test_an_outage_never_becomes_a_refusal_on_a_reject_class_tool(self) -> None:
+        """add_memory is DEFAULT class, whose ambiguity cell is a rejection.
+
+        An outage must not borrow that cell: the guard never learned whether
+        the citation was ambiguous at all.
+        """
+        h = outage_harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert len(h.recorder.calls) == 1
+
+    async def test_an_outage_never_becomes_a_refusal_on_a_forward_class_tool(self) -> None:
+        h = outage_harness(forward_on_ambiguity_tools=frozenset({'update_task'}))
+        await h.call('update_task', update_call())
+        assert len(h.recorder.calls) == 1
+
+
+class TestAnOutageAbandonsAnAlreadyResolvedExpansion:
+    """The hardest case, and the whole reason the phases are split.
+
+    The first token resolved UNIQUE; the second raised. Interleaved, the
+    expansion for the first would already be sitting in the argument map by
+    the time the outage was discovered — so a call the guard reports as
+    "forwarded unchanged" would have been silently rewritten.
+    """
+
+    CALL = {
+        'content': f'{F1C} supersedes {BFF}',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(
+            answers={F1C: unique(F1C_FULL)},
+            raises={BFF: guard.ResolverUnavailable(OUTAGE)},
+            project_for=project_of,
+        )
+
+    async def test_the_arguments_are_byte_identical_to_what_was_submitted(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert h.recorder.args['content'] == f'{F1C} supersedes {BFF}'
+
+    async def test_meta_reports_only_the_outage(self) -> None:
+        """No `substitutions` key claiming an expansion that was abandoned."""
+        h = self.harness()
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+
+    async def test_no_expanded_fact_is_emitted_for_the_abandoned_token(self) -> None:
+        h = self.harness()
+        await h.call('add_memory', dict(self.CALL))
+        assert [f['outcome'] for f in h.facts] == ['resolver_unavailable']
+
+
+class TestAResolverBugIsNotAnOutage:
+    """A coding bug in the resolver must be LOUD, not absorbed as degradation.
+
+    ``ResolverUnavailable`` and only that type means "the store could not be
+    reached". Catching anything wider would let a TypeError in the resolver
+    present itself for months as an intermittent store outage, and the
+    difference is exactly what an operator would be paged on.
+    """
+
+    async def test_a_bare_runtime_error_propagates(self) -> None:
+        h = build_harness(
+            raises={BFF: RuntimeError('resolver bug: prefix was never validated')},
+            project_for=project_of,
+        )
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_memory', {'content': f'see {BFF}', 'project_id': PROJECT}
+            )
+
+    async def test_the_tool_never_ran(self) -> None:
+        h = build_harness(
+            raises={BFF: RuntimeError('resolver bug')}, project_for=project_of
+        )
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_memory', {'content': f'see {BFF}', 'project_id': PROJECT}
+            )
+        assert h.recorder.calls == []
+
+    async def test_it_is_not_recorded_as_an_outage(self) -> None:
+        h = build_harness(
+            raises={BFF: RuntimeError('resolver bug')}, project_for=project_of
+        )
+        with pytest.raises(ToolError):
+            await h.call(
+                'add_memory', {'content': f'see {BFF}', 'project_id': PROJECT}
+            )
+        assert h.facts == []
+        assert h.escalations == []
+
+
+class TestTheTwoFailSoftOutcomesDoNotPool:
+    """The cross-outcome half of the storm keying (the row deferred at step 17).
+
+    Two forwarded ambiguities and two outages in the same project must not
+    fire: one counter whose window spans every event regardless of label would
+    fire on the fourth and name an outcome that saw only two.
+    """
+
+    async def test_four_interleaved_fail_soft_calls_do_not_fire(self) -> None:
+        h = build_harness(
+            answers={AMB: AMBIGUOUS},
+            raises={BFF: guard.ResolverUnavailable(OUTAGE)},
+            forward_on_ambiguity_tools=frozenset({'update_task'}),
+            project_for=project_of,
+            time_provider=_Clock(),
+        )
+        results = []
+        for index in range(2):
+            results.append(await h.call('update_task', update_call(index)))
+            results.append(
+                await h.call(
+                    'add_memory', {'content': f'see {BFF}', 'project_id': PROJECT}
+                )
+            )
         assert all('storm' not in (repair_of(r) or {}) for r in results)
         assert h.escalations == []
