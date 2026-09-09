@@ -36,6 +36,7 @@ from unittest.mock import patch
 
 import pytest
 from _escalation_http import escalation_http_call
+from _escalation_seed import seed_escalation
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition
 
@@ -68,24 +69,22 @@ def _seed(
     *,
     level: int,
     task_id: str,
-    agent_role: str = 'implementer',
+    summary: str | None = None,
     **kw: Any,
 ) -> Escalation:
-    """Seed a pending escalation at *level* directly via ``queue.submit()``,
-    bypassing the MCP tools entirely (mirrors test_server.py's ``_seed_esc``
-    and test_capability_guard_http.py's ``_seed``)."""
-    kw.setdefault('severity', 'blocking')
-    kw.setdefault('category', 'scope_violation')
-    kw.setdefault('summary', f'status-authority-gate test escalation (level={level})')
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=agent_role,
-        level=level,
-        **kw,
-    )
-    queue.submit(esc)
-    return esc
+    """Seed a pending escalation at *level*, labelled for THIS module.
+
+    A one-call delegation to ``_escalation_seed.seed_escalation``. The only
+    thing it still owns is this module's default summary, and that is
+    load-bearing: the C1-C4 tests share one module-scoped ``EscalationQueue``,
+    so the summary is what names the seeding module when a cross-test
+    interference failure surfaces a record (pinned by
+    ``TestSeedDefaultSummary``). ``severity``, ``category``, ``agent_role`` and
+    every other ``Escalation`` field are the shared helper's business and can
+    still be overridden via **kw."""
+    if summary is None:
+        summary = f'status-authority-gate test escalation (level={level})'
+    return seed_escalation(queue, level=level, task_id=task_id, summary=summary, **kw)
 
 
 class TestSeedDefaultSummary:

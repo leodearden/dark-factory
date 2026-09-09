@@ -40,6 +40,7 @@ from typing import Any
 
 import pytest
 from _escalation_http import escalation_http_call
+from _escalation_seed import seed_escalation
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
@@ -61,19 +62,27 @@ from escalation.queue import EscalationQueue
 # once in ``_serve_escalation_mcp_impl``, with its regression test in
 # ``test_serve_escalation_mcp_fixture.py``.
 #
-# Both halves of the harness are now shared, and neither has a second copy
-# (task 4345 finished what 3736 started, per INV-5). The SERVER-LIFECYCLE half
-# comes from ``conftest.py``'s ``serve_escalation_mcp_module``; the CALL half
-# from ``_escalation_http.escalation_http_call``, a uniquely-named sibling
-# module rather than a conftest fixture because a plain function is not a
-# fixture and would be unreachable from the module-level ``async def`` partials
-# below. Those partials survive on purpose: each is a single delegation
-# carrying no header logic, no transport construction and no protocol
-# knowledge, so there is nothing left that could drift -- what they still carry
-# is per-tool intent in their docstrings, which a shared module could not state
-# without making one docstring serve two different arguments. The single-source
-# property is asserted, not merely asserted-to:
-# ``test_escalation_http_helper.py`` AST-scans this directory for it.
+# All THREE halves of the harness now live exactly once, none with a second
+# copy (tasks 3736 / 4345 / 4997, per INV-5). The SERVER-LIFECYCLE half comes
+# from ``conftest.py``'s ``serve_escalation_mcp_module``; the CALL half from
+# ``_escalation_http.escalation_http_call``; the SEEDING half from
+# ``_escalation_seed.seed_escalation``. The latter two are uniquely-named
+# sibling modules rather than conftest fixtures because a plain function is not
+# a fixture and would be unreachable from the module-level ``async def``
+# partials and ``_seed`` below.
+#
+# Those local adapters survive on purpose: each is a single delegation carrying
+# no header logic, no transport construction, no protocol knowledge and no
+# record construction, so there is nothing left that could drift -- what they
+# still carry is one per-module fact each (the partials' per-tool intent in
+# their docstrings; ``_seed``'s default summary), which a shared module could
+# not state without making one docstring serve two different arguments.
+#
+# For the CALL half the single-source property is asserted, not merely
+# asserted-to: ``test_escalation_http_helper.py`` AST-scans this directory for
+# it. There is deliberately no equivalent scan for the seeding half -- see
+# ``test_escalation_seed_helper.py``'s docstring for why that precedent does
+# not transfer.
 # ---------------------------------------------------------------------------
 
 
@@ -131,27 +140,22 @@ def _seed(
     *,
     level: int,
     task_id: str,
-    agent_role: str = 'implementer',
+    summary: str | None = None,
     **kw: Any,
 ) -> Escalation:
-    """Seed a pending escalation at *level* directly via ``queue.submit()``.
+    """Seed a pending escalation at *level*, labelled for THIS module.
 
-    Bypasses the MCP tools entirely (mirrors the ``_seed_esc`` helper in
-    test_server.py). ``severity``/``category``/``summary`` default to
-    innocuous values but can be overridden via **kw.
+    A one-call delegation to ``_escalation_seed.seed_escalation``. The only
+    thing it still owns is this module's default summary, and that is
+    load-bearing: every test here shares one module-scoped ``EscalationQueue``,
+    so the summary is what names the seeding module when a cross-test
+    interference failure surfaces a record (pinned by ``TestHarnessSanity``).
+    ``severity``, ``category``, ``agent_role`` and every other ``Escalation``
+    field are the shared helper's business and can still be overridden via **kw.
     """
-    kw.setdefault('severity', 'blocking')
-    kw.setdefault('category', 'scope_violation')
-    kw.setdefault('summary', f'capability-guard test escalation (level={level})')
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=agent_role,
-        level=level,
-        **kw,
-    )
-    queue.submit(esc)
-    return esc
+    if summary is None:
+        summary = f'capability-guard test escalation (level={level})'
+    return seed_escalation(queue, level=level, task_id=task_id, summary=summary, **kw)
 
 
 async def _resolve_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
