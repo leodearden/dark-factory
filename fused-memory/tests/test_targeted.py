@@ -2349,6 +2349,17 @@ class TestSweepCancelledDescendants:
         }]}
 
     @staticmethod
+    def _cancel_branch_tasks() -> dict:
+        """B is a deterministic orphan (spawned_from + escalation_id, no
+        surviving declared files) → cancel branch."""
+        return {'tasks': [{
+            'id': 'B', 'status': 'pending', 'title': 'review-followup',
+            'metadata': {'spawned_from': 'A', 'escalation_id': 'esc-A-1'},
+            'dependencies': [],
+            'subtasks': [],
+        }]}
+
+    @staticmethod
     async def _sweep_cancelled_parent(wired_reconciler, project_root) -> dict:
         return await wired_reconciler.reconcile_task(
             task_id='A', transition='cancelled',
@@ -2567,6 +2578,48 @@ class TestSweepCancelledDescendants:
         for operation in ('set_task_status', 'update_task'):
             skips = await self._taskmaster_rows(journal, 'skip', operation)
             assert not skips, f'Expected no skip/{operation} rows, got: {skips}'
+
+    @pytest.mark.asyncio
+    async def test_cancel_status_rejection_reports_nothing(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        tmp_path, caplog,
+    ):
+        """The adjacent cancel branch had the identical unclassified shape.
+
+        `_sweep_cancel_orphan` returned `descendant_cancelled` whether or not
+        the flip landed, so a refused cancel read as a completed one.
+        """
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._cancel_branch_tasks())
+        mock_interceptor.set_task_status = AsyncMock(return_value=_backlog_rejection())
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+
+        cancels = self._descendant_actions(result, 'descendant_cancelled')
+        assert not cancels, (
+            f'Nothing landed, so the sweep must report no cancel; got: {cancels}'
+        )
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the rejected cancel'
+
+        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        assert len(skips) == 1, (
+            f'Expected exactly one skip/set_task_status row, got: {skips}'
+        )
+        detail = skips[0]['detail']
+        assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
+        assert detail.get('type') == 'descendant_cancel', (
+            f'Expected the cancel-branch discriminator, got: {detail!r}'
+        )
+        assert detail.get('error') == 'ReconciliationBacklogExceeded', (
+            f'Expected the stable error_type code, got: {detail!r}'
+        )
 
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
