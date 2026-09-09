@@ -7789,6 +7789,224 @@ class TestCuratorMaybeRouteDeterministic:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# task-5007 RED: TestOperationalRegistryLazyLoadRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestOperationalRegistryLazyLoadRunsOffEventLoop:
+    """Tests that _maybe_route_deterministic's one-shot lazy registry load
+    runs OFF the event-loop thread. Mirrors
+    TestBlocklistLazyLoadRunsOffEventLoop / TestPremiseGuardRunsOffEventLoop
+    (task 4201).
+
+    Candidates here are deliberately UNTAGGED (no execution_class) so they
+    match via the title/description substring fallback — a tagged
+    'operational'/'decision' candidate is skipped by match_candidate
+    entirely (task delta demotion; see TestCuratorMaybeRouteDeterministic
+    above) and would make these tests vacuous.
+    """
+
+    async def test_operational_registry_load_runs_off_event_loop(self, tmp_path):
+        """RED: the one-shot lazy operational-ask registry load must be offloaded.
+
+        Delegates to the REAL load_operational_registry (captured before
+        patching) rather than stubbing a return value: a stub returning []
+        would make the thread-identity assertion vacuous by short-circuiting
+        at ``if not entries: return None`` before ever reaching
+        match_candidate, and would not exercise a genuine route decision.
+        """
+        import threading
+
+        from fused_memory.middleware.operational_ask_registry import (
+            load_operational_registry as real_load_operational_registry,
+        )
+
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        loop_thread_id = threading.get_ident()
+        load_threads: list[int] = []
+
+        def recording_load(path):
+            load_threads.append(threading.get_ident())
+            return real_load_operational_registry(path)
+
+        with patch(
+            "fused_memory.middleware.operational_ask_registry.load_operational_registry",
+            side_effect=recording_load,
+        ):
+            decision1 = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert load_threads and all(tid != loop_thread_id for tid in load_threads)
+        assert len(load_threads) == 1  # lazy load, at most once per instance
+        assert decision1 is not None and decision1.action == "route_deterministic"
+        assert decision2 is not None and decision2.action == "route_deterministic"
+
+    async def test_concurrent_first_calls_both_see_loaded_registry(self, tmp_path):
+        """GUARD (expected GREEN already): concurrent first calls must not
+        observe a half-loaded registry.
+
+        Locks a property that already holds on the current branch (the
+        attempted flag is set BEFORE the synchronous load, so two gathered
+        first calls cannot interleave) against the obvious wrong fix for the
+        sibling RED test above. Uses a slow load_operational_registry
+        wrapper (sleeps inside the worker thread) to force the second
+        concurrent call to enter while the first load is still in flight.
+        Reachable per TestBlocklistLazyLoadRunsOffEventLoop's own docstring:
+        TaskInterceptor._get_curator memoises a single TaskCurator with no
+        project key while TaskInterceptor._curator_lock is keyed
+        per-project.
+        """
+        import time
+
+        from fused_memory.middleware.operational_ask_registry import (
+            load_operational_registry as real_load_operational_registry,
+        )
+
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        load_call_count = 0
+
+        def slow_load(path):
+            nonlocal load_call_count
+            load_call_count += 1
+            time.sleep(0.05)  # yields the loop; runs on the to_thread worker
+            return real_load_operational_registry(path)
+
+        with patch(
+            "fused_memory.middleware.operational_ask_registry.load_operational_registry",
+            side_effect=slow_load,
+        ):
+            d1, d2 = await asyncio.gather(
+                curator._maybe_route_deterministic(candidate, candidate.payload_hash()),
+                curator._maybe_route_deterministic(candidate, candidate.payload_hash()),
+            )
+
+        assert d1 is not None and d1.action == "route_deterministic"
+        assert d2 is not None and d2.action == "route_deterministic"
+        assert load_call_count == 1
+
+    async def test_operational_registry_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """RED: a registry load that RAISES must fail OPEN, not escape, and
+        must not latch into a permanent failure.
+
+        Today, _maybe_route_deterministic's lazy-load block has no
+        try/except at all: a load_operational_registry raise escapes as-is,
+        violating this method's own "Never raises" docstring — and
+        curate()/curate_batch_prepared call it unguarded, so the escape
+        fails the whole task submission.
+
+        Injects the raise directly via side_effect rather than a non-UTF-8
+        file — see the equivalent blocklist test's rationale (task-4483
+        collision-risk note in plan.json): this targets asyncio.to_thread's
+        own raise path, which no loader-internal except can ever cover.
+        """
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        load_calls = 0
+
+        def counting_raise(path):
+            nonlocal load_calls
+            load_calls += 1
+            raise RuntimeError("boom")
+
+        with patch(
+            "fused_memory.middleware.operational_ask_registry.load_operational_registry",
+            side_effect=counting_raise,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        # "operational-ask" + "failing open" is the exact text the shared
+        # load helper's except block emits — narrower than "failing"
+        # appearing somewhere, which would stay green even if this WARNING
+        # were deleted and some unrelated warning fired instead.
+        fail_open_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "failing open" in r.getMessage()
+            and "operational-ask" in r.getMessage()
+        ]
+        assert len(fail_open_records) == 1
+
+    async def test_relative_path_without_cwd_warns_naming_config_key(self, caplog):
+        """Behaviour-preservation pin: a relative operational_ask_registry_path
+        with no cwd resolves against the process CWD and logs a WARNING
+        naming the config key so an operator can identify which field to
+        make absolute. Green today (task_curator.py
+        _maybe_route_deterministic's lazy-load block); must stay green once
+        this branch moves into the shared _LazyRegistry._resolve.
+        """
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(operational_ask_registry_path="relative/registry.yaml")
+        curator = TaskCurator(config=config, taskmaster=None, cwd=None)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        assert any(
+            "operational_ask_registry_path" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # task-2085 step-9 RED: TestCuratorCurateRouteDeterministicIntegration
 # ──────────────────────────────────────────────────────────────────────────────
 
