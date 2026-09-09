@@ -61,6 +61,11 @@ _BARE_STR_SPELLING = 'bare outcome str'
 #: The finding a hard-coded attach position earns. It has to be distinguishable
 #: from "no designation channel exists": the remedies are different.
 _DID_NOT_TRACK = 'did not track the designated candidate'
+#: A run in which the module RECORDED a fail-open is not evidence of
+#: consumption — it is evidence the designation was swallowed. Detected
+#: structurally, from the counter, and reported with its count.
+_FAIL_OPEN = 'FAIL-OPEN'
+_ONE_FAIL_OPEN = 'FAIL-OPEN (1 recorded)'
 
 #: The option-(a) wire shapes a fix might land. None may be pinned by the
 #: probe: option (a) has not landed, so a probe that required one spelling
@@ -182,3 +187,27 @@ class TestConsumptionProbe:
         proc = _run_probe(src_root)
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         assert _PASS in proc.stdout, proc.stdout
+
+    def test_a_fail_open_is_not_evidence_of_consumption(self, tmp_path):
+        """The catastrophic false pass.
+
+        This is what main does TODAY with a designating verdict: the payload is
+        not in TRIAGE_OUTCOMES, a fail-open is recorded, and the write returns
+        BandDecision(stored, None, ...). That canonical_id of None is not the
+        band's top-1 either, so a naive "did the attach avoid the band
+        canonical?" check reads it as CONSUMED — and authorises the production
+        write_triage.enabled flip on a codebase where nothing changed at all.
+
+        The diagnosis matters as much as the verdict: "the designation was
+        swallowed" and "no designation channel exists" send an operator to
+        different remedies, so the report must attribute this to the fail-open
+        and name the count it measured.
+        """
+        src_root = write_fake_triage(
+            tmp_path / 'src', variant='fail_opens_on_designation',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS not in proc.stdout, proc.stdout
+        assert _FAIL_OPEN in proc.stdout, proc.stdout
+        assert _ONE_FAIL_OPEN in proc.stdout, proc.stdout

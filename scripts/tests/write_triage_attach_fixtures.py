@@ -401,6 +401,53 @@ triage_write = _make_designating_triage_write(_decode, _attach_last)
 '''
 
 
+#: main's ACTUAL response to a designating verdict today, and the catastrophic
+#: false pass this whole item has to survive: the payload trips
+#: `verdict not in TRIAGE_OUTCOMES`, a fail-open is recorded, and the write
+#: returns BandDecision(stored, None, ...). That canonical_id of None is not the
+#: band's top-1 either, so a naive "did the attach avoid the band canonical?"
+#: check reads it as CONSUMED and authorises the production flag flip on a
+#: codebase where nothing changed at all.
+#:
+#: isinstance-guarded rather than main's bare membership test, deliberately: an
+#: unhashable payload must reach the FAIL-OPEN arm here instead of raising, or
+#: this variant would measure the raise rather than the fail-open it exists to
+#: isolate. `band_top1` keeps main's unguarded spelling.
+_FAIL_OPENS_ON_DESIGNATION = r'''
+
+async def triage_write(memory_service, *, content, project_id, counter,
+                       judge=None, allow_near_duplicate=False,
+                       caller_owns_attach_keys=False):
+    if _forced(allow_near_duplicate, caller_owns_attach_keys):
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+    decision, candidates = await _band_and_candidates(
+        memory_service, content, project_id, counter,
+    )
+    if decision.outcome != OUTCOME_JUDGE:
+        return decision
+    verdict = await (judge or _stub_judge)(
+        memory_service=memory_service,
+        content=content,
+        project_id=project_id,
+        decision=decision,
+        candidates=candidates,
+    )
+    if not isinstance(verdict, str) or verdict not in TRIAGE_OUTCOMES:
+        _record_fail_open(
+            counter, project_id,
+            ValueError('judge returned %r' % (verdict,)),
+            stage='judge',
+        )
+        return BandDecision(
+            OUTCOME_STORED, None, None, decision.t_high, decision.t_low,
+        )
+    canonical_id = None if verdict == OUTCOME_STORED else decision.canonical_id
+    return BandDecision(
+        verdict, canonical_id, decision.similarity, decision.t_high, decision.t_low,
+    )
+'''
+
+
 #: variant name -> the ``triage_write`` that defines it. Appended to
 #: :data:`TRIAGE_PREAMBLE` by :func:`write_fake_triage`.
 VARIANT_TAILS: dict[str, str] = {
@@ -409,6 +456,7 @@ VARIANT_TAILS: dict[str, str] = {
     'consumes_designated_dict': _CONSUMES_DICT,
     'consumes_designated_object': _CONSUMES_OBJECT,
     'hardcodes_last_candidate': _HARDCODES_LAST,
+    'fail_opens_on_designation': _FAIL_OPENS_ON_DESIGNATION,
 }
 
 
