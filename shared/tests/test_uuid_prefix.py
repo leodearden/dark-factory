@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from shared.uuid_prefix import PrefixToken, find_prefix_tokens
+from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute
 
 # A 31-hex run: the INCLUSIVE upper bound of the grammar.
 HEX31 = 'bff81530aacc4f1e9d2b7c6a5e4d3f0'
@@ -293,3 +293,122 @@ def test_deep_nesting_does_not_raise_recursion_error() -> None:
     found = find_prefix_tokens({'root': node})
     assert len(found) == 1
     assert found[0].token == 'bff81530'
+
+
+# --- substitute: span-exact, non-mutating, monotone ---------------------
+
+FULL_BFF = 'bff81530-1c2d-4e3f-a5b6-7c8d9e0f1a2b'
+FULL_8BE = '8bec9cd6-2d3e-4f50-b6c7-8d9e0f1a2b3c'
+FULL_F1C = 'f1c4a651-3e4f-4051-c7d8-9e0f1a2b3c4d'
+FULL_B7B = 'b7b0f63b-4f50-4162-d8e9-0f1a2b3c4d5e'
+
+
+def test_substitute_replaces_only_the_span() -> None:
+    arguments = {'content': 'before bff81530 after'}
+    token = find_prefix_tokens(arguments)[0]
+    result = substitute(arguments, token, FULL_BFF)
+    assert result['content'] == f'before {FULL_BFF} after'
+
+
+def test_substitute_leaves_an_adjacent_second_token_byte_identical() -> None:
+    """Only the named span moves; a sibling token in the same string does not."""
+    arguments = {'content': 'f1c4a651/b7b0f63b'}
+    first, second = find_prefix_tokens(arguments)
+    assert (first.token, second.token) == ('f1c4a651', 'b7b0f63b')
+    result = substitute(arguments, first, FULL_F1C)
+    assert result['content'] == f'{FULL_F1C}/b7b0f63b'
+
+
+def test_substitute_does_not_mutate_its_input() -> None:
+    arguments = {
+        'content': 'see bff81530',
+        'metadata': {'cluster_memory_ids': ['8bec9cd6', FULL_BFF]},
+    }
+    before = copy.deepcopy(arguments)
+    substitute(arguments, find_prefix_tokens(arguments)[0], FULL_BFF)
+    assert arguments == before
+
+
+def test_substitute_returns_a_new_object_at_the_tokens_path() -> None:
+    arguments = {'metadata': {'cluster_memory_ids': ['8bec9cd6', FULL_BFF]}}
+    token = find_prefix_tokens(arguments)[0]
+    result = substitute(arguments, token, FULL_8BE)
+    assert result is not arguments
+    assert result['metadata'] is not arguments['metadata']
+    assert result['metadata']['cluster_memory_ids'] is not arguments['metadata']['cluster_memory_ids']
+
+
+def test_substitute_shares_untouched_substructures_by_identity() -> None:
+    """A PATH COPY, not a deep copy: only the containers on the route are rebuilt."""
+    untouched = {'deep': ['no identifiers here']}
+    arguments = {'content': 'see bff81530', 'other': untouched}
+    result = substitute(arguments, find_prefix_tokens(arguments)[0], FULL_BFF)
+    assert result['other'] is untouched
+
+
+def test_substitute_at_a_nested_path_leaves_siblings_untouched() -> None:
+    """PRD boundary row B8: index 0 expands, the full uuid at index 1 does not."""
+    arguments = {'metadata': {'cluster_memory_ids': ['8bec9cd6', FULL_BFF]}}
+    token = find_prefix_tokens(arguments)[0]
+    assert token.path == ('metadata', 'cluster_memory_ids', 0)
+    result = substitute(arguments, token, FULL_8BE)
+    assert result['metadata']['cluster_memory_ids'] == [FULL_8BE, FULL_BFF]
+
+
+# --- monotonicity: the safety property ----------------------------------
+
+
+def test_result_has_the_original_token_as_a_prefix_of_the_replacement() -> None:
+    """The MONOTONE invariant, stated positively.
+
+    A wrong expansion stays visible in the stored text and reversible by
+    truncation; a non-prefix replacement would be silent information loss.
+    """
+    arguments = {'content': 'see bff81530 here'}
+    token = find_prefix_tokens(arguments)[0]
+    result = substitute(arguments, token, FULL_BFF)
+    assert FULL_BFF.startswith(token.token)
+    assert result['content'][token.start :].startswith(token.token)
+
+
+@pytest.mark.parametrize(
+    'full_id',
+    [
+        pytest.param('c0ffee00-1c2d-4e3f-a5b6-7c8d9e0f1a2b', id='different-uuid'),
+        pytest.param('bff8153', id='truncation-not-expansion'),
+        pytest.param('', id='empty'),
+        pytest.param('BFF81530-1c2d-4e3f-a5b6-7c8d9e0f1a2b', id='case-changed'),
+    ],
+)
+def test_substitute_refuses_a_non_prefix_replacement(full_id: str) -> None:
+    """The one door that could destroy information is closed at the door."""
+    arguments = {'content': 'see bff81530 here'}
+    token = find_prefix_tokens(arguments)[0]
+    with pytest.raises(ValueError) as excinfo:
+        substitute(arguments, token, full_id)
+    message = str(excinfo.value)
+    assert token.token in message
+    assert repr(full_id) in message or full_id in message
+
+
+# --- ordering: reverse document order is what keeps spans valid ---------
+
+
+def test_two_substitutions_in_reverse_document_order_are_both_span_exact() -> None:
+    arguments = {'content': 'f1c4a651/b7b0f63b'}
+    first, second = find_prefix_tokens(arguments)
+    result = substitute(arguments, second, FULL_B7B)
+    result = substitute(result, first, FULL_F1C)
+    assert result['content'] == f'{FULL_F1C}/{FULL_B7B}'
+
+
+def test_forward_order_is_what_would_corrupt_the_second_span() -> None:
+    """Why step-14 folds in REVERSE order — pinned here as a property of the offsets.
+
+    Applying the earlier token first shifts every later offset by the length
+    the string grew, so the second token's recorded span no longer covers it.
+    """
+    arguments = {'content': 'f1c4a651/b7b0f63b'}
+    first, second = find_prefix_tokens(arguments)
+    after_first = substitute(arguments, first, FULL_F1C)
+    assert after_first['content'][second.start : second.end] != second.token
