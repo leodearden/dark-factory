@@ -35,6 +35,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -1557,6 +1558,51 @@ _GIT_ENV_ARGS = [
 #: `init.defaultBranch` the host git is configured with.
 _FIXTURE_REF = 'fixture-main'
 
+#: The budget the whole gate runs under in production, pinned by
+#: fused-memory/tests/server/test_write_triage_flip_gate_invariants.py::FLIP_GATE_DELIVERED_CHECK.
+#: A check that OVERRUNS it is ERRORED, and per docs/task-authoring.md §3.3 an
+#: ERRORED check is a fail-safe wait with NO streak bump and NO escalation —
+#: i.e. a SILENT indefinite hold on the dependent task. So the gate's worst case
+#: has to fit this number; the number is not widened to fit the gate.
+_DELIVERED_CHECK_TIMEOUT_SECS = 120
+
+#: What the gate SCRIPT itself must come in under. Strictly below the budget
+#: above, because that budget also covers the runner spawning and reaping the
+#: script: a gate that merely equalled it would ERROR on a busy host.
+_GATE_WORST_CASE_CEILING_SECS = 110
+
+#: The ONE knob both probes' `timeout` is built from, spelled as the gate
+#: spells it. Pinned rather than merely exercised: two probes bounded
+#: independently is exactly how a 120s budget silently becomes a 180s worst
+#: case, and nothing in a passing run would show it.
+_PROBE_TIMEOUT_KNOB = 'PROBE_TIMEOUT_SECS=45'
+
+
+def _hang_module(repo: Path, name: str) -> None:
+    """Replace one of the ref's probe subjects with a module that never returns.
+
+    Stands in for any hang inside code the probe EXECUTES — an import that
+    blocks, a judge call that never comes back. What the gate must do about it
+    is identical either way: kill it at the bound and fail the item closed.
+    """
+    module = (
+        repo / 'fused-memory' / 'src' / 'fused_memory' / 'server' / name
+    )
+    module.write_text('import time\ntime.sleep(600)\n')
+
+
+def _commit_all(repo: Path, message: str) -> None:
+    """Commit the fixture repo's working tree, so ``git archive`` sees it.
+
+    Every assertion in this file is made against a REF, so an edit that is not
+    committed is an edit the gate cannot read.
+    """
+    subprocess.run(['git', 'add', '-A', '-f'], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ['git', *_GIT_ENV_ARGS, 'commit', '-q', '-m', message],
+        cwd=repo, check=True, capture_output=True,
+    )
+
 # Item 2 greps for the frozenset being iterated directly; item 4 for the
 # self-overwriting markdown sibling. These two fixtures straddle both.
 _EVAL_FAILING = '''\
@@ -1825,25 +1871,19 @@ class TestFlipPreconditionsScript:
         ran-but-never-finished, which reaches a different record_fail site.
         """
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
-        # Shrink the gate's own `timeout 90` so the test does not take 90s.
+        # Shrink the gate's own bound so the test does not wait it out.
         gate = repo / 'scripts' / _GATE_SCRIPT.name
         gate_src = gate.read_text()
         # ASSERTED, not assumed: the bound is a tuning knob (its comment ties it
         # to the predicate's 120s budget). Retuned, this replacement becomes a
         # silent no-op — the test still passes, but only after the REAL timeout
         # elapses, which fits inside _run_gate's 240s and so degrades invisibly.
-        assert 'timeout 90' in gate_src, 'the gate no longer spells `timeout 90`'
-        gate.write_text(gate_src.replace('timeout 90', 'timeout 2'))
-        judge = (
-            repo / 'fused-memory' / 'src' / 'fused_memory' / 'server'
-            / 'write_triage_judge.py'
+        assert _PROBE_TIMEOUT_KNOB in gate_src, (
+            f'the gate no longer spells `{_PROBE_TIMEOUT_KNOB}`'
         )
-        judge.write_text('import time\ntime.sleep(600)\n')
-        subprocess.run(['git', 'add', '-A', '-f'], cwd=repo, check=True, capture_output=True)
-        subprocess.run(
-            ['git', *_GIT_ENV_ARGS, 'commit', '-q', '-m', 'hang'],
-            cwd=repo, check=True, capture_output=True,
-        )
+        gate.write_text(gate_src.replace(_PROBE_TIMEOUT_KNOB, 'PROBE_TIMEOUT_SECS=2'))
+        _hang_module(repo, 'write_triage_judge.py')
+        _commit_all(repo, 'hang')
         proc = _run_gate(gate, ref=_FIXTURE_REF)
         assert proc.returncode == 1, (
             f'the gate passed on a probe that never finished:\n{proc.stdout}'
@@ -2165,6 +2205,52 @@ class TestOneExtractionServesBothProbes:
         assert 'FAIL  item 1' in proc.stdout, proc.stdout
         tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
         assert 'FAILING ITEMS: 1 2 4 5' in tail, tail
+
+
+class TestBothProbesShareOneBudget:
+    """Two probes, one 120s delivered-check budget — measured, not asserted.
+
+    The gate's worst case is not the ref being unreadable; it is both probe
+    subjects HANGING, because that is the only outcome whose cost is a wall
+    clock rather than an exit status. Two probes bounded independently at
+    item 1's historical `timeout 90` spend 180s reaching the same verdict a
+    120s budget will not wait for — and overrunning does not FAIL the check,
+    it ERRORS it, which per docs/task-authoring.md §3.3 is a fail-safe wait
+    with no streak bump and no escalation. The dependent then waits silently
+    and forever, which is strictly worse than the clean FAIL the gate spent
+    all this machinery earning.
+
+    So the bound is measured behaviourally here rather than read off the
+    script: a shared knob that both probes are DERIVED from is the only thing
+    that makes the worst case addable, and only running it proves they are.
+    """
+
+    def test_both_probes_hanging_stays_inside_the_delivered_check_budget(
+        self, tmp_path,
+    ):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        _hang_module(repo, 'write_triage_judge.py')
+        _hang_module(repo, 'write_triage.py')
+        _commit_all(repo, 'both probe subjects hang')
+
+        started = time.monotonic()
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        elapsed = time.monotonic() - started
+
+        # Fail CLOSED, both items, each with its own verdict: a hang is an
+        # unverifiable invariant, and an unverifiable invariant is not a
+        # satisfied one.
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert f'FAIL  item 1  {_UNVERIFIABLE}' in proc.stdout, proc.stdout
+        assert f'{_ITEM5_FAIL}  {_UNVERIFIABLE}' in proc.stdout, proc.stdout
+        # ... and in time for anyone to read it.
+        assert elapsed < _GATE_WORST_CASE_CEILING_SECS, (
+            f'both probes hanging took {elapsed:.0f}s, against a '
+            f'{_DELIVERED_CHECK_TIMEOUT_SECS}s delivered-check budget. An '
+            f'overrunning check is ERRORED, not failed: the dependent waits '
+            f'silently and indefinitely instead of being told which item is '
+            f'unmet. Bound both probes from one knob sized so their sum fits.'
+        )
 
 
 class TestReportSurvivesTruncation:
