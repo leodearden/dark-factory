@@ -649,6 +649,115 @@ def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float
     return min(base + per_entry * size, cap)
 
 
+class _LazyRegistry:
+    """One-shot, off-loop lazy load of a YAML registry file.
+
+    Owns the ``(entries, attempted, lock)`` triple for exactly one registry
+    so the double-checked-lock + ``asyncio.to_thread`` + fail-open idiom
+    (see :meth:`entries`) exists once for all three curator guards
+    (:meth:`TaskCurator._maybe_blocklist_drop`,
+    :meth:`TaskCurator._maybe_route_deterministic`,
+    :meth:`TaskCurator._maybe_premise_refuted_drop`) instead of being copied
+    at each site. The idiom is subtle in exactly the way that punishes
+    copies: the attempted flag must latch AFTER the load settles and never
+    in a ``finally``, because ``asyncio.CancelledError`` is a
+    ``BaseException`` (task 4201).
+    """
+
+    def __init__(self, config_key: str, label: str) -> None:
+        # CuratorConfig field name for this registry's path — named in the
+        # relative-path-without-cwd WARNING so an operator knows which
+        # config field to make absolute.
+        self._config_key = config_key
+        # Short guard label ('blocklist' / 'operational-ask' / 'recon-premise')
+        # — named in the load-error WARNING so an operator knows which guard
+        # just went dark. Deliberately distinct from config_key: the two
+        # warnings name genuinely different things, and 'recon-premise' does
+        # not appear in 'recon_code_fix_premise_registry_path' (hyphen vs
+        # underscore), which an existing test asserts on verbatim.
+        self._label = label
+        # None means "not yet attempted"; [] means "loaded but empty or
+        # failed" — no hot-reload, a server restart is required to pick up
+        # YAML changes.
+        self._entries: list | None = None
+        self._attempted = False
+        # Guards the one-shot load. Needed because the load is offloaded via
+        # asyncio.to_thread: the await point means a concurrent caller could
+        # otherwise observe attempted=True while _entries is still None and
+        # silently fail the guard open. One TaskCurator instance is shared
+        # across projects while the interceptor's curator lock is
+        # per-project, so concurrent entry is reachable. asyncio.Lock() is
+        # loop-agnostic at construction on Python 3.13, so building it here
+        # in __init__ is safe.
+        self._lock = asyncio.Lock()
+
+    def _resolve(self, cfg_path: str, cwd: Path | None) -> Path:
+        """Resolve *cfg_path* against *cwd*, warning once when relative with no cwd."""
+        raw_path = Path(cfg_path)
+        if raw_path.is_absolute():
+            return raw_path
+        if cwd is not None:
+            return cwd / raw_path
+        logger.warning(
+            'task_curator: %s %r is relative but TaskCurator was constructed '
+            'without cwd — resolving against process CWD which may be '
+            'incorrect; use an absolute path in CuratorConfig',
+            self._config_key, cfg_path,
+        )
+        return raw_path
+
+    async def entries(
+        self, loader: Callable[[Path], list], cfg_path: str, cwd: Path | None,
+    ) -> list | None:
+        """Return this registry's parsed entries, loading at most once.
+
+        Offloaded via ``asyncio.to_thread`` so the blocking read/YAML-parse
+        work never stalls the event loop (INV-8
+        loop-thread-occupancy-bounded, docs/legibility/design-invariants.md).
+
+        Double-checked lock: the await point inside the offloaded load means
+        a concurrent second caller could otherwise observe attempted=True
+        while entries is still None and silently fail the guard open. The
+        outer unlocked check keeps the steady-state path (every call after
+        the first) lock-free; the inner re-check under the lock is what
+        makes concurrent first calls correct. The flag is set only AFTER the
+        assignment so nobody can observe the attempted-but-unassigned window.
+        """
+        if not self._attempted:
+            async with self._lock:
+                if not self._attempted:
+                    path = self._resolve(cfg_path, cwd)
+                    try:
+                        self._entries = await asyncio.to_thread(loader, path)
+                    except Exception as exc:
+                        # The loader documents "never raises", but
+                        # asyncio.to_thread adds a raise path (thread-pool
+                        # failure, or an exception type the loader's own
+                        # internal except does not cover — e.g. a registry
+                        # that is not valid UTF-8 raises UnicodeDecodeError,
+                        # a ValueError, not an OSError) that no loader-
+                        # internal except can ever cover. Fail OPEN (guard
+                        # disabled) rather than escaping into curate() /
+                        # curate_batch_prepared, which call the guard
+                        # methods unguarded — an escape would fail the whole
+                        # task submission.
+                        logger.warning(
+                            'task_curator: %s registry load errored for %s, '
+                            'failing open (guard disabled): %s',
+                            self._label, path, exc,
+                        )
+                        self._entries = None
+                    # Settled outcome (loaded, or failed open) — latch the
+                    # one-shot contract. Deliberately NOT a `finally`:
+                    # asyncio.CancelledError is a BaseException, so it
+                    # bypasses the except above, and latching in a `finally`
+                    # would permanently disable the guard because an
+                    # unrelated caller was cancelled mid-load. Leaving the
+                    # flag clear on cancellation lets the next call retry.
+                    self._attempted = True
+        return self._entries
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -677,9 +786,9 @@ class TaskCurator:
         # case cheaply — skips embedding + LLM entirely on the second call.
         self._recent_creates: dict[str, dict[str, tuple[str, float]]] = {}
         # Cancelled-premise blocklist — lazy-loaded on first curate() call.
-        # None means "not yet attempted"; [] means "loaded but empty or failed".
-        self._blocklist: list | None = None
-        self._blocklist_load_attempted: bool = False
+        self._blocklist = _LazyRegistry(
+            config_key='cancelled_premise_blocklist_path', label='blocklist',
+        )
         # Recon code-fix premise-verification registry — lazy-loaded on first
         # curate() call, same shape as _blocklist above. Unlike the blocklist,
         # a match here is re-verified against the live source tree on every
@@ -985,12 +1094,16 @@ class TaskCurator:
         Lazy-loads the blocklist from ``self._config.curator.cancelled_premise_blocklist_path``
         on the first call and caches it for the lifetime of this :class:`TaskCurator`
         instance (no hot-reload; a server restart is required to pick up YAML changes).
+        The load runs off the event-loop thread via :class:`_LazyRegistry`
+        (``asyncio.to_thread``), so it cannot stall the fused-memory event loop.
 
         Returns ``None`` when:
         - The blocklist path is not configured (``None``).
         - The blocklist file is missing, unreadable, or unparseable (one WARNING logged).
         - The blocklist is empty.
         - No entry matches the candidate.
+        - The offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per call).
 
         Never raises.
         """
@@ -1003,23 +1116,7 @@ class TaskCurator:
         if cfg_path is None:
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
-        if not self._blocklist_load_attempted:
-            self._blocklist_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                if self._cwd is not None:
-                    raw_path = self._cwd / raw_path
-                else:
-                    logger.warning(
-                        'task_curator: cancelled_premise_blocklist_path %r is relative but '
-                        'TaskCurator was constructed without cwd — resolving against process '
-                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
-                        cfg_path,
-                    )
-            self._blocklist = load_blocklist(raw_path)
-
-        entries = self._blocklist
+        entries = await self._blocklist.entries(load_blocklist, cfg_path, self._cwd)
         if not entries:
             return None
 
