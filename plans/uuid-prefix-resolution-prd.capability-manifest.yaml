@@ -1,0 +1,387 @@
+# Machine-readable twin of uuid-prefix-resolution-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md "Contract" section; validated by
+# shared/src/shared/capability_manifest.py::CapabilityManifestDoc.
+# task_id values are stamped by commit_planning from metadata.prd_task_label.
+#
+# The .md manifest's `binding` prose records AUTHORING-time evidence (the substrate this
+# capability rests on already exists). The delivered_check below is its DISPATCH-time twin
+# and asserts the opposite direction: that the producing leaf actually SHIPPED its part.
+# So these greps are expected to be ABSENT on main today and PRESENT once the leaf lands.
+prd: plans/uuid-prefix-resolution-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "shared.uuid_prefix detector + UuidPrefixGuardMiddleware (C1, C3)"
+    note: >-
+      Intermediate; unlocks γ, δ, ε. PRD §4 C3 names `MarkupStormCounter`, which does not
+      exist — the real symbol is shared/src/shared/storm_counter.py::StormCounter, whose
+      threshold/window are per-call .record() arguments. Erratum 1 in the .md manifest.
+      C3's project_for cannot simply read project_id off the arguments: update_task and
+      submit_task declare project_root. It must invert run_server's known_projects
+      {project_id: project_root} registry. Erratum 7.
+    capabilities:
+      - name: "prefix-detector-module-exists"
+        binding: "capability→producer (this leaf) — C1 pure detector + span-exact substitute in shared/"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def find_prefix_tokens\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "prefix-guard-middleware-exists"
+        binding: "capability→producer (this leaf) — C3 declared outcome × tool-class matrix"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class UuidPrefixGuardMiddleware"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "storm-counter-reused-not-forked"
+        binding: "capability→producer (wired) — shared/src/shared/storm_counter.py::StormCounter reused (INV-5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class (Uuid)?PrefixStormCounter"
+          paths: ["shared/src/shared/"]
+          expect: absent
+      - name: "detector-invariants-pinned"
+        binding: "field-population — ≥200-row real-context fixture corpus, replays byte-identically twice"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "find_prefix_tokens"
+          paths: ["shared/tests/"]
+          expect: present
+      - name: "project-for-resolves-project-root-tools"
+        binding: >-
+          capability→producer (this leaf) — project_for must resolve a project for
+          update_task/submit_task, which declare project_root rather than project_id;
+          server/markup_guard.py::_resolve_project_root is the precedent translator.
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "project_root"
+          paths: ["shared/src/shared/uuid_prefix_guard.py"]
+          expect: present
+      - name: "detector-loop-occupancy-bounded"
+        binding: "manual — find_prefix_tokens is sync on the loop thread; bound is the MCP argument-map size (INV-8)"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a stated wall-time bound is a review judgement, not a grep"
+
+  - label: "β"
+    task_id: null
+    title: "fused-memory resolver, read-side arms, HTTP route (C2, C4, C5)"
+    note: >-
+      Leaf with its own live signal AND the resolver producer for γ, δ, ε. The one substrate
+      extension in the whole PRD is the with_payload kwarg on the single Mem0 walk primitive.
+    capabilities:
+      - name: "id-resolver-module-exists"
+        binding: "capability→producer (this leaf) — C2 resolve_prefix over both namespaces, per-project (D4, D6)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def resolve_prefix\\("
+          paths: ["fused-memory/src/fused_memory/services/"]
+          expect: present
+      - name: "resolver-unavailable-raises"
+        binding: "capability→producer (this leaf) — INV-11: never `none` for a prefix that could not be checked"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ResolverUnavailable"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+      - name: "with-payload-kwarg-on-sole-walk"
+        binding: "capability→producer (this leaf) — the one substrate extension, on THE single walk primitive (INV-5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "with_payload: bool"
+          paths: ["fused-memory/src/fused_memory/backends/mem0_client.py"]
+          expect: present
+      - name: "no-sibling-mem0-walk"
+        binding: "capability→producer (wired) — scroll_collection_pages stays THE single home for the offset walk"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def .*scroll.*pages"
+          paths: ["fused-memory/src/fused_memory/services/id_resolver.py"]
+          expect: absent
+      - name: "resolve-prefix-http-route-mounted"
+        binding: "capability→producer (this leaf) — C5, a plain Starlette Route beside the MCP mount (D7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "/resolve-prefix"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "read-side-miss-report"
+        binding: >-
+          capability→producer (this leaf) — C4 on get_memory_by_id and get_entity_by_uuid.
+          Written PER TOOL: get_memory_by_id has a {found: false} shape and leaks a raw Qdrant
+          UnexpectedResponse today; get_entity_by_uuid has neither. Erratum 6.
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "prefix_checked"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "unique-prefix-resolves-live"
+        binding: >-
+          numeric/exactness premise — re-confirmed at decompose that one live reify Mem0 id
+          starts with bff81530. The assertion is "a unique prefix resolves", not "this prefix
+          is unique forever" (PRD §9 β G6 note).
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a live-corpus fact about a specific record; the drift-proof restatement is in the PRD's own G6 note"
+      - name: "graphiti-prefix-query-latency"
+        binding: "manual — D4 makes measuring the two STARTS WITH latencies part of this leaf's deliverable"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "no pre-existing bound to check against; the measurement IS the deliverable"
+
+  - label: "γ"
+    task_id: null
+    title: "fused-memory boundary: shim consumes FORWARD_REPAIR, guard chain, registration"
+    note: >-
+      This leaf IS DF 4643, rewritten in place per D12 — its recon provenance
+      (stage1_finding_id, cross_project_origin) and its dark_factory routing note are the
+      durable record of why the write-side arm exists (INV-9). No sibling task was filed.
+      Install site is _install_tool_dispatch_guards, not the PRD's _install_tool_wrappers
+      (erratum 4); exempt_tools drops remove_edge, which does not exist (erratum 5).
+    capabilities:
+      - name: "guard-chain-installer-exists"
+        binding: "capability→producer (this leaf) — install_markup_guard generalised to a chain (D5, SPOT)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "install_boundary_guards"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "prefix-guard-registered-on-fused-memory"
+        binding: "DAG-direction — UuidPrefixGuardMiddleware produced by α upstream, registered here after the markup guard"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "UuidPrefixGuardMiddleware"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "update-task-in-forward-on-ambiguity-set"
+        binding: "capability→producer (this leaf) — D3: losing the write is worse than the defect"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "forward_on_ambiguity_tools"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "destructive-tools-stay-refuse-only"
+        binding: >-
+          rejection-mechanism — D10: a prefix must never be expanded before a delete, merge or
+          edge rewrite. Not greppable: `exempt_tools` already appears on main via the markup
+          guard, so a pattern check proves nothing. B9 asserts the behaviour instead —
+          delete_memory('bff81530') is still refused by require_full_uuid, never expanded.
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "exempt_tools is already present via the markup guard; refuse-only-ness is behavioural (B9), not a pattern"
+      - name: "allow-uuid-prefix-override-documented"
+        binding: "capability→producer (this leaf) — mirrors allow_mcp_markup, stripped before dispatch"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "allow_uuid_prefix"
+          paths: ["docs/task-authoring.md"]
+          expect: present
+      - name: "project-for-wired-with-known-projects"
+        binding: >-
+          capability→producer (this leaf) — the registration site must hand project_for the
+          known_projects registry so update_task (D3's forward-on-ambiguity tool) resolves a
+          project instead of falling to resolver='no_project'. Erratum 7.
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "project_for"
+          paths: ["fused-memory/src/fused_memory/server/"]
+          expect: present
+      - name: "markup-guard-tier-unchanged"
+        binding: >-
+          rejection-mechanism — B16 re-runs task 4458's 30 markup gate × specimen combinations
+          under REJECT_WITH_REPAIR and requires identical verdicts. The chain must not move the
+          markup guard's own tier (that is PRD open question 3, explicitly out of scope).
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "verdict-identity across a 30-specimen corpus is a test property, not a grep"
+      - name: "client-renders-meta"
+        binding: "manual — PRD open question 1; γ probes it as its first step and folds into structuredContent if not"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "whether the agent's MCP client surfaces _meta to the model is measured live during γ, not from the tree"
+
+  - label: "δ"
+    task_id: null
+    title: "escalation servers: httpx resolver client + registration on 8100 / 8102 / 8103"
+    note: >-
+      PRD §6 claims escalation/watcher.py already makes httpx calls. It does not — it uses
+      stdlib urllib.request. httpx reaches this package transitively via dark-factory-shared.
+      Erratum 2 in the .md manifest.
+    capabilities:
+      - name: "prefix-resolver-http-client-exists"
+        binding: "capability→producer (this leaf) — httpx, 1 s timeout, non-200 → ResolverUnavailable (D7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "prefix_resolver_client|class PrefixResolverClient"
+          paths: ["escalation/src/escalation/"]
+          expect: present
+      - name: "guard-registered-on-escalation-server"
+        binding: "DAG-direction — produced by α upstream; registered after the markup guard in create_server"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "UuidPrefixGuardMiddleware"
+          paths: ["escalation/src/escalation/server.py"]
+          expect: present
+      - name: "registration-test-mirrors-markup-one"
+        binding: "capability→producer (this leaf) — exactly one instance, ordered after the markup guard, on the real server"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "uuid_prefix"
+          paths: ["escalation/tests/"]
+          expect: present
+      - name: "recon-harness-passes-service-resolver"
+        binding: "capability→producer (this leaf) — the in-process 8103 copy wires the service resolver directly, not over HTTP"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "resolver"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: present
+      - name: "markup-registration-test-not-renamed"
+        binding: >-
+          rejection-mechanism — escalation/tests/test_markup_middleware_registration.py is
+          load-bearing: another PRD's manifest greps its exact filename and the string
+          `evidence` inside it. δ mirrors it, never replaces it.
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "evidence"
+          paths: ["escalation/tests/test_markup_middleware_registration.py"]
+          expect: present
+      - name: "fail-open-on-resolver-unavailable"
+        binding: "rejection-mechanism — INV-11: an escalation still files, with resolver='unavailable' on meta and a WARNING fact"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "fail-open under a stopped fused-memory is an integration property, exercised by δ's own test"
+
+  - label: "ε"
+    task_id: null
+    title: "sweep_uuid_prefixes.py — three lanes, dry-run default, atomic, idempotent"
+    note: >-
+      PRD open question 4 is resolved to IMPORT: sweep_toolcall_markup.py is already imported
+      by bare name by two existing modules via scripts/tests/conftest.py + --import-mode=importlib.
+      No scripts/sweep_common.py extraction. ε's tasks-lane signal was repaired at decompose —
+      erratum 3 in the .md manifest.
+    capabilities:
+      - name: "sweep-script-exists"
+        binding: "capability→producer (this leaf) — C6, three lanes selected by a declared table"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "lane"
+          paths: ["scripts/sweep_uuid_prefixes.py"]
+          expect: present
+      - name: "engine-imported-not-copied"
+        binding: "capability→producer (this leaf) — INV-5: no second atomic-write engine, no second token grammar"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "import sweep_toolcall_markup"
+          paths: ["scripts/sweep_uuid_prefixes.py"]
+          expect: present
+      - name: "no-second-atomic-write-engine"
+        binding: "capability→producer (this leaf) — mkstemp/os.replace must arrive by import, never by copy"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tempfile\\.mkstemp\\("
+          paths: ["scripts/sweep_uuid_prefixes.py"]
+          expect: absent
+      - name: "dry-run-is-the-default"
+        binding: "rejection-mechanism — the destructive arm must be opt-in; --apply is the only writing path"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "--apply"
+          paths: ["scripts/sweep_uuid_prefixes.py"]
+          expect: present
+      - name: "task-writes-assert-acceptance"
+        binding: >-
+          field-population — a rejected update_task still returns a success JSON-RPC envelope,
+          so the tasks lane must guard every write the way
+          fused-memory/scripts/migrate_task_metadata_to_x_namespace.py does.
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "assert_write_accepted"
+          paths: ["scripts/sweep_uuid_prefixes.py"]
+          expect: present
+      - name: "tasks-lane-signal-is-falsifiable"
+        binding: >-
+          field-population, REPAIRED AT DECOMPOSE. The PRD's tasks-lane signal named reify 6482;
+          measured at decompose, 6482 is done and all 51 cluster_memory_ids entries are already
+          full uuids, so it would pass with the sweep doing nothing. Replaced with a drift-proof
+          form: the dry-run names the record, --apply expands it, a second run reports
+          0 expandable remaining and EXIT_CLEAN.
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the repaired signal is an operator-run sequence over live stores, not a tree property"
+      - name: "expandable-population-size"
+        binding: "manual — the ≈11,5xx figure is a position-paper measurement over a dated store snapshot (INV-9)"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "re-runnable only from the paper's scripts against a store snapshot, not from the repo"
+
+  - label: "ζ"
+    task_id: null
+    title: "paired edits: seam tables + DF 3144 amendment"
+    note: >-
+      This decompose session additionally wired DF 3144 → depends on ζ (not a PRD-declared
+      edge) so 3144 cannot dispatch against its stale seven-tool scope before the amendment
+      lands. Recorded in the hand-back.
+    capabilities:
+      - name: "markup-prd-names-this-prd-as-owner"
+        binding: "capability→producer (this leaf) — a §8 row for the shim generalisation, owner this PRD"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "uuid-prefix-resolution-prd"
+          paths: ["plans/toolcall-markup-containment-prd.md"]
+          expect: present
+      - name: "convergence-prd-names-this-prd-as-owner"
+        binding: "capability→producer (this leaf) — η's read-side rule extended here for exactly two tools"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "uuid-prefix-resolution-prd"
+          paths: ["docs/prds/memory-write-path-convergence.md"]
+          expect: present
+      - name: "df-3144-reads-five-tools"
+        binding: >-
+          field-population — 3144's description must lose its get_memory_by_id and
+          get_entity_by_uuid items and gain a dated pointer here, keeping five tools.
+          update_task REPLACES description wholesale, so the amendment must re-read first.
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "task-store state, not a tree property; verified by get_task on DF 3144"
