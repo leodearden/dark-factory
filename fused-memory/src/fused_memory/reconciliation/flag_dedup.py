@@ -5176,7 +5176,10 @@ def _cluster_growth_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
 
     Entries whose ``store`` is not ``'mem0'`` are INCLUDED, conservatively: an
     unmatched graph-edge uuid can only fail the all-present test and force a
-    KEEP, which is the fail-safe direction.
+    KEEP, which is the fail-safe direction.  That holds because the caller
+    additionally requires every cited id to be DISCRIMINATING
+    (:func:`_is_discriminating_memory_id`) -- shape is NOT validated here,
+    since a caller that wants the raw citation list should get the raw list.
 
     Total over malformed LLM-authored input -- a non-list ``cited_memories``, a
     non-dict entry, or a missing/non-``str``/blank ``memory_id`` is skipped
@@ -5201,6 +5204,70 @@ def _cluster_growth_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
         seen.add(memory_id)
         ids.append(memory_id)
     return ids
+
+
+#: A cited memory id confirms a drop only if finding it inside a task body is
+#: EVIDENCE of tracking rather than coincidence.  The body test is a
+#: case-insensitive substring scan, and ``cited_memories[].memory_id`` reaches
+#: this module unvalidated -- ``verify_cited_memories`` never resolves a
+#: ``store != 'mem0'`` entry, and KEEPS a citation whose lookup ERRORS, so
+#: during a Qdrant outage unverified ids arrive too.  A degenerate id
+#: (``'mem0'``, ``'3'``) would then match almost any prose and turn the guard's
+#: positive confirmation into the false DROP it exists to exclude.  Mem0 point
+#: ids and Graphiti uuids are both UUID-shaped; the length arm keeps the guard
+#: working for any other store whose ids are simply long (task 3476 amendment).
+_UUID_SHAPED_MEMORY_ID_RE = re.compile(
+    r'\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z',
+    re.IGNORECASE,
+)
+
+#: Inclusive lower bound for the non-UUID arm of
+#: :func:`_is_discriminating_memory_id`.  Sixteen hex-ish characters is already
+#: far past anything that occurs in a task body by chance, while staying short
+#: enough to admit non-UUID store ids.
+_MIN_DISCRIMINATING_MEMORY_ID_LEN = 16
+
+
+def _is_discriminating_memory_id(memory_id: str) -> bool:
+    """True iff *memory_id* appearing in a task body is evidence, not coincidence.
+
+    UUID-shaped, or at least :data:`_MIN_DISCRIMINATING_MEMORY_ID_LEN`
+    characters long.  See that constant's note for why the guard needs this at
+    all.
+
+    Pure, sync, no I/O.
+    """
+    return (
+        _UUID_SHAPED_MEMORY_ID_RE.match(memory_id) is not None
+        or len(memory_id) >= _MIN_DISCRIMINATING_MEMORY_ID_LEN
+    )
+
+
+def _cluster_growth_unconfirmable_reason(
+    memory_ids: list[str],
+    task_ids: list[str],
+) -> str | None:
+    """Why a cluster-growth flag cannot be confirmed accounted-for, or ``None``.
+
+    ``None`` means the flag is a CANDIDATE: it cites something discriminating
+    to look for and somewhere to look.  Every other result names a reason the
+    guard must simply KEEP the flag, and exists to be LOGGED -- each is a way
+    :func:`filter_accounted_cluster_growth_flags` becomes a permanent silent
+    no-op that the drift log cannot see, because in all three the ``flag_type``
+    matched perfectly well.
+
+    Order matters only for the log's legibility: a flag citing nothing is
+    reported as citing nothing rather than as citing nothing discriminating.
+
+    Pure, sync, no I/O.
+    """
+    if not memory_ids:
+        return 'no_cited_memory_ids'
+    if not all(_is_discriminating_memory_id(m) for m in memory_ids):
+        return 'non_discriminating_memory_id'
+    if not task_ids:
+        return 'no_resolvable_task_id'
+    return None
 
 
 def _cluster_growth_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
@@ -5273,9 +5340,11 @@ async def filter_accounted_cluster_growth_flags(
 
     **The drop rule.**  A flag is a CANDIDATE iff
     :func:`_is_cluster_growth_flag_type` accepts its ``flag_type`` AND it cites
-    at least one memory id AND at least one task id resolves.  A candidate is
-    DROPPED iff SOME single candidate task's current body contains EVERY one of
-    its cited memory UUIDs (case-insensitive substring).  Bodies are never
+    at least one memory id, EVERY one of them discriminating
+    (:func:`_is_discriminating_memory_id`), AND at least one task id resolves.
+    A candidate is DROPPED iff SOME single candidate task's current body
+    contains EVERY one of its cited memory UUIDs (case-insensitive
+    substring).  Bodies are never
     UNIONED across tasks: "uuid-A is in 3417 and uuid-B is in 3468" does not
     establish that the cluster is fully tracked anywhere -- only one task
     listing the whole cited set does.  A candidate id that errors or resolves
@@ -5294,7 +5363,9 @@ async def filter_accounted_cluster_growth_flags(
     confirmation.  Every other outcome keeps the flag: partial presence (one
     cited UUID absent -- that is GENUINE growth), a ``get_task`` error or
     ``TaskNotFoundError``, a non-dict or body-less result, zero cited memories,
-    no resolvable task id, and a falsy ``taskmaster``/``project_root``.  The
+    a cited id too short to discriminate (which would otherwise "confirm"
+    against ordinary prose), no resolvable task id, and a falsy
+    ``taskmaster``/``project_root``.  The
     asymmetry is deliberate -- a false KEEP costs one redundant flag that dedup
     and suppression already handle and that self-heals next cycle, whereas a
     false DROP silently loses the signal entirely.
@@ -5321,15 +5392,19 @@ async def filter_accounted_cluster_growth_flags(
     candidate_positions: list[int] = []
     cited_by_pos: dict[int, list[str]] = {}
     task_ids_by_pos: dict[int, list[str]] = {}
+    unconfirmable: list[str] = []
 
     for i, flag in enumerate(flags):
-        if not _is_cluster_growth_flag_type(flag.get('flag_type')):
+        flag_type = flag.get('flag_type')
+        if not _is_cluster_growth_flag_type(flag_type):
             continue
         memory_ids = _cluster_growth_cited_memory_ids(flag)
-        if not memory_ids:
-            continue
         task_ids = _cluster_growth_candidate_task_ids(flag)
-        if not task_ids:
+        reason = _cluster_growth_unconfirmable_reason(memory_ids, task_ids)
+        if reason is not None:
+            unconfirmable.append(
+                f'{reason} flag_type={flag_type} task_id={flag.get("task_id")}'
+            )
             continue
         candidate_positions.append(i)
         cited_by_pos[i] = memory_ids
@@ -5354,6 +5429,20 @@ async def filter_accounted_cluster_growth_flags(
             '— update CLUSTER_GROWTH_FLAG_TYPES if drift confirmed',
             drift_candidates,
             sorted(CLUSTER_GROWTH_FLAG_TYPES),
+        )
+
+    # The drift log above sees only ONE of the ways this guard goes silently
+    # no-op.  A flag whose flag_type matched perfectly well but that cites
+    # nothing usable is invisible to it, and if the family ever settles into
+    # putting the UUID only in prose (which this module deliberately refuses to
+    # parse) the guard is permanently ineffective with nothing in the logs
+    # saying so.  Same aggregate-per-call shape as the drift log.
+    if unconfirmable:
+        logger.info(
+            'reconciliation.accounted_cluster_growth_filter_unconfirmable_candidates '
+            'skipped=%s — flag_type matched but the finding carries nothing to '
+            'confirm against; these flags are KEPT',
+            unconfirmable,
         )
 
     if not candidate_positions:
