@@ -9,6 +9,7 @@ shapes so both suites pin the same parsing contract.
 
 from __future__ import annotations
 
+import dataclasses
 import types
 from typing import Any
 
@@ -136,8 +137,6 @@ class TestPsiSampleV2Fields:
         assert sample.own_read_ok is True
 
     def test_v2_instance_stays_frozen(self):
-        import dataclasses
-
         from shared.psi import PsiSample
 
         sample = PsiSample(
@@ -153,8 +152,6 @@ class TestPsiSampleV2Fields:
 
     def test_field_order_appends_v2_fields_last(self):
         """The five v1 fields keep their positional slots (§6.1)."""
-        import dataclasses
-
         from shared.psi import PsiSample
 
         names = tuple(f.name for f in dataclasses.fields(PsiSample))
@@ -209,29 +206,7 @@ def _healthy_sample(**overrides):
     return PsiSample(**fields)
 
 
-def vars_of(sample) -> dict[str, Any]:
-    """The sample's fields as a plain dict, for building a variant of it."""
-    import dataclasses
-
-    return {f.name: getattr(sample, f.name) for f in dataclasses.fields(sample)}
-
-
 class TestPsiSampleSaturated:
-    def test_frozen(self):
-        import dataclasses
-
-        from shared.psi import PsiSample
-
-        sample = PsiSample(
-            cpu_some10=10.0,
-            mem_some10=5.0,
-            mem_full10=1.0,
-            io_some10=5.0,
-            read_ok=True,
-        )
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            sample.cpu_some10 = 99.0  # type: ignore[misc]
-
     def test_cpu_some_trips_when_an_operator_configures_it(self):
         """D1 turns the cpu arm off by default; it does not remove it."""
         from shared.psi import PsiSample
@@ -458,7 +433,7 @@ class TestTrippingMetric:
         overrides = {}
         for name in self.D10_RANK[:dropped]:
             overrides.update(removals[name])
-        sample = _healthy_sample(**{**vars_of(self._all_arms_over()), **overrides})
+        sample = dataclasses.replace(self._all_arms_over(), **overrides)
         cfg = self._all_arms_cfg()
         assert sample.tripping_metric(cfg) == self.D10_RANK[dropped]
 
@@ -485,7 +460,7 @@ class TestTrippingMetric:
             sample.tripping_metric(self._all_arms_cfg())
 
     def test_raises_when_host_read_failed_even_with_everything_over(self):
-        sample = _healthy_sample(**{**vars_of(self._all_arms_over()), 'read_ok': False})
+        sample = dataclasses.replace(self._all_arms_over(), read_ok=False)
         with pytest.raises(ValueError, match='saturated'):
             sample.tripping_metric(self._all_arms_cfg())
 
