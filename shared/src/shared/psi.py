@@ -295,6 +295,13 @@ Single home (heuristic 11): ``saturated`` reads it order-insensitively
 (``any``) and ``tripping_metric`` reads the SAME generator order-sensitively
 (first element), so the OR set and the rank cannot drift apart. The rank
 itself is owned by PRD ``plans/load-throttle-harmonisation-prd.md`` D10.
+
+That single home is still ahead of the tree (2026-09-09): until β (task 3590,
+PRD §8) switches ``scheduler.py::_note_heavy_deferral`` from its own if/elif
+chain to ``tripping_metric()``, that site ranks in the older DA-D1 order
+(cpu > mem_some > mem_full > io). Two live rankings, on purpose and for that
+window only — they already agree on the reported DOMAIN (the cfg field
+names), so β changes the order and nothing else.
 """
 
 
@@ -337,6 +344,11 @@ class PsiSample:
     def _tripping_arms(self, cfg) -> Iterator[_Arm]:
         """Yield the arms of ``_ARMS`` this sample trips, in D10 rank order."""
         for arm in _ARMS:
+            # β (task 3590) must retire the ABSENCE half of this default with
+            # `{a.field for a in _ARMS} <= set(PsiAdmissionConfig.model_fields)`
+            # — `shared` cannot import that model, and without the guard a
+            # later rename there silently disables an arm forever. `saturated`
+            # documents why absence is tolerated until then.
             threshold = getattr(cfg, arm.field, None)
             if threshold is None:
                 continue
