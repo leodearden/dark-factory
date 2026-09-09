@@ -74,8 +74,6 @@ def test_grammar_accepts(value: str, expected: list[str]) -> None:
     [
         pytest.param('see bff8153 here', 'below the 8-char floor', id='7-hex-floor'),
         pytest.param(f'see {HEX32} here', 'above the 31-char ceiling', id='32-hex-ceiling'),
-        pytest.param('zbff81530', 'preceded by a hex char', id='preceded-by-hex'),
-        pytest.param('bff81530a', 'followed by a hex char', id='followed-by-hex'),
         # The not-followed-by-hyphen rule is what makes group 1 of a full uuid
         # never match, so no separate uuid predicate is needed (INV-5).
         pytest.param('bff81530-aacc', "followed by '-'", id='followed-by-hyphen'),
@@ -91,6 +89,31 @@ def test_grammar_accepts(value: str, expected: list[str]) -> None:
 )
 def test_grammar_rejects(value: str, why: str) -> None:
     assert tokens_for(value) == (), why
+
+
+def test_no_sub_run_of_a_longer_hex_run_is_reported() -> None:
+    """"Not preceded/followed by a hex char" is an ANTI-SUBSTRING rule.
+
+    It does not reject a run that happens to sit next to a letter — it stops
+    the detector reporting a sub-run of a longer hex run. A 9-hex run is one
+    9-char token, never the 8-char prefix or the 8-char suffix inside it.
+    """
+    run = 'abff81530'
+    assert len(run) == 9
+    found = spans_for(f'see {run} here')
+    assert found == [run]
+    assert 'abff8153' not in found
+    assert 'bff81530' not in found
+
+
+def test_over_ceiling_run_reports_no_sub_run_either() -> None:
+    """The strongest form of the same rule: a 32-hex run yields NOTHING.
+
+    Every one of its many 8-31 length sub-runs is suppressed, which is why a
+    bare undashed uuid cannot be mistaken for a prefix.
+    """
+    assert tokens_for(f'see {HEX32} here') == ()
+    assert HEX31 in HEX32
 
 
 def test_full_uuid_in_prose_yields_no_tokens() -> None:
