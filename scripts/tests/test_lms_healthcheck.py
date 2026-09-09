@@ -2500,6 +2500,59 @@ def test_a_placeholder_part_covers_its_arm_in_the_merged_slate(
     assert lms_healthcheck.exit_code_for(merged) == lms_healthcheck.EXIT_ARM_FAILED
 
 
+def test_a_placeholder_only_run_reports_on_a_card_a_stranger_is_holding(
+    tmp_path, monkeypatch,
+):
+    """The refusal row must not be held hostage to whoever holds the card.
+
+    Measured on this worktree: `lms_vram.unexpected_baseline_consumers([whisper
+    4050 MiB, ollama 10314 MiB])` returns the ollama entry, so feeding the LIVE
+    probe inventory to the BASELINE guard raises `PollutedBaselineError` and the
+    CLI exits 7 having written nothing.  That refusal is spurious here.  Both
+    the baseline guard and `classify_pollution` exist to protect the
+    attribution of `used - baseline` to an arm; nothing was started, so there is
+    no such attribution and no footprint for a dirty baseline to corrupt.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(
+            consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]
+        ),
+        probe=lms_healthcheck.probe_arm,
+    )
+
+    assert report.arms[0].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    assert report.vram.pollution == lms_vram.PollutionState.CLEAN
+    assert report.vram.arm_footprint_mib == 0
+
+
+def test_a_placeholder_only_run_never_emits_the_unmeasured_sentinel(
+    tmp_path, monkeypatch,
+):
+    """CLEAN here means "there is nothing to pollute", and it has to be CLEAN.
+
+    UNMEASURED is the more literal reading of a branch that skipped the
+    classifier, but it is precisely the value `merge_reports` REFUSES to
+    combine -- so emitting it would restore the unassemblable slate by another
+    route, which is the whole thing this change removes.  Mirrors
+    `test_this_producer_never_emits_the_unmeasured_sentinel`.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    report = lms_healthcheck.run_healthcheck(
+        [_placeholder_arm()],
+        gpu_probe=lambda: _snapshot(consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]),
+        probe=lms_healthcheck.probe_arm,
+    )
+
+    assert report.vram.pollution != lms_vram.PollutionState.UNMEASURED
+    assert lms_healthcheck.merge_reports([report]).arms[0].arm_id == (
+        PLACEHOLDER_ARM_ID
+    )
+
+
 # ---------------------------------------------------------------------------
 # The extraction floor, and the reasoning-mode contract (esc-3713-10).
 #
