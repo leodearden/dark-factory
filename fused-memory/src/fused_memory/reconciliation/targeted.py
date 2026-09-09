@@ -1414,6 +1414,16 @@ class TargetedReconciler:
                     causation_id=run_id,
                 )
                 return None
+            await self.journal.add_run_action(
+                run_id, 'write', 'taskmaster', 'set_task_status',
+                {
+                    'task_id': task_id,
+                    'parent_id': parent_id,
+                    'type': 'descendant_block',
+                    'new_status': 'blocked',
+                },
+                causation_id=run_id,
+            )
         except Exception as e:
             logger.warning(
                 'sweep: block (status) failed for descendant %s (parent %s): %s',
@@ -1472,6 +1482,16 @@ class TargetedReconciler:
                     causation_id=run_id,
                 )
                 action['metadata_stamp'] = 'rejected'
+            else:
+                await self.journal.add_run_action(
+                    run_id, 'write', 'taskmaster', 'update_task',
+                    {
+                        'task_id': task_id,
+                        'parent_id': parent_id,
+                        'type': 'block_metadata_stamp',
+                    },
+                    causation_id=run_id,
+                )
         except Exception as e:
             logger.warning(
                 'sweep: block (metadata) failed for descendant %s (parent %s): %s',
