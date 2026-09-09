@@ -188,9 +188,14 @@ async def _run_path_check(
     match), but ``ls-tree`` exits 0 either way: a MISSING path prints
     nothing, an existing path prints its name. Reading ``rc == 0`` here
     would make every path check report DELIVERED — a universal false green
-    on a dispatch gate. A non-zero rc is reserved for genuine git errors
-    (a bad ref and a pathspec outside the repository both exit 128) and is
-    handled by the caller-facing fail-safe path.
+    on a dispatch gate.
+
+    A non-zero rc is reserved for genuine git errors (a bad ref and a
+    pathspec outside the repository both exit 128) and returns ERRORED
+    immediately, before stdout is interpreted and without probing any
+    further path. That ordering matters: git prints nothing on an error and
+    nothing on an absent path, so reading stdout first would report a
+    definitive FAILED for a check that could not be evaluated at all.
 
     ``--full-tree`` makes the pathspec repo-root-relative regardless of the
     subprocess cwd, matching the repo-relative ``paths`` invariant the
@@ -220,7 +225,14 @@ async def _run_path_check(
             '--',
             path,
         ]
-        _rc, out, _err = await runner(argv)
+        rc, out, _err = await runner(argv)
+        if rc != 0:
+            # A genuine git error (bad ref / pathspec outside the repository
+            # both exit 128), NOT an answer about existence. Checked BEFORE
+            # stdout is interpreted, because an error prints nothing and an
+            # absent path prints nothing too — collapsing the two would turn
+            # an unevaluable check into a definitive "not delivered".
+            return DeliveredCheckResult.ERRORED
         exists = bool(out.strip())
         delivered = exists if meta.expect == 'present' else not exists
         if not delivered:
