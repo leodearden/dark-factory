@@ -83,6 +83,7 @@ __all__ = [
     'ToolClass',
     'UUID_PREFIX_STORM_ERROR_TYPE',
     'UuidPrefixGuardMiddleware',
+    'project_from_arguments',
 ]
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,76 @@ ProjectFor = Callable[[Mapping[str, Any]], str | None]
 #: Either channel may be a plain function OR an ``async def``: the machinery a
 #: registration site wires them to is largely async in this repo.
 Sink = Callable[[dict[str, Any]], Any | Awaitable[Any]]
+
+#: The two argument names a guarded tool spells its project scope with. Data,
+#: because which one a tool declares is a fact about the surface rather than a
+#: rule: ``add_memory`` takes ``project_id``, ``update_task`` and
+#: ``submit_task`` take ``project_root``, and the ORDER here is the precedence.
+_PROJECT_ARGUMENTS = ('project_id', 'project_root')
+
+
+def project_from_arguments(known_projects: Mapping[str, str]) -> ProjectFor:
+    """Build the shipped :data:`ProjectFor` over a ``{project_id: project_root}`` registry.
+
+    ERRATUM 7 is what this exists for. C3's letter says every guarded tool
+    declares ``project_id``; it does not. ``update_task`` and ``submit_task``
+    declare ``project_root``, and D3 puts ``update_task`` in the
+    forward-on-ambiguity class — so a ``project_for`` written to the PRD's
+    letter would return ``None`` for the one tool that ruling most depends on,
+    and the guard would go inert there without anything saying so.
+
+    ``project_id`` FIRST, then ``project_root`` translated through the inverse
+    registry. That is the opposite precedence to
+    ``MarkupGuardMiddleware._identity``, which prefers the root — and the
+    reason the two are not one helper. ``_identity``'s value addresses an
+    ESCALATION QUEUE, which lives at a filesystem root. This value feeds the
+    RESOLVER, whose universe is one Mem0 collection and one graph ``group_id``,
+    both keyed by project_id. A root must therefore be TRANSLATED here, never
+    preferred, and sharing a helper would couple two answers that must diverge.
+
+    Exact membership only, mirroring
+    ``fused_memory/server/markup_guard.py::_resolve_project_root``'s refusal to
+    accept an arbitrary path the registry does not vouch for. A root the
+    registry has never heard of yields ``None``, as do a non-string and an
+    empty value: resolving a citation against a GUESSED project is the one
+    outcome worse than leaving the prefix alone, because it expands to another
+    project's id and reads as a repair.
+
+    A ``project_id`` is returned without a registry lookup — it already IS the
+    resolver's vocabulary, so there is nothing to translate and no reason for
+    an unregistered project's citations to go unchecked.
+
+    The inverse map is built ONCE here, at registration, and a duplicate root
+    raises immediately, naming both ids: a registry mapping two projects to one
+    directory is a startup wiring bug, and picking one of them silently would
+    resolve a whole project's citations against the other's ids with nothing
+    downstream able to tell. Deterministic and at construction — the
+    ``StormCounter`` ``fire_mode`` precedent.
+
+    The signature is what lets leaf γ hand it ``run_server``'s existing
+    ``_known_projects_map`` (from ``build_known_projects_map``) with no new
+    plumbing, and lets leaf δ pass a registration-time constant instead, since
+    no escalation tool declares a project at all.
+    """
+    by_root: dict[str, str] = {}
+    for project_id, project_root in known_projects.items():
+        claimed = by_root.setdefault(project_root, project_id)
+        if claimed != project_id:
+            raise ValueError(
+                f'known_projects maps both {claimed!r} and {project_id!r} to '
+                f'{project_root!r}; a project_root must identify exactly one '
+                'project, or a citation resolves against the wrong one'
+            )
+
+    def project_for(arguments: Mapping[str, Any]) -> str | None:
+        project_id, project_root = (arguments.get(key) for key in _PROJECT_ARGUMENTS)
+        if isinstance(project_id, str) and project_id:
+            return project_id
+        if isinstance(project_root, str) and project_root:
+            return by_root.get(project_root)
+        return None
+
+    return project_for
 
 
 #: Which fact outcome each action reports. A DECLARED table for the same
@@ -477,7 +548,13 @@ class UuidPrefixGuardMiddleware(Middleware):
             # forwarded UNCHANGED rather than guessed at against a default
             # project, which is how a citation gets expanded to another
             # project's id.
-            return await call_next(context)
+            #
+            # SAID rather than left to be inferred (INV-11): an absent meta
+            # block means the guard saw nothing, and this call is the opposite
+            # — it saw a citation and could not scope it. No fact, because
+            # nothing was detected in the fact stream's sense; no storm,
+            # because an unscoped tool is a wiring fact and not a burst.
+            return await self._forward(context, call_next, {'resolver': 'no_project'})
 
         try:
             resolutions = await self._resolve(project, tokens)
