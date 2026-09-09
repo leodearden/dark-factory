@@ -1111,6 +1111,24 @@ def run_healthcheck(
             reading=reading, consumers=snapshot.consumers,
             measured_at=datetime.now(UTC),
         )
+        budget = lms_vram.unstarted_budget(reading)
+        # THE ONE PLACE THIS MODULE RELAXES A REFUSAL, and the asymmetry is
+        # deliberate.  BOTH pollution guards below exist to protect the
+        # attribution of `used - baseline` to an arm: a dirty baseline builds a
+        # stranger's memory into the number the footprint is subtracted from,
+        # and a card that moved under the probe makes the difference mean
+        # something else.  With no arm started there IS no attribution -- the
+        # footprint is 0 by construction -- so applying either guard here can
+        # only produce a false refusal, holding a TBD arm's PLACEHOLDER_ARM row
+        # hostage to whoever happens to hold the card (measured: ollama
+        # resident makes `unexpected_baseline_consumers` refuse, exit 7, no
+        # file).  CLEAN here means "there is nothing to pollute", not "the card
+        # was quiet"; the probe inventory is still recorded in the block below,
+        # so a reader sees exactly who was there.  UNMEASURED would be the more
+        # literal sentinel and is deliberately NOT used: it is the one value
+        # `merge_reports` refuses to combine, so emitting it would restore the
+        # unassemblable slate by another route.
+        pollution, pollution_reason = lms_vram.PollutionState.CLEAN, ''
     else:
         # The baseline is read BEFORE any probing, and its absence propagates for
         # the same reason a dead GPU probe does: without the reading taken before
@@ -1119,52 +1137,50 @@ def run_healthcheck(
         base = baseline if baseline is not None else lms_vram.read_baseline_records(
             [arm.arm_id for arm in measurable]
         )
-    # The SAME rule the baseline was written under, read off the record itself
-    # (`coresident_arms`) rather than re-derived here: a `--no-exclusive` start
-    # legitimately records another arm in its inventory, and re-applying the
-    # strict rule now would refuse to report on a run that was never polluted.
-    # Empty -- including for a file written before that key existed -- is the
-    # strict rule unchanged.
-    polluted_baseline = lms_vram.unexpected_baseline_consumers(
-        base.consumers, coresident_arms=base.coresident_arms,
-    )
-    if polluted_baseline:
-        raise lms_vram.PollutedBaselineError(
-            polluted_baseline,
-            context=(
-                'refusing to report against a polluted baseline recorded at '
-                f'{base.measured_at.isoformat()}'
-            ),
+        # The SAME rule the baseline was written under, read off the record itself
+        # (`coresident_arms`) rather than re-derived here: a `--no-exclusive` start
+        # legitimately records another arm in its inventory, and re-applying the
+        # strict rule now would refuse to report on a run that was never polluted.
+        # Empty -- including for a file written before that key existed -- is the
+        # strict rule unchanged.
+        polluted_baseline = lms_vram.unexpected_baseline_consumers(
+            base.consumers, coresident_arms=base.coresident_arms,
         )
-    # POLLUTION IS CLASSIFIED BEFORE THE BUDGET IS EVALUATED, and that order is
-    # load-bearing.  `evaluate_budget` raises a plain VramProbeError when
-    # `baseline > used` -- which is exactly the SHRINK/VANISH direction
-    # `classify_pollution` diagnoses, reachable whenever a baseline holder
-    # (whisper-writer at 4050 MiB) exits mid-run while the arm takes less than
-    # it released.  Evaluated first, that raise reached the CLI's generic
-    # branch and reported "the GPU probe failed" (exit 4) for a probe that
-    # worked perfectly on a card that was polluted (exit 7), and the shrink
-    # diagnosis this function had already computed was never printed.
-    pollution, pollution_reason = lms_vram.classify_pollution(
-        base.consumers, snapshot.consumers
-    )
-    if pollution is lms_vram.PollutionState.POLLUTED:
-        pollution_reason = f'{pollution_reason}. {POLLUTED_FOOTPRINT_NOTE}'
-        if base.reading.used_mib > reading.used_mib:
-            # Void, not merely unflattering: there is no footprint to report.
-            # Probe-time pollution is otherwise NOT fatal -- the report is the
-            # honest record of what was seen and is still emitted, POLLUTED,
-            # with the refusal carried by the exit code.  This narrow case is
-            # different only because the arithmetic cannot be performed at all.
-            raise lms_vram.PollutedMeasurementError(pollution_reason)
-    budget = lms_vram.unstarted_budget(reading) if not measurable else (
-        lms_vram.evaluate_budget(
+        if polluted_baseline:
+            raise lms_vram.PollutedBaselineError(
+                polluted_baseline,
+                context=(
+                    'refusing to report against a polluted baseline recorded at '
+                    f'{base.measured_at.isoformat()}'
+                ),
+            )
+        # POLLUTION IS CLASSIFIED BEFORE THE BUDGET IS EVALUATED, and that order is
+        # load-bearing.  `evaluate_budget` raises a plain VramProbeError when
+        # `baseline > used` -- which is exactly the SHRINK/VANISH direction
+        # `classify_pollution` diagnoses, reachable whenever a baseline holder
+        # (whisper-writer at 4050 MiB) exits mid-run while the arm takes less than
+        # it released.  Evaluated first, that raise reached the CLI's generic
+        # branch and reported "the GPU probe failed" (exit 4) for a probe that
+        # worked perfectly on a card that was polluted (exit 7), and the shrink
+        # diagnosis this function had already computed was never printed.
+        pollution, pollution_reason = lms_vram.classify_pollution(
+            base.consumers, snapshot.consumers
+        )
+        if pollution is lms_vram.PollutionState.POLLUTED:
+            pollution_reason = f'{pollution_reason}. {POLLUTED_FOOTPRINT_NOTE}'
+            if base.reading.used_mib > reading.used_mib:
+                # Void, not merely unflattering: there is no footprint to report.
+                # Probe-time pollution is otherwise NOT fatal -- the report is the
+                # honest record of what was seen and is still emitted, POLLUTED,
+                # with the refusal carried by the exit code.  This narrow case is
+                # different only because the arithmetic cannot be performed at all.
+                raise lms_vram.PollutedMeasurementError(pollution_reason)
+        budget = lms_vram.evaluate_budget(
             reading.used_mib,
             reading.total_mib,
             baseline_mib=base.reading.used_mib,
             baseline_free_mib=base.reading.free_mib,
         )
-    )
 
     measured_at = _now_iso()
     rows: list[ArmRow] = []
