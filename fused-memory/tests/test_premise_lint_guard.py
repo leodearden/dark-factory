@@ -261,6 +261,40 @@ class TestPremiseLintErrorInvariantMatrix:
         assert 'never persisted across cycles' in error
         assert 'deleted only by GC' in error
 
+    def test_recon_stage_negative_probe_absence_claim_in_details_rejects(self):
+        """Task 4644: the cd53b227 absence paragraph travelled through
+        `details`, so that is the channel the rule has to close.
+
+        A recon stage promoting a negative mixed-store probe set to "the
+        degradation did not reproduce" is rejected before the task is
+        persisted, with the error naming the invariant it contradicts.
+        """
+        result = premise_lint_error(
+            None,
+            'recon-stage-task_knowledge_sync',
+            '/tmp',
+            details=(
+                'EXPLICIT NON-CORROBORATION: the mixed-store probe ran and the '
+                'degradation did not reproduce this cycle.'
+            ),
+        )
+        assert result is not None
+        assert result.get('error_type') == 'ValidationError'
+        assert 'negative_probe_set_does_not_clear_intermittent_fault' in result['error']
+
+    def test_non_recon_caller_negative_probe_claim_passes(self):
+        """The guard's recon-only scoping is unchanged by the new rule: a
+        human or interactive caller writing the same sentence is unaffected."""
+        assert premise_lint_error(
+            None,
+            'claude-interactive',
+            '/tmp',
+            details=(
+                'EXPLICIT NON-CORROBORATION: the mixed-store probe ran and the '
+                'degradation did not reproduce this cycle.'
+            ),
+        ) is None
+
     def test_recon_stage_duplicate_violation_across_fields_deduped(self):
         """The SAME false premise stated in two different fields
         (`description` and `title`) produces two Violations sharing one

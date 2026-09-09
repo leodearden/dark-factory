@@ -23,6 +23,10 @@ from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
     render_end_state_brief,
 )
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    NEGATIVE_SET_VERDICT_TEMPLATE,
+    PROBE_LIMIT_LADDER,
+)
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 
@@ -539,6 +543,11 @@ class TestInvariantPredicates:
         assert isinstance(result, bool)
         assert result is True
 
+    def test_negative_probe_set_does_not_clear_intermittent_fault(self):
+        result = m.negative_probe_set_does_not_clear_intermittent_fault()
+        assert isinstance(result, bool)
+        assert result is True
+
 
 # --------------------------------------------------------------------------- #
 # premise_lint + Violation (step-17/18)
@@ -571,6 +580,46 @@ class TestPremiseLint:
         """A benign, true description matches no known false premise."""
         violations = m.premise_lint('Reconcile task 7 status against the knowledge graph')
         assert violations == []
+
+
+class TestNegativeProbeSetPremise:
+    """Task 4644: a negative mixed-store probe set licenses "0 of N
+    reproduced" and nothing stronger. Run cd53b227 promoted one negative probe
+    to an absence conclusion and wrote it into a task's `details`; these are
+    the two phrasings it used, and the two it must not swallow along with them.
+    """
+
+    INVARIANT = 'negative_probe_set_does_not_clear_intermittent_fault'
+
+    def _invariants(self, text: str) -> set[str]:
+        return {v.invariant for v in m.premise_lint(text)}
+
+    def test_flags_unqualified_did_not_reproduce_premise(self):
+        assert self.INVARIANT in self._invariants(
+            'Stage 2 probed the mixed-store path and the degradation did not '
+            'reproduce this cycle.'
+        )
+
+    def test_flags_no_persistent_graphiti_problem_premise(self):
+        assert self.INVARIANT in self._invariants(
+            'The probe was negative, so there is no persistent Graphiti problem.'
+        )
+
+    def test_permitted_verdict_wording_is_not_flagged(self):
+        """LOAD-BEARING: a rule that also rejected the sanctioned wording would
+        make requirement 4 unsatisfiable -- there would be nothing a stage
+        could truthfully say. Sourced from the constant the prompts render, so
+        the rule and the permitted wording cannot drift apart."""
+        permitted = NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER))
+        assert self.INVARIANT not in self._invariants(permitted)
+
+    def test_benign_graphiti_prose_is_not_flagged(self):
+        """The false-positive floor: naming the degradation without claiming
+        it is gone."""
+        assert self.INVARIANT not in self._invariants(
+            '0 of 3 probes reproduced the Graphiti degradation; continuing to '
+            'watch it.'
+        )
 
     def test_violation_is_a_frozen_dataclass(self):
         import dataclasses
