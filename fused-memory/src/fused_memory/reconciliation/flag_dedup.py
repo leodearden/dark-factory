@@ -5365,10 +5365,10 @@ async def filter_accounted_cluster_growth_flags(
     ``TaskNotFoundError``, a non-dict or body-less result, zero cited memories,
     a cited id too short to discriminate (which would otherwise "confirm"
     against ordinary prose), no resolvable task id, and a falsy
-    ``taskmaster``/``project_root``.  The
-    asymmetry is deliberate -- a false KEEP costs one redundant flag that dedup
-    and suppression already handle and that self-heals next cycle, whereas a
-    false DROP silently loses the signal entirely.
+    ``taskmaster``/``project_root``.  The asymmetry is deliberate -- a false
+    KEEP costs one redundant flag that dedup and suppression already handle and
+    that self-heals next cycle, whereas a false DROP silently loses the signal
+    entirely.
 
     Non-candidate flags pass through with no ``get_task`` call at all, and a
     batch with zero candidates returns before any I/O.
