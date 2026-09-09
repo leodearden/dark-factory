@@ -171,3 +171,141 @@ class TestReconRailBadgeWiring:
             'vocabulary must come from recon_status.js so the rail badge and '
             'the Recon tab cannot drift apart from each other.'
         )
+
+
+@pytest.fixture(scope='module')
+def recon_tab_code(tabs_jsx_body):
+    """ReconTab's comment-stripped body — the scope every tabs.jsx assertion
+    below runs in.
+
+    tabs.jsx is ~1400 lines and defines nine tab components; unscoped, a
+    token from MemoryTab or MergeTab could satisfy a presence assertion and
+    any of them could falsify an absence one. extract_function_body raises on
+    a miss rather than returning '', so this fixture cannot hand the tests an
+    empty slice that passes everything vacuously.
+    """
+    return strip_js_comments(extract_function_body(tabs_jsx_body, 'ReconTab'))
+
+
+def _extract_stat_tile(code: str, label: str) -> str:
+    """Return the source of the self-closing ``<ST label="<label>" ... />``
+    element.
+
+    Scopes a tile assertion to ONE tile: the Recon strip renders several, and
+    an unscoped search for `reconSuccessPct(` would be satisfied by any of
+    them. Raises on a miss for the same reason _extract_object_literal does.
+    """
+    match = re.search(
+        r'<ST\s+label="' + re.escape(label) + r'"(.*?)/>',
+        code,
+        re.DOTALL,
+    )
+    assert match is not None, (
+        f'no self-closing <ST label="{label}" ... /> tile in ReconTab — it was '
+        f'renamed or restructured, and an assertion over an empty slice would '
+        f'pass vacuously.'
+    )
+    return match.group(0)
+
+
+class TestReconSuccessRateWiring:
+    """DEFECT 2 — the success-rate tile counted `x.status === 'success'`, a
+    spelling the journal never writes, so it read 0% forever."""
+
+    def test_tabs_jsx_destructures_recon_status_at_top_level(self, tabs_jsx_body):
+        """Whole-file scope: top-level destructures sit outside every
+        component body, so scoping this to ReconTab would never match."""
+        match = re.search(
+            r'const\s*\{([^}]*)\}\s*=\s*window\.DF_RECON_STATUS\s*;',
+            tabs_jsx_body,
+        )
+        assert match is not None, (
+            'tabs.jsx does not destructure window.DF_RECON_STATUS at top level.'
+        )
+        names = {n.strip() for n in match.group(1).split(',') if n.strip()}
+        assert {'reconRunCounts', 'reconSuccessPct', 'reconStatusTone'} <= names, (
+            f'tabs.jsx destructures {sorted(names)} from window.DF_RECON_STATUS '
+            '— ReconTab needs all three: the counts drive the tiles, the pct '
+            'drives the rate, the tone drives the Recent Runs badges.'
+        )
+
+    def test_counts_are_derived_exactly_once(self, recon_tab_code):
+        """ReconTab must call reconRunCounts once and bind it to `counts`.
+
+        ONE derivation feeding every tile is the structural point: this file
+        previously held two independent status filters that disagreed with
+        each other (the tile's 'success' and the badge ternary's
+        'success' || 'completed'), and a second call site is how that returns.
+        """
+        calls = re.findall(r'reconRunCounts\s*\(', recon_tab_code)
+        assert len(calls) == 1, (
+            f'ReconTab calls reconRunCounts {len(calls)} times — every tile '
+            'must read the SAME counts object, or two tiles can disagree '
+            'about the same window.'
+        )
+        assert re.search(r'const\s+counts\s*=\s*reconRunCounts\s*\(', recon_tab_code), (
+            'ReconTab does not bind reconRunCounts(...) to `const counts`.'
+        )
+
+    def test_success_rate_tile_value_comes_from_recon_success_pct(self, recon_tab_code):
+        """The rate is computed by the module the node suite covers."""
+        tile = _extract_stat_tile(recon_tab_code, 'Run success rate')
+        assert 'reconSuccessPct(' in tile, (
+            f'the Run success rate tile does not call reconSuccessPct(...): '
+            f'{tile!r}'
+        )
+
+    def test_success_literal_is_gone_from_recon_tab(self, recon_tab_code):
+        """The literal that pinned the tile at 0% must be absent.
+
+        Absence rather than bypass: the journal has never written 'success',
+        so any surviving comparison against it is dead code that reads as
+        though the status were handled.
+        """
+        assert "x.status === 'success'" not in recon_tab_code
+        assert "'success'" not in recon_tab_code, (
+            "ReconTab still contains the literal 'success' — the "
+            'reconciliation journal writes "completed", never "success".'
+        )
+
+    def test_rate_denominator_is_terminal_runs_not_the_whole_window(
+        self, recon_tab_code
+    ):
+        """The rate must not be divided by the window size.
+
+        Fixing only the 'success' literal would leave a rate that DIPS every
+        time reconciliation gets busy, because an in-flight run would sit in
+        the denominator having neither succeeded nor failed — a second,
+        subtler version of the same bug. `totalRuns` was the old local for it.
+        """
+        assert 'totalRuns' not in recon_tab_code, (
+            'ReconTab still computes `totalRuns` — the success rate denominator '
+            'must be the TERMINAL count (counts.terminal), not the window size.'
+        )
+        assert not re.search(r'/\s*r\.runs\.length', recon_tab_code), (
+            'ReconTab still divides by r.runs.length — an in-flight run would '
+            'depress the success rate.'
+        )
+
+    def test_success_rate_hint_surfaces_the_denominator_and_the_residue(
+        self, recon_tab_code
+    ):
+        """The tile's hint must report what the rate was computed over.
+
+        `counts.terminal` and `counts.inFlight` make the denominator legible
+        on the tile itself, so an operator can tell "no run has finished yet"
+        from "everything failed". `counts.unknown` is what keeps THIS defect
+        from recurring silently: a status the store grows later shows up as a
+        number in the UI instead of vanishing into a filter that matches
+        nothing.
+        """
+        tile = _extract_stat_tile(recon_tab_code, 'Run success rate')
+        hint = re.search(r'hint=\{(.*?)\}\s*\n', tile, re.DOTALL)
+        assert hint is not None, f'the Run success rate tile has no hint: {tile!r}'
+        hint_src = hint.group(1)
+
+        for field in ('counts.terminal', 'counts.inFlight', 'counts.unknown'):
+            assert field in hint_src, (
+                f'the Run success rate hint does not surface {field}: '
+                f'{hint_src!r}'
+            )
