@@ -1,0 +1,122 @@
+"""Tests for recon's Graphiti-degradation probe protocol (task 4644).
+
+The protocol is DATA — a ladder of ``limit`` values, a minimum probe count,
+a fan-out floor, two stat-key names and one verdict template — and the prompt
+prose is rendered from it. Every assertion here is therefore about referential
+integrity against those constants, never about the wording they render into:
+rewording the guidance must keep this suite green, while dropping a ladder
+rung, renaming a counter or weakening the verdict rule must turn it red.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY,
+    GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY,
+    HIGH_FANOUT_LIMIT_FLOOR,
+    MIN_PROBES_PER_CYCLE,
+    NEGATIVE_SET_VERDICT_TEMPLATE,
+    PROBE_LIMIT_LADDER,
+)
+
+
+class TestProbeLadderIsAControlledVariable:
+    """Requirements 1 and 2: N>=3 probes, with ``limit`` spanned rather than
+    silently held at the one value that produced the cd53b227 false negative."""
+
+    def test_ladder_supplies_at_least_the_per_cycle_minimum(self):
+        """Requirement 1 — the ladder IS the reason for the minimum, so it
+        must be able to satisfy it on its own."""
+        assert len(PROBE_LIMIT_LADDER) >= MIN_PROBES_PER_CYCLE
+
+    def test_ladder_rungs_are_distinct(self):
+        """Three probes at one ``limit`` would raise N without controlling the
+        fan-out confound at all."""
+        assert len(set(PROBE_LIMIT_LADDER)) == len(PROBE_LIMIT_LADDER)
+
+    def test_ladder_reaches_the_high_fanout_floor(self):
+        """Requirement 2 — at least one probe at the fan-out size that has
+        demonstrated power to fire."""
+        assert max(PROBE_LIMIT_LADDER) >= HIGH_FANOUT_LIMIT_FLOOR
+
+    def test_ladder_keeps_the_limit_that_produced_the_false_negative(self):
+        """limit=3 is the lone probe cd53b227's Stage 2 ran. It stays IN the
+        ladder: controlling a variable means spanning it, including the value
+        already known to miss. Dropping it would swap the confound, not fix it."""
+        assert 3 in PROBE_LIMIT_LADDER
+
+    def test_ladder_includes_the_limit_both_positive_sightings_used(self):
+        """Both reproductions came from limit=8 mixed-store queries."""
+        assert 8 in PROBE_LIMIT_LADDER
+
+    def test_minimum_probe_count_is_three(self):
+        assert MIN_PROBES_PER_CYCLE == 3
+
+    def test_high_fanout_floor_is_eight(self):
+        assert HIGH_FANOUT_LIMIT_FLOOR == 8
+
+    def test_ladder_is_immutable(self):
+        """A module-level list would let one importer mutate the protocol for
+        every other."""
+        assert isinstance(PROBE_LIMIT_LADDER, tuple)
+
+
+class TestCounterKeyNames:
+    """Requirement 3 — the denominator pair. These exact spellings are what a
+    cycle-report reader greps for, so they are pinned as literals here and
+    imported (never retyped) everywhere else."""
+
+    def test_probes_run_key_spelling(self):
+        assert GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY == 'graphiti_mixed_store_probes_run'
+
+    def test_reproduced_key_spelling(self):
+        assert GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY == 'graphiti_degradation_reproduced'
+
+    def test_the_two_counters_are_distinct_keys(self):
+        assert (
+            GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY
+            != GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY
+        )
+
+
+class TestVerdictTemplate:
+    """Requirement 4's permitted wording, single-sourced."""
+
+    def test_renders_the_mandated_sentence_for_the_ladder(self):
+        assert NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER)) == (
+            '0 of 3 probes reproduced; the fault is intermittent and '
+            'load-dependent, so a negative set does not clear it.'
+        )
+
+    def test_render_leaves_no_unfilled_placeholder(self):
+        """The rendered verdict is interpolated into stage f-strings; a stray
+        brace would be silently swallowed there rather than raising."""
+        rendered = NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER))
+        assert '{' not in rendered
+        assert '}' not in rendered
+
+
+def test_module_is_import_light():
+    """The leaf sits on the prompt-import path and is imported by the equally
+    import-light ``recon_self_model``, so it must stay stdlib-only.
+
+    Probed in a FRESH interpreter: this test process has already imported the
+    heavy modules transitively, so an in-process ``sys.modules`` check would
+    pass vacuously. The constant round-trip at the end keeps the probe itself
+    from silently no-opping if the import ever stops resolving.
+    """
+    probe = (
+        'import sys; '
+        'import fused_memory.reconciliation.graphiti_degradation_probe as p; '
+        "assert 'mem0' not in sys.modules, sorted(k for k in sys.modules if 'mem0' in k); "
+        "assert 'fused_memory.config.schema' not in sys.modules; "
+        "assert 'fused_memory.reconciliation.harness' not in sys.modules; "
+        'assert p.MIN_PROBES_PER_CYCLE == 3'
+    )
+    result = subprocess.run(
+        [sys.executable, '-c', probe], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
