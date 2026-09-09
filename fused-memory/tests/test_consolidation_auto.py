@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import uuid
+
+from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
+from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN
 
 
 class TestImportLeafAndSingleHomes:
@@ -119,3 +123,72 @@ class TestImportLeafAndSingleHomes:
             'assert cg is not None and ca is not None\n',
         )
         assert result.returncode == 0, result.stderr
+
+
+class TestBuildAutoCanonical:
+    """PRD C3: the ONE home of auto-consolidated canonical text.
+
+    The template is duplicated between the test below and the implementation
+    DELIBERATELY, and only here: it is the one thing this class exists to pin,
+    and a test that derived the expected string from the implementation would
+    assert nothing about drift in its wording, backticks or punctuation.
+    """
+
+    CLAIM = (
+        'Stage 1 keeps re-proposing the same cluster because the ledger row is '
+        'never addressed.'
+    )
+    TOPIC = 'memory-consolidation'
+    RUN_ID = 'ce8590f1-cc05-48da-9428-1cf1f54f3fff'
+
+    def test_renders_the_prd_template_verbatim(self):
+        expected = (
+            f'{self.CLAIM}\n\n'
+            f'Index canonical for topic `{self.TOPIC}` over 5 short peers; the '
+            f'live metadata.topic scroll is the member list (auto-consolidated, '
+            f'run {self.RUN_ID}).'
+        )
+
+        assert build_auto_canonical(
+            self.CLAIM, self.TOPIC, 5, self.RUN_ID,
+        ) == expected
+
+    def test_the_claim_is_the_first_paragraph_verbatim(self):
+        """PRD §2 measured that a template canonical retrieves within 0.015
+        cosine of a hand-written one. That property rests on the claim LEADING
+        the body, so the claim must open the string and be followed by exactly
+        one blank line."""
+        out = build_auto_canonical(self.CLAIM, self.TOPIC, 5, self.RUN_ID)
+
+        assert out.startswith(self.CLAIM)
+        assert out[len(self.CLAIM):len(self.CLAIM) + 3] == '\n\nI', (
+            'exactly one blank line must separate the claim from the index line'
+        )
+
+    def test_bound_is_under_500_chars_at_the_extremes(self):
+        """PRD D5's evidence, and why there is no `canonical_max_chars` leaf.
+
+        Every input at its own cap: a claim at the `claim_max_chars` default
+        (200), a slug at TOPIC_SLUG_MAX_LEN (100), N at the `member_max`
+        default (20), and a real recon run id — `str(uuid4())`, 36 chars, the
+        shape reconciliation/harness.py and targeted.py both generate.
+
+        The lower bound is asserted too: a silent shrink to a truncating
+        implementation would otherwise sail past a bare `< 500`.
+        """
+        out = build_auto_canonical(
+            'x' * 200, 't' * TOPIC_SLUG_MAX_LEN, 20, str(uuid.uuid4()),
+        )
+
+        assert len(out) < 500, len(out)
+        assert len(out) >= 460, (
+            f'expected the measured 464-char maximum, got {len(out)} — a '
+            'shorter maximum means the builder is clipping something'
+        )
+
+    def test_extreme_inputs_are_not_truncated(self):
+        """The builder never clips: a 200-char claim appears in full."""
+        claim = 'y' * 200
+        out = build_auto_canonical(claim, 't' * TOPIC_SLUG_MAX_LEN, 20, self.RUN_ID)
+
+        assert claim in out
