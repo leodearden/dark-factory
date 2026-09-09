@@ -79,14 +79,42 @@ class PrefixToken(NamedTuple):
 def find_prefix_tokens(arguments: Any) -> tuple[PrefixToken, ...]:
     """Return every prefix-shaped token in *arguments*, in document order.
 
+    Every string value reachable through dicts AND lists is scanned, not only
+    the top-level ones that ``mcp_markup_middleware.py::_first_markup_argument``
+    inspects. D11 is the reason: the DF 4643 instance lives one level down at
+    ``metadata.cluster_memory_ids[i]``, and the measured field spread is 20+
+    paths, so a top-level-only scan would have missed the incident that
+    motivated the contract.
+
+    Only VALUES are scanned. A dict key that happens to look like a prefix is
+    a field name, not a citation.
+
+    Document order is argument insertion order, then container order, then
+    span within a string. It falls out of pushing children onto the stack in
+    REVERSE so they pop in order.
+
+    The traversal is ITERATIVE with an explicit stack, never recursive: this
+    runs on the event-loop thread inside a middleware hook, and a deeply
+    nested argument map must not turn a guard into a RecursionError.
+
+    PRECONDITION: *arguments* is JSON-derived, and therefore finite and
+    acyclic. No cycle detection is written — a cycle cannot arrive through the
+    MCP wire, and none is testable without hanging the suite.
+
     Pure, synchronous, and never raises for any JSON-shaped input.
     """
     if not isinstance(arguments, dict):
         return ()
     found: list[PrefixToken] = []
-    for name, value in arguments.items():
-        if isinstance(value, str):
-            found.extend(_scan(value, (name,)))
+    stack: list[tuple[tuple[str | int, ...], Any]] = [((), arguments)]
+    while stack:
+        path, node = stack.pop()
+        if isinstance(node, str):
+            found.extend(_scan(node, path))
+        elif isinstance(node, dict):
+            stack.extend((path + (k,), v) for k, v in reversed(list(node.items())))
+        elif isinstance(node, list):
+            stack.extend((path + (i,), v) for i, v in reversed(list(enumerate(node))))
     return tuple(found)
 
 
