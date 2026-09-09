@@ -215,14 +215,25 @@ def _slate_ids(candidates):
     return [getattr(c, 'id', None) for c in candidates or ()]
 
 
-def _make_designating_triage_write(decode):
-    """Build a triage_write that CONSUMES the candidate its judge designated.
+def _attach_designated(candidate_id, candidates, decision):
+    """Honour the designation, after validating it against the slate."""
+    if candidate_id in _slate_ids(candidates):
+        return candidate_id
+    return decision.canonical_id
+
+
+def _make_designating_triage_write(decode, attach=_attach_designated):
+    """Build a triage_write that reads a designating verdict.
 
     *decode* maps a judge payload to ``(outcome, candidate_id)``, or None for
     "not the spelling this variant speaks" — in which case the payload is
     treated as main treats it, i.e. as a bare outcome word naming no candidate.
-    Everything else mirrors main, including validating the designated id against
-    the slate before honouring it.
+
+    *attach* maps ``(candidate_id, candidates, decision)`` to the id the write
+    attaches to. Decoding a designation and HONOURING it are separate things,
+    and a variant that decodes one and then attaches somewhere fixed is exactly
+    the bug class the swap test exists to catch — so they are separate
+    parameters rather than one entangled body.
     """
     async def triage_write(memory_service, *, content, project_id, counter,
                            judge=None, allow_near_duplicate=False,
@@ -260,10 +271,8 @@ def _make_designating_triage_write(decode):
             )
         if outcome == OUTCOME_STORED:
             canonical_id = None
-        elif candidate_id in _slate_ids(candidates):
-            canonical_id = candidate_id
         else:
-            canonical_id = decision.canonical_id
+            canonical_id = attach(candidate_id, candidates, decision)
         return BandDecision(
             outcome, canonical_id, decision.similarity,
             decision.t_high, decision.t_low,
@@ -368,6 +377,30 @@ triage_write = _make_designating_triage_write(_decode)
 '''
 
 
+#: The POSITIONAL BUG, relocated to the consumption side. It decodes the
+#: designation perfectly happily and then attaches to a fixed slot, so its
+#: attach id is neither the band's canonical nor anything the judge said. A
+#: single-shot "is the attach id different from the band canonical?" check
+#: blesses it; only requiring the attach to TRACK the designation across two
+#: different designations rejects it. Item 1 had to defeat the same class as
+#: `candidates[0]`.
+_HARDCODES_LAST = r'''
+
+def _decode(verdict):
+    if isinstance(verdict, tuple) and len(verdict) == 2:
+        return verdict
+    return None
+
+
+def _attach_last(candidate_id, candidates, decision):
+    ids = _slate_ids(candidates)
+    return ids[-1] if ids else decision.canonical_id
+
+
+triage_write = _make_designating_triage_write(_decode, _attach_last)
+'''
+
+
 #: variant name -> the ``triage_write`` that defines it. Appended to
 #: :data:`TRIAGE_PREAMBLE` by :func:`write_fake_triage`.
 VARIANT_TAILS: dict[str, str] = {
@@ -375,6 +408,7 @@ VARIANT_TAILS: dict[str, str] = {
     'consumes_designated_id': _CONSUMES_TUPLE,
     'consumes_designated_dict': _CONSUMES_DICT,
     'consumes_designated_object': _CONSUMES_OBJECT,
+    'hardcodes_last_candidate': _HARDCODES_LAST,
 }
 
 

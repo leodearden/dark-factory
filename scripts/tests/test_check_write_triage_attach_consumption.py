@@ -58,6 +58,9 @@ _CHANNEL = 'designation channel'
 #: The control spelling. It designates nothing, so it must never satisfy on its
 #: own — a module that widened nothing would otherwise open the gate.
 _BARE_STR_SPELLING = 'bare outcome str'
+#: The finding a hard-coded attach position earns. It has to be distinguishable
+#: from "no designation channel exists": the remedies are different.
+_DID_NOT_TRACK = 'did not track the designated candidate'
 
 #: The option-(a) wire shapes a fix might land. None may be pinned by the
 #: probe: option (a) has not landed, so a probe that required one spelling
@@ -145,3 +148,37 @@ class TestConsumptionProbe:
         assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
         assert _PASS not in proc.stdout, proc.stdout
         assert _BARE_STR_SPELLING in proc.stdout, proc.stdout
+
+    def test_a_hardcoded_attach_position_is_not_consumption(self, tmp_path):
+        """The positional bug, relocated to the consumption side.
+
+        This variant DECODES the designation and then attaches to a fixed slot,
+        so its attach id is neither the band's canonical nor anything the judge
+        said. A single-shot "is the attach id different from the band
+        canonical?" check blesses it — the same `candidates[0]` class item 1
+        already had to defeat. Only requiring the attach to TRACK the
+        designation rejects it, and the report must say so: "did not track" and
+        "no designation channel exists" point at different remedies.
+        """
+        src_root = write_fake_triage(
+            tmp_path / 'src', variant='hardcodes_last_candidate',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS not in proc.stdout, proc.stdout
+        assert _DID_NOT_TRACK in proc.stdout, proc.stdout
+
+    def test_the_tracking_requirement_does_not_fail_a_correct_fix(self, tmp_path):
+        """The converse control for the test above.
+
+        A requirement that rejects the positional bug is worthless if it also
+        rejects a module that genuinely threads the designation — that would
+        re-block task 3169 against a correct fix, which is the false-FAIL class
+        this gate family exists to remove.
+        """
+        src_root = write_fake_triage(
+            tmp_path / 'src', variant='consumes_designated_id',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS in proc.stdout, proc.stdout
