@@ -24,6 +24,7 @@ import pytest
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.reconciliation.consolidation_auto import (
+    CORRECTION_METADATA_KEYS,
     UNREADABLE,
     AutoOutcome,
     AutoProposal,
@@ -93,6 +94,21 @@ def _proposal(
 ) -> AutoProposal:
     """Build the structured proposal task delta assembles from a ledger row."""
     return AutoProposal(topic=topic, member_ids=tuple(member_ids), category=category)
+
+
+def _codes(verdict: AutoVerdict) -> list[AutoReasonCode]:
+    """Every reason code the verdict gave, in order."""
+    return [reason.code for reason in verdict.reasons]
+
+
+def _reasons_for(verdict: AutoVerdict, code: AutoReasonCode) -> list[Any]:
+    """The reasons carrying *code* — a list, because collecting is the contract.
+
+    Asking for a code and getting back a list is deliberate: the hazard arm
+    reports EVERY offender, so a test that wants "the one reason" says so by
+    asserting the length rather than by silently reading the first.
+    """
+    return [reason for reason in verdict.reasons if reason.code is code]
 
 
 def _auto_config(**overrides: Any):
@@ -595,3 +611,274 @@ class TestTerminalOutcomes:
 
         assert verdict.outcome is AutoOutcome.PASS
         assert verdict.retain_ids == ('m1', 'm2', 'm3')
+
+
+#: Correction banners taken from LIVE dark_factory records, not invented.
+#:
+#: Each is a real body prefix. Together they pin the four shapes the regex has
+#: to cover: bracketed at offset 0, bracketed MID-BODY, the bare bracketed
+#: stamp, and the un-bracketed line-leading form.
+CORRECTION_BANNER_SPECIMENS = {
+    # mem0 cedabf87-ae25-4acb-9331-19b13599e78d — the 5180 canonical the PRD
+    # names as its motivating specimen.
+    'bracketed_5180_canonical': (
+        '[CORRECTION 2026-09-08 (curator sitting, gate 5180 / esc-5180-1, ruled by '
+        'Leo) — READ THIS FIRST]: Two earlier banners sat here and are replaced by '
+        'this one.'
+    ),
+    # mem0 0090d639-c325-490c-a432-866b60a26ba7 — a SECOND banner sitting after
+    # an ordinary paragraph. This one is why the regex must not be \A-anchored:
+    # an anchored pattern reads this record as clean.
+    'bracketed_mid_body': (
+        f'{BENIGN_BODY}\n\n'
+        '[CORRECTION 2026-09-07, task 4899] Topic `dashboard-js-test-substrate`: '
+        'the load-bearing premise of this entry is now FALSE.'
+    ),
+    'bracketed_bare_stamp': '[CORRECTION 2026-08-08] The measured figure below is stale.',
+    # Pinned in-repo as
+    # scripts/amend_stale_resume_cwd_records.py::_CORRECTED_RECORD_PREIMAGE.
+    'unbracketed_superseded': (
+        'SUPERSEDED 2026-08-30 (by Stage-1 memory consolidation, task 4610). This '
+        "entry's original framing is CONTRADICTED by later measurement."
+    ),
+    # One of the 9 live kind='correction' records.
+    'unbracketed_correction_to': (
+        "CORRECTION to the parent entry's closing STATUS paragraph (esc-4377-4, "
+        'measured 2026-09-04).'
+    ),
+}
+
+#: Bodies that must NOT match. The AMENDMENT idiom is the load-bearing one: 53
+#: live dark_factory records open with it, and it is benign ACCRETION rather
+#: than retraction — `server/grouped_read.py::AMENDMENT_KIND` treats it as a
+#: first-class child kind. Matching it would refuse the majority of real
+#: clusters and turn the auto path back into the gate flood the PRD ends.
+BENIGN_ACCRETION_SPECIMENS = {
+    'amendment': (
+        'AMENDMENT to the "KNOWN-RED ON MAIN: test_fleet_staleness_composition.py" '
+        'record — the trio is NO LONGER RED.'
+    ),
+    'sharpening': (
+        'SHARPENING of the "never pin the prose of a constant this codebase owns" '
+        'norm: the rule is about ownership, not about prose.'
+    ),
+    'ordinary': BENIGN_BODY,
+}
+
+
+class TestMemberHazards:
+    """Rung 2, member level: every code that sends a cluster to a human.
+
+    The arm is REFUSAL-ONLY. A code firing adds a FAIL; no code firing certifies
+    nothing (PRD D14). Every test here RUNS the predicate against fixture
+    members and asserts on the returned verdict — none inspects the regex, the
+    key set, or any source text, so the checks survive a reimplementation.
+    """
+
+    @staticmethod
+    def _judge(members, *, proposal_ids=None, canonical_count=0, config=None):
+        """Run the predicate over *members* with the gate closed."""
+        ids = tuple(proposal_ids) if proposal_ids is not None else tuple(members)
+        return evaluate_auto_predicate(
+            _proposal(ids),
+            members=members,
+            canonical_count=canonical_count,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=config or _auto_config(),
+        )
+
+    def test_unreadable_member_fails_closed(self):
+        """A read that DID NOT ANSWER must never look benign.
+
+        `MemoryService.get_memory_by_id` returns None for a genuine miss but
+        PROPAGATES a backend read timeout as TimeoutError, precisely so callers
+        can tell the two apart. Collapsing them would let a Qdrant timeout read
+        as "record absent" — and absent is a benign-looking input the predicate
+        would happily rule on.
+        """
+        members = _members(_member('m1'), _member('m3'))
+        members['m2'] = UNREADABLE
+
+        verdict = self._judge(members, proposal_ids=('m1', 'm2', 'm3'))
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_unreadable)
+        assert [r.ids for r in reasons] == [('m2',)]
+
+    def test_missing_member_fails(self):
+        """A member the proposal named and the store does not have."""
+        members = _members(_member('m1'), _member('m3'))
+        members['m2'] = None
+
+        verdict = self._judge(members, proposal_ids=('m1', 'm2', 'm3'))
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_not_found)
+        assert [r.ids for r in reasons] == [('m2',)]
+
+    def test_member_canonical_of_a_different_topic_fails(self):
+        """Folding another topic's canonical in would destroy that topic's index.
+
+        PRD D15: the detail names BOTH slugs, because the operator reading the
+        refusal needs to know which other topic was about to be swallowed.
+
+        The incumbent of THIS topic is in the same fixture and must NOT be
+        reported under this code — it is stripped, not refused, and that
+        distinction is the whole of rung 3.
+        """
+        members = _members(
+            _member('m1'),
+            _member('x1', topic='some-other-topic', canonical=True),
+            _member('C', topic=TOPIC, canonical=True),
+        )
+
+        verdict = self._judge(members, proposal_ids=('m1', 'x1', 'C'), canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_already_canonical)
+        assert [r.ids for r in reasons] == [('x1',)]
+        assert 'some-other-topic' in reasons[0].detail
+        assert TOPIC in reasons[0].detail
+
+    def test_member_stamped_with_a_different_topic_fails(self):
+        """The admitted set is `topic in (None, T)` — anything else is a refusal.
+
+        A member already stamped with another topic belongs to that topic's
+        scroll; re-stamping it would silently move it, and nothing sweeps a
+        topic that lost a member.
+        """
+        members = _members(
+            _member('m1'),
+            _member('m2', topic=TOPIC),
+            _member('x1', topic='some-other-topic'),
+        )
+
+        verdict = self._judge(members, proposal_ids=('m1', 'm2', 'x1'))
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_different_topic)
+        assert [r.ids for r in reasons] == [('x1',)]
+
+    @pytest.mark.parametrize('key', sorted(CORRECTION_METADATA_KEYS))
+    def test_member_carrying_correction_metadata_fails(self, key):
+        """Parametrised FROM the frozenset, so a key added later is covered.
+
+        Hard-coding the six keys here would let a seventh ship untested — the
+        one shape of drift this arm cannot afford, since it is the only
+        machine-readable half of correction detection.
+        """
+        members = _members(
+            _member('m1'),
+            _member('m2', **{key: 'ce8590f1-cc05-48da-9428-1cf1f54f3fff'}),
+        )
+
+        verdict = self._judge(members)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_carries_correction_metadata)
+        assert [r.ids for r in reasons] == [('m2',)]
+        assert key in reasons[0].detail
+
+    @pytest.mark.parametrize(
+        'body',
+        CORRECTION_BANNER_SPECIMENS.values(),
+        ids=list(CORRECTION_BANNER_SPECIMENS),
+    )
+    def test_member_carrying_a_correction_banner_fails(self, body):
+        """Every shape is a MEASURED live record body, not an invented one.
+
+        A regex derived from imagined banners would miss the ones that exist;
+        the mid-body specimen in particular is a real record whose second
+        banner an anchored pattern reads straight past.
+        """
+        members = _members(_member('m1'), _member('m2', content=body))
+
+        verdict = self._judge(members)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_carries_correction_banner)
+        assert [r.ids for r in reasons] == [('m2',)]
+
+    @pytest.mark.parametrize(
+        'body',
+        BENIGN_ACCRETION_SPECIMENS.values(),
+        ids=list(BENIGN_ACCRETION_SPECIMENS),
+    )
+    def test_benign_accretion_is_not_a_correction_banner(self, body):
+        """The false-positive guard, and why the regex is measured not guessed.
+
+        A cluster of ordinary amended records must pass. If AMENDMENT matched,
+        the predicate would refuse 53 live records' worth of perfectly healthy
+        accretion and the auto path would produce the very gate flood it exists
+        to end.
+        """
+        members = _members(_member('m1'), _member('m2', content=body))
+
+        verdict = self._judge(members)
+
+        assert AutoReasonCode.member_carries_correction_banner not in _codes(verdict)
+        assert verdict.outcome is AutoOutcome.PASS
+
+    def test_mixed_category_fails(self):
+        """One canonical cannot index two categories' worth of records.
+
+        A member with NO category does not by itself trip this: an unstamped
+        record predates the vocabulary rather than contradicting it, and
+        refusing on absence would refuse most old clusters.
+        """
+        members = _members(
+            _member('m1', category='procedural_knowledge'),
+            _member('m2', category='observations_and_summaries'),
+        )
+
+        verdict = self._judge(members)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.mixed_category)
+        assert len(reasons) == 1
+        assert set(reasons[0].ids) == {'m1', 'm2'}
+
+        uncategorised = _members(_member('n1', category=None), _member('n2'))
+        assert AutoReasonCode.mixed_category not in _codes(self._judge(uncategorised))
+
+    def test_a_hazard_beside_a_live_canonical_still_fails(self):
+        """PRD D4, the case the binding order exists for.
+
+        A NEW member carrying a correction banner arrives at a topic that
+        already has a healthy canonical. Were the outcome rungs tried first
+        this would be a tag-only pass — and the executor would stamp a retracted
+        record into a live topic's scroll. Hazards outrank rungs 3-6.
+        """
+        members = _members(
+            _member('m1', topic=TOPIC),
+            _member('m2', topic=TOPIC),
+            _member('n1', content=CORRECTION_BANNER_SPECIMENS['bracketed_5180_canonical']),
+        )
+
+        verdict = self._judge(members, canonical_count=1)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert AutoReasonCode.member_carries_correction_banner in _codes(verdict)
+
+    def test_every_hazard_is_collected_not_short_circuited(self):
+        """One human sitting must name every problem, not the first one found.
+
+        Same no-short-circuit bar the validator holds. A predicate that stopped
+        at the first hazard would send the cluster back three times.
+        """
+        members = _members(
+            _member('m1'),
+            _member('m4', content=CORRECTION_BANNER_SPECIMENS['unbracketed_superseded']),
+        )
+        members['m2'] = UNREADABLE
+        members['m3'] = None
+
+        verdict = self._judge(members, proposal_ids=('m1', 'm2', 'm3', 'm4'))
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        assert {
+            AutoReasonCode.member_unreadable,
+            AutoReasonCode.member_not_found,
+            AutoReasonCode.member_carries_correction_banner,
+        } <= set(_codes(verdict))
