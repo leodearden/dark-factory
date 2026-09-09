@@ -272,6 +272,20 @@ def _metadata(record: object) -> Mapping[str, Any]:
     return metadata if isinstance(metadata, Mapping) else {}
 
 
+def _content(record: object) -> str:
+    """The body text of a member record, as a string, whatever the record is.
+
+    Same no-raise discipline as :func:`_metadata`: a record with no ``content``,
+    or a ``content`` that is not text, scans as empty rather than exploding. An
+    empty scan certifies nothing — the banner arm is refusal-only — so failing
+    to find a banner in a malformed body costs no safety the arm ever offered.
+    """
+    if not isinstance(record, Mapping):
+        return ''
+    content = record.get('content')
+    return content if isinstance(content, str) else ''
+
+
 def _is_incumbent(record: object, topic: str) -> bool:
     """Is *record* the canonical THIS topic already has?
 
@@ -284,6 +298,135 @@ def _is_incumbent(record: object, topic: str) -> bool:
     """
     metadata = _metadata(record)
     return metadata.get('canonical') is True and metadata.get('topic') == topic
+
+
+def _member_hazards(
+    proposal: AutoProposal,
+    members: Mapping[str, Mapping[str, Any] | None | _Unreadable],
+) -> list[AutoReason]:
+    """Every member-level refusal, COLLECTED — the member half of rung 2.
+
+    Collecting rather than stopping at the first offender is the contract: one
+    human sitting must be able to name every problem, or the same cluster comes
+    back once per hazard. That property is structural here — each check appends
+    to the same list and nothing returns early.
+
+    An id the caller did not supply a read for reads as ``member_not_found``.
+    That is deliberate fail-closed behaviour: the caller's contract is a read
+    per proposed id, and a missing key means the predicate cannot see a record
+    the proposal named.
+
+    The INCUMBENT is exempt from the two CORRECTION scans, and only those. It is
+    not thereby unscrutinised — a corrected incumbent is refused under
+    ``canonical_carries_correction``, which is a different fact about a
+    different record — but reporting it here as well would make one problem look
+    like two.
+    """
+    reasons: list[AutoReason] = []
+    categorised: list[tuple[str, str]] = []
+
+    for member_id in proposal.member_ids:
+        record = members.get(member_id)
+
+        if isinstance(record, _Unreadable):
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.member_unreadable,
+                    ids=(member_id,),
+                    detail=(
+                        f'the read for {member_id} did not answer; a backend that '
+                        'failed to reply is not a record that is fine'
+                    ),
+                ),
+            )
+            continue
+
+        if record is None:
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.member_not_found,
+                    ids=(member_id,),
+                    detail=f'{member_id} was proposed but no such record exists',
+                ),
+            )
+            continue
+
+        metadata = _metadata(record)
+        topic = metadata.get('topic')
+        foreign_topic = topic is not None and topic != proposal.topic
+
+        if metadata.get('canonical') is True and foreign_topic:
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.member_already_canonical,
+                    ids=(member_id,),
+                    detail=(
+                        f'{member_id} is the canonical of topic `{topic}`, not a '
+                        f'member of `{proposal.topic}`; folding it in would destroy '
+                        "that topic's index entry"
+                    ),
+                ),
+            )
+
+        if foreign_topic:
+            reasons.append(
+                AutoReason(
+                    code=AutoReasonCode.member_different_topic,
+                    ids=(member_id,),
+                    detail=(
+                        f'{member_id} is already stamped with topic `{topic}`; '
+                        f're-stamping it to `{proposal.topic}` would silently move '
+                        'it off a scroll nothing else sweeps'
+                    ),
+                ),
+            )
+
+        if not _is_incumbent(record, proposal.topic):
+            present = sorted(key for key in CORRECTION_METADATA_KEYS if key in metadata)
+            if present:
+                reasons.append(
+                    AutoReason(
+                        code=AutoReasonCode.member_carries_correction_metadata,
+                        ids=(member_id,),
+                        detail=(
+                            f'{member_id} carries correction metadata '
+                            f'({", ".join(present)}), so it is superseded rather '
+                            'than merely duplicated'
+                        ),
+                    ),
+                )
+
+            if CORRECTION_BANNER_RE.search(_content(record)):
+                reasons.append(
+                    AutoReason(
+                        code=AutoReasonCode.member_carries_correction_banner,
+                        ids=(member_id,),
+                        detail=(
+                            f"{member_id}'s body carries a correction or supersession "
+                            'banner; consolidating it would fold a retracted claim '
+                            'into a live canonical'
+                        ),
+                    ),
+                )
+
+            category = metadata.get('category')
+            if isinstance(category, str):
+                categorised.append((member_id, category))
+
+    distinct = {category for _, category in categorised}
+    if len(distinct) > 1:
+        reasons.append(
+            AutoReason(
+                code=AutoReasonCode.mixed_category,
+                ids=tuple(member_id for member_id, _ in categorised),
+                detail=(
+                    'the proposed members span more than one category '
+                    f'({", ".join(sorted(distinct))}); one canonical cannot index two'
+                ),
+            ),
+        )
+
+    return reasons
 
 
 def evaluate_auto_predicate(
@@ -351,6 +494,22 @@ def evaluate_auto_predicate(
                     ),
                 ),
             ),
+            retain_ids=(),
+            stripped_ids=(),
+            predicate_version=config.predicate_version,
+        )
+
+    # Rung 2. Hazards outrank every outcome rung below (PRD D4): a new member
+    # carrying a correction banner must refuse the cluster even when the topic
+    # has a healthy live canonical, because otherwise the tag-only rung would
+    # stamp a retracted record into that topic's scroll. A FAIL is not
+    # actionable, so it carries no retained or stripped ids — the reasons name
+    # every record involved, which is what the human sitting reads.
+    hazards = _member_hazards(proposal, members)
+    if hazards:
+        return AutoVerdict(
+            outcome=AutoOutcome.FAIL,
+            reasons=tuple(hazards),
             retain_ids=(),
             stripped_ids=(),
             predicate_version=config.predicate_version,
