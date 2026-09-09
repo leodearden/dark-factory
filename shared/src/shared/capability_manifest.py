@@ -108,6 +108,17 @@ def _check_kind_conditional_fields(
             raise ValueError(
                 f'{model_name}: paths is required and must be non-empty when kind={kind!r}.'
             )
+        for entry in paths:
+            if not entry.strip() or Path(entry).is_absolute() or '..' in Path(entry).parts:
+                raise ValueError(
+                    f'{model_name}: paths entry {entry!r} is invalid when kind={kind!r} — '
+                    'every entry must be a non-empty repo-relative path with no '
+                    "'..' segment. Stricter than kind='grep' on the same field because "
+                    'here the entry IS the assertion: a pathspec git cannot resolve '
+                    'inside the repository exits 128, which the gate maps to ERRORED, '
+                    'and ERRORED is a fail-safe wait with no streak bump and no '
+                    'escalation — a silent indefinite hold on every dependent.'
+                )
         if pattern is not None:
             raise ValueError(f'{model_name}: pattern must not be set when kind={kind!r}.')
         if script is not None:
@@ -180,6 +191,18 @@ class DeliveredCheck(_CheckFieldsBase):
     ``'path'``. ``paths`` is reused rather than a singular ``path`` field:
     two near-identical names on one model is a naming trap, and
     ``paths=['<file>']`` says exactly what ``path='<file>'`` would.
+
+    On ``'path'`` (and only there) ``paths`` entries must be non-empty,
+    repo-relative and free of ``'..'`` segments. The asymmetry with
+    ``'grep'``, which validates the same field not at all, is principled:
+    for grep ``paths`` merely NARROWS a search, so a bad entry degrades to
+    a wider-or-empty scope, whereas for ``'path'`` the entry IS the
+    assertion. A pathspec git cannot resolve inside the repository exits
+    128, which the gate maps to ERRORED — and ERRORED is a fail-safe wait
+    with no streak bump and no escalation, i.e. a silent indefinite hold
+    on every dependent. One typo'd leading slash would wedge a dependent
+    forever while emitting nothing a human would ever see, so the
+    descriptor is refused loudly at authoring time instead.
     """
 
     kind: Literal['grep', 'script', 'path', 'manual']
