@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _escalation_seed import seed_escalation
 
 from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
@@ -261,18 +262,18 @@ class TestGetPendingLevelFilter:
     """get_pending_escalations(level=N) filters by escalation level."""
 
     def _seed_esc(self, queue: EscalationQueue, task_id: str, level: int) -> Escalation:
-        """Seed a pending escalation at the given level directly via queue.submit()."""
-        esc = Escalation(
-            id=queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='implementer',
-            severity='blocking',
-            category='scope_violation',
+        """Seed a pending escalation at the given level directly via queue.submit().
+
+        A one-call delegation to ``_escalation_seed.seed_escalation``; the only
+        thing it still owns is this class's level-labelled default summary (pinned
+        by ``test_seeded_records_carry_a_level_labelled_summary``). Kept as a
+        method with this exact positional shape so its eighteen call sites below
+        stay unchanged.
+        """
+        return seed_escalation(
+            queue, level=level, task_id=task_id,
             summary=f'level={level} test escalation',
-            level=level,
         )
-        queue.submit(esc)
-        return esc
 
     def test_seeded_records_carry_a_level_labelled_summary(self, tmp_path: Path) -> None:
         """``_seed_esc``'s summary names the record's level, and that is what
