@@ -1,465 +1,543 @@
 prd: plans/memory-auto-consolidation-prd.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "Auto-consolidation config block, pure predicate, one validator, canonical builder"
-    capabilities:
-      - name: "config-block-bare-mounted"
-        binding: "capability→producer this-task; pattern config/schema.py::Mem0UpdateConfig bare mount"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "consolidation_auto: ConsolidationAutoConfig = Field\\("
-          paths: ["fused-memory/src/fused_memory/config/schema.py"]
-          expect: present
-      - name: "leaves-green-tier"
-        binding: "capability→producer this-task; config/reload.py::RELOADABLE_FIELDS list-leaf precedent"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "'consolidation_auto\\.(enabled|enabled_projects|max_auto_per_cycle|refusal_streak_threshold)'"
-          paths: ["fused-memory/src/fused_memory/config/reload.py"]
-          expect: present
-      - name: "provenance-prefix-leaf-green-tier"
-        binding: "capability→producer this-task (consumed by ε)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "'reconciliation\\.deterministic_provenance_allowed_agent_prefixes'"
-          paths: ["fused-memory/src/fused_memory/config/reload.py"]
-          expect: present
-      - name: "predicate-defined"
-        binding: "capability→producer this-task"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^def evaluate_auto_predicate\\("
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto.py"]
-          expect: present
-      - name: "builder-defined"
-        binding: "capability→producer this-task"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^def build_auto_canonical\\("
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto.py"]
-          expect: present
-      - name: "predicate-is-import-leaf"
-        binding: "tests/test_consolidation_gate.py::TestImportLeafAndSingleHomes precedent"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^(from|import) fused_memory\\.(services\\.memory_service|server\\.tools|reconciliation\\.harness)"
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto.py"]
-          expect: absent
-      - name: "one-validator-claim-label-rule"
-        binding: "server/consolidation.py::validate_consolidate_args extended (D6)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "INDEX\\|CANONICAL"
-          paths: ["fused-memory/src/fused_memory/server/consolidation.py"]
-          expect: present
-      - name: "reload-applied-signal"
-        binding: "runtime reload_config call; pinned by a green-tier test mirroring tests/test_config_reload.py::TestMem0UpdateLeavesAreGreenTier"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "reload_config reporting applied is a runtime property asserted by the leaf's own test"
-  - label: "β"
-    task_id: null
-    title: "Extract consolidate_memories' retain arm into services/consolidation_ops.py with a tag-only mode"
-    capabilities:
-      - name: "retain-helper-defined"
-        binding: "capability→producer this-task; arm located in server/tools.py::consolidate_memories"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^async def execute_retain_consolidation\\("
-          paths: ["fused-memory/src/fused_memory/services/consolidation_ops.py"]
-          expect: present
-      - name: "helper-owns-authz"
-        binding: "server/mem0_update_authz.py::resolve_mem0_update_authorization live-read (review R17)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "resolve_mem0_update_authorization\\("
-          paths: ["fused-memory/src/fused_memory/services/consolidation_ops.py"]
-          expect: present
-      - name: "tool-delegates-to-helper"
-        binding: "INV-5 one loop for tool and executor"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "execute_retain_consolidation\\("
-          paths: ["fused-memory/src/fused_memory/server/tools.py"]
-          expect: present
-      - name: "tag-only-arm"
-        binding: "C3 canonical_content=None"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "canonical_content is None"
-          paths: ["fused-memory/src/fused_memory/services/consolidation_ops.py"]
-          expect: present
-      - name: "envelope-byte-identical"
-        binding: "tests/test_consolidate_memories_tool.py fixture cluster before/after"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "a before/after envelope equality is a test-run property, not a grep"
-  - label: "γ"
-    task_id: null
-    title: "propose_consolidation tool, ledger list_by_kind + TTL, stage tool surface, Stage-1 advertisement retirement"
-    capabilities:
-      - name: "proposal-tool-defined"
-        binding: "capability→producer this-task; gate precedent server/tools.py::add_system_record"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "async def propose_consolidation\\("
-          paths: ["fused-memory/src/fused_memory/server/tools.py"]
-          expect: present
-      - name: "ledger-list-by-kind"
-        binding: "capability→producer this-task on index ix_recon_ledger_project_kind_state"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "async def list_by_kind\\("
-          paths: ["fused-memory/src/fused_memory/reconciliation/recon_ledger.py"]
-          expect: present
-      - name: "stage-deny-sublist-additive"
-        binding: "cli_stage_runner.py::DISALLOW_RECON_REPORT_LEDGER_WRITES pattern"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "DISALLOW_CONSOLIDATION_PROPOSALS"
-          paths: ["fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py"]
-          expect: present
-      - name: "stage1-advertises-proposal"
-        binding: "prompts/stage1.py names the new tool"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "mcp__fused-memory__propose_consolidation"
-          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
-          expect: present
-      - name: "every-fused-memory-tool-classified"
-        binding: "tests/test_stages.py::TestDisallowedToolLists escalation precedent"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_every_fused_memory_tool_is_classified\\("
-          paths: ["fused-memory/tests/test_stages.py"]
-          expect: present
-      - name: "old-advertisement-test-retired"
-        binding: "tests/test_stage1_consolidation_guidance.py pins replaced by referential integrity (INV-10)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_the_advertised_op_is_one_the_stage_actually_holds\\("
-          paths: ["fused-memory/tests/test_stage1_consolidation_guidance.py"]
-          expect: absent
-      - name: "tool-gated-and-no-metadata-param"
-        binding: "recon-stage- gate branch and absence of a metadata parameter (markup override) are schema properties"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "verified by the referential-integrity test the task adds, not by grep"
-      - name: "consolidate-memories-retired-from-stage-prompts"
-        binding: "prompts/stage1.py, prompts/__init__.py::STALE_KNOWLEDGE_ANNOTATION_NORM, consolidation_gate.py::render_end_state_brief"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "a prompt may legitimately name the op while saying it is unavailable; the classified-tools test is the mechanical pin"
-  - label: "δ"
-    task_id: null
-    title: "Auto-consolidation executor post-step: verdicts, shared flood control, hazard gate shape, reversal, dry-run"
-    capabilities:
-      - name: "executor-defined"
-        binding: "capability→producer this-task"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^async def run_auto_consolidation\\("
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py"]
-          expect: present
-      - name: "executor-wired-into-stage1-post-step"
-        binding: "stages/memory_consolidator.py::MemoryConsolidator.run seam (verified)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "run_auto_consolidation\\("
-          paths: ["fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py"]
-          expect: present
-      - name: "flood-control-single-home"
-        binding: "task 3136 binding amendment; shared with task 4916"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^def rank_and_cap\\("
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_flood_control.py"]
-          expect: present
-      - name: "reversal-defined"
-        binding: "C4 revert_auto_consolidation; services/memory_service.py::delete_memory store positional"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "^async def revert_auto_consolidation\\("
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py"]
-          expect: present
-      - name: "refusal-escalates-info-in-stage"
-        binding: "stage1_stall_detector.py::maybe_escalate_stalled_gate_backlog precedent; pins.py::_classify_record info NON_PINNING"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "severity='info'"
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py"]
-          expect: present
-      - name: "category-declared"
-        binding: "escalation/server.py::CATEGORIES (inert vocabulary; consumer is ζ's playbook)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "recon_auto_consolidation_refused"
-          paths: ["escalation/src/escalation/server.py"]
-          expect: present
-      - name: "gate-builder-carries-reason-codes"
-        binding: "consolidation_gate.py::build_consolidation_gate_task extended (C6)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "reason_codes"
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_gate.py"]
-          expect: present
-      - name: "closure-uses-4808-helper"
-        binding: "producer:task-4808 upstream (branch task/4808 tip 60e05ccea3, not on main)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "resolve_unstamped_live_ids\\("
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py"]
-          expect: present
-      - name: "raw-add-task-folds-gate-markers-into-metadata"
-        binding: "backends/sqlite_task_backend.py::SqliteTaskBackend.add_task has no task_kind param; task_interceptor._GATE_MARKER_KEYS reads metadata"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "'task_kind': 'deterministic'"
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py", "fused-memory/src/fused_memory/reconciliation/consolidation_gate.py"]
-          expect: present
-      - name: "stats-disclosed"
-        binding: "summary_pool.py::write_cycle_summary serialises report.stats whole (INV-2/INV-11)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "auto_consolidations_dry_run"
-          paths: ["fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py"]
-          expect: present
-      - name: "task-4808-landed"
-        binding: "external dep; dispatch gate is the dependency closure"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "task 4808 is an out-of-batch dependency edge; its landing is gated by the scheduler, then grep def resolve_unstamped_live_ids on main"
-  - label: "ε"
-    task_id: null
-    title: "Refuse hand-passed deterministic-* done provenance from recon stages and non-orchestrator callers; journal the caller"
-    capabilities:
-      - name: "named-refusal-error"
-        binding: "rejection-mechanism built by this task; existing is_recon_stage branch in task_interceptor.py::_validate_done_provenance observed to fire for operational-verified"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "DeterministicProvenanceCallerNotPermitted"
-          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py", "fused-memory/src/fused_memory/middleware/done_provenance_authz.py"]
-          expect: present
-      - name: "live-read-authz-resolver"
-        binding: "server/mem0_update_authz.py::resolve_mem0_update_allowed_prefixes shape copied"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def resolve_deterministic_provenance_allowed_prefixes\\("
-          paths: ["fused-memory/src/fused_memory/middleware/done_provenance_authz.py"]
-          expect: present
-      - name: "config-leaf-from-alpha"
-        binding: "producer:task-α upstream"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "deterministic_provenance_allowed_agent_prefixes"
-          paths: ["fused-memory/src/fused_memory/middleware/done_provenance_authz.py"]
-          expect: present
-      - name: "docs-name-the-caller-contract"
-        binding: "docs/task-authoring.md done_provenance requirement table"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "deterministic_provenance_allowed_agent_prefixes"
-          paths: ["docs/task-authoring.md"]
-          expect: present
-      - name: "journal-carries-caller-and-kind"
-        binding: "task_interceptor.py::TaskInterceptor._journal_around passes the literal 'task-interceptor'; write_journal.log_write_op accepts agent_id"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "field population on the journal row is asserted by the interceptor test, not by grep"
-      - name: "pure-gate-passes-escalation-id"
-        binding: "deterministic_runner.py curator arm precedent (_gate_esc_id)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "kwarg presence on one call site is pinned by orchestrator/tests/test_deterministic_runner.py"
-  - label: "ζ"
-    task_id: null
-    title: "Auto-consolidation review surfaces: report script with --revert, skill amendments, operator docs, cross-PRD pointers"
-    capabilities:
-      - name: "report-script-exists"
-        binding: "scripts/check_consolidation_closure.py thin-wrapper exemplar; inputs from γ/δ upstream"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def main\\("
-          paths: ["scripts/report_auto_consolidations.py"]
-          expect: present
-      - name: "report-script-tested"
-        binding: "scripts/tests/conftest.py fixtures"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "report_auto_consolidations"
-          paths: ["scripts/tests/"]
-          expect: present
-      - name: "revert-wired"
-        binding: "producer:task-δ upstream"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "revert_auto_consolidation"
-          paths: ["scripts/report_auto_consolidations.py"]
-          expect: present
-      - name: "skill-phase-3a-stamp"
-        binding: "shared/task_metadata.py::HUMAN_CURATOR_ADJUDICATED_AT_KEY consumed by deterministic_runner.py::_curator_adjudication_confirmed"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "human_curator_adjudicated_at"
-          paths: ["skills/curate-fused-memories/SKILL.md"]
-          expect: present
-      - name: "skill-stale-anchored-read-line-retired"
-        binding: "services/topic_anchor.py (task 3111) landed 2026-08-21"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "should assume a grouped or anchored read exists"
-          paths: ["skills/curate-fused-memories/SKILL.md"]
-          expect: absent
-      - name: "watcher-playbook-rows"
-        binding: "producer:task-δ declares the categories"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "recon_auto_consolidation_refused"
-          paths: ["skills/recon-escalation-watcher/SKILL.md"]
-          expect: present
-      - name: "ops-green-tier-paragraph"
-        binding: "OPERATIONS.md fused-memory separate green tier paragraph"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "consolidation_auto"
-          paths: ["OPERATIONS.md"]
-          expect: present
-      - name: "cross-prd-pointers"
-        binding: "docs/prds/memory-write-path-convergence.md C2 + §9 ι; docs/prds/memory-metadata-vocabulary.md §3"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "memory-auto-consolidation-prd"
-          paths: ["docs/prds/memory-write-path-convergence.md", "docs/prds/memory-metadata-vocabulary.md"]
-          expect: present
-      - name: "accretion-instruction-single-home"
-        binding: "server/tools.py::FUSED_MEMORY_INSTRUCTIONS (open question 5 resolved)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "exactly-one occurrence across tools.py is a count, not a presence grep"
-  - label: "η"
-    task_id: null
-    title: "Auto-consolidation end-to-end integration gate (boundary-test sketch B1–B13)"
-    capabilities:
-      - name: "e2e-suite-exists"
-        binding: "DAG-direction: α, β, γ, δ, ε all upstream (η ← δ, ε)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "propose_consolidation"
-          paths: ["fused-memory/tests/test_auto_consolidation_e2e.py"]
-          expect: present
-      - name: "all-thirteen-rows"
-        binding: "PRD §5 boundary-test sketch B1–B13"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def test_b(1[0-3]|[1-9])_"
-          paths: ["fused-memory/tests/test_auto_consolidation_e2e.py"]
-          expect: present
-      - name: "red-against-reverted-executor"
-        binding: "INV-10 the suite must go red when run_auto_consolidation is a no-op"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "requires running the suite against a stubbed executor; not greppable"
-  - label: "θ"
-    task_id: null
-    title: "Migrate the open consolidation gates through the auto predicate (dark_factory first, then every project)"
-    capabilities:
-      - name: "script-has-both-modes"
-        binding: "fused-memory/scripts/retro_stamp_topics.py direct-service precedent"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "dry-run|--execute"
-          paths: ["scripts/migrate_open_consolidation_gates.py"]
-          expect: present
-      - name: "keys-on-gate-block-not-title"
-        binding: "consolidation_gate.py::GATE_METADATA_KEY + curator_gate_resolution_sweep.py::extract_open_gate_task_ids"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "x_recon_consolidation_gate|GATE_METADATA_KEY"
-          paths: ["scripts/migrate_open_consolidation_gates.py"]
-          expect: present
-      - name: "re-reads-live-members"
-        binding: "INV-3; get_memories_by_metadata scroll"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "get_memories_by_metadata"
-          paths: ["scripts/migrate_open_consolidation_gates.py"]
-          expect: present
-      - name: "never-sets-task-status"
-        binding: "rejection-style: the runner closes gates; ε would refuse the script anyway"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "set_task_status\\("
-          paths: ["scripts/migrate_open_consolidation_gates.py"]
-          expect: absent
-      - name: "store-mutation-preflight"
-        binding: "scripts/retro_stamp_topics.py assert_store_mutation_allowed precedent"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "assert_store_mutation_allowed\\("
-          paths: ["scripts/migrate_open_consolidation_gates.py"]
-          expect: present
-      - name: "script-tested-with-fixture-gates"
-        binding: "live count (1 today) is not a premise; fixture supplies gates"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "migrate_open_consolidation_gates"
-          paths: ["scripts/tests/"]
-          expect: present
+- label: α
+  task_id: 5237
+  title: Auto-consolidation config block, pure predicate, one validator, canonical
+    builder
+  capabilities:
+  - name: config-block-bare-mounted
+    binding: capability→producer this-task; pattern config/schema.py::Mem0UpdateConfig
+      bare mount
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'consolidation_auto: ConsolidationAutoConfig = Field\('
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: present
+  - name: leaves-green-tier
+    binding: capability→producer this-task; config/reload.py::RELOADABLE_FIELDS list-leaf
+      precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''consolidation_auto\.(enabled|enabled_projects|max_auto_per_cycle|refusal_streak_threshold)'''
+      paths:
+      - fused-memory/src/fused_memory/config/reload.py
+      expect: present
+  - name: provenance-prefix-leaf-green-tier
+    binding: capability→producer this-task (consumed by ε)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''reconciliation\.deterministic_provenance_allowed_agent_prefixes'''
+      paths:
+      - fused-memory/src/fused_memory/config/reload.py
+      expect: present
+  - name: predicate-defined
+    binding: capability→producer this-task
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def evaluate_auto_predicate\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto.py
+      expect: present
+  - name: builder-defined
+    binding: capability→producer this-task
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def build_auto_canonical\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto.py
+      expect: present
+  - name: predicate-is-import-leaf
+    binding: tests/test_consolidation_gate.py::TestImportLeafAndSingleHomes precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^(from|import) fused_memory\.(services\.memory_service|server\.tools|reconciliation\.harness)
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto.py
+      expect: absent
+  - name: one-validator-claim-label-rule
+    binding: server/consolidation.py::validate_consolidate_args extended (D6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: INDEX\|CANONICAL
+      paths:
+      - fused-memory/src/fused_memory/server/consolidation.py
+      expect: present
+  - name: reload-applied-signal
+    binding: runtime reload_config call; pinned by a green-tier test mirroring tests/test_config_reload.py::TestMem0UpdateLeavesAreGreenTier
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: reload_config reporting applied is a runtime property asserted by the
+        leaf's own test
+- label: β
+  task_id: 5238
+  title: Extract consolidate_memories' retain arm into services/consolidation_ops.py
+    with a tag-only mode
+  capabilities:
+  - name: retain-helper-defined
+    binding: capability→producer this-task; arm located in server/tools.py::consolidate_memories
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def execute_retain_consolidation\(
+      paths:
+      - fused-memory/src/fused_memory/services/consolidation_ops.py
+      expect: present
+  - name: helper-owns-authz
+    binding: server/mem0_update_authz.py::resolve_mem0_update_authorization live-read
+      (review R17)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: resolve_mem0_update_authorization\(
+      paths:
+      - fused-memory/src/fused_memory/services/consolidation_ops.py
+      expect: present
+  - name: tool-delegates-to-helper
+    binding: INV-5 one loop for tool and executor
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: execute_retain_consolidation\(
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: tag-only-arm
+    binding: C3 canonical_content=None
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: canonical_content is None
+      paths:
+      - fused-memory/src/fused_memory/services/consolidation_ops.py
+      expect: present
+  - name: envelope-byte-identical
+    binding: tests/test_consolidate_memories_tool.py fixture cluster before/after
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a before/after envelope equality is a test-run property, not a grep
+- label: γ
+  task_id: 5239
+  title: propose_consolidation tool, ledger list_by_kind + TTL, stage tool surface,
+    Stage-1 advertisement retirement
+  capabilities:
+  - name: proposal-tool-defined
+    binding: capability→producer this-task; gate precedent server/tools.py::add_system_record
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def propose_consolidation\(
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: ledger-list-by-kind
+    binding: capability→producer this-task on index ix_recon_ledger_project_kind_state
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def list_by_kind\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/recon_ledger.py
+      expect: present
+  - name: stage-deny-sublist-additive
+    binding: cli_stage_runner.py::DISALLOW_RECON_REPORT_LEDGER_WRITES pattern
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DISALLOW_CONSOLIDATION_PROPOSALS
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
+      expect: present
+  - name: stage1-advertises-proposal
+    binding: prompts/stage1.py names the new tool
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mcp__fused-memory__propose_consolidation
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/prompts/stage1.py
+      expect: present
+  - name: every-fused-memory-tool-classified
+    binding: tests/test_stages.py::TestDisallowedToolLists escalation precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_every_fused_memory_tool_is_classified\(
+      paths:
+      - fused-memory/tests/test_stages.py
+      expect: present
+  - name: old-advertisement-test-retired
+    binding: tests/test_stage1_consolidation_guidance.py pins replaced by referential
+      integrity (INV-10)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_the_advertised_op_is_one_the_stage_actually_holds\(
+      paths:
+      - fused-memory/tests/test_stage1_consolidation_guidance.py
+      expect: absent
+  - name: tool-gated-and-no-metadata-param
+    binding: recon-stage- gate branch and absence of a metadata parameter (markup
+      override) are schema properties
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: verified by the referential-integrity test the task adds, not by grep
+  - name: consolidate-memories-retired-from-stage-prompts
+    binding: prompts/stage1.py, prompts/__init__.py::STALE_KNOWLEDGE_ANNOTATION_NORM,
+      consolidation_gate.py::render_end_state_brief
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a prompt may legitimately name the op while saying it is unavailable;
+        the classified-tools test is the mechanical pin
+- label: δ
+  task_id: 5240
+  title: 'Auto-consolidation executor post-step: verdicts, shared flood control, hazard
+    gate shape, reversal, dry-run'
+  capabilities:
+  - name: executor-defined
+    binding: capability→producer this-task
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def run_auto_consolidation\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py
+      expect: present
+  - name: executor-wired-into-stage1-post-step
+    binding: stages/memory_consolidator.py::MemoryConsolidator.run seam (verified)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: run_auto_consolidation\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py
+      expect: present
+  - name: flood-control-single-home
+    binding: task 3136 binding amendment; shared with task 4916
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def rank_and_cap\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_flood_control.py
+      expect: present
+  - name: reversal-defined
+    binding: C4 revert_auto_consolidation; services/memory_service.py::delete_memory
+      store positional
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def revert_auto_consolidation\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py
+      expect: present
+  - name: refusal-escalates-info-in-stage
+    binding: stage1_stall_detector.py::maybe_escalate_stalled_gate_backlog precedent;
+      pins.py::_classify_record info NON_PINNING
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: severity='info'
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py
+      expect: present
+  - name: category-declared
+    binding: escalation/server.py::CATEGORIES (inert vocabulary; consumer is ζ's playbook)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recon_auto_consolidation_refused
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: gate-builder-carries-reason-codes
+    binding: consolidation_gate.py::build_consolidation_gate_task extended (C6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reason_codes
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_gate.py
+      expect: present
+  - name: closure-uses-4808-helper
+    binding: producer:task-4808 upstream (branch task/4808 tip 60e05ccea3, not on
+      main)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: resolve_unstamped_live_ids\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py
+      expect: present
+  - name: raw-add-task-folds-gate-markers-into-metadata
+    binding: backends/sqlite_task_backend.py::SqliteTaskBackend.add_task has no task_kind
+      param; task_interceptor._GATE_MARKER_KEYS reads metadata
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''task_kind'': ''deterministic'''
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py
+      - fused-memory/src/fused_memory/reconciliation/consolidation_gate.py
+      expect: present
+  - name: stats-disclosed
+    binding: summary_pool.py::write_cycle_summary serialises report.stats whole (INV-2/INV-11)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: auto_consolidations_dry_run
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/consolidation_auto_executor.py
+      expect: present
+  - name: task-4808-landed
+    binding: external dep; dispatch gate is the dependency closure
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: task 4808 is an out-of-batch dependency edge; its landing is gated by
+        the scheduler, then grep def resolve_unstamped_live_ids on main
+- label: ε
+  task_id: 5241
+  title: Refuse hand-passed deterministic-* done provenance from recon stages and
+    non-orchestrator callers; journal the caller
+  capabilities:
+  - name: named-refusal-error
+    binding: rejection-mechanism built by this task; existing is_recon_stage branch
+      in task_interceptor.py::_validate_done_provenance observed to fire for operational-verified
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DeterministicProvenanceCallerNotPermitted
+      paths:
+      - fused-memory/src/fused_memory/middleware/task_interceptor.py
+      - fused-memory/src/fused_memory/middleware/done_provenance_authz.py
+      expect: present
+  - name: live-read-authz-resolver
+    binding: server/mem0_update_authz.py::resolve_mem0_update_allowed_prefixes shape
+      copied
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def resolve_deterministic_provenance_allowed_prefixes\(
+      paths:
+      - fused-memory/src/fused_memory/middleware/done_provenance_authz.py
+      expect: present
+  - name: config-leaf-from-alpha
+    binding: producer:task-α upstream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: deterministic_provenance_allowed_agent_prefixes
+      paths:
+      - fused-memory/src/fused_memory/middleware/done_provenance_authz.py
+      expect: present
+  - name: docs-name-the-caller-contract
+    binding: docs/task-authoring.md done_provenance requirement table
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: deterministic_provenance_allowed_agent_prefixes
+      paths:
+      - docs/task-authoring.md
+      expect: present
+  - name: journal-carries-caller-and-kind
+    binding: task_interceptor.py::TaskInterceptor._journal_around passes the literal
+      'task-interceptor'; write_journal.log_write_op accepts agent_id
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: field population on the journal row is asserted by the interceptor test,
+        not by grep
+  - name: pure-gate-passes-escalation-id
+    binding: deterministic_runner.py curator arm precedent (_gate_esc_id)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: kwarg presence on one call site is pinned by orchestrator/tests/test_deterministic_runner.py
+- label: ζ
+  task_id: 5242
+  title: 'Auto-consolidation review surfaces: report script with --revert, skill amendments,
+    operator docs, cross-PRD pointers'
+  capabilities:
+  - name: report-script-exists
+    binding: scripts/check_consolidation_closure.py thin-wrapper exemplar; inputs
+      from γ/δ upstream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def main\(
+      paths:
+      - scripts/report_auto_consolidations.py
+      expect: present
+  - name: report-script-tested
+    binding: scripts/tests/conftest.py fixtures
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: report_auto_consolidations
+      paths:
+      - scripts/tests/
+      expect: present
+  - name: revert-wired
+    binding: producer:task-δ upstream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: revert_auto_consolidation
+      paths:
+      - scripts/report_auto_consolidations.py
+      expect: present
+  - name: skill-phase-3a-stamp
+    binding: shared/task_metadata.py::HUMAN_CURATOR_ADJUDICATED_AT_KEY consumed by
+      deterministic_runner.py::_curator_adjudication_confirmed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: human_curator_adjudicated_at
+      paths:
+      - skills/curate-fused-memories/SKILL.md
+      expect: present
+  - name: skill-stale-anchored-read-line-retired
+    binding: services/topic_anchor.py (task 3111) landed 2026-08-21
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: should assume a grouped or anchored read exists
+      paths:
+      - skills/curate-fused-memories/SKILL.md
+      expect: absent
+  - name: watcher-playbook-rows
+    binding: producer:task-δ declares the categories
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recon_auto_consolidation_refused
+      paths:
+      - skills/recon-escalation-watcher/SKILL.md
+      expect: present
+  - name: ops-green-tier-paragraph
+    binding: OPERATIONS.md fused-memory separate green tier paragraph
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: consolidation_auto
+      paths:
+      - OPERATIONS.md
+      expect: present
+  - name: cross-prd-pointers
+    binding: docs/prds/memory-write-path-convergence.md C2 + §9 ι; docs/prds/memory-metadata-vocabulary.md
+      §3
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory-auto-consolidation-prd
+      paths:
+      - docs/prds/memory-write-path-convergence.md
+      - docs/prds/memory-metadata-vocabulary.md
+      expect: present
+  - name: accretion-instruction-single-home
+    binding: server/tools.py::FUSED_MEMORY_INSTRUCTIONS (open question 5 resolved)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: exactly-one occurrence across tools.py is a count, not a presence grep
+- label: η
+  task_id: 5243
+  title: Auto-consolidation end-to-end integration gate (boundary-test sketch B1–B13)
+  capabilities:
+  - name: e2e-suite-exists
+    binding: 'DAG-direction: α, β, γ, δ, ε all upstream (η ← δ, ε)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: propose_consolidation
+      paths:
+      - fused-memory/tests/test_auto_consolidation_e2e.py
+      expect: present
+  - name: all-thirteen-rows
+    binding: PRD §5 boundary-test sketch B1–B13
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def test_b(1[0-3]|[1-9])_
+      paths:
+      - fused-memory/tests/test_auto_consolidation_e2e.py
+      expect: present
+  - name: red-against-reverted-executor
+    binding: INV-10 the suite must go red when run_auto_consolidation is a no-op
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: requires running the suite against a stubbed executor; not greppable
+- label: θ
+  task_id: 5244
+  title: Migrate the open consolidation gates through the auto predicate (dark_factory
+    first, then every project)
+  capabilities:
+  - name: script-has-both-modes
+    binding: fused-memory/scripts/retro_stamp_topics.py direct-service precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: dry-run|--execute
+      paths:
+      - scripts/migrate_open_consolidation_gates.py
+      expect: present
+  - name: keys-on-gate-block-not-title
+    binding: consolidation_gate.py::GATE_METADATA_KEY + curator_gate_resolution_sweep.py::extract_open_gate_task_ids
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: x_recon_consolidation_gate|GATE_METADATA_KEY
+      paths:
+      - scripts/migrate_open_consolidation_gates.py
+      expect: present
+  - name: re-reads-live-members
+    binding: INV-3; get_memories_by_metadata scroll
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: get_memories_by_metadata
+      paths:
+      - scripts/migrate_open_consolidation_gates.py
+      expect: present
+  - name: never-sets-task-status
+    binding: 'rejection-style: the runner closes gates; ε would refuse the script
+      anyway'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: set_task_status\(
+      paths:
+      - scripts/migrate_open_consolidation_gates.py
+      expect: absent
+  - name: store-mutation-preflight
+    binding: scripts/retro_stamp_topics.py assert_store_mutation_allowed precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: assert_store_mutation_allowed\(
+      paths:
+      - scripts/migrate_open_consolidation_gates.py
+      expect: present
+  - name: script-tested-with-fixture-gates
+    binding: live count (1 today) is not a premise; fixture supplies gates
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: migrate_open_consolidation_gates
+      paths:
+      - scripts/tests/
+      expect: present
