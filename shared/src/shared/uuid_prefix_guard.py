@@ -58,7 +58,13 @@ from fastmcp.server.middleware import Middleware
 from fastmcp.tools.base import ToolResult
 
 from shared.storm_counter import StormCounter
-from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute
+from shared.uuid_prefix import (
+    PrefixToken,
+    find_prefix_tokens,
+    strip_uuid_prefix_override,
+    substitute,
+    uuid_prefix_override_requested,
+)
 
 __all__ = [
     'FACT_OUTCOMES',
@@ -428,13 +434,36 @@ class UuidPrefixGuardMiddleware(Middleware):
         no awaited resolver round-trip, which would put a store read on the
         event-loop thread for every call the factory makes. The INV-8 bound on
         that scan is stated in ``shared.uuid_prefix``'s module docstring.
+
+        The two DECLARED bypasses come first, both ahead of the scan, which is
+        also ``MarkupGuardMiddleware.on_call_tool``'s ordering. Neither is a
+        detection, so neither may cost a scan, a resolution, a ``meta`` key or
+        a fact.
         """
         name = context.message.name
         # The SAME dict object the tool will be called with, which is what
-        # makes the in-place write-back in :meth:`_expand` reach the tool. The
-        # ``or {}`` fallback can only produce a fresh dict for an empty
-        # argument map, and that map has no tokens and returns just below.
+        # makes the in-place write-back in :meth:`_expand` — and in
+        # :meth:`_apply_override` — reach the tool. The ``or {}`` fallback can
+        # only produce a fresh dict for an empty argument map, and such a map
+        # has neither a ``metadata`` key nor a token, so nothing is ever
+        # written back into a detached dict.
         arguments = context.message.arguments or {}
+
+        # B9 — a declared exemption. An id-addressed destructive tool is not a
+        # repair site: an expansion the guard chose and an id the author chose
+        # are indistinguishable once the delete has run, and only one of them
+        # is recoverable. Recording the exemption would additionally make the
+        # fact stream measure declarations rather than citations.
+        if name in self.exempt_tools:
+            return await call_next(context)
+
+        # B17 — the author means the bare token. Forward it, with no fact: a
+        # declared intent is not a detection. Whether the flag itself travels
+        # onward is the invoked tool's own schema's business — see
+        # :meth:`_apply_override`.
+        if uuid_prefix_override_requested(arguments.get('metadata')):
+            await self._apply_override(context, name, arguments)
+            return await call_next(context)
 
         tokens = find_prefix_tokens(arguments)
         if not tokens:
@@ -462,6 +491,95 @@ class UuidPrefixGuardMiddleware(Middleware):
             return await call_next(context)
 
         return await self._deliver(context, call_next, name, arguments, project, plan)
+
+    # -- the author's override (B17 / D10) ---------------------------------
+
+    @classmethod
+    async def _apply_override(cls, context, name: str, arguments: dict[str, Any]) -> None:
+        """Decide, FROM THE TOOL'S OWN SCHEMA, whether the flag travels onward.
+
+        ONE override, ONE lifecycle. This boundary is not the only party that
+        honours ``allow_uuid_prefix``: leaf γ's write-time layer in
+        fused-memory's ``tools.py`` keys off the SAME ``metadata`` map and
+        strips the key there, exactly as ``allow_mcp_markup`` is stripped at
+        both layers. So whether the flag reaches the tool body decides whether
+        the SECOND guard can see the declaration the first one already
+        honoured.
+
+        * The tool DECLARES ``metadata`` — forward it UNCHANGED, flag
+          included, in whichever shape the caller chose (a dict or the JSON
+          string ``submit_task``/``update_task`` also accept, which γ's own
+          ``uuid_prefix_override_requested`` parses either way). Consuming the
+          flag here would leave an author who did exactly what the rejection
+          hint told them to bounced by the next guard, with a hint telling them
+          to set a flag they had already set.
+        * The tool declares NO ``metadata`` — strip the flag (it is call-time
+          control, never payload) and drop the key when that empties the map.
+          MEASURED on the sibling guard: most tools a boundary middleware sits
+          in front of take no ``metadata`` at all, and forwarding the parameter
+          to one of those turns the documented escape into ``ToolError:
+          Unexpected keyword argument``. Anything the caller sent BESIDES the
+          flag is left in place: on a tool with no ``metadata`` parameter that
+          residue is the caller's own bug, and an unknown-parameter error on it
+          is visible where a silent discard would not be.
+
+        The awaited ``get_tool`` round-trip is affordable because the clean
+        path never reaches this method — an explicit override is rarer than a
+        prefix, which is itself rare, and the INV-8 bound is stated against a
+        call that carries neither.
+
+        Fail-safe: an unresolvable schema yields ``()`` (see
+        :meth:`_schema_params`), which takes the DROP branch — the only branch
+        that cannot raise ``Unexpected keyword argument``. A tool that does
+        take metadata then loses the flag and its own write-time gate answers
+        with an actionable hint, which beats a call the tool cannot accept.
+        """
+        if 'metadata' in await cls._schema_params(context, name):
+            return
+        stripped = strip_uuid_prefix_override(arguments['metadata'])
+        # Both shapes of "nothing left": ``{}`` from a dict, and the ``'{}'``
+        # ``json.dumps`` emits for the JSON-string form.
+        if stripped == {} or stripped == '{}':
+            del arguments['metadata']
+        else:
+            arguments['metadata'] = stripped
+
+    @staticmethod
+    async def _schema_params(context, name: str) -> tuple[str, ...]:
+        """The invoked tool's LIVE parameter names.
+
+        Two measured substrate facts, both of which the PRD's section 6 table
+        gets wrong for fastmcp 3.2.2: ``get_tool`` is a COROUTINE and must be
+        awaited, and ``tool.parameters`` is a full JSON Schema dict — so the
+        names live under ``'properties'``, not on the object itself.
+
+        LIVE rather than declared at registration, because what travels to a
+        tool has to be checked against the tool as it actually is; a schema
+        captured at wiring time would drift.
+
+        Any failure to resolve one yields an EMPTY tuple, which routes
+        :meth:`_apply_override` to the drop branch. That is the fail-safe
+        direction: the flag is lost and the write-time gate answers, where the
+        other direction is a call fastmcp refuses outright.
+
+        ``MarkupGuardMiddleware._schema_properties`` reads the same two facts
+        for a different consumer (it needs the properties MAP, to coerce
+        recovered values against their declared types; this needs only the
+        NAMES). The two are near-twins and share no helper because extracting
+        one would mean editing that middleware, which is outside this leaf's
+        declared file scope — filed rather than dropped, as this task's
+        ``cleanup_needed`` note records.
+        """
+        try:
+            tool = await context.fastmcp_context.fastmcp.get_tool(name)
+        except Exception:
+            logger.exception('uuid-prefix guard could not resolve the schema for %r', name)
+            return ()
+        parameters = getattr(tool, 'parameters', None) or {}
+        properties = parameters.get('properties') if isinstance(parameters, dict) else None
+        if not isinstance(properties, dict):
+            return ()
+        return tuple(properties)
 
     # -- resolution -------------------------------------------------------
 
