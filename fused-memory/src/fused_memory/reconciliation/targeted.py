@@ -1341,12 +1341,32 @@ class TargetedReconciler:
         reason = f'{_PARENT_CANCELLED_REOPEN_PREFIX}{parent_id}'
         try:
             assert self.task_interceptor is not None  # narrowed by caller
-            await self.task_interceptor.set_task_status(
+            resp = await self.task_interceptor.set_task_status(
                 task_id=task_id,
                 status='cancelled',
                 project_root=project_root,
                 reopen_reason=reason,
             )
+            if not interceptor_write_succeeded(resp):
+                error_code = (
+                    (resp.get('error_type') or resp.get('error'))
+                    if isinstance(resp, dict) else 'unknown'
+                ) or 'unknown'
+                logger.warning(
+                    'sweep: cancel rejected for orphan %s (parent %s): error=%r',
+                    task_id, parent_id, error_code,
+                )
+                await self.journal.add_run_action(
+                    run_id, 'skip', 'taskmaster', 'set_task_status',
+                    {
+                        'task_id': task_id,
+                        'parent_id': parent_id,
+                        'type': 'descendant_cancel',
+                        'error': error_code,
+                    },
+                    causation_id=run_id,
+                )
+                return None
         except Exception as e:
             logger.warning(
                 'sweep: cancel failed for orphan %s (parent %s): %s',
