@@ -36,11 +36,13 @@ No test here asserts on docstring or comment prose.
 from __future__ import annotations
 
 import itertools
+import json
 from collections.abc import Callable, Mapping
 from typing import Any, get_args
 
 import pytest
 from fastmcp import Client, FastMCP
+from fastmcp.exceptions import ToolError
 
 from shared import uuid_prefix_guard as guard
 
@@ -539,12 +541,13 @@ SIBLING_FULL = '48433882-ee71-480d-aff7-c91aa4640ff5'
 AGENT = 'claude-interactive'
 
 
-def expanded_fact(**overrides: Any) -> dict[str, Any]:
-    """One complete ``uuid_prefix_detected`` record for an expansion.
+def detection_fact(**overrides: Any) -> dict[str, Any]:
+    """One complete ``uuid_prefix_detected`` record, defaulted to the B1 expansion.
 
     Spelled as a COMPLETE record with overrides rather than as a subset check,
     so a key the guard silently stopped emitting fails a test instead of
-    passing one.
+    passing one — and one builder for every arm, so a key that drifted between
+    arms could not pass either.
     """
     fact = {
         'fact': 'uuid_prefix_detected',
@@ -612,7 +615,7 @@ class TestB1UniqueExpansion:
     async def test_exactly_one_fact_with_outcome_expanded(self) -> None:
         h = self.harness()
         await h.call('add_memory', dict(self.CALL))
-        assert h.facts == [expanded_fact()]
+        assert h.facts == [detection_fact()]
 
     async def test_fastmcps_own_meta_is_preserved_not_replaced(self) -> None:
         """``call_next``'s result already carries FastMCP's signalling.
@@ -728,7 +731,7 @@ class TestB8NestedPath:
         h = self.harness()
         await h.call('submit_task', dict(self.CALL))
         assert h.facts == [
-            expanded_fact(
+            detection_fact(
                 tool='submit_task',
                 field='metadata',
                 token=BEC,
@@ -811,7 +814,7 @@ class TestARepeatedCitationIsOneResolutionAndTwoEdits:
         repair = repair_of(result)
         assert repair is not None
         assert len(repair['substitutions']) == 2
-        assert h.facts == [expanded_fact(), expanded_fact()]
+        assert h.facts == [detection_fact(), detection_fact()]
 
 
 # ---------------------------------------------------------------------------
@@ -855,3 +858,180 @@ class TestExpandedIsNeverStormCounted:
     async def test_the_escalation_sink_received_nothing(self) -> None:
         h = await self._ten_calls()
         assert h.escalations == []
+
+
+# ---------------------------------------------------------------------------
+# B2 / B4 — ambiguity on a DEFAULT-class tool is a rejection.
+# ---------------------------------------------------------------------------
+#
+# B4 is the cross-namespace case, so the two candidates here sit in DIFFERENT
+# namespaces: one Mem0 id and one Graphiti node uuid sharing a prefix is
+# `ambiguous`, and it is the shape a single-namespace resolver would have
+# missed entirely.
+
+AMB = '208f1bdf'
+AMB_MEM0 = '208f1bdf-5e6f-4071-8c23-4567890abcde'
+AMB_NODE = '208f1bdf-6f70-4182-8d34-567890abcdef'
+
+AMBIGUOUS = guard.Resolution(
+    'ambiguous',
+    (
+        guard.Candidate('mem0', AMB_MEM0, 'the reconciler ran twice and both passes'),
+        guard.Candidate('graphiti_node', AMB_NODE, 'ReconciliationRun'),
+    ),
+)
+
+
+def rejection_payload(excinfo: Any) -> dict[str, Any]:
+    """The refusal's JSON payload, which must survive the boundary intact."""
+    return json.loads(str(excinfo.value))
+
+
+class TestB2AmbiguityIsRejectedOnADefaultTool:
+    CALL = {
+        'content': f'see {AMB} for the earlier pass',
+        'category': 'observations_and_summaries',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={AMB: AMBIGUOUS})
+
+    async def _reject(self, harness: Harness) -> dict[str, Any]:
+        with pytest.raises(ToolError) as excinfo:
+            await harness.call('add_memory', dict(self.CALL))
+        return rejection_payload(excinfo)
+
+    async def test_the_tool_never_ran(self) -> None:
+        """What makes "nothing written" TRUE rather than merely intended."""
+        h = self.harness()
+        await self._reject(h)
+        assert h.recorder.calls == []
+
+    async def test_the_payload_carries_exactly_the_declared_keys(self) -> None:
+        h = self.harness()
+        payload = await self._reject(h)
+        assert set(payload) == {
+            'error',
+            'error_type',
+            'outcome',
+            'tool',
+            'field',
+            'token',
+            'candidates',
+            'original_call',
+            'hint',
+        }
+
+    async def test_the_payload_names_the_outcome_and_the_site(self) -> None:
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['error_type'] == 'ambiguous_uuid_prefix'
+        assert payload['outcome'] == 'rejected'
+        assert payload['tool'] == 'add_memory'
+        assert payload['field'] == 'content'
+        assert payload['token'] == AMB
+
+    async def test_both_candidates_arrive_with_namespace_and_preview(self) -> None:
+        """A caller told only "ambiguous" cannot choose; this is what lets it."""
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['candidates'] == [
+            {
+                'namespace': 'mem0',
+                'id': AMB_MEM0,
+                'preview': 'the reconciler ran twice and both passes',
+            },
+            {'namespace': 'graphiti_node', 'id': AMB_NODE, 'preview': 'ReconciliationRun'},
+        ]
+
+    async def test_original_call_is_the_complete_submitted_argument_map(self) -> None:
+        """The 3936 gap, answered locally: a resubmit is mechanical.
+
+        The COMPLETE map, not just the offending field — a caller reassembling
+        the rest by hand is how the other arguments get lost for good.
+        """
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['original_call'] == dict(self.CALL)
+
+    async def test_there_is_no_repaired_call(self) -> None:
+        """The choice is the author's, and the guard must not appear to have made it.
+
+        This is the one place this guard's refusal deliberately DIVERGES from
+        the markup guard's, which does carry a `repaired_call`: a mis-closed
+        tag has one correct repair, and an ambiguous citation has two correct
+        answers and no way to tell them apart.
+        """
+        h = self.harness()
+        payload = await self._reject(h)
+        assert 'repaired_call' not in payload
+
+    async def test_the_hint_tells_the_caller_to_pick_one_and_resubmit(self) -> None:
+        """The one action available to the caller, named.
+
+        A hint that offered to choose would be a promise the guard cannot
+        keep — "exactly one candidate, or nothing is changed" is the whole
+        design.
+        """
+        h = self.harness()
+        payload = await self._reject(h)
+        assert 'resubmit' in payload['hint'].lower()
+
+    async def test_exactly_one_fact_with_outcome_rejected(self) -> None:
+        h = self.harness()
+        await self._reject(h)
+        assert h.facts == [
+            detection_fact(
+                token=AMB,
+                outcome='rejected',
+                candidate_ids=[AMB_MEM0, AMB_NODE],
+                # Two namespaces, so there is no single one — present and null
+                # rather than absent, so a consumer never has to tell "no
+                # single namespace" from "that arm forgot the key".
+                namespace=None,
+            )
+        ]
+
+
+class TestAMixedCallIsRejectedWhole:
+    """One unique token and one ambiguous token in the same call.
+
+    The two-phase shape is what makes this structural: resolution completes
+    before ANY substitution is applied, so the rejection leaves the argument
+    map untouched rather than half-expanded. Interleaved, the unique token
+    would already have been written into the arguments by the time the
+    ambiguous one was resolved — and a rejected call would have mutated the
+    caller's data on its way out.
+    """
+
+    CALL = {
+        'content': f'{BFF} supersedes {AMB}',
+        'project_id': PROJECT,
+        'agent_id': AGENT,
+    }
+
+    def harness(self) -> Harness:
+        return build_harness(answers={BFF: unique(BFF_FULL), AMB: AMBIGUOUS})
+
+    async def _reject(self, harness: Harness) -> dict[str, Any]:
+        with pytest.raises(ToolError) as excinfo:
+            await harness.call('add_memory', dict(self.CALL))
+        return rejection_payload(excinfo)
+
+    async def test_the_tool_never_ran(self) -> None:
+        h = self.harness()
+        await self._reject(h)
+        assert h.recorder.calls == []
+
+    async def test_no_partial_substitution_reaches_the_payload(self) -> None:
+        """`original_call` is the map the CALLER sent, not a half-repaired one."""
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['original_call']['content'] == f'{BFF} supersedes {AMB}'
+
+    async def test_the_refusal_names_the_ambiguous_token(self) -> None:
+        h = self.harness()
+        payload = await self._reject(h)
+        assert payload['token'] == AMB
