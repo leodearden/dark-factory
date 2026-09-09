@@ -1588,6 +1588,7 @@ def _make_gate_repo(
     *,
     judge: str = 'flat',
     triage: str = 'band_top1',
+    shared_src: bool = False,
     eval_src: str | None = None,
     eval_text: str | None = None,
     repo_name: str = 'gate-repo',
@@ -1603,6 +1604,11 @@ def _make_gate_repo(
     It defaults to ``'band_top1'`` — main's shape, where the attach lands on
     the band's top-1 whatever the judge said — so a repo is unfixed on item 5
     unless a test says otherwise, and no test passes the gate by accident.
+
+    ``shared_src`` lays down a first-party ``shared/src`` tree. The real
+    ``write_triage`` imports ``shared.storm_counter``, which no ``fused-memory/src``
+    pathspec reaches, so the gate archives it too — best-effort. Most fixture
+    repos carry none, which is exactly what exercises the absent path.
 
     ``eval_text`` and ``eval_src`` are mutually exclusive: pass at most one.
     When ``eval_text`` is given, it is written VERBATIM as the fixture's
@@ -1624,6 +1630,11 @@ def _make_gate_repo(
     # and item 5 reads write_triage.py, and the gate extracts that tree once.
     _write_fake_judge(repo / 'fused-memory' / 'src', variant=judge)
     write_fake_triage(repo / 'fused-memory' / 'src', variant=triage)
+    if shared_src:
+        shared = repo / 'shared' / 'src' / 'shared'
+        shared.mkdir(parents=True)
+        (shared / '__init__.py').write_text('')
+        (shared / 'storm_counter.py').write_text('STORM_COUNTER_FIXTURE = True\n')
     (repo / 'fused-memory' / 'scripts').mkdir(parents=True)
     if eval_text is not None:
         eval_source = eval_text
@@ -2083,6 +2094,77 @@ class TestItemFiveThroughTheGate:
         assert _ITEM5_CLAUSE not in _normalize_ws(_result_block(proc.stdout)), (
             proc.stdout
         )
+
+
+class TestOneExtractionServesBothProbes:
+    """Both probe items read the SAME ref, extracted once.
+
+    ``write_triage.py`` and ``write_triage_judge.py`` are siblings in one tree,
+    so a second ``git archive`` of the same pathspec buys nothing and costs
+    wall clock the 120s delivered-check budget cannot spare. Hoisting the
+    extraction is only safe if the fail-closed branches keep failing BOTH items
+    closed, which is what this class holds still.
+    """
+
+    def test_both_probe_items_report_against_the_same_ref(self, tmp_path):
+        repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert _ITEM5_FAIL in proc.stdout, proc.stdout
+
+    def test_a_repo_without_shared_src_still_reports_both_items(self, tmp_path):
+        """The absent path, and why the second archive must stay non-fatal.
+
+        Every fixture repo here carries no `shared/src`, and so does any repo
+        whose layout differs from this one's. If a failed second archive could
+        fail an item, adding the pathspec would have invented a new way for the
+        gate to report UNVERIFIABLE against a tree that is perfectly readable.
+        """
+        repo = _make_gate_repo(
+            tmp_path, judge='by_id', triage=_TRIAGE_CONSUMES, eval_src='fixed',
+        )
+        assert not (repo / 'shared').exists()
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert _ITEM5_PASS in proc.stdout, proc.stdout
+        assert _UNVERIFIABLE not in proc.stdout, proc.stdout
+
+    def test_a_repo_with_shared_src_reports_both_items_normally(self, tmp_path):
+        """The present path, so the flag the gate passes is exercised too.
+
+        A best-effort branch that is only ever measured on its failing side is
+        a branch nobody has run.
+        """
+        repo = _make_gate_repo(
+            tmp_path,
+            judge='by_id',
+            triage=_TRIAGE_CONSUMES,
+            eval_src='fixed',
+            shared_src=True,
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert 'PASS  item 1' in proc.stdout, proc.stdout
+        assert _ITEM5_PASS in proc.stdout, proc.stdout
+
+    def test_an_unreadable_ref_fails_both_probe_items_closed(self, tmp_path):
+        """The negative control the script's own comment says to keep.
+
+        A `fail=1` assigned inside a `$(...)` is discarded when the subshell
+        exits, and that is how an unreadable ref once skipped a whole check
+        block and the gate exited 0 on unverifiable input. One extraction
+        shared by two items doubles what a regression there would cost.
+        """
+        repo = _make_gate_repo(
+            tmp_path, judge='by_id', triage=_TRIAGE_CONSUMES, eval_src='fixed',
+        )
+        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref='no-such-ref')
+        assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
+        assert _ITEM5_FAIL in proc.stdout, proc.stdout
+        assert 'FAIL  item 1' in proc.stdout, proc.stdout
+        tail = proc.stdout[-_ESCALATION_DETAIL_CHARS:]
+        assert 'FAILING ITEMS: 1 2 4 5' in tail, tail
 
 
 class TestReportSurvivesTruncation:
