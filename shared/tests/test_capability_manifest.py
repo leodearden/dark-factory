@@ -306,6 +306,81 @@ class TestDeliveredCheck:
         assert 'pattern' in message
 
 
+class TestPathCheckHygiene:
+    """kind='path' entries must be repo-relative, non-empty, and '..'-free.
+
+    Stricter than kind='grep' on the SAME field, and deliberately so: for
+    grep, `paths` merely NARROWS a search, so a bad entry degrades to a
+    wider-or-empty scope. For kind='path' the entry IS the assertion, and
+    a pathspec git cannot resolve inside the repository exits 128, which
+    the runner maps to ERRORED — a fail-safe wait with no streak bump and
+    no escalation, i.e. a SILENT INDEFINITE HOLD on every dependent. One
+    typo'd leading slash would wedge a dependent forever while emitting
+    nothing a human would ever see, so the descriptor is refused loudly at
+    authoring time instead.
+    """
+
+    @pytest.mark.parametrize(
+        'bad_path',
+        [
+            pytest.param('/etc/passwd', id='absolute'),
+            pytest.param('/orchestrator/tests/test_x.py', id='absolute_repo_shaped'),
+            pytest.param('../outside.py', id='parent_segment_leading'),
+            pytest.param('orchestrator/../../outside.py', id='parent_segment_interior'),
+            pytest.param('', id='empty'),
+            pytest.param('   ', id='whitespace_only'),
+        ],
+    )
+    def test_delivered_check_rejects_bad_path(self, bad_path):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(kind='path', expect='present', paths=[bad_path])
+        assert repr(bad_path) in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        'bad_path',
+        [
+            pytest.param('/etc/passwd', id='absolute'),
+            pytest.param('../outside.py', id='parent_segment_leading'),
+            pytest.param('', id='empty'),
+        ],
+    )
+    def test_delivered_check_meta_rejects_bad_path(self, bad_path):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheckMeta(name='cap-one', kind='path', expect='present', paths=[bad_path])
+        assert repr(bad_path) in str(exc_info.value)
+
+    def test_bad_entry_alongside_good_entries_is_still_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(
+                kind='path', expect='present', paths=['a/one.py', '/etc/passwd', 'b/two.py']
+            )
+        assert repr('/etc/passwd') in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        'good_path',
+        [
+            pytest.param(
+                'orchestrator/tests/test_workflow_merge_gating_strand.py', id='nested_file'
+            ),
+            pytest.param('README.md', id='repo_root_file'),
+            pytest.param('shared/src/shared/', id='trailing_slash_directory'),
+            pytest.param('scripts/audit_combine_gate_marker_loss.py', id='script_path'),
+        ],
+    )
+    def test_ordinary_repo_relative_paths_are_still_accepted(self, good_path):
+        # Positive control: the rule must not be satisfiable by rejecting
+        # everything.
+        check = DeliveredCheck(kind='path', expect='present', paths=[good_path])
+        assert check.paths == [good_path]
+
+    def test_grep_paths_are_not_subject_to_the_stricter_rule(self):
+        # The asymmetry is the point: for grep, `paths` only narrows a
+        # search, so it keeps its existing (unvalidated) latitude.
+        check = DeliveredCheck(kind='grep', pattern='foo', expect='present', paths=['../x/'])
+        assert check.paths == ['../x/']
+
+
+
 class TestManifestCapability:
     def test_constructs_with_required_fields_only(self):
         cap = ManifestCapability(
