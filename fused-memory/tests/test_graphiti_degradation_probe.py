@@ -13,6 +13,8 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
+
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY,
     GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY,
@@ -20,7 +22,10 @@ from fused_memory.reconciliation.graphiti_degradation_probe import (
     MIN_PROBES_PER_CYCLE,
     NEGATIVE_SET_VERDICT_TEMPLATE,
     PROBE_LIMIT_LADDER,
+    render_graphiti_degradation_probe_section,
 )
+
+_VERDICT = NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER))
 
 
 class TestProbeLadderIsAControlledVariable:
@@ -120,3 +125,71 @@ def test_module_is_import_light():
         [sys.executable, '-c', probe], capture_output=True, text=True, timeout=120
     )
     assert result.returncode == 0, result.stderr
+
+
+class TestBothBranchesCarryTheVerdictRule:
+    """Requirement 4's mandated wording is shared between the two stages that
+    assess store health, so it must exist exactly once and reach both."""
+
+    @pytest.mark.parametrize('runs_probes', [True, False])
+    def test_verdict_appears_exactly_once(self, runs_probes):
+        rendered = render_graphiti_degradation_probe_section(runs_probes=runs_probes)
+        assert rendered.count(_VERDICT) == 1
+
+
+class TestProbeBranchRendersTheLadder:
+    """Stage 2 runs the probes and reports the counters."""
+
+    def test_every_ladder_rung_is_named(self):
+        rendered = render_graphiti_degradation_probe_section(runs_probes=True)
+        for limit in PROBE_LIMIT_LADDER:
+            assert str(limit) in rendered
+
+    def test_per_cycle_minimum_is_named(self):
+        rendered = render_graphiti_degradation_probe_section(runs_probes=True)
+        assert str(MIN_PROBES_PER_CYCLE) in rendered
+
+    def test_the_denominator_pair_is_never_advertised_apart(self):
+        """Requirement 3: `graphiti_degradation_reproduced` is unreadable
+        without its denominator beside it, so no edit may leave one behind."""
+        rendered = render_graphiti_degradation_probe_section(runs_probes=True)
+        assert GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY in rendered
+        assert GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY in rendered
+
+
+class TestReadOnlyBranchDoesNotOrderProbes:
+    """Stage 3 is read-only: it inherits the verdict rule and the cross-stage
+    caveat, and nothing that would have it run a ladder or emit stats it does
+    not own. Naming a counter to a stage is an instruction, not decoration."""
+
+    @pytest.mark.parametrize(
+        'stat_key',
+        [
+            GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY,
+            GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY,
+        ],
+    )
+    def test_counter_is_absent(self, stat_key):
+        rendered = render_graphiti_degradation_probe_section(runs_probes=False)
+        assert stat_key not in rendered
+
+
+class TestBranchesDiffer:
+    def test_capability_flag_is_load_bearing(self):
+        """A renderer that ignored its keyword argument would satisfy every
+        positive assertion above."""
+        assert render_graphiti_degradation_probe_section(
+            runs_probes=True
+        ) != render_graphiti_degradation_probe_section(runs_probes=False)
+
+
+class TestRenderIsSafeToInterpolate:
+    """Both stage prompts are module-level f-strings. An interpolated value is
+    not re-scanned, but a brace authored into the section would break the day
+    someone inlines it -- the hazard `prompts/__init__.py` documents."""
+
+    @pytest.mark.parametrize('runs_probes', [True, False])
+    def test_render_carries_no_braces(self, runs_probes):
+        rendered = render_graphiti_degradation_probe_section(runs_probes=runs_probes)
+        assert '{' not in rendered
+        assert '}' not in rendered
