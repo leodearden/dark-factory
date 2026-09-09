@@ -232,9 +232,14 @@ run_auto_consolidation(memory_service, taskmaster, escalation_queue, *, project_
   `auto_consolidations_dry_run`, `auto_consolidation_refusals{code: n}`,
   `auto_consolidation_gates_filed`, `applied_cap`, `unexecuted`, `unfiled` (INV-2/INV-11).
 - `revert_auto_consolidation(memory_service, ledger_row)`: for a minted canonical
-  `delete_memory(canonical_id)`; for every member the row tagged, `update_memory(
+  `delete_memory(canonical_id, 'mem0', ...)` (`store` is a required positional on
+  `MemoryService.delete_memory`); for every member the row tagged, `update_memory(
   metadata_delete_keys=['topic', 'x_auto_consolidated_run'])`; never touches an incumbent.
   Called by the report script's `--revert <ledger_key>` and by the sitting.
+- C3's helper takes the live `memory_service` (never a captured config) so
+  `resolve_mem0_update_authorization`'s live read of `config.mem0_update.*` keeps the α leaves
+  green-tier (the exact failure `tests/server/test_update_memory_authz_gate.py::TestLiveRead`
+  guards).
 
 ### C5 — Provenance caller contract
 
@@ -263,7 +268,13 @@ auto_predicate_version, ...)`: `task_kind='deterministic'`, `always_escalates=Tr
 (`authoritative: False`), description "Auto-consolidation refused: `<code>` (ids …).
 Before resolving, stamp `update_task(<id>, metadata={'human_curator_adjudicated_at':
 '<ISO>'}, metadata_mode='merge')`." Filed through the raw backend's `add_task` (Stage 2
-precedent `stages/task_knowledge_sync.py`); the skipped guards are named in D8.
+precedent `stages/task_knowledge_sync.py::_queue_briefing_refresh_tasks`); the skipped guards
+are named in D8. `SqliteTaskBackend.add_task` has no `task_kind` / `always_escalates`
+parameters — both markers (and `execution_class`, `operational_mode`) travel inside the
+metadata JSON string, which is what the interceptor's `_GATE_MARKER_KEYS` reads; the MCP-only
+`ConsolidationGateSpec.as_submit_task_kwargs` shape does not apply on this path. The
+`escalation/server.py::CATEGORIES` list is inert vocabulary (nothing validates against it);
+the consumer-side recognition of the new categories is the watcher skill (task ζ).
 
 ## 5. Boundary-test sketch (the integration gate's signal — task η)
 
@@ -324,14 +335,26 @@ precedent `stages/task_knowledge_sync.py`); the skipped guards are named in D8.
   config-free and catches the 5156 writer class; the allowlist catches an omitted `agent_id`;
   the journal makes the residual (a deliberate spoof) visible.
 - **D12 `consolidate_memories` leaves the Stage 1/2 surface additively**, retiring task 3134's
-  advertisement (its test, the `STALE_KNOWLEDGE_ANNOTATION_NORM` reference, five prompt sites)
-  with a dated pointer on `docs/prds/memory-write-path-convergence.md` §9 ι / C2 that Stage 1's
-  caller is now the executor. Sittings keep the tool via the `curator-` prefix.
+  advertisement with a dated pointer on `docs/prds/memory-write-path-convergence.md` §9 ι / C2
+  that Stage 1's caller is now the executor. Sittings keep the tool via the `curator-` prefix.
+  The sites (re-verified at decompose 2026-09-09): `prompts/stage1.py` (tool block, "Executing
+  a Cluster Fold", guard section), `prompts/__init__.py::STALE_KNOWLEDGE_ANNOTATION_NORM`
+  clause (d) (rendered once into both stage prompts), and
+  `consolidation_gate.py::render_end_state_brief` step 5 (reused verbatim by
+  `render_consolidation_gate_section`). `recon_self_model.py` mentions the op only as the
+  delete arm's deleter provenance, which stays true, and is NOT edited. Tests to retire or
+  replace: `tests/test_stage1_consolidation_guidance.py::TestStage1AdvertisesTheConsolidationOp`,
+  `::TestSharedNormNamesTheSanctionedPath.test_the_norm_names_the_consolidation_op`,
+  `::TestStage1ExecutionContract`, and read
+  `tests/test_stages.py::TestDisallowedToolLists.test_consolidate_memories_is_classified_as_a_memory_write`
+  before editing the lists. The CLI flag literal is `--disallowed-tools`
+  (`shared/src/shared/cli_invoke.py::invoke_with_cap_retry`); the runner docstrings misspell it.
 - **D13 Scope is all projects; rollout is per project.** `enabled_projects` (default `[]`,
   `summary_rebuild.projects` / `backlog_hard_limit_overrides` precedent) stages the
-  supervised cycle on `dark_factory` first, then every reconciled project. The 31 open gates
-  (7 df pending, 24 reify) are migrated by script (task θ) after each project's clean cycle;
-  until then they stay sitting-owned.
+  supervised cycle on `dark_factory` first, then every reconciled project. The open gates
+  (recounted 2026-09-09 at decompose: dark_factory **1**, task 5183 — the 09-08 sitting's
+  seven were closed by the runner overnight; reify 24 as of 09-08) are migrated by script
+  (task θ) after each project's clean cycle; until then they stay sitting-owned.
 - **D14 Tag-only refreshes nothing on the incumbent** (3112 doctrine; `content_amend=False` is
   load-bearing). A stale-but-unbannered incumbent (5130, 5180) is undetectable by code and
   stays with the sitting.
@@ -370,8 +393,13 @@ Verified present and wired:
   `upsert` last-write-wins; `mark_addressed`; index `ix_recon_ledger_project_kind_state`.
   **Absent:** a list-by-kind reader; TTL for NULL `expires_at` (task γ adds both).
 - `_resolve_identity` clientInfo fallback; `Scheduler.set_task_status` sends no `agent_id`;
-  `McpSession.initialize` advertises `'orchestrator'`; only `deterministic_runner.py::
-  _build_done_provenance` produces `deterministic-*` kinds in production.
+  `McpSession.initialize` advertises `'orchestrator'`; `deterministic_runner.py::
+  _build_done_provenance` is the live producer of `deterministic-*` kinds. One other
+  producer exists (found at decompose, 2026-09-09):
+  `fused-memory/scripts/cgl_eta_finalize_gate.py::_gate_done_provenance`, a finished one-shot
+  for task 2273 (done) presenting clientInfo `cgl-sched-gate`. Decision: it is NOT added to
+  the default allowlist — a re-run would be refused, which is correct for a dead script; ε
+  names it in `docs/task-authoring.md`.
 - `_validate_done_provenance(task_id, raw, project_root, *, require, is_recon_stage=False)`
   with the `is_recon_stage` refusal branch for `operational-verified`.
 - `escalation/pins.py::_classify_record`: only `severity='info'` is NON_PINNING.
@@ -390,8 +418,10 @@ Verified present and wired:
 
 External prerequisites (hard, in the DAG):
 
-- **Task 4808** (closure helper `resolve_unstamped_live_ids`, `provenance.observed_members`):
-  branch tip `8d3af634ea`, **not on main**. Task δ depends on it.
+- **Task 4808** (closure helper `resolve_unstamped_live_ids` + pure `unstamped_candidates`,
+  `provenance.observed_members`): branch `task/4808`, tip `60e05ccea3` at decompose
+  (2026-09-09; the earlier `8d3af634ea` was rewritten), 22 commits ahead, **not on main**.
+  Main's `evaluate_closure` already accepts `unstamped_live_ids`. Task δ depends on 4808.
 - **Task 3136 / 4916** (detector report, `duplicate_audit` config block): **not on main**.
   This PRD creates the shared flood-control helper and block; 4916 consumes it (seam table).
 - `memory_metadata.enforce` is `False` (task 3626, red-tier, untouched): canonical uniqueness
@@ -431,7 +461,8 @@ No reciprocal-ownership ambiguity: every seam above has one owner.
 
 ## 10. Decomposition plan (signals are the G2 gate; Greek labels this-PRD-local)
 
-Deps: γ ← {α, β}; δ ← {γ, task 4808}; ε ← α; ζ ← δ; η ← δ; θ ← δ. α ‖ β ‖ (ε after α).
+Deps: γ ← {α, β}; δ ← {γ, task 4808}; ε ← α; ζ ← δ; η ← {δ, ε}; θ ← δ. α ‖ β ‖ (ε after α).
+(η ← ε added at decompose 2026-09-09: boundary row B11 needs ε's refusal.)
 Same-file serialisation is carried by those edges (`server/tools.py`: β → γ → ζ;
 `consolidation_gate.py`: γ → δ; `config/schema.py`: α → ε).
 
@@ -507,9 +538,12 @@ Same-file serialisation is carried by those edges (`server/tools.py`: β → γ 
   a project: re-read the live members (never the gate's snapshot list — every ruled list
   undercounted), run the predicate, execute PASS / PASS_TAG_ONLY under the cycle caps, stamp
   `observed_members`, and print the gates now closable via `resolve_issue(resume)` (the runner
-  closes them; the script never sets a task status). *Signal (leaf):* `--dry-run` on
-  dark_factory prints the 7 pending gates with verdicts; `--execute` leaves each PASS gate with
-  `evaluate_closure` closed and lists it. G7: INV-3 (re-read live state before acting).
+  closes them; the script never sets a task status). Enumerate gates by
+  `metadata.operational_mode == 'gate'` AND the `x_recon_consolidation_gate` block (read its
+  `topic`), never by title. *Signal (leaf):* `--dry-run` on dark_factory prints every open
+  consolidation gate with a verdict (one today, task 5183; the test fixture supplies its own
+  gates); `--execute` leaves each PASS gate with `evaluate_closure` closed and lists it. G7:
+  INV-3 (re-read live state before acting).
 
 Decompose-time actions for the decomposing session, not tasks: amend task 4916's details with
 the shared flood-control block name via `update_task`; dep-gate δ on 4808 as an out-of-batch
@@ -539,5 +573,8 @@ dependency; file ζ and θ with `complexity` reflecting their docs/scripts weigh
    construction. Decide in γ.
 4. **Stopword list for the label check.** Reuse the slug tokenizer's list if one exists in
    `fused_memory.topic_slug`; otherwise a 30-word inline list. Decide in α.
-5. **Where the accretion instruction lives** — the `search` docstring or
-   `FUSED_MEMORY_INSTRUCTIONS`: whichever the pin caveat already lives in. Decide in ζ.
+5. **Where the accretion instruction lives.** Resolved at decompose (2026-09-09): the pin
+   caveat lives in BOTH `server/tools.py::FUSED_MEMORY_INSTRUCTIONS` and the `search`
+   docstring, so "whichever" was no answer. ζ puts it in `FUSED_MEMORY_INSTRUCTIONS` only
+   (the docstring is not test-pinned; the instructions block is the one every client reads),
+   and the recon-watcher playbook is a bullet list, not a table.
