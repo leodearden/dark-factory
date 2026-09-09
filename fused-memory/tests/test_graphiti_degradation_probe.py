@@ -25,7 +25,16 @@ from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
 
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import (
+    STAGE2_SYSTEM_PROMPT,
+    build_stage2_system_prompt,
+)
+from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
 _VERDICT = NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER))
+_PROBE_SECTION = render_graphiti_degradation_probe_section(runs_probes=True)
+_READ_ONLY_SECTION = render_graphiti_degradation_probe_section(runs_probes=False)
 
 
 class TestProbeLadderIsAControlledVariable:
@@ -193,3 +202,60 @@ class TestRenderIsSafeToInterpolate:
         rendered = render_graphiti_degradation_probe_section(runs_probes=runs_probes)
         assert '{' not in rendered
         assert '}' not in rendered
+
+
+class TestSectionIsWiredIntoBothStages:
+    """Pin the WIRING -- the section is embedded verbatim, once, in each stage
+    that needs it. Prose may be reworded freely; the wiring may not silently
+    break. Shape lifted from ``test_recon_gate_closure_guidance.py``.
+    """
+
+    def test_probing_stage_embeds_the_probe_section_once(self):
+        assert STAGE2_SYSTEM_PROMPT.count(_PROBE_SECTION) == 1
+
+    def test_read_only_stage_embeds_the_read_only_section_once(self):
+        assert STAGE3_SYSTEM_PROMPT.count(_READ_ONLY_SECTION) == 1
+
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_section_survives_both_runtime_builder_branches(self, project_id):
+        """``autopilot_video`` splices a contamination guardrail in ahead of the
+        ``## Available Tools`` sentinel; that injection must not displace or
+        truncate this section."""
+        assert _PROBE_SECTION in build_stage2_system_prompt(project_id)
+
+
+class TestNoCrossContamination:
+    """The capability split has to hold at the wiring level too, not just at
+    the renderer's."""
+
+    def test_read_only_stage_is_never_told_to_run_the_ladder(self):
+        assert _PROBE_SECTION not in STAGE3_SYSTEM_PROMPT
+
+    def test_probing_stage_does_not_receive_the_weaker_clause(self):
+        assert _READ_ONLY_SECTION not in STAGE2_SYSTEM_PROMPT
+
+
+class TestCounterNamesReachTheProbingStage:
+    """The user-observable signal, end to end: the counter names an operator
+    reads out of a cycle's stats are the same strings the stage was instructed
+    to emit -- resolved through the constants, never retyped."""
+
+    @pytest.mark.parametrize(
+        'stat_key',
+        [
+            GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY,
+            GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY,
+        ],
+    )
+    def test_counter_is_named_in_the_probing_stage_prompt(self, stat_key):
+        assert stat_key in STAGE2_SYSTEM_PROMPT
+
+
+class TestStage1IsDeliberatelyExcluded:
+    """Stage 1 is the memory-consolidation stage: it ran no probes in the
+    incident and asserts nothing about store health. Its exclusion is a
+    decision, pinned here so a later editor does not "fix" it by accident."""
+
+    @pytest.mark.parametrize('section', [_PROBE_SECTION, _READ_ONLY_SECTION])
+    def test_section_is_absent_from_stage1(self, section):
+        assert section not in STAGE1_SYSTEM_PROMPT
