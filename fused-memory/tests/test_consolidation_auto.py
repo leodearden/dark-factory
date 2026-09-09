@@ -13,12 +13,98 @@ notice drift in its wording, backticks or punctuation.
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import subprocess
 import sys
 import uuid
+from typing import Any
 
-from fused_memory.reconciliation.consolidation_auto import build_auto_canonical
+import pytest
+
+from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.reconciliation.consolidation_auto import (
+    UNREADABLE,
+    AutoOutcome,
+    AutoProposal,
+    AutoReasonCode,
+    AutoVerdict,
+    build_auto_canonical,
+    evaluate_auto_predicate,
+)
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN
+
+#: The topic every predicate fixture proposes unless a test says otherwise.
+TOPIC = 'memory-consolidation'
+
+#: A member body that trips no hazard: no correction banner, no index label.
+#: Fixtures that need a hazard say so explicitly, so a test that fails is
+#: always failing on the one fact it names.
+BENIGN_BODY = (
+    'The scheduler drains its queue before the watchdog fires, so a wedged unit is '
+    'revived without any operator action.'
+)
+
+
+def _member(
+    member_id: str,
+    *,
+    topic: str | None = None,
+    canonical: bool = False,
+    category: str | None = 'procedural_knowledge',
+    content: str = BENIGN_BODY,
+    **extra_meta: Any,
+) -> dict[str, Any]:
+    """Build one record in the shape ``MemoryService.get_memory_by_id`` returns.
+
+    That shape is the plain ``{'id', 'content', 'metadata'}`` dict — there is no
+    ``MemoryRecord`` class in the tree — so these fixtures are the real thing
+    rather than a stand-in whose drift from the source would go unnoticed.
+
+    An unstamped member carries no ``metadata.topic`` KEY at all (not a ``None``
+    value), and a non-canonical member carries no ``canonical`` key, because
+    that is how live records are shaped. ``extra_meta`` is how a test adds a
+    correction-metadata key without a second builder.
+    """
+    metadata: dict[str, Any] = dict(extra_meta)
+    if category is not None:
+        metadata['category'] = category
+    if topic is not None:
+        metadata['topic'] = topic
+    if canonical:
+        metadata['canonical'] = True
+    return {'id': member_id, 'content': content, 'metadata': metadata}
+
+
+def _members(*records: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Key each record by its OWN id — the mapping the predicate is handed.
+
+    Keying from the record keeps the mapping key and ``record['id']`` from ever
+    disagreeing, which a hand-written literal would let drift silently.
+    """
+    return {record['id']: record for record in records}
+
+
+def _proposal(
+    member_ids: tuple[str, ...],
+    *,
+    topic: str = TOPIC,
+    category: str = 'procedural_knowledge',
+) -> AutoProposal:
+    """Build the structured proposal task delta assembles from a ledger row."""
+    return AutoProposal(topic=topic, member_ids=tuple(member_ids), category=category)
+
+
+def _auto_config(**overrides: Any):
+    """A REAL ``ConsolidationAutoConfig``, never a bare ``MagicMock``.
+
+    The model IS the contract: its defaults, its bounds and its cross-field
+    validator are what the predicate reads, so a mock would let this suite pass
+    against knobs that cannot exist (the ``scripts/check_bare_magicmock_config.py``
+    guard, task 1372).
+    """
+    config = FusedMemoryConfig().consolidation_auto
+    return config.model_copy(update=overrides) if overrides else config
 
 
 class TestImportLeafAndSingleHomes:
@@ -192,3 +278,136 @@ class TestBuildAutoCanonical:
         out = build_auto_canonical(claim, 't' * TOPIC_SLUG_MAX_LEN, 20, self.RUN_ID)
 
         assert claim in out
+
+
+class TestVerdictShapeAndGating:
+    """The verdict's shape, and rung 1 of C2's binding evaluation order.
+
+    `already_gated` is evaluated FIRST, before every hazard and every outcome
+    rung. That order is the contract, not an optimisation: a topic a human
+    already owns must never collect a second gate filing, which is task 3524's
+    DECIDE-FIRST seam. The test below therefore hands the predicate a member
+    list that ALSO trips a hazard and pins that the hazard never surfaces.
+    """
+
+    def test_already_gated_is_a_noop_naming_the_gate(self):
+        """An open gate short-circuits everything, and names the gate it found.
+
+        The fixture is deliberately hostile: `m2` is UNREADABLE, which on any
+        other path is a fail-closed FAIL. Seeing NOOP here — with no hazard
+        reason — is what proves rung 1 runs before rung 2 rather than merely
+        beside it.
+        """
+        members = _members(_member('m1'), _member('m3'))
+        members['m2'] = UNREADABLE
+
+        verdict = evaluate_auto_predicate(
+            _proposal(('m1', 'm2', 'm3')),
+            members=members,
+            canonical_count=0,
+            open_gate_id='5183',
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        assert verdict.outcome is AutoOutcome.NOOP
+        assert len(verdict.reasons) == 1, verdict.reasons
+        assert verdict.reasons[0].code is AutoReasonCode.already_gated
+        assert '5183' in verdict.reasons[0].ids
+        assert verdict.retain_ids == ()
+        assert verdict.stripped_ids == ()
+
+    def test_verdict_is_frozen_and_typed(self):
+        """Structured data, not prose: enums and tuples, and immutable.
+
+        A caller serialises `code.value` and branches on it (PRD §6). Freezing
+        the verdict is what lets one be passed to a ledger writer and a
+        reporter without either being able to edit the other's copy.
+        """
+        gated = evaluate_auto_predicate(
+            _proposal(('m1', 'm2')),
+            members=_members(_member('m1'), _member('m2')),
+            canonical_count=0,
+            open_gate_id='5183',
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+        ungated = evaluate_auto_predicate(
+            _proposal(('m1', 'm2')),
+            members=_members(_member('m1'), _member('m2')),
+            canonical_count=0,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        for verdict in (gated, ungated):
+            assert isinstance(verdict, AutoVerdict)
+            assert isinstance(verdict.outcome, AutoOutcome)
+            assert isinstance(verdict.reasons, tuple)
+            assert isinstance(verdict.retain_ids, tuple)
+            assert isinstance(verdict.stripped_ids, tuple)
+            for reason in verdict.reasons:
+                assert isinstance(reason.code, AutoReasonCode)
+                assert isinstance(reason.ids, tuple)
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                verdict.outcome = AutoOutcome.PASS
+
+    def test_predicate_version_is_echoed_from_config(self):
+        """The version is a LIVE READ of the green-tier leaf, not a constant.
+
+        `consolidation_auto.predicate_version` reloads hot, so a verdict minted
+        after a reload must carry the NEW version — that is how a ledger row
+        records which ruleset judged it. A module constant would silently keep
+        stamping the old one.
+        """
+        args = dict(
+            members=_members(_member('m1'), _member('m2')),
+            canonical_count=0,
+            open_gate_id='5183',
+            existing_canonical_slugs=(),
+        )
+        shipped = _auto_config()
+        retagged = _auto_config(predicate_version='2')
+
+        assert shipped.predicate_version == '1'
+        first = evaluate_auto_predicate(_proposal(('m1', 'm2')), config=shipped, **args)
+        second = evaluate_auto_predicate(_proposal(('m1', 'm2')), config=retagged, **args)
+
+        assert first.predicate_version == shipped.predicate_version
+        assert second.predicate_version == '2'
+
+    def test_the_predicate_reads_no_store(self):
+        """The caller supplies every fact — there is nowhere to pass a service.
+
+        C2's "never calls search" is pinned structurally rather than by
+        watching for I/O: the signature admits exactly six names and every one
+        of them is a plain fact. A verdict that could depend on a live read
+        would be a verdict that depends on WHEN it ran.
+        """
+        params = inspect.signature(evaluate_auto_predicate).parameters
+
+        assert set(params) == {
+            'proposal',
+            'members',
+            'canonical_count',
+            'open_gate_id',
+            'existing_canonical_slugs',
+            'config',
+        }
+        assert [
+            name
+            for name, p in params.items()
+            if p.kind is not inspect.Parameter.KEYWORD_ONLY
+        ] == ['proposal']
+
+        verdict = evaluate_auto_predicate(
+            _proposal(('m1', 'm2')),
+            members=_members(_member('m1'), _member('m2')),
+            canonical_count=0,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        assert isinstance(verdict, AutoVerdict)
