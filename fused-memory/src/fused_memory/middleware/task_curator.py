@@ -810,8 +810,9 @@ class TaskCurator:
         # candidate straight to a deterministic PURE-GATE instead of the LLM;
         # unlike the blocklist, the resulting decision is deliberately NOT
         # written to the idempotency cache (see _maybe_route_deterministic).
-        self._operational_registry: list | None = None
-        self._operational_registry_load_attempted: bool = False
+        self._operational_registry = _LazyRegistry(
+            config_key='operational_ask_registry_path', label='operational-ask',
+        )
         # Consecutive-ZOT circuit breaker (task 1743).
         # Counts zero-output/full-timeout curator LLM failures since the
         # last real LLM success; a non-ZOT failure neither increments nor
@@ -1475,7 +1476,10 @@ class TaskCurator:
         ``self._config.curator.operational_ask_registry_path`` on the first
         call and caches the parsed entries for the lifetime of this
         :class:`TaskCurator` instance (no hot-reload; a server restart is
-        required to pick up YAML changes) — mirrors ``_maybe_blocklist_drop``.
+        required to pick up YAML changes). The load runs off the event-loop
+        thread through the shared :class:`_LazyRegistry` (``asyncio.to_thread``),
+        so it cannot stall the fused-memory event loop — mirrors
+        ``_maybe_blocklist_drop``.
 
         Unlike ``_maybe_blocklist_drop``, the resulting decision is
         deliberately NOT written to the idempotency cache
@@ -1508,6 +1512,8 @@ class TaskCurator:
           WARNING logged by the loader).
         - The registry is empty.
         - No entry matches the candidate.
+        - The offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per call).
 
         Note (task δ demotion): a candidate whose ``metadata.execution_class``
         is ``"operational"`` or ``"decision"`` now returns ``None`` here too —
@@ -1532,23 +1538,9 @@ class TaskCurator:
         if cfg_path is None:
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
-        if not self._operational_registry_load_attempted:
-            self._operational_registry_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                if self._cwd is not None:
-                    raw_path = self._cwd / raw_path
-                else:
-                    logger.warning(
-                        'task_curator: operational_ask_registry_path %r is relative but '
-                        'TaskCurator was constructed without cwd — resolving against process '
-                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
-                        cfg_path,
-                    )
-            self._operational_registry = load_operational_registry(raw_path)
-
-        entries = self._operational_registry
+        entries = await self._operational_registry.entries(
+            load_operational_registry, cfg_path, self._cwd,
+        )
         if not entries:
             return None
 
