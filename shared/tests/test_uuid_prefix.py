@@ -12,6 +12,9 @@ No test in this file asserts on docstring or comment prose.
 
 from __future__ import annotations
 
+import copy
+from typing import Any
+
 import pytest
 
 from shared.uuid_prefix import PrefixToken, find_prefix_tokens
@@ -164,3 +167,129 @@ def test_span_is_exact_on_every_positive_row(value: str) -> None:
     assert found
     for token in found:
         assert value[token.start : token.end] == token.token
+
+
+# --- the nested walk (D11) ----------------------------------------------
+
+
+def test_reaches_the_4643_shape_and_reports_the_structured_path() -> None:
+    """The literal DF 4643 instance: metadata.cluster_memory_ids, prefixes one level down.
+
+    The markup guard scans top-level arguments only. D11 widens this detector
+    precisely because the incident's prefixes lived inside a list inside a
+    dict, and the measured field spread is 20+ paths.
+    """
+    arguments = {
+        'project_root': '/home/leo/src/dark-factory',
+        'metadata': {
+            'cluster_memory_ids': [
+                '48433882-ee71-480d-aff7-c91aa4640ff5',
+                'ffa913a1-ffdc-4f30-b435-bb4f06771fd5',
+                '8bec9cd6',
+                'bff81530',
+                '2b0a4f1c-0c1e-4f7a-9c3d-8a1b2c3d4e5f',
+                'f1c4a651',
+                '5d6e7f80-1a2b-3c4d-5e6f-708192a3b4c5',
+                'b7b0f63b',
+                '9e8d7c6b-5a49-4382-9170-6f5e4d3c2b1a',
+            ],
+        },
+    }
+    found = find_prefix_tokens(arguments)
+    assert [t.path for t in found] == [
+        ('metadata', 'cluster_memory_ids', 2),
+        ('metadata', 'cluster_memory_ids', 3),
+        ('metadata', 'cluster_memory_ids', 5),
+        ('metadata', 'cluster_memory_ids', 7),
+    ]
+    assert [t.token for t in found] == ['8bec9cd6', 'bff81530', 'f1c4a651', 'b7b0f63b']
+    # Four of nine entries are prefixes; the five full uuids are not tokens.
+    assert len(arguments['metadata']['cluster_memory_ids']) == 9
+
+
+def test_walks_dicts_inside_lists_inside_dicts() -> None:
+    arguments = {'outer': [{'inner': ['see bff81530 here']}]}
+    found = find_prefix_tokens(arguments)
+    assert [t.path for t in found] == [('outer', 0, 'inner', 0)]
+    assert found[0].token == 'bff81530'
+
+
+def test_a_prefix_shaped_dict_key_is_not_reported() -> None:
+    """Only VALUES are scanned. A key that looks like a prefix is not a citation."""
+    arguments = {'bff81530': 'no identifiers in this value'}
+    assert find_prefix_tokens(arguments) == ()
+
+
+def test_a_nested_prefix_shaped_dict_key_is_not_reported() -> None:
+    arguments = {'metadata': {'8bec9cd6': {'f1c4a651': 'plain prose'}}}
+    assert find_prefix_tokens(arguments) == ()
+
+
+def test_document_order_across_arguments_containers_and_spans() -> None:
+    """Argument insertion order, then container order, then span within a string."""
+    arguments = {
+        'first': 'aaaaaaa1 then aaaaaaa2',
+        'second': {'nested': ['bbbbbbb1', 'bbbbbbb2']},
+        'third': 'ccccccc1',
+    }
+    found = find_prefix_tokens(arguments)
+    assert [(t.path, t.token) for t in found] == [
+        (('first',), 'aaaaaaa1'),
+        (('first',), 'aaaaaaa2'),
+        (('second', 'nested', 0), 'bbbbbbb1'),
+        (('second', 'nested', 1), 'bbbbbbb2'),
+        (('third',), 'ccccccc1'),
+    ]
+
+
+# --- purity and total-ness ----------------------------------------------
+
+
+def test_input_is_not_mutated() -> None:
+    arguments = {
+        'content': 'see bff81530',
+        'metadata': {'cluster_memory_ids': ['8bec9cd6', 'f1c4a651']},
+    }
+    before = copy.deepcopy(arguments)
+    find_prefix_tokens(arguments)
+    assert arguments == before
+
+
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        pytest.param({}, id='empty-map'),
+        pytest.param({'a': None}, id='none'),
+        pytest.param({'a': 12345678}, id='int'),
+        pytest.param({'a': 1.5}, id='float'),
+        pytest.param({'a': True}, id='bool'),
+        pytest.param({'a': {}}, id='empty-dict'),
+        pytest.param({'a': []}, id='empty-list'),
+        pytest.param({'a': ''}, id='empty-string'),
+        pytest.param({'a': [None, 1, True, {}, []]}, id='mixed-non-strings'),
+        pytest.param({'a': {'b': [{'c': None}]}}, id='nested-nones'),
+    ],
+)
+def test_never_raises_on_hostile_json_shaped_input(arguments: dict) -> None:
+    assert find_prefix_tokens(arguments) == ()
+
+
+def test_non_string_leaves_are_skipped_not_coerced() -> None:
+    """12345678 as an int is not a token — only str values are scanned."""
+    assert find_prefix_tokens({'a': 12345678}) == ()
+    assert find_prefix_tokens({'a': '12345678'}) != ()
+
+
+def test_deep_nesting_does_not_raise_recursion_error() -> None:
+    """5,000 alternating containers: the walk must be iterative, not recursive.
+
+    A RecursionError here would be raised on the event-loop thread inside a
+    middleware hook, turning a malformed argument map into an outage.
+    """
+    innermost: Any = ['see bff81530 here']
+    node: Any = innermost
+    for i in range(5_000):
+        node = {'k': node} if i % 2 else [node]
+    found = find_prefix_tokens({'root': node})
+    assert len(found) == 1
+    assert found[0].token == 'bff81530'
