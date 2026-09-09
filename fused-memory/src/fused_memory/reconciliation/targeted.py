@@ -1395,6 +1395,13 @@ class TargetedReconciler:
             )
             return None
 
+        action: dict[str, Any] = {
+            'type': 'descendant_blocked',
+            'task_id': task_id,
+            'parent_id': parent_id,
+            'reopen_reason': reason,
+        }
+
         meta: dict[str, Any] = {
             'parent_cancelled': parent_id,
             'needs_recheck_against_main': True,
@@ -1403,24 +1410,48 @@ class TargetedReconciler:
         if escalation_id:
             meta['review_escalation_id'] = escalation_id
 
+        # Own try/except so a stamp failure never downgrades the landed status
+        # flip -- but try/except ALONE is not enough: update_task's gates return
+        # a rejection dict rather than raising, so a bare handler drops the
+        # stamp silently under exactly the deep-backlog conditions this sweep
+        # runs in, and _unblock_veto_reason reads the very keys it writes.  Full
+        # rationale for the capture/classify/mark pattern, the
+        # error_type-before-error precedence and the rejected-vs-failed split
+        # lives in targeted.py::_unblock_dependent.
         try:
-            await self.task_interceptor.update_task(
+            resp_meta = await self.task_interceptor.update_task(
                 task_id=task_id,
                 project_root=project_root,
                 metadata=json.dumps(meta),
                 append=True,
             )
+            if not interceptor_write_succeeded(resp_meta):
+                error_code = (
+                    (resp_meta.get('error_type') or resp_meta.get('error'))
+                    if isinstance(resp_meta, dict) else 'unknown'
+                ) or 'unknown'
+                logger.warning(
+                    'sweep: block (metadata) rejected for descendant %s '
+                    '(parent %s): error=%r',
+                    task_id, parent_id, error_code,
+                )
+                await self.journal.add_run_action(
+                    run_id, 'skip', 'taskmaster', 'update_task',
+                    {
+                        'task_id': task_id,
+                        'parent_id': parent_id,
+                        'type': 'block_metadata_stamp',
+                        'error': error_code,
+                    },
+                    causation_id=run_id,
+                )
+                action['metadata_stamp'] = 'rejected'
         except Exception as e:
             logger.warning(
                 'sweep: block (metadata) failed for descendant %s (parent %s): %s',
                 task_id, parent_id, e,
             )
-        return {
-            'type': 'descendant_blocked',
-            'task_id': task_id,
-            'parent_id': parent_id,
-            'reopen_reason': reason,
-        }
+        return action
 
     def _sweep_escalate_l1(
         self,
