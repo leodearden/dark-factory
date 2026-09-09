@@ -53,7 +53,7 @@ def _check_kind_conditional_fields(
     timeout_secs: int | None,
     reason: str | None = None,
 ) -> None:
-    """Shared grep/script/manual cross-field validation (PRD §Contract).
+    """Shared grep/script/path/manual cross-field validation (PRD §Contract).
 
     Raises ``ValueError`` naming ``model_name`` (the calling model class),
     ``kind``, and the offending field, so the structured ``ValidationError``
@@ -63,9 +63,15 @@ def _check_kind_conditional_fields(
     (``metadata.delivered_checks`` entries; its own ``kind`` type excludes
     ``'manual'`` and it has no ``reason`` field at all, so those branches
     are unreachable there but kept here so both models enforce identical
-    grep/script rules). Callers without a ``reason`` field simply omit it
-    (default ``None``), which never trips the grep/script ``reason``-forbidden
-    checks below.
+    mechanical rules). Callers without a ``reason`` field simply omit it
+    (default ``None``), which never trips the ``reason``-forbidden checks
+    below.
+
+    The ``'path'`` arm is an explicit ``elif`` ahead of the trailing
+    ``else:  # manual`` fallback, and that placement is load-bearing: a
+    path check reaching the manual arm would be rejected for carrying
+    ``paths`` — with a message naming ``'manual'``, a kind the author
+    never wrote.
     """
     if kind == 'grep':
         if not pattern:
@@ -95,6 +101,23 @@ def _check_kind_conditional_fields(
             raise ValueError(f'{model_name}: paths must not be set when kind={kind!r}.')
         if reason is not None:
             raise ValueError(f'{model_name}: reason must not be set when kind={kind!r}.')
+    elif kind == 'path':
+        if expect is None:
+            raise ValueError(f'{model_name}: expect is required when kind={kind!r}.')
+        if not paths:
+            raise ValueError(
+                f'{model_name}: paths is required and must be non-empty when kind={kind!r}.'
+            )
+        if pattern is not None:
+            raise ValueError(f'{model_name}: pattern must not be set when kind={kind!r}.')
+        if script is not None:
+            raise ValueError(f'{model_name}: script must not be set when kind={kind!r}.')
+        if args:
+            raise ValueError(f'{model_name}: args must not be set when kind={kind!r}.')
+        if timeout_secs is not None:
+            raise ValueError(f'{model_name}: timeout_secs must not be set when kind={kind!r}.')
+        if reason is not None:
+            raise ValueError(f'{model_name}: reason must not be set when kind={kind!r}.')
     else:  # manual
         if pattern is not None:
             raise ValueError(f'{model_name}: pattern must not be set when kind={kind!r}.')
@@ -111,11 +134,11 @@ def _check_kind_conditional_fields(
 
 
 class _CheckFieldsBase(BaseModel):
-    """Shared grep/script check-descriptor fields (PRD §Contract).
+    """Shared check-descriptor fields (PRD §Contract).
 
     Private base for :class:`DeliveredCheck` and :class:`DeliveredCheckMeta`,
     factoring out the six descriptor fields common to both so a future field
-    addition only needs to change in one place — the grep/script/manual
+    addition only needs to change in one place — the per-kind
     cross-field *rules* were already centralized in
     :func:`_check_kind_conditional_fields`, but the field *declarations*
     were duplicated verbatim between the two models. ``kind`` (the two
@@ -139,18 +162,27 @@ class _CheckFieldsBase(BaseModel):
 class DeliveredCheck(_CheckFieldsBase):
     """A single sidecar ``delivered_check`` — the gate δ evaluates (PRD §Contract).
 
-    ``kind`` discriminates three mutually exclusive shapes: ``'grep'``
-    (``pattern`` + ``expect``, optional ``paths``), ``'script'`` (``script``
-    + ``timeout_secs``, optional ``args``), and ``'manual'`` (no check
-    fields — excluded from the gate; optional free-text ``reason``, which is
-    itself forbidden on ``'grep'``/``'script'`` — it is documented as
-    manual-only and the validator enforces that).
+    ``kind`` discriminates four mutually exclusive shapes: ``'grep'``
+    (``pattern`` + ``expect``, optional ``paths`` narrowing the search),
+    ``'script'`` (``script`` + ``timeout_secs``, optional ``args``),
+    ``'path'`` (``expect`` + a non-empty ``paths``), and ``'manual'`` (no
+    check fields — excluded from the gate; optional free-text ``reason``,
+    which is itself forbidden on every mechanical kind — it is documented
+    as manual-only and the validator enforces that).
     ``extra='forbid'`` — this is a strict authoring schema whose deliverable
     is rejecting malformed/typo'd entries, unlike ``shared.task_metadata``'s
     ``extra='allow'`` round-trip sub-models.
+
+    ``'path'`` asserts FILE EXISTENCE on the committed tree, where
+    ``'grep'`` asserts file CONTENTS. Reaching for ``'grep'`` to say "file
+    X exists" is a check that can never go green — a test module does not
+    mention its own filename — so a file-existence capability must use
+    ``'path'``. ``paths`` is reused rather than a singular ``path`` field:
+    two near-identical names on one model is a naming trap, and
+    ``paths=['<file>']`` says exactly what ``path='<file>'`` would.
     """
 
-    kind: Literal['grep', 'script', 'manual']
+    kind: Literal['grep', 'script', 'path', 'manual']
     reason: str | None = None
 
     @model_validator(mode='after')
@@ -317,12 +349,12 @@ class DeliveredCheckMeta(_CheckFieldsBase):
     excluded from the automated gate) plus a required ``name`` (the
     capability name, so a gate-failure escalation can name which capability
     failed). Shares :class:`DeliveredCheck`'s descriptor fields (via
-    :class:`_CheckFieldsBase`) and grep/script cross-field validation (via
+    :class:`_CheckFieldsBase`) and per-kind cross-field validation (via
     :func:`_check_kind_conditional_fields`).
     """
 
     name: str = Field(min_length=1)
-    kind: Literal['grep', 'script']
+    kind: Literal['grep', 'script', 'path']
 
     @model_validator(mode='after')
     def _check_fields(self) -> DeliveredCheckMeta:
