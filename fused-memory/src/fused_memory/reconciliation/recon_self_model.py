@@ -15,10 +15,12 @@ its rendered sections at a later task (ξ). Those prompts currently import
 nothing from harness.py/flag_dedup.py/recon_ledger.py, so — to stay safely
 importable from the prompt-import path without pulling in aiosqlite
 (recon_ledger's dependency) or other reconciliation internals — this module
-imports ONLY reconciliation.recon_pool_map and
-reconciliation.standing_decision_constants (both pure leaves — see those
-modules' docstrings; standing_decision_constants imports only
-`from __future__ import annotations`, so it pulls no reconciliation
+imports ONLY reconciliation.recon_pool_map,
+reconciliation.standing_decision_constants and
+reconciliation.graphiti_degradation_probe (all pure leaves — see those
+modules' docstrings; standing_decision_constants and
+graphiti_degradation_probe import only
+`from __future__ import annotations`, so they pull no reconciliation
 internals onto the prompt-import path) plus stdlib. Consistency with
 recon_ledger.MARKER_KINDS,
 harness._derive_affected_ids, and flag_dedup's content-fingerprint fallback
@@ -48,6 +50,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    NEGATIVE_SET_VERDICT_TEMPLATE,
+)
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
@@ -855,6 +860,24 @@ def markers_deleted_only_by_gc() -> bool:
     return True
 
 
+def negative_probe_set_does_not_clear_intermittent_fault() -> bool:
+    """Invariant: a negative mixed-store probe set never clears the Graphiti
+    degradation — it supports "0 of N reproduced" and nothing stronger.
+
+    The fault is intermittent and load-dependent, and ``search`` reports
+    ``degraded``/``failed_stores`` only WHEN a store has already failed, so a
+    clean probe yields no evidence of health at all. A negative set is an
+    absence of evidence by construction.
+
+    Guards against run cd53b227, whose Stage 2 promoted ONE negative probe
+    (limit=3) to "did not reproduce" and "no persistent Graphiti problem" —
+    which Stage 3 of the same cycle falsified at limit=8. Raising N does not
+    change this: run 45b9a919 ran three probes, one replaying the exact query
+    and limit that HAD fired, and 0 of 3 reproduced.
+    """
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # premise_lint
 # --------------------------------------------------------------------------- #
@@ -908,6 +931,32 @@ _GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
 # matched, not that the description is otherwise correct. Treat a clean
 # lint result accordingly and keep extending this table as new paraphrases
 # surface, rather than over-trusting its coverage.
+# What a clearance claim must be ABOUT for the probe rules below to fire.
+# Without it, an unrelated task reporting "the flaky test did not reproduce"
+# would be rejected under an invariant that says nothing about it.
+_PROBE_SUBJECT = r'(?:graphiti|falkordb|mixed[- ]store|degradation)'
+
+# Stays inside one clause, like _GAP_NO_NEGATION, but deliberately DOES cross a
+# negation cue: the premises these two rules match are themselves phrased as
+# negations ("did not reproduce", "no persistent problem"), so a gap that
+# refused to cross `not` could never reach them.
+_CLAUSE_GAP = r'[^.;]{0,40}?'
+
+_NOT_REPRODUCED = (
+    r"\b(?:did|does|do|was|were|is|are|has|have|had|could|would)"
+    r"(?:\s+not|n['\u2019]t)\s+(?:be\s+)?reproduc\w*"
+)
+
+# Sourced from the template the stage prompts render, so a rejected caller is
+# told the exact permitted wording and the two can never disagree.
+_NEGATIVE_PROBE_SET_DETAIL = (
+    'The Graphiti mixed-store degradation is intermittent and load-dependent, '
+    'and `search` reports store failure only WHEN a store has already failed — '
+    'so a clean probe is no evidence of health, and a negative probe set is an '
+    'absence of evidence rather than evidence of absence. Report the count, not '
+    'a verdict: "' + NEGATIVE_SET_VERDICT_TEMPLATE.format(n='N') + '"'
+)
+
 _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (
         re.compile(
@@ -949,6 +998,30 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
             'stage2_persistence_marker) are deleted only by GC on terminal '
             'task (or TTL) — never by Stage 3 remediation or the LLM.'
         ),
+    ),
+    (
+        re.compile(
+            '(?:'
+            + _PROBE_SUBJECT + _CLAUSE_GAP + _NOT_REPRODUCED
+            + '|'
+            + _NOT_REPRODUCED + _CLAUSE_GAP + _PROBE_SUBJECT
+            + ')',
+            re.IGNORECASE,
+        ),
+        'negative_probe_set_does_not_clear_intermittent_fault',
+        _NEGATIVE_PROBE_SET_DETAIL,
+    ),
+    (
+        re.compile(
+            r'\bno\s+(?:persistent|persisting|ongoing|active|current|systemic|'
+            r'underlying)\b'
+            + f'(?=[^.;]*{_PROBE_SUBJECT})'
+            + _CLAUSE_GAP
+            + r'\b(?:problem|issue|degradation|fault|defect|failure)s?\b',
+            re.IGNORECASE,
+        ),
+        'negative_probe_set_does_not_clear_intermittent_fault',
+        _NEGATIVE_PROBE_SET_DETAIL,
     ),
 )
 
