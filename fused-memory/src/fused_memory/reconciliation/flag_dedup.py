@@ -2501,24 +2501,18 @@ async def filter_terminal_metadata_flags(
     if not check_positions:
         return list(flags)
 
-    async def _safe_get_task_or_none(task_id: Any) -> Any:
-        # Deliberately NOT the module-level _safe_get_task: this filter fails
-        # SAFE to None (KEEP the flag) rather than to a normalised error dict,
-        # and it binds this filter's single fixed project_root.
-        try:
-            return await taskmaster.get_task(task_id, project_root)
-        except Exception as exc:
-            # WARN, not debug: this is a degraded outcome (the filter cannot
-            # tell whether the flag is stale), so it must be visible without
-            # raising the log level — see the silent-fallthrough gate.
-            logger.warning(
-                'reconciliation.terminal_metadata_filter_get_task_error task_id=%s error=%s',
-                task_id, exc,
-            )
-            return None  # KEEP flag on error (fail-safe)
-
+    # Fails SAFE to None (KEEP the flag), NOT to _safe_get_task's error dict:
+    # this filter classifies a lookup by whether a task body came back.
     lookup_results: list[Any] = await asyncio.gather(
-        *[_safe_get_task_or_none(tid) for tid in check_task_ids]
+        *[
+            _safe_get_task_or_none(
+                taskmaster,
+                tid,
+                project_root,
+                log_event='reconciliation.terminal_metadata_filter_get_task_error',
+            )
+            for tid in check_task_ids
+        ]
     )
     results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results, strict=True))
 
@@ -3047,17 +3041,54 @@ async def _safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> An
     :func:`filter_false_phantom_task_creation_flags` — previously carried
     byte-identical private closures with a "keep the two in sync" NOTE.  Both
     take a PER-CITATION ``project_root``, so neither was actually closing over
-    anything, and the note had already gone stale at three copies.  The two
-    remaining private variants genuinely differ: they bind one fixed
-    ``project_root`` for a whole filter (and
-    :func:`filter_terminal_metadata_flags`' variant fails SAFE to ``None``
-    rather than to an error dict), so they stay closures — the absence-filter's
-    now delegates here so the normalised shape cannot drift.
+    anything, and the note had already gone stale at three copies.
+
+    The fail-safe-to-``None`` variant is the SEPARATE module-level
+    :func:`_safe_get_task_or_none` (task 3476 amendment pass), extracted for
+    the same reason once it had reached two byte-identical copies, in
+    :func:`filter_terminal_metadata_flags` and
+    :func:`filter_accounted_cluster_growth_flags`.  Exactly ONE private closure
+    now survives — :func:`filter_false_absence_flags`' ``_safe_get_task_for_root``,
+    which binds one fixed ``project_root`` for a whole filter and delegates
+    here so the normalised shape cannot drift.
     """
     try:
         return await taskmaster.get_task(task_id, project_root)
     except Exception as exc:
         return {'error': str(exc), 'error_type': type(exc).__name__}
+
+
+async def _safe_get_task_or_none(
+    taskmaster: Any,
+    task_id: Any,
+    project_root: str,
+    *,
+    log_event: str,
+) -> Any:
+    """Fetch ONE task, failing SAFE to ``None`` and WARNing under *log_event*.
+
+    The sibling of :func:`_safe_get_task` for the filters that classify a
+    lookup by PRESENCE of a task body rather than by an error dict: a caller
+    that cannot read a body cannot positively confirm anything, so it KEEPS the
+    flag.  ``None`` says exactly that, where an ``{'error', 'error_type'}``
+    dict would be one more shape each such caller has to recognise as "no
+    body".
+
+    *log_event* is the caller's own event name, so a WARNING still identifies
+    which filter degraded.  WARN, not debug: a swallowed lookup error is a real
+    degraded outcome and must be visible without raising the log level — a
+    broad handler returning an empty value with NO ``WARN+`` log is signature
+    (b) of ``shared/tests/test_silent_fallthrough_gate.py``.
+
+    ``CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit`` need no explicit
+    re-raise clause: all three are ``BaseException`` subclasses, which a bare
+    ``except Exception`` already lets propagate.
+    """
+    try:
+        return await taskmaster.get_task(task_id, project_root)
+    except Exception as exc:
+        logger.warning('%s task_id=%s error=%s', log_event, task_id, exc)
+        return None  # KEEP flag on error (fail-safe)
 
 
 def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool:
@@ -5330,23 +5361,6 @@ async def filter_accounted_cluster_growth_flags(
         # this family is rare) does zero I/O.
         return list(flags)
 
-    async def _safe_get_task_or_none(task_id: str) -> Any:
-        # Deliberately NOT the module-level _safe_get_task: this filter fails
-        # SAFE to None (KEEP the flag) rather than to a normalised error dict,
-        # and it binds this filter's single fixed project_root.
-        try:
-            return await taskmaster.get_task(task_id, project_root)
-        except Exception as exc:
-            # WARN, not debug: this is a degraded outcome (the filter cannot
-            # tell whether the flag is accounted for), so it must be visible
-            # without raising the log level — see the silent-fallthrough gate.
-            logger.warning(
-                'reconciliation.accounted_cluster_growth_filter_get_task_error '
-                'task_id=%s error=%s',
-                task_id, exc,
-            )
-            return None  # KEEP flag on error (fail-safe)
-
     # Resolve each distinct task id exactly ONCE per call, however many flags
     # in the batch cite it.
     wanted_task_ids: list[str] = []
@@ -5357,8 +5371,18 @@ async def filter_accounted_cluster_growth_flags(
                 seen_task_ids.add(tid)
                 wanted_task_ids.append(tid)
 
+    # Fails SAFE to None (KEEP the flag), NOT to _safe_get_task's error dict:
+    # a task whose body is unreadable can neither confirm a drop nor veto one.
     lookup_results: list[Any] = await asyncio.gather(
-        *[_safe_get_task_or_none(tid) for tid in wanted_task_ids]
+        *[
+            _safe_get_task_or_none(
+                taskmaster,
+                tid,
+                project_root,
+                log_event='reconciliation.accounted_cluster_growth_filter_get_task_error',
+            )
+            for tid in wanted_task_ids
+        ]
     )
     body_by_task: dict[str, str] = {}
     for tid, result in zip(wanted_task_ids, lookup_results, strict=True):
