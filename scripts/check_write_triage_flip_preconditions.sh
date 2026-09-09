@@ -160,11 +160,36 @@ else
   PROBE5_PY_CMD=(uv run --frozen --project "$REPO/fused-memory" python)
 fi
 
-# Bounded well inside the before_done predicate's own 120s budget. A host
-# without coreutils' `timeout` runs the probe unbounded rather than failing
-# every run on a missing binary.
+#: Wall-clock bound for EACH probe, and the only place either one is tuned.
+#
+# THE ARITHMETIC, which a retune has to redo rather than nudge. This gate runs
+# as a before_done DeterministicCheck whose descriptor pins `timeout_secs: 120`
+# (fused-memory/tests/server/test_write_triage_flip_gate_invariants.py::FLIP_GATE_DELIVERED_CHECK).
+# TWO probes now share that budget -- item 1's and item 5's -- so the worst
+# case is 2 * PROBE_TIMEOUT_SECS, plus a few seconds of archive/tar and items
+# 2 and 4. At 45 that is 90s + ~5s against 120s. This was 90 when item 1 was
+# the only probe; leaving it there gave a MEASURED 181s, which overruns.
+#
+# And overrunning does not FAIL the check, it ERRORS it: per
+# docs/task-authoring.md 3.3 an ERRORED check is a fail-safe wait with NO
+# streak bump and NO escalation, so the dependent (task 3169) waits silently
+# and indefinitely instead of being told which item is unmet -- strictly worse
+# than the clean FAIL everything below exists to produce. So the SUM is the
+# constraint, not the individual bound: do not raise this without re-checking
+# 2 * PROBE_TIMEOUT_SECS against the descriptor, and do not widen the
+# descriptor instead, which buys a longer silent hold with a bounded
+# predicate. Measured typical for the whole gate: 10.3s.
+#
+# BOTH probes below build their `timeout` from this ONE value (SPOT). Bounded
+# apart they could be retuned apart, and nothing in a passing run would show
+# it, which is why
+# scripts/tests/test_check_write_triage_flip_preconditions.py pins this
+# spelling AND measures the sum with both probe subjects hanging.
+PROBE_TIMEOUT_SECS=45
+# A host without coreutils' `timeout` runs the probes unbounded rather than
+# failing every run on a missing binary.
 if command -v timeout >/dev/null 2>&1; then
-  PROBE_TIMEOUT_CMD=(timeout 90)
+  PROBE_TIMEOUT_CMD=(timeout "$PROBE_TIMEOUT_SECS")
 else
   PROBE_TIMEOUT_CMD=()
 fi
