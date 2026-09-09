@@ -387,7 +387,7 @@ class TaskArtifacts:
             return None
         try:
             metadata = json.loads(meta_path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
+        except (ValueError, OSError) as exc:
             logger.warning('Corrupt metadata.json at %s: %s', meta_path, exc)
             return None
         return metadata.get('created_at')
