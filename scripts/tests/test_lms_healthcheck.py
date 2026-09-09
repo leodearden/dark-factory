@@ -2553,6 +2553,63 @@ def test_a_placeholder_only_run_never_emits_the_unmeasured_sentinel(
     )
 
 
+def _mixed_probe(arm):
+    """The real dispatch for a placeholder, a canned PASS for anything else.
+
+    A mixed run has to reach `_placeholder_refusal` for one arm without issuing
+    a request for the other, and patching `probe_arm` wholesale would take the
+    refusal out of the path under test.
+    """
+    return lms_healthcheck.probe_arm(arm) if arm.is_placeholder else _passing_probe(arm)
+
+
+def test_a_placeholder_row_is_charged_no_footprint_beside_a_real_arm():
+    """A placeholder loaded nothing, so its row's footprint is 0, not the block's.
+
+    `run_healthcheck` used to write `budget.arm_footprint_mib` into EVERY row
+    uniformly, which in a mixed `--all` run puts "this TBD arm took 4050 MiB"
+    into the artifact -- a number that only became WRONG once the row became
+    reachable, and one a downstream reader has no way to discount, because the
+    merged slate keeps just ONE vram block and the per-row figure is the only
+    place an arm's own footprint survives.
+    """
+    report = lms_healthcheck.run_healthcheck(
+        [_arm(), _placeholder_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_mixed_probe,
+        baseline=_baseline(),
+    )
+
+    rows = {row.arm_id: row for row in report.arms}
+    assert set(rows) == {'qwen3.5-9b', PLACEHOLDER_ARM_ID}
+    assert rows['qwen3.5-9b'].arm_footprint_mib == MEASURED_FOOTPRINT_MIB
+    assert rows[PLACEHOLDER_ARM_ID].arm_footprint_mib == 0
+    assert rows[PLACEHOLDER_ARM_ID].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    # The BLOCK still reports what the card actually did, which the real arm
+    # explains; only the placeholder's own row declines to claim any of it.
+    assert report.vram.arm_footprint_mib == MEASURED_FOOTPRINT_MIB
+
+
+def test_a_real_arm_without_a_baseline_still_refuses_beside_a_placeholder(
+    tmp_path, monkeypatch,
+):
+    """The partition narrows WHICH ids are looked up; it never weakens the guard.
+
+    Without this pin a placeholder sibling could launder a real arm's missing
+    baseline: the run would find nothing to look up for the placeholder, and an
+    over-eager branch would take the unstarted path for a run that genuinely
+    started something and report its footprint as 0.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'empty'))
+
+    with pytest.raises(lms_vram.StaleBaselineError, match='qwen3.5-9b'):
+        lms_healthcheck.run_healthcheck(
+            [_arm(), _placeholder_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_mixed_probe,
+        )
+
+
 # ---------------------------------------------------------------------------
 # The extraction floor, and the reasoning-mode contract (esc-3713-10).
 #
