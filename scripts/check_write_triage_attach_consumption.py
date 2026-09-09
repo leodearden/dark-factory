@@ -310,6 +310,8 @@ class _Run(NamedTuple):
 
     decision: Any
     calls: list[dict[str, Any]]
+    #: Fail-opens the module recorded on THIS run's own fresh counter.
+    fail_opens: int
     error: str | None
 
 
@@ -320,7 +322,7 @@ async def _await(awaitable: Any) -> Any:
 def _drive(module: Any, judge: _FakeJudge) -> _Run:
     """Execute ``triage_write`` once against the fixture slate."""
     triage_write = _require(module, 'triage_write')
-    counter = _make_counter(module)
+    counter, read_fail_opens = _make_counter(module)
     results = _fixture_results(_parent_key(module), _child_kind(module))
     service = _Service(results)
     try:
@@ -336,8 +338,8 @@ def _drive(module: Any, judge: _FakeJudge) -> _Run:
             ),
         )
     except Exception as exc:  # noqa: BLE001 - attributed to this run, not global
-        return _Run(None, judge.calls, f'triage_write raised: {exc!r}')
-    return _Run(decision, judge.calls, None)
+        return _Run(None, judge.calls, read_fail_opens(), f'triage_write raised: {exc!r}')
+    return _Run(decision, judge.calls, read_fail_opens(), None)
 
 
 class _CountingCounter:
@@ -357,18 +359,31 @@ class _CountingCounter:
         return self.records
 
 
-def _make_counter(module: Any) -> Any:
-    """A FRESH fail-open counter for one run, preferring the ref's own class."""
+def _make_counter(module: Any) -> tuple[Any, Callable[[], int]]:
+    """A FRESH fail-open counter for one run, and a reader for its count.
+
+    THE REF'S OWN CLASS FIRST, so what is measured is the ref's accounting
+    rather than a reimplementation of it: ``_record_fail_open`` increments it on
+    exactly the paths that swallowed the designation. The counting stand-in is
+    the fallback for a ref whose class is absent, whose constructor changed, or
+    whose ``live_count`` no longer reports an int — none of which is a reason to
+    stop measuring.
+    """
     cls = getattr(module, 'TriageFailOpenCounter', None)
     if cls is not None:
         try:
-            return cls()
-        except Exception:  # noqa: BLE001 - a changed constructor is not fatal
-            logger.warning(
-                'the ref\'s TriageFailOpenCounter could not be constructed; '
-                'using a counting stand-in',
-            )
-    return _CountingCounter()
+            counter = cls()
+            reader = counter.live_count
+            if isinstance(reader(), int):
+                return counter, reader
+        except Exception:  # noqa: BLE001 - a changed shape is not fatal
+            pass
+        logger.warning(
+            "the ref's TriageFailOpenCounter could not be used to count "
+            'fail-opens; measuring with a counting stand-in instead',
+        )
+    fallback = _CountingCounter()
+    return fallback, fallback.live_count
 
 
 def _designated_ids(slate_ids: list[str], band_canonical: Any) -> list[str]:
@@ -396,6 +411,12 @@ def _measure(module: Any) -> tuple[_Run, list[str], Any]:
     run = _drive(module, judge)
     if run.error is not None:
         raise _Unverifiable(run.error)
+    if run.fail_opens:
+        raise _Unverifiable(
+            f'the module recorded {run.fail_opens} fail-open(s) on a plain, '
+            f'valid {_ATTACH_OUTCOME!r} verdict, so this run measures a '
+            'degraded write path rather than what the attach consumes',
+        )
     if not run.calls:
         raise _Unverifiable(
             'the judge slot was never reached — the fixture slate did not route '
@@ -440,6 +461,19 @@ def _swap_verdict(
         run = _drive(module, judge)
         if run.error is not None:
             return run.error
+        # BEFORE the tracking test, and structurally rather than by inferring
+        # from the outcome. A fail-open run returns canonical_id=None, which is
+        # not the band's top-1 either — so a check that only asked "did the
+        # attach avoid the band canonical?" would read main's own
+        # `verdict not in TRIAGE_OUTCOMES` arm as CONSUMED. Inferring from the
+        # outcome is no better: `stored` is also a legitimate judge verdict.
+        if run.fail_opens:
+            return (
+                f'FAIL-OPEN ({run.fail_opens} recorded) — the module rejected '
+                f'this designation and fell open to outcome '
+                f'{getattr(run.decision, "outcome", None)!r}, so the '
+                'designation was swallowed rather than consumed'
+            )
         observed = getattr(run.decision, 'canonical_id', None)
         if observed != designated:
             return (
