@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+import inspect
 import logging
 import sys
 from collections.abc import Callable
@@ -61,6 +62,29 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 
 logger = logging.getLogger(__name__)
+
+#: Prefix for the probe's own degraded-measurement records. They are collected
+#: rather than logged straight out because logging's default destination is
+#: stderr, which the gate drops.
+_WARN_PREFIX = 'WARN  '
+
+
+class _WarnCollector(logging.Handler):
+    """Divert the probe's own warnings into the END of the report.
+
+    A warning about HOW something was measured has to reach the operator
+    reading the verdict, and the two channels this probe's output survives are
+    narrow: the gate drops stderr, and a report read through a tail keeps only
+    its end. So the records go on stdout, and last.
+    """
+
+    def __init__(self, sink: list[str]) -> None:
+        super().__init__(level=logging.WARNING)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._sink.append(_WARN_PREFIX + record.getMessage())
+
 
 _MODULE_NAME = 'fused_memory.server.write_triage'
 
@@ -345,26 +369,61 @@ async def _await(awaitable: Any) -> Any:
     return await awaitable
 
 
+def _decision_shape_error(decision: Any) -> str | None:
+    """Why *decision* cannot be read as a ``BandDecision``, or None if it can.
+
+    Duck-typed on the two fields this probe reads rather than on the class.
+    An ``isinstance`` check against a class imported from the same bare tree
+    would add nothing and would fail any ref that renamed the dataclass, which
+    is a mechanism this gate may not pin.
+
+    Without this check a returned shape carrying no ``canonical_id`` reads as
+    an attach id of None on every run — neither the band's top-1 nor a
+    designation — so the probe would report NOT CONSUMED and send an operator
+    to fix a defect this run never measured. A wrong diagnosis, not merely a
+    wrong verdict.
+    """
+    missing = [f for f in ('outcome', 'canonical_id') if not hasattr(decision, f)]
+    if not missing:
+        return None
+    return (
+        f'triage_write returned {decision!r}, which exposes no '
+        f'{"/".join(missing)} — nothing here measured an attach'
+    )
+
+
 def _drive(module: Any, judge: _FakeJudge) -> _Run:
     """Execute ``triage_write`` once against the fixture slate."""
     triage_write = _require(module, 'triage_write')
     counter, read_fail_opens = _make_counter(module)
     results = _fixture_results(_parent_key(module), _child_kind(module))
     service = _Service(results)
+
+    def failed(reason: str) -> _Run:
+        return _Run(None, judge.calls, read_fail_opens(), reason)
+
     try:
-        decision = asyncio.run(
-            _await(
-                triage_write(
-                    service,
-                    content=_NEW_ENTRY,
-                    project_id=_PROJECT_ID,
-                    counter=counter,
-                    judge=judge,
-                ),
-            ),
+        pending = triage_write(
+            service,
+            content=_NEW_ENTRY,
+            project_id=_PROJECT_ID,
+            counter=counter,
+            judge=judge,
         )
+        # Checked BEFORE awaiting: a plain `def` returns its value directly, so
+        # `await`ing it raises a TypeError that reads like a defect inside the
+        # write path rather than like "the write path never ran".
+        if not inspect.isawaitable(pending):
+            return failed(
+                f'triage_write(...) returned {pending!r}, which is not '
+                'awaitable — nothing here executed the write path',
+            )
+        decision = asyncio.run(_await(pending))
     except Exception as exc:  # noqa: BLE001 - attributed to this run, not global
-        return _Run(None, judge.calls, read_fail_opens(), f'triage_write raised: {exc!r}')
+        return failed(f'triage_write raised: {exc!r}')
+    shape_error = _decision_shape_error(decision)
+    if shape_error is not None:
+        return failed(shape_error)
     return _Run(decision, judge.calls, read_fail_opens(), None)
 
 
@@ -404,10 +463,14 @@ def _make_counter(module: Any) -> tuple[Any, Callable[[], int]]:
                 return counter, reader
         except Exception:  # noqa: BLE001 - a changed shape is not fatal
             pass
-        logger.warning(
-            "the ref's TriageFailOpenCounter could not be used to count "
-            'fail-opens; measuring with a counting stand-in instead',
-        )
+    # Outside the branch above, so an ABSENT class warns too. Falling back is
+    # not a reason to stop measuring, but it does change what was measured —
+    # the stand-in's accounting rather than the ref's — and a gate that
+    # authorises a production flag flip may not degrade quietly.
+    logger.warning(
+        "the ref's TriageFailOpenCounter is absent or unusable, so fail-opens "
+        "were counted with a stand-in rather than with the ref's own accounting",
+    )
     fallback = _CountingCounter()
     return fallback, fallback.live_count
 
@@ -587,6 +650,30 @@ def _search_spellings(
     return None, attempts
 
 
+def _pass_scope_note() -> list[str]:
+    """What a PASS deliberately does NOT prove.
+
+    Item 5 asserts at ``BandDecision.canonical_id`` — the value
+    ``tools.py::add_memory`` consumes verbatim as ``attached_to``. It stops
+    there: the remaining hops live inline in that MCP tool body with no
+    callable seam, and standing up a real ``memory_service`` is not something a
+    bounded before_done predicate can do. So a later change to add_memory's own
+    target selection would still pass this gate — an honest smaller claim, said
+    out loud rather than left for a reader to infer from the absence of one.
+
+    Emitted on the PASS path only. That is the run an operator acts on to flip
+    a production flag, and it is also the report whose window is uncontended: a
+    FAIL's window belongs to the remedy.
+    """
+    return [
+        '      NOTE this gate asserts at BandDecision.canonical_id — the value',
+        '      tools.py::add_memory consumes verbatim as `attached_to`. It does NOT',
+        '      execute the stamp, so it does not show that the write puts that id in',
+        "      PARENT_ID_KEY, and a later change to add_memory's own target selection",
+        '      would still pass here. Confirm that separately before flipping.',
+    ]
+
+
 def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     out.append(
         f'write_triage attach-consumption probe — src-root={src_root}',
@@ -608,6 +695,7 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     out.append(announced_line)
     if announced:
         out.append(_PASS_MARKER)
+        out.extend(_pass_scope_note())
         return EXIT_OK
 
     if len(usable) < 2:
@@ -631,6 +719,7 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
             f'designated candidates {designations!r}',
         )
         out.append(_PASS_MARKER)
+        out.extend(_pass_scope_note())
         return EXIT_OK
 
     out.append(f'spellings tried: {_first_few(attempts)}')
@@ -665,9 +754,20 @@ def main(argv: list[str] | None = None) -> int:
             'Repeatable.'
         ),
     )
+    # Argparse stays OUTSIDE the try below: `--help` and a missing --src-root
+    # are argparse's own exit codes to own, and reporting a usage error as an
+    # UNVERIFIABLE invariant would name a defect in the ref for a defect in the
+    # invocation.
     args = parser.parse_args(argv)
 
     out: list[str] = []
+    warnings: list[str] = []
+    # propagate=False so the collector is the ONLY destination: logging's
+    # lastResort handler would otherwise also write each record to stderr,
+    # which the gate drops, leaving a duplicate nobody reads.
+    logger.addHandler(_WarnCollector(warnings))
+    logger.propagate = False
+
     try:
         rc = _probe(
             Path(args.src_root),
@@ -680,6 +780,28 @@ def main(argv: list[str] | None = None) -> int:
             '      Failing closed — an unverifiable invariant is not a satisfied one.',
         )
         rc = EXIT_FAIL
+    except BaseException as exc:  # noqa: BLE001 - see below; nothing may escape
+        # BaseException, NOT Exception, and this is the whole point of the arm.
+        # A `SystemExit` out of the ref's own module body is not an Exception,
+        # so an `except Exception` lets it through: the interpreter then exits
+        # with the REF's code — 0 for `SystemExit(0)` — having printed nothing
+        # at all, and a gate that greps stdout for a marker reads silence plus
+        # rc=0 as a PASS. That is a measured escape on the item-1 probe, not a
+        # hypothetical one, and it is the worst failure this probe has: it
+        # authorises a production flag flip on a run that measured nothing.
+        out.append(
+            f'FAIL  UNVERIFIABLE: the probe raised {exc!r} while evaluating the '
+            'invariant',
+        )
+        out.append(
+            '      Failing closed — an unverifiable invariant is not a satisfied one.',
+        )
+        rc = EXIT_FAIL
+
+    # LAST, and deduplicated: every run builds its own counter, so one degraded
+    # measurement would otherwise repeat itself once per run and crowd the
+    # verdict out of a tail-truncated report.
+    out.extend(dict.fromkeys(warnings))
     sys.stdout.write('\n'.join(out) + '\n')
     return rc
 
