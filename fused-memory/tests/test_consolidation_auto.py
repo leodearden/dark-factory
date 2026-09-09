@@ -411,3 +411,187 @@ class TestVerdictShapeAndGating:
         )
 
         assert isinstance(verdict, AutoVerdict)
+
+
+class TestTerminalOutcomes:
+    """Rungs 3-6: the strip, and the three non-FAIL outcomes.
+
+    These are the shapes the auto path exists to produce. PRD D4 expects the
+    RE-EMISSION shapes (B2/B3) to be the majority verdict over time — a topic
+    gets consolidated once and then re-proposed for the rest of its life — so
+    the incumbent-strip and the tag-only rung are the load-bearing cases, not
+    the fresh-cluster one.
+    """
+
+    def test_fresh_cluster_passes(self):
+        """PRD B1: nothing stamped, no canonical yet — mint one.
+
+        `retain_ids` comes back in the PROPOSAL's order, not the mapping's, so
+        the members are built here in a different order than they are proposed.
+        The executor folds in that order, and an order that silently came from
+        a dict would be an order no caller could predict.
+        """
+        members = _members(
+            _member('m3'), _member('m1'), _member('m5'), _member('m4'), _member('m2'),
+        )
+
+        verdict = evaluate_auto_predicate(
+            _proposal(('m1', 'm2', 'm3', 'm4', 'm5')),
+            members=members,
+            canonical_count=0,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        assert verdict.outcome is AutoOutcome.PASS
+        assert verdict.retain_ids == ('m1', 'm2', 'm3', 'm4', 'm5')
+        assert verdict.stripped_ids == ()
+        assert verdict.reasons == ()
+
+    def test_unstamped_member_beside_one_canonical_is_tag_only(self):
+        """A topic that already has a canonical grows two new members.
+
+        PASS_TAG_ONLY means the executor stamps the unstamped members and
+        touches the incumbent's content and metadata NOT AT ALL (PRD D14).
+        `retain_ids` still carries all five: the already-stamped ones are what
+        makes the cluster this topic's, and dropping them would leave the
+        caller unable to report what it judged.
+        """
+        members = _members(
+            _member('m1', topic=TOPIC),
+            _member('m2', topic=TOPIC),
+            _member('m3', topic=TOPIC),
+            _member('n1'),
+            _member('n2'),
+        )
+
+        verdict = evaluate_auto_predicate(
+            _proposal(('m1', 'm2', 'm3', 'n1', 'n2')),
+            members=members,
+            canonical_count=1,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        assert verdict.outcome is AutoOutcome.PASS_TAG_ONLY
+        assert verdict.retain_ids == ('m1', 'm2', 'm3', 'n1', 'n2')
+        assert verdict.stripped_ids == ()
+
+    def test_fully_consolidated_re_emission_is_a_noop(self):
+        """PRD B3: the topic is already done and the cluster is re-proposed.
+
+        Every member is stamped and the canonical exists, so there is nothing
+        to write. NOOP rather than PASS_TAG_ONLY is the difference between a
+        cycle that does nothing and a cycle that rewrites a settled topic every
+        time Stage 1 notices it again.
+        """
+        members = _members(*(_member(f'm{i}', topic=TOPIC) for i in range(1, 6)))
+
+        verdict = evaluate_auto_predicate(
+            _proposal(('m1', 'm2', 'm3', 'm4', 'm5')),
+            members=members,
+            canonical_count=1,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        assert verdict.outcome is AutoOutcome.NOOP
+        assert [r.code for r in verdict.reasons] == [AutoReasonCode.already_consolidated]
+        assert verdict.retain_ids == ('m1', 'm2', 'm3', 'm4', 'm5')
+        assert verdict.stripped_ids == ()
+
+    def test_re_emission_with_regrowth_strips_the_incumbent(self):
+        """PRD B2, the shape the strip rung exists for.
+
+        A consolidated topic grows three new members and the LLM re-proposes
+        the cluster, enumerating the canonical `C` along with them — which is
+        what an LLM looking at a topic scroll naturally does. `C` must be moved
+        out of the retained set (the executor would otherwise tag or fold the
+        canonical into itself) and DISCLOSED, because a silently shortened
+        member list would drop a record the proposal named with nothing
+        recording why (PRD §6 INV-11).
+
+        `C` is proposed in the MIDDLE of the list, so the retained order is a
+        real assertion about order preservation rather than a truncation that
+        would pass by accident.
+        """
+        proposed = ('m1', 'm2', 'C', 'm3', 'n1', 'm4', 'n2', 'm5', 'n3')
+        members = _members(
+            *(_member(f'm{i}', topic=TOPIC) for i in range(1, 6)),
+            *(_member(f'n{i}') for i in range(1, 4)),
+            _member('C', topic=TOPIC, canonical=True),
+        )
+
+        verdict = evaluate_auto_predicate(
+            _proposal(proposed),
+            members=members,
+            canonical_count=1,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        assert verdict.outcome is AutoOutcome.PASS_TAG_ONLY
+        assert verdict.stripped_ids == ('C',)
+        assert 'C' not in verdict.retain_ids
+        assert verdict.retain_ids == ('m1', 'm2', 'm3', 'n1', 'm4', 'n2', 'm5', 'n3')
+
+        stripped = [r for r in verdict.reasons if r.code is AutoReasonCode.incumbent_canonical_stripped]
+        assert len(stripped) == 1, verdict.reasons
+        assert stripped[0].ids == ('C',)
+
+    def test_a_stripped_incumbent_does_not_make_the_cluster_look_consolidated(self):
+        """The strip is rung 3 and runs BEFORE the already-consolidated rung.
+
+        Same cluster as above with the regrowth removed. The verdict is a NOOP,
+        and the incumbent is STILL stripped and disclosed: `retain_ids`
+        describes the members the predicate actually judged, with the canonical
+        accounted for separately rather than silently folded in among them.
+        Rung 4 reads that retained set, not `proposal.member_ids`.
+        """
+        members = _members(
+            *(_member(f'm{i}', topic=TOPIC) for i in range(1, 6)),
+            _member('C', topic=TOPIC, canonical=True),
+        )
+
+        verdict = evaluate_auto_predicate(
+            _proposal(('m1', 'm2', 'C', 'm3', 'm4', 'm5')),
+            members=members,
+            canonical_count=1,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        assert verdict.outcome is AutoOutcome.NOOP
+        assert verdict.stripped_ids == ('C',)
+        assert verdict.retain_ids == ('m1', 'm2', 'm3', 'm4', 'm5')
+
+        codes = [r.code for r in verdict.reasons]
+        assert AutoReasonCode.incumbent_canonical_stripped in codes
+        assert AutoReasonCode.already_consolidated in codes
+
+    def test_stamped_members_with_no_canonical_still_pass(self):
+        """Stamped members, zero canonicals — mint the missing canonical.
+
+        The fall-through a naive "all stamped -> NOOP" gets wrong. It is a real
+        state: task theta's migration stamps members onto a topic before any
+        canonical exists, and a NOOP here would leave a topic whose scroll has
+        members and no index entry, which nothing else sweeps.
+        """
+        members = _members(*(_member(f'm{i}', topic=TOPIC) for i in range(1, 4)))
+
+        verdict = evaluate_auto_predicate(
+            _proposal(('m1', 'm2', 'm3')),
+            members=members,
+            canonical_count=0,
+            open_gate_id=None,
+            existing_canonical_slugs=(),
+            config=_auto_config(),
+        )
+
+        assert verdict.outcome is AutoOutcome.PASS
+        assert verdict.retain_ids == ('m1', 'm2', 'm3')
