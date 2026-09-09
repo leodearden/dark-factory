@@ -12,8 +12,9 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
     checked-in sidecar (not just the one committed exemplar TestLoader
     covers), built on the sibling test-support module
     shared/tests/capability_manifest_corpus.py (task 3362).
-  - TestDeliveredCheckMeta / TestMetadataRegistration: the
-    metadata.delivered_checks registered sub-model.
+  - TestDeliveredCheckMeta / TestMechanicalCheckKinds / TestMetadataRegistration:
+    the metadata.delivered_checks registered sub-model and the derived
+    MECHANICAL_CHECK_KINDS vocabulary its consumers import.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, get_args
 
 import pytest
 import yaml
@@ -39,8 +40,10 @@ from capability_manifest_corpus import (
 )
 from pydantic import BaseModel, ValidationError
 
+import shared.capability_manifest as capability_manifest_module
 import shared.task_metadata as task_metadata_module
 from shared.capability_manifest import (
+    MECHANICAL_CHECK_KINDS,
     CapabilityManifestDoc,
     DeliveredCheck,
     DeliveredCheckMeta,
@@ -1731,6 +1734,36 @@ class TestDeliveredCheckMeta:
             DeliveredCheckMeta(name='cap-one', kind='grep', expect='present')
         message = str(exc_info.value)
         assert 'DeliveredCheckMeta: pattern is required' in message
+
+
+class TestMechanicalCheckKinds:
+    """MECHANICAL_CHECK_KINDS — the one place "mechanical" is defined.
+
+    Mechanical is not an independent concept that happens to coincide with
+    DeliveredCheckMeta's vocabulary — it IS that vocabulary, definitionally:
+    mechanical means "copied into metadata.delivered_checks", and
+    DeliveredCheckMeta is precisely the model of a metadata entry. The
+    derivation assertion below is the point of this class: it is what makes
+    adding a future kind impossible to half-apply.
+    """
+
+    def test_value_is_the_three_mechanical_kinds(self):
+        assert MECHANICAL_CHECK_KINDS == ('grep', 'script', 'path')
+
+    def test_is_derived_from_the_delivered_check_meta_literal(self):
+        assert MECHANICAL_CHECK_KINDS == get_args(
+            DeliveredCheckMeta.model_fields['kind'].annotation
+        )
+
+    def test_does_not_contain_manual(self):
+        # Derived from DeliveredCheckMeta, NOT DeliveredCheck: the latter
+        # also carries 'manual', the one kind that must never be copied
+        # into metadata.
+        assert 'manual' not in MECHANICAL_CHECK_KINDS
+        assert 'manual' in get_args(DeliveredCheck.model_fields['kind'].annotation)
+
+    def test_is_exported_in_module_all(self):
+        assert 'MECHANICAL_CHECK_KINDS' in capability_manifest_module.__all__
 
 
 class TestMetadataRegistration:
