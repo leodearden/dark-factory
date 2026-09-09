@@ -46,6 +46,13 @@ RECON_STATUS_LITERALS = (
     'partial',
 )
 
+# The burst-AGENT states, a separate vocabulary rendered by ReconTab's Burst
+# state table (`b.state`, not a run's status). 'running' belongs to both, so a
+# whole-body ban on the string would forbid correct code this task has no
+# business touching; the overlap is checked by USE instead — see
+# TestReconStatusLiteralsAreGone.
+BURST_STATE_LITERALS = ('bursting', 'cooling', 'running', 'idle')
+
 
 @pytest.fixture(scope='module')
 def app_jsx_code(app_jsx_body):
@@ -469,10 +476,30 @@ class TestReconStatusLiteralsAreGone:
         """
         survivors = [
             lit for lit in RECON_STATUS_LITERALS
-            if f"'{lit}'" in recon_tab_code
+            if lit not in BURST_STATE_LITERALS and f"'{lit}'" in recon_tab_code
         ]
         assert survivors == [], (
             f'ReconTab still hard-codes the run-status literal(s) {survivors} '
             '— every one of them must come from recon_status.js, or two call '
             'sites in this file can disagree about the same window again.'
+        )
+
+    def test_no_run_row_is_compared_against_a_status_literal(self, recon_tab_code):
+        """The overlapping literals, checked by USE rather than by presence.
+
+        'running' is a member of BOTH the run vocabulary and the burst-AGENT
+        vocabulary (bursting / cooling / running / idle), and the Burst state
+        table legitimately branches on `b.state === 'running'`. That is a
+        different vocabulary with a different writer — the same reason the
+        rail-badge test above spares app.jsx's TASK statuses — so a
+        whole-body ban on the string would forbid correct, in-scope-adjacent
+        code. What must hold instead is that no RUN row's status is ever
+        compared against a literal.
+        """
+        compared = re.findall(
+            r'\b(\w+)\.status\s*===\s*\'([^\']*)\'', recon_tab_code
+        )
+        assert compared == [], (
+            f'ReconTab compares a run status against a literal: {compared} — '
+            'the run vocabulary belongs to recon_status.js.'
         )

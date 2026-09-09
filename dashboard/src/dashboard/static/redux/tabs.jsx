@@ -814,7 +814,7 @@ function ReconTab({ projectFilter, search }) {
                   <td className="mono">{rn.project_id || rn.project}</td>
                   <td style={{ color: 'var(--fg-2)' }}>{rn.trigger_reason || rn.trigger}</td>
                   <td>{rn.run_type || rn.type}</td>
-                  <td><span className={`badge ${rn.status === 'success' || rn.status === 'completed' ? 'ok' : rn.status === 'failed' ? 'bad' : 'warn'}`}>{rn.status}</span></td>
+                  <td><span className={`badge ${reconStatusTone(rn.status)}`}>{rn.status}</span></td>
                   <td className="num">{rn.events_processed ?? rn.events ?? 0}</td>
                   <td className="num">{rn.duration_seconds != null ? `${rn.duration_seconds.toFixed(1)}s` : '—'}</td>
                   <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(rn.started_at)}</td>
