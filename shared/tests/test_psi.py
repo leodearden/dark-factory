@@ -722,6 +722,24 @@ class TestResolveOwnCgroup:
         assert own.path == ''
         assert own.pressure_path is None
 
+    def test_bare_v2_line_with_no_path_is_not_a_resolution(self, tmp_path):
+        """A degenerate ``0::`` line carries no cgroup path.
+
+        Resolving it to the sysfs ROOT would report the root cgroup's pressure
+        as a successful reading of "no cgroup" and break OwnCgroup's
+        ``path == '' iff pressure_path is None`` biconditional.
+        """
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, '0::\n'),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == ''
+        assert own.pressure_path is None
+
     def test_result_is_cached_per_process(self, tmp_path):
         """INV-8: the ~150s gate tick must not repeat the walk or the join."""
         from shared.psi import resolve_own_cgroup
@@ -863,6 +881,19 @@ class TestReadOwnCgroupPressure:
 
         assert reading == ('', 0.0, False)
 
+    def test_bare_v2_line_never_reports_the_root_cgroup(self, tmp_path):
+        """A ``0::`` line with no path resolves to nothing, so a cpu.pressure
+        sitting at the sysfs root is NOT this process's own pressure."""
+        from shared.psi import read_own_cgroup_pressure
+
+        cgroup_file, root = self._tree(tmp_path, '0::\n', pressure_at='/')
+
+        reading = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+
+        assert reading == ('', 0.0, False)
+
     def test_never_raises_on_a_directory_in_place_of_the_pressure_file(self, tmp_path):
         from shared.psi import read_own_cgroup_pressure
 
@@ -875,29 +906,66 @@ class TestReadOwnCgroupPressure:
 
         assert reading.read_ok is False
 
-    def test_failure_re_resolves_so_a_late_slice_is_picked_up(self, tmp_path):
+    def test_read_failure_re_resolves_so_a_late_slice_is_picked_up(self, tmp_path):
         """A df-<project_id>.slice that does not exist yet (3394 unlanded) must
-        be picked up when it appears, without restarting the orchestrator. The
-        failure path clears the resolver cache, so the test never touches it.
+        be picked up when it appears, without restarting the orchestrator.
+
+        The second call has to resolve to a DIFFERENT cgroup than the first —
+        that is what makes the failure path's cache invalidation load-bearing
+        rather than incidental. The failure path clears the cache itself, so
+        the test never touches it.
         """
         from shared.psi import read_own_cgroup_pressure
 
-        cgroup_file, root = self._tree(tmp_path, CGROUP_UNDER_SLICE)
-        directory = root / SLICE_PATH.lstrip('/')
-        directory.mkdir(parents=True)
+        cgroup_file, root = self._tree(tmp_path, CGROUP_NO_SLICE)
 
         first = read_own_cgroup_pressure(
             'x', proc_cgroup_path=cgroup_file, cgroup_root=root
         )
         assert first.read_ok is False
+        assert first.cgroup == UNIT_PATH
 
+        # the slice lands, and this process is restarted inside it
+        cgroup_file.write_text(CGROUP_UNDER_SLICE)
+        directory = root / SLICE_PATH.lstrip('/')
+        directory.mkdir(parents=True)
         (directory / 'cpu.pressure').write_text(PSI_CPU_TEXT)
 
         second = read_own_cgroup_pressure(
             'x', proc_cgroup_path=cgroup_file, cgroup_root=root
         )
         assert second.read_ok is True
+        assert second.cgroup == SLICE_PATH
         assert second.some_avg10 == pytest.approx(2.50)
+
+    def test_resolution_failure_re_resolves_too(self, tmp_path):
+        """A transient failure READING /proc/self/cgroup must not disable the
+        arm for the whole process lifetime.
+
+        The memoized ``OwnCgroup('', None)`` is as sticky as a memoized good
+        one, and the read that fails under memory pressure is exactly the read
+        this gate exists to survive.
+        """
+        from shared.psi import read_own_cgroup_pressure
+
+        cgroup_file = tmp_path / 'cgroup'
+        root = tmp_path / 'sys'
+
+        first = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+        assert first == ('', 0.0, False)
+
+        cgroup_file.write_text(CGROUP_UNDER_SLICE)
+        directory = root / SLICE_PATH.lstrip('/')
+        directory.mkdir(parents=True)
+        (directory / 'cpu.pressure').write_text(PSI_CPU_TEXT)
+
+        second = read_own_cgroup_pressure(
+            'x', proc_cgroup_path=cgroup_file, cgroup_root=root
+        )
+        assert second.read_ok is True
+        assert second.cgroup == SLICE_PATH
 
 
 class TestReadPsiSampleHappyPath:

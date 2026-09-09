@@ -183,15 +183,23 @@ def resolve_own_cgroup(
     neither the walk nor the join. The key includes both injected paths, so a
     fixture never shares an entry with the live defaults or with another
     fixture. ``resolve_own_cgroup.cache_clear()`` is the public invalidation
-    seam — ``read_own_cgroup_pressure`` calls it after any read failure, and
+    seam — ``read_own_cgroup_pressure`` calls it after any failure of its own,
+    a failed resolution included, and
     tests use that same seam rather than reaching into module internals.
 
-    Never raises: any failure returns ``OwnCgroup('', None)``.
+    Never raises: any failure returns ``OwnCgroup('', None)``. A degenerate
+    ``0::`` line with no path is one of those failures, not a resolution of
+    the root cgroup: joining it would yield the ROOT ``cpu.pressure``, whose
+    reading would then be reported under ``own_cgroup=''`` — a
+    mis-attribution, and a break of this type's ``''`` / ``None``
+    biconditional.
     """
     try:
         text = Path(proc_cgroup_path).read_text()
         line = next(line for line in text.splitlines() if line.startswith('0::'))
         path = line[len('0::') :]
+        if not path:
+            raise ValueError('0:: line carries no cgroup path')
         segments = path.split('/')
         if project_id is not None:
             slice_name = f'df-{project_id}.slice'
@@ -237,18 +245,23 @@ def read_own_cgroup_pressure(
     Never raises. A failure carries the attempted cgroup in the result so the
     degradation is visible by value (INV-11), and re-resolves: a
     ``df-<project_id>.slice`` that does not exist yet must be picked up when
-    it appears, without restarting the orchestrator.
+    it appears, without restarting the orchestrator. Failing to RESOLVE is one
+    of those failures — a memoized ``OwnCgroup('', None)`` from one transient
+    /proc/self/cgroup read error would otherwise disable this arm for the
+    process lifetime — so all three (no resolution, unreadable file,
+    unparseable text) share ONE exit, which is where the cache is cleared.
     """
     own = resolve_own_cgroup(
         project_id, proc_cgroup_path=proc_cgroup_path, cgroup_root=cgroup_root
     )
-    if own.pressure_path is None:
-        return OwnPressureReading('', 0.0, False)
-    try:
-        parsed = parse_pressure_file(own.pressure_path.read_text())
-    except Exception:
-        logger.debug('own cgroup pressure unreadable; component degraded', exc_info=True)
-        parsed = None
+    parsed = None
+    if own.pressure_path is not None:
+        try:
+            parsed = parse_pressure_file(own.pressure_path.read_text())
+        except Exception:
+            logger.debug(
+                'own cgroup pressure unreadable; component degraded', exc_info=True
+            )
     if parsed is None:
         resolve_own_cgroup.cache_clear()
         return OwnPressureReading(own.path, 0.0, False)
