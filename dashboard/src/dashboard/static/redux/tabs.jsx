@@ -735,7 +735,7 @@ function ReconTab({ projectFilter, search }) {
           .map(x => x.duration_seconds)
           .reverse();
         return (
-          <div className="col-span-12 grid cols-4">
+          <div className="col-span-12 grid cols-5">
             <ST label="Buffered events" value={r.buffer.buffered_count}
                 hint={r.buffer.oldest_event_age_seconds != null
                   ? `oldest ${r.buffer.oldest_event_age_seconds}s`
@@ -744,6 +744,9 @@ function ReconTab({ projectFilter, search }) {
             <ST label="Active agents" value={r.burst_state.length}
                 hint={`${r.burst_state.filter(b=>b.state!=='idle').length} non-idle`}
                 spark={(r.agents_spark?.values || []).slice(-30)} sparkColor={CP.accent} />
+            <ST label="In progress" value={counts.inFlight}
+                hint={`of ${counts.total} recent runs`}
+                spark={[]} />
             <ST label="Last full run"
                 value={lastFullIso ? window.DF_SHELL.timeago(lastFullIso) : '—'}
                 hint={lastFullProject || 'no completed run'}
