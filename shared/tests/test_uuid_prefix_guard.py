@@ -17,7 +17,6 @@ import pytest
 
 from shared import uuid_prefix_guard as guard
 
-
 # --- the resolution vocabulary is typed and closed ----------------------
 
 
@@ -38,12 +37,12 @@ def test_resolution_fields() -> None:
 
 def test_namespace_constants_are_derived_from_the_literal_type() -> None:
     """One source for the type and the constant, so they cannot drift apart."""
-    assert guard.NAMESPACES == get_args(guard.Namespace)
+    assert get_args(guard.Namespace) == guard.NAMESPACES
     assert set(guard.NAMESPACES) == {'mem0', 'graphiti_node', 'graphiti_edge'}
 
 
 def test_resolution_outcome_constants_are_derived_from_the_literal_type() -> None:
-    assert guard.RESOLUTION_OUTCOMES == get_args(guard.ResolutionOutcome)
+    assert get_args(guard.ResolutionOutcome) == guard.RESOLUTION_OUTCOMES
     assert set(guard.RESOLUTION_OUTCOMES) == {'unique', 'ambiguous', 'none'}
 
 
@@ -59,7 +58,7 @@ def test_resolver_unavailable_is_an_exception_carrying_the_failed_store() -> Non
 
 
 def test_fact_outcome_vocabulary_is_exactly_the_four_declared_values() -> None:
-    assert guard.FACT_OUTCOMES == get_args(guard.FactOutcome)
+    assert get_args(guard.FactOutcome) == guard.FACT_OUTCOMES
     assert set(guard.FACT_OUTCOMES) == {
         'expanded',
         'rejected',
@@ -89,9 +88,11 @@ NON_EXEMPT_CLASSES = (guard.ToolClass.DEFAULT, guard.ToolClass.FORWARD_ON_AMBIGU
 
 @pytest.mark.parametrize(
     ('outcome', 'tool_class'),
-    list(itertools.product(('unique', 'ambiguous', 'none'), NON_EXEMPT_CLASSES)),
+    list(itertools.product(guard.RESOLUTION_OUTCOMES, NON_EXEMPT_CLASSES)),
 )
-def test_every_cell_is_declared(outcome: str, tool_class: guard.ToolClass) -> None:
+def test_every_cell_is_declared(
+    outcome: guard.ResolutionOutcome, tool_class: guard.ToolClass
+) -> None:
     """No cell is reachable by falling off the end of a lookup (INV-1).
 
     Parametrized over the PRODUCT of the two vocabularies rather than over a
@@ -144,9 +145,9 @@ def test_storm_counted_outcomes_are_exactly_the_two_fail_soft_ones() -> None:
     would fire the 3/3600 thresholds continuously and be ignored, which is how
     a storm escape stops being an escape.
     """
-    assert guard.STORM_COUNTED_OUTCOMES == frozenset(
+    assert frozenset(
         {'forwarded_ambiguous', 'resolver_unavailable'}
-    )
+    ) == guard.STORM_COUNTED_OUTCOMES
 
 
 def test_expanded_is_not_storm_counted() -> None:
@@ -159,4 +160,4 @@ def test_rejected_is_not_storm_counted() -> None:
 
 
 def test_storm_counted_outcomes_are_all_real_fact_outcomes() -> None:
-    assert guard.STORM_COUNTED_OUTCOMES <= set(guard.FACT_OUTCOMES)
+    assert set(guard.FACT_OUTCOMES) >= guard.STORM_COUNTED_OUTCOMES
