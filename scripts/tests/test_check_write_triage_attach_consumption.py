@@ -30,6 +30,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _HERE = Path(__file__).resolve().parent
 # The repo-wide `--import-mode=importlib` addopts means pytest does NOT put a
 # test file's own directory on sys.path, and scripts/tests/conftest.py inserts
@@ -50,6 +52,21 @@ _PROBE = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_consumption.py'
 _PASS = 'PASS  the judge-bound candidate is CONSUMED by the attach'
 _NOT_CONSUMED = 'FAIL  the judge-bound candidate is NOT CONSUMED by the attach'
 _UNVERIFIABLE = 'UNVERIFIABLE'
+#: Named on a PASS, so an operator can see WHICH wire shape the module speaks
+#: rather than only that some shape worked.
+_CHANNEL = 'designation channel'
+#: The control spelling. It designates nothing, so it must never satisfy on its
+#: own — a module that widened nothing would otherwise open the gate.
+_BARE_STR_SPELLING = 'bare outcome str'
+
+#: The option-(a) wire shapes a fix might land. None may be pinned by the
+#: probe: option (a) has not landed, so a probe that required one spelling
+#: would fail a correct fix that chose another.
+_DESIGNATING_VARIANTS = (
+    'consumes_designated_id',
+    'consumes_designated_dict',
+    'consumes_designated_object',
+)
 
 #: The hoisted parent the probe's own fixture slate makes the band pick. It
 #: belongs to NO candidate in the slate — that is what separates "the attach
@@ -99,3 +116,32 @@ class TestConsumptionProbe:
         assert _BAND_CANONICAL in proc.stdout, proc.stdout
         assert _PASS not in proc.stdout, proc.stdout
         assert _UNVERIFIABLE not in proc.stdout, proc.stdout
+
+    @pytest.mark.parametrize('variant', _DESIGNATING_VARIANTS)
+    def test_a_module_that_consumes_the_designation_passes(self, tmp_path, variant):
+        """Any of the three plausible option-(a) wire shapes satisfies item 5.
+
+        Which spelling a fix picks is a MECHANISM. Pinning one would fail a
+        correct fix that chose another — the false-FAIL class this gate family
+        was rewritten to remove — so all three are accepted and the report says
+        which one was found.
+        """
+        src_root = write_fake_triage(tmp_path / 'src', variant=variant)
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS in proc.stdout, proc.stdout
+        assert _CHANNEL in proc.stdout, proc.stdout
+
+    def test_the_bare_str_spelling_alone_never_satisfies(self, tmp_path):
+        """The control: widening nothing must not open the gate.
+
+        A judge that returns a plain outcome word designates no candidate, so a
+        module that still attaches to `decision.canonical_id` has changed
+        nothing. The spelling is tried anyway — and reported as tried — because
+        a control nobody exercises proves nothing.
+        """
+        src_root = write_fake_triage(tmp_path / 'src', variant='band_top1')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS not in proc.stdout, proc.stdout
+        assert _BARE_STR_SPELLING in proc.stdout, proc.stdout

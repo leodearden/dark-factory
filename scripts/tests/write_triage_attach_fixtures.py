@@ -209,6 +209,67 @@ async def _band_and_candidates(memory_service, content, project_id, counter):
 
 def _forced(allow_near_duplicate, caller_owns_attach_keys):
     return allow_near_duplicate or caller_owns_attach_keys
+
+
+def _slate_ids(candidates):
+    return [getattr(c, 'id', None) for c in candidates or ()]
+
+
+def _make_designating_triage_write(decode):
+    """Build a triage_write that CONSUMES the candidate its judge designated.
+
+    *decode* maps a judge payload to ``(outcome, candidate_id)``, or None for
+    "not the spelling this variant speaks" — in which case the payload is
+    treated as main treats it, i.e. as a bare outcome word naming no candidate.
+    Everything else mirrors main, including validating the designated id against
+    the slate before honouring it.
+    """
+    async def triage_write(memory_service, *, content, project_id, counter,
+                           judge=None, allow_near_duplicate=False,
+                           caller_owns_attach_keys=False):
+        if _forced(allow_near_duplicate, caller_owns_attach_keys):
+            return BandDecision(OUTCOME_STORED, None, None, None, None)
+        decision, candidates = await _band_and_candidates(
+            memory_service, content, project_id, counter,
+        )
+        if decision.outcome != OUTCOME_JUDGE:
+            return decision
+        try:
+            verdict = await (judge or _stub_judge)(
+                memory_service=memory_service,
+                content=content,
+                project_id=project_id,
+                decision=decision,
+                candidates=candidates,
+            )
+        except Exception as exc:
+            _record_fail_open(counter, project_id, exc, stage='judge')
+            return BandDecision(
+                OUTCOME_STORED, None, None, decision.t_high, decision.t_low,
+            )
+        designated = decode(verdict)
+        outcome, candidate_id = designated if designated else (verdict, None)
+        if not isinstance(outcome, str) or outcome not in TRIAGE_OUTCOMES:
+            _record_fail_open(
+                counter, project_id,
+                ValueError('judge returned %r' % (verdict,)),
+                stage='judge',
+            )
+            return BandDecision(
+                OUTCOME_STORED, None, None, decision.t_high, decision.t_low,
+            )
+        if outcome == OUTCOME_STORED:
+            canonical_id = None
+        elif candidate_id in _slate_ids(candidates):
+            canonical_id = candidate_id
+        else:
+            canonical_id = decision.canonical_id
+        return BandDecision(
+            outcome, canonical_id, decision.similarity,
+            decision.t_high, decision.t_low,
+        )
+
+    return triage_write
 '''
 
 
@@ -262,10 +323,58 @@ async def triage_write(memory_service, *, content, project_id, counter,
 '''
 
 
+#: The three plausible option-(a) wire shapes for "the verdict names its own
+#: candidate". Which one an eventual fix picks is unknown — option (a) has not
+#: landed — so the probe may pin none of them, and the fixtures carry all three
+#: so that discipline is testable rather than asserted. Each speaks exactly ONE
+#: spelling and treats every other payload as main does: a bare outcome word
+#: attaches to the band's canonical, and anything unrecognised falls open.
+_CONSUMES_TUPLE = r'''
+
+def _decode(verdict):
+    """(outcome, candidate_id)."""
+    if isinstance(verdict, tuple) and len(verdict) == 2:
+        return verdict
+    return None
+
+
+triage_write = _make_designating_triage_write(_decode)
+'''
+
+_CONSUMES_DICT = r'''
+
+def _decode(verdict):
+    """{'outcome': ..., 'candidate_id': ...}."""
+    if isinstance(verdict, dict):
+        return verdict.get('outcome'), verdict.get('candidate_id')
+    return None
+
+
+triage_write = _make_designating_triage_write(_decode)
+'''
+
+_CONSUMES_OBJECT = r'''
+
+def _decode(verdict):
+    """An object exposing .outcome and .candidate_id."""
+    outcome = getattr(verdict, 'outcome', None)
+    candidate_id = getattr(verdict, 'candidate_id', None)
+    if isinstance(outcome, str) and isinstance(candidate_id, str):
+        return outcome, candidate_id
+    return None
+
+
+triage_write = _make_designating_triage_write(_decode)
+'''
+
+
 #: variant name -> the ``triage_write`` that defines it. Appended to
 #: :data:`TRIAGE_PREAMBLE` by :func:`write_fake_triage`.
 VARIANT_TAILS: dict[str, str] = {
     'band_top1': _BAND_TOP1,
+    'consumes_designated_id': _CONSUMES_TUPLE,
+    'consumes_designated_dict': _CONSUMES_DICT,
+    'consumes_designated_object': _CONSUMES_OBJECT,
 }
 
 
